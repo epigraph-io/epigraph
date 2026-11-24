@@ -254,7 +254,7 @@ at the 12 rows pinned by `tenancy_coverage.rs::REGISTRY`.
 | `agents`, `jobs`, `claim_encryption`, `claim_version_encryption` | identity, queue, sealed keys | not content |
 | `experiments` | `protocol` discloses the design for a private hypothesis | **does not follow** a shared hypothesis claim; under-sharing, not a leak |
 | `counterfactual_scenarios`, `learning_events`, `match_candidates` | free text about two claims | do not follow. `match_candidates` is a near-duplicate oracle and stays exempt. |
-| `behavioral_executions` | a private step's `goal_text` and `goal_embedding` | a workflow share moves nothing here (section 3.2) |
+| `behavioral_executions` | a private step's `goal_text` and `goal_embedding` | a workflow share moves nothing here (section 3.2). Since migration 240 (after this measurement) a run carries its workflow's tenancy and follows it; a run of another plan naming a moved step does not |
 | `alternative_set`, `alt_set_decisions` (views) | closed by 077 (`security_invoker = true`) | follow `edges` and `claims` |
 
 ### 2.5 Untenanted dependencies
@@ -265,7 +265,7 @@ does, or a stale aggregate.
 
 | table(s) | references | note |
 |---|---|---|
-| `papers` | `asserts` / `authored` / `processed_by` edges | [papers-tenancy-followup.md](papers-tenancy-followup.md): a private ingest's paper row is world-readable today. Sharing does not make this worse. Publicizing makes it moot for that paper. |
+| `papers` | `asserts` / `authored` / `processed_by` edges | Since migration 246 a private ingest's paper row carries the ingest's tenancy and its edges take the meet with it. A share or publicize of the claims does not yet move or merge the paper row (follow-up in [papers-tenancy-followup.md](papers-tenancy-followup.md)): the paper's edges stay its group's. |
 | `entities`, `experiment_entities`, `entity_merge_candidates` | `entity_mentions`, `experiment_entity_mentions` | the entity registry is instance-wide; mentions carry the tenancy |
 | `graph_cluster_runs`, `graph_clusters`, `cluster_centroids`, `cluster_edges`, `cluster_labels`, `graph_neighborhoods`, `neighborhood_edges` | `claim_cluster_membership`, `claim_neighborhood_membership` | aggregates; section 6.2 |
 | `workflow_executions`, `tasks` | `workflows` (by `workflow_id`, no FK) | execution telemetry; section 3.2 |
@@ -444,9 +444,9 @@ The roles:
 
 | act | rule (this spec) | today (206) |
 |---|---|---|
-| share private → team | a **human** (R1) who is a live admin of the home group (in practice, the human whose personal group it is) and who writes the target by **own** membership (`via = 'own'`) | author **or** home admin; the target is any team in `epigraph_writable_teams(caller)`, including `via = 'operator'`. **An operated agent passes today.** |
+| share private → team | a **human** (R1) who is a live admin of the home group (in practice, the human whose personal group it is) and who writes the target by **own** membership (`via = 'own'`) | author **or** home admin; the target is any team in `epigraph_writable_teams(caller)`, including `via = 'operator'`. An operated agent passed until migration 242, which refuses it (`refused_not_human`) and takes the target by `via = 'own'` only; the author arm remains. |
 | move A → B | a **human** (R1) with its own live admin membership of A and writer membership of B; refused when `readers_losing > 0` (R2) | not app-callable |
-| publicize | a **human** (R1) with its own live admin membership of the owning group (D-V2) | D-V2 without the human test |
+| publicize | a **human** (R1) with its own live admin membership of the owning group (D-V2) | D-V2; since migration 242 an operated agent is refused (`refused_not_human`), an unlinked agent is not yet |
 | undo a publicize | inside the window (R3): a **human** live admin of the owning group; refused if anyone outside the owning group has built on it (R8). After the window, or when refused: maintenance only. | none |
 | undo a share or move | inside the window (R7): a **human** live admin of the source group (home, or team A); refused if anyone outside that group has built on it (R8). After the window, or when refused: maintenance only (`reown-reverse`), which keeps attached claims in the team (R4). | none |
 
@@ -467,6 +467,11 @@ The roles:
 
   D-V3 is untouched for **writes**: an operated agent still writes into its human's teams. R1
   removes it only from the acts that move existing work.
+
+* **Migration 242 lands part of R1** (backlog ecd842bf): both acts refuse an operated agent
+  (`epigraph_human_of(caller, false)` is another agent) with `refused_not_human`, and share
+  takes the target by `via = 'own'` only. The author arm and the gate for an agent that belongs
+  to no human remain P1's.
 
 ### 4.3 All or nothing
 
@@ -532,7 +537,7 @@ The roles:
 | **pinned evidence** (110) | **stays** `('group', pin owner)` | **stays group** (206 reports `evidence_kept_private`) | see below |
 | edges incident to a moved claim | re-met by arm (d) (non-public meets only) | 206 recomputes, widening allowed, **only** for edges whose tuple equalled their meet beforehand; a declared `('group', G)` edge is kept | 072/120: visibility never widens by accident |
 | edges incident to a moved claim's **evidence** | **re-met by the act's body (new)** | likewise | the arm (d) gap, section 3.3 |
-| `harvester_fragments` | follow through provenance; a fragment also feeding a claim that is not moving is **held** (`shared-fragment`) | same | otherwise the other claim's fragment changes owner under it |
+| `harvester_fragments` | follow through provenance; a fragment also feeding a claim that is not moving is **held** (`shared-fragment`), unless that claim is already at the destination (migration 242: co-citing claims shared in separate calls must not strand the fragment). Publicize: 218's arm (d) guard holds a group fragment another group claim cites; one whose other citers are all public goes public (its owner does not change) | same | otherwise the other claim's fragment changes owner under it |
 | `harvester_audit_reports` | follow the fragment (173) | follow | — |
 | `harvester_sources` | **moved by the act's body (new)** when all its fragments now agree, using 173's derivation rule; otherwise held (`source-mixed`) and reported | same | otherwise a harvested source stays private while all its claims are public |
 | cached belief on the moved claim (`claims.belief` / `plausibility` / `pignistic_prob`, `ds_combined_beliefs`, `ds_bayesian_divergence`) | **recomputed by the act (new)** | **recomputed by the act (new)** | see "The DS cache" below |

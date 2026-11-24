@@ -92,7 +92,8 @@ fn start_mcp(
     // The separate-signing-key pair may be exported on the runner (by a host
     // in that mode); cleared FIRST, so only what this test sets reaches the child.
     cmd.env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
-        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY");
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

@@ -60,27 +60,33 @@ Added to:
   to every claim the ingest creates, with their evidence, traces and `asserts` edges. Claims it
   converges onto keep their own tenancy.
 
-  **An ingest's visibility scopes its CLAIMS only.** The rest of what an ingest writes stays
-  world-readable whatever `visibility` says, because it has no row security:
+  **An ingest's visibility scopes its claims and, since migration 246, its paper.** The
+  `papers` row (title, DOI or synthesized document key, journal) carries the ingest's tenancy
+  under FORCEd row security, and `epigraph_node_tenancy` meets a paper endpoint with that row,
+  so for a `team` or `private` ingest:
 
-  * the `papers` row: title, DOI (or synthesized document key) and journal. `papers` has no
-    row-level security in any migration (127: "papers and workflows carry no tenancy"), and
-    `ensure_paper_node` writes it on the pool before the walk, with no `VisibilityChoice`;
-  * the author agents (`agents` rows named after the paper's authors) and their `authored`
-    edges to the paper;
-  * the paper's `processed_by` edge, which is what `check_already_ingested` reports;
-  * the `asserts` edge from the paper to every claim the ingest converged onto that is already
-    **public** (an existing atom with the same content). Both endpoints are public, so the edge
-    is public, and anyone can see which public statements the document contains. A converged
-    public claim the agent may write also gets the document's `doi:<doi>` label.
+  * the paper row is readable only by the group, and another group's private ingest of the
+    same document writes its own row (one row per document per scope; every public ingest of
+    a document still shares its one public row);
+  * the `authored` edges from the author agents to the paper, the paper's `processed_by` stamp
+    (what `check_already_ingested` reports) and its `asserts` edges, including those onto
+    already-public claims it converged onto, are the group's edges;
+  * outside the group, `check_already_ingested`, `query_paper` and `GET /api/v1/papers` answer
+    as for an unknown document.
 
-  The paper-to-agent edges have a paper or agent endpoint, and the converged `asserts` edges
-  two public endpoints, so 120's `epigraph_edges_tenancy` keeps them all public. So for a
-  `team` or `private` ingest, the new claims are scoped, but anyone can learn that the
-  document exists, its title and DOI, who wrote it, that it was ingested, and which
-  already-public statements it asserts. **Do not ingest a confidential document until a follow-up adds tenancy to these
-  rows** (operator ruling, 2026-11-11). The follow-up's design is
-  [papers-tenancy-followup.md](papers-tenancy-followup.md).
+  Still world-readable whatever `visibility` says (backlog 34864fb5, follow-ups):
+
+  * the author agents themselves (`agents` rows named after the paper's authors): an author's
+    NAME stays readable. Which document it wrote does not (the `authored` edge onto a group
+    paper is the group's), but an author's `asserts` attribution edge onto an already-public
+    claim the ingest converges onto is public (both endpoints are), so `get_neighborhood` or
+    `traverse` from that claim ties the name to it. Do not ingest a document whose author list
+    is itself confidential;
+  * the `doi:<doi>` label a non-public ingest adds to a converged public claim it may write.
+
+  Publicizing or sharing the claims does not yet widen or merge the paper row: a publicized
+  claim's `asserts` edge from a group paper stays the group's. The design and what remains are
+  in [papers-tenancy-followup.md](papers-tenancy-followup.md).
 * The operator `ingest-document` CLI, as `--visibility` / `--group-id`, resolved for its acting
   agent (the `--agent-key` signer). Omitted, it is D-V1 like every other surface, so an operator
   ingest's claims land in that agent's team, else private, and are never public unless
@@ -207,10 +213,9 @@ team-or-private, where it used to write public:
   membership, its human's, or its default team), or pass `--visibility team --group-id <team>`
   for a team that agent writes. A human's default team reaches CLI ingests only through an
   agent linked to that human. A paper that must be public takes `--visibility public`.
-  Whatever the flags, the paper's own record (title, DOI, journal), its author agents and its
-  `processed_by` stamp stay world-readable (section 3.1); a confidential document should not
-  be ingested until the follow-up in [papers-tenancy-followup.md](papers-tenancy-followup.md)
-  lands.
+  The flags scope the paper's own record (title, DOI, journal) and its `processed_by` stamp
+  too (migration 246); its author agents stay world-readable (section 3.1 and
+  [papers-tenancy-followup.md](papers-tenancy-followup.md)).
 * **`create_claim_core`'s structural edges** (AUTHORED, HAS_TRACE, DERIVED_FROM) used to be
   written after the commit on the unstamped pool, best-effort. A group-visible claim is
   invisible there, so the edge's reference check refused them silently. For a group-visible
@@ -286,15 +291,19 @@ Every id is classified first, in this order, and nothing changes unless every id
 
 1. The row must exist and be readable by the session. Otherwise it is answered as `not_found`;
    existence of an unreadable claim is never disclosed.
-2. It must be `visibility = 'group'`. An already-public claim is a no-op, `already_public`.
-3. The caller must be authorized under **D-V2**, else `refused_not_admin`.
-4. It must not be sealed (`claim_encryption` row), else `refused_sealed`. This is a returned
+2. The caller must not be an operated agent (migration 242, share-with-team ruling R1): when
+   `epigraph_human_of(caller, false)` is another agent (an operator link of any state, or a
+   client allowance), every readable id is `refused_not_human`, whatever memberships the agent
+   holds itself. Its human makes the call.
+3. It must be `visibility = 'group'`. An already-public claim is a no-op, `already_public`.
+4. The caller must be authorized under **D-V2**, else `refused_not_admin`.
+5. It must not be sealed (`claim_encryption` row), else `refused_sealed`. This is a returned
    outcome, not a raised error, and it is checked before anything changes. The 074 trigger is
    the backstop.
 
 Then, for the `publicize` claims:
 
-5. `set_config('epigraph.allow_declassify','yes', true)`, then `UPDATE claims SET
+6. `set_config('epigraph.allow_declassify','yes', true)`, then `UPDATE claims SET
    visibility='public'` with the owner unchanged, then reset the GUC to `''` in the same body.
    The UPDATE moves a claim only while it is still `group` and still owned by the group it was
    classified under. If fewer claims move than were classified (a claim that was not locked
@@ -302,19 +311,19 @@ Then, for the `publicize` claims:
    (SQLSTATE 40001) and nothing is changed; the repo maps it to a `State` refusal (409 over
    REST), and a retry classifies the new state. Propagation copies `public` onto the 17 derived
    tables. Pinned evidence stays `group`, and its owner never moves.
-6. Recompute the edge meet for every edge incident to the claims, **widening allowed**. This is
+7. Recompute the edge meet for every edge incident to the claims, **widening allowed**. This is
    the same CASE as `recompute_boundary_meet_conn`: both endpoints public and in writer scope →
    `('public', writer_group_id)`, otherwise world. One endpoint still private → the private
    side's group. An edge explicitly declared `('group', G)` between public endpoints is kept,
    as 120 does on INSERT. That declaration is not recorded, so the rule is narrowed: only edges
    whose whole `(visibility, owner_group_id, co_owner_group_id)` tuple equals the meet that the
    old tenancy produces get rewritten. Anything else was a declaration and is left alone.
-7. Insert one `security_events` row, `event_type = 'claim.publicized'`, with `agent_id` set to
+8. Insert one `security_events` row, `event_type = 'claim.publicized'`, with `agent_id` set to
    the principal and details `{claim_ids, owner_group_ids, reason, edges_widened,
    evidence_kept_private, migration, session_user}`.
 
 It returns per-claim `(claim_id, outcome)` where outcome is `publicized | already_public |
-not_found | refused_not_admin | refused_sealed`. If any id is `not_found` or `refused_*`,
+not_found | refused_not_human | refused_not_admin | refused_sealed`. If any id is `not_found` or `refused_*`,
 nothing is changed and the classification is returned as it stands. The repo wrapper
 (`ClaimRepository::publicize_conn`) answers `not_found` as a missing claim and any refusal as a
 designed refusal, so a caller never sees a partial act.
@@ -325,18 +334,23 @@ This handles `private → team`. Each claim must be `('group', H)`, where `H` is
 group (its own personal group, or its operator's for an operated caller). The caller must be the
 claim's author (`claims.agent_id`), **or** a live admin of `H`. The second arm lets the human
 whose personal group it is share what its agents wrote there; it is the share-side counterpart
-of D-V2's note that the human is admin of its own personal group. `p_group_id` must be in
-`epigraph_writable_teams(caller)` and must not be `H`.
+of D-V2's note that the human is admin of its own personal group. `p_group_id` must be a team
+the caller writes by its **own** live membership (`epigraph_writable_teams(caller)` rows with
+`via = 'own'`, migration 242) and must not be `H`. An operated caller (an agent whose
+`epigraph_human_of(caller, false)` is another agent) is refused outright (242, share-with-team
+ruling R1): it may write into its human's teams (D-V3), but it does not move existing work out
+of a group on its own authority.
 
 Every id is classified first, in this order, all or nothing as in §4.2:
 
 | Outcome | When |
 |---|---|
 | `not_found` | no such claim, or the session cannot read it |
+| `refused_not_human` | the caller is an operated agent (242); every readable id gets it |
 | `refused_not_private` | the claim is public, or owned by a group other than `H` |
 | `refused_not_author` | the caller neither wrote it nor is a live admin of `H` |
 | `refused_sealed` | it has a `claim_encryption` row (its key material is bound to its group) |
-| `refused_not_team_writer` | the target group is not writable by the caller, or is `H` |
+| `refused_not_team_writer` | the caller has no own writer or admin membership of the target, or it is `H` |
 | `share` | to be moved; returned as `shared` once moved |
 
 The rows are locked before they are classified, as in §4.2. If every id is `share`, the

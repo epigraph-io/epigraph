@@ -232,6 +232,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                 &mut tx,
                 auth,
                 caller,
+                viewer,
                 anchor,
                 "workflow_ingest",
                 &not_found,
@@ -279,6 +280,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                         &mut tx,
                         auth,
                         caller,
+                        viewer,
                         existing,
                         "workflow_ingest",
                         &not_found,
@@ -435,7 +437,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         ),
     }
 
-    let inserted = result.inserted.clone();
+    // Every claim the walk left current without a vector: the ones it created
+    // and the ones it revived from a workflow deprecation (backlog 1767f2ae).
+    let inserted = result.claims_to_embed();
     let response = IngestWorkflowResponse {
         workflow_id: if caller_reads_row {
             result.workflow_id.to_string()

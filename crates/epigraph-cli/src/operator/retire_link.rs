@@ -16,7 +16,10 @@
 //! that row would survive the retire. So the definer refuses (OLR03) while the
 //! agent holds a live writer/admin row there, unless `--revoke-membership`
 //! asks it to revoke those rows in the same act. The count it revoked is
-//! printed and recorded in the audit row.
+//! printed and recorded in the audit row; since migration 257 (backlog
+//! 452a1330) the audit row also names each revoked membership's id and the
+//! role it held (`revoked_memberships`), so a revocation can be reviewed and
+//! reversed from the record alone.
 //!
 //! This module runs the call in ONE transaction, committed under `--apply` and
 //! rolled back otherwise, so a dry run prints exactly what the definer did.

@@ -663,13 +663,12 @@ async fn seed_claim(pool: &PgPool, agent_id: Uuid) -> ClaimId {
 
 async fn seed_claim_with_truth(pool: &PgPool, agent_id: Uuid, truth: f64) -> ClaimId {
     let id = Uuid::new_v4();
-    // 16-byte UUID padded to a 32-byte content_hash. `repeat(0).take(16)` keeps
-    // this MSRV-safe (avoids `iter::repeat_n`).
+    // 16-byte UUID padded to a 32-byte content_hash.
     let hash: Vec<u8> = id
         .as_bytes()
         .iter()
         .copied()
-        .chain(std::iter::repeat(0).take(16))
+        .chain(std::iter::repeat_n(0, 16))
         .take(32)
         .collect();
     sqlx::query(

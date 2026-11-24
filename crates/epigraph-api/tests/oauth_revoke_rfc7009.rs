@@ -296,8 +296,8 @@ async fn an_unknown_hint_still_revokes(pool: PgPool) {
 /// The JSON body with an explicit, correct hint keeps working (deployed
 /// clients send exactly this), and a token that is neither a JWT this server
 /// signed nor a hex refresh token is answered 200 (section 2.2). A body
-/// without `token` is still a 400, so the endpoint did not become "accept
-/// anything".
+/// without `token` is a 400 `invalid_request` (section 2.2.1, backlog
+/// cd96cd49), so the endpoint did not become "accept anything".
 #[sqlx::test(migrations = "../../migrations")]
 async fn json_bodies_unrecognised_tokens_and_a_missing_token(pool: PgPool) {
     let app = app_router(&pool).await;
@@ -329,6 +329,11 @@ async fn json_bodies_unrecognised_tokens_and_a_missing_token(pool: PgPool) {
         status,
         StatusCode::BAD_REQUEST,
         "a request without `token` is invalid: {body}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    assert_eq!(
+        parsed["error"], "invalid_request",
+        "in RFC 7009 section 2.2.1's shape: {body}"
     );
 }
 

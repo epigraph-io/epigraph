@@ -27,7 +27,11 @@
 //! `--restore <record file>` puts each recorded `truth_before` back, last
 //! record first, only where `truth_value` still holds exactly what the
 //! refresh wrote; anything else is reported `superseded_since_refresh` and
-//! left alone. With `--dry-run` it runs the same statements and rolls back.
+//! left alone. The undo is faithful: a claim superseded or retired after the
+//! refresh, whose `truth_value` still holds what the refresh wrote, is
+//! restored too (as `restore_belief_cache` restores its cache), and is
+//! counted apart as `restored_not_current`, so `restored` counts live claims
+//! only. With `--dry-run` it runs the same statements and rolls back.
 //!
 //! Rollback order is last-in, first-out: restore this tool's record BEFORE
 //! `restore_belief_cache` restores the caches its waves wrote. Restoring the
@@ -35,8 +39,20 @@
 //! served.
 //!
 //! Output files are never overwritten (they are created new, before the
-//! database is touched). A writing run (`--apply`, or `--restore` without
-//! `--dry-run`) first checks that its belief modes match the API's
+//! database is touched; a run refused because one exists leaves no file of
+//! its own behind). A run that stops on an error, including one that cannot
+//! connect, still writes its report, marked `"partial": true` with the
+//! error, holding the outcomes of the batches confirmed committed. The two
+//! files can differ, and the record is the one to reconcile from: it lists
+//! every committed write, and may also list writes of the batch that failed
+//! (each record is written before its batch commits, so a write recorded
+//! early in a batch that a later statement, a deadlock or a dropped
+//! connection rolls back stays listed; a restore finds it
+//! `already_restored`). A batch whose COMMIT itself errored may have landed
+//! although the report leaves it out. For a restore, re-running it is the
+//! reconcile: what landed is `already_restored`. A writing run (`--apply`,
+//! or `--restore` without `--dry-run`) first checks that its belief modes
+//! match the API's
 //! (`belief_mode_check`), as every wave bin does. It runs on the maintenance
 //! connection.
 
@@ -49,8 +65,8 @@ use clap::Parser;
 use epigraph_cli::belief_cache::read_wave;
 use epigraph_cli::belief_mode_check::{enforce_or_exit, RunIntent};
 use epigraph_cli::truth_mirror::{
-    apply, dry_run, plan_candidates, read_truth_records, restore, write_truth_record, Bucket,
-    MirrorReport, RefreshOptions, DEFAULT_BATCH,
+    apply_into, dry_run, plan_candidates, read_truth_records, restore_into, write_truth_record,
+    Bucket, MirrorReport, RefreshOptions, TruthRestoreReport, DEFAULT_BATCH,
 };
 
 #[derive(Parser, Debug)]
@@ -72,7 +88,10 @@ struct Cli {
     /// Admit round-valued mirrors (multiples of 0.001), held by default.
     #[arg(long, conflicts_with = "restore")]
     include_round: bool,
-    /// Undo the writes of a record file.
+    /// Undo the writes of a record file: each `truth_before` goes back where
+    /// `truth_value` still holds what the refresh wrote, current or not; a
+    /// restored claim that is no longer current is counted
+    /// `restored_not_current`, apart from `restored`.
     #[arg(long)]
     restore: Option<PathBuf>,
     /// Write nothing. For a refresh this is the default, spelled out; with
@@ -102,8 +121,7 @@ async fn main() {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
-    let writes = cli.apply || (cli.restore.is_some() && !cli.dry_run);
-    let intent = if writes {
+    let intent = if writes(&cli) {
         RunIntent::Writes
     } else {
         RunIntent::WritesNothing
@@ -117,6 +135,26 @@ async fn main() {
     }
 }
 
+/// Whether this run writes the database: an apply, or a restore that is not a
+/// dry run. The belief-mode check and the refresh's write path both decide
+/// on this, never on whether a record file was given.
+fn writes(cli: &Cli) -> bool {
+    cli.apply || (cli.restore.is_some() && !cli.dry_run)
+}
+
+/// The record file a refresh writes: present exactly when it applies (clap
+/// also refuses `--record` without `--apply`, and `--apply` without
+/// `--record`).
+fn refresh_record_path(cli: &Cli) -> anyhow::Result<Option<PathBuf>> {
+    if !writes(cli) {
+        return Ok(None);
+    }
+    cli.record
+        .clone()
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("--apply requires --record"))
+}
+
 fn create_new(path: &Path) -> anyhow::Result<BufWriter<File>> {
     let f = OpenOptions::new()
         .write(true)
@@ -124,6 +162,34 @@ fn create_new(path: &Path) -> anyhow::Result<BufWriter<File>> {
         .open(path)
         .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     Ok(BufWriter::new(f))
+}
+
+/// Create every output new, in order; if one cannot be created, remove the
+/// ones this call already created (they are empty) and fail, so a refused run
+/// leaves no file behind.
+fn create_all_new(paths: &[&Path]) -> anyhow::Result<Vec<BufWriter<File>>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        match create_new(p) {
+            Ok(w) => out.push(w),
+            Err(e) => {
+                drop(out);
+                for created in &paths[..i] {
+                    let _ = std::fs::remove_file(created);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Mark a report complete, or partial with the error that stopped the run.
+fn mark_outcome(v: &mut serde_json::Value, err: Option<&anyhow::Error>) {
+    v["partial"] = serde_json::Value::Bool(err.is_some());
+    v["error"] = err.map_or(serde_json::Value::Null, |e| {
+        serde_json::Value::String(format!("{e:#}"))
+    });
 }
 
 fn write_json(mut out: BufWriter<File>, v: &serde_json::Value) -> anyhow::Result<()> {
@@ -153,46 +219,75 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .report
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--report is required"))?;
-    let report_w = create_new(&report_path)?;
-    let mut record_w = match &cli.record {
-        Some(p) => Some(create_new(p)?),
-        None => None,
-    };
+    // The record exists only for an apply; the write path is chosen on
+    // `writes` below, as the belief-mode check was, never on the record's
+    // presence.
+    let record_path = refresh_record_path(&cli)?;
+    let mut outputs: Vec<&Path> = vec![report_path.as_path()];
+    if let Some(p) = &record_path {
+        outputs.push(p);
+    }
+    let mut writers = create_all_new(&outputs)?.into_iter();
+    let report_w = writers.next().expect("the report writer");
+    let mut record_w = writers.next();
 
-    let maint = epigraph_cli::MaintenancePool::connect(BIN)
-        .await
-        .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
-    // The bypass viewer is spent on `claim_role::roles_batch` only, on the
-    // maintenance connection, for as long as the run lasts.
-    let session = maint
-        .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
-        .await
-        .map_err(|e| anyhow::anyhow!("maintenance viewer: {e}"))?;
-    let viewer = session.viewer();
     let opts = RefreshOptions {
         batch_size: cli.batch_size,
         include_round: cli.include_round,
     };
 
-    let result = if let Some(w) = record_w.as_mut() {
-        apply(maint.pool(), viewer, &candidates, &opts, |rec| {
-            write_truth_record(w, rec)?;
-            w.flush()?;
-            w.get_ref().sync_data()?;
-            Ok(())
-        })
-        .await
-    } else {
-        dry_run(maint.pool(), viewer, &candidates, &opts).await
-    };
-    let report: MirrorReport = result
-        .map_err(|e| e.context("refresh stopped; the record file lists every committed write"))?;
+    // Everything from the first connection on is inside `result`, so a run
+    // that cannot even connect still writes its (empty, partial) report.
+    let mut report = MirrorReport::default();
+    let result: anyhow::Result<()> = async {
+        let maint = epigraph_cli::MaintenancePool::connect(BIN)
+            .await
+            .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
+        // The bypass viewer is spent on `claim_role::roles_batch` only, on the
+        // maintenance connection, for as long as the run lasts.
+        let session = maint
+            .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .map_err(|e| anyhow::anyhow!("maintenance viewer: {e}"))?;
+        let viewer = session.viewer();
+        match (writes(&cli), record_w.as_mut()) {
+            (true, Some(w)) => {
+                apply_into(
+                    maint.pool(),
+                    viewer,
+                    &candidates,
+                    &opts,
+                    &mut report,
+                    |rec| {
+                        write_truth_record(w, rec)?;
+                        w.flush()?;
+                        w.get_ref().sync_data()?;
+                        Ok(())
+                    },
+                )
+                .await
+            }
+            (true, None) => Err(anyhow::anyhow!("--apply without a record file")),
+            (false, _) => {
+                report = dry_run(maint.pool(), viewer, &candidates, &opts).await?;
+                Ok(())
+            }
+        }
+    }
+    .await;
 
-    let dry = !cli.apply;
-    write_json(
-        report_w,
-        &report.to_json(dry, cli.include_round, records.len()),
-    )?;
+    let dry = !writes(&cli);
+    let mut json = report.to_json(dry, cli.include_round, records.len());
+    mark_outcome(&mut json, result.as_ref().err());
+    write_json(report_w, &json)?;
+    if let Err(e) = result {
+        return Err(e.context(format!(
+            "refresh stopped; reconcile from the record file, which lists every committed \
+             write and may list writes of the failed batch that rolled back; the partial \
+             report {} holds the outcomes of the batches confirmed committed",
+            report_path.display()
+        )));
+    }
     if dry {
         println!("DRY RUN: nothing written");
     }
@@ -214,7 +309,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     println!("report: {}", report_path.display());
-    if let Some(p) = &cli.record {
+    if let Some(p) = &record_path {
         println!("record: {}", p.display());
     }
     Ok(())
@@ -233,10 +328,23 @@ async fn run_restore(cli: &Cli, record_path: &Path) -> anyhow::Result<()> {
         PathBuf::from(p)
     });
     let report_w = create_new(&report_path)?;
-    let maint = epigraph_cli::MaintenancePool::connect(BIN)
+    // Connecting is inside `result` too: a restore that cannot connect still
+    // writes its (empty, partial) report.
+    let mut report = TruthRestoreReport::default();
+    let result: anyhow::Result<()> = async {
+        let maint = epigraph_cli::MaintenancePool::connect(BIN)
+            .await
+            .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
+        restore_into(
+            maint.pool(),
+            &records,
+            cli.batch_size,
+            cli.dry_run,
+            &mut report,
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
-    let report = restore(maint.pool(), &records, cli.batch_size, cli.dry_run).await?;
+    }
+    .await;
 
     let mut buckets = serde_json::Map::new();
     for (name, ids) in report.buckets() {
@@ -245,15 +353,21 @@ async fn run_restore(cli: &Cli, record_path: &Path) -> anyhow::Result<()> {
             serde_json::json!({ "count": ids.len(), "ids": ids }),
         );
     }
-    write_json(
-        report_w,
-        &serde_json::json!({
-            "restore": true,
-            "dry_run": cli.dry_run,
-            "records": records.len(),
-            "buckets": buckets,
-        }),
-    )?;
+    let mut json = serde_json::json!({
+        "restore": true,
+        "dry_run": cli.dry_run,
+        "records": records.len(),
+        "buckets": buckets,
+    });
+    mark_outcome(&mut json, result.as_ref().err());
+    write_json(report_w, &json)?;
+    if let Err(e) = result {
+        return Err(e.context(format!(
+            "restore stopped; the partial report {} lists the batches confirmed committed \
+             (re-run the restore to reconcile: what landed is already_restored)",
+            report_path.display()
+        )));
+    }
     if cli.dry_run {
         println!("DRY RUN: every batch rolled back");
     }
@@ -263,4 +377,50 @@ async fn run_restore(cli: &Cli, record_path: &Path) -> anyhow::Result<()> {
     }
     println!("report: {}", report_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Cli` built directly, past clap's guards, as `run` would see it.
+    fn cli(apply: bool, record: Option<&str>, restore: Option<&str>, dry_run: bool) -> Cli {
+        Cli {
+            waves: Vec::new(),
+            apply,
+            record: record.map(PathBuf::from),
+            include_round: false,
+            restore: restore.map(PathBuf::from),
+            dry_run,
+            report: Some(PathBuf::from("report.json")),
+            batch_size: DEFAULT_BATCH,
+            allow_mode_skew: false,
+        }
+    }
+
+    #[test]
+    fn a_record_without_apply_neither_writes_nor_opens_a_record() {
+        // Were clap's `requires = "apply"` lost, `--record` alone must stay a
+        // dry run: the belief-mode check exempts it, so it must not write.
+        let c = cli(false, Some("R.jsonl"), None, false);
+        assert!(!writes(&c));
+        assert_eq!(refresh_record_path(&c).unwrap(), None);
+    }
+
+    #[test]
+    fn an_apply_writes_through_its_record_and_needs_one() {
+        let c = cli(true, Some("R.jsonl"), None, false);
+        assert!(writes(&c));
+        assert_eq!(
+            refresh_record_path(&c).unwrap(),
+            Some(PathBuf::from("R.jsonl"))
+        );
+        assert!(refresh_record_path(&cli(true, None, None, false)).is_err());
+    }
+
+    #[test]
+    fn a_restore_writes_unless_it_is_a_dry_run() {
+        assert!(writes(&cli(false, None, Some("R.jsonl"), false)));
+        assert!(!writes(&cli(false, None, Some("R.jsonl"), true)));
+    }
 }

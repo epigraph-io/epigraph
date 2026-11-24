@@ -44,11 +44,14 @@
 //!   on an application connection the server still filters these reads, and
 //!   a session that can see none of a compound's in-force decomposition
 //!   edges finds no compound. The cached-belief owner lookup
-//!   (`MassFunctionRepository::cache_owner_frame_for_claim`) closes that gap
-//!   with migration 193's definer-rights `epigraph_claim_is_compound`, which
-//!   decides [`IS_COMPOUND_SQL`] on the whole graph (backlog 0dc20fad). The
-//!   templates here, and [`roles_batch`], still read on the caller's
-//!   connection.
+//!   (`MassFunctionRepository::cache_owner_frame_for_claim`, backlog
+//!   0dc20fad), the vacate gates' fold-cache test
+//!   (`DerivationScopeRepository::claim_has_fold_cache`, backlog bbece56a)
+//!   and BP apply's compound guard (`factor::compound_ids_among_sql`,
+//!   backlog 77b605ce) close that gap with migration 193's definer-rights
+//!   `epigraph_claim_is_compound`, which decides [`IS_COMPOUND_SQL`] on the
+//!   whole graph. The templates here, and [`roles_batch`], still read on the
+//!   caller's connection.
 //! * **The leaf closure is spliced** on both `edges` (`EDGE_VISIBILITY`) and
 //!   `claims` (`VISIBILITY`), because a compound's derived value served to a
 //!   viewer may use only the leaves that viewer can read (§8 T1). A leaf is
@@ -539,6 +542,60 @@ pub async fn roles_batch<'e, E: sqlx::PgExecutor<'e>>(
         out.insert(id, role);
     }
     Ok(out)
+}
+
+/// Whether `claim_id` is currently a compound, decided by migration 193's
+/// definer (`super::mass_function::IS_COMPOUND_DEFINER_CALL`): on the whole
+/// graph, whatever the executor's row security lets it see. A caller that
+/// cannot see a compound's decomposition still finds a compound here, which
+/// [`IS_COMPOUND_SQL`] read on its own application session would not.
+///
+/// # Errors
+/// Returns [`DbError::QueryFailed`] if the query fails.
+#[instrument(skip(executor))]
+pub async fn is_compound_by_definer<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    claim_id: Uuid,
+) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT {}",
+        super::mass_function::IS_COMPOUND_DEFINER_CALL
+    ))
+    .bind(claim_id)
+    .fetch_one(executor)
+    .await?)
+}
+
+/// `(id, content)` of each of `ids` the viewer can read that is NOT a
+/// compound by migration 193's definer, ordered by id. Used to name a
+/// compound's atoms from its leaf closure ([`leaf_closure_batch`]): a visible
+/// leaf whose own decomposition is hidden from the viewer is a compound, and
+/// is left out.
+///
+/// # Errors
+/// Returns [`DbError::QueryFailed`] if the query fails.
+#[instrument(skip(executor, viewer, ids), fields(n = ids.len()))]
+pub async fn visible_non_compounds<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    viewer: &Viewer,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, String)>, DbError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = viewer.splice(
+        "SELECT c.id, c.content FROM claims c \
+          WHERE c.id = ANY($1) \
+            AND NOT public.epigraph_claim_is_compound(c.id) \
+            /* {VISIBILITY:c} */ \
+          ORDER BY c.id",
+        2,
+    );
+    let mut q = sqlx::query_as::<_, (Uuid, String)>(&sql).bind(ids);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    Ok(q.fetch_all(executor).await?)
 }
 
 #[cfg(test)]

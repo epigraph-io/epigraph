@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT e.source_id AS \"paragraph_id!\", e.target_id AS \"atom_id!\"\n                FROM edges e\n                JOIN claims c ON c.id = e.source_id\n                WHERE e.target_id = ANY($1)\n                  AND e.relationship = 'decomposes_to'\n                  AND (c.properties->>'level')::int = 2\n                  AND c.is_current\n                  AND ($2::bool OR c.visibility = 'public'\n                       OR c.owner_group_id = ANY($3::uuid[]))\n                  AND ($2::bool OR e.visibility = 'public'\n                       OR (e.owner_group_id = ANY($3::uuid[])\n                           AND (e.co_owner_group_id IS NULL\n                                OR e.co_owner_group_id = ANY($3::uuid[]))))\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "paragraph_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "atom_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "12682ab34f6dc9f2e8e220a3a5d06ccbfb9976ee631672bdef2e828f21edc92e"
+}

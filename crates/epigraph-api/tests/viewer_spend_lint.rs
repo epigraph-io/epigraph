@@ -29,9 +29,10 @@
 //! passes `&viewer` to a helper counts that call as viewed, so the helper's own
 //! body is measured as well; its `&PgPool` and connection parameters are
 //! database handles there. A helper declared inside a handler is measured once,
-//! as itself. Viewer-holding code outside `src/routes/` (the MCP tools, the
-//! repo layer) is not in this population; `visibility_lint.rs` covers the
-//! repo layer's SQL.
+//! as itself. Viewer-holding code outside `src/routes/` is not in this
+//! population: the repo layer and the MCP tools keep the same per-call
+//! register in `epigraph-db/tests/visibility_lint.rs` and
+//! `epigraph-mcp/tests/tool_viewer_is_spent.rs` (backlog ada8ee55).
 //!
 //! # What counts as a database call
 //!
@@ -45,6 +46,12 @@
 //!   constructor (`read_as`, `write_as`, `begin_claim_write`, `begin_as`,
 //!   `maintenance`, `Connection::begin`, `.begin()`, `.acquire()`), from
 //!   `state`, or from another connection;
+//! * a connection handed on BY VALUE as a bare argument (`Repo::finish(tx,
+//!   id)`): any of the bindings above, or a by-value `let x` / `if let
+//!   Ok(x)` whose right-hand side is a constructor call at bracket depth 0
+//!   (not a block or `match` that used one). Handing it to a
+//!   [`CONNECTION_FINISHERS`] callee (`drop`, `finish_scoped_read`), which
+//!   only ends it, is not a call;
 //! * `state` itself (`&state`, `state.clone()`): a helper handed the whole
 //!   `AppState` can reach the pool;
 //! * in a route helper, a parameter typed as a pool (`&PgPool`) or as a
@@ -141,13 +148,40 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "list_acts",
         &["AdminActCeremony::list_mine"],
     ),
+    // stamped + untenanted (backlog 54018ca1, migration 239; backlog
+    // 6492de67, migration 252): `agent_keys` has no tenancy columns and no
+    // row security; the route first refuses a caller who is neither the agent
+    // nor an admin (`require_self_or_admin`), then reads the key and changes
+    // its status or rotates it on ONE `write_as` transaction stamped with
+    // this viewer, where 239's definers apply the same agent-or-admin gate
+    // (AK03) in the database. On the admin override the admin audit row
+    // (migration 112's definer, which re-checks the client grant) is written
+    // on that same transaction.
+    (
+        "agent_keys.rs",
+        "revoke_agent_key",
+        &[
+            "AgentKeyRepository::get_by_id",
+            "AgentKeyRepository::update_status",
+            "audit_admin_key_change",
+        ],
+    ),
+    (
+        "agent_keys.rs",
+        "rotate_agent_key",
+        &[
+            "AgentKeyRepository::get_active_key",
+            "AgentKeyRepository::rotate",
+            "audit_admin_key_change",
+        ],
+    ),
     // stamped: a security-definer read that refuses a caller who is neither
     // the agent's operator nor an admin; agents are untenanted.
     (
         "agent_prompt_history.rs",
         "get_prompt_history",
         &[
-            "AgentIdentityRepository::prompt_history_index",
+            "AgentIdentityRepository::prompt_history_page",
             "AgentRepository::get_by_id",
         ],
     ),
@@ -163,35 +197,50 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "get_agent_reputation",
         &["AgentRepository::get_by_id"],
     ),
-    // gated (`ClaimRepository::get_by_id`) then write; `human_of` is an agents
-    // read; the SELECT is an advisory lock. narrows: `retain_for_cache` (and
-    // the `acquire` it runs on) filters the BBAs just read through the viewer
-    // (`get_for_claim_frame`). untenanted: `analyze_independence` groups those
-    // rows' source agents by owner (`AgentRepository::humans_of`, ruling R-36);
-    // it took the viewer only while it read lineage, and no longer reads any.
-    // write: `insert_on` records the `claim.assessed` writer event inside the
-    // slot transaction (ids and booleans only; the event list hides it from a
-    // reader who cannot read the claim).
+    // untenanted: the agent rows (`agents` is USING (true)); their ORCID / ROR
+    // id are nulled through the viewer (`profile_details_visible`, backlog
+    // 761c2b05).
+    ("agents.rs", "get_agent", &["AgentRepository::get_by_id"]),
+    // untenanted, as `get_agent`: `get_by_public_key` (backlog 8946be59) reads
+    // the one agent row holding the key on the caller's stamped read, and
+    // that row's ORCID / ROR id are nulled through the viewer like the list's.
+    (
+        "agents.rs",
+        "list_agents",
+        &[
+            "AgentRepository::count",
+            "AgentRepository::count_by_label",
+            "AgentRepository::get_by_public_key",
+            "AgentRepository::list",
+            "AgentRepository::list_by_label",
+        ],
+    ),
+    // stamped (backlog 74feb76b): every call runs on ONE `AppState::write_as`
+    // transaction stamped from the caller's viewer, so row security decides
+    // each write against the caller's writable set. gated
+    // (`ClaimRepository::get_by_id`) then write; `human_of` is an agents read;
+    // the SELECT is an advisory lock. narrows: `retain_for_cache` filters the
+    // BBAs just read through the viewer (`get_for_claim_frame`) to count the
+    // rows the engine's viewed fold combined (backlog 735df6d7). write:
+    // `insert_on` records the `claim.assessed` writer event (ids and booleans
+    // only; the event list hides it from a reader who cannot read the claim);
+    // the `claim_frames` INSERT, the global scoped belief and the WITHIN_FRAME
+    // edge are best-effort under savepoints. write (backlog 840bc5ed):
+    // `retract_conn` retires the caller's own pre-link assessment row, read
+    // through the viewer (`get_for_claim_frame`); its definer decides on the
+    // stamped session principal and audits it.
     (
         "assess.rs",
         "assess_claim",
         &[
             "AgentRepository::human_of",
             "AgentRepository::human_of",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
             "EventRepository::insert_on",
-            "MassFunctionRepository::store_with_perspective",
-            "PerspectiveRepository::ensure_evidence_perspective",
+            "MassFunctionRepository::retract_conn",
+            "MassFunctionRepository::store_in_slot",
             "ScopedBeliefRepository::upsert",
-            "db_pool.acquire",
-            "db_pool.acquire",
-            "db_pool.acquire",
-            "db_pool.acquire",
-            "db_pool.begin",
+            "belief::create_edge_under_savepoint",
             "derivation_scope::retain_for_cache",
-            "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
         ],
@@ -223,14 +272,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "belief.rs",
         "refine_frame",
         &["FrameRepository::create_refinement"],
-    ),
-    // narrows: the perspective / community rows its caller read through the
-    // viewer (`get_for_claim_frame_perspective(s)`), filtered to the rows a
-    // scoped belief may fold.
-    (
-        "belief.rs",
-        "scoped_belief_write",
-        &["derivation_scope::retain_for_cache"],
     ),
     // gated (the claim is read through the viewer on the write transaction
     // first); the reads are the gated claim's own columns, its agent's
@@ -380,16 +421,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "remove_member",
         &["CommunityRepository::remove_member"],
     ),
-    // open finding: F-SHARD4-A2.
-    (
-        "computation.rs",
-        "propagate_beliefs",
-        &[
-            "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_all",
-        ],
-    ),
     // narrows: an `apply` run keeps the cache-admissible rows of the BBAs it
     // read through the viewer (`get_for_claims`); a read-only run filters them
     // through the viewer instead (`retain_for_viewer`, viewed).
@@ -423,6 +454,32 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
+    // The convention claim, its labels, trace and structural edges are the
+    // SYSTEM agent's, written on the raw pool as before (the caller does not
+    // write that agent's group). The evidence and its signed `supports` edge
+    // (backlog 73d4f7ff) are ONE write on a transaction stamped with the
+    // caller's viewer (`state.write_as(&viewer, ..)`, passed as `&mut *tx`), as
+    // in `forget_convention`: migration 114 owns the evidence by the caller's
+    // group and migration 120 the edge. `embed_created_claim` stores the
+    // claim's vector where the claim was written.
+    (
+        "conventions.rs",
+        "learn_convention",
+        &[
+            "AgentRepository::create",
+            "AgentRepository::get_by_public_key",
+            "ClaimRepository::create",
+            "ClaimRepository::default_decl_for_author_pool",
+            "ClaimRepository::update_trace_id",
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
+            "EvidenceRepository::create",
+            "ReasoningTraceRepository::create",
+            "embed_created_claim",
+            "sqlx::query(UPDATE).execute",
+        ],
+    ),
     // `embed_created_claim` (backlog 56d2430b): the best-effort embed of the
     // shared copy this request just created. It cannot take the caller's
     // viewer: the copy is authored by the system agent and owned by that
@@ -441,6 +498,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "embed_created_claim",
             "sqlx::query(UPDATE).execute",
         ],
+    ),
+    // stamped + write (backlog 04c02296): the transaction is stamped from the
+    // caller's viewer (`AppState::write_as`), and migration 208's countersign
+    // definer reads the caller from that session principal, acts only on
+    // authorship rows naming the caller (or an agent it is the live operator
+    // of) and returns only those rows' ids; it reads nothing for display.
+    (
+        "countersign.rs",
+        "countersign_authorship",
+        &["CountersignRepository::countersign_conn"],
     ),
     // untenanted: match_candidates rows; both claims are checked through the
     // viewer (`are_all_current`) before a promotion writes.
@@ -467,6 +534,22 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "assign_claim_to_frame",
         &[
             "FrameRepository::assign_claim",
+            "provenance::record_provenance",
+        ],
+    ),
+    // stamped / write (backlog 73d4f7ff): the claim's viewer-spliced
+    // pre-read, the author-key read (agents are untenanted), the evidence with
+    // its `supports` edge and the best-effort `DERIVED_FROM` edge run on ONE
+    // `AppState::write_as` transaction, so the database decides the
+    // evidence's owner (migration 114) and refuses what the caller may not
+    // attach. Provenance is the audit-trail append.
+    (
+        "crud.rs",
+        "create_evidence",
+        &[
+            "AgentRepository::get_by_id",
+            "EvidenceRepository::create",
+            "belief::create_edge_under_savepoint",
             "provenance::record_provenance",
         ],
     ),
@@ -851,14 +934,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         ],
     ),
     // gated: the status re-check calls `hypothesis_status` with a scoped copy
-    // of the caller's own viewer (`detach_scoped`), then writes; the two
-    // SELECTs are frames by name.
+    // of the caller's own viewer (`detach_scoped`), then writes on ONE
+    // transaction stamped with that viewer (`write_as`, backlog b9c4e809), so
+    // row security decides every statement below; the two SELECTs are frames
+    // by name.
     (
         "hypothesis.rs",
         "promote_hypothesis",
         &[
             "MassFunctionRepository::copy_to_frame",
-            "db_pool.begin",
             "hypothesis_status",
             "sqlx::query(INSERT).execute",
             "sqlx::query(UPDATE).execute",
@@ -869,19 +953,20 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
-    // untenanted: the `papers` registry rows and their count, read on the
-    // caller's stamped connection. `papers` carries no row security (it is
-    // keyed on the document, not on a tenant), so no viewer predicate applies.
-    // Every claim-derived field (authors, claim count, ingests) is read by
-    // `paper_listings` on the same connection, with the viewer.
+    // (`papers.rs::list_papers` left this list with backlog 34864fb5's review:
+    // its four `papers` statements now bind the viewer's predicate as well as
+    // running on the caller's stamped connection.)
+    // stamped write (migration 246): the caller's home group (a definer
+    // answer on the pool, as every claim-writing handler resolves it), then
+    // the public paper row written and read back on the caller's stamped
+    // transaction (`begin_claim_write`), whose row security decides.
     (
         "papers.rs",
-        "list_papers",
+        "create_paper",
         &[
-            "sqlx::query(SELECT).fetch_all",
-            "sqlx::query(SELECT).fetch_all",
-            "sqlx::query_scalar(SELECT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_one",
+            "ClaimRepository::default_decl_for_author_pool",
+            "PaperRepository::get_or_create",
+            "PaperRepository::registered_row",
         ],
     ),
     // gated (`PerspectiveRepository::get_by_id`) then write, on a transaction
@@ -1134,6 +1219,28 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
+    // agents are untenanted: the binding read is migration 149's SECURITY
+    // DEFINER `epigraph_human_of`, which answers on authority (a live binding),
+    // not on what the viewer may read. Run on the caller's stamped connection
+    // (backlog 1dea9589).
+    (
+        "spans.rs",
+        "attributed_agent",
+        &["AgentRepository::speaks_for"],
+    ),
+    // stamped / write (backlog 1dea9589): the span (`agent_spans` has no
+    // tenancy columns) and a root span's best-effort `attributed_to` edge run
+    // on ONE `AppState::write_as` transaction, so the edge records the
+    // caller's writer group. The attributed agent is the caller or one it
+    // speaks for (`attributed_agent`).
+    (
+        "spans.rs",
+        "create_span",
+        &[
+            "SpanRepository::insert",
+            "belief::create_edge_under_savepoint",
+        ],
+    ),
     // no SQL: `validate_packet` runs no tenancy read. `propagate_from` left
     // this list with the in-memory orchestrator registration it ran on
     // (backlog 7b3722b5).
@@ -1141,6 +1248,40 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // receive the viewer (`AppState::store_claim_embedding_as` /
     // `store_evidence_embedding_as`, backlog 1e2315a9), so they left this list.
     ("submit.rs", "submit_packet", &["validate_packet"]),
+    // write / read: team_groups.rs (migration 263). Each handler spends its
+    // viewer on `write_as` (`read_as` for the list) and calls one 263 definer
+    // on that stamped transaction through `PersonTeamGroupRepository`; the
+    // definer reads the caller from the stamp and decides who may (a Person
+    // signed in as themselves, a live admin, the invitee), so no call here
+    // takes the viewer as an argument.
+    (
+        "team_groups.rs",
+        "accept_invitation",
+        &["PersonTeamGroupRepository::accept_conn"],
+    ),
+    (
+        "team_groups.rs",
+        "create_team_group",
+        &["PersonTeamGroupRepository::create_conn"],
+    ),
+    (
+        "team_groups.rs",
+        "decline_invitation",
+        &["PersonTeamGroupRepository::decline_conn"],
+    ),
+    (
+        "team_groups.rs",
+        "invite_to_group",
+        &["PersonTeamGroupRepository::invite_conn"],
+    ),
+    (
+        "team_groups.rs",
+        "my_groups",
+        &[
+            "PersonTeamGroupRepository::my_groups_conn",
+            "PersonTeamGroupRepository::my_invitations_conn",
+        ],
+    ),
     // gated (`write_target_of`) then write.
     (
         "versioning.rs",
@@ -1168,7 +1309,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "unmark_duplicate",
         &["ClaimRepository::session_may_unmark_conn"],
     ),
-    // gated (`get_by_id_with_labels`) then write.
+    // gated (`get_by_id_with_labels`) then write. `truth_value_of` reads the
+    // hierarchical row back on the same caller-stamped transaction when the
+    // `set_truth_value` mirror changed 0 rows (migration 237's owner-scoped
+    // UPDATE policy filters a non-writer's write silently), so a filtered
+    // write refuses the request instead of committing the claim's half alone;
+    // `workflows` row security (183) bounds that read like the write.
     (
         "workflows.rs",
         "deprecate_workflow",
@@ -1176,6 +1322,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::deprecate_claim",
             "EventRepository::insert",
             "WorkflowRepository::set_truth_value",
+            "WorkflowRepository::truth_value_of",
         ],
     ),
     // the existence check is the caller's viewed read (backlog 08061583);
@@ -1187,12 +1334,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["BehavioralExecutionRepository::create"],
     ),
     // write on a transaction stamped with the caller's viewer, after the
-    // database's lineage-authority check for the caller.
+    // database's lineage-authority check for the caller. The lineage lock
+    // (backlog bf2e9aa6) locks the parent's row and takes an advisory lock on
+    // the same stamped transaction; it returns nothing to the caller.
     (
         "workflows.rs",
         "evolve_step",
         &[
             "ClaimRepository::evolve_step_conn",
+            "WorkflowRepository::lock_step_lineage_for_evolve",
             "record_api_lineage_writes",
             "versioning::admin_session_or_deferral",
         ],
@@ -1979,6 +2129,41 @@ const CONNECTION_CTORS: &[&str] = &[
     ".begin()",
     ".acquire()",
 ];
+/// Callees that take a connection by value only to END it: `drop`, and the
+/// route helpers that commit or roll back a stamped read or a savepoint and
+/// run no statement of their own (`routes::finish_scoped_read`,
+/// `belief.rs::finish_savepoint`). A connection handed to one of these is not
+/// a database call. Adding a name here is a review, like a [`REVIEWED`] entry:
+/// the helper must read and write nothing.
+const CONNECTION_FINISHERS: &[&str] = &["drop", "finish_scoped_read", "finish_savepoint"];
+
+/// Whether the whitespace-free right-hand side `flat` calls a connection
+/// constructor at bracket depth 0, i.e. the binding IS that connection rather
+/// than a value computed in a block or an argument that used one.
+fn ctor_at_depth_0(flat: &str) -> bool {
+    let s = flat.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..s.len() {
+        match s[i] {
+            b'(' | b'[' | b'{' => {
+                if depth == 0 && CONNECTION_CTORS.iter().any(|c| flat[..=i].ends_with(c)) {
+                    return true;
+                }
+                depth += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                // `.begin()` / `.acquire()` close at depth 0.
+                if depth == 0 && CONNECTION_CTORS.iter().any(|c| flat[..=i].ends_with(c)) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 const STATE_DB_METHODS: &[&str] = &["read_as", "write_as", "begin_claim_write"];
 const TERMINALS: &[&str] = &[
     "fetch_one",
@@ -2238,6 +2423,8 @@ fn db_calls(code: &str, sql: &str, h: &Handler, nested: &[(usize, usize)]) -> Ve
     let mut pool_aliases: Vec<String> = h.pools.clone();
     let mut conns: Vec<String> = h.conns.clone();
     let mut repos: Vec<(String, String)> = Vec::new();
+    // The let-bound connections (not the parameters, measured below).
+    let mut let_conns: Vec<String> = Vec::new();
     for (name, is_mut, _, ra, rb) in &bindings {
         let rhs = &code[*ra..*rb];
         let flat: String = rhs.chars().filter(|c| !c.is_whitespace()).collect();
@@ -2257,13 +2444,22 @@ fn db_calls(code: &str, sql: &str, h: &Handler, nested: &[(usize, usize)]) -> Ve
                 continue;
             }
         }
-        if *is_mut
-            && (CONNECTION_CTORS.iter().any(|c| flat.contains(c))
+        let from_ctor = CONNECTION_CTORS.iter().any(|c| flat.contains(c));
+        // A `mut` binding is a connection when its right-hand side names one
+        // (a constructor, a deref, state or another connection). A by-value
+        // binding only when its right-hand side IS a constructor call (one
+        // at bracket depth 0): `let x = state.config..` stays a value, and so
+        // does `let owner = match .. { .. acquire() .. }`, whose connection
+        // lives and dies inside the block.
+        if (*is_mut
+            && (from_ctor
                 || flat.contains("&mut*")
                 || names_pool
-                || conns.iter().any(|c| has_word(rhs, c)))
+                || conns.iter().any(|c| has_word(rhs, c))))
+            || (!*is_mut && ctor_at_depth_0(&flat))
         {
             conns.push(name.clone());
+            let_conns.push(name.clone());
         }
     }
 
@@ -2345,6 +2541,28 @@ fn db_calls(code: &str, sql: &str, h: &Handler, nested: &[(usize, usize)]) -> Ve
         for p in words(code, alias, b, e) {
             if let Some((m, open)) = method_after(p + alias.len()) {
                 calls.entry(open).or_insert((format!("{ty}::{m}"), false));
+            }
+        }
+    }
+    // A let-bound connection handed on whole, as a bare argument
+    // (`Repo::finish(tx, id)`): the callee owns the connection. Not
+    // `drop(tx)`, and not a method on it (`tx.commit()`, not an argument).
+    for conn in &let_conns {
+        for p in words(code, conn, b, e) {
+            let mut k = p;
+            while k > b && s[k - 1].is_ascii_whitespace() {
+                k -= 1;
+            }
+            let after = skip_ws(s, p + conn.len());
+            let bare = k > b && matches!(s[k - 1], b'(' | b',') && matches!(s[after], b')' | b',');
+            if !bare {
+                continue;
+            }
+            if let Some((callee, open)) = enclosing_call(s, p, b) {
+                let last = callee.rsplit("::").next().unwrap_or(&callee);
+                if !CONNECTION_FINISHERS.contains(&last) {
+                    calls.entry(open).or_insert((callee, true));
+                }
             }
         }
     }
@@ -2890,5 +3108,99 @@ pub async fn if_let_decoys(
         vec!["Repo::get", "Repo::write"],
         "an if-let binding from a non-connection scrutinee is not a connection, the \
          scrutinee stops at the body's `{{`, and the `let mut` form is unchanged"
+    );
+}
+
+/// `if let Err(mut tx) = <ctor>` is a connection binding like `Ok(mut tx)`: a
+/// helper that hands an unused connection back as `Err(tx)` (a fast path that
+/// did not need it) leaves the caller holding a live connection, and a call
+/// handed `&mut tx` from that arm is measured. Red when `Err` is dropped from
+/// [`if_let_binding`]'s constructors (backlog d4890b22).
+#[test]
+fn the_scanner_sees_a_connection_bound_by_if_let_err() {
+    let src = r##"
+pub async fn if_let_err(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    if let Err(mut tx) = fast_path(state.write_as(&viewer, "if_let_err").await?, id) {
+        Repo::write(&mut tx, id).await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+"##;
+    let m = unviewed_in(src);
+    assert_eq!(
+        labels(&m, "if_let_err"),
+        vec!["Repo::write"],
+        "a call handed `&mut tx` where `tx` is bound by `if let Err(mut tx) = <ctor>` is a \
+         database call"
+    );
+}
+
+/// A connection bound BY VALUE, `if let Ok(tx) = <ctor>` or `let tx = <ctor>`,
+/// and handed on as a whole value (`Repo::finish(tx, id)`), is a database call:
+/// the callee owns the connection and can write through it. Before backlog
+/// d4890b22 only a `mut` binding became a connection and only `&mut x` was
+/// measured, so a by-value hand-off escaped the lint. Decoys: a by-value
+/// binding of a non-connection (or of a value computed in a block that used
+/// one) is not one, a [`CONNECTION_FINISHERS`] callee (`drop(tx)`,
+/// `finish_scoped_read(read, ..)`) only ends it, and a method on the
+/// connection (`tx.commit()`) is not an argument.
+#[test]
+fn the_scanner_sees_a_connection_handed_on_by_value() {
+    let src = r##"
+pub async fn by_value(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    if let Ok(tx) = state.write_as(&viewer, "by_value").await {
+        Repo::finish(tx, id).await?;
+    }
+    let read = state.read_as(&viewer).await?;
+    let row = Repo::get_owned(id, read).await?;
+    Ok(row)
+}
+
+pub async fn by_value_decoys(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    if let Ok(guard) = lock.read() {
+        touch(guard, id);
+    }
+    let cfg = state.config.limits;
+    apply_limits(cfg, id);
+    // The connection lives and dies inside the block: `ok` is a value.
+    let ok = match id {
+        _ => state.read_as(&viewer).await.is_ok(),
+    };
+    label(ok, id);
+    let read = state.read_as(&viewer).await?;
+    finish_scoped_read(read, "by_value_decoys").await?;
+    if let Ok(tx) = state.write_as(&viewer, "decoy").await {
+        Ok(Some(tx.commit().await?))
+    } else {
+        let tx = state.read_as(&viewer).await?;
+        drop(tx);
+        Ok(None)
+    }
+}
+"##;
+    let m = unviewed_in(src);
+    assert_eq!(
+        labels(&m, "by_value"),
+        vec!["Repo::finish", "Repo::get_owned"],
+        "a connection bound by value and handed on whole is a database call"
+    );
+    assert_eq!(
+        labels(&m, "by_value_decoys"),
+        Vec::<String>::new(),
+        "a by-value binding of a non-connection or of a block's value, a finisher \
+         and a method on the connection are not database calls"
     );
 }

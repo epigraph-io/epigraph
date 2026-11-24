@@ -70,7 +70,8 @@ pub const CLAIMS_ADMIN: &str = "claims:admin";
 /// `epigraph-operator grant-client-scope <client-id> <scope>` (and withdraws it
 /// with `revoke-client-scope`): maintenance DSN only, scopes from THIS list
 /// only, `client_type = 'human'` only (service and agent clients are refused;
-/// `bootstrap_clients` and the approval route manage theirs), both
+/// `bootstrap_clients` and approval, `epigraph-operator approve-client`,
+/// manage theirs), both
 /// `allowed_scopes` and `granted_scopes` kept consistent for that scope,
 /// idempotent, with a `--dry-run`, and one `security_events` row
 /// (`oauth.client_scope_granted` / `oauth.client_scope_revoked`) naming who,
@@ -185,13 +186,16 @@ pub const PUBLIC_CLIENT_READ_SCOPES: &[&str] = &[
     "analysis:political",
 ];
 
-/// The exact scope set granted to an OAuth client auto-provisioned alongside a
-/// new agent by `POST /api/v1/agents` (`routes/agents.rs`). Harvester-level:
+/// The exact scope set an OAuth client provisioned alongside a new agent by
+/// `POST /api/v1/agents` (`routes/agents.rs`) may hold: proposed as
+/// `allowed_scopes` on an explicit `login: true` request, and granted only
+/// when the caller holds `claims:admin` (backlog 2f87eb08; any other caller's
+/// client is pending with none granted). Harvester-level:
 /// read+write on claims, edges and evidence, plus `agents:read`.
 ///
 /// A **strict subset** of `READ_SCOPES ∪ WRITE_SCOPES`, and not any canonical
 /// union — in particular it carries no `ingest:write`, no analysis scopes and
-/// no `agents:write`, so an auto-provisioned agent cannot mint further agents.
+/// no `agents:write`, so a provisioned agent client cannot mint further agents.
 /// It is also the set `/oauth/register`'s `client_type: "agent"` arm now
 /// proposes as `allowed_scopes` while granting **none** of them: an admin must
 /// approve before any become effective.

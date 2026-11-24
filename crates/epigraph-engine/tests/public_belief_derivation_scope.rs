@@ -176,15 +176,16 @@ async fn a_bba_citing_group_private_evidence_never_enters_a_public_claims_belief
         .await
         .expect("binary_truth");
     let target = fixture::seed_public_claim(&pool, author, "r22 evidence target").await;
-    let store = |agent: Uuid, evidence: Option<Uuid>, perspective: Option<Uuid>, t: f64| {
+    // `slot`: the evidence slot the BBA is keyed on (migration 267).
+    let store = |agent: Uuid, evidence: Option<Uuid>, slot: Option<Uuid>, t: f64| {
         let pool = pool.clone();
         async move {
-            epigraph_db::MassFunctionRepository::store_with_perspective(
+            epigraph_db::MassFunctionRepository::store_for_evidence(
                 &pool,
                 target,
                 frame,
                 Some(agent),
-                perspective,
+                slot,
                 &serde_json::json!({"0": t, "0,1": 1.0 - t}),
                 None,
                 Some("auto_wire"),
@@ -200,9 +201,6 @@ async fn a_bba_citing_group_private_evidence_never_enters_a_public_claims_belief
 
     // The public BBA cites public evidence on the claim.
     let public_ev = fixture::seed_evidence(&pool, target, "observation").await;
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, public_ev, Some(author))
-        .await
-        .expect("evidence perspective");
     store(author, Some(public_ev), Some(public_ev), 0.6).await;
     let mut conn = pool.acquire().await.expect("acquire");
     recompute_claim_cached_belief(&mut conn, &public, target)
@@ -231,9 +229,6 @@ async fn a_bba_citing_group_private_evidence_never_enters_a_public_claims_belief
         .execute(&pool)
         .await
         .expect("narrow the evidence to the group");
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, hidden_ev, Some(member))
-        .await
-        .expect("evidence perspective");
     store(member, Some(hidden_ev), Some(hidden_ev), 0.8).await;
     let mut conn = pool.acquire().await.expect("acquire");
     recompute_claim_cached_belief(&mut conn, &member_viewer, target)

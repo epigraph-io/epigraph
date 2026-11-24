@@ -4,7 +4,7 @@
 //! `A`'s stored `EpistemicInterval`, applies the relationship's transmission
 //! factor (per `RestrictionKind` + `RestrictionProfile`), materializes the
 //! restricted interval as a CDST `MassFunction` on the canonical `binary_truth`
-//! frame, persists it keyed by `edge_id` (perspective_id), and re-combines
+//! frame, persists it keyed on the edge's slot (`BbaSlot::Edge`), and re-combines
 //! all of the target's stored BBAs into its (Bel, Pl, BetP) columns.
 //!
 //! Lives in `epigraph-engine` (not `epigraph-mcp`) so both the MCP edge-creation
@@ -18,9 +18,7 @@ use sqlx::Acquire;
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
-use epigraph_db::{
-    EdgeRepository, FrameRepository, MassFunctionRepository, MassFunctionRow, PerspectiveRepository,
-};
+use epigraph_db::{EdgeRepository, FrameRepository, MassFunctionRepository, MassFunctionRow};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
 use crate::belief_profile::{BeliefProfile, FrameTier, PerspectiveTier};
@@ -122,21 +120,20 @@ pub async fn auto_wire_ds_for_edge(
     FrameRepository::assign_claim(&mut *conn, target_id, frame_id, Some(0))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
-    PerspectiveRepository::ensure_edge_perspective(&mut *conn, edge_id, Some(edge_signer_agent_id))
-        .await
-        .map_err(|e| format!("ensure_edge_perspective: {e}"))?;
-
     // Phase 1a (issue #197): the locality classification [`finish_edge_bba`]
     // computed is persisted into a dedicated column. The current combine path
     // still reads `source_strength` (already composed with the locality
     // factor); the tag is metadata so the backfill script and Phase 2 combine
     // path can stop inferring typing from the numeric value-set.
-    MassFunctionRepository::store_with_perspective(
+    //
+    // Keyed on the edge's own slot (migration 267, backlog 1777638e), not on a
+    // pseudo-perspective row: one BBA per (target, frame, signer, edge).
+    MassFunctionRepository::store_in_slot(
         &mut *conn,
         target_id,
         frame_id,
         Some(edge_signer_agent_id),
-        Some(edge_id),
+        epigraph_db::BbaSlot::Edge(edge_id),
         &masses_json,
         None,
         Some("edge_factor"),
@@ -363,8 +360,18 @@ pub fn finish_edge_bba(
 }
 
 /// Whether the edge `source → target` is intra-source: the source claim has
-/// an evidence row whose `properties->>'doi'` matches the DOI of the paper
-/// that asserts the target claim. Read-only.
+/// an evidence row whose `properties->>'doi'` names the same document as the
+/// DOI of a paper that asserts the target claim. Read-only.
+///
+/// "Names the same document" is the same-source key both values give as a
+/// document identifier (`source_dependence::doi_field_key`: the shared
+/// case-folded DOI identity,
+/// [`epigraph_db::repos::paper::document_identity_key`], or for a document
+/// keyed on its URI, the normalized URL; backlog e34fd66e). `papers.doi`
+/// holds the canonical stored key while an evidence row's `doi` holds
+/// whatever its writer passed (a doi.org link, a `doi:` label, another case),
+/// so the exact string join this replaced silently missed the paper. A
+/// placeholder ("unknown", "n/a") names no document and matches nothing.
 ///
 /// Equivalent semantic: "the supporter is supported by data from the
 /// target's own paper", so its contribution is correlated with the target's
@@ -382,28 +389,33 @@ pub async fn edge_source_is_intra(
     source_id: Uuid,
     target_id: Uuid,
 ) -> Result<bool, String> {
-    sqlx::query_scalar::<_, bool>(
+    let (paper_dois, evidence_dois): (Vec<String>, Vec<String>) = sqlx::query_as(
         r#"
-        SELECT EXISTS (
-            SELECT 1
-              FROM evidence e
-              JOIN edges ed_asserts
-                ON ed_asserts.target_id = $2
-               AND ed_asserts.relationship = 'asserts'
-               AND ed_asserts.source_type = 'paper'
-              JOIN papers p
-                ON p.id = ed_asserts.source_id
-               AND p.doi = e.properties->>'doi'
-             WHERE e.claim_id = $1
-               AND e.properties ? 'doi'
-        )
+        SELECT
+            ARRAY(SELECT p.doi
+                    FROM edges ed_asserts
+                    JOIN papers p ON p.id = ed_asserts.source_id
+                   WHERE ed_asserts.target_id = $2
+                     AND ed_asserts.relationship = 'asserts'
+                     AND ed_asserts.source_type = 'paper'
+                     AND p.doi IS NOT NULL),
+            ARRAY(SELECT e.properties->>'doi'
+                    FROM evidence e
+                   WHERE e.claim_id = $1
+                     AND e.properties->>'doi' IS NOT NULL)
         "#,
     )
     .bind(source_id)
     .bind(target_id)
     .fetch_one(&mut *conn)
     .await
-    .map_err(|e| format!("intra-source evidence lookup: {e}"))
+    .map_err(|e| format!("intra-source evidence lookup: {e}"))?;
+    let key = |d: &String| crate::source_dependence::doi_field_key(d);
+    let papers: std::collections::HashSet<_> = paper_dois.iter().filter_map(key).collect();
+    Ok(evidence_dois
+        .iter()
+        .filter_map(key)
+        .any(|k| papers.contains(&k)))
 }
 
 /// The intra-evidence locality factor an edge wire on `frame_id` composes.
@@ -458,8 +470,8 @@ pub fn edge_evidence_type(relationship: &str, profile: &BeliefProfile) -> String
 /// wiring — otherwise the wake-up is a permanent no-op (backlog claim
 /// 8ef5cf61-7382-43a4-85cb-565d76ba3f06). So the real gate is "has a BBA
 /// EVER been materialized for this edge_id" (checked via
-/// `MassFunctionRepository::exists_for_perspective`, since edge-factor BBAs
-/// are persisted keyed by `perspective_id = edge_id`): skip only when one
+/// `MassFunctionRepository::exists_for_edge`, since edge-factor BBAs
+/// are persisted on the edge's slot): skip only when one
 /// already exists, regardless of `was_created`. This makes the wake-up
 /// idempotent — once wired, further re-hits on the same edge are no-ops
 /// again, matching the pre-fix behavior for the common (believed-source)
@@ -528,8 +540,7 @@ pub async fn auto_wire_edge_if_epistemic(
     };
     let proceed = proceed
         && (was_created
-            || match MassFunctionRepository::exists_for_perspective(&mut *sp, viewer, edge_id).await
-            {
+            || match MassFunctionRepository::exists_for_edge(&mut *sp, viewer, edge_id).await {
                 Ok(true) => false,
                 Ok(false) => true, // never wired — attempt the wake-up below
                 Err(e) => {
@@ -626,7 +637,10 @@ pub async fn recompute_claim_belief_binary(
 /// own a public claim (migration 114, `epigraph_foreign_belief_cache`,
 /// reached through `MassFunctionRepository::update_claim_belief`): it may
 /// refresh the cache on the frame already recorded, or seed an empty cache on
-/// `binary_truth`; on any other frame its write is a no-op, not an error.
+/// `binary_truth`, or (migration 243, backlog 0296077b) move it off a recorded
+/// frame that holds no cache-admissible input onto the canonical frame the
+/// cache-owner rule elects; on any other frame its write is a no-op, not an
+/// error.
 ///
 /// Returns whether the claim's cache was WRITTEN (backlog 8d720490 (2)):
 /// `Ok(false)` when the claim has no BBAs on `frame_id`, when the derivation
@@ -1667,7 +1681,8 @@ const VACATED_CLASSIFICATION: &str = "not_enough_info";
 /// Write half of the combine pipeline: persist what [`compute_combined_belief`]
 /// computes to `claims.{belief, plausibility, pignistic_prob, conflict_k,
 /// missing_mass}` (and `classification`: on the binary frame, or on any
-/// frame when the cache is vacated under ruling R-80). No-ops (does not
+/// frame when the cache is vacated under ruling R-80; cleared to NULL when
+/// the cache is written on any other frame). No-ops (does not
 /// write) when the claim has no BBAs on `frame_id`, or none the scope rule
 /// admits and nothing to vacate.
 ///
@@ -1724,11 +1739,21 @@ async fn recompute_combined_belief(
 
     // The verdict belongs to the cache it describes: when the cache was not
     // written (a non-owner on a frame the claim's cache does not carry,
-    // migration 114), neither is its classification.
-    if let (true, Some(label)) = (written, preview.classification) {
-        MassFunctionRepository::update_claim_classification(&mut *conn, claim_id, &label, frame_id)
-            .await
-            .map_err(|e| format!("update_claim_classification: {e}"))?;
+    // migration 114), neither is its classification. When it was, the verdict
+    // is this fold's, and a fold with no verdict (any frame but the binary
+    // one, unless vacated) CLEARS the old label rather than leaving it: that
+    // label was the verdict on another frame's fold, e.g. a `binary_truth`
+    // fold of evidence since narrowed, and every reader of the claim is served
+    // it (backlog 0296077b).
+    if written {
+        MassFunctionRepository::update_claim_classification(
+            &mut *conn,
+            claim_id,
+            preview.classification.as_deref(),
+            frame_id,
+        )
+        .await
+        .map_err(|e| format!("update_claim_classification: {e}"))?;
     }
 
     Ok(written)
@@ -1999,8 +2024,8 @@ impl AtomCacheSettings {
     #[must_use]
     pub fn current() -> Self {
         Self {
-            fold: crate::atom_items::modes().atom_fold,
-            compound_source_edges: crate::atom_items::modes().compound_source_edges,
+            fold: crate::atom_items::modes().atom_fold(),
+            compound_source_edges: crate::atom_items::modes().compound_source_edges(),
             vacate_on_evidence_removal: true,
         }
     }
@@ -2101,6 +2126,16 @@ pub async fn recompute_atom_cache(
 /// empty fold. Which viewer each lifecycle site writes as is chosen where the
 /// site is wired (PR-5b1), as `retraction_cascade` chooses it today.
 ///
+/// **Derivation scope.** Under the AEF the fold reads only the rows
+/// [`crate::atom_items::atom_cache_rows_under`] admits (every source at least
+/// as widely readable as the atom, decided before the seed rule), whoever
+/// `viewer` is: a group member's write never carries its group's sources into
+/// the one cache everyone reads. When the atom has AEF input and none of it
+/// is admitted, an atom with a fold cache gets the explicit vacuous value
+/// ([`AtomCacheOutcome::Vacated`], logged under target
+/// `epigraph::atom_cache::scope_vacate` when the cache took it, apart from
+/// the evidence-removal vacate list); one without a cache is left without.
+///
 /// **Row security.** The role is read without a splice, which makes "a
 /// compound is never written" hold on a connection that bypasses row
 /// security. On an application session `edges` row security can hide a
@@ -2119,7 +2154,7 @@ pub async fn recompute_atom_cache_with(
     legacy: LegacyFold,
     settings: AtomCacheSettings,
 ) -> Result<AtomCacheOutcome, String> {
-    use crate::atom_items::{atom_axiom_rows_under, atom_fold_under, AtomFoldMode, AxiomMode};
+    use crate::atom_items::{atom_cache_rows_under, atom_fold_under, AtomFoldMode};
     use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
 
     if let CacheWriteCause::EvidenceRemoved(before) = cause {
@@ -2169,17 +2204,71 @@ pub async fn recompute_atom_cache_with(
     let ctx = crate::belief_query::FramedBeliefContext::global();
     // The classifier reads the same profile the fold runs under.
     let thresholds = ctx.profile().classifier.thresholds();
-    let rows = atom_axiom_rows_under(
+    // The derivation-scope rule (backlog c2ef65a0, as the claim cache applies
+    // it in `compute_combined_belief_over`): the cache is served to everyone
+    // who can read the atom, so it folds only the rows whose every source is
+    // at least as widely readable as the atom. The read applies it BEFORE the
+    // seed rule, so a seed is never dropped for input the cache does not
+    // fold. Filtered before anything reads the rows: `has_opposing` below
+    // iterates them too. `had_input` is the input before the rule, as
+    // `aef_input_before` reads it.
+    let mut read = atom_cache_rows_under(
         &mut *conn,
         viewer,
         &[claim_id],
-        AxiomMode::Display,
         &ctx,
         settings.compound_source_edges,
     )
-    .await?
-    .remove(&claim_id)
-    .unwrap_or_default();
+    .await?;
+    let had_input = read.had_input.contains(&claim_id);
+    let rows = read.rows.remove(&claim_id).unwrap_or_default();
+    if had_input && rows.is_empty() {
+        // Input exists but none of it may enter the cache. The cache, if any,
+        // was folded from sources narrower than the atom (a source narrowed
+        // after the fact, or a cache written before the rule), so it is
+        // vacated. The gate is the claim cache's widening-act gate
+        // (`VacateGate::OwnerFrame`: any fold cache), stricter than its
+        // ordinary recompute gate (`VacateGate::ClaimWide`, which keeps the
+        // cache when an input on a frame this fold does not read is
+        // admissible), and it does not wait for `vacate_on_evidence_removal`:
+        // a cache this fold cannot reproduce from rows its readers may see is
+        // not kept. An atom with no cache gets none: a vacuous value written
+        // where there was none would tell its readers that an unseen BBA
+        // exists.
+        let has_cache =
+            epigraph_db::repos::derivation_scope::DerivationScopeRepository::claim_has_fold_cache(
+                &mut *conn, viewer, claim_id,
+            )
+            .await
+            .map_err(|e| format!("fold cache read: {e}"))?;
+        if !has_cache {
+            return Ok(AtomCacheOutcome::KeptEmpty);
+        }
+        let written = write_atom_cache(
+            conn,
+            viewer,
+            claim_id,
+            &crate::atom_items::EvidencedInterval::unproven(),
+            false,
+            &thresholds,
+        )
+        .await?;
+        if written {
+            tracing::warn!(
+                target: "epigraph::atom_cache::scope_vacate",
+                claim = %claim_id,
+                "derivation-scope vacate: no AEF input row may enter the atom's cache; \
+                 explicit vacuous cache (basis unproven)"
+            );
+        } else {
+            tracing::info!(
+                claim = %claim_id,
+                "derivation-scope vacate not taken by the cache (non-owner write on \
+                 another recorded frame); the cache is unchanged"
+            );
+        }
+        return Ok(AtomCacheOutcome::Vacated { written });
+    }
 
     if rows.is_empty() {
         let lost_input = matches!(cause, CacheWriteCause::EvidenceRemoved(b) if b.had_input);
@@ -2250,7 +2339,12 @@ pub enum VacateOutcome {
 /// The caller decides WHICH atoms (only ids on an operator-accepted list);
 /// this function refuses every claim the vacate is not for, whatever the
 /// list says ([`vacate_refusal`]). The PR-0 guard keeps every bulk recompute
-/// from writing this value, so this is the one bulk path to it.
+/// from writing this value to a residue atom, so this is the one bulk path to
+/// it for those. The single atom-cache writer writes it on its own in two
+/// cases only, neither of them residue: an atom that lost all its AEF input
+/// to a lifecycle act, and an atom that HAS AEF input of which the
+/// derivation-scope rule admits none to its cache (under the claim cache's
+/// widening-act gate: any fold cache); see [`recompute_atom_cache_with`].
 ///
 /// # Errors
 /// A database read or write.
@@ -2375,7 +2469,7 @@ async fn write_atom_cache(
         MassFunctionRepository::update_claim_classification(
             &mut *conn,
             claim_id,
-            &label.to_string(),
+            Some(&label.to_string()),
             binary,
         )
         .await

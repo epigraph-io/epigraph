@@ -10,8 +10,9 @@
 //! * The SIGNING key is random. The host registers its public half for the
 //!   agent in `agent_keys` (`key_type 'signing'`, through migration 161's
 //!   attestor-only registration) and gives the container the private half
-//!   (`EPIGRAPH_AGENT_SIGNING_KEY`). Every signature this process makes is
-//!   by it.
+//!   (`EPIGRAPH_AGENT_SIGNING_KEY`, or the 0600 file
+//!   `EPIGRAPH_AGENT_SIGNING_KEY_FILE` names). Every signature this process
+//!   makes is by it.
 //!
 //! # Why the boot check
 //!
@@ -124,7 +125,8 @@ fn signing_key_verdict(
             .join("; ")
     };
     Err(format!(
-        "the signing key {signing_hex} (public half of EPIGRAPH_AGENT_SIGNING_KEY) is not an \
+        "the signing key {signing_hex} (public half of EPIGRAPH_AGENT_SIGNING_KEY, or of the \
+         key in the file EPIGRAPH_AGENT_SIGNING_KEY_FILE names) is not an \
          active signing key of agent {agent}: {found}. The host registers the signing key \
          (epigraph_register_agent_identity) before the container starts; refusing to start."
     ))
@@ -185,7 +187,11 @@ fn window_admits(
 /// Bind a claim's signature to a key (design D2).
 ///
 /// `signer_key` is the signer agent's `agents.public_key` (what
-/// `verify_claim` checked before D2); `keys` are the attested keys of the
+/// `verify_claim` checked before D2), and `None` when that key is not a
+/// signature verifier: no signer, or a signer whose `agents.key_kind` is not
+/// `ed25519` (a `seed-derived` key's private half is computable from a public
+/// seed, so a signature under it proves nothing; backlog 57943a39). `keys`
+/// are the attested keys of the
 /// claim's author and signer. In the separate-signing-key mode the signer's
 /// `agents.public_key` is its identity key, which signs nothing, so the
 /// signature verifies only under a `signing` row: that is why `keys` widen
@@ -208,7 +214,7 @@ fn window_admits(
 pub fn bind_signature(
     digest: &[u8; 32],
     signature: Option<&[u8; 64]>,
-    signer_key: &[u8; 32],
+    signer_key: Option<&[u8; 32]>,
     author: Uuid,
     created_at: DateTime<Utc>,
     keys: &[AttestedKeyRow],
@@ -234,7 +240,7 @@ pub fn bind_signature(
         .collect();
     let admitted = epigraph_db::repos::agent_key::admitted_signature_keys(
         &lifecycle,
-        Some(signer_key.as_slice()),
+        signer_key.map(<[u8; 32]>::as_slice),
         created_at,
     );
     // Versioned (ruling R-34): the claim-tagged v1 message first, then the
@@ -405,9 +411,9 @@ mod tests {
             Some(t0 + Duration::days(5)),
         );
         let open = attested(author, &key, "signing", "rotated", t0, None);
-        let b = bind_signature(&digest, Some(&sig), &[0; 32], author, at, &[closed]);
+        let b = bind_signature(&digest, Some(&sig), None, author, at, &[closed]);
         assert!(b.signature_valid && b.key_bound, "{b:?}");
-        let b = bind_signature(&digest, Some(&sig), &[0; 32], author, at, &[open]);
+        let b = bind_signature(&digest, Some(&sig), None, author, at, &[open]);
         assert!(!b.signature_valid && !b.key_bound, "{b:?}");
     }
 
@@ -428,7 +434,7 @@ mod tests {
             let b = bind_signature(
                 &digest,
                 Some(&sig),
-                &[0; 32],
+                None,
                 author,
                 from - skew,
                 std::slice::from_ref(&row),
@@ -438,7 +444,7 @@ mod tests {
         let b = bind_signature(
             &digest,
             Some(&sig),
-            &[0; 32],
+            None,
             author,
             from - Duration::minutes(10),
             std::slice::from_ref(&row),
@@ -464,7 +470,7 @@ mod tests {
             bind_signature(
                 &digest,
                 Some(&sig),
-                &[0; 32],
+                None,
                 author,
                 at,
                 std::slice::from_ref(&row),
@@ -489,7 +495,7 @@ mod tests {
         let b = bind_signature(
             &digest,
             Some(&sig),
-            &key.public_key(),
+            Some(&key.public_key()),
             author,
             Utc::now(),
             &[],
@@ -503,7 +509,14 @@ mod tests {
                 signature_scheme: Some(epigraph_crypto::SignatureScheme::Legacy),
             }
         );
-        let b = bind_signature(&digest, None, &key.public_key(), author, Utc::now(), &[]);
+        let b = bind_signature(
+            &digest,
+            None,
+            Some(&key.public_key()),
+            author,
+            Utc::now(),
+            &[],
+        );
         assert_eq!(
             b,
             KeyBinding {
@@ -537,7 +550,7 @@ mod tests {
         let b = bind_signature(
             &digest,
             Some(&v1),
-            &key.public_key(),
+            Some(&key.public_key()),
             author,
             Utc::now(),
             std::slice::from_ref(&row),
@@ -550,7 +563,7 @@ mod tests {
             let b = bind_signature(
                 &digest,
                 Some(&as_evidence),
-                &key.public_key(),
+                Some(&key.public_key()),
                 author,
                 Utc::now(),
                 keys,
@@ -577,7 +590,14 @@ mod tests {
         let digest = [5u8; 32];
         let sig = key.sign(&digest);
         let at = Utc::now();
-        let alone = bind_signature(&digest, Some(&sig), &key.public_key(), author, at, &[]);
+        let alone = bind_signature(
+            &digest,
+            Some(&sig),
+            Some(&key.public_key()),
+            author,
+            at,
+            &[],
+        );
         assert!(alone.signature_valid, "calibration: {alone:?}");
         for status in ["revoked", "pending"] {
             let row = attested(
@@ -591,7 +611,7 @@ mod tests {
             let b = bind_signature(
                 &digest,
                 Some(&sig),
-                &key.public_key(),
+                Some(&key.public_key()),
                 author,
                 at,
                 std::slice::from_ref(&row),

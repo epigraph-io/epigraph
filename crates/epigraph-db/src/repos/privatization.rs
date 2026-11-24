@@ -606,6 +606,38 @@ pub struct WorkflowMove {
     pub before_owner_group_id: Uuid,
 }
 
+/// What [`PrivatizationRepository::recompute_boundary_meet_conn`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoundaryMeet {
+    /// Edges whose `(visibility, owner_group_id, co_owner_group_id)` the
+    /// statement changed.
+    pub updated: u64,
+    /// Edges with a recorded declaration (migration 260) that the statement
+    /// kept OFF their endpoints' meet, or could not keep on their declaration
+    /// (`unmet`), in edge-id order. Classified from the computed meet, not
+    /// from what changed, so a re-run reports them again.
+    pub held: Vec<HeldEdge>,
+}
+
+/// One declared edge the re-meet treated as declared, not derived
+/// ([`BoundaryMeet::held`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldEdge {
+    /// The edge.
+    pub edge_id: Uuid,
+    /// The visibility the meet alone would have given it.
+    pub meet_visibility: String,
+    /// `true` when the declaration and the meet together name more groups
+    /// than one owner plus one co-owner can express. The endpoints' meet
+    /// wins (the edge is never readable by a session that cannot read both
+    /// endpoints), keeping the declared owner where the meet allows, so the
+    /// declaration is only partly honoured; recorded as `edge.unmet` for an
+    /// operator. Reachable only in a stacked state (a second plan, or a
+    /// sibling path that already re-tenanted an endpoint): one plan has one
+    /// target group, so its meet next to a declaration names at most it.
+    pub unmet: bool,
+}
+
 /// A state transition [`PrivatizationRepository::transition_plan_conn`] performs.
 ///
 /// An enum rather than four functions, so the guard conditions that make each
@@ -2704,6 +2736,39 @@ impl PrivatizationRepository {
         .map_err(|source| DbError::QueryFailed { source })
     }
 
+    /// Lock `claim_ids`' rows in ascending id order, before a multi-claim
+    /// write takes them in its planner's order (backlog d1818fd0).
+    ///
+    /// Migration 206's `epigraph_publicize_claims` and
+    /// `epigraph_share_claims_with_team` lock their claims `ORDER BY c.id FOR
+    /// NO KEY UPDATE`. An `UPDATE … WHERE c.id = ANY(…)` or `UPDATE … FROM
+    /// unnest(…)` locks in whatever order its plan visits the rows (heap order
+    /// under a sequential or bitmap scan, the array's order under a nested
+    /// loop), so the same two claims taken in opposite orders by such a write
+    /// and a publicize deadlock and Postgres aborts one with `40P01`. Taking
+    /// every lock here first, in the publicize's order, makes the two wait for
+    /// each other instead. `FOR NO KEY UPDATE` is the mode the write's own
+    /// UPDATE takes, so this adds no new kind of lock and blocks nothing the
+    /// write would not; it only moves the waits to the start, in id order.
+    ///
+    /// The caller's row security applies (a locking read is filtered by the
+    /// UPDATE policies), so a row this cannot lock is one the write cannot
+    /// update either.
+    async fn lock_claims_in_id_order_conn(
+        conn: &mut PgConnection,
+        claim_ids: &[Uuid],
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "SELECT 1 FROM public.claims c WHERE c.id = ANY($1) \
+              ORDER BY c.id FOR NO KEY UPDATE OF c",
+        )
+        .bind(claim_ids)
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
     /// `restrict`: move a batch of claims into the target group.
     ///
     /// This is the whole of `restrict` mode. `content`, `content_tsv` and
@@ -2760,6 +2825,8 @@ impl PrivatizationRepository {
         if claim_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Lock order: by id, as 206's publicize locks (backlog d1818fd0).
+        Self::lock_claims_in_id_order_conn(conn, claim_ids).await?;
         sqlx::query_scalar::<_, Uuid>(
             r#"
             UPDATE public.claims c
@@ -2872,7 +2939,9 @@ impl PrivatizationRepository {
         // an edge's meet, and no trigger re-meets an edge when only its
         // workflow row changes. So the moved rows' own edges (`variant_of`,
         // `AUTHORED`, `executes` onto a claim the plan leaves public) are
-        // re-met here, on this transaction.
+        // re-met here, on this transaction. (A DECLARED edge is narrowed to its
+        // declaration and its meet, migration 260; the batch's own re-meet
+        // over these rows reports it for the plan's audit trail.)
         let moved: Vec<Uuid> = moves.iter().map(|m| m.workflow_id).collect();
         Self::recompute_boundary_meet_conn(conn, &moved).await?;
         Ok(moves)
@@ -2995,8 +3064,12 @@ impl PrivatizationRepository {
         .map_err(|source| DbError::QueryFailed { source })?;
         // Migration 219: the claims went back first, and their re-meet still
         // read these rows as private, so every edge on a restored row is re-met
-        // now that the row is back (widening allowed, as for the claims').
-        Self::recompute_boundary_meet_conn(conn, &restored).await?;
+        // now that the row is back (widening allowed, as for the claims'; a
+        // DECLARED edge goes back on its declaration, migration 260, and is
+        // recorded in the plan's audit trail).
+        let meet = Self::recompute_boundary_meet_conn(conn, &restored).await?;
+        Self::record_edge_holds_conn(conn, plan_id, actor_agent_id, correlation_id, &meet.held)
+            .await?;
         Ok(restored.len() as u64)
     }
 
@@ -3061,6 +3134,8 @@ impl PrivatizationRepository {
         if claim_ids.is_empty() {
             return Ok(0);
         }
+        // Lock order: by id, as 206's publicize locks (backlog d1818fd0).
+        Self::lock_claims_in_id_order_conn(conn, claim_ids).await?;
         sqlx::query("SET LOCAL epigraph.allow_declassify = 'yes'")
             .execute(&mut *conn)
             .await
@@ -3141,9 +3216,40 @@ impl PrivatizationRepository {
     /// tuples exactly. `writer_group_id` is read ONLY here: a re-point never
     /// recomputes an owner from it.
     ///
-    /// NOT fixed here: an edge DECLARED `('group', H)` between two public
-    /// claims widens on revert, as before (the declaration is not recorded).
-    /// It blocks re-enabling the privatization lifecycle, not this change.
+    /// # A DECLARED edge (migration 260)
+    ///
+    /// An edge whose tenancy its author declared (`('group', H)` between two
+    /// public endpoints, kept by 072's no-widening arm; recorded in
+    /// `edges.declared_owner_group_id` / `declared_co_owner_group_id`) is not
+    /// derived, so it does not simply take the meet. Two bounds, in order:
+    /// the edge is NEVER readable by a session that cannot read its
+    /// endpoints' meet (an edge naming a private node discloses it), and,
+    /// within that, it is readable only by a reader of its declaration:
+    ///
+    /// * meet `public` (a revert, or an endpoint this plan never moved): the
+    ///   declared tuple exactly, co-owner included. A revert therefore gives
+    ///   back what the author declared, not the world's edge;
+    /// * meet `group`: the INTERSECTION of the declaration and the meet, so
+    ///   the edge is readable only by a reader of both. When the groups
+    ///   involved (declared owner, declared co-owner, meet owner, meet
+    ///   co-owner) are at most two, that is owner H with the other group as
+    ///   co-owner: owner and visibility unchanged, narrowed only.
+    /// * more groups (`unmet`): no tuple expresses the intersection. The
+    ///   meet wins: a one-group meet G gives `(H, co G)` (owner kept, the
+    ///   declared co-owner dropped); a two-group meet gives the meet itself,
+    ///   with H as owner when it is one of the two. Reported `unmet` for an
+    ///   operator; the record survives, so a later revert restores the
+    ///   declaration. One plan has one target group, so a single restrict
+    ///   and its revert never reach a two-group meet next to a declaration;
+    ///   only a stacked state (a second plan, or a sibling path that already
+    ///   re-tenanted an endpoint) does.
+    ///
+    /// The apply direction needs this too: the claims UPDATE's propagation
+    /// trigger has already re-met the edge (re-owning it to the target)
+    /// before this runs on the same transaction, and this statement puts the
+    /// declaration back. Every declared edge kept off the meet is returned in
+    /// [`BoundaryMeet::held`]; the callers that hold a plan record them in its
+    /// audit trail ([`Self::record_edge_holds_conn`]).
     ///
     /// # Errors
     ///
@@ -3151,14 +3257,17 @@ impl PrivatizationRepository {
     pub async fn recompute_boundary_meet_conn(
         conn: &mut PgConnection,
         entity_ids: &[Uuid],
-    ) -> Result<u64, DbError> {
+    ) -> Result<BoundaryMeet, DbError> {
         if entity_ids.is_empty() {
-            return Ok(0);
+            return Ok(BoundaryMeet::default());
         }
-        sqlx::query(
-            r#"
+        let (updated, held_ids, held_meet, held_unmet): (i64, Vec<Uuid>, Vec<String>, Vec<bool>) =
+            sqlx::query_as(
+                r#"
             WITH ep AS (
               SELECT e.id,
+                     e.declared_owner_group_id AS dg,
+                     e.declared_co_owner_group_id AS dco,
                      COALESCE(s.v, 'public')::text AS sv,
                      COALESCE(s.g, '00000000-0000-0000-0000-000000000000'::uuid) AS sg,
                      COALESCE(t.v, 'public')::text AS tv,
@@ -3173,7 +3282,7 @@ impl PrivatizationRepository {
                WHERE e.source_id = ANY($1) OR e.target_id = ANY($1)
                ORDER BY e.id
             ), meet AS (
-              SELECT ep.id,
+              SELECT ep.id, ep.dg, ep.dco,
                      (CASE WHEN ep.sv = 'public' AND ep.tv = 'public'
                            THEN 'public' ELSE 'group' END)::varchar(16) AS v,
                      CASE WHEN ep.sv = 'public' AND ep.tv = 'public'
@@ -3184,17 +3293,125 @@ impl PrivatizationRepository {
                      CASE WHEN ep.sv = 'group' AND ep.tv = 'group' AND ep.sg <> ep.tg
                                THEN ep.tg ELSE NULL END AS co
                 FROM ep
+            ), decided AS (
+              -- A derived edge (no declaration) takes the meet. A declared one
+              -- keeps ('group', declared owner) and takes as co-owner the one
+              -- other group the declaration and the meet name, if there is
+              -- exactly one (the intersection). More than one is `unmet` and
+              -- the MEET bounds it (readers of the tuple are a subset of the
+              -- meet's only when the tuple names every group the meet names):
+              -- a one-group meet G gives (declared owner, co G); a two-group
+              -- meet gives the meet, the declared owner first when it is one
+              -- of the two.
+              SELECT m.id, m.dg,
+                     m.v AS mv, m.g AS mg, m.co AS mco,
+                     CASE WHEN m.dg IS NULL THEN m.v
+                          ELSE 'group'::varchar(16) END AS v,
+                     CASE WHEN m.dg IS NULL THEN m.g
+                          WHEN cardinality(x.others) <= 1 THEN m.dg
+                          WHEN m.co IS NULL OR m.dg = m.co THEN m.dg
+                          ELSE m.g END AS g,
+                     CASE WHEN m.dg IS NULL THEN m.co
+                          WHEN cardinality(x.others) = 0 THEN NULL
+                          WHEN cardinality(x.others) = 1 THEN x.others[1]
+                          WHEN m.co IS NULL OR m.dg = m.co THEN m.g
+                          ELSE m.co END AS co,
+                     (m.dg IS NOT NULL AND cardinality(x.others) > 1) AS unmet
+                FROM meet m
+                CROSS JOIN LATERAL (
+                  SELECT COALESCE(array_agg(DISTINCT u.o)
+                                    FILTER (WHERE u.o IS NOT NULL AND u.o <> m.dg),
+                                  '{}'::uuid[]) AS others
+                    FROM unnest(CASE WHEN m.v = 'group' THEN ARRAY[m.dco, m.g, m.co]
+                                     ELSE ARRAY[m.dco] END) AS u(o)
+                ) x
+            ), upd AS (
+              UPDATE public.edges e
+                 SET visibility = d.v, owner_group_id = d.g, co_owner_group_id = d.co
+                FROM decided d
+               WHERE d.id = e.id
+                 AND d.g IS NOT NULL
+                 AND (e.visibility, e.owner_group_id, e.co_owner_group_id)
+                     IS DISTINCT FROM (d.v, d.g, d.co)
+              RETURNING e.id
+            ), held AS (
+              SELECT d.id, d.mv::text AS mv, d.unmet
+                FROM decided d
+               WHERE d.dg IS NOT NULL
+                 AND (d.unmet
+                      OR (d.v, d.g, d.co) IS DISTINCT FROM (d.mv, d.mg, d.mco))
             )
-            UPDATE public.edges e
-               SET visibility = m.v, owner_group_id = m.g, co_owner_group_id = m.co
-              FROM meet m
-             WHERE m.id = e.id
-               AND m.g IS NOT NULL
-               AND (e.visibility, e.owner_group_id, e.co_owner_group_id)
-                   IS DISTINCT FROM (m.v, m.g, m.co)
+            SELECT (SELECT count(*) FROM upd),
+                   ARRAY(SELECT h.id FROM held h ORDER BY h.id),
+                   ARRAY(SELECT h.mv FROM held h ORDER BY h.id),
+                   ARRAY(SELECT h.unmet FROM held h ORDER BY h.id)
+            "#,
+            )
+            .bind(entity_ids)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        let held = held_ids
+            .into_iter()
+            .zip(held_meet)
+            .zip(held_unmet)
+            .map(|((edge_id, meet_visibility), unmet)| HeldEdge {
+                edge_id,
+                meet_visibility,
+                unmet,
+            })
+            .collect();
+        Ok(BoundaryMeet {
+            updated: u64::try_from(updated).unwrap_or(0),
+            held,
+        })
+    }
+
+    /// Record, in a plan's audit trail, the declared edges a re-meet kept off
+    /// their endpoints' meet ([`Self::recompute_boundary_meet_conn`]): one
+    /// `privatization_audit` row each, `kind = 'edge'`, action `edge.hold`
+    /// (owner and visibility kept, narrowed to the intersection or put back
+    /// on the declaration) or `edge.unmet` (the declaration and the meet name
+    /// more groups than one tuple expresses; the edge took the meet, keeping
+    /// the declared owner where the meet allows: an operator decision).
+    /// `before_visibility` is what the meet alone would have written,
+    /// `after_visibility` what the edge has (`group`). The owner columns are left NULL: an entity row is
+    /// readable by the target group's admins (083), who need not read the
+    /// declaring group's edge. Written on the caller's transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn record_edge_holds_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        actor_agent_id: Uuid,
+        correlation_id: Option<&str>,
+        held: &[HeldEdge],
+    ) -> Result<u64, DbError> {
+        if held.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<Uuid> = held.iter().map(|h| h.edge_id).collect();
+        let meets: Vec<String> = held.iter().map(|h| h.meet_visibility.clone()).collect();
+        let unmet: Vec<bool> = held.iter().map(|h| h.unmet).collect();
+        sqlx::query(
+            r#"
+            INSERT INTO public.privatization_audit
+                   (plan_id, actor_agent_id, action, kind, entity_id,
+                    before_visibility, after_visibility, correlation_id)
+            SELECT $1, $2,
+                   CASE WHEN h.unmet THEN 'edge.unmet' ELSE 'edge.hold' END,
+                   'edge', h.id, h.mv, 'group', $6
+              FROM unnest($3::uuid[], $4::text[], $5::bool[]) AS h(id, mv, unmet)
             "#,
         )
-        .bind(entity_ids)
+        .bind(plan_id)
+        .bind(actor_agent_id)
+        .bind(&ids)
+        .bind(&meets)
+        .bind(&unmet)
+        .bind(correlation_id)
         .execute(&mut *conn)
         .await
         .map(|r| r.rows_affected())
@@ -3603,23 +3820,43 @@ impl PrivatizationRepository {
     /// applied. It is load-bearing anyway, because it is what makes the
     /// ordering an invariant of the database rather than of this function.
     ///
-    /// # Row locks (migration 227)
+    /// # Row locks (migration 227) and their order (backlog d1818fd0)
     ///
-    /// Since 227 that trigger reads each claim's visibility `FOR NO KEY
-    /// UPDATE`, so statement 1, not statement 2, is where this function first
-    /// takes the claim rows' locks and waits on a concurrent publicize (which
-    /// then either commits first and the seal is refused, or waits for the
-    /// seal and is refused by 074). The rows are locked in the order of
-    /// `items`. Under the route's `lock_timeout` a contended claim therefore
-    /// surfaces as a `55P03` from statement 1, and a lock-order deadlock with a
-    /// multi-claim publicize (possible before 227 at statement 2) as a `40P01`
-    /// from either statement; both abort the transaction with nothing written.
+    /// Before statement 1 this function locks every claim row of `items`
+    /// `FOR NO KEY UPDATE` in ascending id order
+    /// ([`Self::lock_claims_in_id_order_conn`]): the order migration 206's
+    /// `epigraph_publicize_claims` and `epigraph_share_claims_with_team` take
+    /// them in (`ORDER BY c.id FOR NO KEY UPDATE`). So the seal waits on a
+    /// concurrent publicize there, before it writes anything, and the
+    /// publicize then either commits first (and 227's trigger, which reads
+    /// each claim's visibility `FOR NO KEY UPDATE` on the lock the seal now
+    /// holds, refuses the seal) or waits for the seal (and is refused by 074).
+    /// Under the route's `lock_timeout` a contended claim surfaces as a
+    /// `55P03` from that first lock, which aborts the transaction with nothing
+    /// written. Before this the rows were locked in the caller's order, by
+    /// 227's trigger as statement 1 inserted each row, and a seal sent
+    /// `[b, a]` beside a publicize of `[a, b]` aborted one of them with
+    /// `40P01`. `items` is also sorted by `claim_id` and statement 1 inserts
+    /// `ORDER BY claim_id`, so the trigger's own locks follow the same order
+    /// even where its locking read finds no row to lock.
+    ///
+    /// A re-delivered commit running beside the first waits at that lock,
+    /// then finds the ciphertext rows (`ON CONFLICT DO NOTHING`) and returns
+    /// nothing.
+    ///
+    /// A duplicate `claim_id` keeps its FIRST occurrence, which is the one
+    /// statement 1's `ON CONFLICT DO NOTHING` kept before; statement 2 used to
+    /// take its hash from either copy, so a duplicate with different bytes
+    /// could pair one copy's ciphertext with the other's hash.
     ///
     /// # Errors
     ///
     /// [`DbError`] for a query fault. A `42501` from statement 1 is the PRV01
-    /// guard refusing an unrestricted claim; a `55P03` or `40P01` is a lock
-    /// wait that timed out or deadlocked (above).
+    /// guard refusing an unrestricted claim; a `55P03` from the first lock is
+    /// a lock wait that timed out (above). A `40P01` is still possible against
+    /// a writer that does not take claim rows in id order, or that locks other
+    /// rows first (edge rows are not ordered here): nothing is written and the
+    /// commit may be retried.
     pub async fn seal_claims_conn(
         conn: &mut PgConnection,
         group_id: Uuid,
@@ -3629,7 +3866,15 @@ impl PrivatizationRepository {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        // Ascending claim id, first occurrence kept: the lock order 206's
+        // publicize uses (see "Row locks" above). A stable sort, so
+        // `dedup_by_key` keeps the caller's first copy of a duplicate.
+        let mut ordered: Vec<&SealCommitItem> = items.iter().collect();
+        ordered.sort_by_key(|i| i.claim_id);
+        ordered.dedup_by_key(|i| i.claim_id);
+        let items = ordered;
         let claim_ids: Vec<Uuid> = items.iter().map(|i| i.claim_id).collect();
+        Self::lock_claims_in_id_order_conn(conn, &claim_ids).await?;
         let content_cts: Vec<Vec<u8>> = items.iter().map(|i| i.content_ct.clone()).collect();
         let labels_cts: Vec<Vec<u8>> = items.iter().map(|i| i.labels_ct.clone()).collect();
         let props_cts: Vec<Vec<u8>> = items.iter().map(|i| i.properties_ct.clone()).collect();
@@ -3637,7 +3882,8 @@ impl PrivatizationRepository {
 
         // 1. The ciphertext row. ON CONFLICT DO NOTHING is what makes a
         //    re-delivered commit a no-op; the RETURNING set is what bounds
-        //    every statement after it.
+        //    every statement after it. `ORDER BY t.claim_id` is the lock
+        //    order: 227's trigger locks each claim row as its row is inserted.
         let sealed: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
             r"
             INSERT INTO public.claim_encryption
@@ -3646,6 +3892,7 @@ impl PrivatizationRepository {
             SELECT t.claim_id, $5, $6, $7, t.content_ct, t.labels_ct, t.props_ct
               FROM unnest($1::uuid[], $2::bytea[], $3::bytea[], $4::bytea[])
                 AS t(claim_id, content_ct, labels_ct, props_ct)
+             ORDER BY t.claim_id
             ON CONFLICT (claim_id) DO NOTHING
             RETURNING claim_id
             ",
@@ -4141,7 +4388,16 @@ impl PrivatizationRepository {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        // Ascending claim id, first occurrence kept, and every claim row
+        // locked in that order before the head UPDATE (backlog d1818fd0): its
+        // `FROM unnest(…)` join locks in planner order, and 206's publicize of
+        // the same sealed claims locks by id.
+        let mut ordered: Vec<&UnsealCommitItem> = items.iter().collect();
+        ordered.sort_by_key(|i| i.claim_id);
+        ordered.dedup_by_key(|i| i.claim_id);
+        let items = ordered;
         let claim_ids: Vec<Uuid> = items.iter().map(|i| i.claim_id).collect();
+        Self::lock_claims_in_id_order_conn(conn, &claim_ids).await?;
         let contents: Vec<String> = items.iter().map(|i| i.content.clone()).collect();
         let hashes: Vec<Vec<u8>> = items.iter().map(|i| i.content_hash.clone()).collect();
         let labels: Vec<serde_json::Value> = items

@@ -221,7 +221,7 @@ fn log_designed_refusal(e: &dyn std::any::Any, text: &str) {
 
 /// Whether a database message opens with a schema refusal code: two to five
 /// ASCII capitals, two digits, a colon (`FA07: ...`), at the very start.
-fn coded(message: &str) -> bool {
+pub(crate) fn coded(message: &str) -> bool {
     let b = message.as_bytes();
     let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
     (2..=5).contains(&caps)
@@ -416,6 +416,11 @@ pub fn executor_caller_error(
         e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
             invalid_params(format!("{context}: {e}"))
         }
+        // A generation-0 payload naming a parent it could never link
+        // (backlog 26a436c6): the caller's payload error.
+        e @ epigraph_ingest_executor::IngestExecutorError::GenerationZeroNamesParent { .. } => {
+            invalid_params(format!("{context}: {e}"))
+        }
         // A tenancy refusal (the caller does not write the declared or
         // inherited group, or names no principal): a denial, as OPL02 is.
         e if e.is_declared_tenancy_refusal() => McpError {
@@ -451,9 +456,67 @@ pub fn executor_caller_error(
     }
 }
 
+/// How an HTTP twin of a tool answers one of its errors (`epigraph-api`'s
+/// `routes::mcp_twins`, backlog fff61b9e), decided by the JSON-RPC code alone
+/// so the two surfaces classify a refusal the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpClass {
+    /// `INVALID_PARAMS`: the caller's input is wrong; a 400.
+    BadRequest,
+    /// `INVALID_REQUEST`: this codebase's class for a denial of authority
+    /// ([`edge_not_owner`], [`claim_not_writer`], a missing principal); a 403.
+    Forbidden,
+    /// Every other code, `INTERNAL_ERROR` included: a server fault; a 500.
+    Internal,
+}
+
+/// The [`HttpClass`] of `e`.
+#[must_use]
+pub fn http_class(e: &McpError) -> HttpClass {
+    if e.code == ErrorCode::INVALID_PARAMS {
+        HttpClass::BadRequest
+    } else if e.code == ErrorCode::INVALID_REQUEST {
+        HttpClass::Forbidden
+    } else {
+        HttpClass::Internal
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The boundaries of the refusal-code grammar (two to five ASCII capitals,
+    /// exactly two digits, a colon, at the very start) that `internal_error`
+    /// relays a database refusal by and the supersede mapper splits `42501`
+    /// on (one predicate since backlog 86a26e69; the mapper had a private
+    /// byte-for-byte copy).
+    #[test]
+    fn coded_admits_exactly_the_code_grammar() {
+        for msg in [
+            "CX03: the act",
+            "OPL01: unbound",
+            "ABCDE12: five capitals",
+            "AB12:",
+        ] {
+            assert!(coded(msg), "{msg:?} is coded");
+        }
+        for msg in [
+            "A12: one capital",
+            "ABCDEF12: six capitals",
+            "FA4: one digit",
+            "FA123: three digits",
+            "FA04 no colon",
+            "FA04",
+            " CX03: leading space",
+            "cx03: lower case",
+            "new row violates row-level security policy for table \"claims\"",
+            "permission denied for function epigraph_record_cascade_deferral",
+            "",
+        ] {
+            assert!(!coded(msg), "{msg:?} is not coded");
+        }
+    }
 
     /// A caller-caused rejection must be INVALID_PARAMS and must carry the
     /// repo's reason text through, and everything else must stay
@@ -557,6 +620,26 @@ mod tests {
         assert!(
             e.message.contains("empty workflow generation")
                 && e.message.contains("weekly-capability-audit")
+                && e.message.contains("Nothing was written"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// Backlog 26a436c6: a generation-0 payload naming a parent is the
+    /// caller's error, INVALID_PARAMS with the executor's text.
+    #[test]
+    fn a_generation_zero_parent_is_invalid_params() {
+        let e = executor_caller_error(
+            "workflow ingest",
+            epigraph_ingest_executor::IngestExecutorError::GenerationZeroNamesParent {
+                canonical_name: "weekly-capability-audit-fork".to_string(),
+                parent_canonical_name: "weekly-capability-audit".to_string(),
+            },
+        );
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            e.message.contains("generation 0 starts a lineage")
                 && e.message.contains("Nothing was written"),
             "{}",
             e.message
@@ -864,5 +947,25 @@ mod tests {
         ] {
             assert!(!coded(rejected), "{rejected:?} must not be recognised");
         }
+    }
+
+    /// Each code an HTTP twin can see maps to its own class, and an unknown
+    /// code is a server fault, never a caller error.
+    #[test]
+    fn http_class_follows_the_json_rpc_code() {
+        assert_eq!(http_class(&invalid_params("bad")), HttpClass::BadRequest);
+        assert_eq!(
+            http_class(&claim_not_writer(uuid::Uuid::nil(), "supersede")),
+            HttpClass::Forbidden
+        );
+        assert_eq!(http_class(&internal_error_text("x")), HttpClass::Internal);
+        assert_eq!(
+            http_class(&McpError {
+                code: ErrorCode::METHOD_NOT_FOUND,
+                message: Cow::Borrowed("no such method"),
+                data: None,
+            }),
+            HttpClass::Internal
+        );
     }
 }

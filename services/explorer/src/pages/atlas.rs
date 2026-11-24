@@ -68,6 +68,10 @@ pub struct AtlasShell {
     /// `data-atlas-claim-leaf-url`: a claim's leaf is
     /// `<this><map key>/<hierarchy>/<claim id>` (contract `atlas_claim_leaf` v1).
     pub claim_leaf_url: String,
+    /// `data-sources-url`: a theme's sources (`/bff/atlas/sources`, P3b).
+    pub sources_url: String,
+    /// `data-timeline-url`: a theme's timeline (`/bff/atlas/timeline`, P3c).
+    pub timeline_url: String,
 }
 
 /// Most maps in the list (the `atlas_maps` v1 schema's cap).
@@ -257,6 +261,8 @@ async fn atlas(State(state): State<AppState>, caller: Caller) -> Result<Html<Str
             .await
             .map(|m| m.to_attr()),
         claim_leaf_url: links.path(CLAIM_LEAF_PREFIX),
+        sources_url: links.bff_atlas_sources(),
+        timeline_url: links.bff_atlas_timeline(),
     };
     render(&AtlasPage {
         ctx: caller.ctx,

@@ -37,6 +37,8 @@ async fn run_op(pool: &PgPool, args: &[&str]) -> Run {
         .env_remove("DATABASE_URL")
         .env_remove("MAINTENANCE_DATABASE_URL")
         .env_remove("EPIGRAPH_OPERATOR_LINK_ENFORCEMENT")
+        // No live embedder: the verb's `embedded=` field is deterministic.
+        .env_remove("OPENAI_API_KEY")
         .env(DSN_ENV, url)
         .output()
         .expect("spawn epigraph-operator");
@@ -219,6 +221,19 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
     // Applied, on the retired-linked author's corpus claim.
     let applied = supersede(&pool, &c_ret_s, &ia_s, &a_s, true).await;
     assert_eq!(applied.code, 0, "{}", applied.show());
+    // Backlog 5fd3e2b4: the verb reports whether it embedded the successor.
+    // With no OPENAI_API_KEY (the helper removes it) there is no embedder, so
+    // `embedded=false` and the backfill note is printed; the dry run above
+    // never embeds.
+    assert!(
+        applied.stdout.contains("\tembedded=false\n")
+            && applied
+                .stdout
+                .contains("NOTE: the successor was not embedded"),
+        "{}",
+        applied.show()
+    );
+    assert!(dry.stdout.contains("\tembedded=false\n"), "{}", dry.show());
     let successor: (Uuid, Uuid, Uuid, String, bool) = sqlx::query_as(
         "SELECT id, agent_id, owner_group_id, visibility, COALESCE(is_current, true) \
            FROM claims WHERE supersedes = $1",
@@ -430,6 +445,7 @@ fn run_op_on(dsn: &str, args: &[&str]) -> Run {
         .env_remove("DATABASE_URL")
         .env_remove("MAINTENANCE_DATABASE_URL")
         .env_remove("EPIGRAPH_OPERATOR_LINK_ENFORCEMENT")
+        .env_remove("OPENAI_API_KEY")
         .env(DSN_ENV, dsn)
         .output()
         .expect("spawn epigraph-operator");
@@ -481,11 +497,11 @@ async fn insert_claim_with_interval(pool: &PgPool, author: Uuid, bel: f64, pl: f
     id
 }
 
-/// Live BBAs on `claim` keyed on `edge` (edge-keyed: `perspective_id` is the
-/// edge id).
+/// Live BBAs on `claim` keyed on `edge` (edge-keyed: the edge's slot,
+/// migration 267).
 async fn edge_bbas(pool: &PgPool, claim: Uuid, edge: Uuid) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2 \
+        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2 \
            AND retracted_at IS NULL",
     )
     .bind(claim)
@@ -528,14 +544,21 @@ async fn deferrals(pool: &PgPool) -> Vec<(Uuid, Option<Uuid>, serde_json::Value)
 ///   deferral under the custodian's name, whose ids row lists the incoming
 ///   strengthening edge as retargeted and the outgoing one as resourced (the
 ///   migrated set the supersede cascade's factor regeneration keys on); the
-///   edges have moved (`contradicts` stays); and the belief cascade ran: the
+///   edges have moved (`contradicts` stays); K3 re-minted both moved edges'
+///   BP factors on the successor (the incoming edge is a `corroborates`, an
+///   `evidential_support` factor, the outgoing a `supports`, a
+///   `directional_support` one): a factor row per edge over the new pair, and
+///   the applied row counts `factors_minted` = 2 (backlog d4810e69); and the
+///   belief cascade ran: the
 ///   target's BBA frozen from the RETIRED claim's interval, keyed on the
 ///   outgoing edge, is invalidated, and the target's cache, which no row backs
 ///   any more, is cleared.
 ///
 /// Verified to fail on the base: no deferral row (the custodial path recorded
 /// none and ran no belief cascade; its inline edge migration left the replay
-/// nothing to move).
+/// nothing to move). Verified to fail with K3 skipped in the replay
+/// (`apply_after_supersede` minting no factors): no factor row on the
+/// successor and `factors_minted` 0.
 #[sqlx::test(migrations = "../../migrations")]
 async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_replay(pool: PgPool) {
     let (a, _) = fixture::seed_human_operator(&pool, "k8-custodian-a").await;
@@ -545,9 +568,17 @@ async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_rep
     let target = insert_claim(&pool, legacy, WORLD).await;
     let supporter = insert_claim(&pool, legacy, WORLD).await;
     let critic = insert_claim(&pool, legacy, WORLD).await;
-    let incoming = edge(&pool, supporter, old, "supports").await;
+    let incoming = edge(&pool, supporter, old, "corroborates").await;
     let outgoing = edge(&pool, old, target, "supports").await;
     let contradicts = edge(&pool, critic, old, "contradicts").await;
+    assert_eq!(
+        (
+            factors_on(&pool, incoming, supporter, old).await,
+            factors_on(&pool, outgoing, old, target).await,
+        ),
+        (1, 1),
+        "precondition: each strengthening edge carries its factor"
+    );
 
     // The outgoing edge's BBA on the target, wired from the predecessor's
     // interval by the engine's own edge-factor path.
@@ -731,6 +762,30 @@ async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_rep
         serde_json::json!([outgoing]),
         "the cascade migrated the outgoing strengthening edge: {touched}"
     );
+    // K3 (backlog d4810e69): the retirement deleted the predecessor's
+    // factors and the migration's re-points are UPDATEs the INSERT-only
+    // factor trigger never sees, so these rows exist only if the replay's
+    // regeneration minted them.
+    assert_eq!(
+        ad["touched"]["factors_minted"],
+        serde_json::json!(2),
+        "the replay minted the two moved edges' factors: {ad}"
+    );
+    assert_eq!(
+        touched["factors_minted"].as_array().map(Vec::len),
+        Some(2),
+        "the ids row lists the two minted slots: {touched}"
+    );
+    assert_eq!(
+        (
+            factors_on(&pool, incoming, supporter, new).await,
+            factors_on(&pool, outgoing, new, target).await,
+            factors_on(&pool, incoming, supporter, old).await,
+            factors_on(&pool, outgoing, old, target).await,
+        ),
+        (1, 1, 0, 0),
+        "each moved edge's factor is over the successor, none over the retired claim"
+    );
     let ends: (Uuid, Uuid, Uuid) = sqlx::query_as(
         "SELECT (SELECT target_id FROM edges WHERE id = $1), \
                 (SELECT source_id FROM edges WHERE id = $2), \
@@ -786,4 +841,528 @@ async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_rep
 
     drop_login(&pool, &maint_role).await;
     drop_login(&pool, &app_role).await;
+}
+
+/// BP factors keyed on `edge` over exactly the pair `(a, b)`.
+async fn factors_on(pool: &PgPool, edge: Uuid, a: Uuid, b: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM factors \
+          WHERE properties->>'source_edge_id' = $1::text \
+            AND variable_ids @> ARRAY[$2, $3]::uuid[] AND cardinality(variable_ids) = 2",
+    )
+    .bind(edge)
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .expect("count factors")
+}
+
+/// The `--report-only` pending count of the deferred-cascade replay.
+fn pending_replays(dsn: &str) -> i64 {
+    let r = Command::new(REPLAY)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("DATABASE_URL", dsn)
+        .env("MAINTENANCE_DATABASE_URL", dsn)
+        .env("RUST_LOG", "warn")
+        .arg("--report-only")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("spawn the report");
+    assert_eq!(
+        r.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&r.stdout).trim()).expect("JSON");
+    v["pending"].as_i64().expect("pending count")
+}
+
+/// Backlog 6a670eab: a custodial supersede of a GROUP-owned claim
+/// (`--allow-owned`) leaves a group-owned successor that a group writer can
+/// supersede again before the custodial deferral replays. The replay then
+/// moves the predecessor's edges onto the CURRENT head of the successor's
+/// supersedes chain, not onto the successor it recorded (now retired, where
+/// traversal and belief from the head would never reach them): the
+/// strengthening edges land on the head with their BP factors on the head,
+/// `contradicts` stays on the predecessor, the deferral still names the
+/// recorded successor, and the replay's audit names the head (the applied
+/// row counts the one later replacement it followed; its ids row names it).
+///
+/// The intermediate supersede (successor -> head) runs with its own edge
+/// migration inline (`supersede_conn`), as a request path's applied cascade
+/// does, so only the custodial deferral is pending when the replay runs. The
+/// replay runs on real maintenance and application logins.
+///
+/// The belief cascade keys on the head too: the target's BBA frozen from the
+/// predecessor's interval, keyed on the outgoing edge (which now leaves the
+/// head), is invalidated by the replay.
+///
+/// Verified to fail on the base: the replay migrated onto the recorded
+/// successor (`migrate_superseded_edges_conn(old, new)`), so the edges ended on
+/// the retired successor, no factor was minted (the successor is not current)
+/// and no audit row named the head. Verified to fail with the belief cascade
+/// keyed on the recorded successor (`cascade_after_supersede(.., new_id)` in
+/// `apply_after_supersede`): the frozen BBA stays live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replayed_custodial_cascade_lands_on_the_successors_current_head(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "head-custodian-a").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "head-legacy").await;
+    let owned = insert_claim(&pool, a, a_group).await;
+    let supporter = insert_claim(&pool, legacy, WORLD).await;
+    let target = insert_claim(&pool, legacy, WORLD).await;
+    let critic = insert_claim(&pool, legacy, WORLD).await;
+    let incoming = edge(&pool, supporter, owned, "supports").await;
+    let outgoing = edge(&pool, owned, target, "corroborates").await;
+    let contradicts = edge(&pool, critic, owned, "contradicts").await;
+    // The outgoing edge's BBA on the target, frozen from the predecessor's
+    // interval by the engine's own edge-factor path: only a belief cascade
+    // keyed on the claim the edge now leaves from (the head) reaches it.
+    sqlx::query("UPDATE claims SET belief = 0.8, plausibility = 0.9 WHERE id = $1")
+        .bind(owned)
+        .execute(&pool)
+        .await
+        .expect("the predecessor's interval");
+    {
+        let (_scoped, viewer) = fixture::bypass(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        let wired = epigraph_engine::edge_factor::auto_wire_ds_for_edge(
+            &mut conn,
+            &viewer,
+            outgoing,
+            a,
+            owned,
+            target,
+            "corroborates",
+        )
+        .await
+        .expect("wire the outgoing edge");
+        assert!(
+            matches!(
+                wired,
+                epigraph_engine::edge_factor::EdgeFactorOutcome::Wired
+            ),
+            "precondition: the outgoing edge carries a BBA ({wired:?})"
+        );
+    }
+    let frozen_bba: Uuid = sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE claim_id = $1 AND slot_kind = 'edge' \
+           AND slot_id = $2 AND retracted_at IS NULL",
+    )
+    .bind(target)
+    .bind(outgoing)
+    .fetch_one(&pool)
+    .await
+    .expect("precondition: one live BBA keyed on the outgoing edge");
+    let ia = fixture::make_custodian(&pool, a).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm");
+        (conn, ())
+    })
+    .await;
+
+    // The custodial revision of the owned claim: its cascade is deferred.
+    let mut args = supersede_args(&owned.to_string(), &ia.to_string(), &a.to_string(), true);
+    args.push("--allow-owned".to_string());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let run = run_op(&pool, &refs).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    let new: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE supersedes = $1")
+        .bind(owned)
+        .fetch_one(&pool)
+        .await
+        .expect("the custodial successor");
+
+    // A group writer revises the group-owned successor before the replay,
+    // with its own edge migration applied.
+    let head = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let (head, _) = epigraph_db::ClaimRepository::supersede_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(new),
+            "the group's later revision of the successor",
+            epigraph_core::TruthValue::new(0.6).expect("truth"),
+            "a later revision",
+            epigraph_db::SupersedeActor::new(a, epigraph_db::SupersedeTool::SupersedeClaim),
+        )
+        .await
+        .expect("supersede the successor");
+        head
+    };
+    assert!(!current(&pool, new).await && current(&pool, head).await);
+    let dsn = fixture::database_url_for(&pool).await;
+    assert_eq!(
+        pending_replays(&dsn),
+        1,
+        "precondition: only the custodial deferral is pending"
+    );
+    assert!(
+        bba_live(&pool, frozen_bba).await,
+        "precondition: the act and the later revision left the frozen BBA in place"
+    );
+
+    // The replay as production runs it: REAL maintenance and application
+    // logins (`NOSUPERUSER NOBYPASSRLS`), so the chain walk reads the retired
+    // successor through row security, not as a superuser.
+    let (maint_role, maint_dsn) = create_login(&pool, "epigraph_maintenance").await;
+    let (app_role, app_dsn) = create_login(&pool, "epigraph_app").await;
+    let r = replay(&app_dsn, &maint_dsn);
+    assert_eq!(r.code, 0, "{}", r.show());
+    let report: serde_json::Value = serde_json::from_str(r.stdout.trim()).expect("replay JSON");
+    assert_eq!(report["applied"], 1, "{report}");
+
+    let ends: (Uuid, Uuid, Uuid) = sqlx::query_as(
+        "SELECT (SELECT target_id FROM edges WHERE id = $1), \
+                (SELECT source_id FROM edges WHERE id = $2), \
+                (SELECT target_id FROM edges WHERE id = $3)",
+    )
+    .bind(incoming)
+    .bind(outgoing)
+    .bind(contradicts)
+    .fetch_one(&pool)
+    .await
+    .expect("edge ends");
+    assert_eq!(
+        ends,
+        (head, head, owned),
+        "the strengthening edges land on the current head (not the retired successor {new}); \
+         contradicts stays"
+    );
+    assert_eq!(
+        (
+            factors_on(&pool, incoming, supporter, head).await,
+            factors_on(&pool, outgoing, head, target).await,
+        ),
+        (1, 1),
+        "the moved edges' factors are minted on the head"
+    );
+    assert!(
+        !bba_live(&pool, frozen_bba).await,
+        "the belief cascade ran from the head: the BBA frozen from the retired predecessor's \
+         interval, keyed on the edge that now leaves the head, is invalidated"
+    );
+
+    let (deferred_object,): (Option<String>,) = sqlx::query_as(
+        "SELECT details->'trigger'->>'object_id' FROM security_events \
+          WHERE event_type = 'cascade.deferred' AND details->'trigger'->>'subject_id' = $1",
+    )
+    .bind(owned.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the deferral");
+    assert_eq!(
+        deferred_object,
+        Some(new.to_string()),
+        "the deferral still names the successor it recorded"
+    );
+    let (applied_id, touched): (Uuid, serde_json::Value) = sqlx::query_as(
+        "SELECT id, details->'touched' FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' AND details->>'cause' = 'supersede' \
+            AND details->'trigger'->>'subject_id' = $1",
+    )
+    .bind(owned.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the applied row");
+    assert_eq!(
+        touched["superseded_onto"],
+        serde_json::json!(1),
+        "the applied row counts the later replacement it followed: {touched}"
+    );
+    let ids: serde_json::Value = sqlx::query_scalar(
+        "SELECT details->'touched' FROM security_events \
+          WHERE event_type = 'cascade.admin_applied_ids' \
+            AND details->>'applied_event_id' = $1",
+    )
+    .bind(applied_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the applied ids row");
+    assert_eq!(
+        ids["superseded_onto"],
+        serde_json::json!([head]),
+        "the ids row names the head: {ids}"
+    );
+
+    drop_login(&pool, &maint_role).await;
+    drop_login(&pool, &app_role).await;
+}
+
+/// Whether the `mass_functions` row `id` is live (not retracted, not deleted).
+async fn bba_live(pool: &PgPool, id: Uuid) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM mass_functions WHERE id = $1 AND retracted_at IS NULL)",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("BBA")
+}
+
+/// Backlog 6a670eab, the refusal: when the recorded successor's supersedes
+/// chain has no single current head (here the group-owned custodial successor
+/// was deprecated, retired with no replacement, before the replay), the
+/// replay does NOT fall back to the recorded successor. The cascade fails
+/// with nothing moved: the strengthening edges stay on the predecessor, no
+/// factor is minted on the retired successor, a `cascade.admin_failed` row is
+/// recorded and the deferral stays pending (it is replayable, then stuck, for
+/// an operator to read). Run on real maintenance and application logins.
+///
+/// The edge migration's own refusal reason is asserted on a direct call of
+/// `migrate_superseded_edges_to_head_conn` (the replay logs it and records
+/// only a generic reason).
+///
+/// Verified to fail with the chain-walk error mapped to the recorded successor
+/// (`[new_id]`) instead of a refusal: the replay applies, and the edges land
+/// on the deprecated successor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replay_refuses_a_successor_chain_with_no_current_head(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "headless-custodian").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "headless-legacy").await;
+    let owned = insert_claim(&pool, a, a_group).await;
+    let supporter = insert_claim(&pool, legacy, WORLD).await;
+    let target = insert_claim(&pool, legacy, WORLD).await;
+    let incoming = edge(&pool, supporter, owned, "supports").await;
+    let outgoing = edge(&pool, owned, target, "corroborates").await;
+    let ia = fixture::make_custodian(&pool, a).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm");
+        (conn, ())
+    })
+    .await;
+
+    let mut args = supersede_args(&owned.to_string(), &ia.to_string(), &a.to_string(), true);
+    args.push("--allow-owned".to_string());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let run = run_op(&pool, &refs).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    let new: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE supersedes = $1")
+        .bind(owned)
+        .fetch_one(&pool)
+        .await
+        .expect("the custodial successor");
+
+    // The group deprecates the successor before the replay: retired, with no
+    // replacement.
+    assert_eq!(
+        epigraph_db::ClaimRepository::deprecate_claim(
+            &pool,
+            epigraph_core::ClaimId::from_uuid(new)
+        )
+        .await
+        .expect("deprecate the successor"),
+        1
+    );
+    assert!(!current(&pool, new).await);
+
+    let (maint_role, maint_dsn) = create_login(&pool, "epigraph_maintenance").await;
+    let (app_role, app_dsn) = create_login(&pool, "epigraph_app").await;
+    let r = replay(&app_dsn, &maint_dsn);
+    assert_eq!(r.code, 1, "a failed replay exits non-zero: {}", r.show());
+    let report: serde_json::Value = r
+        .stdout
+        .find('{')
+        .and_then(|i| serde_json::from_str(r.stdout[i..].trim()).ok())
+        .unwrap_or_else(|| panic!("replay JSON: {}", r.show()));
+    assert_eq!(
+        (report["applied"].as_i64(), report["failed"].as_i64()),
+        (Some(0), Some(1)),
+        "{report}"
+    );
+
+    let ends: (Uuid, Uuid) = sqlx::query_as(
+        "SELECT (SELECT target_id FROM edges WHERE id = $1), \
+                (SELECT source_id FROM edges WHERE id = $2)",
+    )
+    .bind(incoming)
+    .bind(outgoing)
+    .fetch_one(&pool)
+    .await
+    .expect("edge ends");
+    assert_eq!(
+        ends,
+        (owned, owned),
+        "nothing moved: not onto the deprecated successor {new}"
+    );
+    assert_eq!(
+        (
+            factors_on(&pool, incoming, supporter, new).await,
+            factors_on(&pool, outgoing, new, target).await,
+        ),
+        (0, 0),
+        "no factor on the deprecated successor"
+    );
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT event_type, details->>'outcome' FROM security_events \
+          WHERE event_type IN ('cascade.admin_applied', 'cascade.admin_failed') \
+            AND details->'trigger'->>'subject_id' = $1",
+    )
+    .bind(owned.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("cascade rows");
+    assert_eq!(
+        rows,
+        vec![(
+            "cascade.admin_failed".to_string(),
+            Some("failed".to_string())
+        )],
+        "one failure recorded, nothing applied"
+    );
+    // The edge migration itself refuses, naming why (the replay records only a
+    // generic reason), with nothing moved.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let v = &viewer;
+    let refusal = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = epigraph_db::ClaimRepository::migrate_superseded_edges_to_head_conn(
+            &mut conn, v, owned, new,
+        )
+        .await
+        .map(|_| ());
+        (conn, r)
+    })
+    .await;
+    let e = refusal.expect_err("no single current head: the migration refuses");
+    assert!(e.to_string().contains("no single current head"), "{e}");
+
+    let dsn = fixture::database_url_for(&pool).await;
+    assert_eq!(pending_replays(&dsn), 1, "the cascade stays pending");
+
+    drop_login(&pool, &maint_role).await;
+    drop_login(&pool, &app_role).await;
+}
+
+/// Whether `claim` carries an embedding.
+async fn embedded(pool: &PgPool, claim: Uuid) -> bool {
+    sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("claim")
+}
+
+/// Backlog 5fd3e2b4: the custodial supersede embeds the successor it
+/// committed, on the maintenance session's bypass viewer, so the revised claim
+/// stays recallable (the retirement nulled the predecessor's vector). With an
+/// embedder, the applied run's successor has an embedding and the report says
+/// so; a dry run embeds nothing (there is no successor); with no embedder
+/// configured the act still commits and reports `embedded: false`, leaving the
+/// row to the backfill.
+///
+/// The session is opened on a real maintenance login, so the store is
+/// exercised under row security, not as a superuser.
+///
+/// Verified to fail on the base: the verb never embedded, so the applied run's
+/// successor kept `embedding IS NULL`; and with the post-commit store removed
+/// from `custodial_supersede`, `embedded` is false and the vector NULL.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_custodial_supersede_embeds_its_successor(pool: PgPool) {
+    use epigraph_cli::operator::custodian;
+    use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+
+    let (a, _) = fixture::seed_human_operator(&pool, "embed-custodian").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "embed-legacy").await;
+    let with = insert_claim(&pool, legacy, WORLD).await;
+    let without = insert_claim(&pool, legacy, WORLD).await;
+    let ia = fixture::make_custodian(&pool, a).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm");
+        (conn, ())
+    })
+    .await;
+
+    // The session the verb opens, on a REAL maintenance login (`NOSUPERUSER
+    // NOBYPASSRLS`), so the store runs under row security on a world-owned
+    // claim, as in production.
+    let (maint_role, maint_dsn) = create_login(&pool, "epigraph_maintenance").await;
+    let scoped = epigraph_db::ScopedPool::connect(&maint_dsn, epigraph_db::SessionGucMode::Session)
+        .await
+        .expect("connect as the maintenance login");
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+        .await
+        .expect("a maintenance session");
+    let (conn, viewer) = session.split();
+    let mock = MockProvider::new(EmbeddingConfig::openai(1536));
+    let request = |claim: Uuid, apply: bool| custodian::SupersedeRequest {
+        claim,
+        content: format!("the custodian's revision of {claim}"),
+        truth: 0.7,
+        assignment: ia,
+        actor: a,
+        reason: "custodial embedding test".to_string(),
+        allow_owned: false,
+        act: None,
+        apply,
+    };
+    let done = |o: custodian::SupersedeOutcome| match o {
+        custodian::SupersedeOutcome::Done(r) => r,
+        other => panic!("the supersede did not complete: {other:?}"),
+    };
+
+    // A dry run: rolled back, nothing to embed.
+    let dry = done(
+        custodian::custodial_supersede(
+            &mut *conn,
+            viewer,
+            Some(&mock as &dyn EmbeddingService),
+            &request(with, false),
+        )
+        .await
+        .expect("dry run"),
+    );
+    assert!(!dry.applied && !dry.embedded, "a dry run embeds nothing");
+    assert!(current(&pool, with).await, "a dry run retires nothing");
+
+    // Applied, with an embedder: the successor is embedded.
+    let r = done(
+        custodian::custodial_supersede(
+            &mut *conn,
+            viewer,
+            Some(&mock as &dyn EmbeddingService),
+            &request(with, true),
+        )
+        .await
+        .expect("applied run"),
+    );
+    assert!(r.applied, "{r:?}");
+    assert!(!current(&pool, with).await, "the predecessor is retired");
+    assert!(
+        r.embedded,
+        "the report says the successor was embedded: {r:?}"
+    );
+    assert!(
+        embedded(&pool, r.new).await,
+        "the committed successor carries an embedding"
+    );
+
+    // Applied, with no embedder: the act stands, the successor waits for the
+    // backfill.
+    let r = done(
+        custodian::custodial_supersede(&mut *conn, viewer, None, &request(without, true))
+            .await
+            .expect("applied run without an embedder"),
+    );
+    assert!(r.applied && !r.embedded, "{r:?}");
+    assert!(!current(&pool, without).await, "the act committed");
+    assert!(
+        !embedded(&pool, r.new).await,
+        "no embedder: no vector (the control)"
+    );
+
+    drop(session);
+    scoped.inner().close().await;
+    drop_login(&pool, &maint_role).await;
 }

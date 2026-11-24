@@ -275,9 +275,9 @@ async fn targeted_rewire_never_merges_away_a_row_that_appeared_after_selection(p
     let edge = the_edge(&pool, &w).await;
     let other_agent = seed_agent(&pool, "dup-wirer").await;
     sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, masses, \
                                      combination_method, source_strength, evidence_type, locality_tag) \
-         VALUES ($1, $2, $3, $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross')",
+         VALUES ($1, $2, $3, 'edge', $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross')",
     )
     .bind(w.target)
     .bind(w.frame)
@@ -310,7 +310,7 @@ async fn targeted_rewire_holds_a_stale_target_and_the_untargeted_phase_does_not(
     let edge = the_edge(&pool, &w).await;
     sqlx::query(
         "UPDATE mass_functions SET masses = $2::jsonb \
-          WHERE claim_id = $1 AND perspective_id IS NULL",
+          WHERE claim_id = $1 AND perspective_id IS NULL AND slot_id IS NULL",
     )
     .bind(w.target)
     .bind(EVIDENCE_C)
@@ -342,12 +342,14 @@ async fn targeted_rewire_holds_a_mixed_row(pool: PgPool) {
     let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
     let w = world(&pool, &viewer, "mixed", "supports", true).await;
     let edge = the_edge(&pool, &w).await;
-    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
-        .bind(w.edge)
-        .bind(STALE_PRE_401)
-        .execute(&pool)
-        .await
-        .expect("an older row shape");
+    sqlx::query(
+        "UPDATE mass_functions SET masses = $2::jsonb WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(w.edge)
+    .bind(STALE_PRE_401)
+    .execute(&pool)
+    .await
+    .expect("an older row shape");
     refold(&pool, &viewer, w.target).await; // the target stays fresh
     let before = footprint(&pool, &w).await;
 
@@ -437,10 +439,10 @@ async fn targeted_rewire_holds_an_edge_with_a_retracted_row_and_never_touches_it
     .await
     .expect("second frame");
     sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, masses, \
                                      combination_method, source_strength, evidence_type, locality_tag, \
                                      retracted_at, retracted_by, retract_reason) \
-         VALUES ($1, $2, $3, $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
+         VALUES ($1, $2, $3, 'edge', $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
                  now(), $3, 'cal4 fixture')",
     )
     .bind(w.target)
@@ -589,7 +591,10 @@ async fn targeted_rewire_holds_a_target_that_would_vacate(pool: PgPool) {
     let before = footprint(&pool, &w).await;
     assert!(before.1.belief.is_some(), "fixture: the target has a cache");
 
-    let o = TargetedRunOptions::default();
+    let o = TargetedRunOptions {
+        only_changed: false,
+        ..TargetedRunOptions::default()
+    };
     let predicted =
         predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&w.wave, o.epsilon), &o)
             .await
@@ -701,5 +706,226 @@ async fn targeted_rewire_rolls_back_when_its_snapshot_record_cannot_be_written(p
         footprint(&pool, &w).await,
         before,
         "rolled back: row, created_at, target cache and updated_at unchanged"
+    );
+}
+
+/// Install a row trigger that nudges `target`'s stored BetP by 1e-6 on every
+/// UPDATE of its row: the cache the wire writes is then no longer the fold
+/// the decision predicted (the shape of a cache-writer guard declining, or
+/// a write landing between the decision and the wire), deterministically.
+async fn nudge_cache_writes_of(pool: &PgPool, target: Uuid) {
+    sqlx::query(&format!(
+        "CREATE FUNCTION test_nudge_cache() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN \
+           IF NEW.id = '{target}'::uuid AND NEW.pignistic_prob IS NOT NULL THEN \
+             NEW.pignistic_prob := NEW.pignistic_prob + 1e-6; \
+           END IF; \
+           RETURN NEW; \
+         END $f$"
+    ))
+    .execute(pool)
+    .await
+    .expect("nudge function");
+    sqlx::query(
+        "CREATE TRIGGER zz_test_nudge_cache BEFORE UPDATE ON claims \
+         FOR EACH ROW EXECUTE FUNCTION test_nudge_cache()",
+    )
+    .execute(pool)
+    .await
+    .expect("nudge trigger");
+}
+
+/// The post-wire cache check: when the cache the wire WROTE differs from the
+/// fold the decision predicted over the same rows, the edge rolls back
+/// (row, target cache and `updated_at` exactly as before, no capture) and is
+/// counted `post_wire_mismatch`, not `target_stale`: a stale target is a
+/// decision-time verdict, and folding the two together hid real mismatches
+/// between the predicted fold and the cache writer. The control drops the
+/// trigger and the same edge rewires, so the hold is the check's doing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_holds_a_written_cache_that_differs_from_the_predicted_fold(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "post-wire", "supports", true).await;
+    let edge = the_edge(&pool, &w).await;
+    nudge_cache_writes_of(&pool, w.target).await;
+    let before = footprint(&pool, &w).await;
+
+    let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "rolled back: row, target cache and updated_at unchanged"
+    );
+    assert!(captured.is_empty(), "no record for a rolled-back edge");
+    assert_held(&out, HeldBucket::PostWireMismatch);
+    assert_eq!(HeldBucket::PostWireMismatch.name(), "post_wire_mismatch");
+
+    sqlx::query("DROP TRIGGER zz_test_nudge_cache ON claims")
+        .execute(&pool)
+        .await
+        .expect("drop the nudge");
+    let (control, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+    assert!(
+        matches!(control, TargetedOutcome::Rewired(_)),
+        "without the nudge the same edge rewires: {control:?}"
+    );
+    assert_eq!(captured.len(), 1);
+}
+
+/// The post-wire outcome check: the source turns factorless AFTER the
+/// decision read it (a statement trigger on the rewire's own row DELETE,
+/// which runs between the decision and the wire), so the wire finds no
+/// interval. The targeted rewire must keep the row and never reach the
+/// un-targeted removal arm: rolled back, the edge row, the target cache and
+/// the source cache exactly as before, counted `held_would_remove`. The
+/// control drops the trigger and the same edge rewires, so the decision
+/// itself would have proceeded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_keeps_an_edge_whose_source_turned_factorless_after_the_decision(
+    pool: PgPool,
+) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "post-decision", "supports", true).await;
+    let edge = the_edge(&pool, &w).await;
+    sqlx::query(&format!(
+        "CREATE FUNCTION test_source_turns_factorless() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN \
+           UPDATE claims SET belief = NULL, plausibility = NULL, pignistic_prob = NULL \
+            WHERE id = '{}'::uuid; \
+           RETURN NULL; \
+         END $f$",
+        w.source
+    ))
+    .execute(&pool)
+    .await
+    .expect("trigger function");
+    sqlx::query(
+        "CREATE TRIGGER test_source_turns_factorless AFTER DELETE ON mass_functions \
+         FOR EACH STATEMENT EXECUTE FUNCTION test_source_turns_factorless()",
+    )
+    .execute(&pool)
+    .await
+    .expect("statement trigger");
+    let before = footprint(&pool, &w).await;
+    let source_before = cache(&pool, w.source).await;
+    assert!(
+        source_before.belief.is_some(),
+        "fixture: the source has a cache"
+    );
+
+    let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "row, target cache and updated_at unchanged"
+    );
+    assert_eq!(
+        cache(&pool, w.source).await,
+        source_before,
+        "the source's mid-run change rolled back with the edge"
+    );
+    assert!(captured.is_empty());
+    assert_held(&out, HeldBucket::WouldRemove);
+
+    sqlx::query("DROP TRIGGER test_source_turns_factorless ON mass_functions")
+        .execute(&pool)
+        .await
+        .expect("drop the trigger");
+    let (control, _) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+    assert!(
+        matches!(control, TargetedOutcome::Rewired(_)),
+        "without the trigger the decision proceeds and the edge rewires: {control:?}"
+    );
+}
+
+/// The post-delete duplicate arm of the targeted rewire: a second live row
+/// on the edge that appears AFTER the decision counted one row at the key
+/// (`edge_shape`'s single statement) is found by the delete, which returns
+/// it, and the rewire rolls back: held `off_key_or_duplicate`, the edge's
+/// rows and the target's cache exactly as before, and the late row gone
+/// with the rolled-back transaction (it never committed).
+///
+/// The late row is planted by a wrapper around `epigraph_claim_is_compound`,
+/// which `edge_shape` calls: it inserts the row once, and only inside a
+/// transaction that already holds an xid (the rewire's `FOR SHARE` / `FOR
+/// UPDATE`), never on an autocommit read. `edge_shape`'s count subqueries
+/// read the statement's snapshot, so the decision does not see it; the
+/// DELETE, a later statement, does. The row is on a second frame, so the
+/// decision's binary-frame folds are unchanged and it proceeds. The control
+/// restores the function and the same edge rewires.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_holds_a_row_that_appeared_between_the_decision_and_the_delete(
+    pool: PgPool,
+) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "post-shape-dup", "supports", true).await;
+    let edge = the_edge(&pool, &w).await;
+    let other_frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("cal4-late-dup-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("second frame");
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_claim_is_compound(uuid) \
+         RENAME TO test_orig_claim_is_compound",
+    )
+    .execute(&pool)
+    .await
+    .expect("set the definer aside");
+    sqlx::query(&format!(
+        "CREATE FUNCTION public.epigraph_claim_is_compound(p_claim_id uuid) RETURNS boolean \
+         LANGUAGE plpgsql VOLATILE AS $f$ \
+         BEGIN \
+           IF pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL \
+              AND pg_catalog.current_setting('test.late_dup', true) IS DISTINCT FROM 'planted' THEN \
+             PERFORM pg_catalog.set_config('test.late_dup', 'planted', true); \
+             INSERT INTO public.mass_functions (claim_id, frame_id, source_agent_id, \
+                 slot_kind, slot_id, masses, combination_method, source_strength, evidence_type, \
+                 locality_tag) \
+             VALUES ('{target}'::uuid, '{other_frame}'::uuid, '{author}'::uuid, 'edge', '{edge}'::uuid, \
+                     '{masses}'::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross'); \
+           END IF; \
+           RETURN public.test_orig_claim_is_compound(p_claim_id); \
+         END $f$",
+        target = w.target,
+        author = w.author,
+        edge = w.edge,
+        masses = STALE_PRE_401,
+    ))
+    .execute(&pool)
+    .await
+    .expect("planting wrapper");
+    let before = footprint(&pool, &w).await;
+    assert_eq!(before.0.len(), 1, "PREMISE: one row on the edge");
+
+    let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "row, target cache and updated_at unchanged; the late row rolled back"
+    );
+    assert!(captured.is_empty());
+    assert_held(&out, HeldBucket::OffKeyOrDuplicate);
+
+    sqlx::query("DROP FUNCTION public.epigraph_claim_is_compound(uuid)")
+        .execute(&pool)
+        .await
+        .expect("drop the wrapper");
+    sqlx::query(
+        "ALTER FUNCTION public.test_orig_claim_is_compound(uuid) \
+         RENAME TO epigraph_claim_is_compound",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore the definer");
+    let (control, _) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+    assert!(
+        matches!(control, TargetedOutcome::Rewired(_)),
+        "without the late row the decision proceeds and the edge rewires: {control:?}"
     );
 }

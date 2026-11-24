@@ -368,10 +368,15 @@ impl Node {
 /// edge row has its own visibility and owner and co-owner groups, apart from
 /// its endpoints. The public map draws public rows only. A team map draws
 /// public rows and the rows that team owns with no co-owner. A co-owned row
-/// is readable only by members of both groups, so it is never drawn on a
-/// single team's map (a joint view for such viewers is later work). Two
-/// readable endpoints do not make a row readable, and a served edge carries no row id or visibility, so
-/// [`LevelDocument::for_viewer`] cannot check this: the builder must.
+/// is readable only by members of both groups, so it is never baked into a
+/// single team's map. When both its ends are nodes of a team's leaf, the
+/// kernel draws it at request time instead, for a viewer whose own session
+/// reads it, on that viewer's answer only
+/// ([`LevelDocument::with_viewer_edges`]); a co-owned row whose ends no
+/// single map draws (a claim of each team) is drawn nowhere yet. Two readable endpoints do not make
+/// a row readable, and a served edge carries no row id or visibility, so
+/// [`LevelDocument::for_viewer`] cannot check this: the builder must, and the
+/// kernel's overlay read does.
 ///
 /// The `edges` table keeps one row per submission (migration 018 dropped
 /// its triple-uniqueness), so one (source, target, relationship) can have
@@ -592,6 +597,8 @@ impl LevelDocument {
     /// Edges are kept by their endpoints only. Whether each edge row is
     /// readable by the map's audience is settled when the builder draws the
     /// leaf (see [`Edge`]); a served edge carries nothing to check it by.
+    /// The co-owned edges a viewer reads are added afterwards, by
+    /// [`Self::with_viewer_edges`].
     ///
     /// Counts and signs pass through as stored: they are aggregates the
     /// team's map already shows, and `count >= sources.len()` still holds.
@@ -650,6 +657,70 @@ impl LevelDocument {
         }
         out.outgoing.retain(|o| !o.sources.is_empty());
         Some(LevelDocument::Leaf(out))
+    }
+
+    /// The leaf as served to one viewer with `extra` edges drawn on top of
+    /// it: the request-time per-viewer overlay of the co-owned edges (see
+    /// [`Edge`]) the viewer's own session can read between nodes the served
+    /// leaf already draws. Call it on the output of [`Self::for_viewer`].
+    ///
+    /// Purely additive. The stored edges keep their order and values; each
+    /// `extra` edge is appended, in the order given, when all of these hold:
+    /// * both ends are nodes of the leaf and the edge is no self-loop;
+    /// * its relationship is a contract name ([`is_relationship_name`]);
+    /// * its basis is one the endpoint kinds allow, its sign is -1, 0 or 1,
+    ///   its weight is in [0, 1], and a `none` edge (or a `proxy` edge of
+    ///   sign 0) has weight 0;
+    /// * no edge of the leaf (stored or added) already has its source,
+    ///   target and relationship, compared case-insensitively. A triple the
+    ///   map already draws keeps the map's edge, so an answer gains edges and
+    ///   never changes one;
+    /// * the leaf still has room under [`MAX_LEAF_EDGES`].
+    ///
+    /// Adding edges between existing nodes never drops a node, an edge or an
+    /// `outgoing` source, so a valid leaf stays valid. A group level is
+    /// returned as stored. Returns the document, the number of edges added,
+    /// and the number left out because the leaf was full.
+    #[must_use]
+    pub fn with_viewer_edges(&self, extra: &[Edge]) -> (LevelDocument, usize, usize) {
+        let leaf = match self {
+            LevelDocument::Group(_) => return (self.clone(), 0, 0),
+            LevelDocument::Leaf(l) => l,
+        };
+        let kinds: BTreeMap<Uuid, NodeKind> =
+            leaf.nodes.iter().map(|n| (n.id(), n.kind())).collect();
+        let mut triples: BTreeSet<(Uuid, Uuid, String)> = leaf
+            .edges
+            .iter()
+            .map(|e| (e.source, e.target, e.relationship.to_ascii_lowercase()))
+            .collect();
+        let mut out = leaf.clone();
+        let (mut added, mut over_cap) = (0, 0);
+        for e in extra {
+            let (Some(&s), Some(&t)) = (kinds.get(&e.source), kinds.get(&e.target)) else {
+                continue;
+            };
+            let flow_ok = (-1..=1).contains(&e.sign)
+                && (0.0..=1.0).contains(&e.flow_weight)
+                && e.flow_basis.allows(s, t)
+                && !(e.flow_basis == FlowBasis::None && (e.flow_weight != 0.0 || e.sign != 0))
+                && !(e.flow_basis == FlowBasis::Proxy && e.sign == 0 && e.flow_weight != 0.0);
+            if e.source == e.target || !is_relationship_name(&e.relationship) || !flow_ok {
+                continue;
+            }
+            let key = (e.source, e.target, e.relationship.to_ascii_lowercase());
+            if triples.contains(&key) {
+                continue;
+            }
+            if out.edges.len() >= MAX_LEAF_EDGES {
+                over_cap += 1;
+                continue;
+            }
+            triples.insert(key);
+            out.edges.push(e.clone());
+            added += 1;
+        }
+        (LevelDocument::Leaf(out), added, over_cap)
     }
 
     /// Every rule of schema v1 that the types do not already enforce, plus

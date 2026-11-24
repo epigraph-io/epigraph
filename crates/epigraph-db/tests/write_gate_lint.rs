@@ -174,7 +174,12 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     ("claim.rs::update_trace_id_conn", "caller-supplied id"),
     ("claim.rs::update_truth_value_conn", "caller-supplied id"),
     ("edge.rs::retract", "caller-supplied id"),
-    ("frame.rs::set_property", "caller-supplied id"),
+    (
+        "frame.rs::write_property",
+        "caller-supplied id; behind the public `set_property` and `set_validated_belief_profile`, \
+         the second of which does not check the object it stores (the engine's \
+         `set_frame_overrides` validates before calling it)",
+    ),
     ("perspective.rs::set_reliability_map", "caller-supplied id"),
     ("semantic_link.rs::retract", "caller-supplied ids"),
     // ── derived-row writes keyed on a claim the caller named ────────────────
@@ -237,7 +242,6 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "clustering, corpus-wide",
     ),
     ("claim_theme.rs::bulk_assign", "clustering, corpus-wide"),
-    ("claim_theme.rs::delete_all_conn", "clustering, corpus-wide"),
     ("claim_theme.rs::unassign_claim", "clustering, corpus-wide"),
     // `evidence.rs::store_embedding` left this register with the function
     // (backlog f78526ad): it had no caller and no seal predicate.

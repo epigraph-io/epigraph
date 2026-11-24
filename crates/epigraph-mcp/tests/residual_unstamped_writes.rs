@@ -106,18 +106,19 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "server.rs",
-        "AgentRepository::create",
+        "AgentRepository::create_signer",
         1,
-        "`agent_id`'s first-boot creation of the server's OWN `agents` row. `agents` carries no \
-         owner group (universally readable, migration 077), so the INSERT is admitted unstamped, \
-         and no caller exists to stamp from: this resolves the identity requests are attributed to.",
+        "`agent_id`'s first-boot creation of the server's OWN `agents` row (typed `llm` or \
+         `software_agent` at INSERT, backlog 9d4673a0). `agents` carries no owner group \
+         (universally readable, migration 077), so the INSERT is admitted unstamped, and no \
+         caller exists to stamp from: this resolves the identity requests are attributed to.",
     ),
     (
         "server.rs",
         "AgentRepository::set_llm_properties",
         1,
         "`agent_id`'s CREATE branch: annotate the freshly created server agent row with its \
-         derived LLM identity. Same row and same reason as `AgentRepository::create` above.",
+         derived LLM identity. Same row and same reason as `AgentRepository::create_signer` above.",
     ),
     (
         "server.rs",
@@ -231,19 +232,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/ingestion.rs",
-        "PaperRepository::get_or_create",
-        3,
-        "The `papers` upsert, three times: `ensure_paper_node` (synchronous, before the detached \
-         task is spawned), and the walk-opening call in `do_ingest_document` and \
-         `do_ingest_document_spine` (the last two reached through `let pool = &server.pool`, which \
-         this scan now follows). `papers` has NO row-level security \
-         (`relrowsecurity = false`, measured at head 101), so these are admitted unstamped by \
-         construction, and `ensure_paper_node` has already created the row before the walk's \
-         call runs. The rest of both walks runs on ONE transaction stamped from the ingesting \
-         agent (Unit E); reverting any of those statements to `pool` adds an entry here.",
-    ),
-    (
-        "tools/ingestion.rs",
         "server.pool.begin",
         1,
         "`begin_ingest_tx`'s PRIVILEGED arm: a plain transaction, taken ONLY when the server has \
@@ -290,13 +278,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/workflows.rs",
-        "BehavioralExecutionRepository::create",
-        1,
-        "`report_workflow_outcome`. `behavioral_executions` is not claim-derived and carries no \
-         `owner_group_id`, so there is no `WITH CHECK` for a stamp to satisfy.",
-    ),
-    (
-        "tools/workflows.rs",
         "ClaimRepository::merge_properties",
         1,
         "`refresh_workflow_promotion`'s `properties.promotion` overwrite. Surfaced when `merge` \
@@ -310,17 +291,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          `merge_properties` returns NotFound. Same population and the same H3 question as \
          `evolve_step`: the workflow claims it patches are authored by \
          `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
-    ),
-    (
-        "unauthenticated_reader.rs",
-        "AgentRepository::create",
-        1,
-        "`UnauthenticatedReader::find_or_create`'s first-use creation of the \
-         `--allow-unauthenticated-http` reader agent's OWN `agents` row. `agents` carries no \
-         owner group (universally readable, migration 077), so the INSERT is admitted \
-         unstamped, and no caller exists to stamp from: this IS the zero-membership identity \
-         the listener reads as. Same row class and reason as `server.rs`'s \
-         `AgentRepository::create`.",
     ),
 ];
 

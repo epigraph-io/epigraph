@@ -738,3 +738,118 @@ async fn stdio_evolve_needs_the_submitter(pool: PgPool) {
     assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
     assert!(evolve_rows(&pool, ADMIN_WRITE).await.is_empty());
 }
+
+/// Whether a backend of this test's database is waiting on an advisory lock,
+/// polled until one is or `task` finishes (deadline 30 s).
+async fn evolve_waits_on_the_lineage_lock<T>(
+    pool: &PgPool,
+    task: &tokio::task::JoinHandle<T>,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() \
+                AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return true;
+        }
+        if task.is_finished() {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// An `executes` edge into the step's lineage that a writer has inserted but
+/// not yet committed is gated by a concurrent evolve (backlog bf2e9aa6; the
+/// REST twin is in `epigraph-api/tests/evolve_step_lineage_authority.rs`).
+///
+/// A may evolve its own workflow's step. B's workflow is being attached to
+/// that step by the repository's `executes` writer (the one the ingest uses)
+/// on a transaction still open. The evolve must wait for that writer and then,
+/// with B's workflow in the set, refuse A naming it, with nothing written.
+///
+/// VERIFIED TO FAIL before the fix: the gate read its set with no lock, never
+/// waited, and the evolve was admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_executes_edge_in_flight_is_gated_by_a_concurrent_evolve(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (a, a_token, a_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_b, b_token, b_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_wf_a, step) =
+        ingest_as(&server, &pool, "acme-mcp-evolve-race", &a_viewer, &a_token).await;
+    let (wf_b, _) = ingest_as(
+        &server,
+        &pool,
+        "acme-mcp-evolve-race-b",
+        &b_viewer,
+        &b_token,
+    )
+    .await;
+
+    let mut writer = pool.begin().await.expect("the writer's transaction");
+    let (_, created) =
+        epigraph_db::EdgeRepository::create_if_absent_including_retracted_signed_conn(
+            &mut writer,
+            None,
+            wf_b,
+            "workflow",
+            step,
+            "claim",
+            "executes",
+            Some(serde_json::json!({"level": 2, "plan_index": 7})),
+            None,
+            None,
+        )
+        .await
+        .expect("the writer inserts B's executes edge");
+    assert!(created, "the edge is new");
+
+    let content = "A's revision while an executes edge is in flight";
+    let evolver = server.clone();
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, a)
+        .await
+        .expect("A's viewer");
+    let auth = a_token.clone();
+    let task = tokio::spawn(async move {
+        tools::evolve_step::evolve_step(
+            &evolver,
+            &viewer,
+            by_id(step, content, "revises"),
+            Some(&auth),
+        )
+        .await
+        .map_err(|e| e.message.to_string())
+    });
+    let waited = evolve_waits_on_the_lineage_lock(&pool, &task).await;
+    writer.commit().await.expect("the writer commits");
+    let outcome = task.await.expect("the evolve task");
+    assert!(
+        waited,
+        "the evolve did not wait for the in-flight executes edge: {outcome:?}"
+    );
+    let msg = outcome.expect_err("the gate refuses A over B's workflow");
+    assert!(msg.contains("was submitted by agent"), "{msg}");
+    assert!(msg.contains("Nothing was written"), "{msg}");
+    assert!(msg.contains(&wf_b.to_string()), "names B's workflow: {msg}");
+    assert_eq!(claims_with_content(&pool, content).await, 0, "no claim");
+    assert!(is_current(&pool, step).await, "the parent is not retired");
+    assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
+
+    // CALIBRATION: with authority over both, the same evolve is admitted.
+    set_submitter(&pool, wf_b, a).await;
+    tools::evolve_step::evolve_step(
+        &server,
+        &a_viewer,
+        by_id(step, "A's revision both allow", "revises"),
+        Some(&a_token),
+    )
+    .await
+    .expect("authority over both workflows");
+}

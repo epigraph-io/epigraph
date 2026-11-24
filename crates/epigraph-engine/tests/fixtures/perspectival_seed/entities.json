@@ -1,0 +1,35 @@
+{
+  "_doc": "Fixture for perspectival_loader: the condition-cluster anchor and the four treatments.",
+  "entities": [
+    {
+      "key": "condition-cluster",
+      "canonical_name": "condition cluster (synthetic fixture)",
+      "type_top": "Condition",
+      "type_sub": "DiseaseState"
+    },
+    {
+      "key": "treatment-a",
+      "canonical_name": "treatment-a (synthetic fixture)",
+      "type_top": "Organism",
+      "type_sub": "Botanical"
+    },
+    {
+      "key": "treatment-b",
+      "canonical_name": "treatment-b (synthetic fixture)",
+      "type_top": "Organism",
+      "type_sub": "Botanical"
+    },
+    {
+      "key": "treatment-c",
+      "canonical_name": "treatment-c (synthetic fixture)",
+      "type_top": "Organism",
+      "type_sub": "Botanical"
+    },
+    {
+      "key": "treatment-e",
+      "canonical_name": "treatment-e (synthetic fixture)",
+      "type_top": "Organism",
+      "type_sub": "Botanical"
+    }
+  ]
+}

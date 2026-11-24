@@ -308,7 +308,7 @@ pub async fn submit_ds_evidence(
     // Retry-safety is still worth recording, though it no longer carries a
     // committed-partial argument. `assign_claim` is `ON CONFLICT … DO UPDATE` and
     // `store_with_perspective` upserts on
-    // `(claim_id, frame_id, source_agent_id, perspective_id)`, so a repeat call
+    // `(claim_id, frame_id, source_agent_id, perspective_id, slot)`, so a repeat call
     // re-states the same BBA rather than combining its mass twice.
     //
     // AND IT SUCCEEDS ONLY FOR CLAIMS THIS SERVER'S GROUP OWNS. Stated here because
@@ -347,6 +347,35 @@ pub async fn submit_ds_evidence(
     .await
     .map_err(internal_error)?
     .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+
+    // EPIGRAPH_COMPOUND_WRITE_GUARD (backlog 7435772c, SPEC §4.1 W3): these
+    // masses carry no evidence text, so on a COMPOUND they can never be
+    // attributed to its atoms. The role is decided by structure (migration
+    // 193's definer), before anything is written. `refuse` refuses with the
+    // atoms this caller can see; `warn` goes ahead (the row is inert: a
+    // compound has no cache-owner frame, so neither the recompute below nor
+    // any later owner-rule recompute folds it), tells the caller and, once
+    // the write commits, logs it.
+    let deprecated_compound_target = match epigraph_engine::compound_write_guard::decide(
+        &mut tx,
+        viewer,
+        claim_id,
+        server.compound_write_guard,
+        "submit_ds_evidence",
+        Some(agent_id),
+    )
+    .await
+    .map_err(internal_error)?
+    {
+        epigraph_engine::compound_write_guard::GuardDecision::NotCompound => None,
+        epigraph_engine::compound_write_guard::GuardDecision::Accept(target) => {
+            warnings.push(target.warning());
+            Some(target)
+        }
+        epigraph_engine::compound_write_guard::GuardDecision::Refuse(target) => {
+            return Err(compound_target_refusal(&target));
+        }
+    };
 
     // Evidence named on `hypothesis_assessment` for a PROMOTED hypothesis goes
     // to the frame its readers read, `research_validity` (writers follow the
@@ -473,6 +502,13 @@ pub async fn submit_ds_evidence(
              POST /api/v1/claims/:id/assess; choose another perspective",
         ));
     }
+    // The claim's index on the frame BEFORE this call assigns it: the index a
+    // BBA this call replaces was counted with on the Beta track, and so the
+    // one its increment is withdrawn at (backlog 862d8404).
+    let prior_index = FrameRepository::get_claim_assignment(&mut *tx, viewer, claim_id, frame_id)
+        .await
+        .map_err(internal_error)?
+        .and_then(|a| a.hypothesis_index);
     FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
         .await
         .map_err(internal_error)?;
@@ -494,8 +530,11 @@ pub async fn submit_ds_evidence(
     let rows = MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
         .await
         .map_err(internal_error)?;
-    let write_outcome = match prior_for(&rows, Some(agent_id), perspective_id) {
-        None => BbaWriteOutcome::Inserted,
+    // A replacement also yields what the replaced row was counted with on the
+    // Beta track, withdrawn below as this BBA's increment is added (backlog
+    // 862d8404); `None` for a row the track never counted.
+    let (write_outcome, withdrawn) = match prior_for(&rows, Some(agent_id), perspective_id) {
+        None => (BbaWriteOutcome::Inserted, None),
         Some(row)
             if restates_bba(
                 row,
@@ -505,9 +544,12 @@ pub async fn submit_ds_evidence(
                 stored_locality_tag,
             ) =>
         {
-            BbaWriteOutcome::Unchanged
+            (BbaWriteOutcome::Unchanged, None)
         }
-        Some(_) => BbaWriteOutcome::Replaced,
+        Some(row) => (
+            BbaWriteOutcome::Replaced,
+            epigraph_engine::ds_divergence::replaced_increments(row, &frame, prior_index),
+        ),
     };
     match write_outcome {
         BbaWriteOutcome::Unchanged => warnings.push(
@@ -518,8 +560,9 @@ pub async fn submit_ds_evidence(
         ),
         BbaWriteOutcome::Replaced => warnings.push(
             "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
-             perspective_id (same mass_function_id); it was not added beside it. To add \
-             independent evidence, submit it under a distinct perspective_id."
+             perspective_id (same mass_function_id); it was not added beside it, and \
+             bayesian_posterior counts it in place of the replaced BBA. To add independent \
+             evidence, submit it under a distinct perspective_id."
                 .to_string(),
         ),
         BbaWriteOutcome::Inserted => {}
@@ -554,7 +597,8 @@ pub async fn submit_ds_evidence(
     // `POST /frames/:id/evidence` keeps it, by the same function: the stored
     // BBA's mass on the claim's assigned hypothesis goes to alpha, the rest of
     // its non-conflict mass to beta. An identical resubmission was counted
-    // when it was first stored and is not counted again. Best-effort, under
+    // when it was first stored and is not counted again; a replacement
+    // withdraws the replaced BBA's increment as it adds its own. Best-effort, under
     // its own savepoint: a refused statement (a non-owner of a public claim
     // does not write its row) never aborts this submission.
     let assigned_index =
@@ -568,6 +612,7 @@ pub async fn submit_ds_evidence(
         claim_id,
         (write_outcome != BbaWriteOutcome::Unchanged)
             .then(|| epigraph_engine::ds_divergence::beta_increments(&mass_fn, assigned_index)),
+        withdrawn,
         "submit_ds_evidence",
     )
     .await
@@ -784,6 +829,11 @@ pub async fn submit_ds_evidence(
     }
 
     tx.commit().await.map_err(internal_error)?;
+    // The compound write has landed: only now does it count in the guard's
+    // journal (a call that failed above added no line).
+    if let Some(target) = &deprecated_compound_target {
+        target.log_accepted("submit_ds_evidence", Some(agent_id));
+    }
 
     let betp = pignistic_prob.unwrap_or(0.0);
     let ign = plausibility - belief;
@@ -805,7 +855,22 @@ pub async fn submit_ds_evidence(
         warnings,
         unknown_keys,
         unknown_locality_tag,
+        deprecated_compound_target,
     })
+}
+
+/// The `refuse`-mode answer to a textless BBA write on a compound
+/// (`EPIGRAPH_COMPOUND_WRITE_GUARD=refuse`): `INVALID_PARAMS`, the caller's
+/// remedy (write on the atoms) in the message, and the machine-keyed body
+/// the REST twin's 422 carries in `data`. Nothing was written.
+fn compound_target_refusal(
+    target: &epigraph_engine::compound_write_guard::CompoundTarget,
+) -> McpError {
+    McpError {
+        code: rmcp::model::ErrorCode::INVALID_PARAMS,
+        message: std::borrow::Cow::from(target.refusal()),
+        data: Some(target.refusal_data()),
+    }
 }
 
 /// Whether `row` already holds exactly what this call is about to store, by

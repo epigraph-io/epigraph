@@ -15,7 +15,9 @@ connection for query consistency.
 Why nested-CLI file-write, with stdout as the second source: Claude CLI's
 `result` field is empty when invoked from inside another agent's session, so
 the prompt asks the model to Write a JSON file and the script polls for it on
-disk (`--dangerously-skip-permissions` lets the Write tool run unattended).
+disk (`--dangerously-skip-permissions` lets the Write tool run unattended;
+`--tools Write` makes it the only tool, and the CLI gets no database
+credentials in its environment: call_claude_cli).
 Outside such a session the model often answers inline instead (backlog
 b6191a3c: about two answers in three on a --relabel-all run), so when no file
 appears call_claude_cli reads the first JSON value in the envelope's `result`.
@@ -49,6 +51,11 @@ as for themes.
 Environment:
     DATABASE_URL  - Postgres connection string. epigraph_admin is required
                     for the UPDATE; epigraph_ro is sufficient for --dry-run.
+
+Exit status: 0 when every theme (or neighbourhood) considered was labelled,
+given the placeholder or skipped; EXIT_SOME_FAILED when at least one got no
+valid answer and kept its old label. theme_pipeline reports a label step as
+failed from this status alone, so a partial failure must not exit 0.
 """
 
 import argparse
@@ -79,19 +86,34 @@ RESULT_POLL_INTERVAL = 1.0
 # read to name it from (theme_lib.public_label_source). is_placeholder_label
 # matches it, so a later run labels it once a public member joins.
 NO_PUBLIC_MEMBER_LABEL = theme_lib.NO_PUBLIC_MEMBER_LABEL
+# Exit status when at least one theme or neighbourhood got no valid answer.
+EXIT_SOME_FAILED = 1
+
+
+def exit_status(failed):
+    """The process exit status for a run that left `failed` items unlabelled."""
+    return EXIT_SOME_FAILED if failed else 0
 
 
 def load_themes_with_samples(conn, limit=None):
-    """Load themes (ordered by claim_count desc) and their top-10 nearest
-    PUBLIC claims (theme_lib.public_label_source). A theme with no public
-    member comes back with no samples."""
+    """Load EVERY theme (ordered by claim_count desc) and its top-10 nearest
+    PUBLIC current claims (theme_lib.public_label_source). A theme with no
+    public member comes back with no samples.
+
+    Every theme, whatever its centroid: a theme whose centroid is 3072-d only
+    (seed_themes_from_textbooks, for a section embedded only at 3072-d) or
+    absent shows its stored label like any other, so --relabel-all must reach
+    it too. Members are ranked by distance to the 1536-d centroid, else to the
+    3072-d one, then by id, so a member with no embedding of the theme's
+    dimension is still sampled, after the ranked ones. is_current is stated
+    rather than implied by `embedding IS NOT NULL` (a superseded claim has no
+    embedding)."""
     themes = []
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         sql = """
             SELECT id, label, description, claim_count
             FROM claim_themes
-            WHERE centroid IS NOT NULL
-            ORDER BY claim_count DESC
+            ORDER BY claim_count DESC, id
         """
         if limit:
             sql += f" LIMIT {int(limit)}"
@@ -110,13 +132,17 @@ def load_themes_with_samples(conn, limit=None):
                        COALESCE(a.display_name, 'unknown') AS agent
                 FROM claims c
                 LEFT JOIN agents a ON c.agent_id = a.id
-                WHERE c.theme_id = %s
-                  AND c.embedding IS NOT NULL
+                CROSS JOIN claim_themes t
+                WHERE t.id = %s
+                  AND c.theme_id = t.id
+                  AND c.is_current
                   AND {theme_lib.public_label_source("c")}
-                ORDER BY c.embedding <=> (SELECT centroid FROM claim_themes WHERE id = %s)
+                ORDER BY COALESCE(c.embedding <=> t.centroid,
+                                  c.embedding_3072 <=> t.centroid_3072) NULLS LAST,
+                         c.id
                 LIMIT 10
                 """,
-                (theme_id, theme_id),
+                (theme_id,),
             )
             samples = cur.fetchall()
             themes.append({
@@ -234,12 +260,41 @@ def _read_result_file(result_path):
             return None
 
 
+# Environment variables never handed to the Claude CLI: the database
+# credentials this script (and theme_pipeline's label step) run with.
+_CLI_SECRET_ENV = ("PGPASSWORD",)
+
+
+def claude_cli_env(environ=None):
+    """The Claude CLI's environment: this process's, minus database credentials.
+
+    The prompt quotes member text that any public-claim author controls, so
+    the CLI is given only the Write tool (`--tools Write` in call_claude_cli);
+    that is what stops an injected prompt from running commands. Dropping
+    every *DATABASE_URL* variable and PGPASSWORD as well means a model that
+    did get a shell would not find the DSN by listing its own environment.
+    It is not a boundary on its own: a same-user process can still read its
+    parent's /proc environ and cmdline. HOME, PATH and the CLI's own auth
+    state pass through unchanged.
+    """
+    environ = os.environ if environ is None else environ
+    return {
+        k: v for k, v in environ.items()
+        if "DATABASE_URL" not in k.upper() and k.upper() not in _CLI_SECRET_ENV
+    }
+
+
 def call_claude_cli(prompt, result_path, cwd, timeout=120):
     """Call Claude CLI and return its label answer ({label, description}) or None.
 
     The answer is taken from the result file the prompt asks the model to
     Write, else from the model's inline answer on stdout (inline_label_answer),
     else from the file once it appears within the poll window.
+
+    The CLI runs with `--tools Write`: Write is the only tool the file-answer
+    path needs, and `--dangerously-skip-permissions` would otherwise let a
+    prompt injected through member text run Bash unattended. Its environment
+    carries no database credentials (claude_cli_env).
     """
     try:
         proc = subprocess.run(
@@ -248,6 +303,7 @@ def call_claude_cli(prompt, result_path, cwd, timeout=120):
                 "--output-format", "json",
                 "--model", "claude-haiku-4-5-20251001",
                 "--max-turns", "1",
+                "--tools", "Write",
                 "--dangerously-skip-permissions",
             ],
             capture_output=True,
@@ -255,6 +311,7 @@ def call_claude_cli(prompt, result_path, cwd, timeout=120):
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             cwd=cwd,
+            env=claude_cli_env(),
         )
     except subprocess.TimeoutExpired:
         print(f"    TIMEOUT after {timeout}s", file=sys.stderr)
@@ -341,10 +398,16 @@ def is_neighborhood_placeholder_label(label):
 
 def latest_cluster_run(conn):
     """The clustering run the expand route serves (ClusterRunRepository::latest:
-    newest completed_at), or None."""
+    the newest completed run with algo = 'louvain'), or None.
+
+    A louvain_bridge run (POST /api/v1/clusters/build-from-bridges) has no
+    graph_neighborhoods rows and is never the run expand serves, so it must
+    not be picked here either: labelling it would label nothing while expand
+    kept serving the Louvain run's neighborhood-N placeholders."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT run_id::text FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1"
+            "SELECT run_id::text FROM graph_cluster_runs WHERE algo = 'louvain' "
+            "ORDER BY completed_at DESC LIMIT 1"
         )
         row = cur.fetchone()
     return row[0] if row else None
@@ -443,6 +506,7 @@ def label_neighborhoods(conn, run_id, limit=None, relabel_all=False, dry_run=Fal
 
 
 def main():
+    """Run the labeller; return the process exit status (exit_status)."""
     parser = argparse.ArgumentParser(description="Label themes with LLM summaries")
     parser.add_argument(
         "--database-url",
@@ -472,7 +536,7 @@ def main():
     parser.add_argument(
         "--run-id", default=None,
         help="With --neighborhoods: the graph_cluster_runs run to label "
-             "(default: the latest, the one the expand route serves)",
+             "(default: the latest Louvain run, the one the expand route serves)",
     )
     args = parser.parse_args()
 
@@ -484,7 +548,7 @@ def main():
         if run_id is None:
             print("No clustering run: nothing to label", file=sys.stderr)
             conn.close()
-            return
+            return 0
         labeled, placeholders, skipped, failed = label_neighborhoods(
             conn, run_id, limit=args.limit, relabel_all=args.relabel_all,
             dry_run=args.dry_run, cli_cwd=args.cli_cwd,
@@ -495,7 +559,7 @@ def main():
             file=sys.stderr,
         )
         conn.close()
-        return
+        return exit_status(failed)
 
     print("Loading themes with sample claims...", file=sys.stderr)
     themes = load_themes_with_samples(conn, limit=args.limit)
@@ -563,7 +627,8 @@ def main():
         file=sys.stderr,
     )
     conn.close()
+    return exit_status(failed)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

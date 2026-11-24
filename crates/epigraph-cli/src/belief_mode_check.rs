@@ -23,8 +23,9 @@
 //! `--help` and exists for tests and for a deliberate, recorded operator
 //! override; a wave run never needs it.
 //!
-//! Wave bins wired today: `recompute_betp`, `backfill_factors`, and
-//! `decompose_claims` in its two retarget writing modes. A wave bin added
+//! Wave bins wired today: `recompute_betp`, `backfill_factors`,
+//! `recompute_claim_belief`, and `decompose_claims` in its two retarget
+//! writing modes. A wave bin added
 //! later (`attribute_atoms`, `rekey_self_assertions`) calls [`enforce`] the
 //! same way.
 
@@ -193,9 +194,9 @@ pub async fn enforce_or_exit(bin: &str, intent: RunIntent, allow_skew: bool) {
 /// and it refuses instead a wave whose fold does not cover its role.
 ///
 /// # Errors
-/// The refusal text, when `ours.atom_fold` is not the legacy fold.
+/// The refusal text, when `ours.atom_fold()` is not the legacy fold.
 pub fn check_build_writes_fold(bin: &str, ours: &BeliefModes) -> Result<(), String> {
-    if ours.atom_fold == AtomFold::Legacy {
+    if ours.atom_fold() == AtomFold::Legacy {
         return Ok(());
     }
     Err(format!(
@@ -203,7 +204,7 @@ pub fn check_build_writes_fold(bin: &str, ours: &BeliefModes) -> Result<(), Stri
          this build writes only the legacy fold, so it would write legacy-fold caches while \
          the {fold} fold is in force. Run a build that implements the {fold} fold, or run \
          with --dry-run. --allow-mode-skew does not lift this.",
-        fold = ours.atom_fold,
+        fold = ours.atom_fold(),
         env = AtomFold::ENV,
     ))
 }
@@ -228,16 +229,28 @@ mod tests {
     use super::*;
     use epigraph_engine::belief_modes::{BpApply, CompoundWriteGuard};
 
+    /// The modes an environment of `pairs` describes, every other flag at its
+    /// default (the fields are private to `belief_modes`).
+    fn modes(pairs: &[(&str, &str)]) -> BeliefModes {
+        let read = BeliefModes::from_lookup(|key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_string())
+        });
+        assert!(read.unrecognised.is_empty(), "{:?}", read.unrecognised);
+        read.modes
+    }
+
     /// Only the legacy fold passes, whatever the other modes are; every other
     /// fold is refused, named, with what this build writes.
     #[test]
     fn a_fold_this_build_cannot_write_is_refused_and_legacy_is_not() {
         for fold in AtomFold::ALL.iter().copied() {
-            let ours = BeliefModes {
-                atom_fold: fold,
-                bp_apply: BpApply::On,
-                ..BeliefModes::default()
-            };
+            let ours = modes(&[
+                (AtomFold::ENV, fold.as_str()),
+                (BpApply::ENV, BpApply::On.as_str()),
+            ]);
             let decision = check_build_writes_fold("bin", &ours);
             if fold == AtomFold::Legacy {
                 assert_eq!(decision, Ok(()));
@@ -260,11 +273,10 @@ mod tests {
             Ok(())
         );
 
-        let ours = BeliefModes {
-            atom_fold: AtomFold::Aef,
-            compound_write_guard: CompoundWriteGuard::Refuse,
-            ..server
-        };
+        let ours = modes(&[
+            (AtomFold::ENV, AtomFold::Aef.as_str()),
+            (CompoundWriteGuard::ENV, CompoundWriteGuard::Refuse.as_str()),
+        ]);
         let refusal = check_writing_run("bin", &ours, &[], Ok(server), "http://api").unwrap_err();
         for needle in [
             "atom_fold",
@@ -281,10 +293,7 @@ mod tests {
         assert!(!refusal.contains("bp_apply"), "{refusal}");
 
         // One differing mode is enough, whichever it is.
-        let only_bp = BeliefModes {
-            bp_apply: BpApply::On,
-            ..server
-        };
+        let only_bp = modes(&[(BpApply::ENV, BpApply::On.as_str())]);
         assert!(check_writing_run("bin", &only_bp, &[], Ok(server), "http://api").is_err());
     }
 
@@ -311,10 +320,7 @@ mod tests {
         let read = BeliefModes::from_lookup(|key| {
             (key == AtomFold::ENV).then(|| "aef-standalone".to_string())
         });
-        let server = BeliefModes {
-            atom_fold: AtomFold::AefStandalone,
-            ..BeliefModes::default()
-        };
+        let server = modes(&[(AtomFold::ENV, AtomFold::AefStandalone.as_str())]);
         for refusal in [
             check_writing_run(
                 "bin",

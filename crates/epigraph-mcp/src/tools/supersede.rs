@@ -39,7 +39,7 @@ pub async fn supersede_claim(
     // The act's edges are attested at INSERT with the server's key (backlog
     // `dae795f8`), resolved before the act's transaction opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, caller) = begin_claim_act(
+    let (mut tx, actor, caller, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -161,7 +161,7 @@ pub fn supersede_refusal(claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError
         return denial;
     }
     if let Some(message) = database_42501(&e) {
-        if !opens_with_refusal_code(&message) {
+        if !crate::errors::coded(&message) {
             tracing::warn!(
                 target: "tenancy.scoped_write",
                 tool = "supersede_claim",
@@ -243,19 +243,6 @@ fn caller_denial(message: String) -> McpError {
         message: std::borrow::Cow::from(message),
         data: None,
     }
-}
-
-/// Whether a database message opens with a schema refusal code (two to five
-/// ASCII capitals, two digits, a colon: `FA04: ...`), the convention the
-/// migrations' designed refusals follow.
-fn opens_with_refusal_code(message: &str) -> bool {
-    let b = message.as_bytes();
-    let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
-    (2..=5).contains(&caps)
-        && b.len() > caps + 2
-        && b[caps].is_ascii_digit()
-        && b[caps + 1].is_ascii_digit()
-        && b[caps + 2] == b':'
 }
 
 /// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
@@ -360,7 +347,15 @@ async fn begin_claim_act<'p>(
     canonical: Option<uuid::Uuid>,
     tool: &'static str,
     action: &str,
-) -> Result<(epigraph_db::ScopedTx<'p>, uuid::Uuid, uuid::Uuid), McpError> {
+) -> Result<
+    (
+        epigraph_db::ScopedTx<'p>,
+        uuid::Uuid,
+        uuid::Uuid,
+        Option<LinkAdmission>,
+    ),
+    McpError,
+> {
     let not_found = |id: uuid::Uuid| invalid_params(format!("claim {id} not found"));
 
     // The write identity (batch H-b, D1): the caller's own agent over HTTP,
@@ -374,8 +369,19 @@ async fn begin_claim_act<'p>(
             .await
             .map_err(internal_error)?
             .ok_or_else(|| not_found(claim))?;
-        crate::tools::claims::require_owner_or_admin(server, auth, caller, claim_author).await?;
-        return Ok((tx, caller.agent_id(), caller.agent_id()));
+        let grant = crate::tools::claims::require_owner_or_admin(
+            server,
+            &mut tx,
+            auth,
+            caller,
+            claim_author,
+        )
+        .await?;
+        let link = grant.is_link().then_some(LinkAdmission {
+            caller,
+            author: claim_author,
+        });
+        return Ok((tx, caller.agent_id(), caller.agent_id(), link));
     };
 
     let mut caller_tx = crate::claim_helper::begin_author_stamped_tx(server, caller, tool).await?;
@@ -428,7 +434,7 @@ async fn begin_claim_act<'p>(
     tracing::info!(tool, claim = %claim, arm = arm.as_str(), "claim act admitted");
 
     if viewer.writable_groups().contains(&owner_group) {
-        return Ok((caller_tx, caller.agent_id(), caller.agent_id()));
+        return Ok((caller_tx, caller.agent_id(), caller.agent_id(), None));
     }
     if arm != epigraph_auth::claim_act::ClaimActArm::Admin {
         // Not reachable through `claim_act_arm` (a non-admin arm requires the
@@ -444,7 +450,48 @@ async fn begin_claim_act<'p>(
         .await?;
     drop(caller_tx);
     let tx = crate::claim_helper::begin_author_stamped_tx(server, server_agent, tool).await?;
-    Ok((tx, server_agent.agent_id(), caller.agent_id()))
+    Ok((tx, server_agent.agent_id(), caller.agent_id(), None))
+}
+
+/// A claim act admitted through an operator link (`OwnershipGrant::is_link`):
+/// the caller and the claim author it was admitted over. Returned by
+/// [`begin_claim_act`] so an act that commits on ANOTHER transaction than the
+/// gate's (the un-mark, on the administrative connection) can decide the
+/// admission again there, under the link lock ([`LinkRecheck`]). An act that
+/// commits on the transaction `begin_claim_act` returns needs nothing more:
+/// the gate already read the link on it, under the lock.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinkAdmission {
+    caller: crate::write_identity::WriteIdentity,
+    author: uuid::Uuid,
+}
+
+/// [`LinkAdmission`] decided again on the un-mark's own (administrative)
+/// transaction, before its act: `require_owner_or_admin` on that transaction,
+/// whose link arms take the link lock (backlog 9a5bc055). The un-mark's gate
+/// ran on the caller's transaction and rolled it back, which released the lock;
+/// without this a link retire committed between that gate and the un-mark's
+/// commit did not stop the un-mark.
+struct LinkRecheck<'a> {
+    server: &'a EpiGraphMcpFull,
+    auth: Option<&'a epigraph_auth::AuthContext>,
+    link: LinkAdmission,
+}
+
+#[async_trait::async_trait]
+impl admin_cascade::UnmarkPrecondition for LinkRecheck<'_> {
+    async fn check(&self, tx: &mut sqlx::PgConnection) -> Result<(), String> {
+        crate::tools::claims::require_owner_or_admin(
+            self.server,
+            tx,
+            self.auth,
+            self.link.caller,
+            self.link.author,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{}; nothing was changed", e.message))
+    }
 }
 
 pub async fn mark_duplicate(
@@ -473,18 +520,20 @@ pub async fn mark_duplicate(
 /// The gate `mark_duplicate` applies before it writes `dup` onto `canon`,
 /// and nothing else: the caller's authority over both claims, read through
 /// the caller ([`begin_claim_act`]). The transaction it opens is rolled back.
-/// `consolidate_claims(mode='identity')` asks it for every source before it
-/// marks any, so a source the caller may not mark refuses the whole call with
-/// nothing written.
-pub(crate) async fn mark_duplicate_preflight(
+/// Returns the principal the act would be stamped as (the caller, or this
+/// server's agent on a `claims:admin` borrow) and, for a grant through an
+/// operator link, the [`LinkAdmission`] to decide again on the transaction
+/// that commits. [`mark_duplicates_onto`] asks it for every duplicate before
+/// it opens its one transaction.
+async fn mark_duplicate_preflight(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     dup: uuid::Uuid,
     canon: uuid::Uuid,
     tool: &'static str,
-) -> Result<(), McpError> {
-    let (tx, _, _) = begin_claim_act(
+) -> Result<(uuid::Uuid, Option<LinkAdmission>), McpError> {
+    let (tx, actor, _, link) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -495,13 +544,237 @@ pub(crate) async fn mark_duplicate_preflight(
     )
     .await?;
     drop(tx);
-    Ok(())
+    Ok((actor, link))
+}
+
+/// Several dedup acts onto ONE canonical, all or nothing
+/// (`consolidate_claims(mode='identity')`, backlog 635dbfae). Each duplicate
+/// gets exactly what [`mark_duplicate_pair`] gives one: the act with its
+/// identity edge, then the cascade. Returns one `mark_duplicate` answer per
+/// duplicate, in the order given.
+///
+/// 1. Every pair's gate ([`mark_duplicate_preflight`]) first, each on its own
+///    rolled-back transaction, so one pair the caller may not mark refuses
+///    the call before anything is written.
+/// 2. ONE transaction, stamped as those gates decided, holds every act. All
+///    the pairs must share that stamp: a `claims:admin` caller that writes
+///    some duplicates' owning groups and not others' would need two stamps,
+///    and is refused with nothing written (split the call).
+/// 3. Inside it, every duplicate, and the canonical where the stamp can lock
+///    it, is locked in id order and re-checked
+///    ([`ClaimRepository::lock_dedup_sources_conn`]): a duplicate another
+///    writer marked, revised or retired after the gates, or a canonical
+///    another writer retired, refuses the whole batch. Any refusal before the
+///    commit rolls back every mark; the answer says no source was marked.
+/// 4. The administrative session is asked for once, before the commit; with
+///    none, each duplicate's cascade deferral is recorded inside the same
+///    transaction. After the commit the cascades run one by one on that
+///    session, best-effort, as for a single mark.
+///
+/// A canonical the stamp cannot write (a `claims:admin` caller marking onto
+/// a claim it may only read) cannot be locked, since a lock takes the UPDATE
+/// policy. Each act still refuses a canonical that is not current when it
+/// runs, which rolls the batch back too; only a retirement between the last
+/// act and the commit is then not seen, as for a single `mark_duplicate`.
+///
+/// `dups` must be distinct and must not contain `canon`; the caller checks.
+pub(crate) async fn mark_duplicates_onto(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    dups: &[uuid::Uuid],
+    canon: uuid::Uuid,
+    reason: Option<&str>,
+    tool: &'static str,
+) -> Result<Vec<serde_json::Value>, McpError> {
+    let Some(&first) = dups.first() else {
+        return Ok(Vec::new());
+    };
+
+    // 1. Every gate, before anything is written; each names its stamp.
+    let mut stamp: Option<uuid::Uuid> = None;
+    let mut links: Vec<LinkAdmission> = Vec::new();
+    for dup in dups {
+        let (actor, link) =
+            mark_duplicate_preflight(server, viewer, auth, *dup, canon, tool).await?;
+        links.extend(link);
+        match stamp {
+            None => stamp = Some(actor),
+            Some(s) if s == actor => {}
+            Some(_) => {
+                return Err(invalid_params(format!(
+                    "{tool}: claims {first} and {dup} would be marked under different write \
+                     identities (your own for a claim whose owning group you write, this \
+                     server's agent through the claims:admin borrow for one you do not), and \
+                     the marks are one transaction, which carries one; nothing was written. \
+                     Split the call by owning group."
+                )))
+            }
+        }
+    }
+
+    // 2. The one transaction. The identity edges are attested at INSERT with
+    // the server's key (backlog `dae795f8`), resolved before it opens.
+    let edge_key = server.edge_signing_key().await?;
+    let (mut tx, actor, _, _) = begin_claim_act(
+        server,
+        viewer,
+        auth,
+        first,
+        Some(canon),
+        tool,
+        "mark as a duplicate",
+    )
+    .await?;
+    if stamp != Some(actor) {
+        return Err(invalid_params(format!(
+            "{tool}: the write identity for claim {first} changed while the call ran (a \
+             membership change); nothing was written. Retry."
+        )));
+    }
+    // Every grant the gates made through an operator link is decided again
+    // HERE, on the transaction that commits the marks, whose link arms take
+    // the link lock (backlog 9a5bc055): each gate ran on its own transaction
+    // and rolled it back, which released the lock, so a link retired since
+    // then must still refuse the batch before anything is written.
+    for link in &links {
+        crate::tools::claims::require_owner_or_admin(
+            server,
+            &mut tx,
+            auth,
+            link.caller,
+            link.author,
+        )
+        .await?;
+    }
+    let n = dups.len();
+    let rolled_back = |e: epigraph_db::DbError| -> McpError {
+        let mut err = match e {
+            // A source another writer changed (or removed) since the gates,
+            // or a malformed pair: the caller's to re-read, not a fault to
+            // retry blindly.
+            epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::State | epigraph_db::RefusalKind::Input,
+                message,
+            } => invalid_params(message),
+            e @ epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
+            // A denial of the caller's authority the gates do not predict
+            // (the act's FA04 / FA07 refusals, a row-security refusal): the
+            // denial class, as `db_caller_error` answers it on every write
+            // tool, not a server fault an agent would retry.
+            epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::Authority,
+                message,
+            } => McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: message.into(),
+                data: None,
+            },
+            other
+                if matches!(other, epigraph_db::DbError::WriteRefused { .. })
+                    || other.is_write_authority_refusal() =>
+            {
+                crate::errors::db_caller_error(other)
+            }
+            other => internal_error(other),
+        };
+        err.message = format!(
+            "{} (no source was marked: the {n} marks are one transaction, and this refusal \
+             rolled it back)",
+            err.message
+        )
+        .into();
+        err
+    };
+
+    // 3. Lock and re-check every duplicate, then every act.
+    ClaimRepository::lock_dedup_sources_conn(&mut tx, dups, canon)
+        .await
+        .map_err(rolled_back)?;
+    let provenance = DuplicateProvenance::new(tool, DuplicateProvenance::RULE_CALLER_ASSERTED)
+        .marked_by(Some(actor))
+        .reason(reason);
+    for dup in dups {
+        ClaimRepository::mark_duplicate_act_attributed_conn(
+            &mut tx,
+            Some(edge_key),
+            ClaimId::from_uuid(*dup),
+            ClaimId::from_uuid(canon),
+            &provenance,
+        )
+        .await
+        .map_err(rolled_back)?;
+    }
+
+    // 4. One administrative session for every cascade, or every deferral
+    // recorded with the acts.
+    let triggers: Vec<CascadeTrigger> = dups
+        .iter()
+        .map(|dup| {
+            CascadeTrigger::new(
+                CascadeCause::Dedup,
+                Some(actor),
+                oauth_principal(auth),
+                *dup,
+                Some(canon),
+            )
+        })
+        .collect();
+    let (mut session, deferred) = match crate::maintenance::admin_cascade_session(server).await {
+        Ok(session) => (Some(session), Vec::new()),
+        Err(why) => {
+            let mut deferred = Vec::with_capacity(n);
+            for trigger in &triggers {
+                deferred.push(
+                    admin_cascade::record_deferral(&mut *tx, trigger, &why)
+                        .await
+                        .map_err(rolled_back)?,
+                );
+            }
+            (None, deferred)
+        }
+    };
+    // A failed COMMIT is not a known rollback: the server may have committed
+    // before the connection failed, so the answer must not say nothing was
+    // marked.
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged(
+            format!(
+                "{tool}: the commit of the {n} marks failed, and whether they stand is unknown; \
+                 re-read the sources before retrying"
+            ),
+            e,
+        )
+    })?;
+
+    let mut deferred = deferred.into_iter();
+    let mut out = Vec::with_capacity(n);
+    for (dup, trigger) in dups.iter().zip(&triggers) {
+        let (cascade, belief_cascade) = match session.as_mut() {
+            Some(session) => {
+                let (conn, v) = session.split();
+                admin_cascade::apply_after_dedup(conn, v, viewer, trigger, *dup, canon).await
+            }
+            None => (
+                deferred.next().unwrap_or_default(),
+                CascadeReport::default(),
+            ),
+        };
+        out.push(serde_json::json!({
+            "duplicate_id": dup,
+            "canonical_id": canon,
+            "mode": "mark_duplicate",
+            "cascade": cascade,
+            "belief_cascade": belief_cascade,
+        }));
+    }
+    Ok(out)
 }
 
 /// One dedup act, `dup` onto `canon`, and its cascade: the whole of
-/// `mark_duplicate`, shared with `consolidate_claims(mode='identity')`, which
-/// runs it once per non-survivor source. `tool` is recorded in the identity
-/// edge's provenance.
+/// `mark_duplicate`. `tool` is recorded in the identity edge's provenance.
+/// Several duplicates onto one canonical go through [`mark_duplicates_onto`]
+/// instead, which holds every act in one transaction.
 pub(crate) async fn mark_duplicate_pair(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -523,7 +796,7 @@ pub(crate) async fn mark_duplicate_pair(
     // The identity edge is attested at INSERT with the server's key (backlog
     // `dae795f8`), resolved before the act's transaction opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, _) = begin_claim_act(
+    let (mut tx, actor, _, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -630,6 +903,9 @@ pub(crate) struct UnmarkGate {
     author: uuid::Uuid,
     content: String,
     actor: uuid::Uuid,
+    /// Set when the gate admitted the caller through an operator link: the
+    /// un-mark decides it again on its own transaction ([`LinkRecheck`]).
+    link: Option<LinkAdmission>,
 }
 
 /// Every check `unmark_duplicate` makes before it writes, and nothing else:
@@ -693,7 +969,7 @@ pub(crate) async fn unmark_gate(
              written"
         )));
     }
-    let (mut tx, actor, _) = begin_claim_act(
+    let (mut tx, actor, _, link) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -720,7 +996,7 @@ pub(crate) async fn unmark_gate(
     // The same gate over each claim that replaced the canonical: the reversal
     // moves the duplicate's rows off it as off the canonical.
     for replacement in chain.iter().flat_map(|c| c.iter().skip(1)) {
-        let (mut tx, _, _) = begin_claim_act(
+        let (mut tx, _, _, _) = begin_claim_act(
             server,
             viewer,
             auth,
@@ -751,7 +1027,26 @@ pub(crate) async fn unmark_gate(
         author,
         content,
         actor,
+        link,
     })
+}
+
+/// The answer the un-mark tools give when the administrative un-mark changed
+/// nothing ([`admin_cascade::UnmarkRefusal`]): an act refusal of authority is
+/// a denial (`INVALID_REQUEST`), as on every other write tool; any other act
+/// refusal, and a mark with no record to reverse, is the caller's to correct
+/// (`INVALID_PARAMS`), with its text; a failure is a redacted internal error.
+pub(crate) fn unmark_refusal(e: admin_cascade::UnmarkRefusal) -> McpError {
+    match e {
+        admin_cascade::UnmarkRefusal::Act {
+            kind: epigraph_db::RefusalKind::Authority,
+            message,
+        } => caller_denial(message),
+        e @ (admin_cascade::UnmarkRefusal::Act { .. } | admin_cascade::UnmarkRefusal::NoRecord) => {
+            invalid_params(e.to_string())
+        }
+        e @ admin_cascade::UnmarkRefusal::Failed(_) => internal_error(e),
+    }
 }
 
 /// [`unmark_duplicate`]'s body, for a caller that knows which dedup it means
@@ -770,6 +1065,7 @@ pub(crate) async fn unmark_duplicate_expecting(
         author,
         content,
         actor,
+        link,
     } = unmark_gate(server, viewer, auth, dup, expected).await?;
     let chain =
         chain.map_err(|why| invalid_params(format!("claim {dup} {why}; nothing was written")))?;
@@ -790,8 +1086,9 @@ pub(crate) async fn unmark_duplicate_expecting(
         dup,
         Some(canonical),
     );
+    let recheck = link.map(|link| LinkRecheck { server, auth, link });
     let (conn, admin_viewer) = session.split();
-    let (outcome, belief_cascade) = admin_cascade::apply_unmark_authorized(
+    let (outcome, belief_cascade) = admin_cascade::apply_unmark_checked(
         conn,
         admin_viewer,
         viewer,
@@ -799,12 +1096,12 @@ pub(crate) async fn unmark_duplicate_expecting(
         dup,
         canonical,
         Some(&chain),
+        recheck
+            .as_ref()
+            .map(|r| r as &dyn admin_cascade::UnmarkPrecondition),
     )
     .await
-    .map_err(|e| match e {
-        admin_cascade::UnmarkRefusal::Failed(_) => internal_error(e),
-        other => invalid_params(other.to_string()),
-    })?;
+    .map_err(unmark_refusal)?;
 
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule), through the claim's author like every other write path.
@@ -831,38 +1128,36 @@ pub(crate) async fn unmark_duplicate_expecting(
 
 #[cfg(test)]
 mod tests {
-    use super::opens_with_refusal_code;
+    use super::unmark_refusal;
+    use epigraph_db::RefusalKind;
+    use epigraph_engine::admin_cascade::UnmarkRefusal;
+    use rmcp::model::ErrorCode;
 
-    /// The boundaries of the refusal-code grammar the supersede mapper splits
-    /// `42501` on (two to five ASCII capitals, exactly two digits, a colon, at
-    /// the very start), which is `errors::coded`'s grammar byte for byte.
+    /// An un-mark's act refusal of AUTHORITY is a denial (`INVALID_REQUEST`),
+    /// as on every other write tool; its other refusals stay the caller's to
+    /// correct (`INVALID_PARAMS`) with their text; a failure is redacted
+    /// (backlog dca9ed56: the act's driver errors used to be stringified into
+    /// the refusal and sent).
     #[test]
-    fn opens_with_refusal_code_admits_exactly_the_code_grammar() {
-        for coded in [
-            "CX03: the act",
-            "OPL01: unbound",
-            "ABCDE12: five capitals",
-            "AB12:",
-        ] {
-            assert!(opens_with_refusal_code(coded), "{coded:?} is coded");
+    fn an_unmark_refusal_is_answered_by_its_kind() {
+        let act = |kind| UnmarkRefusal::Act {
+            kind,
+            message: "unmark_duplicate: refused".into(),
+        };
+        let denial = unmark_refusal(act(RefusalKind::Authority));
+        assert_eq!(denial.code, ErrorCode::INVALID_REQUEST, "{denial:?}");
+        assert_eq!(denial.message, "unmark_duplicate: refused");
+        for kind in [RefusalKind::Input, RefusalKind::State] {
+            let e = unmark_refusal(act(kind));
+            assert_eq!(e.code, ErrorCode::INVALID_PARAMS, "{kind:?}: {e:?}");
+            assert_eq!(e.message, "unmark_duplicate: refused");
         }
-        for uncoded in [
-            "A12: one capital",
-            "ABCDEF12: six capitals",
-            "FA4: one digit",
-            "FA123: three digits",
-            "FA04 no colon",
-            "FA04",
-            " CX03: leading space",
-            "cx03: lower case",
-            "new row violates row-level security policy for table \"claims\"",
-            "permission denied for function epigraph_record_cascade_deferral",
-            "",
-        ] {
-            assert!(
-                !opens_with_refusal_code(uncoded),
-                "{uncoded:?} is not coded"
-            );
-        }
+        let none = unmark_refusal(UnmarkRefusal::NoRecord);
+        assert_eq!(none.code, ErrorCode::INVALID_PARAMS, "{none:?}");
+        let failed = unmark_refusal(UnmarkRefusal::Failed(
+            "Query failed: canceling statement due to lock timeout".into(),
+        ));
+        assert_eq!(failed.code, ErrorCode::INTERNAL_ERROR, "{failed:?}");
+        assert!(!failed.message.contains("lock timeout"), "{failed:?}");
     }
 }

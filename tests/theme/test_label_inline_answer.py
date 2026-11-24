@@ -27,7 +27,7 @@ import sys
 import pytest
 
 from scripts import label_themes_llm as L
-from tests.theme.conftest import TEST_DSN
+from tests.theme.conftest import script_dsn
 from tests.theme.test_label_excludes_intake import PUBLIC_TEXT, _claim, _group
 from tests.theme.test_label_neighborhoods import _label, _nbr, _run
 from tests.theme.test_label_neighborhoods import _theme as _plain_theme
@@ -219,7 +219,7 @@ def test_a_file_answer_still_wins(stub_claude, tmp_path):
 
 def _main(monkeypatch, *extra):
     monkeypatch.delenv("MAINTENANCE_DATABASE_URL", raising=False)
-    monkeypatch.setattr(sys, "argv", ["label_themes_llm.py", "--database-url", TEST_DSN, *extra])
+    monkeypatch.setattr(sys, "argv", ["label_themes_llm.py", "--database-url", script_dsn(), *extra])
     L.main()
 
 

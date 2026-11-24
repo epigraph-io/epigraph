@@ -389,7 +389,7 @@ async fn a_foreign_public_claim_still_takes_evidence_and_gets_no_divergence_row(
         .begin_as(&viewer)
         .await
         .expect("stamped probe tx");
-    let update = apply_beta_update(&mut probe, &viewer, claim, Some((0.8, 0.2)), "probe")
+    let update = apply_beta_update(&mut probe, &viewer, claim, Some((0.8, 0.2)), None, "probe")
         .await
         .expect("probe update");
     probe.rollback().await.expect("roll back the probe");
@@ -463,7 +463,7 @@ async fn overlapping_beta_updates_on_one_claim_lose_no_increment(pool: PgPool) {
     let claim = own_claim(&pool, group, "Two overlapping Beta updates both count.").await;
 
     let mut a = pool_a.begin_as(&viewer).await.expect("stamped tx A");
-    let pa = apply_beta_update(&mut a, &viewer, claim, Some((0.8, 0.2)), "tx A")
+    let pa = apply_beta_update(&mut a, &viewer, claim, Some((0.8, 0.2)), None, "tx A")
         .await
         .expect("A's update");
     assert!(
@@ -474,7 +474,7 @@ async fn overlapping_beta_updates_on_one_claim_lose_no_increment(pool: PgPool) {
 
     let b = async {
         let mut b = pool_b.begin_as(&viewer).await.expect("stamped tx B");
-        let pb = apply_beta_update(&mut b, &viewer, claim, Some((0.5, 0.5)), "tx B")
+        let pb = apply_beta_update(&mut b, &viewer, claim, Some((0.5, 0.5)), None, "tx B")
             .await
             .expect("B's update");
         b.commit().await.expect("commit B");
@@ -562,10 +562,23 @@ async fn a_cold_start_on_a_mature_claim_stays_out_of_top_divergent(pool: PgPool)
         "the cold-start update must not put the claim in top_divergent"
     );
 
-    // A different BBA from the same caller replaces its first and is counted:
-    // m({TRUE}) = 0.7 adds (0.7, 0.3).
+    // A second, independent BBA from the same caller, under a perspective it
+    // owns, is counted beside the first: m({TRUE}) = 0.7 adds (0.7, 0.3).
+    // (Not a replacement of the first: a replacement withdraws the BBA it
+    // replaces, backlog 862d8404, which would leave a track holding only the
+    // new BBA, itself a cold start.)
+    let agent = server.server_agent_id().await.expect("server agent");
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(format!("cold-start-second-{}", Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed perspective");
     let mut second = sde(claim, frame);
     second.masses = serde_json::json!({"0": 0.7, "~": 0.3});
+    second.perspective_id = Some(perspective.to_string());
     let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, second, None)
         .await
         .expect("the claim's second live evidence");
@@ -580,4 +593,463 @@ async fn a_cold_start_on_a_mature_claim_stays_out_of_top_divergent(pool: PgPool)
     assert!(close(row.bayesian_posterior, 2.5 / 4.0), "{row:?}");
     assert!(close(row.pignistic_prob, betp2), "{row:?}");
     assert!(close(row.kl_divergence, kl(betp2, 2.5 / 4.0)), "{row:?}");
+}
+
+fn assert_beta(got: (f64, f64), want: (f64, f64), what: &str) {
+    assert!(
+        (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
+        "{what}: want Beta{want:?}, got Beta{got:?}"
+    );
+}
+
+/// Backlog 862d8404, the MCP transport: a `submit_ds_evidence` write that
+/// REPLACES the caller's earlier BBA moves the Beta track by the difference
+/// between the two. Replacing a BBA with the same masses (only
+/// `evidence_type` differs, so the write is `replaced`, not `unchanged`)
+/// leaves the track and the reported posterior where they were; replacing it
+/// with different masses leaves the track a fresh claim holding only the new
+/// BBA has. At origin/main every replacement added its full increment: the
+/// first arm moved Beta(1.8, 1.2) to Beta(2.6, 1.4).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replaced_bba_moves_the_beta_track_by_the_difference_only(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let claim = own_claim(&pool, group, "862d8404 replaced over MCP").await;
+
+    let first =
+        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+            .await
+            .expect("first submission");
+    assert_eq!(first_text(&first)["write_outcome"], "inserted");
+    assert_beta(beta(&pool, claim).await, (1.8, 1.2), "first write");
+
+    let mut retyped = sde(claim, frame);
+    retyped.evidence_type = Some("statistical".into());
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, retyped, None)
+        .await
+        .expect("same masses, another evidence_type");
+    let body = first_text(&res);
+    assert_eq!(body["write_outcome"], "replaced", "{body}");
+    assert_beta(
+        beta(&pool, claim).await,
+        (1.8, 1.2),
+        "a BBA replaced by the same masses leaves the track where it was",
+    );
+
+    let mut other = sde(claim, frame);
+    other.evidence_type = Some("statistical".into());
+    other.masses = serde_json::json!({"0": 0.3, "~": 0.7});
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, other, None)
+        .await
+        .expect("different masses");
+    let body = first_text(&res);
+    assert_eq!(body["write_outcome"], "replaced", "{body}");
+    assert_beta(
+        beta(&pool, claim).await,
+        (1.3, 1.7),
+        "a replaced track holds only the new BBA, as a fresh claim would",
+    );
+}
+
+/// The guard on the withdrawal, MCP transport: the seed wire's `auto_wire` BBA
+/// sits in the author's slot with no perspective and was never counted by the
+/// Beta track, so the author's first `submit_ds_evidence` on the claim
+/// replaces it and withdraws nothing. (Holds at origin/main too; it pins that
+/// the withdrawal is limited to the writers that count.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn replacing_an_uncounted_seed_bba_withdraws_nothing(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let claim = own_claim(&pool, group, "862d8404 seed replaced over MCP").await;
+    let agent = server.server_agent_id().await.expect("server agent");
+    // As the seed wire leaves it: linked at hypothesis 0 (TRUE), so a
+    // withdrawal of the seed would have a singleton to read and would show.
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0)",
+    )
+    .bind(claim)
+    .bind(frame)
+    .execute(&pool)
+    .await
+    .expect("link the claim at hypothesis 0");
+    MassFunctionRepository::store_with_perspective(
+        &pool,
+        claim,
+        frame,
+        Some(agent),
+        None,
+        &serde_json::json!({"0": 0.9, "0,1": 0.1}),
+        None,
+        Some("auto_wire"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed the author's auto_wire BBA");
+
+    let res =
+        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+            .await
+            .expect("evidence over the seed");
+    let body = first_text(&res);
+    assert_eq!(body["write_outcome"], "replaced", "{body}");
+    assert_beta(
+        beta(&pool, claim).await,
+        (1.8, 1.2),
+        "an uncounted seed's mass is not withdrawn",
+    );
+}
+
+/// Backlog 862d8404's change to the cold-start rule, MCP transport: a
+/// replacement whose withdrawal leaves the track holding only the new BBA is a
+/// cold start and records no divergence row. At origin/main the replacement
+/// was counted on top of the replaced BBA, so it recorded one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replacement_that_leaves_only_the_new_bba_records_no_divergence(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let claim = own_claim(&pool, group, "862d8404 cold replacement over MCP").await;
+
+    let first =
+        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+            .await
+            .expect("first submission");
+    assert_eq!(first_text(&first)["write_outcome"], "inserted");
+    let mut other = sde(claim, frame);
+    other.masses = serde_json::json!({"0": 0.3, "~": 0.7});
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, other, None)
+        .await
+        .expect("different masses");
+    let body = first_text(&res);
+    assert_eq!(body["write_outcome"], "replaced", "{body}");
+    assert_beta(
+        beta(&pool, claim).await,
+        (1.3, 1.7),
+        "the track holds only the new BBA",
+    );
+    assert!(
+        divergence_rows(&pool, claim).await.is_empty(),
+        "a replacement leaving only its own BBA on the track is a cold start"
+    );
+}
+
+/// The converse, MCP transport: a replacement on a track that also holds an
+/// independent BBA (under a perspective the caller owns) is not a cold start
+/// and records a divergence row. (Holds at origin/main too; mutation-proved:
+/// treating any write that withdraws as a cold start fails it.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replacement_beside_other_evidence_records_divergence(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let claim = own_claim(&pool, group, "862d8404 warm replacement over MCP").await;
+    let agent = server.server_agent_id().await.expect("server agent");
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id, confidence_calibration) \
+         VALUES ($1, $2, NULL) RETURNING id",
+    )
+    .bind(format!("862d8404-warm-mcp-{}", Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed perspective");
+
+    let mut independent = sde(claim, frame);
+    independent.masses = serde_json::json!({"0": 0.6, "~": 0.4});
+    independent.perspective_id = Some(perspective.to_string());
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, independent, None)
+        .await
+        .expect("independent evidence");
+    assert_eq!(first_text(&res)["write_outcome"], "inserted");
+    let res =
+        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+            .await
+            .expect("the caller's own evidence");
+    assert_eq!(first_text(&res)["write_outcome"], "inserted");
+    assert_eq!(
+        divergence_rows(&pool, claim).await.len(),
+        1,
+        "the second BBA records a row"
+    );
+
+    let mut other = sde(claim, frame);
+    other.masses = serde_json::json!({"0": 0.3, "~": 0.7});
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, other, None)
+        .await
+        .expect("replacement");
+    let body = first_text(&res);
+    assert_eq!(body["write_outcome"], "replaced", "{body}");
+    assert_beta(
+        beta(&pool, claim).await,
+        (1.9, 2.1),
+        "the independent evidence plus the new BBA",
+    );
+    assert_eq!(
+        divergence_rows(&pool, claim).await.len(),
+        2,
+        "a replacement beside other evidence records its divergence"
+    );
+}
+
+// ── Backlog d3648d3c: which other DS writers keep the track ─────────────
+//
+// `report_workflow_outcome` stores its outcome BBA through the same `ds_auto`
+// update as `update_with_evidence` and now keeps the track and the row as that
+// tool does. The seed wire, the batch ingest wire and the edge wire are
+// deliberately left out (`epigraph_engine::ds_divergence`, "Deliberately
+// excluded"): their BBAs carry a large uncommitted mass the Beta arithmetic
+// would count against the hypothesis, the artefact that retired the Beta
+// replay's `--apply`. One arm pins each side.
+
+/// `(m({TRUE}), m(conflict))` of a stored BBA's masses, `0` when absent.
+fn support_and_conflict(masses: &serde_json::Value) -> (f64, f64) {
+    (
+        masses["0"].as_f64().unwrap_or(0.0),
+        masses[""].as_f64().unwrap_or(0.0),
+    )
+}
+
+/// The app-role pool a test opens its own stamped transactions on.
+async fn app_role_pool(pool: &PgPool) -> ScopedPool {
+    let url = fixture::database_url_for(pool).await;
+    ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+        .await
+        .expect("app-role ScopedPool")
+}
+
+/// The seed wire (`submit_claim`), the batch ingest wire
+/// (`auto_wire_ds_batch`) and the edge wire (`link_epistemic`) each store a
+/// BBA and refold the claim's cache, and leave its Beta track and its
+/// divergence rows untouched: they are excluded on purpose. Each arm first
+/// checks that the writer DID store its BBA, so an arm that wired nothing
+/// cannot pass. Verified to fail on a version of this branch that counted
+/// those three writers (the tracks moved by the stored masses).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_seed_batch_and_edge_wires_leave_the_track_alone(pool: PgPool) {
+    use epigraph_mcp::tools::ds_auto::{auto_wire_ds_batch, BatchDsEntry};
+
+    let (server, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+
+    // The seed wire.
+    let res = epigraph_mcp::tools::claims::submit_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::SubmitClaimParams {
+            content: "A claim whose creation BBA the seed wire stores.".into(),
+            methodology: "deductive_logic".into(),
+            evidence_data: "the creation evidence".into(),
+            evidence_type: "logical".into(),
+            confidence: 0.8,
+            source_url: None,
+            reasoning: None,
+            labels: vec![],
+            novelty_threshold: None,
+            visibility: None,
+            group_id: None,
+            dataset: None,
+        },
+        None,
+    )
+    .await
+    .expect("submit_claim on the app role");
+    let seeded = parse_uuid_field(&first_text(&res), "claim_id");
+    let masses: serde_json::Value =
+        sqlx::query_scalar("SELECT masses FROM mass_functions WHERE claim_id = $1")
+            .bind(seeded)
+            .fetch_one(&pool)
+            .await
+            .expect("PREMISE: the seed wire stored the creation BBA");
+    assert!(
+        support_and_conflict(&masses).0 > 0.0,
+        "PREMISE: the creation BBA supports the claim: {masses}"
+    );
+
+    // The batch ingest wire.
+    let ingested = own_claim(&pool, group, "an ingested atom on the binary frame").await;
+    let app = app_role_pool(&pool).await;
+    let mut tx = app.begin_as(&viewer).await.expect("stamped tx");
+    let (_, wired) = auto_wire_ds_batch(
+        &mut tx,
+        &viewer,
+        &[BatchDsEntry {
+            claim_id: ingested,
+            confidence: 0.8,
+            weight: 0.9,
+            evidence_type: None,
+            axis: None,
+        }],
+        server.server_agent_id().await.expect("server agent"),
+    )
+    .await
+    .expect("batch wire");
+    tx.commit().await.expect("commit the batch");
+    assert_eq!(wired, 1, "PREMISE: the batch wired its entry");
+
+    // The edge wire, onto a target whose track already holds evidence, so a
+    // count would also record a row (no cold start).
+    let source = seed_claim_with_belief(&pool, 0.8, 0.95, Some(0.9)).await;
+    let target = own_claim(&pool, group, "an edge target whose track holds evidence").await;
+    sqlx::query("UPDATE claims SET beta_alpha = 1.8, beta_beta = 1.2 WHERE id = $1")
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("seed the target's track off the prior");
+    let res = epigraph_mcp::tools::link_epistemic::link_epistemic(
+        &server,
+        &viewer,
+        epigraph_mcp::types::LinkEpistemicParams {
+            source_claim_id: source.to_string(),
+            target_claim_id: target.to_string(),
+            relationship: "supports".into(),
+            properties: None,
+        },
+        None,
+    )
+    .await
+    .expect("link_epistemic on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["belief_wired"], true, "PREMISE: {body}");
+    let edge = parse_uuid_field(&body, "edge_id");
+    let masses: serde_json::Value = sqlx::query_scalar(
+        "SELECT masses FROM mass_functions WHERE claim_id = $1 AND slot_kind = 'edge' \
+           AND slot_id = $2",
+    )
+    .bind(target)
+    .bind(edge)
+    .fetch_one(&pool)
+    .await
+    .expect("PREMISE: the edge's BBA on the target");
+    assert!(
+        support_and_conflict(&masses).0 > 0.0,
+        "PREMISE: a supports edge from a believed source: {masses}"
+    );
+
+    // Every arm is checked before failing, so a regression names each writer.
+    let mut moved = Vec::new();
+    for (writer, claim, prior) in [
+        ("seed wire", seeded, (1.0, 1.0)),
+        ("batch wire", ingested, (1.0, 1.0)),
+        ("edge wire", target, (1.8, 1.2)),
+    ] {
+        let (a, b) = beta(&pool, claim).await;
+        if !(close(a, prior.0) && close(b, prior.1)) {
+            moved.push(format!("{writer} moved the track {prior:?} -> ({a}, {b})"));
+        }
+        let rows = divergence_rows(&pool, claim).await;
+        if !rows.is_empty() {
+            moved.push(format!("{writer} recorded {rows:?}"));
+        }
+    }
+    assert!(
+        moved.is_empty(),
+        "excluded writers kept the track: {moved:#?}"
+    );
+}
+
+/// `report_workflow_outcome` counts its outcome BBA as `update_with_evidence`
+/// counts its evidence: the first report moves the track (a cold start, no
+/// row), and the second, from a track holding the first, records the row.
+/// A failed outcome's BBA sits on FALSE, so all its non-conflict mass goes to
+/// beta.
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_workflow_outcome_counts_its_outcome_bba(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let wf = seed_workflow_claim(&pool, "ship a team workflow", &["build", "test"]).await;
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(wf)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("re-own the workflow claim into the server agent's group");
+
+    let report = |success: bool, details: &str| epigraph_mcp::types::ReportWorkflowOutcomeParams {
+        idempotency_key: None,
+        workflow_id: wf.to_string(),
+        success,
+        execution_log: vec![epigraph_mcp::types::StepExecution {
+            step_index: 0,
+            planned: "build".into(),
+            actual: "build".into(),
+            deviated: false,
+            deviation_reason: None,
+        }],
+        outcome_details: details.into(),
+        quality: Some(0.9),
+        goal_text: None,
+    };
+    let outcome_masses = |body: serde_json::Value| {
+        let ev = parse_uuid_field(&body, "evidence_id");
+        let pool = pool.clone();
+        async move {
+            let m: serde_json::Value =
+                sqlx::query_scalar("SELECT masses FROM mass_functions WHERE evidence_id = $1")
+                    .bind(ev)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("the outcome's BBA");
+            m
+        }
+    };
+
+    let res = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        report(true, "ran clean"),
+        None,
+    )
+    .await
+    .expect("first outcome");
+    let (s1, c1) = support_and_conflict(&outcome_masses(first_text(&res)).await);
+    assert!(
+        s1 > 0.0,
+        "PREMISE: a successful outcome supports the workflow"
+    );
+    let (a, b) = beta(&pool, wf).await;
+    assert!(
+        close(a, 1.0 + s1) && close(b, 2.0 - s1 - c1),
+        "the outcome BBA is counted: expected Beta({}, {}), got ({a}, {b})",
+        1.0 + s1,
+        2.0 - s1 - c1
+    );
+    assert!(
+        divergence_rows(&pool, wf).await.is_empty(),
+        "the first counted outcome is the workflow's cold start"
+    );
+
+    let res = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        report(false, "the test step failed"),
+        None,
+    )
+    .await
+    .expect("second outcome");
+    let body = first_text(&res);
+    let (s2, c2) = support_and_conflict(&outcome_masses(body.clone()).await);
+    assert!(
+        close(s2, 0.0),
+        "PREMISE: a failed outcome puts nothing on TRUE"
+    );
+    let (alpha, beta_param) = (1.0 + s1, 3.0 - s1 - c1 - c2);
+    let (a, b) = beta(&pool, wf).await;
+    assert!(close(a, alpha) && close(b, beta_param), "got ({a}, {b})");
+
+    let rows = divergence_rows(&pool, wf).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let posterior = alpha / (alpha + beta_param);
+    assert_eq!(rows[0].0, frame);
+    assert!(close(rows[0].2, posterior), "{rows:?} vs {posterior}");
+    assert!(close(rows[0].3, kl(rows[0].1, posterior)), "{rows:?}");
+    let cached: f64 = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(wf)
+        .fetch_one(&pool)
+        .await
+        .expect("the workflow's cache");
+    assert!(
+        close(rows[0].1, cached),
+        "the row's BetP is the cached one: {rows:?}"
+    );
 }

@@ -100,16 +100,22 @@ impl TokenExchange {
     /// A client for the token endpoint at `endpoint` (the kernel's absolute
     /// `/oauth/token` URL). The caller's bearer is sent there on every
     /// federated call, so the URL must be `https`, or `http` to a loopback
-    /// host (`127.0.0.0/8`, `[::1]`, `localhost`).
+    /// host (`127.0.0.0/8`, `[::1]`, `localhost`). An `http` URL naming
+    /// `localhost` is dialled at `127.0.0.1`, never by resolving the name
+    /// (backlog b0d05192); an `https` one keeps its name, which the
+    /// certificate check needs. A loopback endpoint is dialled directly,
+    /// whatever proxy the environment names; any other keeps the
+    /// environment's proxy settings.
     ///
     /// # Errors
     /// A description of why `endpoint` is refused.
     pub fn new(endpoint: &str) -> Result<Self, String> {
-        let url = reqwest::Url::parse(endpoint)
+        let mut url = reqwest::Url::parse(endpoint)
             .map_err(|e| format!("token exchange URL `{endpoint}` does not parse: {e}"))?;
         let host = url.host_str().unwrap_or_default();
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        let loopback = host.eq_ignore_ascii_case("localhost")
+        let localhost = super::config::is_localhost_name(host);
+        let loopback = localhost
             || bare
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback());
@@ -124,8 +130,20 @@ impl TokenExchange {
                 ))
             }
         }
-        let http = reqwest::Client::builder()
-            .timeout(EXCHANGE_TIMEOUT)
+        if localhost && url.scheme() == "http" {
+            url.set_host(Some(super::config::LOCALHOST_LITERAL))
+                .map_err(|e| format!("token exchange URL `{endpoint}`: {e}"))?;
+        }
+        let mut http = reqwest::Client::builder().timeout(EXCHANGE_TIMEOUT);
+        if loopback {
+            // reqwest reads HTTP_PROXY / ALL_PROXY from the environment, and
+            // NO_PROXY matches names and IP literals separately, so
+            // `NO_PROXY=localhost` does not cover the `127.0.0.1` dialled
+            // above. A loopback endpoint is never sent through a proxy: the
+            // caller's bearer would leave the machine in cleartext.
+            http = http.no_proxy();
+        }
+        let http = http
             .build()
             .map_err(|e| format!("token exchange HTTP client: {e}"))?;
         Ok(Self {
@@ -417,11 +435,11 @@ async fn connect(addr: &str, token: Option<&str>) -> Result<ExtensionClient, Fed
     }
     // Explicit rather than inherited, so a later rmcp default cannot move it.
     config.max_sse_event_size = MAX_RESPONSE_EVENT_BYTES;
-    // rmcp implements its client transport for the reqwest it links (0.13),
-    // not this crate's reqwest; leaving the type parameter to inference keeps
-    // that version choice inside rmcp instead of adding a second direct
-    // reqwest dependency here.
-    let transport = StreamableHttpClientTransport::from_config(config);
+    let http = extension_http_client().map_err(|e| FederationError::Connect {
+        uri: uri.clone(),
+        cause: format!("extension HTTP client: {e}"),
+    })?;
+    let transport = StreamableHttpClientTransport::with_client(http, config);
 
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, serve_client((), transport)).await {
         Ok(Ok(client)) => Ok(client),
@@ -432,6 +450,53 @@ async fn connect(addr: &str, token: Option<&str>) -> Result<ExtensionClient, Fed
         Err(_elapsed) => Err(FederationError::Timeout(HANDSHAKE_TIMEOUT, uri)),
     }
 }
+
+/// The HTTP client every extension dial uses. rmcp's `from_config` would
+/// build its default client, which reads `HTTP_PROXY` / `ALL_PROXY` from the
+/// environment: with a proxy set, every bearer this dial carries (the
+/// discovery token, each caller's exchanged token) would go through it in
+/// cleartext while the boot check reports the extension as loopback, and
+/// `NO_PROXY=localhost` does not cover the `127.0.0.1` a configured
+/// `localhost` is dialled at (backlog b0d05192). So this client never uses a
+/// proxy, for an `insecure_remote` extension too.
+///
+/// Otherwise it keeps rmcp's default settings (rmcp 3.9,
+/// `StreamableHttpClientTransport::default_http_client`): no idle pooling,
+/// and only same-origin 307 / 308 redirects followed, at most
+/// [`MAX_EXTENSION_REDIRECTS`]; any other redirect is returned as the answer.
+///
+/// It is rmcp's reqwest (`reqwest_rmcp`, 0.13), not this crate's (0.12):
+/// rmcp implements its client transport for that one only.
+fn extension_http_client() -> Result<reqwest_rmcp::Client, reqwest_rmcp::Error> {
+    use reqwest_rmcp::redirect::Policy;
+    use reqwest_rmcp::StatusCode;
+    let same_origin = Policy::custom(|attempt| {
+        let preserves_body = matches!(
+            attempt.status(),
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+        );
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|original| original.origin() == attempt.url().origin());
+        if !preserves_body || !same_origin {
+            attempt.stop()
+        } else if attempt.previous().len() > MAX_EXTENSION_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    });
+    reqwest_rmcp::Client::builder()
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .redirect(same_origin)
+        .build()
+}
+
+/// Redirects [`extension_http_client`] follows for one request (rmcp's
+/// default client's limit).
+const MAX_EXTENSION_REDIRECTS: usize = 10;
 
 #[cfg(test)]
 mod tests {
@@ -462,6 +527,44 @@ mod tests {
                 TokenExchange::new(refused).is_err(),
                 "{refused} must be refused"
             );
+        }
+    }
+
+    /// Cleartext to `localhost` is accepted as loopback, but the name is
+    /// never what the exchange dials: the stored endpoint is the `127.0.0.1`
+    /// literal, so where every caller's bearer is sent does not depend on how
+    /// this host resolves `localhost` (backlog b0d05192). `https` keeps its
+    /// name, which its certificate check needs, and protects the bearer
+    /// whatever the name resolves to.
+    ///
+    /// Mutation: store the URL as given -> the `localhost` endpoints are kept
+    /// and this fails.
+    #[test]
+    fn a_cleartext_localhost_exchange_url_is_dialled_as_the_loopback_literal() {
+        for (given, dialled) in [
+            (
+                "http://localhost:8080/oauth/token",
+                "http://127.0.0.1:8080/oauth/token",
+            ),
+            (
+                "http://LOCALHOST:8080/oauth/token",
+                "http://127.0.0.1:8080/oauth/token",
+            ),
+            (
+                "http://localhost/oauth/token",
+                "http://127.0.0.1/oauth/token",
+            ),
+            (
+                "https://localhost:8443/oauth/token",
+                "https://localhost:8443/oauth/token",
+            ),
+            (
+                "http://127.0.0.1:8080/oauth/token",
+                "http://127.0.0.1:8080/oauth/token",
+            ),
+        ] {
+            let exchange = TokenExchange::new(given).unwrap_or_else(|e| panic!("{given}: {e}"));
+            assert_eq!(exchange.endpoint, dialled, "{given}");
         }
     }
 }

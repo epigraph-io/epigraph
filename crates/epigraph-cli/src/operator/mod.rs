@@ -137,6 +137,15 @@
 //!   audit row, in one transaction. Access tokens already minted stay valid
 //!   until they expire (at most 1 h), which each run prints.
 //!
+//! And role-attached agents (migration 264; see [`role_restore`]):
+//!
+//! * `restore-role-successor --role R --root <agent> --successor <agent>` —
+//!   after a role's root identity was detached, attach it by name again (or
+//!   keep its live row made by name) and give its running successor the group
+//!   back in one audited act: detach the successor's stale succession copy and
+//!   attach it by name, only where a copy written fresh from the root's row
+//!   would admit it (refused `ROL04` otherwise, nothing written).
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -194,6 +203,8 @@ pub mod reown_workflows;
 pub mod restrict;
 pub mod retire_link;
 pub mod reverse;
+pub mod role_agent;
+pub mod role_restore;
 pub mod system_agent;
 pub mod tables;
 pub mod team_group;
@@ -242,6 +253,19 @@ impl OperatorDb {
     #[must_use]
     pub const fn pool(&self) -> &sqlx::PgPool {
         self.scoped.inner()
+    }
+
+    /// One connection of this pool with its bypass viewer, as one
+    /// [`epigraph_db::MaintenanceSession`]: for a verb that needs a viewer
+    /// (`custodial-supersede` stores its successor's embedding through one).
+    ///
+    /// # Errors
+    /// The connection cannot be acquired.
+    pub async fn session(
+        &self,
+        reason: epigraph_db::visibility::SystemReason,
+    ) -> anyhow::Result<epigraph_db::MaintenanceSession<'_>> {
+        Ok(self.scoped.maintenance_session(reason).await?)
     }
 }
 

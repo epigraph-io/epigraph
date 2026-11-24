@@ -8,9 +8,11 @@
 //!
 //! Tight contract — narrower than the generic `POST /api/v1/edges` route:
 //! - `relationship` must be one of `HIERARCHICAL_RELATIONSHIPS` (claim to
-//!   claim) or `WORKFLOW_REFERENCE_RELATIONSHIPS` (backlogs 03d87e3a and
+//!   claim), `WORKFLOW_REFERENCE_RELATIONSHIPS` (backlogs 03d87e3a and
 //!   41d7b27a: `executes` workflow -> claim, `invokes` workflow|claim ->
-//!   workflow, `depends_on` workflow -> workflow),
+//!   workflow, `depends_on` workflow -> workflow) or
+//!   `AGENT_ATTRIBUTION_RELATIONSHIPS` (backlog c6949159: `asserts` agent ->
+//!   claim),
 //! - both endpoints must exist and be readable; their types default to
 //!   `"claim"`, are validated against the `entity_types` registry, and must be
 //!   a pair the relationship admits ([`endpoint_types_for`]),
@@ -20,14 +22,27 @@
 //!   requires that authority over every workflow executing the step, and a
 //!   claim no workflow executes is refused,
 //! - `executes` writes from the HEAD generation of a lineage only (as
-//!   `add_step` does), so a frozen older generation's plan is not extended,
+//!   `add_step` does), so a frozen older generation's plan is not extended;
+//!   its target is a claim of the plan's own lineage (any level: the repair
+//!   path), or a workflow STEP the caller or the submitter wrote
+//!   (`WorkflowRepository::is_step_shaped`, backlog 298317a7),
 //! - `invokes` and `depends_on` refuse a NON-PUBLIC workflow endpoint: the
 //!   edges trigger derives an edge's tenancy from its claim endpoints only
 //!   (a workflow endpoint counts as public), so such an edge would be stored
 //!   public and name the private workflow to every reader,
+//! - `asserts` credits its source agent with the claim, so only that agent or
+//!   the human operating it through a live binding may write it
+//!   (`AgentRepository::speaks_for`, the HTTP route's rule, no admin arm); an
+//!   agent's edge onto a public claim is world-owned, like the HTTP route's,
+//!   so `owned_by_caller` is false and its writer cannot retract it,
 //! - `invokes`, `depends_on` and `executes` refuse an edge that would close a
-//!   cycle through `invokes` / `executes` (or `depends_on`) edges the caller
-//!   reads; the check and the insert are serialized per relationship set,
+//!   cycle through in-force `invokes` / `executes` (or `depends_on`) edges,
+//!   including edges the caller cannot read (walked by migration 254's
+//!   definer; the refusal names only the two endpoints, never the hidden
+//!   edges); the check and the insert are serialized per relationship set,
+//! - `properties` may not carry a reserved key
+//!   (`epigraph_db::RESERVED_EDGE_PROPERTIES`), refused with the HTTP edges
+//!   route's text (`epigraph_db::reserved_edge_property_refusal`),
 //! - the call is idempotent on `(source, target, relationship)`.
 //!
 //! Intentionally side-effect-free vs the generic POST: no DS recomputation,
@@ -62,6 +77,14 @@ pub const HIERARCHICAL_RELATIONSHIPS: &[&str] =
 /// mirrors the HTTP hierarchical route's claim-only list.
 pub const WORKFLOW_REFERENCE_RELATIONSHIPS: &[&str] = &["executes", "invokes", "depends_on"];
 
+/// The agent attribution this tool writes (backlog c6949159): `asserts`,
+/// agent -> claim, the edge that attributes a claim to the agent asserting it.
+/// It credits the agent with the claim's content, so only that agent or the
+/// human operating it through a live binding may write it
+/// (`epigraph_db::credited_agent_end`, `AgentRepository::speaks_for`: the rule
+/// `POST /api/v1/edges` applies).
+pub const AGENT_ATTRIBUTION_RELATIONSHIPS: &[&str] = &["asserts"];
+
 /// The `(source_type, target_type)` pairs `relationship` admits; empty for a
 /// relationship this tool does not write.
 ///
@@ -70,7 +93,8 @@ pub const WORKFLOW_REFERENCE_RELATIONSHIPS: &[&str] = &["executes", "invokes", "
 ///   `add_step` write; this is its repair path);
 /// - `invokes`: a sub-workflow reference, from a workflow or from one of its
 ///   step claims;
-/// - `depends_on`: a prerequisite workflow.
+/// - `depends_on`: a prerequisite workflow;
+/// - `asserts`: an agent asserts a claim (its attribution).
 #[must_use]
 pub fn endpoint_types_for(relationship: &str) -> &'static [(&'static str, &'static str)] {
     match relationship {
@@ -78,6 +102,7 @@ pub fn endpoint_types_for(relationship: &str) -> &'static [(&'static str, &'stat
         "executes" => &[("workflow", "claim")],
         "invokes" => &[("workflow", "workflow"), ("claim", "workflow")],
         "depends_on" => &[("workflow", "workflow")],
+        "asserts" => &[("agent", "claim")],
         _ => &[],
     }
 }
@@ -108,7 +133,9 @@ pub fn requires_public_workflow_endpoints(relationship: &str) -> bool {
 }
 
 fn is_hierarchical_relationship(s: &str) -> bool {
-    HIERARCHICAL_RELATIONSHIPS.contains(&s) || WORKFLOW_REFERENCE_RELATIONSHIPS.contains(&s)
+    HIERARCHICAL_RELATIONSHIPS.contains(&s)
+        || WORKFLOW_REFERENCE_RELATIONSHIPS.contains(&s)
+        || AGENT_ATTRIBUTION_RELATIONSHIPS.contains(&s)
 }
 
 /// Whether the `(id, entity_type)` endpoint exists for `viewer`, on the
@@ -130,6 +157,15 @@ async fn endpoint_exists(
         "workflow" => epigraph_db::WorkflowRepository::viewer_reads_row(&mut *conn, viewer, id)
             .await
             .map_err(internal_error),
+        // Agent rows are universally readable (their public key renders
+        // authorship), so existence needs no viewer.
+        "agent" => Ok(epigraph_db::AgentRepository::get_by_id(
+            &mut *conn,
+            epigraph_core::AgentId::from_uuid(id),
+        )
+        .await
+        .map_err(internal_error)?
+        .is_some()),
         other => Err(internal_error_logged(
             "link_hierarchical: no existence check for this entity type",
             format!("entity type '{other}'"),
@@ -171,10 +207,12 @@ pub async fn do_link_hierarchical(
     // `WORKFLOW_REFERENCE_RELATIONSHIPS`.
     if !is_hierarchical_relationship(&params.relationship) {
         return Err(invalid_params(format!(
-            "invalid relationship '{}'. Valid hierarchical types: {}. Valid workflow references: {}",
+            "invalid relationship '{}'. Valid hierarchical types: {}. Valid workflow references: \
+             {}. Valid agent attribution: {}",
             params.relationship,
             HIERARCHICAL_RELATIONSHIPS.join(", "),
             WORKFLOW_REFERENCE_RELATIONSHIPS.join(", "),
+            AGENT_ATTRIBUTION_RELATIONSHIPS.join(", "),
         )));
     }
 
@@ -183,6 +221,16 @@ pub async fn do_link_hierarchical(
         return Err(invalid_params(
             "self-loops are not allowed (source and target are the same entity)",
         ));
+    }
+    // The keys only an act or the document ingest writes (backlog 3676c459),
+    // checked on the caller's own `properties` before `at_step` is merged in:
+    // refused with the HTTP edges route's text, as `patch_edge` refuses them.
+    if let Some(reason) = params
+        .properties
+        .as_ref()
+        .and_then(epigraph_db::reserved_edge_property_refusal)
+    {
+        return Err(invalid_params(reason));
     }
     if params.at_step.is_some() && params.relationship != "invokes" {
         return Err(invalid_params(format!(
@@ -258,6 +306,27 @@ pub async fn do_link_hierarchical(
         )));
     }
 
+    // An edge that credits an agent with content (`asserts` from it, backlog
+    // c6949159) puts words in that agent's mouth: only the agent itself, or
+    // the human operating it through a binding in force, may write it. The
+    // HTTP edges route's rule and refusal text, and like it no admin arm.
+    if let Some(end) =
+        epigraph_db::credited_agent_end(source_type, target_type, &params.relationship)
+    {
+        let credited = match end {
+            epigraph_db::CreditedEnd::Source => source_id,
+            epigraph_db::CreditedEnd::Target => target_id,
+        };
+        let speaks =
+            epigraph_db::AgentRepository::speaks_for(&mut *tx, actor.agent_id(), &[credited])
+                .await
+                .map_err(internal_error)?
+                .contains_key(&credited);
+        if !speaks {
+            return Err(invalid_params(epigraph_db::AGENT_ATTRIBUTION_REFUSAL));
+        }
+    }
+
     // A reference touching a non-public workflow would be stored public
     // (`epigraph_node_tenancy` treats a workflow endpoint as tenancy-less), so
     // it is refused before anything is written. Both endpoints were read
@@ -317,6 +386,7 @@ pub async fn do_link_hierarchical(
             &mut tx,
             auth,
             actor,
+            viewer,
             workflow_id,
             "link_hierarchical",
             &not_found,
@@ -381,6 +451,23 @@ pub async fn do_link_hierarchical(
                      claim. Nothing was written."
                 )));
             }
+            // An own claim is adopted only when it is a STEP (backlog
+            // 298317a7): plan readers and the outcome reports take every
+            // level-2 `executes` target as one, so an ordinary claim (or a
+            // level-2 paragraph, which has no step lineage) is refused. The
+            // in-lineage branch above repairs every level, as the executor
+            // writes `executes` to the thesis and phases too.
+            if !epigraph_db::WorkflowRepository::is_step_shaped(&mut tx, viewer, target_id)
+                .await
+                .map_err(internal_error)?
+            {
+                return Err(invalid_params(format!(
+                    "refused: claim {target_id} is not a step of this workflow's lineage, and it \
+                     is not a workflow step (a plan level-2 claim with a step lineage, as \
+                     store_workflow, add_step and evolve_step write). executes adopts only a \
+                     step; add_step writes a new one. Nothing was written."
+                )));
+            }
         }
 
         // A workflow endpoint has no tenancy of its own in the edges trigger
@@ -409,7 +496,9 @@ pub async fn do_link_hierarchical(
     }
 
     // Cycle refusal (backlog 41d7b27a): `source -rel-> target` closes a cycle
-    // exactly when `target` already reaches `source`.
+    // exactly when `target` already reaches `source`. The walk sees every
+    // in-force edge, readable or not (backlog 7149132e), and the message
+    // names only the two endpoints read above, whichever edges closed it.
     if let Some(walk) = cycle_walk_for(&params.relationship) {
         if EdgeRepository::reaches_in_force_conn(&mut tx, target_id, source_id, walk)
             .await

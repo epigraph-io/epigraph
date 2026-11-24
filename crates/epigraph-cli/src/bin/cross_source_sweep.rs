@@ -67,8 +67,11 @@ struct Args {
     #[arg(long)]
     apply: bool,
 
-    /// Path to calibration.toml; defaults to the workspace root.
-    #[arg(long, env = "EPIGRAPH_CALIBRATION_PATH", hide_env_values = true)]
+    /// Path to a calibration.toml whose `[matcher]` section to use. Defaults
+    /// to the served calibration: the file `CALIBRATION_PATH` names, else the
+    /// copy compiled into this binary (never a cwd-relative file; the
+    /// separate `EPIGRAPH_CALIBRATION_PATH` variable is gone, backlog 26a12f41).
+    #[arg(long)]
     calibration: Option<std::path::PathBuf>,
 
     /// Skip the LLM verifier — every mid-band pair is reported as "no answer"
@@ -106,9 +109,21 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let pool = maint.pool().clone();
 
-    let cfg = match args.calibration {
-        Some(p) => MatcherConfig::load_from(&p)?,
-        None => MatcherConfig::load_default()?,
+    let cfg = match &args.calibration {
+        Some(p) => {
+            eprintln!(
+                "cross_source_sweep: [matcher] from --calibration {}",
+                p.display()
+            );
+            MatcherConfig::load_from(p)?
+        }
+        None => {
+            eprintln!(
+                "cross_source_sweep: [matcher] from the served calibration ({})",
+                epigraph_engine::calibration::CalibrationConfig::cached_source()
+            );
+            MatcherConfig::load_default()?
+        }
     };
 
     // Pick seeds: claims never scanned, or scanned more than 7 days ago.

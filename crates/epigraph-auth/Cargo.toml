@@ -2,13 +2,20 @@
 name = "epigraph-auth"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# base64url of the published Ed25519 public key (JWK `x`).
+base64 = "0.22"
 chrono = { workspace = true }
+# The kernel's EdDSA JWT key: its public half is derived from the seed.
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

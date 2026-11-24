@@ -19,6 +19,14 @@ Commands:
             no DB driver: this is the step that may run off the box.
   apply     Writes a result file (`--from`, from `plan` or `compute`) in ONE
             transaction, and writes a manifest that `reverse` restores from.
+            A result that is not itself a plan (a `compute` result, or a file
+            with no `source`) must be checked against the plan the operator
+            reviewed: `--reviewed-plan PLAN`, or `--expect-digest HEX` with
+            the `parts_digest` that PLAN printed. Apply refuses, before
+            connecting and writing nothing, a result whose parts differ, and
+            refuses an unchecked one unless `--unreviewed` is passed.
+            (`compute` prints the digest of its own result, which always
+            matches itself: it is not a review.)
   reverse   Restores exactly what a manifest's apply changed.
 
 What apply writes, per theme:
@@ -40,16 +48,28 @@ What apply writes, per theme:
     marks it for the Atlas group naming (W8). The label is kept short and
     off label_themes_llm's placeholder patterns, so that script's default run,
     which samples member text, does not rename it.
+  * Current members WITHOUT an embedding (the off-box split cannot place
+    them) are placed on the box, in claim-id order, by
+    `theme_cap_core.unembedded_slots`: each part in turn (the kept part first)
+    is filled up to the cap, and any remainder becomes extra parts of at most
+    the cap. So a theme whose embedded members fit in one part, or that has
+    none, is still split under the cap. A part holding only unembedded members
+    has no centroid (NULL) and a `claim_count` of 0, as `claim_count` and the
+    centroid count embedded members only; the Atlas builds take only themes
+    with an embedded member, so such a part is not drawn until its members
+    are embedded (plan reports `unembedded_only_parts`). A part filled to
+    exactly the cap goes over it at the next nightly assignment to it. The
+    placed members move with their part, so `reverse` restores them too.
   * Refused, with nothing written, when the result no longer matches the live
     membership (claims assigned or moved since the plan), when any theme the
-    result names would end over the cap once current members without an
-    embedding (which stay with the kept part) are counted, including a theme
-    whose embedded members fit in one part or that has none, or when the
-    result's cap is over apply's `--cap` (default 2000).
+    result names would still end over the cap (a safety net: the placement
+    above keeps every part under it), or when the result's cap is over
+    apply's `--cap` (default 2000).
 
 The cap counts CURRENT members (`COALESCE(is_current, true)`), what the Atlas
 draws. Retired members (superseded or duplicate-marked) keep their theme_id and
-have no embedding; they stay with the kept part and do not count.
+have no embedding; they stay with the kept part and do not count. Only CURRENT
+unembedded members are placed as above.
 
 Member text: nothing here reads, prints or stores claim content, so the
 bug-report intake rule (`theme_lib.not_intake_owned`, which keeps intake text
@@ -70,6 +90,17 @@ theme whose membership changed since its plan (a supersede, a dedup, a new
 assignment) refuses the whole apply, as does any theme the result names that
 would stay over the cap.
 
+Off-box compute and the reviewed plan: the split is deterministic on one host
+and set of library versions, but not promised across hosts or CPU
+architectures. A `plan` result is tagged `"source": "plan"` and a `compute`
+result `"source": "compute"`. Applying a plan file applies what was reviewed.
+Applying any other result needs `--reviewed-plan plan.json` (the on-box plan
+the operator reviewed): apply compares `theme_cap_core.parts_digest` of both
+and refuses on a mismatch, before connecting. The digest is recomputed from
+the parts, never read from either file. `--unreviewed` applies such a result
+unchecked, and the output and manifest record which of these it was
+(`review`).
+
 After an apply, Atlas layouts (`atlas_layout_themes`) and graph neighbourhoods
 of a split theme are stale until rebuilt. `reverse` deletes the new parts'
 rows, and rows that reference them cascade.
@@ -84,7 +115,7 @@ Usage:
     MAINTENANCE_DATABASE_URL=... python3 scripts/theme_cap_split.py export --out export-dir/
     python3 scripts/theme_cap_split.py compute --from export-dir/ --out result.json
     MAINTENANCE_DATABASE_URL=... python3 scripts/theme_cap_split.py apply --from result.json \\
-        --manifest manifest.json
+        --reviewed-plan plan.json --manifest manifest.json
 """
 import argparse
 import datetime
@@ -243,7 +274,10 @@ def plan(conn, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_ids=None):
 
     Returns (result, report): the result document apply consumes, and one
     report row per theme with its proposed part sizes."""
-    result = {"format": core.RESULT_FORMAT, "cap": cap, "seed": seed, "themes": []}
+    # `source` marks the file as the plan itself (see review_digest); it is not
+    # part of parts_digest, so a matching compute result has the same digest.
+    result = {"format": core.RESULT_FORMAT, "source": "plan", "cap": cap, "seed": seed,
+              "themes": []}
     report = []
     for theme_id, members, embedded, retired in over_cap_themes(conn, cap, theme_ids):
         ids, x = load_members(conn, theme_id)
@@ -251,13 +285,19 @@ def plan(conn, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_ids=None):
         conn.rollback()  # end the read transaction between themes
         result["themes"].append({"theme_id": theme_id, "parts": parts, **stats})
         unembedded = members - embedded
+        sizes = [len(p) for p in parts]
+        taken, extra = core.unembedded_slots(sizes, unembedded, cap)
+        final = [n + k for n, k in zip(sizes, taken)] + extra
         report.append({
             "theme_id": theme_id, "current": members, "embedded": embedded,
             "unembedded": unembedded, "retired": retired,
-            "part_sizes": [len(p) for p in parts],
+            "part_sizes": sizes,
             "id_chunk_cuts": stats["id_chunk_cuts"],
-            "kept_part_with_unembedded": (len(parts[0]) if parts else 0) + unembedded,
-            "reaches_cap": bool(parts) and len(parts[0]) + unembedded <= cap,
+            # Apply places the current unembedded members on the box (see the
+            # module docstring); these are the part sizes it will write.
+            "part_sizes_with_unembedded": final,
+            "unembedded_only_parts": len(extra),
+            "reaches_cap": bool(final) and max(final) <= cap,
         })
     return result, report
 
@@ -339,25 +379,74 @@ def _recompute(cur, theme_id, with_3072):
         )
 
 
-def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP):
+def check_reviewed(result, expect_digest):
+    """Refuse `result` unless its `parts_digest` is `expect_digest` (when one
+    is given). Touches no database."""
+    if expect_digest is None:
+        return
+    got = core.parts_digest(result)
+    if got != expect_digest:
+        raise ValueError(
+            f"the result's parts are not the reviewed plan's (parts digest {got}, reviewed "
+            f"{expect_digest}): an off-box compute on another host, architecture or library "
+            "version need not reproduce the on-box plan. Nothing was written; review this "
+            "result (or re-run plan and apply that file)")
+
+
+# How an apply's result was checked (recorded in the output and the manifest).
+REVIEW_PLAN_FILE = "reviewed-plan"
+REVIEW_DIGEST = "expect-digest"
+REVIEW_IS_PLAN = "result-is-the-plan"
+REVIEW_NONE = "unreviewed"
+
+
+def review_digest(result, reviewed_plan=None, expect_digest=None, unreviewed=False):
+    """(expect_digest, review) for an apply of `result`, or ValueError.
+
+    `reviewed_plan` is the reviewed plan's document, `expect_digest` its
+    `parts_digest`. Without either, only a result that is itself a plan
+    (`"source": "plan"`) is accepted, unless `unreviewed` opts out: a compute
+    result, or a file that does not say what wrote it, may come from another
+    host whose parts nobody reviewed. Touches no database."""
+    if reviewed_plan is not None:
+        return core.parts_digest(reviewed_plan), REVIEW_PLAN_FILE
+    if expect_digest is not None:
+        return expect_digest.strip().lower(), REVIEW_DIGEST
+    if result.get("source") == "plan":
+        return None, REVIEW_IS_PLAN
+    if unreviewed:
+        return None, REVIEW_NONE
+    raise ValueError(
+        f"this result is not a plan (source {result.get('source')!r}) and nothing was given "
+        "to check it against: pass --reviewed-plan PLAN (the plan file you reviewed) or "
+        "--expect-digest HEX (the parts_digest that plan printed; compute's own digest is "
+        "not a review), or --unreviewed to apply it unchecked. Nothing was written")
+
+
+def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_digest=None,
+                 review=None):
     """Write a result document in one transaction; returns the manifest.
 
     The result's own cap is enforced, and a result whose cap exceeds `max_cap`
     (apply's `--cap`) is refused: the file may come back from off the box,
-    and its cap must not be what decides how large a part may be.
+    and its cap must not be what decides how large a part may be. With
+    `expect_digest` (the reviewed plan's `parts_digest`), a result whose parts
+    differ is refused before anything is read or written.
 
     The manifest is written and fsynced BEFORE the commit, so a committed
     apply always has one. A manifest whose apply did not commit reverses as a
     no-op."""
     if result.get("format") != core.RESULT_FORMAT:
         raise ValueError(f"not a {core.RESULT_FORMAT} result: {result.get('format')!r}")
+    check_reviewed(result, expect_digest)
     cap = int(result["cap"])
     if cap > int(max_cap):
         raise ValueError(f"the result's cap of {cap} is over apply's cap of {max_cap}; refusing "
                          "(pass --cap to apply to raise it deliberately)")
     run = str(uuid.uuid4())
     manifest = {"format": MANIFEST_FORMAT, "split_run": run, "cap": cap,
-                "seed": result.get("seed"),
+                "seed": result.get("seed"), "parts_digest": core.parts_digest(result),
+                "review": review,
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "themes": []}
     touched = []
@@ -379,6 +468,11 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP):
                 except ValueError as e:
                     raise ValueError(f"theme {parent}: the result no longer matches its live "
                                      f"members ({e}); re-run plan") from None
+                # Current members with no embedding: placed on the box, after
+                # the theme row is locked (core.unembedded_slots).
+                cur.execute(f"SELECT id::text FROM claims WHERE theme_id = %s "
+                            f"AND embedding IS NULL AND {CURRENT} ORDER BY id", (parent,))
+                parts = core.place_unembedded(parts, [r[0] for r in cur.fetchall()], cap)
                 if len(parts) < 2:
                     continue
                 props = snapshot.get("properties") or {}
@@ -415,10 +509,9 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP):
                                            "kept_claim_ids": kept, "new_parts": new_parts})
             for theme_id, with_3072 in touched:
                 _recompute(cur, theme_id, with_3072)
-            # EVERY theme the result names, not only the ones written: a theme
-            # whose embedded members fit in one part (or that has none) is not
-            # split above, and would otherwise stay over the cap behind a
-            # successful apply.
+            # EVERY theme the result names, not only the ones written: a
+            # safety net behind the placement above, so no theme the result
+            # names can stay over the cap behind a successful apply.
             checked = sorted({t for t, _ in touched} | {str(e["theme_id"]) for e in result["themes"]})
             cur.execute(f"SELECT theme_id::text, count(*) FROM claims "
                         f"WHERE theme_id = ANY(%s::uuid[]) AND {CURRENT} "
@@ -426,9 +519,8 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP):
                         (checked, cap))
             over = cur.fetchall()
             if over:
-                raise ValueError(f"themes would end over the cap of {cap} (current members "
-                                 "without an embedding stay with the kept part, and cannot be "
-                                 f"split); drop them with --theme-id and re-plan: {over}")
+                raise ValueError(f"themes would end over the cap of {cap}; drop them with "
+                                 f"--theme-id and re-plan: {over}")
         if not manifest["themes"]:
             conn.rollback()
             return manifest
@@ -568,6 +660,16 @@ def main(argv=None):
                     help="refuse a result whose cap is larger (default %(default)s)")
     sp.add_argument("--manifest", default=None,
                     help="manifest to create (default theme-cap-manifest-<UTC>.json)")
+    reviewed = sp.add_mutually_exclusive_group()
+    reviewed.add_argument("--reviewed-plan", default=None,
+                          help="the plan file the operator reviewed: refuse a result whose "
+                               "parts differ from it (an off-box compute)")
+    reviewed.add_argument("--expect-digest", default=None,
+                          help="the parts_digest the reviewed plan printed (not compute's): "
+                               "refuse a result whose parts differ")
+    reviewed.add_argument("--unreviewed", action="store_true",
+                          help="apply a result that is not a plan without checking it against "
+                               "a reviewed plan")
 
     sp = sub.add_parser("reverse", help="restore what an apply changed")
     db_args(sp)
@@ -580,11 +682,22 @@ def main(argv=None):
         result = core.compute_export_dir(args.src, cap=args.cap, seed=args.seed)
         _write_json_new(args.out, result)
         print(json.dumps({"status": "computed", "result_file": args.out, "cap": result["cap"],
+                          "parts_digest": core.parts_digest(result),
                           "themes": [{"theme_id": t["theme_id"],
                                       "part_sizes": [len(x) for x in t["parts"]],
                                       "id_chunk_cuts": t.get("id_chunk_cuts", 0)}
                                      for t in result["themes"]]}))
         return 0
+
+    expect_digest = review = None
+    if args.command == "apply":
+        result = json.loads(pathlib.Path(args.src).read_text())
+        reviewed_plan = (None if args.reviewed_plan is None
+                         else json.loads(pathlib.Path(args.reviewed_plan).read_text()))
+        # Before connecting: a result nobody reviewed never reaches the database.
+        expect_digest, review = review_digest(result, reviewed_plan, args.expect_digest,
+                                              args.unreviewed)
+        check_reviewed(result, expect_digest)
 
     conn = connect(args.database_url)
     try:
@@ -594,25 +707,31 @@ def main(argv=None):
             _write_json_new(out, result)
             labels = theme_labels(conn, [r["theme_id"] for r in report])
             for r in report:
-                flag = "" if r["reaches_cap"] else "  NOT UNDER CAP (unembedded members)"
+                flag = "" if r["reaches_cap"] else "  NOT UNDER CAP"
+                if r["unembedded"]:
+                    flag += (f"  UNEMBEDDED: {r['unembedded']} placed on apply -> "
+                             f"{r['part_sizes_with_unembedded']}")
                 if r["id_chunk_cuts"]:
                     flag += f"  ID-ORDER CUTS: {r['id_chunk_cuts']} (identical vectors)"
                 print(f"  {r['theme_id']}  {r['current']:>6} -> {r['part_sizes']}"
                       f"  ({labels.get(r['theme_id'], '?')}){flag}", file=sys.stderr)
             print(json.dumps({"status": "dry-run", "cap": args.cap, "result_file": out,
-                              "themes": report}))
+                              "parts_digest": core.parts_digest(result), "themes": report}))
         elif args.command == "export":
             index = export(conn, args.out, args.cap, args.seed, args.theme_id)
             size = sum(f.stat().st_size for f in pathlib.Path(args.out).iterdir())
             print(json.dumps({"status": "exported", "dir": args.out, "bytes": size,
                               "themes": index["themes"]}))
         elif args.command == "apply":
-            result = json.loads(pathlib.Path(args.src).read_text())
             mpath = args.manifest or f"theme-cap-manifest-{_stamp()}.json"
-            manifest = apply_result(conn, result, mpath, max_cap=args.cap)
+            manifest = apply_result(conn, result, mpath, max_cap=args.cap,
+                                    expect_digest=expect_digest, review=review)
             print(json.dumps({"status": "applied" if manifest["themes"] else "nothing to split",
                               "manifest": mpath if manifest["themes"] else None,
                               "split_run": manifest["split_run"],
+                              "parts_digest": manifest["parts_digest"],
+                              "checked_against_review": expect_digest is not None,
+                              "review": review,
                               "themes": [{"parent_id": t["parent_id"],
                                           "kept": len(t["kept_claim_ids"]),
                                           "new_parts": [{"theme_id": n["theme_id"],

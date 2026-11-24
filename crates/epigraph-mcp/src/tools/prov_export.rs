@@ -45,7 +45,8 @@ fn effective_depth(requested: Option<i32>) -> i32 {
 }
 
 /// The node cap and content clip, defaulted and clamped. Never unbounded:
-/// [`ProvExportLimits::default`] is the operator CLI's, not a request's.
+/// [`ProvExportLimits::default`] is the operator CLI's `--unbounded` opt-in,
+/// never a request's.
 fn effective_limits(params: &ExportProvenanceProvOParams) -> ProvExportLimits {
     ProvExportLimits {
         max_nodes: Some(

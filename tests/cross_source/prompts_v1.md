@@ -124,10 +124,24 @@ after the sweep would therefore flag every pair the sweep just scored.
    `matcher_run_id = <run_id>`. The upsert re-stamps `matcher_run_id` on rows
    that already existed, so previously decided pairs show up here too. Split
    the pairs into **clean** and **contaminated** against the step-1 snapshot
-   with `epigraph_engine::matching::contamination::partition_by_ledger`. v1
-   ships no CLI for this step: read the snapshot's `entries` array back as
-   `Vec<LedgerEntry>` (it derives `Deserialize`) and call the function from a
-   one-off script or test harness, recording its sha in the report.
+   with `epigraph_engine::matching::contamination::partition_by_ledger`, run
+   from the command line, before the next sweep re-stamps any row:
+
+   ```sh
+   contamination_split --ledger <out>/contamination_ledger.json \
+       --run-id <run_id> --out-dir <out>/split
+   ```
+
+   It reads the run's rows (read-only), archives them as `run_pairs.json`,
+   and writes `clean_pairs.json`, `contaminated_pairs.json` and
+   `split_counts.json` (refusing to overwrite; all four files or none),
+   printing the counts. The counts record the ledger file's sha256 and its
+   `generated_at`, the sha256 of the pairs split and the run id: check that
+   `generated_at` predates the sweep. A run id that matches no row is
+   refused. Given
+   `--pairs <file>` instead of `--run-id` it splits an already archived pairs
+   file and never connects to a database. Record the binary's git sha in the
+   report.
 4. Of the **clean** rows, the ones with a `verifier_verdict` are this run's
    verifier answers. This does not hold for contaminated rows: the upsert
    keeps the stored verdict on any row whose `decided_at` is set, so a
@@ -203,8 +217,9 @@ security). It therefore lists claim ids from every tenant, private groups
 included, with their decision history. **Archive it privately next to the
 results, with the run's sha. Never commit it to this repository**, which is
 public; the same applies to the adjudicator packet, labels and sealed mapping
-(§7). Split the sweep's pairs with `partition_by_ledger`, which matches pairs
-whatever their orientation.
+(§7). Split the sweep's pairs with `contamination_split` (§2 step 3), which
+calls `partition_by_ledger` and matches pairs whatever their orientation. Its
+inputs and outputs carry the same claim ids, so archive them privately too.
 
 A `decided` reason means only that `decided_at` is set. Retirement stamps it
 too, so a `decided` row may be a retired same-source pair rather than one a

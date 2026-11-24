@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::errors::{DbError, RefusalKind};
 use crate::repos::ClaimRepository;
+use crate::visibility::Viewer;
 
 /// Proof that `agent` may write a claim into team `group` ONLY through its
 /// live human (owner decision D-V3: an operated agent writes where its human
@@ -294,7 +295,13 @@ fn refusal_text(outcome: &str) -> &'static str {
             "you did not write this claim and are not an admin of the group it is private to"
         }
         "refused_not_team_writer" => {
-            "the target is not a team you may write (writer or admin, your own or your human's)"
+            "the target is not a team you may write (your own live writer or admin membership)"
+        }
+        // Migration 242 (spec ruling R1, backlog ecd842bf).
+        "refused_not_human" => {
+            "only a human moves existing work out of its group: you are an operated agent, and \
+             an operated agent does not share or publish work on its own authority, whatever \
+             memberships it holds; your human operator makes this call"
         }
         _ => "refused",
     }
@@ -669,6 +676,10 @@ impl ClaimRepository {
     /// classified (`VIS04`; retry), `Input` for a bad request) with nothing
     /// changed;
     /// `DbError::QueryFailed` for faults.
+    ///
+    /// Call `epigraph_engine::visibility_act::publicize_claims` instead: this
+    /// does not refold the moved claims' cached belief for their new audience.
+    /// `tests/visibility_act_callers_ratchet.rs` fails on any other caller.
     pub async fn publicize_conn(
         conn: &mut PgConnection,
         claim_ids: &[Uuid],
@@ -691,6 +702,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// As [`Self::publicize_conn`].
+    ///
+    /// Call `epigraph_engine::visibility_act::share_claims_with_team` instead,
+    /// for the same reason; the same ratchet holds it.
     pub async fn share_with_team_conn(
         conn: &mut PgConnection,
         claim_ids: &[Uuid],
@@ -732,6 +746,66 @@ impl ClaimRepository {
         .bind(claim_ids)
         .fetch_all(&mut *conn)
         .await?)
+    }
+
+    /// After a widening act refolded `claim_id`'s cached belief for its new
+    /// audience (`epigraph_engine::visibility_act`), set its `truth_value` to
+    /// that refolded BetP (`pignistic_prob`, clamped to `[0, 1]`; NaN reads as
+    /// 0.5, as `TruthValue::clamped`), on the act's own stamped transaction.
+    /// Returns whether the row was written.
+    ///
+    /// Several writers persist `truth_value` as a copy of the fold they just
+    /// cached (`submit_claim`, `update_with_evidence`), so it can carry a BBA
+    /// the new audience may not read (evidence pinned behind, a private edge
+    /// source); a copy that a later recompute left stale carries it as well.
+    /// The refolded cache is admissible by construction, so it is the value
+    /// served from now on. That holds for workflow, step and procedural claims
+    /// too: `report_workflow_outcome` persists the same fold copy, and a
+    /// workflow's outcome track (the REST outcome route's Bayesian update) is
+    /// itself derived from outcome reports the new audience may not read, so
+    /// they are written like any other claim. Not written:
+    /// * a claim with no cache (`pignistic_prob IS NULL`);
+    /// * a claim at the deprecation marker (`truth_value` 0.05, whether or not
+    ///   it is current): the marker is a state set by a retirement
+    ///   (`deprecate_claim`, `deprecate_workflow`) or a step's soft delete
+    ///   (`delete_step`, which leaves the step current), not a fold, so it
+    ///   carries no input, and writing over it would revive what was retired;
+    /// * a claim whose `truth_value` already equals the new value;
+    /// * a claim whose owner group `viewer` does not write (the write gate).
+    ///
+    /// The guards read only the claim's own row, so what the session can see
+    /// of the claim's edges or workflow rows cannot change what is written.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the write fails.
+    pub async fn mirror_refolded_cache_into_truth_conn(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "WITH n AS ( \
+                     SELECT c.id, \
+                            CASE WHEN c.pignistic_prob = 'NaN'::float8 THEN 0.5::float8 \
+                                 ELSE LEAST(GREATEST(c.pignistic_prob, 0.0::float8), 1.0::float8) \
+                            END AS tv \
+                       FROM claims c \
+                      WHERE c.id = $1 \
+                        AND c.pignistic_prob IS NOT NULL \
+                        AND abs(c.truth_value - 0.05) > 1e-9) \
+                 UPDATE claims AS u SET truth_value = n.tv, updated_at = NOW() \
+                   FROM n \
+                  WHERE u.id = n.id AND u.truth_value IS DISTINCT FROM n.tv \
+                  /* {WRITABLE:u} */ \
+                 RETURNING u.id",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(claim_id);
+        // Conditional: a `Bypass` viewer renders no `$2`.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?.is_some())
     }
 }
 
@@ -789,5 +863,20 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// Migration 242's outcome is an AUTHORITY refusal (403 / INVALID_REQUEST),
+    /// never a state one, and its text names the reason rather than the
+    /// catch-all "refused".
+    #[test]
+    fn an_operated_agent_refusal_is_an_authority_refusal_that_says_why() {
+        let rows = vec![(g(1), "refused_not_human".to_string())];
+        match outcomes_or_refusal("share_claims_with_team", rows, &["shared"]) {
+            Err(DbError::Refused {
+                kind: RefusalKind::Authority,
+                message,
+            }) => assert!(message.contains("operated agent"), "{message}"),
+            other => panic!("expected an authority refusal, got {other:?}"),
+        }
     }
 }

@@ -11,14 +11,26 @@ use helpers::{make_agent, make_claim};
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_or_create_inserts_then_returns_existing(pool: PgPool) {
     let doi = "10.1234/test-paper-1";
-    let id1 = PaperRepository::get_or_create(&pool, doi, Some("Title 1"), Some("Journal X"))
-        .await
-        .expect("first insert");
+    let id1 = PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("Title 1"),
+        Some("Journal X"),
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("first insert");
 
     // Second call with the same DOI should return the same id (UNIQUE on doi).
-    let id2 = PaperRepository::get_or_create(&pool, doi, Some("Title 1 updated"), None)
-        .await
-        .expect("second insert");
+    let id2 = PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("Title 1 updated"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("second insert");
     assert_eq!(id1, id2, "same DOI must return same paper id");
 
     // A hit fills only what is missing (backlog 62ce37ca): the first
@@ -39,15 +51,22 @@ async fn get_or_create_inserts_then_returns_existing(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_or_create_on_a_hit_fills_only_null_fields(pool: PgPool) {
     let doi = "10.5555/repo-fill-only";
-    let id = PaperRepository::get_or_create(&pool, doi, Some("Original title"), None)
-        .await
-        .expect("first writer");
+    let id = PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("Original title"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("first writer");
 
     let again = PaperRepository::get_or_create(
         &pool,
         doi,
         Some("Rewritten by a second ingester"),
         Some("Second journal"),
+        epigraph_core::TenancyDecl::instance_wide(),
     )
     .await
     .expect("second writer");
@@ -69,9 +88,15 @@ async fn get_or_create_on_a_hit_fills_only_null_fields(pool: PgPool) {
     );
 
     // And once filled, the journal is not rewritten either.
-    PaperRepository::get_or_create(&pool, doi, None, Some("Third journal"))
-        .await
-        .expect("third writer");
+    PaperRepository::get_or_create(
+        &pool,
+        doi,
+        None,
+        Some("Third journal"),
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("third writer");
     let row = PaperRepository::find_by_doi(&pool, doi)
         .await
         .expect("find_by_doi")
@@ -91,10 +116,15 @@ async fn find_by_doi_returns_none_for_unknown(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let paper_id =
-        PaperRepository::get_or_create(&pool, "10.1234/has-pbe", Some("Has-PBE Paper"), None)
-            .await
-            .expect("create paper");
+    let paper_id = PaperRepository::get_or_create(
+        &pool,
+        "10.1234/has-pbe",
+        Some("Has-PBE Paper"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("create paper");
 
     // No edge yet → false.
     assert!(!PaperRepository::has_processed_by_edge(
@@ -222,9 +252,15 @@ async fn get_or_create_reuses_a_legacy_url_keyed_row_instead_of_twinning(pool: P
     let legacy_key = format!("https://doi.org/{bare}");
     let legacy_id = seed_raw_paper(&pool, &legacy_key, "legacy").await;
 
-    let id = PaperRepository::get_or_create(&pool, bare, Some("re-ingested"), None)
-        .await
-        .expect("get_or_create");
+    let id = PaperRepository::get_or_create(
+        &pool,
+        bare,
+        Some("re-ingested"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("get_or_create");
 
     assert_eq!(
         rows_ending_in(&pool, "repo-legacy-reuse").await,
@@ -251,9 +287,15 @@ async fn get_or_create_prefers_the_canonical_row_over_a_legacy_twin(pool: PgPool
     let _legacy = seed_raw_paper(&pool, &format!("https://doi.org/{bare}"), "legacy").await;
     let canonical = seed_raw_paper(&pool, bare, "canonical").await;
 
-    let id = PaperRepository::get_or_create(&pool, &format!("https://doi.org/{bare}"), None, None)
-        .await
-        .expect("get_or_create");
+    let id = PaperRepository::get_or_create(
+        &pool,
+        &format!("https://doi.org/{bare}"),
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("get_or_create");
     assert_eq!(
         id, canonical,
         "with both spellings stored, the canonical (bare) row is the one returned"
@@ -265,9 +307,15 @@ async fn get_or_create_prefers_the_canonical_row_over_a_legacy_twin(pool: PgPool
 async fn get_or_create_stores_a_new_paper_under_the_canonical_key(pool: PgPool) {
     let bare = "10.5555/repo-canonical-insert";
     for spelling in [format!("doi:{bare}"), format!("https://dx.doi.org/{bare}")] {
-        PaperRepository::get_or_create(&pool, &spelling, None, None)
-            .await
-            .expect("get_or_create");
+        PaperRepository::get_or_create(
+            &pool,
+            &spelling,
+            None,
+            None,
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
+        .expect("get_or_create");
     }
     let rows = rows_ending_in(&pool, "repo-canonical-insert").await;
     assert_eq!(rows.len(), 1, "two spellings, one paper: {rows:?}");
@@ -290,7 +338,14 @@ async fn concurrent_writers_under_two_spellings_of_a_new_doi_converge(pool: PgPo
 
     let p = pool.clone();
     let writer = tokio::spawn(async move {
-        PaperRepository::get_or_create(&p, &format!("https://doi.org/{bare}"), None, None).await
+        PaperRepository::get_or_create(
+            &p,
+            &format!("https://doi.org/{bare}"),
+            None,
+            None,
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
     });
 
     // Wait (bounded) until the writer blocks on the held row's unique-index
@@ -341,7 +396,14 @@ async fn the_race_loser_does_not_overwrite_the_winners_title(pool: PgPool) {
 
     let p = pool.clone();
     let writer = tokio::spawn(async move {
-        PaperRepository::get_or_create(&p, bare, Some("loser"), Some("loser journal")).await
+        PaperRepository::get_or_create(
+            &p,
+            bare,
+            Some("loser"),
+            Some("loser journal"),
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
     });
 
     for _ in 0..200 {
@@ -393,10 +455,15 @@ async fn the_race_loser_does_not_overwrite_the_winners_title(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let paper_id =
-        PaperRepository::get_or_create(&pool, "10.1234/parallel-edges", Some("Parallel"), None)
-            .await
-            .expect("create paper");
+    let paper_id = PaperRepository::get_or_create(
+        &pool,
+        "10.1234/parallel-edges",
+        Some("Parallel"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("create paper");
     let author = AgentRepository::create(&pool, &make_agent(Some("Ysolde Pemberton")))
         .await
         .expect("create author")
@@ -474,4 +541,317 @@ async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(
         .await
         .expect("list_asserted_claims");
     assert_eq!(claims.len(), 1, "a claim listed twice");
+}
+
+// --- Case-variant resolver prefixes (backlog f3a3ca54) ----------------------
+//
+// A legacy row keyed on a resolver URL whose PREFIX differs from the listed
+// spellings only in letter case (`HTTPS://DOI.ORG/10.x/y`, `Doi:10.x/y`) is the
+// same document as the bare DOI: `canonical_document_key` already folds the
+// prefix's case. The lookup matched the legacy spellings byte-for-byte, so a
+// re-ingest under the bare DOI missed such a row and minted a bare twin. The
+// DOI suffix keeps its case: only the prefix is compared case-insensitively.
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_or_create_reuses_a_case_variant_prefix_row_instead_of_twinning(pool: PgPool) {
+    for (n, prefix) in [
+        "HTTPS://DOI.ORG/",
+        "Http://Dx.Doi.Org/",
+        "WWW.DOI.ORG/",
+        "DOI:",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let suffix = format!("repo-case-variant-{n}");
+        let bare = format!("10.5555/{suffix}");
+        let legacy_key = format!("{prefix}{bare}");
+        let legacy_id = seed_raw_paper(&pool, &legacy_key, "legacy").await;
+
+        let id = PaperRepository::get_or_create(
+            &pool,
+            &bare,
+            Some("re-ingested"),
+            None,
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
+        .expect("get_or_create");
+        assert_eq!(
+            rows_ending_in(&pool, &suffix).await,
+            vec![(legacy_id, legacy_key.clone())],
+            "an ingest under the bare DOI must reuse the {prefix:?}-keyed row, not mint a twin"
+        );
+        assert_eq!(id, legacy_id, "{legacy_key}");
+
+        // The read path the MCP paper tools use agrees with the writer, under
+        // the bare DOI and under another spelling of it.
+        for spelling in [bare.clone(), format!("https://doi.org/{bare}")] {
+            let row = PaperRepository::find_by_document_key(&pool, &spelling)
+                .await
+                .expect("find_by_document_key")
+                .unwrap_or_else(|| panic!("{spelling} must find the {legacy_key} row"));
+            assert_eq!(row.id, legacy_id, "{spelling} -> {legacy_key}");
+        }
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_case_variant_prefix_match_keeps_the_suffix_exact_and_prefers_the_exact_row(
+    pool: PgPool,
+) {
+    // The suffix is not folded: a stored `HTTPS://DOI.ORG/10.5555/REPO-SUFFIX`
+    // is not the paper a lookup for `10.5555/repo-suffix` names.
+    let upper = seed_raw_paper(&pool, "HTTPS://DOI.ORG/10.5555/REPO-SUFFIX", "upper").await;
+    let found = PaperRepository::find_by_document_key(&pool, "10.5555/repo-suffix")
+        .await
+        .expect("find_by_document_key");
+    assert!(
+        found.is_none(),
+        "the DOI suffix is compared exactly: {found:?}"
+    );
+    let id = PaperRepository::get_or_create(
+        &pool,
+        "10.5555/repo-suffix",
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("get_or_create");
+    assert_ne!(id, upper, "a different suffix case is a different key");
+
+    // A non-DOI key is not matched case-insensitively at all.
+    seed_raw_paper(&pool, "URN:EPIGRAPH:DOC:repo-case", "urn").await;
+    assert!(
+        PaperRepository::find_by_document_key(&pool, "urn:epigraph:doc:repo-case")
+            .await
+            .expect("find_by_document_key")
+            .is_none()
+    );
+
+    // With both an exact spelling and a case-variant one stored, the exact
+    // (canonical) row wins, whatever the heap order.
+    let bare = "10.5555/repo-case-order";
+    let _variant = seed_raw_paper(&pool, &format!("HTTPS://DOI.ORG/{bare}"), "variant").await;
+    let canonical = seed_raw_paper(&pool, bare, "canonical").await;
+    let id = PaperRepository::get_or_create(
+        &pool,
+        bare,
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("get_or_create");
+    assert_eq!(id, canonical);
+    let row = PaperRepository::find_by_document_key(&pool, bare)
+        .await
+        .expect("find_by_document_key")
+        .expect("row");
+    assert_eq!(row.id, canonical);
+}
+
+// --- The case-variant fallback must not cost an exact hit its index ---------
+//
+// No index serves the case-variant arm. Written as `exact OR case-variant` in
+// one WHERE, it made every lookup scan the whole `papers` table, exact hits
+// included: every re-ingest's `get_or_create`, every `query_paper` probe,
+// every `GET /api/v1/papers?doi=`. The lookup runs the case-variant scan only
+// when no exact spelling is stored, and never for a key that is not a DOI.
+
+/// Sequential scans of `papers` counted so far in the cluster's statistics,
+/// after flushing the calling backend's pending counts (PG 15+).
+async fn papers_seq_scans(pool: &PgPool) -> i64 {
+    sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(pool)
+        .await
+        .expect("force stats flush");
+    sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(pool)
+        .await
+        .expect("clear stats snapshot");
+    sqlx::query_scalar(
+        "SELECT seq_scan FROM pg_stat_user_tables \
+         WHERE relid = 'public.papers'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read papers seq_scan")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_exact_key_hit_never_scans_papers(pool: PgPool) {
+    use sqlx::postgres::PgPoolOptions;
+
+    let bare = "10.5555/repo-index-hit";
+    let canonical = seed_raw_paper(&pool, bare, "canonical").await;
+    seed_raw_paper(&pool, "10.5555/repo-index-other", "other").await;
+    seed_raw_paper(&pool, "urn:epigraph:doc:repo-index-urn", "urn").await;
+
+    // One connection, so every statement below runs on the backend whose
+    // counts `papers_seq_scans` flushes; sequential scans priced out, so a
+    // scan that still appears is one the statement had no index path for.
+    let one = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET enable_seqscan = off")
+                    .execute(conn)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("single-connection pool");
+
+    let before = papers_seq_scans(&one).await;
+
+    // Exact hits, through every lookup shape: the writer's get-or-create, the
+    // read the MCP paper tools use (bare and URL spelling of the key), and
+    // the row set the REST list and count read.
+    let id = PaperRepository::get_or_create(
+        &one,
+        bare,
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("get_or_create");
+    assert_eq!(id, canonical);
+    for spelling in [bare.to_string(), format!("https://doi.org/{bare}")] {
+        let row = PaperRepository::find_by_document_key(&one, &spelling)
+            .await
+            .expect("find_by_document_key")
+            .expect("hit");
+        assert_eq!(row.id, canonical, "{spelling}");
+    }
+    let listed: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM ({}) AS m",
+        epigraph_db::repos::paper::document_key_rows_sql("id, doi", 1)
+    ))
+    .bind(epigraph_db::repos::paper::document_key_spellings(bare))
+    .fetch_one(&one)
+    .await
+    .expect("rows count");
+    assert_eq!(listed, 1);
+    // A miss on a key that is not a DOI has no prefix to fold: no scan.
+    assert!(
+        PaperRepository::find_by_document_key(&one, "urn:epigraph:doc:repo-index-miss")
+            .await
+            .expect("find_by_document_key")
+            .is_none()
+    );
+
+    assert_eq!(
+        papers_seq_scans(&one).await,
+        before,
+        "an exact hit (or a non-DOI miss) must stay on the papers.doi index"
+    );
+
+    // Control: the instrument sees a scan. A miss on a bare DOI is the one
+    // lookup that must look for a case-variant prefix, which only a scan can.
+    assert!(
+        PaperRepository::find_by_document_key(&one, "10.5555/repo-index-miss")
+            .await
+            .expect("find_by_document_key")
+            .is_none()
+    );
+    assert!(
+        papers_seq_scans(&one).await > before,
+        "a bare-DOI miss scans papers for a case-variant prefix"
+    );
+}
+
+// --- The case-variant fallback inside a declared scope (246 + f3a3ca54) -----
+//
+// Since migration 246 a `papers` row carries the tenancy of the ingest that
+// wrote it, and `get_or_create` reuses only a row of the declared scope. The
+// case-variant fallback must stay inside that scope too, gate included: a
+// group's case-variant row is not a public ingest's to reuse, and a group's
+// exact-spelling row must not switch off the fallback for the public scope.
+
+async fn seed_scoped_paper(
+    pool: &PgPool,
+    key: &str,
+    visibility: &str,
+    owner: uuid::Uuid,
+) -> uuid::Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, visibility, owner_group_id) \
+         VALUES ($1, 'scoped', $2, $3) RETURNING id",
+    )
+    .bind(key)
+    .bind(visibility)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("seed scoped paper row")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_case_variant_fallback_stays_inside_the_declared_scope(pool: PgPool) {
+    let (_, g) = fixture::seed_agent_with_group(&pool, "case-variant-scope").await;
+    let world = epigraph_core::TenancyDecl::instance_wide()
+        .owner_group_bind()
+        .expect("the instance-wide declaration names its owner");
+
+    // A GROUP row keyed on a case-variant prefix belongs to that group.
+    let bare = "10.5555/repo-case-scope";
+    let group_variant =
+        seed_scoped_paper(&pool, &format!("HTTPS://DOI.ORG/{bare}"), "group", g).await;
+    let public_id = PaperRepository::get_or_create(
+        &pool,
+        bare,
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("public get_or_create");
+    assert_ne!(
+        public_id, group_variant,
+        "a public ingest must not reuse a group's case-variant row"
+    );
+    let group_id = PaperRepository::get_or_create(
+        &pool,
+        bare,
+        None,
+        None,
+        epigraph_core::TenancyDecl::group(g),
+    )
+    .await
+    .expect("group get_or_create");
+    assert_eq!(
+        group_id, group_variant,
+        "the group's own ingest reuses its case-variant row instead of twinning it"
+    );
+    assert_eq!(
+        PaperRepository::find_in_scope(&pool, bare, epigraph_core::TenancyDecl::group(g))
+            .await
+            .expect("find_in_scope"),
+        Some(group_variant),
+        "find_in_scope agrees with the writer"
+    );
+
+    // The gate is scoped as well: a group row stored under the EXACT bare key
+    // does not hide the public scope's case-variant row from a public ingest.
+    let bare2 = "10.5555/repo-case-gate";
+    let public_variant = seed_scoped_paper(&pool, &format!("Doi:{bare2}"), "public", world).await;
+    let _group_exact = seed_scoped_paper(&pool, bare2, "group", g).await;
+    let id = PaperRepository::get_or_create(
+        &pool,
+        bare2,
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("public get_or_create");
+    assert_eq!(
+        id, public_variant,
+        "another scope's exact row must not switch off this scope's case-variant match"
+    );
 }

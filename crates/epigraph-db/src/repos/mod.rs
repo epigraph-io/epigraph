@@ -83,6 +83,7 @@ pub mod paper;
 pub mod passkey;
 pub mod passkey_ceremony;
 pub mod pattern_template;
+pub mod person_team_group;
 pub mod perspective;
 pub mod policy;
 pub mod political;
@@ -105,6 +106,7 @@ pub mod system_agent;
 pub mod task;
 pub mod trace;
 pub mod triple;
+pub(crate) mod vector_scan;
 pub mod webhook;
 pub mod workflow;
 pub mod workflow_execution;
@@ -122,11 +124,14 @@ pub use agent::{
     CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
     SpeaksFor,
 };
-pub use agent::{DelegationLive, RunTokens, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV};
+pub use agent::{
+    DelegationLive, RunTokens, SignerAgentType, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV,
+};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
 pub use agent_identity::{
     AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptBlobRead,
-    PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot, PromptSnapshotIndex,
+    PromptFile, PromptHistoryCursor, PromptHistoryEntry, PromptHistoryIndexEntry,
+    PromptHistoryPage, PromptSnapshot, PromptSnapshotIndex, PROMPT_HISTORY_PAGE_MAX,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use agent_lookup::{
@@ -169,14 +174,15 @@ pub use claim::{
     ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository,
     ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult,
     CreatedWindow, DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy,
-    EmbeddingSeedScope, EvolveStepResult, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit,
-    GroundedNeighbor, HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead,
-    MarkedDuplicateRow, MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff,
-    PatchClaimInput, SemanticSelectedClaim, SortDirection, SupersedeActor, SupersedeEdgeMigration,
-    SupersedeTool, SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES,
-    CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
-    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, RESERVED_EDGE_PROPERTIES,
-    SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY, SUPERSEDE_ACT_TOOLS,
+    EmbeddingSeedScope, EvolveStepResult, FlatPage, FlatRanking, FrameClaimBeliefHit,
+    GraphExpansionHit, GroundedNeighbor, HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType,
+    LineageHead, MarkedDuplicateRow, MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff,
+    PatchClaimInput, PromotionStanding, SemanticFlatPage, SemanticSelectedClaim, SortDirection,
+    SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate, UnmarkedDuplicate,
+    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED,
+    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
+    SUPERSEDE_ACT_TOOLS,
 };
 pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,

@@ -144,15 +144,14 @@ async fn seed_public_claim_owned_by(pool: &PgPool, agent: Uuid, group: Uuid, tag
     id
 }
 
-/// An edge id is also the perspective its BBAs are keyed by
-/// (`ensure_edge_perspective`); `mass_functions.perspective_id` is an FK.
+/// A genuine (registry) perspective row with id `id`.
 async fn seed_perspective(pool: &PgPool, id: Uuid) {
     sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
         .bind(id)
         .bind(format!("edge {id}"))
         .execute(pool)
         .await
-        .expect("seed edge perspective");
+        .expect("seed a perspective");
 }
 
 async fn insert_evidence(conn: &mut PgConnection, claim: Uuid, tag: &str) -> Uuid {
@@ -189,21 +188,42 @@ async fn store_bba(
     source_agent: Uuid,
     perspective: Option<Uuid>,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        &mut *conn,
-        claim,
-        frame,
-        Some(source_agent),
-        perspective,
-        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
-        None,
-        Some("test"),
-        None,
-        None,
-        "unknown",
-        None,
-    )
-    .await
+    match perspective {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                &mut *conn,
+                claim,
+                frame,
+                Some(source_agent),
+                epigraph_db::BbaSlot::Edge(edge),
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                &mut *conn,
+                claim,
+                frame,
+                Some(source_agent),
+                None,
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
     .expect("store bba")
 }
 
@@ -587,7 +607,6 @@ async fn the_dedup_repair_is_the_maintenance_connections_and_drops_the_collision
     let bt = seed_frame(&pool, "binary_truth").await;
     let dup_edge = fixture::seed_edge(&pool, dup, third).await;
     let _canon_edge = fixture::seed_edge(&pool, canonical, third).await;
-    seed_perspective(&pool, dup_edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -687,7 +706,6 @@ async fn the_retraction_cascade_refuses_every_non_owner_and_lands_on_maintenance
     let target = fixture::seed_public_claim(&pool, author, "world target").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, replacement, target).await;
-    seed_perspective(&pool, edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -696,12 +714,11 @@ async fn the_retraction_cascade_refuses_every_non_owner_and_lands_on_maintenance
             stamp(&mut conn, &p, x).await;
             let bba = store_bba(&mut conn, target, bt, w, Some(edge)).await;
             stamp(&mut conn, &p, z).await;
-            let by_z = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            let by_z = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
             unstamp(&mut conn).await;
-            let by_unstamped =
-                MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            let by_unstamped = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
             stamp(&mut conn, &p, w).await;
-            let by_w = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            let by_w = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
             (conn, (bba, by_z, by_unstamped, by_w))
         })
         .await;
@@ -726,7 +743,7 @@ async fn the_retraction_cascade_refuses_every_non_owner_and_lands_on_maintenance
     );
 
     let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let n = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         (conn, n)
     })
     .await
@@ -752,7 +769,6 @@ async fn the_resourced_edges_bba_is_the_maintenance_connections_to_invalidate(po
     let target = fixture::seed_public_claim(&pool, author, "world target").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, dup, target).await;
-    seed_perspective(&pool, edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -794,9 +810,9 @@ async fn the_resourced_edges_bba_is_the_maintenance_connections_to_invalidate(po
     let p = pool.clone();
     let (by_z, by_w) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, z).await;
-        let by_z = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let by_z = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         stamp(&mut conn, &p, w).await;
-        let by_w = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let by_w = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         (conn, (by_z, by_w))
     })
     .await;
@@ -807,7 +823,7 @@ async fn the_resourced_edges_bba_is_the_maintenance_connections_to_invalidate(po
     assert!(exists(&pool, "mass_functions", bba).await);
 
     let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let n = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         (conn, n)
     })
     .await
@@ -838,7 +854,6 @@ async fn a_dedup_collision_with_another_writers_row_keeps_the_canonicals(pool: P
     let source = fixture::seed_public_claim(&pool, author, "world source").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, source, dup).await;
-    seed_perspective(&pool, edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -939,7 +954,6 @@ async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("matcher edge");
-    seed_perspective(&pool, edge).await;
     let cand = MatchCandidateRepo::new(pool.clone())
         .upsert(
             a,
@@ -993,20 +1007,25 @@ async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
 
     // The application role, pooled or on a connection: refused, nothing written.
     let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    // A repo-authored refusal of the session's authority (backlog 05f56dde:
+    // `DbError::Refused`, which a transport answers as a refusal; a
+    // `sqlx::Error::Protocol` was redacted as a server fault).
+    let authority = |r: &Result<_, epigraph_db::DbError>| {
+        matches!(
+            r,
+            Err(epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::Authority,
+                message,
+            }) if message.contains("privileged")
+        )
+    };
     let whole = MatchCandidateRepo::new(app).retire(cand.id, None).await;
     assert!(
-        whole
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("privileged")),
+        authority(&whole),
         "retirement is not the application role's: {whole:?}"
     );
     let by_app = retire(pool.clone(), "epigraph_app", Some("promoted")).await;
-    assert!(
-        by_app
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("privileged")),
-        "{by_app:?}"
-    );
+    assert!(authority(&by_app), "{by_app:?}");
     assert_eq!(status(pool.clone()).await, "promoted");
     assert!(edge_in_force(pool.clone()).await);
     assert!(exists(&pool, "mass_functions", bba).await);
@@ -1015,10 +1034,14 @@ async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
     // nothing changed.
     let moved_on = retire(pool.clone(), "epigraph_maintenance", Some("pending")).await;
     assert!(
-        moved_on
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("decided again")),
-        "{moved_on:?}"
+        matches!(
+            &moved_on,
+            Err(epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::State,
+                message,
+            }) if message.contains("decided again")
+        ),
+        "a state refusal: {moved_on:?}"
     );
     assert_eq!(status(pool.clone()).await, "promoted");
     assert!(edge_in_force(pool.clone()).await);
@@ -1064,9 +1087,6 @@ async fn privileged_sessions_delete_edge_bbas_exactly_as_before(pool: PgPool) {
     let bt = seed_frame(&pool, "binary_truth").await;
     let e1 = fixture::seed_edge(&pool, s1, target).await;
     let e2 = fixture::seed_edge(&pool, s2, target).await;
-    for e in [e1, e2] {
-        seed_perspective(&pool, e).await;
-    }
     let p = pool.clone();
     let (b1, b2) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, x).await;
@@ -1077,7 +1097,7 @@ async fn privileged_sessions_delete_edge_bbas_exactly_as_before(pool: PgPool) {
     .await;
 
     let mut su = pool.acquire().await.expect("acquire");
-    let n = MassFunctionRepository::delete_for_perspective(&mut *su, e1)
+    let n = MassFunctionRepository::delete_for_edge(&mut *su, e1)
         .await
         .expect("superuser");
     drop(su);
@@ -1085,7 +1105,7 @@ async fn privileged_sessions_delete_edge_bbas_exactly_as_before(pool: PgPool) {
     assert!(!exists(&pool, "mass_functions", b1).await);
 
     let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, e2).await;
+        let n = MassFunctionRepository::delete_for_edge(&mut *conn, e2).await;
         (conn, n)
     })
     .await
@@ -1177,7 +1197,6 @@ async fn a_reader_of_a_group_deletes_none_of_its_rows(pool: PgPool) {
     let source = fixture::seed_public_claim(&pool, author, "a world source").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, source, public_claim).await;
-    seed_perspective(&pool, edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -1209,7 +1228,7 @@ async fn a_reader_of_a_group_deletes_none_of_its_rows(pool: PgPool) {
             ] {
                 deleted.push(delete_by_id(&mut conn, t, id).await);
             }
-            let cascade = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            let cascade = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
             (conn, (ev, mf, seen, deleted, cascade))
         })
         .await;
@@ -1249,8 +1268,6 @@ async fn no_retired_duplicate_licenses_another_writers_bba_any_more(pool: PgPool
     let bt = seed_frame(&pool, "binary_truth").await;
     let e1 = fixture::seed_edge(&pool, s1, target).await;
     let e2 = fixture::seed_edge(&pool, s2, target).await;
-    seed_perspective(&pool, e1).await;
-    seed_perspective(&pool, e2).await;
     // Both rows are public world-owned (they inherit the world target), so
     // W reads them and the owner arm cannot admit them.
     let b1 = store_bba_privileged(&pool, target, bt, w, e1).await;
@@ -1261,8 +1278,8 @@ async fn no_retired_duplicate_licenses_another_writers_bba_any_more(pool: PgPool
     let (same_author, other_author) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, w).await;
-            let a = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
-            let b = MassFunctionRepository::delete_for_perspective(&mut *conn, e2).await;
+            let a = MassFunctionRepository::delete_for_edge(&mut *conn, e1).await;
+            let b = MassFunctionRepository::delete_for_edge(&mut *conn, e2).await;
             (conn, (a, b))
         })
         .await;
@@ -1275,8 +1292,8 @@ async fn no_retired_duplicate_licenses_another_writers_bba_any_more(pool: PgPool
     assert!(exists(&pool, "mass_functions", b2).await);
 
     let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let a = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
-        let b = MassFunctionRepository::delete_for_perspective(&mut *conn, e2).await;
+        let a = MassFunctionRepository::delete_for_edge(&mut *conn, e1).await;
+        let b = MassFunctionRepository::delete_for_edge(&mut *conn, e2).await;
         (conn, (a, b))
     })
     .await;
@@ -1300,7 +1317,6 @@ async fn the_cascade_never_touches_a_row_the_session_cannot_read(pool: PgPool) {
     let h_claim = fixture::seed_group_claim(&pool, h, hg, "H's private claim").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, source, target).await;
-    seed_perspective(&pool, edge).await;
     let private_bba = store_bba_privileged(&pool, h_claim, bt, author, edge).await;
     assert_eq!(
         writer_owned(&pool, "mass_functions", private_bba).await.0,
@@ -1313,7 +1329,7 @@ async fn the_cascade_never_touches_a_row_the_session_cannot_read(pool: PgPool) {
     let (z_bba, n) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, z).await;
         let z_bba = store_bba(&mut conn, target, bt, author, Some(edge)).await;
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let n = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         (conn, (z_bba, n))
     })
     .await;
@@ -1941,7 +1957,8 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
         steps.push(("restrict", moved.len() as u64));
         let n = PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &[c1])
             .await
-            .expect("recompute_boundary_meet_conn (apply)");
+            .expect("recompute_boundary_meet_conn (apply)")
+            .updated;
         steps.push(("meet after restrict", n));
         let n = PrivatizationRepository::restore_claims_conn(&mut tx, plan, &[c1], p_group)
             .await
@@ -1949,7 +1966,8 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
         steps.push(("restore", n));
         let n = PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &[c1])
             .await
-            .expect("recompute_boundary_meet_conn (revert)");
+            .expect("recompute_boundary_meet_conn (revert)")
+            .updated;
         steps.push(("meet after restore", n));
 
         tx.commit().await.expect("commit");
@@ -2057,9 +2075,13 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     // `workflows_delete_owner` and `workflows_owner_immutable`.
     // 27 -> 30 (Atlas W2, backlog 77f4bf09): migration 210's three
     // `atlas_map_*` tables, each with `<t>_delete_owner` and `<t>_owner_immutable`.
+    // 30 -> 31 (backlog 88cf603b): migration 240's `behavioral_executions`, with
+    // `behavioral_executions_delete_owner` and `behavioral_executions_owner_immutable`.
+    // 31 -> 32 (backlog 34864fb5): migration 246's `papers`, with
+    // `papers_delete_owner` and `papers_owner_immutable`.
     assert_eq!(
         rows.len(),
-        30,
+        32,
         "the tier-A set changed size; decide its DELETE rule: {rows:?}"
     );
     let missing: Vec<&String> = rows
@@ -2097,7 +2119,9 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     .expect("delete policy quals");
     // 26 -> 27 (ruling R-74): migration 183's `workflows_delete_owner`.
     // 27 -> 30 (Atlas W2): migration 210's three `atlas_map_*_delete_owner`.
-    assert_eq!(quals.len(), 30, "{quals:?}");
+    // 30 -> 31 (backlog 88cf603b): migration 240's `behavioral_executions_delete_owner`.
+    // 31 -> 32 (backlog 34864fb5): migration 246's `papers_delete_owner`.
+    assert_eq!(quals.len(), 32, "{quals:?}");
     for (table, qual) in &quals {
         assert!(
             qual.contains("owner_group_id = ANY") && qual.contains("epigraph_writable_groups()"),
@@ -2317,12 +2341,9 @@ fn no_application_path_deletes_a_non_tier_a_edge_node() {
             "AgentRepository::delete: `agents` has row security and no DELETE policy, \
              so a non-privileged session deletes nothing",
         ),
-        (
-            "epigraph-db/src/repos/recall_event.rs",
-            "events",
-            1,
-            "prune_telemetry_events: telemetry event rows are not edge endpoints",
-        ),
+        // `prune_telemetry_events` deletes from `events` through migration
+        // 250's definer `epigraph_prune_telemetry_events` since then, so it
+        // names no `events` DELETE in Rust any more.
     ];
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("read dir") {
@@ -2455,7 +2476,15 @@ async fn endpoints(pool: &PgPool, edge: Uuid) -> (Uuid, Uuid) {
 /// that is not the repair of a committed act: before the act, with a pair the
 /// claims do not record, and (the supersede migration) on the application role
 /// after the act. Only the matching pair on the maintenance connection moves
-/// the other writer's edge.
+/// the other writer's edge. The administrative cascade's entry point
+/// (`migrate_superseded_edges_to_head_conn`, which follows the replacement's
+/// supersedes chain to its current head) refuses the same three calls, with
+/// the same reasons.
+///
+/// Verified to fail with `require_privileged_session` removed from
+/// `migrate_superseded_edges_to_head_conn` (the application-role call no
+/// longer refuses as unprivileged) and with its act verification removed (the
+/// pre-act `(old, decoy)` call moves X's edge onto the decoy).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
@@ -2469,9 +2498,13 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
     let into_old = fixture::seed_edge(&pool, xc, old).await;
     let into_dup = fixture::seed_edge(&pool, xc, dup).await;
     assert_app_role_does_not_bypass(&pool).await;
+    // The maintenance session's bypass viewer, which the cascade's entry
+    // point reads the act and the chain through.
+    let (_scoped, bv) = fixture::bypass(&pool).await;
 
     // Before any act: both repairs refuse on the maintenance connection.
-    let (sup_pre, dup_pre) =
+    let v = &bv;
+    let (sup_pre, dup_pre, head_pre) =
         fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
             let a =
                 epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, decoy)
@@ -2482,10 +2515,18 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
                 epigraph_core::ClaimId::from_uuid(canonical),
             )
             .await;
-            (conn, (a, b))
+            let c = epigraph_db::ClaimRepository::migrate_superseded_edges_to_head_conn(
+                &mut conn, v, old, decoy,
+            )
+            .await;
+            (conn, (a, b, c))
         })
         .await;
     let e = sup_pre.expect_err("no supersession happened: the migration refuses");
+    assert!(e.to_string().contains("does not supersede"), "{e}");
+    let e = head_pre
+        .map(|_| ())
+        .expect_err("no supersession happened: the cascade's migration refuses");
     assert!(e.to_string().contains("does not supersede"), "{e}");
     let e = dup_pre.expect_err("no dedup happened: the repair refuses");
     assert!(e.to_string().contains("not a retired duplicate"), "{e}");
@@ -2494,45 +2535,56 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
 
     // W's two acts, on the application role.
     let p = pool.clone();
-    let (new_id, on_app) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        use sqlx::Acquire;
-        stamp(&mut conn, &p, w).await;
-        let new_id = {
-            let mut tx = conn.begin().await.expect("begin");
-            let (n, _) = epigraph_db::ClaimRepository::supersede_act_conn(
-                &mut tx,
-                None,
-                epigraph_core::ClaimId::from_uuid(old),
-                "W's corrected claim",
-                epigraph_core::TruthValue::clamped(0.6),
-                "a correction",
-                epigraph_db::SupersedeActor::new(w, epigraph_db::SupersedeTool::SupersedeClaim),
+    let v = &bv;
+    let (new_id, on_app, head_on_app) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            use sqlx::Acquire;
+            stamp(&mut conn, &p, w).await;
+            let new_id = {
+                let mut tx = conn.begin().await.expect("begin");
+                let (n, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+                    &mut tx,
+                    None,
+                    epigraph_core::ClaimId::from_uuid(old),
+                    "W's corrected claim",
+                    epigraph_core::TruthValue::clamped(0.6),
+                    "a correction",
+                    epigraph_db::SupersedeActor::new(w, epigraph_db::SupersedeTool::SupersedeClaim),
+                )
+                .await
+                .expect("W supersedes its own claim on the app role");
+                tx.commit().await.expect("commit the act");
+                n
+            };
+            epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+                &mut conn,
+                epigraph_core::ClaimId::from_uuid(dup),
+                epigraph_core::ClaimId::from_uuid(canonical),
             )
             .await
-            .expect("W supersedes its own claim on the app role");
-            tx.commit().await.expect("commit the act");
-            n
-        };
-        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
-            &mut conn,
-            epigraph_core::ClaimId::from_uuid(dup),
-            epigraph_core::ClaimId::from_uuid(canonical),
-        )
-        .await
-        .expect("W marks its own duplicate on the app role");
-        // The supersede migration on W's own application session, AFTER the act.
-        let on_app =
-            epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, new_id)
-                .await;
-        (conn, (new_id, on_app))
-    })
-    .await;
+            .expect("W marks its own duplicate on the app role");
+            // The supersede migration on W's own application session, AFTER the act.
+            let on_app =
+                epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, new_id)
+                    .await;
+            let head_on_app = epigraph_db::ClaimRepository::migrate_superseded_edges_to_head_conn(
+                &mut conn, v, old, new_id,
+            )
+            .await;
+            (conn, (new_id, on_app, head_on_app))
+        })
+        .await;
     let e = on_app.expect_err("the supersede migration is not the application role's to run");
+    assert!(e.to_string().contains("privileged"), "{e}");
+    let e = head_on_app
+        .map(|_| ())
+        .expect_err("the cascade's migration is not the application role's to run");
     assert!(e.to_string().contains("privileged"), "{e}");
     assert_eq!(endpoints(&pool, into_old).await.0, old, "nothing moved");
 
     // After the acts, a mismatched pair still refuses.
-    let (sup_bad, dup_bad) =
+    let v = &bv;
+    let (sup_bad, dup_bad, head_bad) =
         fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
             let a =
                 epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, decoy)
@@ -2543,10 +2595,18 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
                 epigraph_core::ClaimId::from_uuid(decoy),
             )
             .await;
-            (conn, (a, b))
+            let c = epigraph_db::ClaimRepository::migrate_superseded_edges_to_head_conn(
+                &mut conn, v, old, decoy,
+            )
+            .await;
+            (conn, (a, b, c))
         })
         .await;
     assert!(sup_bad.is_err(), "a replacement the claims do not record");
+    let e = head_bad
+        .map(|_| ())
+        .expect_err("the cascade's migration: a replacement the claims do not record");
+    assert!(e.to_string().contains("does not supersede"), "{e}");
     assert!(dup_bad.is_err(), "a canonical the claims do not record");
     assert_eq!(endpoints(&pool, into_old).await.0, old, "nothing moved");
     assert_eq!(endpoints(&pool, into_dup).await.0, dup, "nothing moved");

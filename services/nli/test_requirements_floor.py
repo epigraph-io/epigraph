@@ -1,4 +1,8 @@
-"""Security floor for the pinned ML stack in services/nli/requirements.txt.
+"""Security floor for the pinned stack in services/nli/requirements.txt.
+
+Covers the ML packages (torch, transformers, sentencepiece) and the web
+framework (starlette, pinned directly because fastapi pulls it in
+transitively, so dependency scanners do not flag it on this manifest).
 
 Standard-library only, so it runs without installing the (multi-GB) stack:
     python3 -m unittest services/nli/test_requirements_floor.py
@@ -25,6 +29,11 @@ SECURITY_FLOORS = {
     # CVE-2026-4372 and CVE-2024-11392/11393/11394.
     "transformers": ("5.10.0", "CVE-2026-9856"),
     "sentencepiece": ("0.2.1", "CVE-2026-1260"),
+    # Newest of the fixed starlette advisories (form limits ignored for
+    # urlencoded bodies). The 0.37.2 that fastapi 0.111.0 resolved was also
+    # open to CVE-2026-54282, CVE-2026-48817/48818, CVE-2026-48710,
+    # CVE-2025-54121 and CVE-2024-47874, all fixed at or below this floor.
+    "starlette": ("1.3.1", "CVE-2026-54283"),
 }
 
 _PIN = re.compile(r"^([A-Za-z0-9_.\-]+)(?:\[[^\]]*\])?\s*==\s*([0-9][0-9A-Za-z.\-+]*)\s*$")
@@ -105,6 +114,7 @@ class RequirementsSecurityFloorTest(unittest.TestCase):
         # and a range specifier are each reported.
         problems = _floor_violations(
             "fastapi==0.111.0\n"
+            "starlette==0.37.2  # what fastapi 0.111.0 resolved\n"
             "uvicorn[standard]==0.30.1\n"
             "torch==2.12.1  # one release short\n"
             "transformers>=5.10.0\n"
@@ -116,6 +126,7 @@ class RequirementsSecurityFloorTest(unittest.TestCase):
                 "transformers not ==-pinned ('transformers>=5.10.0'); floor "
                 "5.10.0 (CVE-2026-9856)",
                 "sentencepiece missing; floor 0.2.1 (CVE-2026-1260)",
+                "starlette 0.37.2 < 1.3.1 (CVE-2026-54283)",
             ],
         )
 
@@ -132,12 +143,14 @@ class RequirementsSecurityFloorTest(unittest.TestCase):
             "torch==2.13.0\n"
             "transformers==5.10.0rc1\n"
             "sentencepiece==0.2.1.dev0\n"
+            "starlette==1.3.1rc1\n"
         )
         self.assertEqual(
             problems,
             [
                 "transformers 5.10.0rc1 < 5.10.0 (CVE-2026-9856)",
                 "sentencepiece 0.2.1.dev0 < 0.2.1 (CVE-2026-1260)",
+                "starlette 1.3.1rc1 < 1.3.1 (CVE-2026-54283)",
             ],
         )
 
@@ -149,6 +162,7 @@ class RequirementsSecurityFloorTest(unittest.TestCase):
                 "torch==2.13.0+cpu\n"
                 "transformers==5.10.0.post1\n"
                 "sentencepiece==0.2.1\n"
+                "starlette==1.3.1.post1\n"
             ),
             [],
         )

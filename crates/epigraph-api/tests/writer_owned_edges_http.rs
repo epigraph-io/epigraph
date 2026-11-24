@@ -773,3 +773,126 @@ fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
         },
     )
 }
+
+/// Edges between `a` and `b` in either direction, in force or not.
+async fn edges_between(pool: &PgPool, a: Uuid, b: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE (source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .expect("count edges")
+}
+
+/// `err` is the refusal `POST /api/v1/edges` answers for `properties`: a 400
+/// on the `properties` field with exactly the shared refusal text.
+fn assert_reserved_refusal(err: ApiError, properties: &serde_json::Value, route: &str) {
+    let expected = epigraph_db::reserved_edge_property_refusal(properties)
+        .unwrap_or_else(|| panic!("CALIBRATION: {properties} carries a reserved key"));
+    match err {
+        ApiError::ValidationError { field, reason } => {
+            assert_eq!(field, "properties", "{route}: {properties}");
+            assert_eq!(reason, expected, "{route}: {properties}");
+        }
+        other => panic!("{route}: {properties} answered {other:?}, not the reserved-key refusal"),
+    }
+}
+
+/// `POST /api/v1/edges/hierarchical` and `POST /api/v1/claims/:id/relate`
+/// write caller-supplied edge `properties` too, so they refuse every key of
+/// `epigraph_db::RESERVED_EDGE_PROPERTIES` exactly as `POST /api/v1/edges`
+/// does (400 on `properties`, the same text), with nothing written. Before,
+/// both passed the body straight to the edge writer: a `supersede_act` marker
+/// (which the supersede cascade keys on to leave an edge on the claim it
+/// retires) or an ingest-record key landed on the caller's own edge.
+/// CALIBRATION: the same routes write an ordinary property spelling a
+/// supersession `tool`, so the refusal is about the reserved KEY.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hierarchical_and_relate_refuse_every_reserved_edge_property(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (w, _) = seed_agent_with_group(&pool, "http-reserved-keys-w").await;
+    let hierarchical = |a: Uuid, b: Uuid, properties: serde_json::Value| {
+        let state = state.clone();
+        let pool = pool.clone();
+        async move {
+            create_hierarchical_edge(
+                ViewerExtractor(viewer(&pool, w).await),
+                State(state),
+                auth(w),
+                Json(LinkHierarchicalRequest {
+                    source_claim_id: a,
+                    target_claim_id: b,
+                    relationship: "decomposes_to".to_string(),
+                    properties: Some(properties),
+                }),
+            )
+            .await
+            .map(|_| ())
+        }
+    };
+    let relate = |a: Uuid, b: Uuid, properties: serde_json::Value| {
+        let state = state.clone();
+        let pool = pool.clone();
+        async move {
+            relate_claims(
+                ViewerExtractor(viewer(&pool, w).await),
+                State(state),
+                auth(w),
+                Path(a),
+                Json(RelateClaimsRequest {
+                    target_claim_id: b,
+                    properties: Some(properties),
+                }),
+            )
+            .await
+            .map(|_| ())
+        }
+    };
+
+    // CALIBRATION: an ordinary property lands through both routes.
+    let ordinary = serde_json::json!({"tool": "supersede_claim"});
+    let a = seed_public_claim(&pool, w, "reserved keys calibration a").await;
+    let b = seed_public_claim(&pool, w, "reserved keys calibration b").await;
+    hierarchical(a, b, ordinary.clone())
+        .await
+        .expect("CALIBRATION: hierarchical writes an ordinary property");
+    assert_eq!(
+        edges_between(&pool, a, b).await,
+        1,
+        "CALIBRATION: hierarchical"
+    );
+    let c = seed_public_claim(&pool, w, "reserved keys calibration c").await;
+    relate(a, c, ordinary)
+        .await
+        .expect("CALIBRATION: relate writes an ordinary property");
+    assert_eq!(edges_between(&pool, a, c).await, 2, "CALIBRATION: relate");
+
+    for key in epigraph_db::RESERVED_EDGE_PROPERTIES {
+        let properties = serde_json::json!({ *key: "supersede_claim", "note": "forged" });
+        let a = seed_public_claim(&pool, w, &format!("reserved {key} source")).await;
+        let b = seed_public_claim(&pool, w, &format!("reserved {key} target")).await;
+
+        let err = hierarchical(a, b, properties.clone())
+            .await
+            .expect_err(&format!("hierarchical: {key} is reserved"));
+        assert_reserved_refusal(err, &properties, "hierarchical");
+        assert_eq!(
+            edges_between(&pool, a, b).await,
+            0,
+            "hierarchical {key}: nothing written"
+        );
+
+        let err = relate(a, b, properties.clone())
+            .await
+            .expect_err(&format!("relate: {key} is reserved"));
+        assert_reserved_refusal(err, &properties, "relate");
+        assert_eq!(
+            edges_between(&pool, a, b).await,
+            0,
+            "relate {key}: nothing written"
+        );
+    }
+}

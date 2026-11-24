@@ -4,7 +4,8 @@
 //!
 //! # The defect this pins
 //!
-//! `behavioral_executions` has no visibility columns and no row security, and
+//! `behavioral_executions` had no visibility columns and no row security (until
+//! migration 240, backlog 88cf603b, gave each run its workflow's tenancy), and
 //! `epigraph_app` keeps `SELECT` on it (migration 118). `get_workflow_executions`
 //! took no viewer and read it on the raw pool, so ANY caller got `goal_text`
 //! and `step_beliefs` for ANY workflow UUID, a workflow private to a group the
@@ -96,9 +97,8 @@ fn result_json(out: rmcp::model::CallToolResult) -> (serde_json::Value, String) 
 
 async fn seed_runs(pool: &PgPool, workflow_id: Uuid, successes: usize, failures: usize) {
     let base = chrono::Utc::now();
-    for (i, success) in std::iter::repeat(true)
-        .take(successes)
-        .chain(std::iter::repeat(false).take(failures))
+    for (i, success) in std::iter::repeat_n(true, successes)
+        .chain(std::iter::repeat_n(false, failures))
         .enumerate()
     {
         BehavioralExecutionRepository::create(
@@ -252,9 +252,10 @@ async fn a_non_member_gets_no_executions_of_another_groups_workflow(pool: PgPool
     seed_runs(&pool, hier, 1, 0).await;
     seed_runs(&pool, public, 1, 0).await;
 
-    // Fixture shape: both private parents really are group-private, and the
-    // runs table really is readable to an unstamped app-role session, so the
-    // tool's own filter is the only thing between a stranger and the rows.
+    // Fixture shape: both private parents really are group-private, and since
+    // migration 240 (backlog 88cf603b) their runs carry that tenancy, so an
+    // unstamped app-role session reads none of them: row security and the
+    // tool's own filter now both stand between a stranger and the rows.
     let (flat_vis, flat_owner): (String, Uuid) =
         sqlx::query_as("SELECT visibility::text, owner_group_id FROM claims WHERE id = $1")
             .bind(flat)
@@ -278,9 +279,9 @@ async fn a_non_member_gets_no_executions_of_another_groups_workflow(pool: PgPool
     .await
     .expect("unstamped app-role read of behavioral_executions");
     assert_eq!(
-        raw, 3,
-        "behavioral_executions has no row security: an unstamped app-role \
-         session reads every run, so only the tool's filter can withhold them"
+        raw, 0,
+        "behavioral_executions carries its workflow's tenancy (migration 240): an \
+         unstamped app-role session reads no run of a group-private workflow"
     );
 
     // Resolve on the SUPERUSER pool, then build the app-role server.
@@ -519,9 +520,9 @@ async fn the_deviation_summary_is_read_as_the_caller(pool: PgPool) {
 
 /// The deviation summary's WORKFLOW filter on its own: a group-private plan
 /// whose step claim is PUBLIC (a shared atom). `claims`' row security admits
-/// that step to anyone, and `behavioral_executions` has no row security, so
-/// only the summary's parent filter (the plan must be one the caller reads)
-/// keeps a stranger from learning the plan's deviation reasons and lineage
+/// that step to anyone. The plan's runs carry the plan's tenancy (migration
+/// 240), and the summary's parent filter (the plan must be one the caller
+/// reads) also keeps a stranger from learning the plan's deviation reasons and lineage
 /// ids. The member gets the group (the positive control).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_deviation_summary_of_a_private_plan_with_a_public_step_stays_private(pool: PgPool) {

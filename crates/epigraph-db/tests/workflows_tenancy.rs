@@ -9,9 +9,10 @@
 //!   FORCEd, and a write must declare its tenancy.
 //! * As the application role under real stamps: a group row is read only by a
 //!   reader of the group (an unstamped session reads public rows only), only a
-//!   writer of the owner group inserts a row, a reader may update a row's
-//!   mutable columns but nobody but a maintenance session changes its
-//!   tenancy, and no application session deletes one.
+//!   writer of the owner group inserts a row, only a writer of the owner
+//!   group updates a row's mutable columns (migration 237; a reader's outcome
+//!   report goes through 237's definers), nobody but a maintenance session
+//!   changes its tenancy, and no application session deletes one.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -368,8 +369,9 @@ async fn only_a_writer_inserts_and_nobody_retenants_a_row(pool: PgPool) {
     );
     assert_eq!(
         write(&w, &w.s, counters, w.public).await,
-        Ok(1),
-        "a reader of a public row moves its counters, as before"
+        Ok(0),
+        "a non-writer's direct UPDATE does not reach a public row (237); an outcome report \
+         moves the counters through 237's definer (workflows_update_owner_scope.rs)"
     );
     assert_eq!(
         write(

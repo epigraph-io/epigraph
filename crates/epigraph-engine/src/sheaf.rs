@@ -79,15 +79,27 @@ pub fn restriction_kind(relationship: &str) -> RestrictionKind {
 /// instead of fixed profile constants. Falls back to label-based lookup if
 /// no CDST interval is stored on the edge.
 ///
-/// When `cdst_bel` and `cdst_pl` are present in edge properties:
-/// - bel >= 0.5 → Positive(bel): evidence strength IS the transmission factor
+/// The relationship decides first whether the edge is evidence at all: a
+/// relationship [`restriction_kind_with_profile`] maps to `Neutral` (lineage
+/// such as `supersedes`, structural edges, and any relationship the table
+/// does not know) stays `Neutral` whatever its properties carry, so a
+/// supersession with a stored interval is never scored as support or
+/// contradiction (backlog d3cc7492).
+///
+/// For any other relationship, when `cdst_bel` and `cdst_pl` are present in
+/// edge properties:
 /// - pl <= 0.5  → Negative(1 - pl): evidence opposition IS the factor
-/// - otherwise  → Positive(bel): weak positive, naturally attenuated by low bel
+/// - otherwise  → Positive(bel): evidence strength IS the transmission
+///   factor; a weak positive is naturally attenuated by low bel
 pub fn restriction_kind_from_properties(
     relationship: &str,
     properties: &serde_json::Value,
     profile: &RestrictionProfile,
 ) -> RestrictionKind {
+    let by_label = restriction_kind_with_profile(relationship, profile);
+    if by_label == RestrictionKind::Neutral {
+        return RestrictionKind::Neutral;
+    }
     // If the edge carries a CDST interval, use it directly
     if let (Some(bel), Some(pl)) = (
         properties.get("cdst_bel").and_then(|v| v.as_f64()),
@@ -103,7 +115,7 @@ pub fn restriction_kind_from_properties(
         };
     }
     // Fallback: label-based lookup with profile constants
-    restriction_kind_with_profile(relationship, profile)
+    by_label
 }
 
 /// Classify an edge relationship using a specific domain profile.
@@ -658,5 +670,71 @@ mod tests {
         assert_eq!(coh.h0, 1); // One consistent edge
         assert_eq!(coh.obstructions.len(), 1); // One obstruction above threshold
         assert_eq!(coh.edge_count, 2);
+    }
+
+    /// Backlog d3cc7492: a relationship the label table maps to Neutral
+    /// (lineage such as `supersedes`, or one the table does not know) stays
+    /// Neutral when the edge carries a CDST interval. Before the gate, a
+    /// supporting interval (pl > .5) made it Positive and a refuting one
+    /// (pl <= .5) Negative, so a supersession scored as evidence.
+    #[test]
+    fn neutral_relationship_ignores_cdst_properties() {
+        let profile = RestrictionProfile::scientific();
+        let supporting = serde_json::json!({ "cdst_bel": 0.9, "cdst_pl": 0.95 });
+        let refuting = serde_json::json!({ "cdst_bel": 0.05, "cdst_pl": 0.2 });
+        for rel in [
+            "supersedes",
+            "Supersedes",
+            "SUPERSEDES",
+            "derived_from",
+            "no_such_rel",
+        ] {
+            for props in [&supporting, &refuting] {
+                assert_eq!(
+                    restriction_kind_from_properties(rel, props, &profile),
+                    RestrictionKind::Neutral,
+                    "{rel} with CDST properties {props} must stay Neutral"
+                );
+            }
+            assert_eq!(
+                restriction_kind_from_properties(rel, &serde_json::Value::Null, &profile),
+                RestrictionKind::Neutral,
+                "{rel} without CDST properties"
+            );
+        }
+    }
+
+    /// The gate is only for relationships that transmit no belief: an
+    /// evidential relationship still takes its factor from the CDST interval
+    /// (bel for a supporting interval, 1 − pl for a refuting one), whatever
+    /// its label constant.
+    #[test]
+    fn evidential_relationship_still_reads_cdst_properties() {
+        let profile = RestrictionProfile::scientific();
+        let supporting = serde_json::json!({ "cdst_bel": 0.42, "cdst_pl": 0.95 });
+        let refuting = serde_json::json!({ "cdst_bel": 0.05, "cdst_pl": 0.3 });
+        for rel in [
+            "supports",
+            "contradicts",
+            "Refutes",
+            "informs",
+            "elaborates",
+        ] {
+            assert_eq!(
+                restriction_kind_from_properties(rel, &supporting, &profile),
+                RestrictionKind::Positive(0.42),
+                "{rel} with a supporting interval"
+            );
+            let kind = restriction_kind_from_properties(rel, &refuting, &profile);
+            assert!(
+                matches!(kind, RestrictionKind::Negative(f) if (f - 0.7).abs() < 1e-12),
+                "{rel} with a refuting interval: {kind:?}"
+            );
+        }
+        // Without the interval, the label constant.
+        assert_eq!(
+            restriction_kind_from_properties("supports", &serde_json::Value::Null, &profile),
+            RestrictionKind::Positive(profile.supports)
+        );
     }
 }

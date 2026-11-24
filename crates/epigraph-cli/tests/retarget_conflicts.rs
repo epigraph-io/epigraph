@@ -189,10 +189,10 @@ async fn serve_api_hanging(
             },
         ))
         // The bearer middleware installs this in production. The principal is
-        // a REAL agents row: the edge perspective the auto-wire creates is
-        // signed by the source claim's agent, and a phantom principal would
-        // turn an FK failure inside the swallowed auto-wire into a silently
-        // missing BBA.
+        // a REAL agents row: the edge BBA the auto-wire stores names the
+        // signing agent (`source_agent_id` is an FK), and a phantom principal
+        // would turn an FK failure inside the swallowed auto-wire into a
+        // silently missing BBA.
         .layer(axum::Extension(
             epigraph_api::middleware::bearer::AuthContext {
                 client_id: agent,
@@ -457,7 +457,8 @@ async fn apply_moves_the_conflict_onto_the_chosen_atom_with_ds_wired(pool: PgPoo
 
     // DS wired on the ATOM: a mass_functions row keyed by the new edge.
     let bba_on_atom: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+        "SELECT COUNT(*) FROM mass_functions \
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2",
     )
     .bind(w.atoms[1])
     .bind(new_edge)
@@ -962,7 +963,8 @@ async fn the_pre_create_check_sees_a_reverse_symmetric_edge_only(pool: PgPool) {
 
 async fn bbas_for_edge(pool: &PgPool, claim: Uuid, edge: Uuid) -> i64 {
     sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+        "SELECT COUNT(*) FROM mass_functions \
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2",
     )
     .bind(claim)
     .bind(edge)

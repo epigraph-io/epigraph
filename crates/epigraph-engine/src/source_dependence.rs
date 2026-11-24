@@ -39,8 +39,9 @@
 //! rule alone ([`reduce_same_owner_siblings`]) before combining: the BP seed's
 //! pairwise adaptive combine (REST `routes/computation.rs`) and MCP
 //! `compare_methods`, which then folds the reduced inputs under each method it
-//! compares. The atom fold (`atom_items`) still calls
-//! [`combine_with_source_dependence`] for its legacy-grouping comparison.
+//! compares. The atom evidence fold (`atom_items::atom_fold`) and its
+//! legacy-grouping comparison go through [`combine_with_owner_dependence`]
+//! too (backlog c2ef65a0).
 //!
 //! Source keys are read through the caller's viewer
 //! ([`source_keys_for_rows`]). A BBA can be visible while its evidence row is
@@ -64,7 +65,7 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use epigraph_core::domain::evidence::is_placeholder_id;
+use epigraph_db::repos::paper::{is_bare_doi, peel_document_key_prefixes};
 use epigraph_db::{EvidenceRepository, MassFunctionRow};
 use epigraph_ds::{combination, DsError, FocalElement, MassFunction};
 
@@ -392,24 +393,6 @@ pub async fn bba_sources_for_rows(
     Ok(assemble_bba_sources(rows, keys, &humans))
 }
 
-/// [`bba_sources_for_rows`] read on a pool instead of one connection: for a
-/// read-only caller with no stamped connection to hand (MCP
-/// `compare_methods` on a server built without a `ScopedPool`), which reads
-/// its rows on the same pool.
-///
-/// # Errors
-/// `DbError` if a read fails.
-pub async fn bba_sources_for_rows_on_pool(
-    pool: &sqlx::PgPool,
-    viewer: &epigraph_db::visibility::Viewer,
-    rows: &[MassFunctionRow],
-) -> Result<Vec<BbaSource>, epigraph_db::DbError> {
-    let keys = source_keys_for_rows(pool, viewer, rows).await?;
-    let agents: Vec<Uuid> = rows.iter().filter_map(|r| r.source_agent_id).collect();
-    let humans = epigraph_db::AgentRepository::humans_of(pool, &agents, true).await?;
-    Ok(assemble_bba_sources(rows, keys, &humans))
-}
-
 /// Each row's [`BbaSource`] from its same-source key and the live human of
 /// its source agent (an agent bound to no live human is its own owner).
 fn assemble_bba_sources(
@@ -620,7 +603,8 @@ pub fn combine_with_owner_dependence(
 /// re-cited onto an atom (`perspective_id` = the original evidence id for a
 /// text-bearing item, the original `mass_functions.id` for a textless one).
 pub const ATTRIBUTED_METHOD: &str = "attributed_v1";
-/// `combination_method` of an edge-factor row (`perspective_id` = edge id).
+/// `combination_method` of an edge-factor row (keyed on the edge's slot,
+/// `BbaSlot::Edge`, migration 267).
 pub const EDGE_FACTOR_METHOD: &str = "edge_factor";
 /// `combination_method` of an ingest self-assertion ("paper P asserts this
 /// claim"), written by the ingest batch with no perspective and no evidence.
@@ -667,8 +651,8 @@ impl std::fmt::Display for ItemKey {
 }
 
 /// The evidence row a BBA cites, as the caller's viewer sees it: the row's
-/// `evidence_id`, or its `perspective_id` when that perspective is an
-/// evidence perspective. `doi` is `properties->>'doi'`.
+/// `evidence_id`, or the evidence row its slot names (`BbaSlot::Evidence`,
+/// migration 267). `doi` is `properties->>'doi'`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemEvidence {
     pub id: Uuid,
@@ -676,86 +660,22 @@ pub struct ItemEvidence {
     pub source_url: Option<String>,
 }
 
-/// Prefixes that turn a link or a label into a bare DOI, longest first;
-/// matched case-insensitively. What reaches the evidence row: ingest persists
-/// its document identifier bare in `properties.doi` (a DOI, an arXiv-style
-/// id, a synthesized document key, or the document's URI when it has none of
-/// those) and writes no `source_url` for literature; `source_url` holds what
-/// other writers passed, which may be a doi.org link, a `doi:<id>` label (the
-/// spelling ingest uses for a paper's label), any other link, or free text.
-// belief-profile: allow-literal (array length of a fixed prefix list)
-const DOI_PREFIXES: [&str; 7] = [
-    "https://www.doi.org/",
-    "http://www.doi.org/",
-    "https://dx.doi.org/",
-    "http://dx.doi.org/",
-    "https://doi.org/",
-    "http://doi.org/",
-    "doi:",
-];
-
-/// Strip one [`DOI_PREFIXES`] entry, if `t` starts with one.
-fn strip_doi_prefix(t: &str) -> Option<&str> {
-    DOI_PREFIXES.iter().find_map(|p| {
-        t.get(..p.len())
-            .filter(|head| head.eq_ignore_ascii_case(p))
-            .map(|_| &t[p.len()..])
-    })
-}
-
-/// A DOI resolver root with nothing behind it (`https://doi.org`, with or
-/// without the trailing `/`).
-fn is_doi_resolver_root(t: &str) -> bool {
-    let t = t.trim().trim_end_matches('/');
-    DOI_PREFIXES
-        .iter()
-        .filter(|p| p.ends_with('/'))
-        .any(|p| t.eq_ignore_ascii_case(p.trim_end_matches('/')))
-}
-
-/// What is behind the DOI prefixes of `t`, all of them peeled
-/// (`doi:https://doi.org/10.x` names `10.x`); `""` for a resolver root with
-/// nothing behind it. `None` when `t` carries no DOI prefix.
-fn peel_doi_prefixes(t: &str) -> Option<&str> {
-    let mut rest = match strip_doi_prefix(t) {
-        Some(r) => r,
-        None if is_doi_resolver_root(t) => "",
-        None => return None,
-    };
-    loop {
-        rest = rest.trim();
-        if is_doi_resolver_root(rest) {
-            return Some("");
-        }
-        match strip_doi_prefix(rest) {
-            Some(r) => rest = r,
-            None => return Some(rest),
-        }
-    }
-}
-
-/// Normalize a DOI as evidence stores it (`properties.doi`, usually bare)
-/// or links to it (`doi:<id>`, `https://doi.org/<doi>`, `dx.` / `www.`
-/// variants): prefixes removed, trimmed, trailing `/` removed,
-/// ASCII-lowercased (DOIs are case-insensitive). `None` for a blank result,
-/// a placeholder ([`is_placeholder_id`]: "unknown", "n/a", ...; a document
-/// key built on one would merge every DOI-less document) or anything that is
-/// still a URL after the prefixes are removed (a web page is not a DOI).
-/// Percent-encoded DOIs are not decoded, so one DOI written both ways counts
-/// as two sources, which errs toward the pre-key behaviour.
-#[must_use]
-pub fn normalize_doi(raw: &str) -> Option<String> {
-    let t = raw.trim();
-    let t = peel_doi_prefixes(t)
-        .unwrap_or(t)
-        .trim()
-        .trim_end_matches('/');
-    if t.is_empty() || t.contains("://") || is_placeholder_id(t) {
-        None
-    } else {
-        Some(t.to_ascii_lowercase())
-    }
-}
+/// Normalize a DOI for the same-source key: the shared case-folded document
+/// identity, [`epigraph_db::repos::paper::document_identity_key`] (backlog
+/// e34fd66e; the engine used to keep its own normalizer, which missed the
+/// scheme-less `doi.org/` spellings the stored key folds). Prefixes
+/// (`doi:`, `https://doi.org/`, `dx.` / `www.` and scheme-less variants)
+/// removed, trimmed, trailing `/` removed, ASCII-lowercased. `None` for a
+/// blank result, a placeholder ("unknown", "n/a", ...) or anything that is
+/// still a URL once the prefixes are gone.
+///
+/// What reaches the evidence row: ingest persists its document identifier
+/// bare in `properties.doi` (a DOI, an arXiv-style id, a synthesized document
+/// key, or the document's URI when it has none of those) and writes no
+/// `source_url` for literature; `source_url` holds what other writers passed,
+/// which may be a doi.org link, a `doi:<id>` label (the spelling ingest uses
+/// for a paper's label), any other link, or free text.
+pub use epigraph_db::repos::paper::document_identity_key as normalize_doi;
 
 /// An `http://` or `https://` link with something after the scheme.
 fn is_web_url(t: &str) -> bool {
@@ -764,20 +684,6 @@ fn is_web_url(t: &str) -> bool {
             .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
             && !t[scheme.len()..].trim().trim_matches('/').is_empty()
     })
-}
-
-/// A bare DOI as free text would hold one: `10.`, a 4–9 digit registrant
-/// code, `/`, a non-blank suffix. "10.0.0.5/notes" and "10.5 mg dose" are not.
-fn is_bare_doi(t: &str) -> bool {
-    let Some(rest) = t.strip_prefix("10.") else {
-        return false;
-    };
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    // belief-profile: allow-literal (DOI syntax: a 4-9 digit registrant code)
-    (4..=9).contains(&digits)
-        && rest[digits..]
-            .strip_prefix('/')
-            .is_some_and(|suffix| !suffix.trim().is_empty())
 }
 
 /// The source one identity value names, if any. `doi:` and `url:` are
@@ -793,7 +699,7 @@ fn is_bare_doi(t: &str) -> bool {
 /// - a bare value names a DOI when `bare_is_doi` accepts it, else nothing.
 fn named_source(raw: &str, bare_is_doi: fn(&str) -> bool) -> Option<ItemKey> {
     let t = raw.trim();
-    let (t, bare) = match peel_doi_prefixes(t) {
+    let (t, bare) = match peel_document_key_prefixes(t) {
         Some(inner) => (inner.trim(), false),
         None => (t, true),
     };
@@ -809,7 +715,7 @@ fn named_source(raw: &str, bare_is_doi: fn(&str) -> bool) -> Option<ItemKey> {
 /// `properties.doi` is written by ingest (a DOI, an arXiv-style id, a
 /// synthesized document key or a URI), so any bare value is a document
 /// identifier unless it is a placeholder ([`normalize_doi`] rejects those).
-fn doi_field_key(doi: &str) -> Option<ItemKey> {
+pub(crate) fn doi_field_key(doi: &str) -> Option<ItemKey> {
     named_source(doi, |_| true)
 }
 
@@ -851,8 +757,8 @@ fn source_url_key(url: &str) -> Option<ItemKey> {
 /// agents is one source. The agent never enters a key.
 ///
 /// `evidence` is the row's cited evidence **as the caller's viewer sees it**:
-/// the row's `evidence_id`, or its `perspective_id` when that perspective is
-/// an evidence perspective. A row whose evidence is hidden from the viewer
+/// the row's `evidence_id`, or the evidence row its slot names
+/// (`BbaSlot::Evidence`, migration 267). A row whose evidence is hidden from the viewer
 /// gets `None` and keys `ev:<row.evidence_id>`: the id is already on the
 /// visible `mass_functions` row and no evidence content is read, so this
 /// discloses nothing, and rows citing that one evidence row (a `whole`
@@ -889,10 +795,15 @@ pub fn item_key(
         return ItemKey::Evidence(cited);
     }
     let method = row.combination_method.as_deref();
-    match (method, row.perspective_id, row.evidence_id) {
-        (Some(ATTRIBUTED_METHOD), Some(original), None) => ItemKey::Attribution(original),
-        (Some(EDGE_FACTOR_METHOD), Some(edge), None) => ItemKey::Edge(edge),
-        (Some(INGEST_ASSERTION_METHOD), None, None) => {
+    // An edge-factor row's edge is its slot (migration 267); any other slot
+    // keys the row as a perspective did before 267: it is not a lone
+    // ingest self-assertion.
+    match (method, row.perspective_id, row.evidence_id, row.slot()) {
+        (Some(ATTRIBUTED_METHOD), Some(original), None, None) => ItemKey::Attribution(original),
+        (Some(EDGE_FACTOR_METHOD), None, None, Some(epigraph_db::BbaSlot::Edge(edge))) => {
+            ItemKey::Edge(edge)
+        }
+        (Some(INGEST_ASSERTION_METHOD), None, None, None) => {
             asserting_paper.map_or(ItemKey::Row(row.id), ItemKey::Paper)
         }
         _ => ItemKey::Row(row.id),
@@ -931,6 +842,8 @@ pub struct KeyedBba {
 pub struct KeyedItem {
     pub id: ItemId,
     pub atoms: Vec<(Uuid, MassFunction)>,
+    /// The row whose BBA the item carries on each atom, in `atoms` order.
+    pub kept_rows: Vec<Uuid>,
 }
 
 impl KeyedItem {
@@ -938,6 +851,17 @@ impl KeyedItem {
     #[must_use]
     pub fn on(&self, atom: Uuid) -> Option<&MassFunction> {
         self.atoms.iter().find(|(a, _)| *a == atom).map(|(_, m)| m)
+    }
+
+    /// [`Self::on`] with the row the BBA is: which row of the key and side
+    /// [`item_partition`] kept on `atom`.
+    #[must_use]
+    pub fn kept_on(&self, atom: Uuid) -> Option<(Uuid, &MassFunction)> {
+        self.atoms
+            .iter()
+            .zip(&self.kept_rows)
+            .find(|((a, _), _)| *a == atom)
+            .map(|((_, m), row)| (*row, m))
     }
 }
 
@@ -1015,6 +939,7 @@ pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
             items.push(KeyedItem {
                 id,
                 atoms: Vec::new(),
+                kept_rows: Vec::new(),
             });
             kept.push(Vec::new());
             items.len() - 1
@@ -1023,6 +948,7 @@ pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
         match item.atoms.iter().position(|(a, _)| *a == r.atom_id) {
             None => {
                 item.atoms.push((r.atom_id, r.bba));
+                item.kept_rows.push(r.row_id);
                 kept[i].push((w, r.row_id));
             }
             // A larger weight wins; on a tie, the smaller row id.
@@ -1032,6 +958,7 @@ pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
                     .is_gt() =>
             {
                 item.atoms[j].1 = r.bba;
+                item.kept_rows[j] = r.row_id;
                 kept[i][j] = (w, r.row_id);
             }
             Some(_) => {}

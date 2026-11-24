@@ -556,3 +556,145 @@ test('a map count is labelled as stored on the map, not as what the viewer can r
   assert.equal(N.countLabel(8, false), '8 claims you can read');
   assert.equal(N.countLabel(undefined, true), '0 claims on this map');
 });
+
+// ---- the claim-to-leaf lookup (contract atlas_claim_leaf v1) ---------------
+
+const PREFIX = '/explorer/bff/atlas/claim-leaf/';
+const leafMaps = () => N.parseMaps(pageMaps());
+/** A claim on a fetched-nowhere leaf of preview map `m`, and that leaf. */
+const coldClaim = (m) => {
+  const leaf = previewLevels().find(
+    (d) => d.kind === 'leaf' && N.mapMatches(d, m) && d.hierarchy === 'meaning' && (d.nodes || []).some((n) => n.kind === 'claim'),
+  );
+  const claim = leaf.nodes.find((n) => n.kind === 'claim');
+  return { leaf, claim };
+};
+const leafBody = (m, leaf, claimId) => ({
+  schema_version: 1,
+  claim_id: claimId,
+  map_scope: m.scope,
+  map_group_id: m.group_id,
+  hierarchy: leaf.hierarchy,
+  theme_id: leaf.theme_id,
+  level_id: leaf.level_id,
+});
+const notFound = () => Object.assign(new Error('We could not find that claim on this map.'), { status: 404 });
+
+test('the claim-to-leaf URL is the page prefix, then map key, hierarchy and claim id', () => {
+  const [m] = leafMaps();
+  const { claim } = coldClaim(m);
+  assert.equal(N.claimLeafUrl(PREFIX, m, 'links', claim.id), PREFIX + encodeURIComponent(m.key) + '/links/' + claim.id);
+  // Every part is checked before it goes into a URL.
+  assert.equal(N.claimLeafUrl(null, m, 'meaning', claim.id), null);
+  assert.equal(N.claimLeafUrl('https://evil.example/', m, 'meaning', claim.id), null);
+  assert.equal(N.claimLeafUrl('//evil.example/', m, 'meaning', claim.id), null);
+  assert.equal(N.claimLeafUrl(PREFIX, null, 'meaning', claim.id), null);
+  assert.equal(N.claimLeafUrl(PREFIX, m, 'sideways', claim.id), null);
+  assert.equal(N.claimLeafUrl(PREFIX, m, 'meaning', 'c-' + claim.id), null);
+  assert.equal(N.claimLeafUrl(PREFIX, Object.assign({}, m, { key: '' }), 'meaning', claim.id), null);
+  // A key is one path segment, whatever it holds.
+  const odd = N.claimLeafUrl(PREFIX, Object.assign({}, m, { key: 'a/../b' }), 'meaning', claim.id);
+  assert.equal(odd, PREFIX + 'a%2F..%2Fb/meaning/' + claim.id);
+});
+
+test('a claim-to-leaf answer is refused unless it is for the claim, map and hierarchy asked', () => {
+  const [team, pub] = leafMaps();
+  const { leaf, claim } = coldClaim(team);
+  const want = { claimId: claim.id, map: team, hierarchy: 'meaning' };
+  const ok = leafBody(team, leaf, claim.id);
+  assert.equal(N.claimLeafProblem(ok, want), null);
+  const bad = (patch) => N.claimLeafProblem(Object.assign({}, ok, patch), want);
+  assert.ok(bad({ schema_version: 2 }));
+  assert.ok(bad({ claim_id: leaf.theme_id }));
+  assert.ok(bad({ hierarchy: 'links' }));
+  assert.ok(bad({ map_scope: 'public', map_group_id: null }));
+  assert.ok(bad({ map_group_id: '00000000-0000-4000-8000-000000000001' }));
+  assert.ok(bad({ level_id: 'not-an-id' }));
+  assert.ok(bad({ theme_id: null }));
+  assert.ok(N.claimLeafProblem(null, want));
+  assert.ok(N.claimLeafProblem('x', want));
+  // The same body read for the public map is another map's answer.
+  assert.ok(N.claimLeafProblem(ok, Object.assign({}, want, { map: pub })));
+});
+
+test('a cold claim link asks the lookup route through the page getter', async () => {
+  const [m] = leafMaps();
+  const { leaf, claim } = coldClaim(m);
+  const calls = [];
+  const get = async (url) => {
+    calls.push(url);
+    return leafBody(m, leaf, claim.id);
+  };
+  const got = await N.lookupClaimLeaf(get, PREFIX, m, 'meaning', claim.id);
+  assert.deepEqual(calls, [PREFIX + encodeURIComponent(m.key) + '/meaning/' + claim.id]);
+  assert.equal(got.level_id, leaf.level_id);
+  assert.equal(got.theme_id, leaf.theme_id);
+  // The level it names is one the page can fetch through the map's own URL.
+  assert.equal(N.levelUrl(m, 'meaning', got.level_id), m.level_url + 'meaning/' + leaf.level_id);
+});
+
+test('the lookup route answering not-found means not on this map; other failures stay errors', async () => {
+  const [m] = leafMaps();
+  const { leaf, claim } = coldClaim(m);
+  assert.equal(
+    await N.lookupClaimLeaf(async () => {
+      throw notFound();
+    }, PREFIX, m, 'meaning', claim.id),
+    null,
+  );
+  // A 5xx or a lost connection is not an answer about the claim.
+  await assert.rejects(
+    N.lookupClaimLeaf(async () => {
+      throw Object.assign(new Error('The Atlas could not load this.'), { status: 502 });
+    }, PREFIX, m, 'meaning', claim.id),
+    /could not load/,
+  );
+  // An answer for another claim (or map, or hierarchy) is never followed.
+  await assert.rejects(
+    N.lookupClaimLeaf(async () => leafBody(m, leaf, leaf.level_id), PREFIX, m, 'meaning', claim.id),
+    (e) => e.status !== 404,
+  );
+  await assert.rejects(
+    N.lookupClaimLeaf(async () => Object.assign(leafBody(m, leaf, claim.id), { hierarchy: 'links' }), PREFIX, m, 'meaning', claim.id),
+  );
+});
+
+test('with no usable lookup URL the lookup asks nothing', async () => {
+  const [m] = leafMaps();
+  const { claim } = coldClaim(m);
+  let asked = 0;
+  const get = async () => {
+    asked += 1;
+    return {};
+  };
+  assert.equal(await N.lookupClaimLeaf(get, null, m, 'meaning', claim.id), null);
+  assert.equal(await N.lookupClaimLeaf(get, PREFIX, m, 'meaning', 'nope'), null);
+  assert.equal(await N.lookupClaimLeaf(get, PREFIX, null, 'meaning', claim.id), null);
+  assert.equal(asked, 0);
+});
+
+test('a cold claim lands under the theme the picked map names, or stops with the reason', async () => {
+  const [m] = leafMaps();
+  const { leaf, claim } = coldClaim(m);
+  const place = await N.lookupClaimLeaf(async () => leafBody(m, leaf, claim.id), PREFIX, m, 'meaning', claim.id);
+  const resolved = { id: leaf.theme_id };
+  const other = { id: '00000000-0000-4000-8000-0000000000aa' };
+  const loaded = new Map([[resolved.id, resolved], [other.id, other]]);
+  const byId = (id) => loaded.get(id);
+  // The route agrees with resolve: land under that theme.
+  assert.deepEqual(N.coldClaimHome(resolved, place, byId), { home: resolved });
+  // The picked map places the claim in another loaded theme: re-home there,
+  // never attach its chain under the theme resolve named.
+  const elsewhere = Object.assign({}, place, { theme_id: other.id });
+  assert.equal(N.coldClaimHome(resolved, elsewhere, byId).home, other);
+  // ... and when that theme is not loaded, stop with a notice, no home.
+  const unloaded = N.coldClaimHome(resolved, elsewhere, () => undefined);
+  assert.equal(unloaded.home, undefined);
+  assert.match(unloaded.notice, /not loaded yet/);
+  // The route's not-found answer (lookupClaimLeaf resolves null) stops, never throws.
+  const off = N.coldClaimHome(resolved, await N.lookupClaimLeaf(async () => {
+    throw notFound();
+  }, PREFIX, m, 'meaning', claim.id), byId);
+  assert.equal(off.home, undefined);
+  assert.match(off.notice, /not on the map you picked/);
+});

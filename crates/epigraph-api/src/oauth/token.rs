@@ -11,6 +11,11 @@
 //! - `urn:ietf:params:oauth:grant-type:token-exchange` (RFC 8693): a kernel token exchanged
 //!   for a short, refreshless token whose audience is a federation extension
 //!   (`oauth::token_exchange`)
+//!
+//! A confidential client that fails to authenticate (on `client_credentials`
+//! or the refresh grant) is answered RFC 6749 section 5.2's `invalid_client`
+//! ([`crate::errors::ApiError::OAuthInvalidClient`]), with one generic
+//! description whichever check failed.
 
 // UNSCOPED-POOL-EXEMPT: Pre-authentication by definition, and the largest such site. Token issuance is
 // the step that MINTS the principal; a Viewer cannot precede it.
@@ -339,10 +344,15 @@ async fn materialise_principal_agent(
     // no longer restores a revoked row. The transaction is aborted by the RAISE,
     // so the client stays UNLINKED and every later mint refuses the same way
     // until an operator restores the membership — loud, and reversible.
+    //
+    // A refusal to ADOPT an agent row whose key is computable from public
+    // inputs (an LLM identity or a name-derived author node, backlog 55fba366)
+    // is a designed denial too: `DbError::Refused`, answered 403 by kind.
     let agent_id = AgentRepository::ensure_for_client(&mut tx, client_row_id)
         .await
         .map_err(|e| match e {
             e if e.is_personal_group_refusal() => ApiError::from(e),
+            e @ epigraph_db::DbError::Refused { .. } => ApiError::from(e),
             other => ApiError::InternalError {
                 message: format!("Failed to resolve principal agent: {other}"),
             },
@@ -363,21 +373,64 @@ pub async fn token_endpoint(
     body: Bytes,
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
     let req = parse_token_request(&headers, &body)?;
+    let basic_attempted = attempted_basic_auth(&headers);
+    dispatch_grant(&state, &req)
+        .await
+        .map_err(|e| with_basic_attempt(e, basic_attempted))
+}
+
+/// Whether the request carried `Authorization: Basic ...` (RFC 6749 section
+/// 2.3.1's `client_secret_basic`). This server does not accept it (its
+/// metadata advertises `client_secret_post` and `none`), but RFC 6749 section
+/// 5.2 still requires an `invalid_client` answered to such a client to be a
+/// 401 with a `WWW-Authenticate` challenge for the scheme it tried.
+#[cfg(feature = "db")]
+fn attempted_basic_auth(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_whitespace().next())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+}
+
+/// `e`, with an `invalid_client` refusal marked as answered to a client that
+/// tried HTTP Basic (see [`attempted_basic_auth`]), and its description
+/// saying where the credential goes instead. Every other error is unchanged.
+#[cfg(feature = "db")]
+fn with_basic_attempt(e: ApiError, basic_attempted: bool) -> ApiError {
+    match e {
+        ApiError::OAuthInvalidClient { .. } if basic_attempted => ApiError::OAuthInvalidClient {
+            description: format!(
+                "{CLIENT_AUTH_FAILED}; HTTP Basic client authentication is not accepted, send \
+                 the client credential in the request body (client_secret_post)"
+            ),
+            basic_attempted: true,
+        },
+        other => other,
+    }
+}
+
+/// The grant handler for `req.grant_type`.
+#[cfg(feature = "db")]
+async fn dispatch_grant(
+    state: &AppState,
+    req: &TokenRequest,
+) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
     match req.grant_type.as_str() {
-        "client_credentials" => handle_client_credentials(&state, &req).await,
-        "refresh_token" => handle_refresh_token(&state, &req).await,
-        "authorization_code" => handle_authorization_code(&state, &req).await,
-        ELEVATE_GRANT_TYPE => handle_elevate_grant(&state, &req).await,
+        "client_credentials" => handle_client_credentials(state, req).await,
+        "refresh_token" => handle_refresh_token(state, req).await,
+        "authorization_code" => handle_authorization_code(state, req).await,
+        ELEVATE_GRANT_TYPE => handle_elevate_grant(state, req).await,
         crate::oauth::run_token::RUN_TOKEN_GRANT_TYPE => {
-            crate::oauth::run_token::handle_run_token_grant(&state, &req).await
+            crate::oauth::run_token::handle_run_token_grant(state, req).await
         }
         epigraph_auth::TOKEN_EXCHANGE_GRANT_TYPE => {
-            crate::oauth::token_exchange::handle_token_exchange_grant(&state, &req).await
+            crate::oauth::token_exchange::handle_token_exchange_grant(state, req).await
         }
         other => {
             // Look up an external provider by grant_type.
             if let Some(provider) = state.providers.by_grant_type(other) {
-                handle_external_grant(&state, provider, &req).await
+                handle_external_grant(state, provider, req).await
             } else {
                 Err(ApiError::BadRequest {
                     message: format!("Unsupported grant_type: {other}"),
@@ -641,6 +694,58 @@ async fn consume_assertion_nonce(
     }
 }
 
+/// Refuse an agent assertion whose key is held by an agent that is NOT a
+/// signature verifier (backlog 57943a39): any `key_kind` but `ed25519`, the
+/// rule the claim and edge verifiers apply to a bare key and
+/// `AgentRepository::public_key_if_signer` applies by id.
+///
+/// * `seed-derived` (migration 230): `BLAKE3(<public seed>)`, such as an
+///   ingested author's name key, so anyone who knows the seed can sign.
+/// * `derived`: the unkeyed LLM identity (`BLAKE3("llm-agent:{model}:{prompt
+///   hash}")`, migration 161 section 7), equally computable, which 230 could
+///   not re-mark; a host-registered identity, whose key never signs (D1:
+///   its signatures bind through a separate `signing` key, and the host
+///   authenticates with secret-based clients, not assertions); and the keyless
+///   OAuth principal's placeholder. None of these is a credential.
+///
+/// A key no agent holds is NOT refused: an `/oauth/register` agent client
+/// presents a key of its own and is linked to a separate `derived` principal
+/// (`blake3::derive_key` over the client row id) at mint time
+/// (`AgentRepository::ensure_for_client`), so its own key has no agents row.
+/// Runs after the signature verifies (an unauthenticated request learns
+/// nothing) and before the nonce is recorded. Shared by the
+/// `client_credentials` and refresh grants through
+/// [`authenticate_confidential_client`]. Fails CLOSED on a database error.
+#[cfg(feature = "db")]
+async fn refuse_non_verifier_agent_key(
+    state: &AppState,
+    client: &epigraph_db::repos::oauth_client::OAuthClientRow,
+    public_key: &[u8; 32],
+) -> Result<(), ApiError> {
+    let kind =
+        epigraph_db::AgentRepository::key_kind_of_public_key(&state.db_pool, public_key.as_slice())
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("reading the assertion key's kind failed: {e}"),
+            })?;
+    match kind.as_deref() {
+        None | Some("ed25519") => Ok(()),
+        Some(other) => {
+            tracing::warn!(
+                client_id = %client.client_id,
+                key_kind = other,
+                "Agent assertion rejected: the key is not a signature verifier"
+            );
+            Err(ApiError::Unauthorized {
+                reason: format!(
+                    "the client's key is a '{other}' agent key, which is not a signature \
+                     verifier, so it authenticates nothing; register a random Ed25519 key"
+                ),
+            })
+        }
+    }
+}
+
 /// Access-token lifetime by client type: agent 15 min, human 1 h, service 1 h;
 /// an unknown type gets the shortest. The ONE table, used by the
 /// `client_credentials`, `refresh_token` and `authorization_code` grants, which
@@ -688,13 +793,54 @@ fn is_confidential_client(client_type: &str) -> bool {
 /// recorded once it verifies (migration 213), so a replay is refused.
 ///
 /// # Errors
-/// `ApiError::BadRequest` for a missing or malformed credential,
-/// `ApiError::Unauthorized` for a wrong one or an agent assertion already
-/// used, `ApiError::Unauthorized` for a client that is not confidential (see
-/// [`is_confidential_client`]), and `ApiError::InternalError` when the nonce
-/// cannot be recorded (fail closed).
+/// [`invalid_client`] (RFC 6749 section 5.2) for a missing, malformed or
+/// wrong credential, an agent assertion already used, or a client that is not
+/// confidential (see [`is_confidential_client`]); the specific reason is
+/// logged, never answered. `ApiError::InternalError` when the nonce cannot be
+/// recorded or a service has no stored hash (fail closed; not the client's
+/// fault, so not `invalid_client`).
 #[cfg(feature = "db")]
 async fn authenticate_confidential_client(
+    state: &AppState,
+    client: &epigraph_db::repos::oauth_client::OAuthClientRow,
+    req: &TokenRequest,
+) -> Result<(), ApiError> {
+    match verify_client_credential(state, client, req).await {
+        Err(refused @ (ApiError::BadRequest { .. } | ApiError::Unauthorized { .. })) => {
+            tracing::warn!(
+                client_id = %client.client_id,
+                client_type = %client.client_type,
+                grant_type = %req.grant_type,
+                reason = %refused,
+                "confidential client authentication failed"
+            );
+            Err(invalid_client())
+        }
+        other => other,
+    }
+}
+
+/// The description every `invalid_client` refusal carries: generic, so the
+/// answer does not say which check failed (unknown client, missing, malformed
+/// or wrong credential, replayed assertion). The reason is in the log.
+#[cfg(feature = "db")]
+const CLIENT_AUTH_FAILED: &str = "client authentication failed";
+
+/// RFC 6749 section 5.2 `invalid_client` for a confidential client that did
+/// not authenticate (see [`ApiError::OAuthInvalidClient`]).
+#[cfg(feature = "db")]
+fn invalid_client() -> ApiError {
+    ApiError::OAuthInvalidClient {
+        description: CLIENT_AUTH_FAILED.to_string(),
+        basic_attempted: false,
+    }
+}
+
+/// The credential check itself, for [`authenticate_confidential_client`],
+/// which turns its client-side refusals (`BadRequest`, `Unauthorized`, each
+/// naming its reason) into one `invalid_client`.
+#[cfg(feature = "db")]
+async fn verify_client_credential(
     state: &AppState,
     client: &epigraph_db::repos::oauth_client::OAuthClientRow,
     req: &TokenRequest,
@@ -729,6 +875,7 @@ async fn authenticate_confidential_client(
                 })?;
             let verified =
                 verify_agent_assertion(&assertion_bytes, &pub_key_bytes, &client.client_id)?;
+            refuse_non_verifier_agent_key(state, client, &verified.public_key).await?;
             consume_assertion_nonce(state, client, verified).await?;
         }
         "service" => {
@@ -770,18 +917,40 @@ async fn handle_client_credentials(
 ) -> Result<(StatusCode, Json<TokenResponse>), ApiError> {
     use epigraph_db::repos::oauth_client::OAuthClientRepository;
 
-    let client_id_str = req.client_id.as_deref().ok_or(ApiError::BadRequest {
-        message: "client_id required for client_credentials grant".to_string(),
-    })?;
+    // RFC 6749 section 5.2: no client identification and an unknown client
+    // are `invalid_client`, with the same generic description as a wrong
+    // credential. This does NOT hide which client ids exist: a known client
+    // that is not active (403 below) or not confidential (400 `BadRequest`
+    // below) still answers differently, as it did before this grant answered
+    // `invalid_client`. It only stops the answer saying which credential check
+    // failed for a confidential client.
+    //
+    // The two refusals before the client lookup are anonymous and cheap to
+    // provoke, so they log at info, and never the presented id itself (a
+    // caller-chosen string, sometimes a pasted secret): only its length.
+    let Some(client_id_str) = req.client_id.as_deref() else {
+        tracing::info!(
+            grant_type = %req.grant_type,
+            reason = "no client_id",
+            "confidential client authentication failed"
+        );
+        return Err(invalid_client());
+    };
 
-    let client = OAuthClientRepository::get_by_client_id(&state.db_pool, client_id_str)
+    let Some(client) = OAuthClientRepository::get_by_client_id(&state.db_pool, client_id_str)
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })?
-        .ok_or(ApiError::Unauthorized {
-            reason: "Unknown client_id".to_string(),
-        })?;
+    else {
+        tracing::info!(
+            client_id_len = client_id_str.len(),
+            grant_type = %req.grant_type,
+            reason = "unknown or not active client_id",
+            "confidential client authentication failed"
+        );
+        return Err(invalid_client());
+    };
 
     if client.status != "active" {
         return Err(ApiError::Forbidden {

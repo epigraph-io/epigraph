@@ -562,9 +562,15 @@ async fn retain_visible_events(
 ///
 /// Auto-generates `id`, `graph_version` (monotonic), and `created_at`.
 /// Validates that `event_type` is non-empty and payload is within size limits.
+///
+/// The event's `actor_id` is the caller when the body names none, and a named
+/// actor must be the caller or an agent the caller speaks for
+/// (`spans::attributed_agent`, backlog 1dea9589); any other is `403` with
+/// nothing written. The body's `actor_id` used to be stored as given.
 pub async fn create_event(
     // `claims:write`, checked before the body is parsed (backlog f00d75ab).
-    _scope: crate::middleware::bearer::RequireScopeWrite,
+    crate::middleware::bearer::RequireScopeWrite(_auth): crate::middleware::bearer::RequireScopeWrite,
+    crate::middleware::bearer::ViewerExtractor(_viewer): crate::middleware::bearer::ViewerExtractor,
     State(_state): State<AppState>,
     Json(request): Json<CreateEventRequest>,
 ) -> Result<Json<GraphEvent>, ApiError> {
@@ -613,10 +619,28 @@ pub async fn create_event(
                 ),
             });
         }
+        // Who the event is attributed to, decided on the caller's stamped
+        // connection before anything is written. The INSERT itself stays on
+        // the pool: `events` has no row security, and this file's raw-pool
+        // sites are held unconverted (`no_unscoped_pool.rs`).
+        let actor_id = {
+            let mut read = _state.read_as(&_viewer).await.map_err(|e| {
+                tracing::error!(
+                    target: "tenancy.scoped_read",
+                    error = %e,
+                    handler = "create_event",
+                    "could not acquire a viewer-stamped connection"
+                );
+                ApiError::InternalError {
+                    message: "Failed to acquire a scoped connection".to_string(),
+                }
+            })?;
+            crate::routes::spans::attributed_agent(&mut read, &_viewer, request.actor_id).await?
+        };
         let id = epigraph_db::EventRepository::insert(
             &_state.db_pool,
             &event_type,
-            request.actor_id,
+            Some(actor_id),
             &request.payload,
         )
         .await
@@ -626,7 +650,7 @@ pub async fn create_event(
         let event = GraphEvent {
             id,
             event_type,
-            actor_id: request.actor_id,
+            actor_id: Some(actor_id),
             payload: request.payload,
             graph_version: epigraph_db::EventRepository::get_latest_version(&_state.db_pool)
                 .await
@@ -637,9 +661,17 @@ pub async fn create_event(
     }
     #[cfg(not(feature = "db"))]
     {
+        // No operator bindings without a database: the caller, or nothing.
+        let caller = _auth.agent_id;
+        if request.actor_id.is_some_and(|a| Some(a) != caller) {
+            return Err(ApiError::Forbidden {
+                reason: "actor_id must be the authenticated caller's own agent id, or omitted"
+                    .to_string(),
+            });
+        }
         let store = global_event_store();
         let event = store
-            .push(event_type, request.actor_id, request.payload)
+            .push(event_type, request.actor_id.or(caller), request.payload)
             .await;
         Ok(Json(event))
     }

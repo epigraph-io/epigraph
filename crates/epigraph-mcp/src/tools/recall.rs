@@ -207,11 +207,13 @@ impl CentroidPopulationCache {
 
 /// Corpus cardinality reported alongside every `recall_with_context` response.
 ///
-/// PR-09: three of the four counts are viewer-scoped. `papers` and
-/// `claim_themes` are NOT in migration 062's `tier_a` array and have no
-/// `owner_group_id`, so there is nothing to filter on; `claim_themes` is the
-/// table plan §2.4 registers as `tenancy_exempt` with theme clustering as its
-/// control. Both are annotated in the SQL rather than left silent.
+/// PR-09: the claim counts are viewer-scoped, and since migration 246 the
+/// paper count is too (`papers` carries `owner_group_id`). `claim_themes` is
+/// NOT in migration 062's `tier_a` array and has no `owner_group_id`, so there
+/// is nothing to filter on: it is the table plan §2.4 registers as
+/// `tenancy_exempt`, naming viewer-scoped theme clustering as its control,
+/// which is not yet in the tree. It is annotated in the SQL rather than left
+/// silent.
 async fn compute_corpus_scope<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     viewer: &epigraph_db::visibility::Viewer,
@@ -228,27 +230,33 @@ async fn compute_corpus_scope<'e, E: sqlx::PgExecutor<'e>>(
              WHERE (c2.properties->>'level')::int = 2
                AND ($1::bool OR c2.visibility = 'public'
                     OR c2.owner_group_id = ANY($2::uuid[]))) AS paragraph_total,
-          -- VISIBILITY-EXEMPT: `papers` is not in migration 062's tier_a array
-          -- and carries no owner_group_id. A bibliographic-record count, not
-          -- claim content.
-          (SELECT COUNT(*) FROM papers) AS paper_total,
+          -- `papers` carries owner_group_id since migration 246 (a team's or
+          -- agent's private ingest writes a group row): filtered like the
+          -- claim counts above, on top of the row security that admits the
+          -- same rows to this stamped read.
+          (SELECT COUNT(*) FROM papers p
+             WHERE ($1::bool OR p.visibility = 'public'
+                    OR p.owner_group_id = ANY($2::uuid[]))) AS paper_total,
           -- VISIBILITY-EXEMPT: `claim_themes` is the table plan §2.4 registers
-          -- as tenancy_exempt; it has no owner_group_id either, so no predicate
-          -- can be written here.
+          -- as tenancy_exempt; it has no owner_group_id, so no predicate can
+          -- be written here.
           --
           -- §2.4's stated control for that residual is viewer-scoped
-          -- clustering, and PR-09 DID NOT SHIP IT. `theme_cluster` still calls
-          -- `epigraph_engine::theme_kmeans::run_theme_kmeans`, which takes no
-          -- Viewer. An earlier revision of this comment asserted the control as
-          -- if it existed; an exemption whose written reason is false is worse
+          -- clustering, and it is still not in the tree. The k-means
+          -- prototype an earlier revision named here is retired (backlog
+          -- a0ed0180); themes are now built by the UMAP theme pipeline through
+          -- the `/api/v1/themes/*` routes. Its centroids are averaged only over
+          -- claims the calling viewer reads
+          -- (`ClaimThemeRepository::set_centroid_from_claims`), but theme
+          -- membership (`assign_unthemed_batch`) and the stored labels are
+          -- still derived corpus-wide, so the table stays exempt rather than
+          -- controlled. An exemption whose written reason is false is worse
           -- than an unannotated one, because `visibility_lint.rs` trains
           -- reviewers to read exactly these lines.
           --
-          -- Owner of the residual: the PR that threads a Viewer through
-          -- `theme_kmeans::run_theme_kmeans` must land BOTH callers together —
-          -- this tool and `epigraph-api/src/routes/crud.rs::build_themes_from_corpus`
-          -- — or MCP hardens while HTTP stays corpus-wide. Ledgered as
-          -- D-PR16-theme-cluster-viewer-scope in docs/tenancy/progress.json.
+          -- What this line returns is a count of theme rows, a scalar that
+          -- names no claim. Ledgered as D-PR16-theme-cluster-viewer-scope in
+          -- docs/tenancy/progress.json.
           (SELECT COUNT(*) FROM claim_themes) AS themes_total
         "#,
         viewer.bypass_bind(),
@@ -426,7 +434,8 @@ pub struct RecallWithContextParams {
     ///
     /// SHRINKS the page rather than back-filling: with `rerank=false` the
     /// candidate pool is exactly `limit`, so there is nothing below to promote.
-    /// Same contract as `min_truth` / `exclude_contested`.
+    /// Same contract as `exclude_contested`. (`min_truth` differs: it runs
+    /// before the cut to `limit` and back-fills from the retrieved pool.)
     ///
     /// Hits whose distance cannot be MEASURED are always KEPT — a paragraph
     /// with no vector in the searched column is not known to be near anything.
@@ -626,7 +635,9 @@ pub(crate) async fn write_recall_audit(
 /// to be able to settle.
 ///
 /// The id is minted by the caller rather than read back from the insert,
-/// because the write is not awaited.
+/// because the write is not awaited. It is tracked, though: it runs on the
+/// server's [`crate::background::BackgroundTasks`], which the stdio entry point
+/// drains before the process exits.
 fn spawn_recall_audit(
     server: &EpiGraphMcpFull,
     event_id: Uuid,
@@ -639,7 +650,10 @@ fn spawn_recall_audit(
     let query = query.to_string();
     let pgvec = pgvec.to_string();
     let scoped = server.scoped.clone();
-    tokio::spawn(async move {
+    // On the server's tracked set, not a bare `tokio::spawn` (backlog
+    // 8a23217d): the stdio entry point waits for that set before it exits, so
+    // a session that recalls and closes at once still leaves its audit row.
+    server.background.spawn(async move {
         // Resolved inside the spawn: everything this needs is owned, so nothing
         // here borrows the request. The group lookup (a viewer resolve and one
         // stamped SELECT, never a mint, #493) and the insert on that same
@@ -690,17 +704,25 @@ pub struct RecallWithContextResponse {
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
     /// How many retrieved candidates the `min_truth` belief floor dropped
-    /// from this page (backlog 75920ad6). Counts only that gate: a hit removed
-    /// by `exclude_contested` or `diversity_radius`, or one whose row vanished
-    /// mid-request, is not counted. `0` when the floor dropped nothing,
-    /// including on a page with no candidates at all.
+    /// (backlog 75920ad6), counted over every candidate this request
+    /// retrieved, not only the returned page (backlog d830c073): the floor
+    /// runs BEFORE the cut to `limit`, and a dropped candidate's slot is
+    /// back-filled from the ranked candidates behind it. The retrieved set is
+    /// `limit` candidates on the default flat path, the over-fetched pool
+    /// with `rerank`, and the expanded set with `graph_expansion_depth`.
+    /// Counts only that gate: a hit removed by `exclude_contested` or
+    /// `diversity_radius`, or one whose row vanished mid-request, is not
+    /// counted. `0` when the floor dropped nothing, including when there were
+    /// no candidates at all.
     pub below_confidence_floor: usize,
     /// `true` exactly when candidates WERE retrieved but none cleared the
     /// `min_truth` floor: "relevant material exists, none believed enough",
     /// as distinct from "nothing relevant" (`false` with
-    /// `below_confidence_floor: 0`). Read from the floor alone, so a page
-    /// later emptied by `exclude_contested` or `diversity_radius` is not
-    /// reported as insufficient confidence.
+    /// `below_confidence_floor: 0`). Since the floor runs before the cut, it
+    /// means no retrieved candidate cleared it, not only none on the page.
+    /// Read from the floor alone, so a page later emptied by
+    /// `exclude_contested` or `diversity_radius` is not reported as
+    /// insufficient confidence.
     pub insufficient_confidence: bool,
     /// Id the audit row for this retrieval is written under (backlog
     /// 8cbffa0e), so a caller can cite which recall fed a downstream decision.
@@ -1557,8 +1579,9 @@ async fn recall_with_context_core(
     }
 
     // Stage 4.5: cross-encoder rerank + optional groundedness gate over the
-    // widened pool. Reorders by RELEVANCE and truncates to `want` BEFORE the
-    // expensive fetch_batched_context. Belief/truth fields are untouched here:
+    // widened pool. Reorders by RELEVANCE; the cut to `want` happens after the
+    // belief floor below (backlog d830c073), still BEFORE the expensive
+    // fetch_batched_context. Belief/truth fields are untouched here:
     // rerank_score/verdict are surfaced as SEPARATE metadata.
     let mut rerank_meta: std::collections::HashMap<
         Uuid,
@@ -1630,7 +1653,8 @@ async fn recall_with_context_core(
                                 );
                             }
                         }
-                        merged.truncate(want);
+                        // No cut here: the belief floor below runs over the
+                        // whole reranked pool and cuts to `want` after it.
                         for h in &merged {
                             rerank_meta.insert(h.id, (h.rerank_score, h.verdict));
                         }
@@ -1648,8 +1672,58 @@ async fn recall_with_context_core(
             _ => tracing::warn!("rerank requested but RERANK_API_KEY absent/disabled; flat order"),
         }
     }
-    // Cap to `want` even when rerank is off (or skipped), since the flat pool
-    // may have been widened above.
+    // Stage 4.6: the `min_truth` belief floor, over the WHOLE ranked pool and
+    // BEFORE the cut to `want` (backlog d830c073). It used to run after the
+    // cut, on the page alone, so a better-ranked candidate below the floor
+    // took a page slot a candidate past the cut would have filled, and
+    // `below_confidence_floor` / `insufficient_confidence` described only the
+    // page. Now a dropped candidate's slot is back-filled from the ranked
+    // pool, and the count covers every retrieved candidate.
+    //
+    // "Retrieved" is the pool this request already fetched: `want` on the
+    // default flat path, the over-fetched pool when `rerank` is set, the
+    // expanded set under `graph_expansion_depth`. The floor does not widen the
+    // kNN itself, so on the default path there is nothing past the cut to
+    // back-fill from and the count already covers every candidate.
+    //
+    // Backlog 14b98adc: the floor reads the DS pignistic probability, not
+    // `claims.truth_value` — which no DS write path refreshes, so a paragraph
+    // refuted by epistemic edges kept clearing a floor set against its
+    // pre-edge authored value. One round-trip for the whole pool.
+    // Degrade-not-fail: an error yields an empty map, nothing is dropped here,
+    // and every hit is floored after the context fetch on the `truth_value` it
+    // carries, i.e. on the page alone, as before this fix. An id absent from
+    // the map (invisible, or deleted mid-request) is kept here for the same
+    // fall-back.
+    let pool_ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
+    let mut belief_by_claim = match epigraph_db::ClaimRepository::effective_belief_batch(
+        &mut *read, viewer, &pool_ids,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "DS belief batch failed; min_truth falls back to claims.truth_value for this page"
+            );
+            std::collections::HashMap::new()
+        }
+    };
+    // Candidates the belief floor dropped (backlog 75920ad6). Only the
+    // `min_truth` drop counts; a vanished core is not a confidence fact.
+    let mut below_confidence_floor = 0_usize;
+    raw_hits.retain(|h| match belief_by_claim.get(&h.claim_id) {
+        Some(&score) if score < min_truth => {
+            below_confidence_floor += 1;
+            false
+        }
+        _ => true,
+    });
+    // The ids the floor already judged; only the others are floored after the
+    // context fetch, so no candidate is counted twice.
+    let floored_before_cut: std::collections::HashSet<Uuid> =
+        belief_by_claim.keys().copied().collect();
     raw_hits.truncate(want);
 
     // Stage 5: batch context fetches.
@@ -1665,53 +1739,31 @@ async fn recall_with_context_core(
     .await
     .map_err(|e| recall_fault("could not fetch the context batch", e))?;
 
-    // Backlog 14b98adc: the min_truth gate below reads the DS pignistic
-    // probability, not `claims.truth_value` — which no DS write path refreshes,
-    // so a paragraph refuted by epistemic edges kept clearing a gate set
-    // against its pre-edge authored value. One round-trip for the whole page,
-    // over the ids the batch context fetch already resolved. Degrade-not-fail:
-    // an error yields an empty map and every hit falls back to the
-    // `core.truth_value` the context fetch already carries, i.e. to exactly the
-    // pre-fix behaviour.
-    //
-    // The same round-trip also resolves the context atoms' effective belief,
-    // so each atom is reported on the scale the hit itself is gated on. The
-    // atom ids come from `fetch_batched_context`, which already applied the
-    // viewer's visibility; `effective_belief_batch` applies it again, and an
-    // atom it does not return keeps its `truth_value` fall-back.
-    let belief_ids: Vec<Uuid> = paragraph_ids
-        .iter()
-        .copied()
-        .chain(
-            ctx.atoms_by_paragraph
-                .values()
-                .flat_map(|atoms| atoms.iter().map(|a| a.atom_id)),
-        )
+    // The context atoms' effective belief, so each atom is reported on the
+    // scale the hit itself is gated on. The atom ids come from
+    // `fetch_batched_context`, which already applied the viewer's visibility;
+    // `effective_belief_batch` applies it again, and an atom it does not return
+    // keeps its `truth_value` fall-back. Degrade-not-fail, as above.
+    let atom_ids: Vec<Uuid> = ctx
+        .atoms_by_paragraph
+        .values()
+        .flat_map(|atoms| atoms.iter().map(|a| a.atom_id))
+        .filter(|id| !belief_by_claim.contains_key(id))
         .collect::<std::collections::HashSet<Uuid>>()
         .into_iter()
         .collect();
-    let belief_by_claim = match epigraph_db::ClaimRepository::effective_belief_batch(
-        &mut *read,
-        viewer,
-        &belief_ids,
-    )
-    .await
+    match epigraph_db::ClaimRepository::effective_belief_batch(&mut *read, viewer, &atom_ids).await
     {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "DS belief batch failed; min_truth falls back to claims.truth_value for this page"
-            );
-            std::collections::HashMap::new()
-        }
-    };
+        Ok(m) => belief_by_claim.extend(m),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "DS belief batch for context atoms failed; atoms report claims.truth_value"
+        ),
+    }
 
-    // Stage 4 + 6: filter min_truth, drop hits whose core vanished, assemble.
+    // Stage 6: drop hits whose core vanished, floor the ones the pool batch
+    // could not score, assemble.
     let mut results = Vec::with_capacity(raw_hits.len());
-    // Candidates the belief floor dropped (backlog 75920ad6). Only the
-    // `min_truth` drop below counts; a vanished core is not a confidence fact.
-    let mut below_confidence_floor = 0_usize;
     for hit in raw_hits {
         let paragraph_id = hit.claim_id;
         let (rerank_score, verdict) = rerank_meta
@@ -1728,7 +1780,9 @@ async fn recall_with_context_core(
             .get(&paragraph_id)
             .copied()
             .unwrap_or(core.truth_value);
-        if belief_score < min_truth {
+        // Only a hit the pool batch did not score (it failed, or the id was
+        // absent) is floored here; the rest already cleared the floor above.
+        if !floored_before_cut.contains(&paragraph_id) && belief_score < min_truth {
             below_confidence_floor += 1;
             continue;
         }
@@ -1844,7 +1898,9 @@ async fn recall_with_context_core(
         });
     }
     // Read here, straight after the floor and before any later filter, so the
-    // flag means "the floor emptied the page" and nothing else.
+    // flag means "the floor left the page empty" and nothing else. With the
+    // floor ahead of the cut, an empty page means NO retrieved candidate
+    // cleared it, not only the ones that happened to fall on this page.
     let insufficient_confidence = below_confidence_floor > 0 && results.is_empty();
 
     // Bounded lens post-pass: when a lens is active, annotate each already-built
@@ -1942,8 +1998,9 @@ async fn recall_with_context_core(
         }
 
         // Post-filter after ranking/enrichment — a page may come back short
-        // rather than back-fill with worse-ranked material (same precedent as
-        // `min_truth`).
+        // rather than back-fill with worse-ranked material. (`min_truth` no
+        // longer sets that precedent here: it runs before the cut and
+        // back-fills, backlog d830c073.)
         if params.exclude_contested {
             results.retain(|h| !h.is_contested);
         }
@@ -1960,13 +2017,16 @@ async fn recall_with_context_core(
     // corroborates and neighbour fan-out in `fetch_batched_context`. It is also
     // WRONG, and the test
     // `a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one` pins the
-    // exact failure: on this surface `min_truth` is applied AFTER context
-    // assembly, so a low-truth paragraph ranked first could evict its
-    // high-truth near-duplicate and then be dropped itself by `min_truth`. The
-    // measured result was a page that returned the 0.9 paragraph WITHOUT the
-    // radius and nothing at all WITH it — switching on a de-duplication filter
-    // deleted the good hit. `exclude_contested` has the same shape (as did the
-    // missing-paper drop, removed in drain U082).
+    // exact failure: `min_truth` was then applied AFTER context assembly, so
+    // a low-truth paragraph ranked first could evict its high-truth
+    // near-duplicate and then be dropped itself by `min_truth`. The measured
+    // result was a page that returned the 0.9 paragraph WITHOUT the radius and
+    // nothing at all WITH it — switching on a de-duplication filter deleted
+    // the good hit. `min_truth` now runs before the cut (backlog d830c073),
+    // but `exclude_contested` still has that shape, and so would any later
+    // post-filter (as did the missing-paper drop, removed in drain U082). The
+    // test now pins the ordering through `exclude_contested`: a contested
+    // near-duplicate ranked first must not evict the clean one.
     //
     // Running last makes the rule "a hit may only be suppressed by a hit that
     // is itself being returned", and makes this surface agree with
@@ -2204,9 +2264,26 @@ pub struct BatchedContext {
 /// `Viewer::edge_predicate_fragment`, spelled as statement 7b already spells
 /// it, on the same two binds. In statements 4, 7 and 7b the predicate sits
 /// BEFORE the window functions, so `total` never counts a hidden edge. The
-/// paper-attribution `LEFT JOIN edges asserts_e` in statement 7 carries it in
-/// the `ON`: a hidden attribution leaves `paper_doi` empty rather than dropping
-/// the readable neighbour.
+/// paper attribution in statement 7 carries it inside its `LEFT JOIN LATERAL`:
+/// a hidden attribution leaves `paper_doi` empty rather than dropping the
+/// readable neighbour.
+///
+/// # One row per neighbour (backlog 11402482)
+///
+/// Statement 7 used to `LEFT JOIN edges asserts_e` straight onto the
+/// neighbour, so a neighbour with two visible `paper -asserts->` rows was
+/// listed twice, took two of the paragraph's `corroborates_limit` slots and
+/// counted twice in `total`. That happens whenever two papers assert one claim,
+/// and whenever two ingest principals ingest one paper (the ingest keeps one
+/// marked row of a fact per principal, `epigraph_db::ingest_written`). The
+/// attribution is now ONE paper per neighbour, picked by a lateral subquery
+/// (the oldest visible in-force asserting row, else the oldest visible one),
+/// so a neighbour's asserting rows no longer multiply it in the list or in
+/// `total`; a claim two papers assert shows one of their DOIs. This is about
+/// the attribution join only: the `neighbors` CTE still yields one row per
+/// visible `corroborates` row, so a neighbour linked by two of them (both
+/// directions, both spellings, or two parallel rows) is listed once per row,
+/// as before.
 ///
 /// # A deliberate deviation, recorded
 ///
@@ -2279,6 +2356,21 @@ pub async fn fetch_batched_context(
         });
     }
 
+    // Liveness (backlog bc76b481). Every leg below that joins a claim it hands
+    // back as context requires `is_current` on that claim: the section parent,
+    // atoms, bridge parents, siblings, corroborating and epistemic neighbours,
+    // and the neighbour paragraphs reached by `continues_argument` or an
+    // atom-atom bridge (legs 8-10). A superseded claim is retired content;
+    // returned as a hit's context, a caller reads it as current support.
+    // Supersession (and the dedup / merge cascades) re-points `decomposes_to`
+    // and `corroborates` onto the replacement, so a superseded claim still
+    // hanging off a parent is a stale row whose successor is returned instead.
+    // The CORROBORATES leg also applies `EDGE_IN_FORCE` to the edge, as leg 7b
+    // does: a retracted edge (`delete_edge` sets `valid_to`) is not live
+    // support. Leg 1 (`paragraph_meta`) deliberately has no `is_current`:
+    // `claim_context` pins a claim by id and must still resolve a superseded
+    // one.
+
     // 3. Section parents (level=1 via decomposes_to incoming).
     {
         let rows = sqlx::query!(
@@ -2289,6 +2381,7 @@ pub async fn fetch_batched_context(
             WHERE e.target_id = ANY($1)
               AND e.relationship = 'decomposes_to'
               AND (c.properties->>'level')::int = 1
+              AND c.is_current
               AND ($2::bool OR c.visibility = 'public'
                    OR c.owner_group_id = ANY($3::uuid[]))
               AND ($2::bool OR e.visibility = 'public'
@@ -2332,6 +2425,7 @@ pub async fn fetch_batched_context(
                 WHERE e.source_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 3
+                  AND c.is_current
                   AND ($3::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($4::uuid[]))
                   AND ($3::bool OR e.visibility = 'public'
@@ -2388,6 +2482,7 @@ pub async fn fetch_batched_context(
                 JOIN claims cp ON cp.id = e.source_id
                 WHERE e.target_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
+                  AND cp.is_current
                   AND ($2::bool OR cp.visibility = 'public'
                        OR cp.owner_group_id = ANY($3::uuid[]))
                   AND ($2::bool OR e.visibility = 'public'
@@ -2438,6 +2533,7 @@ pub async fn fetch_batched_context(
                 WHERE e.source_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 2
+                  AND c.is_current
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
                   AND ($2::bool OR e.visibility = 'public'
@@ -2494,6 +2590,7 @@ pub async fn fetch_batched_context(
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.source_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($3::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($4::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -2503,6 +2600,7 @@ pub async fn fetch_batched_context(
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.target_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($3::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($4::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -2516,17 +2614,26 @@ pub async fn fetch_batched_context(
                 FROM neighbors n
                 JOIN claims c
                   ON c.id = n.neighbor_id
+                 AND c.is_current
                  AND ($3::bool OR c.visibility = 'public'
                       OR c.owner_group_id = ANY($4::uuid[]))
-                LEFT JOIN edges asserts_e
-                  ON asserts_e.target_id = c.id
-                  AND asserts_e.relationship = 'asserts'
-                  AND asserts_e.source_type = 'paper'
-                  AND ($3::bool OR asserts_e.visibility = 'public'
-                       OR (asserts_e.owner_group_id = ANY($4::uuid[])
-                           AND (asserts_e.co_owner_group_id IS NULL
-                                OR asserts_e.co_owner_group_id = ANY($4::uuid[]))))
-                LEFT JOIN papers p ON p.id = asserts_e.source_id
+                LEFT JOIN LATERAL (
+                    SELECT pp.doi
+                    FROM edges asserts_e
+                    JOIN papers pp ON pp.id = asserts_e.source_id
+                    WHERE asserts_e.target_id = c.id
+                      AND asserts_e.relationship = 'asserts'
+                      AND asserts_e.source_type = 'paper'
+                      AND ($3::bool OR asserts_e.visibility = 'public'
+                           OR (asserts_e.owner_group_id = ANY($4::uuid[])
+                               AND (asserts_e.co_owner_group_id IS NULL
+                                    OR asserts_e.co_owner_group_id = ANY($4::uuid[]))))
+                    -- An in-force row first: a retracted attribution
+                    -- (valid_to past) is the representative only alone.
+                    ORDER BY (asserts_e.valid_to IS NOT NULL AND asserts_e.valid_to <= now()),
+                             asserts_e.created_at, asserts_e.id
+                    LIMIT 1
+                ) p ON true
             ),
             ranked AS (
                 SELECT *,
@@ -2688,6 +2795,7 @@ pub async fn fetch_batched_context(
             FROM edges e
             JOIN claims cn ON cn.id = e.target_id
             WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'
+              AND cn.is_current
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
               AND ($2::bool OR e.visibility = 'public'
@@ -2699,6 +2807,7 @@ pub async fn fetch_batched_context(
             FROM edges e
             JOIN claims cn ON cn.id = e.source_id
             WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'
+              AND cn.is_current
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
               AND ($2::bool OR e.visibility = 'public'
@@ -2740,6 +2849,7 @@ pub async fn fetch_batched_context(
                       AND e.relationship != 'decomposes_to'
                       AND (ca.properties->>'level')::int = 3
                       AND (cb.properties->>'level')::int = 3
+                      AND cb.is_current
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
                       AND ($2::bool OR e.visibility = 'public'
@@ -2756,6 +2866,7 @@ pub async fn fetch_batched_context(
                       AND e.relationship != 'decomposes_to'
                       AND (ca.properties->>'level')::int = 3
                       AND (cb.properties->>'level')::int = 3
+                      AND cb.is_current
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
                       AND ($2::bool OR e.visibility = 'public'
@@ -2800,6 +2911,7 @@ pub async fn fetch_batched_context(
                 WHERE e.target_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 2
+                  AND c.is_current
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
                   AND ($2::bool OR e.visibility = 'public'

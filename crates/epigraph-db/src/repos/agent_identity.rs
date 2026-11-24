@@ -9,7 +9,17 @@
 //!   calls `epigraph_register_agent_identity`, which only the
 //!   `epigraph_identity_attestor` role may execute. The connection's ROLE is
 //!   the authorisation: the session principal is a variable any login can set,
-//!   so it is never consulted.
+//!   so it is never consulted. Before the call it decompresses each frame it
+//!   is about to send and re-checks size and hash
+//!   ([`AgentIdentityRepository::verify_snapshot_document`]). That is defence
+//!   in depth, not a closed gap: `register` derives frame, hash and size from
+//!   the same bytes, so on this path the check fails only on an encoder
+//!   fault. It is public as the contract for a writer that builds its own
+//!   document; a writer that calls the definer directly is not covered by it.
+//!   It also cannot see a frame ALREADY stored under the hash: the definer
+//!   drops the incoming frame on conflict, comparing only `raw_size`, and the
+//!   attestor cannot read the blob table. Detecting that needs a definer
+//!   change.
 //! * [`AgentIdentityRepository::prompt_history`] calls
 //!   `epigraph_agent_prompt_history`, which reads the session principal
 //!   (operator or admin, else `AID06`), then decompresses every returned file
@@ -17,14 +27,16 @@
 //!   WITHHELD (named in [`PromptSnapshot::withheld_files`]), never returned as
 //!   someone else's text; and since blobs are shared across agents, one bad
 //!   blob withholds that one file, not every history that names it.
-//! * [`AgentIdentityRepository::prompt_history_index`] and
+//! * [`AgentIdentityRepository::prompt_history_page`] and
 //!   [`AgentIdentityRepository::prompt_history_blob`] split that read for a
-//!   server: the first projects only the hashes and metadata out of the same
-//!   definer, so no file content crosses the connection; the second fetches,
-//!   decompresses and verifies the ONE file a readable snapshot in that
-//!   history names. A server's memory then grows with the number of snapshots
-//!   and with one file, not with the sum of every file. (The definer itself
-//!   still builds its whole result, content included, inside the database.)
+//!   server. The first reads migration 268's content-free definer
+//!   `epigraph_agent_prompt_history_meta` (161's gate and walk, hashes and
+//!   metadata only, never `agent_prompt_blobs`), one keyset page at a time, so
+//!   no file content is built or crosses the connection for a listing and a
+//!   page is bounded in rows. The second fetches, decompresses and verifies
+//!   the ONE file a readable snapshot in that history names; it still reads
+//!   through 161's definer, which builds the whole lineage's content inside
+//!   the database for that one file.
 
 use std::borrow::Cow;
 
@@ -54,6 +66,14 @@ const ZSTD_LEVEL: i32 = 19;
 /// The largest raw file the table accepts (`agent_prompt_blobs_raw_size`). Also
 /// the decompression bound, so a stored frame cannot expand past it.
 pub const MAX_PROMPT_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The snapshot document's file keys, in the definer's order.
+const PROMPT_FILES: [&str; 4] = [
+    "identity_md",
+    "global_claude_md",
+    "group_claude_md",
+    "learned_md",
+];
 
 /// One prompt file at registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +219,7 @@ pub struct PromptSnapshotIndex {
     pub last_seen: DateTime<Utc>,
 }
 
-/// One row of [`AgentIdentityRepository::prompt_history_index`]: as
+/// One row of [`AgentIdentityRepository::prompt_history_page`]: as
 /// [`PromptHistoryEntry`], with the snapshot named by hash only.
 #[derive(Debug, Clone)]
 pub struct PromptHistoryIndexEntry {
@@ -213,6 +233,94 @@ pub struct PromptHistoryIndexEntry {
     pub readable: bool,
     /// None when unreadable, or when the agent has no snapshot.
     pub snapshot: Option<PromptSnapshotIndex>,
+}
+
+impl PromptHistoryIndexEntry {
+    /// The page position just after this row: pass it back as the `after` of
+    /// [`AgentIdentityRepository::prompt_history_page`] for the next page.
+    #[must_use]
+    pub fn cursor(&self) -> PromptHistoryCursor {
+        PromptHistoryCursor {
+            depth: self.depth,
+            agent_id: self.agent_id,
+            snapshot: self.snapshot.as_ref().map(|s| (s.first_seen, s.id)),
+        }
+    }
+}
+
+/// The largest page migration 268's definer returns (its `LEAST(p_limit,
+/// 1000)`); a larger `limit` is clamped to it.
+pub const PROMPT_HISTORY_PAGE_MAX: u32 = 1000;
+
+/// A position in an agent's prompt history: the key of the last row of a page,
+/// in migration 268's order `(abs(depth), depth, agent_id, first_seen,
+/// snapshot_id)`. A row with no snapshot has no `snapshot` part.
+///
+/// A position only: every page re-runs the definer's gate and walk, so a
+/// forged cursor reads nothing the caller could not read from the first page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptHistoryCursor {
+    pub depth: i32,
+    pub agent_id: Uuid,
+    /// The row's snapshot `(first_seen, id)`, if it has one.
+    pub snapshot: Option<(DateTime<Utc>, Uuid)>,
+}
+
+impl PromptHistoryCursor {
+    /// `depth_agent` or `depth_agent_firstseenmicros_snapshot`, uuids in
+    /// simple (unhyphenated) form.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let head = format!("{}_{}", self.depth, self.agent_id.simple());
+        match self.snapshot {
+            None => head,
+            Some((at, id)) => format!("{head}_{}_{}", at.timestamp_micros(), id.simple()),
+        }
+    }
+
+    /// The inverse of [`Self::encode`]; `None` for anything it did not write,
+    /// including a position no row can have: a depth past the walk's 64
+    /// generations (which would also overflow the definer's `abs()` at
+    /// `i32::MIN`) or an instant outside years 1..=9999 (`timestamptz` rejects
+    /// some instants chrono accepts).
+    #[must_use]
+    pub fn decode(raw: &str) -> Option<Self> {
+        use chrono::Datelike;
+        const MAX_DEPTH: u32 = 64;
+        let parts: Vec<&str> = raw.split('_').collect();
+        let (depth, agent) = match parts.as_slice() {
+            [d, a] | [d, a, _, _] => (d.parse::<i32>().ok()?, Uuid::try_parse(a).ok()?),
+            _ => return None,
+        };
+        if depth.unsigned_abs() > MAX_DEPTH {
+            return None;
+        }
+        let snapshot = match parts.as_slice() {
+            [_, _, at, id] => Some((
+                DateTime::from_timestamp_micros(at.parse::<i64>().ok()?)
+                    .filter(|t| (1..=9999).contains(&t.year()))?,
+                Uuid::try_parse(id).ok()?,
+            )),
+            _ => None,
+        };
+        Some(Self {
+            depth,
+            agent_id: agent,
+            snapshot,
+        })
+    }
+}
+
+/// One page of [`AgentIdentityRepository::prompt_history_page`].
+#[derive(Debug, Clone)]
+pub struct PromptHistoryPage {
+    /// The page's rows, in the definer's order.
+    pub rows: Vec<PromptHistoryIndexEntry>,
+    /// The farthest ancestor depth of the WHOLE walk (0 when it found none),
+    /// whatever page this is; `None` only for an empty page.
+    pub lineage_min_depth: Option<i32>,
+    /// The farthest descendant depth of the whole walk, likewise.
+    pub lineage_max_depth: Option<i32>,
 }
 
 /// The outcome of [`AgentIdentityRepository::prompt_history_blob`].
@@ -248,6 +356,8 @@ struct IndexRow {
     global_claude_md_hash: Option<Vec<u8>>,
     group_claude_md_hash: Option<Vec<u8>>,
     learned_md_hash: Option<Vec<u8>>,
+    lineage_min_depth: i32,
+    lineage_max_depth: i32,
 }
 
 #[derive(sqlx::FromRow)]
@@ -327,6 +437,67 @@ impl AgentIdentityRepository {
         }))
     }
 
+    /// Check a snapshot document's stored files before they are sent: each
+    /// file's `content` must decompress (under the reader's bound) to exactly
+    /// `raw_size` bytes whose BLAKE3 is `blob_hash`. `null` and
+    /// `{"refused": true}` entries pass; any other shape is left to the
+    /// definer, which refuses it.
+    ///
+    /// The definer cannot run zstd or BLAKE3, so it checks only the shape and,
+    /// when the hash is already stored, the size: a frame under an existing
+    /// hash is then dropped (`ON CONFLICT DO NOTHING`) without its content
+    /// being compared, and a new frame is stored without being checked. Blobs
+    /// are append-only, so a frame that does not decode to its key would
+    /// withhold that file from every later snapshot naming the hash. This is
+    /// the write-side half of the reader's check, for the frames THIS caller
+    /// sends; any frame of the right text passes, whatever encoder or level
+    /// produced it. It says nothing about a frame already stored under the
+    /// hash, and nothing about writers that do not call it.
+    ///
+    /// # Errors
+    /// [`DbError::InvalidData`] naming the first file whose frame does not
+    /// decompress, or decompresses to the wrong size or to bytes that do not
+    /// hash to its `blob_hash`.
+    pub fn verify_snapshot_document(snapshot: &Value) -> Result<(), DbError> {
+        for file in PROMPT_FILES {
+            let Some(entry) = snapshot.get(file).and_then(Value::as_object) else {
+                continue;
+            };
+            if entry.contains_key("refused") {
+                continue;
+            }
+            let invalid = |why: String| DbError::InvalidData {
+                reason: format!("snapshot.{file}: {why}; refusing to send it"),
+            };
+            let decode = |key: &str| -> Result<Vec<u8>, DbError> {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(|h| hex::decode(h).ok())
+                    .ok_or_else(|| invalid(format!("`{key}` is not a hex string")))
+            };
+            let hash = decode("blob_hash")?;
+            let content = decode("content")?;
+            let raw_size = entry
+                .get("raw_size")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid("`raw_size` is not a non-negative integer".into()))?;
+            // `verified_blob`'s reasons already start with "{file}: ".
+            let blob = verified_blob(file, Some(hash), Some(content))
+                .map_err(|why| DbError::InvalidData {
+                    reason: format!("snapshot.{why}; refusing to send it"),
+                })?
+                .ok_or_else(|| invalid("no blob".into()))?;
+            if blob.bytes.len() as u64 != raw_size {
+                return Err(invalid(format!(
+                    "the frame decompresses to {} bytes, not the declared raw_size {raw_size}",
+                    blob.bytes.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Register (or re-register) a host-attested identity through migration
     /// 161's `epigraph_register_agent_identity`. Idempotent: the same identity,
     /// parent, group and files again only bumps the snapshot's `last_seen`.
@@ -339,12 +510,14 @@ impl AgentIdentityRepository {
     /// [`NOT_ADOPTABLE`], [`OPERATOR_CONFLICT`] or [`SIGNING_KEY_CONFLICT`] for
     /// the refusals, 22023 for malformed input (or a signing key already bound
     /// elsewhere), 42501 for a connection that is not the attestor; each writes
-    /// nothing. [`DbError::InvalidData`] from [`Self::snapshot_document`].
+    /// nothing. [`DbError::InvalidData`] from [`Self::snapshot_document`] or
+    /// [`Self::verify_snapshot_document`], before anything is sent.
     pub async fn register(
         conn: &mut sqlx::PgConnection,
         reg: &IdentityRegistration,
     ) -> Result<IdentityRegistered, DbError> {
         let snapshot = Self::snapshot_document(reg)?;
+        Self::verify_snapshot_document(&snapshot)?;
         Ok(sqlx::query_as::<_, IdentityRegistered>(
             "SELECT agent_id, agent_created, succession_created, snapshot_id, snapshot_created, \
                     signing_key_registered, operator_id, inherited, link_live, inherit_reason \
@@ -393,29 +566,56 @@ impl AgentIdentityRepository {
         Ok(rows.into_iter().map(history_entry).collect())
     }
 
-    /// [`Self::prompt_history`] without any file content: the same definer,
-    /// the same gate and the same rows, each file named by its key only. No
-    /// blob crosses the connection.
+    /// One page of [`Self::prompt_history`] without any file content, through
+    /// migration 268's `epigraph_agent_prompt_history_meta`: 161's gate (the
+    /// connection must be stamped with the caller's principal) and walk, the
+    /// same rows, each file named by its key only. The definer never reads
+    /// `agent_prompt_blobs`, so no blob is built or crosses the connection.
+    ///
+    /// `after` is the [`PromptHistoryIndexEntry::cursor`] of the previous
+    /// page's last row (`None` for the first page); at most `limit` rows come
+    /// back (clamped to `[1, PROMPT_HISTORY_PAGE_MAX]`). Ask for one row more
+    /// than you show to learn whether a next page exists.
     ///
     /// # Errors
-    /// As [`Self::prompt_history`]; and [`DbError::InvalidData`] for a stored
-    /// key that is not 32 bytes (the blob table's CHECK makes that
-    /// unreachable).
-    pub async fn prompt_history_index(
+    /// As [`Self::prompt_history`]: `AID06` ([`PROMPT_HISTORY_REFUSED`]) for
+    /// a caller who is neither the operator nor an admin; and
+    /// [`DbError::InvalidData`] for a stored key that is not 32 bytes (the
+    /// blob table's CHECK makes that unreachable).
+    pub async fn prompt_history_page(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
-    ) -> Result<Vec<PromptHistoryIndexEntry>, DbError> {
+        after: Option<&PromptHistoryCursor>,
+        limit: u32,
+    ) -> Result<PromptHistoryPage, DbError> {
+        let limit = i32::try_from(limit.clamp(1, PROMPT_HISTORY_PAGE_MAX))
+            .expect("PROMPT_HISTORY_PAGE_MAX fits an i32");
         let rows = sqlx::query_as::<_, IndexRow>(
             "SELECT agent_id, relation, depth, readable, snapshot_id, group_folder, model, \
                     prompt_hash, in_prompt, blob_refused, runner_version, host_sha, first_seen, \
                     last_seen, identity_md_hash, global_claude_md_hash, group_claude_md_hash, \
-                    learned_md_hash \
-               FROM public.epigraph_agent_prompt_history($1)",
+                    learned_md_hash, lineage_min_depth, lineage_max_depth \
+               FROM public.epigraph_agent_prompt_history_meta($1, $2, $3, $4, $5, $6)",
         )
         .bind(agent_id)
+        .bind(after.map(|c| c.depth))
+        .bind(after.map(|c| c.agent_id))
+        .bind(after.and_then(|c| c.snapshot.map(|(at, _)| at)))
+        .bind(after.and_then(|c| c.snapshot.map(|(_, id)| id)))
+        .bind(limit)
         .fetch_all(&mut *conn)
         .await?;
-        rows.into_iter().map(index_entry).collect()
+        let extent = rows
+            .first()
+            .map(|r| (r.lineage_min_depth, r.lineage_max_depth));
+        Ok(PromptHistoryPage {
+            rows: rows
+                .into_iter()
+                .map(index_entry)
+                .collect::<Result<_, _>>()?,
+            lineage_min_depth: extent.map(|e| e.0),
+            lineage_max_depth: extent.map(|e| e.1),
+        })
     }
 
     /// One file of an agent's prompt history, by key: fetched only when a
@@ -586,10 +786,10 @@ fn verified_blob(
         .try_into()
         .map_err(|_| format!("{file}: a blob key is not 32 bytes"))?;
     let bytes = zstd::bulk::decompress(&content, MAX_PROMPT_FILE_BYTES)
-        .map_err(|e| format!("{file}: the stored blob does not decompress: {e}"))?;
+        .map_err(|e| format!("{file}: the blob does not decompress: {e}"))?;
     if blake3::hash(&bytes).as_bytes() != &blob_hash {
         return Err(format!(
-            "{file}: the stored blob does not hash to its key {}",
+            "{file}: the blob does not hash to its key {}",
             hex::encode(blob_hash)
         ));
     }
@@ -678,6 +878,127 @@ mod tests {
         assert!(reason.contains("does not hash to its key"), "{reason}");
     }
 
+    /// A stored-file entry as the definer takes it, with `content` supplied
+    /// by the caller rather than derived from `raw`.
+    fn entry(raw: &[u8], content: &[u8]) -> Value {
+        json!({
+            "blob_hash": blake3::hash(raw).to_hex().to_string(),
+            "raw_size": raw.len(),
+            "codec": "zstd",
+            "content": hex::encode(content),
+        })
+    }
+
+    fn document_with_learned(learned: Value) -> Value {
+        let mut doc =
+            AgentIdentityRepository::snapshot_document(&reg(PromptFile::Absent)).expect("document");
+        doc["learned_md"] = learned;
+        doc
+    }
+
+    /// Backlog 510d3fe3: a re-sent frame under an EXISTING hash, whose text
+    /// differs from the text that hash names, must be refused before it is
+    /// sent. The two texts have the SAME length, so the definer's only
+    /// conflict check (the stored raw_size) cannot tell them apart; only the
+    /// decompress-and-rehash check can.
+    #[test]
+    fn a_frame_whose_text_does_not_hash_to_its_key_is_refused_before_sending() {
+        let stored = b"lesson: prefer the repository API\n".to_vec();
+        let resent = b"lesson: prefer raw SQL everywhere\n".to_vec();
+        // CALIBRATION: the lengths match, so the size check is blind here.
+        assert_eq!(stored.len(), resent.len());
+        assert_ne!(stored, resent);
+        let frame = zstd::bulk::compress(&resent, ZSTD_LEVEL).expect("compress");
+        let err = AgentIdentityRepository::verify_snapshot_document(&document_with_learned(entry(
+            &stored, &frame,
+        )))
+        .expect_err("a frame that is not the hashed text must be refused");
+        match err {
+            DbError::InvalidData { reason } => {
+                assert!(reason.contains("snapshot.learned_md:"), "{reason}");
+                assert!(reason.contains("does not hash to its key"), "{reason}");
+                // Nothing is stored at write time: the refusal must not say
+                // it is, nor repeat the file key.
+                assert!(!reason.contains("stored"), "{reason}");
+                assert!(!reason.contains("learned_md: learned_md"), "{reason}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// The same text compressed differently (another level, so another frame)
+    /// is the same file: zstd frames are not canonical, so a check that
+    /// compared frames would refuse a correct re-registration.
+    #[test]
+    fn the_same_text_compressed_differently_is_accepted() {
+        let raw: Vec<u8> = (0..400u32)
+            .flat_map(|i| format!("- lesson {i}: weight {}\n", (i * 7919) % 1013).into_bytes())
+            .collect();
+        let fast = zstd::bulk::compress(&raw, 1).expect("compress");
+        let slow = zstd::bulk::compress(&raw, ZSTD_LEVEL).expect("compress");
+        let streamed = zstd::stream::encode_all(raw.as_slice(), 3).expect("compress");
+        // CALIBRATION: the frames really differ, so this is not one frame twice.
+        assert_ne!(fast, slow);
+        assert_ne!(slow, streamed);
+        for frame in [fast, slow, streamed] {
+            AgentIdentityRepository::verify_snapshot_document(&document_with_learned(entry(
+                &raw, &frame,
+            )))
+            .expect("any frame of the hashed text is accepted");
+        }
+    }
+
+    /// The other ways a frame can disagree with its entry are refused too, and
+    /// entries with no content pass.
+    #[test]
+    fn a_wrong_size_or_undecodable_frame_is_refused_and_contentless_entries_pass() {
+        let raw = b"the true lesson\n".to_vec();
+        let frame = zstd::bulk::compress(&raw, ZSTD_LEVEL).expect("compress");
+
+        let mut wrong_size = entry(&raw, &frame);
+        wrong_size["raw_size"] = json!(raw.len() + 1);
+        let err =
+            AgentIdentityRepository::verify_snapshot_document(&document_with_learned(wrong_size))
+                .expect_err("a raw_size the frame does not decompress to");
+        assert!(format!("{err:?}").contains("raw_size"), "{err:?}");
+
+        let mut corrupt = frame.clone();
+        let at = corrupt.len() - 2;
+        corrupt[at] ^= 0x5a;
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(entry(
+            &raw, &corrupt,
+        )))
+        .expect_err("a corrupted frame");
+
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(json!({
+            "blob_hash": "zz",
+            "raw_size": 1,
+            "codec": "zstd",
+            "content": hex::encode(&frame),
+        })))
+        .expect_err("a blob_hash that is not hex");
+
+        // CALIBRATION: the untouched entry, refused and absent files, and a
+        // document built by `snapshot_document` itself all pass.
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(entry(
+            &raw, &frame,
+        )))
+        .expect("the matching entry");
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(
+            json!({"refused": true}),
+        ))
+        .expect("a refused file");
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(Value::Null))
+            .expect("an absent file");
+        let built = AgentIdentityRepository::snapshot_document(&IdentityRegistration {
+            identity_md: PromptFile::Stored(b"identity\n".to_vec()),
+            group_claude_md: PromptFile::Refused,
+            ..reg(PromptFile::Stored(raw))
+        })
+        .expect("document");
+        AgentIdentityRepository::verify_snapshot_document(&built).expect("a built document");
+    }
+
     /// A frame written by the PREVIOUS zstd binding (0.13.3 / zstd-safe 7.3.0,
     /// level 19, captured verbatim) is what deployed databases already hold in
     /// `agent_prompt_blobs`. The reader must still decompress it and
@@ -714,5 +1035,48 @@ mod tests {
         let at = corrupt.len() / 2;
         corrupt[at] ^= 0x01;
         verified_blob("learned_md", Some(key), Some(corrupt)).expect_err("corrupted frame");
+    }
+
+    /// A cursor survives its own encoding, with and without a snapshot part,
+    /// at a negative depth, at microsecond precision; anything else is
+    /// refused rather than read as some other position.
+    #[test]
+    fn a_cursor_round_trips_and_a_malformed_one_is_refused() {
+        let at = DateTime::from_timestamp_micros(1_790_000_000_123_456).expect("instant");
+        for c in [
+            PromptHistoryCursor {
+                depth: -64,
+                agent_id: Uuid::new_v4(),
+                snapshot: Some((at, Uuid::new_v4())),
+            },
+            PromptHistoryCursor {
+                depth: 3,
+                agent_id: Uuid::new_v4(),
+                snapshot: None,
+            },
+        ] {
+            assert_eq!(PromptHistoryCursor::decode(&c.encode()), Some(c));
+        }
+        let good = PromptHistoryCursor {
+            depth: 1,
+            agent_id: Uuid::nil(),
+            snapshot: Some((at, Uuid::nil())),
+        }
+        .encode();
+        assert!(PromptHistoryCursor::decode(&good).is_some(), "CALIBRATION");
+        for bad in [
+            "",
+            "1",
+            "x_00000000000000000000000000000000",
+            "1_not-a-uuid",
+            &format!("{good}_extra"),
+            "1_00000000000000000000000000000000_123",
+            "1_00000000000000000000000000000000_nan_00000000000000000000000000000000",
+            "-2147483648_00000000000000000000000000000000",
+            "65_00000000000000000000000000000000",
+            "1_00000000000000000000000000000000_-220000000000000000_00000000000000000000000000000000",
+        ] {
+            assert_eq!(PromptHistoryCursor::decode(bad), None, "{bad:?}");
+        }
     }
 }

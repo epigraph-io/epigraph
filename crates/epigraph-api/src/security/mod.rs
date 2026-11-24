@@ -22,5 +22,5 @@ pub use keys::{
     KeyStatus, KeyType, Signature,
 };
 pub use rate_limit::{
-    AgentRateLimiter, RateLimitConfig, RateLimitError, RateLimitSettings, TrustedProxies,
+    AgentRateLimiter, Quota, RateLimitConfig, RateLimitError, RateLimitSettings, TrustedProxies,
 };

@@ -189,6 +189,14 @@ async fn hnsw_scans(conn: &mut sqlx::PgConnection) -> i64 {
     .expect("pg_stat_get_xact_numscans")
 }
 
+/// Sequential scans of `claims` this transaction has made.
+async fn claims_seq_scans(conn: &mut sqlx::PgConnection) -> i64 {
+    sqlx::query_scalar("SELECT pg_stat_get_xact_numscans('claims'::regclass)::bigint")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("pg_stat_get_xact_numscans(claims)")
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn flat_search_on_the_index_fills_a_limit_beyond_ef_search(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -235,6 +243,7 @@ async fn flat_search_on_the_index_fills_a_limit_beyond_ef_search(pool: PgPool) {
     // call's own `begin()` when it knows the connection is in a transaction.
     use sqlx::Connection;
     let mut outer = conn.begin().await.expect("BEGIN");
+    let seq_before = claims_seq_scans(&mut outer).await;
     let in_tx = ClaimRepository::semantic_search_flat(
         &mut *outer,
         &viewer,
@@ -251,6 +260,17 @@ async fn flat_search_on_the_index_fills_a_limit_beyond_ef_search(pool: PgPool) {
     .await
     .expect("semantic_search_flat inside the caller's transaction");
     assert_eq!(in_tx.len(), limit, "the savepoint path must fill LIMIT too");
+    // The ITERATIVE scan must fill the page by itself. A short first pass is
+    // retried as an exact scan (backlog 28b79b1e), which re-enables sequential
+    // scans for its one statement, so a full page alone no longer proves the
+    // iterative settings work; an exact retry here would show up as a
+    // sequential scan of `claims` (this connection forbids one otherwise).
+    let seq_after = claims_seq_scans(&mut outer).await;
+    assert_eq!(
+        seq_after, seq_before,
+        "the iterative HNSW pass came back short and the exact retry filled the page: the \
+         first pass no longer widens the scan past ef_search"
+    );
     let ef: String = sqlx::query_scalar("SHOW hnsw.ef_search")
         .fetch_one(&mut *outer)
         .await

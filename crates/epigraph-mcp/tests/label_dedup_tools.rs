@@ -782,18 +782,350 @@ async fn http_refuses_profile_path_and_reads_inline_json(pool: PgPool) {
     assert_eq!(code(&err), "PROFILE_HASH_MISMATCH", "{err:?}");
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_profile_claim_id_is_refused_as_deferred(pool: PgPool) {
-    let bytes = profile_bytes();
-    let server = superuser_server(&pool, config(None, None, 5000)).await;
-    let (_caller, auth, viewer) = seed_caller(&pool, &["claims:read"]).await;
-    let mut p = plan_params_json(&bytes, DEDUP);
-    plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
-    p.profile_claim_id = Some(Uuid::new_v4().to_string());
-    let err = plan_label_dedup(&server, &viewer, p, Some(&auth))
+/// [`plan_params_json`]'s call, reading the profile from the stored claim `id`.
+fn plan_params_claim(id: &str, hash: &str, sections: &[&str]) -> PlanLabelDedupParams {
+    PlanLabelDedupParams {
+        profile_path: None,
+        profile_json: None,
+        profile_claim_id: Some(id.to_string()),
+        profile_hash: hash.to_string(),
+        run_tag: RUN_TAG.to_string(),
+        as_of: Some(AS_OF.to_string()),
+        sections: s(sections),
+        max_claims: None,
+    }
+}
+
+/// Store `bytes` as a claim through `submit_claim` itself (the server's own
+/// identity, public), so the stored content is exactly what the real write
+/// path keeps. Returns the claim id.
+async fn store_profile_claim(server: &EpiGraphMcpFull, pool: &PgPool, bytes: &[u8]) -> String {
+    let viewer = fixture::public_viewer(pool).await;
+    let out = first_text(
+        &epigraph_mcp::tools::claims::submit_claim(
+            server,
+            &viewer,
+            epigraph_mcp::types::SubmitClaimParams {
+                content: String::from_utf8(bytes.to_vec()).expect("utf8"),
+                methodology: "direct_observation".into(),
+                evidence_data: "label-dedup profile fixture".into(),
+                evidence_type: "logical".into(),
+                confidence: 0.8,
+                source_url: None,
+                reasoning: None,
+                labels: s(&["label-dedup-profile"]),
+                // As the docs advise: never answered with a near-identical
+                // existing claim in place of these bytes.
+                novelty_threshold: Some(0.0),
+                visibility: Some("public".to_string()),
+                group_id: None,
+                dataset: None,
+            },
+            None,
+        )
         .await
-        .expect_err("deferred");
-    assert_eq!(code(&err), "PROFILE_CLAIM_DEFERRED", "{err:?}");
+        .expect("store the profile claim"),
+    );
+    out["claim_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no claim_id: {out}"))
+        .to_string()
+}
+
+/// Over HTTP, `profile_claim_id` loads the profile stored in a claim the
+/// caller can read, stored through `submit_claim` (backlog 2f1671b1): the
+/// same bytes give the same profile hash and the same plan hash as inline
+/// `profile_json`, and the plan records the claim it came from. The claim's
+/// bytes are pinned by `profile_hash` like every other source; a malformed
+/// id, two sources, a missing claim and another group's private claim are
+/// each refused with their own code, and missing and unreadable read alike.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_reads_a_profile_stored_as_a_claim_pinned_by_its_hash(pool: PgPool) {
+    let bytes = profile_bytes();
+    let hash = profile_hash(&bytes);
+    let server = superuser_server(&pool, config(None, None, 5000)).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let caller_group = personal_group_of(&pool, caller).await;
+    let stored = store_profile_claim(&server, &pool, &bytes).await;
+    for (content, created) in [
+        (PUMP_A, "2026-10-01T00:00:00Z"),
+        (PUMP_C, "2026-09-01T00:00:00Z"),
+    ] {
+        seed(
+            &pool,
+            caller,
+            caller_group,
+            "public",
+            content,
+            &[FAMILY],
+            created,
+        )
+        .await;
+    }
+
+    let inline = plan_ok(
+        &server,
+        &viewer,
+        plan_params_json(&bytes, DEDUP),
+        Some(&auth),
+    )
+    .await;
+    let p = plan_params_claim(&stored, &hash, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    assert_eq!(plan["profile_hash"], hash, "{plan}");
+    assert_eq!(
+        plan["plan_hash"], inline["plan_hash"],
+        "the stored bytes plan exactly as the same bytes inline: {plan}"
+    );
+    assert_eq!(
+        plan["profile_source"],
+        json!({"kind": "claim", "claim_id": stored}),
+        "{plan}"
+    );
+    assert_eq!(
+        inline["profile_source"],
+        json!({"kind": "inline"}),
+        "{inline}"
+    );
+    assert_eq!(plan["clusters"].as_array().map(Vec::len), Some(1), "{plan}");
+
+    // Apply re-reads the claim and writes, recording the same source.
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(out["status"], "applied", "{out}");
+    assert_eq!(out["counts"]["marks"], 1, "{out}");
+    assert_eq!(out["profile_source"], plan["profile_source"], "{out}");
+
+    // Probe takes the same source.
+    let probe = first_text(
+        &probe_label_dedup(
+            &server,
+            &viewer,
+            ProbeLabelDedupParams {
+                profile_path: None,
+                profile_json: None,
+                profile_claim_id: Some(stored.clone()),
+                profile_hash: hash.clone(),
+                candidates: vec![LabelDedupCandidateParam {
+                    key: "same".into(),
+                    content: PUMP_B.into(),
+                    labels: s(&[FAMILY]),
+                }],
+                include_closed_signals: false,
+                max_claims: None,
+            },
+            Some(&auth),
+        )
+        .await
+        .expect("probe from a stored profile"),
+    );
+    assert_eq!(probe["verdicts"][0]["verdict"], "match", "{probe}");
+
+    // The stored bytes are checked against profile_hash.
+    let err = plan_label_dedup(
+        &server,
+        &viewer,
+        plan_params_claim(&stored, &profile_hash(&profile_bytes_respaced()), DEDUP),
+        Some(&auth),
+    )
+    .await
+    .expect_err("a stored profile that does not hash to profile_hash");
+    assert_eq!(code(&err), "PROFILE_HASH_MISMATCH", "{err:?}");
+
+    // Exactly one source.
+    let mut both = plan_params_json(&bytes, DEDUP);
+    both.profile_claim_id = Some(stored.clone());
+    let err = plan_label_dedup(&server, &viewer, both, Some(&auth))
+        .await
+        .expect_err("two sources");
+    assert_eq!(code(&err), "PROFILE_SOURCE_REQUIRED", "{err:?}");
+
+    let err = plan_label_dedup(
+        &server,
+        &viewer,
+        plan_params_claim("not-a-uuid", &hash, DEDUP),
+        Some(&auth),
+    )
+    .await
+    .expect_err("a malformed claim id");
+    assert_eq!(code(&err), "INVALID_ARGUMENT", "{err:?}");
+
+    // The caller's OWN group-private claim with the same bytes loads: it is
+    // read with the caller's viewer, not a public-only one and not the
+    // server's own identity (neither can see the caller's personal group).
+    let own_private = seed(
+        &pool,
+        caller,
+        caller_group,
+        "group",
+        std::str::from_utf8(&bytes).expect("utf8"),
+        &["label-dedup-profile"],
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    let own = plan_ok(
+        &server,
+        &viewer,
+        plan_params_claim(&own_private.to_string(), &hash, DEDUP),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(own["profile_hash"], hash, "{own}");
+    assert_eq!(
+        own["profile_source"],
+        json!({"kind": "claim", "claim_id": own_private.to_string()}),
+        "the caller's own private profile claim, read as the caller: {own}"
+    );
+
+    // Missing, and another group's private claim with the very same bytes:
+    // one answer, indistinguishable but for the id.
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "profile-owner").await;
+    let private = seed(
+        &pool,
+        stranger,
+        stranger_group,
+        "group",
+        std::str::from_utf8(&bytes).expect("utf8"),
+        &["label-dedup-profile"],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let missing = Uuid::new_v4();
+    let not_found = |id: Uuid| {
+        let (server, viewer, auth, hash) = (&server, &viewer, &auth, &hash);
+        async move {
+            plan_label_dedup(
+                server,
+                viewer,
+                plan_params_claim(&id.to_string(), hash, DEDUP),
+                Some(auth),
+            )
+            .await
+            .expect_err("no readable profile claim")
+        }
+    };
+    let (gone, hidden) = (not_found(missing).await, not_found(private).await);
+    assert_eq!(code(&gone), "PROFILE_NOT_FOUND", "{gone:?}");
+    assert_eq!(code(&hidden), "PROFILE_NOT_FOUND", "{hidden:?}");
+    assert_eq!(
+        gone.message.replace(&missing.to_string(), "X"),
+        hidden.message.replace(&private.to_string(), "X"),
+        "an unreadable profile claim is indistinguishable from a missing one"
+    );
+}
+
+/// On stdio the agent talking to the process must not choose its own
+/// profile, which is why inline JSON is refused there; a claim is something
+/// that agent can write. So `profile_claim_id` is read on stdio only when the
+/// process was started with a pin, and the pin is checked BEFORE the claim is
+/// read (backlog 2f1671b1). On an application-role server, the server agent's
+/// own GROUP-PRIVATE profile claim loads (only a stamped read sees it) and
+/// applies; a stranger's private claim with the same bytes is not found.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stdio_reads_a_stored_profile_only_under_a_pin_and_as_its_own_viewer(pool: PgPool) {
+    let bytes = profile_bytes();
+    let hash = profile_hash(&bytes);
+    let (pinned, agent, group, viewer) =
+        app_role_server(&pool, config(None, Some(hash.as_str()), 5000)).await;
+    let (unpinned, _, _, _) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (other_pin, _, _, _) = app_role_server(
+        &pool,
+        config(
+            None,
+            Some(profile_hash(&profile_bytes_respaced()).as_str()),
+            5000,
+        ),
+    )
+    .await;
+    let text = std::str::from_utf8(&bytes).expect("utf8");
+    let mine = seed(
+        &pool,
+        agent,
+        group,
+        "group",
+        text,
+        &["label-dedup-profile"],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "profile-owner").await;
+    let theirs = seed(
+        &pool,
+        stranger,
+        stranger_group,
+        "group",
+        text,
+        &["label-dedup-profile"],
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    let survivor = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let loser = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+
+    // No pin: refused, though the claim exists, is readable and matches.
+    let p = plan_params_claim(&mine.to_string(), &hash, DEDUP);
+    let err = plan_label_dedup(&unpinned, &viewer, p.clone(), None)
+        .await
+        .expect_err("stdio without a pin");
+    assert_eq!(code(&err), "PROFILE_CLAIM_REFUSED", "{err:?}");
+
+    // A pin that is not profile_hash: refused before any read, so even a
+    // claim id that names nothing answers HASH_MISMATCH, not NOT_FOUND.
+    let err = plan_label_dedup(
+        &other_pin,
+        &viewer,
+        plan_params_claim(&Uuid::new_v4().to_string(), &hash, DEDUP),
+        None,
+    )
+    .await
+    .expect_err("profile_hash is not the pin");
+    assert_eq!(code(&err), "PROFILE_HASH_MISMATCH", "{err:?}");
+
+    // Pinned: the server agent's own private profile claim loads and applies.
+    let plan = plan_ok(&pinned, &viewer, p.clone(), None).await;
+    assert_eq!(plan["profile_hash"], hash, "{plan}");
+    assert_eq!(
+        plan["profile_source"],
+        json!({"kind": "claim", "claim_id": mine.to_string()}),
+        "{plan}"
+    );
+    let out = apply_ok(&pinned, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    assert_eq!(out["status"], "applied", "{out}");
+    assert!(is_marked_onto(&pool, loser, survivor).await, "{out}");
+
+    // A stranger's private claim with the same bytes is not found.
+    let err = plan_label_dedup(
+        &pinned,
+        &viewer,
+        plan_params_claim(&theirs.to_string(), &hash, DEDUP),
+        None,
+    )
+    .await
+    .expect_err("a stranger's private profile claim");
+    assert_eq!(code(&err), "PROFILE_NOT_FOUND", "{err:?}");
 }
 
 // ── Visibility ──────────────────────────────────────────────────────────────
@@ -1395,23 +1727,79 @@ async fn an_applied_marks_identity_edge_is_signed_by_the_server_not_the_caller(p
     );
 }
 
-/// On an application-role server over stdio, every write target takes the
-/// ownership check a cluster member takes (A4), not only the retirement gate:
+/// The transport an ownership arm runs over (backlog d4890b22: the arms below
+/// ran on stdio only).
+#[derive(Debug, Clone, Copy)]
+enum Transport {
+    /// An application-role server, the server agent as the write identity,
+    /// the profile from `profile_path`.
+    Stdio,
+    /// The superuser-backed server, a `claims:write` caller as the write
+    /// identity, the profile as inline `profile_json`.
+    Http,
+}
+
+/// The identity an arm plans and applies as, on `t`.
+struct Caller {
+    server: EpiGraphMcpFull,
+    agent: Uuid,
+    group: Uuid,
+    viewer: Viewer,
+    auth: Option<epigraph_auth::AuthContext>,
+}
+
+async fn caller_on(pool: &PgPool, t: Transport, bytes: &[u8], families: &[&str]) -> Caller {
+    match t {
+        Transport::Stdio => {
+            let root = profile_root(bytes);
+            let (server, agent, group, viewer) =
+                app_role_server(pool, config_allowing(Some(&root), None, 5000, families)).await;
+            Caller {
+                server,
+                agent,
+                group,
+                viewer,
+                auth: None,
+            }
+        }
+        Transport::Http => {
+            let server = superuser_server(pool, config_allowing(None, None, 5000, families)).await;
+            let (agent, auth, viewer) = seed_caller(pool, &["claims:write"]).await;
+            let group = personal_group_of(pool, agent).await;
+            Caller {
+                server,
+                agent,
+                group,
+                viewer,
+                auth: Some(auth),
+            }
+        }
+    }
+}
+
+/// The plan arguments for `bytes` on `t`.
+fn params_on(t: Transport, bytes: &[u8], sections: &[&str]) -> PlanLabelDedupParams {
+    match t {
+        Transport::Stdio => plan_params_path("profile.json", &profile_hash(bytes), sections),
+        Transport::Http => plan_params_json(bytes, sections),
+    }
+}
+
+/// Every write target takes the ownership check a cluster member takes (A4),
+/// not only the retirement gate:
 ///
 /// * a stranger's past-due claim in the stranger's own group (its close-out
 ///   would add `resolved`);
-/// * a stranger's retired claim filed in the server agent's OWN group, so row
+/// * a stranger's retired claim filed in the caller's OWN group, so row
 ///   security admits the write and no label of it is gated: only the
 ///   ownership check can refuse its hygiene write.
 ///
 /// Each fails alone with `TARGET_NOT_OWNED` and stays byte-identical, and the
-/// agent's own close-out and hygiene in the same apply commit.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) {
+/// caller's own close-out and hygiene in the same apply commit.
+async fn a_target_the_caller_does_not_own_fails_alone(pool: PgPool, t: Transport) {
     let bytes = profile_bytes();
-    let root = profile_root(&bytes);
-    let (server, agent, group, viewer) =
-        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let c = caller_on(&pool, t, &bytes, &[FAMILY]).await;
+    let (agent, group) = (c.agent, c.group);
     let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-closeout").await;
     let mine = seed(
         &pool,
@@ -1456,8 +1844,8 @@ async fn a_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) 
     let foreign = [theirs, their_retired];
     let foreign_before = snapshot(&pool, &foreign).await;
 
-    let p = plan_params_path("profile.json", &profile_hash(&bytes), ALL);
-    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let p = params_on(t, &bytes, ALL);
+    let plan = plan_ok(&c.server, &c.viewer, p.clone(), c.auth.as_ref()).await;
     assert_eq!(plan["past_due"].as_array().map(Vec::len), Some(2), "{plan}");
     for id in foreign {
         let unit = unit_writes(&plan)
@@ -1468,22 +1856,28 @@ async fn a_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) 
         assert_eq!(
             unit_check(&plan, &name)["applies"],
             false,
-            "predicted: {plan}"
+            "predicted ({t:?}): {plan}"
         );
     }
-    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    let out = apply_ok(
+        &c.server,
+        &c.viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        c.auth.as_ref(),
+    )
+    .await;
     for unit in [
         format!("closeout:{theirs}"),
         format!("hygiene:{their_retired}"),
     ] {
         let failed = result_for(&out, &unit);
-        assert_eq!(failed["ok"], false, "{out}");
-        assert_eq!(failed["code"], "TARGET_NOT_OWNED", "{out}");
+        assert_eq!(failed["ok"], false, "{t:?}: {out}");
+        assert_eq!(failed["code"], "TARGET_NOT_OWNED", "{t:?}: {out}");
         assert!(!in_review(&out, &unit), "{out}");
     }
     assert_eq!(snapshot(&pool, &foreign).await, foreign_before);
     for unit in [format!("closeout:{mine}"), format!("hygiene:{my_retired}")] {
-        assert_eq!(result_for(&out, &unit)["ok"], true, "{out}");
+        assert_eq!(result_for(&out, &unit)["ok"], true, "{t:?}: {out}");
     }
     assert!(labels_of(&pool, mine)
         .await
@@ -1493,14 +1887,24 @@ async fn a_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) 
         .contains(&FAMILY.to_string()));
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) {
+    a_target_the_caller_does_not_own_fails_alone(pool, Transport::Stdio).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_target_the_caller_does_not_own_fails_only_its_own_unit_over_http(pool: PgPool) {
+    a_target_the_caller_does_not_own_fails_alone(pool, Transport::Http).await;
+}
+
+const SIGNAL: &str = "tracked-signal";
+
 /// A lifecycle unit (an aged-out signal) whose target the caller does not own
 /// takes the same `other_targets` ownership check as a hygiene or close-out
-/// target: on an application-role server over stdio, the stranger's aged-out
-/// signal fails alone with `TARGET_NOT_OWNED` and stays byte-identical, and the
-/// agent's own aged-out signal in the same apply commits (backlog effa09d9).
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_lifecycle_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) {
-    const SIGNAL: &str = "tracked-signal";
+/// target: the stranger's aged-out signal fails alone with `TARGET_NOT_OWNED`
+/// and stays byte-identical, and the caller's own aged-out signal in the same
+/// apply commits (backlog effa09d9).
+async fn a_lifecycle_target_not_owned_fails_alone(pool: PgPool, t: Transport) {
     let mut profile = profile_value();
     profile["lifecycle"] = json!({
         "signal_family_label": SIGNAL,
@@ -1513,19 +1917,14 @@ async fn a_lifecycle_target_the_caller_does_not_own_fails_only_its_own_unit(pool
         "age_out_add": ["resolved", "{run_tag}"]
     });
     let bytes = serde_json::to_vec(&profile).expect("json");
-    let root = profile_root(&bytes);
-    let (server, agent, group, viewer) = app_role_server(
-        &pool,
-        config_allowing(Some(&root), None, 5000, &[FAMILY, SIGNAL]),
-    )
-    .await;
+    let c = caller_on(&pool, t, &bytes, &[FAMILY, SIGNAL]).await;
     let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "signal-other").await;
     // Two signals well past max_age_days on AS_OF, with no strong id any
     // member carries: both age out (neither graduates).
     let mine = seed(
         &pool,
-        agent,
-        group,
+        c.agent,
+        c.group,
         "public",
         "Culvert inspection lead | Acme Roads Office | ref ACME-310001",
         &[SIGNAL],
@@ -1544,8 +1943,8 @@ async fn a_lifecycle_target_the_caller_does_not_own_fails_only_its_own_unit(pool
     .await;
     let foreign_before = snapshot(&pool, &[theirs]).await;
 
-    let p = plan_params_path("profile.json", &profile_hash(&bytes), &["lifecycle"]);
-    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let p = params_on(t, &bytes, &["lifecycle"]);
+    let plan = plan_ok(&c.server, &c.viewer, p.clone(), c.auth.as_ref()).await;
     let (my_unit, their_unit) = (format!("lifecycle:{mine}"), format!("lifecycle:{theirs}"));
     for unit in [&my_unit, &their_unit] {
         assert!(
@@ -1558,20 +1957,187 @@ async fn a_lifecycle_target_the_caller_does_not_own_fails_only_its_own_unit(pool
     assert_eq!(
         unit_check(&plan, &their_unit)["applies"],
         false,
-        "predicted: {plan}"
+        "predicted ({t:?}): {plan}"
     );
 
-    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    let out = apply_ok(
+        &c.server,
+        &c.viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        c.auth.as_ref(),
+    )
+    .await;
     let failed = result_for(&out, &their_unit);
-    assert_eq!(failed["ok"], false, "{out}");
-    assert_eq!(failed["code"], "TARGET_NOT_OWNED", "{out}");
+    assert_eq!(failed["ok"], false, "{t:?}: {out}");
+    assert_eq!(failed["code"], "TARGET_NOT_OWNED", "{t:?}: {out}");
     assert_eq!(snapshot(&pool, &[theirs]).await, foreign_before);
-    assert_eq!(result_for(&out, &my_unit)["ok"], true, "{out}");
+    assert_eq!(result_for(&out, &my_unit)["ok"], true, "{t:?}: {out}");
     let mine_after = labels_of(&pool, mine).await;
     assert!(
         mine_after.contains(&"resolved".to_string()) && mine_after.contains(&RUN_TAG.to_string()),
         "the caller's own aged-out signal got age_out_add: {mine_after:?}"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lifecycle_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) {
+    a_lifecycle_target_not_owned_fails_alone(pool, Transport::Stdio).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lifecycle_target_the_caller_does_not_own_fails_only_its_own_unit_over_http(
+    pool: PgPool,
+) {
+    a_lifecycle_target_not_owned_fails_alone(pool, Transport::Http).await;
+}
+
+/// The lifecycle GRADUATE branch (backlog d4890b22: every lifecycle arm
+/// above ages its signals out). A signal carrying the strong id of a live
+/// family member graduates into it: the plan names the member as its target,
+/// apply writes `graduate_add` (with `{target}` bound to the member) onto the
+/// SIGNAL only, and never touches the target. A graduated signal is a write
+/// target like any other: the stranger's signal, graduating into the
+/// caller's own member, fails alone with `TARGET_NOT_OWNED` and stays
+/// byte-identical, while the caller's own graduation in the same apply
+/// commits. No `max_age_days`, so neither signal could age out instead.
+async fn a_graduated_signal_is_written_only_when_owned(pool: PgPool, t: Transport) {
+    let mut profile = profile_value();
+    profile["lifecycle"] = json!({
+        "signal_family_label": SIGNAL,
+        "signal_family_kind": "index",
+        "signal_exclude_labels": ["resolved"],
+        "target_exclude_labels": [],
+        "graduate_add": ["resolved", "graduated-into:{target}"],
+        "age_out_add": ["resolved", "aged-out"]
+    });
+    let bytes = serde_json::to_vec(&profile).expect("json");
+    let c = caller_on(&pool, t, &bytes, &[FAMILY, SIGNAL]).await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "signal-grad").await;
+    // Two live members of the caller's, each carrying a strong id.
+    let fence = seed(
+        &pool,
+        c.agent,
+        c.group,
+        "public",
+        FENCE,
+        &[FAMILY],
+        "2026-07-01T00:00:00Z",
+    )
+    .await;
+    let gate = seed(
+        &pool,
+        c.agent,
+        c.group,
+        "public",
+        GATE,
+        &[FAMILY],
+        "2026-07-02T00:00:00Z",
+    )
+    .await;
+    // The caller's signal names FENCE's id; the stranger's names GATE's.
+    let mine = seed(
+        &pool,
+        c.agent,
+        c.group,
+        "public",
+        "Fence replacement lead | Acme Parks Office | ref ACME-555001",
+        &[SIGNAL],
+        "2026-10-10T00:00:00Z",
+    )
+    .await;
+    let theirs = seed(
+        &pool,
+        stranger,
+        stranger_group,
+        "public",
+        "Gate motor lead | Acme Parks Office | ref ACME-555002",
+        &[SIGNAL],
+        "2026-10-11T00:00:00Z",
+    )
+    .await;
+    let untouched = [theirs, fence, gate];
+    let before = snapshot(&pool, &untouched).await;
+
+    let p = params_on(t, &bytes, &["lifecycle"]);
+    let plan = plan_ok(&c.server, &c.viewer, p.clone(), c.auth.as_ref()).await;
+    let action = |id: Uuid| -> Value {
+        plan["lifecycle"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["id"] == id.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("no lifecycle action for {id}: {plan}"))
+    };
+    for (signal, target) in [(mine, fence), (theirs, gate)] {
+        let a = action(signal);
+        assert_eq!(
+            (&a["kind"], &a["target"]),
+            (&json!("graduated"), &json!(target.to_string())),
+            "{signal} graduates into {target}: {plan}"
+        );
+        assert_eq!(
+            a["add"],
+            json!(["resolved", format!("graduated-into:{target}")]),
+            "{plan}"
+        );
+    }
+    let (my_unit, their_unit) = (format!("lifecycle:{mine}"), format!("lifecycle:{theirs}"));
+    for (unit, signal) in [(&my_unit, mine), (&their_unit, theirs)] {
+        let written: Vec<Value> = unit_writes(&plan)
+            .into_iter()
+            .find(|u| u["unit"] == unit.as_str())
+            .and_then(|u| u["writes"].as_array().cloned())
+            .unwrap_or_else(|| panic!("no write unit {unit}: {plan}"))
+            .iter()
+            .map(|w| w["claim_id"].clone())
+            .collect();
+        assert_eq!(
+            written,
+            vec![json!(signal.to_string())],
+            "a graduation writes its signal only, never its target: {plan}"
+        );
+    }
+    assert_eq!(
+        unit_check(&plan, &their_unit)["applies"],
+        false,
+        "predicted ({t:?}): {plan}"
+    );
+    assert_eq!(
+        unit_check(&plan, &my_unit)["applies"],
+        true,
+        "predicted ({t:?}): {plan}"
+    );
+
+    let out = apply_ok(
+        &c.server,
+        &c.viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        c.auth.as_ref(),
+    )
+    .await;
+    let failed = result_for(&out, &their_unit);
+    assert_eq!(failed["ok"], false, "{t:?}: {out}");
+    assert_eq!(failed["code"], "TARGET_NOT_OWNED", "{t:?}: {out}");
+    assert_eq!(result_for(&out, &my_unit)["ok"], true, "{t:?}: {out}");
+    assert_eq!(
+        snapshot(&pool, &untouched).await,
+        before,
+        "the stranger's signal and both targets are byte-identical"
+    );
+    assert_eq!(
+        sorted(labels_of(&pool, mine).await),
+        sorted(s(&[SIGNAL, "resolved", &format!("graduated-into:{fence}")])),
+        "the caller's signal got graduate_add, bound to its target"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_graduated_signal_is_written_only_when_owned_on_stdio(pool: PgPool) {
+    a_graduated_signal_is_written_only_when_owned(pool, Transport::Stdio).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_graduated_signal_is_written_only_when_owned_over_http(pool: PgPool) {
+    a_graduated_signal_is_written_only_when_owned(pool, Transport::Http).await;
 }
 
 /// `plan_label_dedup` is a read. For an identity that cannot open a write
@@ -4978,4 +5544,170 @@ async fn every_family_a_profile_names_must_be_an_allowlisted_index(pool: PgPool)
     )
     .await
     .expect("both families allowlisted");
+}
+
+/// Whether `message` is the named refusal a label write onto a claim in a
+/// group the write identity cannot write answers (backlog 3e7bfee3,
+/// `tools::claims::label_not_writer`), for `claim`: it names the claim, says
+/// nothing was written, names the audited admin path, and is not the raw
+/// row-security error.
+fn is_named_not_writer(message: &str, claim: Uuid) -> bool {
+    message.contains(&claim.to_string())
+        && message.contains("nothing was written")
+        && message.contains("claims:admin")
+        && !message.contains("row-level security")
+}
+
+/// `apply_label_dedup`'s label writes go through `update_labels`' per-claim
+/// path (backlog 8672f843): a hygiene unit whose target the server agent
+/// AUTHORED (so the ownership checks admit it) but which is owned by a group
+/// the agent's stamp cannot write is refused by the database, and the unit
+/// fails with the named not-writer refusal, not an internal error, with
+/// nothing written. The plan predicted it (`applies: false`). Calibration: the
+/// agent's own-group hygiene unit in the same apply commits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_apply_label_write_the_claims_group_refuses_is_the_named_refusal(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let (_stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-group").await;
+    let in_foreign_group = seed(
+        &pool,
+        agent,
+        stranger_group,
+        "public",
+        ROOF,
+        &[FAMILY, "tracked-item-duplicate"],
+        "2026-09-05T00:00:00Z",
+    )
+    .await;
+    let in_own_group = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        GATE,
+        &[FAMILY, "tracked-item-duplicate"],
+        "2026-09-06T00:00:00Z",
+    )
+    .await;
+    let before = snapshot(&pool, &[in_foreign_group]).await;
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let foreign_unit = format!("hygiene:{in_foreign_group}");
+    let own_unit = format!("hygiene:{in_own_group}");
+    assert_eq!(
+        unit_check(&plan, &foreign_unit)["applies"],
+        false,
+        "predicted: {plan}"
+    );
+    assert_eq!(unit_check(&plan, &own_unit)["applies"], true, "{plan}");
+
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    let failed = result_for(&out, &foreign_unit);
+    assert_eq!(failed["ok"], false, "{out}");
+    let message = failed["error"].as_str().unwrap_or_default();
+    assert!(
+        is_named_not_writer(message, in_foreign_group),
+        "the unit's refusal is the named not-writer refusal, not an internal error: {out}"
+    );
+    assert_eq!(
+        snapshot(&pool, &[in_foreign_group]).await,
+        before,
+        "nothing written"
+    );
+
+    assert_eq!(
+        result_for(&out, &own_unit)["ok"],
+        true,
+        "calibration: {out}"
+    );
+    assert!(
+        !labels_of(&pool, in_own_group)
+            .await
+            .contains(&FAMILY.to_string()),
+        "calibration: the own-group hygiene write landed"
+    );
+}
+
+/// `revert_label_dedup`'s label writes take the same per-claim path (backlog
+/// 8672f843): reverting a recorded change on a claim the server agent authored
+/// but whose owning group its stamp cannot write fails that step with the
+/// named not-writer refusal, with nothing written, and the revert reports
+/// `partial`. The claim CARRIES the label the revert removes, so the step is a
+/// real write the database decides, not a no-op. Calibration: the same revert
+/// of the agent's own-group claim succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_label_write_the_claims_group_refuses_is_the_named_refusal(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (_stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-group").await;
+    let in_foreign_group = seed(
+        &pool,
+        agent,
+        stranger_group,
+        "public",
+        ROOF,
+        &[RUN_TAG],
+        "2026-09-05T00:00:00Z",
+    )
+    .await;
+    let in_own_group = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        GATE,
+        &[RUN_TAG],
+        "2026-09-06T00:00:00Z",
+    )
+    .await;
+    let before = snapshot(&pool, &[in_foreign_group]).await;
+    let recorded = |id: Uuid| {
+        json!({
+            "unit": format!("hygiene:{id}"), "claim_id": id,
+            "labels_added": [RUN_TAG], "labels_removed": [FAMILY],
+        })
+    };
+    let params: RevertLabelDedupParams = serde_json::from_value(json!({
+        "applied_units": [recorded(in_own_group), recorded(in_foreign_group)],
+        "applied_marks": [],
+    }))
+    .expect("revert params");
+
+    let out = first_text(
+        &revert_label_dedup(&server, &viewer, params, None)
+            .await
+            .expect("revert"),
+    );
+    assert_eq!(out["status"], "partial", "{out}");
+    let step = |id: Uuid| {
+        out["steps"]
+            .as_array()
+            .and_then(|s| s.iter().find(|s| s["claim_id"] == id.to_string()))
+            .unwrap_or_else(|| panic!("no step for {id}: {out}"))
+            .clone()
+    };
+    let refused = step(in_foreign_group);
+    assert_eq!(refused["ok"], false, "{out}");
+    assert!(
+        is_named_not_writer(
+            refused["error"].as_str().unwrap_or_default(),
+            in_foreign_group
+        ),
+        "the step's refusal is the named not-writer refusal, not an internal error: {out}"
+    );
+    assert_eq!(
+        snapshot(&pool, &[in_foreign_group]).await,
+        before,
+        "nothing written"
+    );
+
+    assert_eq!(step(in_own_group)["ok"], true, "calibration: {out}");
+    assert_eq!(
+        sorted(labels_of(&pool, in_own_group).await),
+        sorted(s(&[FAMILY])),
+        "calibration: the own-group revert landed"
+    );
 }

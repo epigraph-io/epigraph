@@ -78,7 +78,7 @@
 //! of force, runs `EdgeRepository::withdraw_edge_bbas_conn` in the same
 //! transaction: a `cause = 'edge_retract'` deferral (whose re-derivation set
 //! the database derives from the caller's own rows) hands every other writer's
-//! `perspective_id = edge_id` BBAs to the maintenance replay, which removes
+//! edge-slot BBAs (`slot_kind = 'edge'`) to the maintenance replay, which removes
 //! them and re-derives the affected beliefs (D1: the cross-owner half is
 //! administrative), and then the caller's OWN are deleted
 //! (`bba_cleanup.deleted`). Before

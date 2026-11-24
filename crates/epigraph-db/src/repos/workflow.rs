@@ -89,6 +89,38 @@ pub struct HierarchicalWorkflowRow {
     pub truth_value: f64,
 }
 
+/// One lineage of [`WorkflowRepository::list_hierarchical_lineage_heads`]:
+/// its head row (highest generation the connection reads) and how many
+/// generations of it the connection reads.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HierarchicalLineageHeadRow {
+    pub id: Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub truth_value: f64,
+    /// Generations of this `canonical_name` the connection reads.
+    pub generations: i64,
+    /// The highest generation the connection reads whose truth is at least
+    /// the live threshold (the head itself when the head is live); `None`
+    /// when every generation it reads is below the threshold.
+    pub live_id: Option<Uuid>,
+    /// [`Self::live_id`]'s generation.
+    pub live_generation: Option<i32>,
+}
+
+/// One row of [`WorkflowRepository::list_flat_page`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FlatWorkflowPageRow {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub labels: Vec<String>,
+    pub is_current: bool,
+}
+
 /// Per-step resolution result for `find_workflow_hierarchical(resolve_to_latest=true)`.
 ///
 /// `frozen_claim_id` is the original step claim attached to the workflow via
@@ -152,6 +184,15 @@ const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') 
 /// `workflows.metadata` (`use_count`, `success_count`, `failure_count`,
 /// `avg_variance`), as [`WorkflowRepository::record_hierarchical_outcome`]
 /// leaves them.
+///
+/// The WRITE is computed in SQL by migration 237's
+/// `epigraph_workflow_record_outcome` (a reader may not UPDATE the row, so it
+/// moves the counters through that definer); [`Self::after_report`] and
+/// [`Self::write_into`] are the rule it follows, and
+/// `epigraph-db/tests/workflows_update_owner_scope.rs` pins the two equal on
+/// the stored shapes the rule treats specially (missing, non-integer,
+/// negative and saturated counters, a non-numeric or out-of-range mean).
+/// Change both together.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HierarchicalOutcomeCounters {
     pub use_count: i64,
@@ -163,26 +204,33 @@ pub struct HierarchicalOutcomeCounters {
 
 impl HierarchicalOutcomeCounters {
     /// The counters after one more report on a row whose metadata is
-    /// `metadata`: a missing or non-numeric counter counts as zero.
+    /// `metadata`. A counter that is missing, is not a JSON integer that fits
+    /// an i64, or is negative counts as zero, and a counter saturates at
+    /// `i64::MAX` instead of overflowing. A stored `avg_variance` that is not
+    /// a JSON number in `[0, 1]` (every running mean of variances in `[0, 1]`
+    /// is) counts as zero. So no stored shape makes a report fail, or makes
+    /// every later report on the row fail.
     #[must_use]
     pub fn after_report(metadata: &serde_json::Value, success: bool, variance: f64) -> Self {
         let int = |k: &str| {
             metadata
                 .get(k)
                 .and_then(serde_json::Value::as_i64)
+                .filter(|n| *n >= 0)
                 .unwrap_or(0)
         };
-        let use_count = int("use_count") + 1;
+        let use_count = int("use_count").saturating_add(1);
         let prev_avg_var = metadata
             .get("avg_variance")
             .and_then(serde_json::Value::as_f64)
+            .filter(|v| (0.0..=1.0).contains(v))
             .unwrap_or(0.0);
         #[allow(clippy::cast_precision_loss)]
         let avg_variance = (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64;
         Self {
             use_count,
-            success_count: int("success_count") + i64::from(success),
-            failure_count: int("failure_count") + i64::from(!success),
+            success_count: int("success_count").saturating_add(i64::from(success)),
+            failure_count: int("failure_count").saturating_add(i64::from(!success)),
             avg_variance,
         }
     }
@@ -291,6 +339,12 @@ pub struct NewHierarchicalOutcomeReport<'a> {
     pub outcome_details: &'a str,
     pub result: &'a HierarchicalOutcomeResult,
 }
+
+/// The advisory-lock namespace of a step lineage (backlog bf2e9aa6): the first
+/// key of `pg_advisory_xact_lock(hashtext(STEP_LINEAGE_LOCK),
+/// hashtext(lineage::text))`. See
+/// [`WorkflowRepository::lock_step_lineage_for_evolve`].
+pub const STEP_LINEAGE_LOCK: &str = "epigraph.step_lineage";
 
 pub struct WorkflowRepository;
 
@@ -455,9 +509,15 @@ impl WorkflowRepository {
     ///
     /// `add_step` takes it before it reads the plan it is about to extend, so
     /// two concurrent `add_step`s on one workflow cannot both compute the same
-    /// next `plan_index`. It runs on `add_step`'s caller-stamped transaction,
-    /// which `workflows`' row security (migration 183) bounds to the rows that
-    /// stamp reads.
+    /// next `plan_index`. It runs on `add_step`'s caller-stamped transaction
+    /// and locks a row that stamp READS (183's `workflows_read`).
+    ///
+    /// Through migration 237's `epigraph_workflow_lock_readable`, not a
+    /// `SELECT ... FOR UPDATE` on the stamp: since 237 a row lock on the stamp
+    /// reaches only a row whose owner group the session WRITES, and the entry
+    /// points admit callers that do not (the submitter, its operator, a
+    /// delegate, the audited admin) to a public plan. On the stamp their lock
+    /// would take nothing and two such appends could take the same index.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -465,12 +525,10 @@ impl WorkflowRepository {
         executor: E,
         workflow_id: Uuid,
     ) -> Result<bool, sqlx::Error> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM workflows WHERE id = $1 FOR UPDATE")
-                .bind(workflow_id)
-                .fetch_optional(executor)
-                .await?;
-        Ok(row.is_some())
+        sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
+            .bind(workflow_id)
+            .fetch_one(executor)
+            .await
     }
 
     /// Every LIVE (`valid_to IS NULL`) `executes` edge of `workflow_id` this
@@ -547,7 +605,9 @@ impl WorkflowRepository {
     ///
     /// 1. `parent_canonical_name = Some(p)`: `(p, generation - 1)` with the
     ///    same saturating arithmetic as before (issue #51 semantics, forks
-    ///    included).
+    ///    included). At generation 0 that row cannot exist, so a named parent
+    ///    links nothing here; the executor refuses such an ingest before it
+    ///    writes anything (`GenerationZeroNamesParent`, backlog 26a436c6).
     /// 2. Otherwise — or when (1) finds nothing and `p` names this same
     ///    lineage — the PREDECESSOR: the highest generation of
     ///    `canonical_name` strictly BELOW `generation`. Not the lineage head:
@@ -710,6 +770,52 @@ impl WorkflowRepository {
         .await
     }
 
+    /// Whether `claim_id` is shaped as a workflow STEP, as `viewer` reads it:
+    /// a claim at plan level 2 (the non-throwing form of the level predicate
+    /// the plan-order readers apply to `executes` targets) that carries a
+    /// `step_lineage_id`. Only the workflow writers set that column (the
+    /// ingest executor for level-2 and level-3 plan claims, `add_step`,
+    /// `evolve_step`), so it tells a step from a level-2 document paragraph or
+    /// a claim whose `properties.level` a caller set. It checks SHAPE, not
+    /// provenance: `evolve_step` (`revises`, level 2) on a caller's own claim
+    /// that no workflow executes needs no workflow authority and back-fills a
+    /// lineage onto it, so a caller can make its own claim step-shaped. That
+    /// grants nothing new: the `executes` adopter already needs authority over
+    /// the workflow and could write the same step with `add_step`.
+    ///
+    /// Exists for MCP `link_hierarchical`'s `executes` gate (backlog
+    /// 298317a7): outside the plan's own lineage it adopts only a step-shaped
+    /// target, because the plan readers and the outcome reports take every
+    /// level-2 `executes` target as a step, and `evolve_step` and a step-claim
+    /// `invokes` gate on the workflows executing a step's lineage.
+    ///
+    /// Run it on the caller's STAMPED transaction (the spliced predicate and
+    /// the row security then agree). A claim the viewer cannot read is not
+    /// step-shaped to it.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn is_step_shaped(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM claims c \
+               WHERE c.id = $1 AND c.step_lineage_id IS NOT NULL \
+                 AND btrim(c.properties->>'level') ~ '^[+]?0*2$' \
+                 /* {VISIBILITY:c} */ \
+             )",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
     /// Every workflow that executes the step lineage of `claim_id`, read
     /// UNFILTERED: the set [`Self::workflows_executing_step_lineage`] returns
     /// to a session that reads every row (same lineage, same edges, retracted
@@ -735,6 +841,146 @@ impl WorkflowRepository {
             .bind(claim_id)
             .fetch_all(&mut *conn)
             .await
+    }
+
+    /// Serialize an `evolve_step` against every concurrent `executes` edge
+    /// into the step lineage of `parent` (backlog bf2e9aa6), on the evolve's
+    /// own transaction: lock the parent's row `FOR UPDATE`, then take the
+    /// lineage's advisory lock EXCLUSIVELY ([`STEP_LINEAGE_LOCK`], keyed on
+    /// the parent's `COALESCE(step_lineage_id, id)`), held to the end of the
+    /// transaction. Returns `false`, having locked nothing, when the parent's
+    /// row is not found on this session; the act's own `FOR UPDATE` read then
+    /// answers it.
+    ///
+    /// # Why
+    ///
+    /// The `evolve_step` gates hold the caller to workflow authority over
+    /// every workflow in [`Self::workflows_executing_step_lineage`] /
+    /// [`Self::step_lineage_executors`]. Read before any lock, an `executes`
+    /// edge committed between that read and the evolve's commit was not
+    /// gated: the evolve changed what the newly attached workflow resolves to
+    /// without authority over it. Locking the parent's row alone does not
+    /// close that, because inserting an edge takes no lock on the claim it
+    /// targets. So every `executes` writer takes the same advisory key in
+    /// SHARE mode before its INSERT ([`Self::lock_step_lineage_shared`], from
+    /// `EdgeRepository`'s connection writers), and a gate that reads its set
+    /// after this lock sees every such edge that committed, or waits for the
+    /// writer that has one in flight. Writers do not block one another.
+    ///
+    /// The row lock comes first because it pins the key: a lineage id is only
+    /// ever back-filled onto a parent under that row's `FOR UPDATE`
+    /// (`ClaimRepository::evolve_step_conn`), so the key read here is the key
+    /// until this transaction ends. A writer that read a NULL lineage before a
+    /// concurrent back-fill keys on the claim id, which is the key the
+    /// back-filling evolve holds, so it waits for that evolve. The back-fill
+    /// gives the lineage a NEW id, so once that evolve commits the claim id is
+    /// a stale key that the next evolve of the lineage no longer takes; the
+    /// writer therefore re-reads the key after its lock is granted and also
+    /// takes the new one ([`Self::lock_step_lineage_shared`]) before it
+    /// inserts.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn lock_step_lineage_for_evolve(
+        conn: &mut sqlx::PgConnection,
+        parent: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let key: Option<Uuid> = sqlx::query_scalar(
+            "-- VISIBILITY-EXEMPT: WRITE path. The evolve's own lock of the parent it is about to \
+             evolve, on the caller-stamped write transaction; returns the lineage key only.\n\
+             SELECT COALESCE(c.step_lineage_id, c.id) FROM claims c WHERE c.id = $1 FOR UPDATE",
+        )
+        .bind(parent)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(key) = key else {
+            return Ok(false);
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2::uuid::text))")
+            .bind(STEP_LINEAGE_LOCK)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+        Ok(true)
+    }
+
+    /// Take the advisory lock of the step lineage `claim_id` belongs to
+    /// ([`STEP_LINEAGE_LOCK`], keyed on `COALESCE(step_lineage_id, id)`) in
+    /// SHARE mode, held to the end of the transaction: what every writer of an
+    /// `executes` edge onto `claim_id` takes before its INSERT, so that edge
+    /// and an `evolve_step` of the same lineage
+    /// ([`Self::lock_step_lineage_for_evolve`]) serialize (backlog bf2e9aa6).
+    /// Called by `EdgeRepository`'s connection writers, so every workflow
+    /// write path (`ingest`, `add_step`, `link_hierarchical`) takes it.
+    ///
+    /// The key is read under the writer's own row security, which returns a
+    /// visible row's true `step_lineage_id`. A writer that cannot read
+    /// `claim_id` is REFUSED (`DbError::NotFound`, the answer a missing claim
+    /// gets, so a hidden one is not told apart), never keyed on the claim id:
+    /// such a key would differ from the lineage key an evolve of that lineage
+    /// holds, and the two would not serialize (security review of bf2e9aa6).
+    /// No workflow path writes an `executes` edge onto a claim its stamp
+    /// cannot read anyway: the ingest refuses such a reused claim by name
+    /// (`ReusedClaimOutsideCallerGroups`) and `link_hierarchical` reads its
+    /// target first, so the refusal costs no legitimate writer anything.
+    ///
+    /// The key is re-read after each lock is granted, and a changed key is
+    /// locked too, until two reads agree. A writer that read a NULL lineage
+    /// keys on the claim id and so queues behind an evolve back-filling that
+    /// claim's lineage; but the back-fill writes a NEW lineage id, so once that
+    /// evolve commits, the next evolve of the lineage keys on the new id and
+    /// would not wait for a writer holding only the claim id (review of
+    /// bf2e9aa6). The key only ever changes from NULL to a lineage id, once,
+    /// under the back-filling evolve's exclusive lock on the old key, so the
+    /// second read is final; the loop is bounded and refuses past the bound.
+    ///
+    /// # Errors
+    /// `DbError::NotFound` when this session cannot read `claim_id` (on either
+    /// read); `DbError::WriteRefused` if the key never settles; a database
+    /// error if a query fails.
+    pub async fn lock_step_lineage_shared(
+        conn: &mut sqlx::PgConnection,
+        claim_id: Uuid,
+    ) -> Result<(), DbError> {
+        // The key changes at most once (NULL to a lineage id), so the second
+        // read settles it; one spare pass guards against a reading this
+        // reasoning missed, and past it the write is refused, never let
+        // through on a key the evolve may not hold.
+        const MAX_LOCKS: usize = 3;
+        let mut locked: Option<Uuid> = None;
+        for _ in 0..MAX_LOCKS {
+            let key: Option<Uuid> = sqlx::query_scalar(
+                "-- VISIBILITY-EXEMPT: WRITE path. The lineage key of the claim an executes edge \
+                 is about to target, for the writer's advisory lock; never returned to a \
+                 caller.\n\
+                 SELECT COALESCE(c.step_lineage_id, c.id) FROM claims c WHERE c.id = $1",
+            )
+            .bind(claim_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(key) = key else {
+                return Err(DbError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: claim_id,
+                });
+            };
+            if locked == Some(key) {
+                return Ok(());
+            }
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext($2::uuid::text))",
+            )
+            .bind(STEP_LINEAGE_LOCK)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+            locked = Some(key);
+        }
+        Err(DbError::WriteRefused {
+            entity: "Claim".to_string(),
+            id: claim_id,
+            action: "executes edge: step lineage key did not settle".to_string(),
+        })
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.
@@ -1172,15 +1418,15 @@ impl WorkflowRepository {
     /// The workflow's level-2 step claims whose PLAN POSITION `viewer` can
     /// establish, in plan order: the lookup an outcome report maps each
     /// `step_index` through, shared by the MCP tool and the HTTP route so step
-    /// N is one step on both transports. Element N is step N; a step whose
-    /// position the rule below can establish is listed, and the list stops at
-    /// the first one it cannot (see the residuals at the end: a hidden
-    /// UNINDEXED chain member is not detected).
+    /// N is one step on both transports. Element N is step N of the plan as a
+    /// reader of EVERY row orders it AND the step `viewer` is shown at slot N;
+    /// the list stops at the first slot where the two differ, or that `viewer`
+    /// cannot read, or whose position the rule below cannot prove.
     ///
     /// Same order as [`Self::resolve_steps_to_heads`] (the `step_follows`
     /// chain, over the `plan_index` order, `created_at` only for edges that
     /// carry none: ruling R-38), and the same two predicates, on the edge and
-    /// on the claim.
+    /// on the claim, for what `viewer` reads.
     ///
     /// # Run it on the caller's STAMPED transaction
     ///
@@ -1188,57 +1434,62 @@ impl WorkflowRepository {
     /// session row security admits only public rows, so a group's own member
     /// would get none of its group-private steps back, without an error.
     ///
-    /// # Only a provable prefix is returned
+    /// # Only the common prefix of two orders is returned
     ///
     /// A step the viewer cannot read is absent from what it reads, so counting
     /// the visible steps would shift every visible step after a hidden one
     /// onto the hidden one's index, and an outcome row would be attributed to
-    /// the WRONG step with no signal. That is reachable: `add_step` declares
-    /// its step public (`ClaimRepository::default_decl_for_author` of the
-    /// system agent) and its `executes` edge carries no `plan_index`, so a
-    /// group-private plan can end in a public step that a non-member sees
-    /// alone. So the list stops where the viewer can no longer prove a step's
-    /// position (`provable_plan_steps`):
+    /// the WRONG step with no signal. What the viewer reads cannot always show
+    /// that a step is missing: `add_step` leaves a middle insert's `executes`
+    /// edge without a `plan_index` and rewires the chain around it, so a step
+    /// another group owns inside a public plan's chain leaves no ordinal gap
+    /// and no readable chain edge (backlog a1474e22). So the ORDER is computed
+    /// over the whole plan, through migration 259's definer
+    /// `epigraph_plan_step_skeleton`, which reads the plan's `executes` edges
+    /// and `step_follows` pairs unfiltered and returns them with every claim
+    /// the viewer did not read masked to an opaque token. No hidden claim id
+    /// reaches the server or the caller.
+    ///
+    /// The definer masks CLAIMS, not edges: a hidden `step_follows` edge (or a
+    /// hidden second `executes` edge) between steps the viewer reads comes
+    /// back unmasked and can reorder the whole-plan chain, while the viewer is
+    /// shown the order its OWN edges give (`resolve_steps_to_heads*`). So the
+    /// caller's own order is computed too, exactly as those readers compute it
+    /// (`viewer_plan_order`), and only the slots on which the two orders agree
+    /// are listed (`common_plan_prefix`): every listed slot is both the true
+    /// step and the step the caller sees there.
+    ///
+    /// On each order's edges (the whole plan's, and the viewer's), a step's
+    /// position is provable when (`provable_plan_steps`):
     ///
     /// * The ingest executor numbers EVERY plan claim's `executes` edge
     ///   `0..n` (`plan_index`, phases included, so `plan_index` is not the step
-    ///   index). A gap in the ordinals the viewer reads means an edge it
-    ///   cannot see; nothing from the gap on is listed.
+    ///   index). A gap or repeat in the ordinals (an edge deleted from the
+    ///   plan) means no later position holds; nothing from it on is listed.
     /// * Edges with no ordinal (written by `add_step`, or before the ordinal
     ///   existed) sort after every ordinal one. They are listed only when the
-    ///   viewer reads the plan they follow: at least one ordinal edge, or (a
-    ///   plan written before the ordinal) a level-1 phase edge.
+    ///   plan they follow is anchored: at least one ordinal edge, or (a plan
+    ///   written before the ordinal) a level-1 phase edge.
     ///
     /// A step that is not listed is reported by the callers like an
     /// out-of-range index (NULL `step_claim_id`, disclosed as unresolved). The
     /// two are deliberately indistinguishable: the difference is the existence
-    /// of a step the caller cannot see. Residual, not detectable without a
-    /// privileged read: hidden ordinal edges AFTER every visible one, followed
-    /// by visible unordered steps. One ingest writes a plan's ordinal edges
-    /// under one owner, so it needs a later re-ownership of part of a plan.
-    ///
-    /// Second residual, accepted: a hidden UNINDEXED step inside the chain.
-    /// With visible indexed steps `[a, b, c]` and an unindexed `x` between `a`
-    /// and `b` that the viewer cannot read (a step another group's `add_step`
-    /// re-owned, or a pre-existing private claim with the same compound id),
-    /// the pairs `(a, x)` and `(x, b)` have an end outside the visible set and
-    /// are dropped, the chain reads `[a]`, `[b, c]`, and all three are
-    /// provable: the viewer's `step_index` 1 resolves to `b`, which is step 2
-    /// in plan order. Detecting it means cutting the list at a `step_follows`
-    /// edge from a listed step to a claim outside the visible step set, which
-    /// also fires on cross-generation pairs (a step claim shared by two
-    /// generations carries the other generation's `step_follows` edges, to
-    /// steps that are not in this plan at all), so it is not done here.
+    /// of a step the caller cannot see. A hidden PHASE moves no step, so it no
+    /// longer cuts the list; a hidden step of ANOTHER plan (a step shared by
+    /// two generations carries the other one's `step_follows` edges) is not a
+    /// target of this plan and is ignored.
     ///
     /// # Errors
-    /// Returns `DbError` if the query fails.
+    /// Returns `DbError` if a query fails, including when migration 259 is
+    /// not applied (the definer is missing: 42883).
     pub async fn plan_step_claim_ids(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
     ) -> Result<Vec<Uuid>, DbError> {
         // Every level, not only steps: the phases' ordinals are part of the
-        // sequence a gap is detected in.
+        // sequence a gap is detected in. The same two predicates, and the same
+        // order key, as every plan-order reader.
         let sql = viewer.splice(
             "SELECT c.id, c.properties->>'level', \
                     CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
@@ -1259,26 +1510,41 @@ impl WorkflowRepository {
             q = q.bind(g);
         }
         let rows: Vec<(Uuid, Option<String>, Option<i32>)> = q.fetch_all(&mut *conn).await?;
-        let provable = provable_plan_steps(&rows);
-        // Ruling R-38: slot N is the N-th step of the `step_follows` chain. The
-        // chain is walked over EVERY visible step, and the list stops at the
-        // first step whose position the rule above does not prove, so an
-        // unindexed step a caller sees after a hidden one cannot pull a
-        // provable step onto the wrong slot.
         let visible: Vec<Uuid> = rows
             .iter()
-            .filter(|(_, lvl, _)| {
-                lvl.as_deref().and_then(|v| v.trim().parse::<i64>().ok()) == Some(2)
-            })
+            .filter(|(_, lvl, _)| plan_level(lvl.as_deref()) == Some(2))
             .map(|(id, _, _)| *id)
             .collect();
+        if visible.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The caller's own order: what `resolve_steps_to_heads*` shows it.
         let follows = step_follows_among(&mut *conn, viewer, &visible).await?;
-        let chain = Self::order_by_step_follows(&visible, &follows);
-        let provable: std::collections::HashSet<Uuid> = provable.into_iter().collect();
-        Ok(chain
-            .into_iter()
-            .take_while(|id| provable.contains(id))
-            .collect())
+        let shown = viewer_plan_order(&rows, &visible, &follows);
+        // The whole plan's order, masked to the caller's steps.
+        let skeleton = Self::plan_step_skeleton(&mut *conn, workflow_id, &visible).await?;
+        let whole = visible_plan_prefix(&skeleton, &visible);
+        Ok(common_plan_prefix(&whole, &shown))
+    }
+
+    /// Migration 259's `epigraph_plan_step_skeleton(workflow, visible)`: the
+    /// plan's `executes` edges in plan-index order, read UNFILTERED, with each
+    /// claim not in `visible` masked to its token. See
+    /// [`Self::plan_step_claim_ids`].
+    async fn plan_step_skeleton(
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        visible: &[Uuid],
+    ) -> Result<Vec<SkeletonRow>, DbError> {
+        Ok(sqlx::query_as::<_, SkeletonRow>(
+            "SELECT s.token, s.claim_id, s.level, s.plan_index, s.successors \
+             FROM public.epigraph_plan_step_skeleton($1, $2) AS s \
+             ORDER BY s.slot",
+        )
+        .bind(workflow_id)
+        .bind(visible)
+        .fetch_all(&mut *conn)
+        .await?)
     }
 
     /// Whether `viewer` reads the plan `workflow_id`: its `workflows` row, and
@@ -1379,12 +1645,15 @@ impl WorkflowRepository {
     ///
     /// # Visibility
     ///
-    /// Run it on the caller's STAMPED transaction. The lock read carries the
-    /// row predicate (`{VISIBILITY:w}`), which agrees with `workflows`' own row
-    /// security (migration 183); [`Self::viewer_reads_plan_structure`] then
-    /// requires a readable STEP. The `UPDATE` is by primary key on the row the
-    /// predicate just admitted, and the report rows are admitted by migration
-    /// 221's policies only through that same row.
+    /// Run it on the caller's STAMPED transaction. A reader of the plan may
+    /// report, but since migration 237 only a writer of the row's owner group
+    /// may UPDATE (or row-lock) a `workflows` row, so the lock and the counter
+    /// write go through 237's two definers, which admit the row exactly when
+    /// the session READS it (183's `workflows_read`, restated in the body).
+    /// [`Self::viewer_reads_plan_structure`] then requires a readable STEP, on
+    /// the stamp. The counter definer writes only the four counter keys, and
+    /// the report rows are admitted by migration 221's policies only through
+    /// that same row.
     ///
     /// # Errors
     /// Returns `DbError` if a query fails, and `DbError::InvalidData` for a
@@ -1397,19 +1666,18 @@ impl WorkflowRepository {
         variance: f64,
         idempotency_key: Option<&str>,
     ) -> Result<HierarchicalOutcomeRecord, DbError> {
-        let sql = viewer.splice(
-            "SELECT w.metadata FROM workflows w \
-             WHERE w.id = $1 /* {VISIBILITY:w} */ \
-             FOR UPDATE OF w",
-            2,
-        );
-        let mut q = sqlx::query_scalar::<_, serde_json::Value>(&sql).bind(workflow_id);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        let Some(mut metadata) = q.fetch_optional(&mut *conn).await? else {
+        // Migration 237's lock definer (`lock_for_plan_edit`'s too): the UPDATE
+        // policy admits only a writer of the row's owner group, and a row lock
+        // is checked against it, so a reader's `FOR UPDATE` on the stamp would
+        // see no row. The definer restates the READ predicate (183's
+        // `workflows_read`).
+        let locked: bool = sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
+            .bind(workflow_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !locked {
             return Ok(HierarchicalOutcomeRecord::NotFound);
-        };
+        }
         if !Self::viewer_reads_plan_structure(conn, viewer, workflow_id).await? {
             return Ok(HierarchicalOutcomeRecord::NotFound);
         }
@@ -1443,13 +1711,22 @@ impl WorkflowRepository {
             }
         }
 
-        let counters = HierarchicalOutcomeCounters::after_report(&metadata, success, variance);
-        counters.write_into(&mut metadata);
-        sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
-            .bind(&metadata)
-            .bind(workflow_id)
-            .execute(&mut *conn)
-            .await?;
+        // Migration 237's counter definer computes the four counters from the
+        // stored ones (`HierarchicalOutcomeCounters::after_report`'s rules) and
+        // writes only those keys, so a reader moves no other part of the row.
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT public.epigraph_workflow_record_outcome($1, $2, $3)")
+                .bind(workflow_id)
+                .bind(success)
+                .bind(variance)
+                .fetch_one(&mut *conn)
+                .await?;
+        let counters: HierarchicalOutcomeCounters = serde_json::from_value(stored.clone())
+            .map_err(|e| DbError::InvalidData {
+                reason: format!(
+                    "workflow {workflow_id}: the recorded counters {stored} do not decode: {e}"
+                ),
+            })?;
         Ok(HierarchicalOutcomeRecord::Recorded(counters))
     }
 
@@ -1927,6 +2204,127 @@ impl WorkflowRepository {
             .await
     }
 
+    /// One page of the hierarchical workflow LINEAGES the connection may read:
+    /// one row per `canonical_name`, its lineage head (highest generation),
+    /// with no text filter. Keyset-paginated on `canonical_name`: pass the
+    /// last `canonical_name` of the previous page as `after` (exclusive), or
+    /// `None` for the first page.
+    ///
+    /// This is the enumeration [`Self::search_hierarchical_by_text`] is not:
+    /// that one is an ILIKE substring match, so a lineage whose goal and name
+    /// lack the query text is never returned however many pages a caller
+    /// walks (backlog 039ef40a).
+    ///
+    /// * **The head is the head.** It is picked over every row the connection
+    ///   reads, before any truth test, so a deprecated head is reported as the
+    ///   head (its truth shows it), never replaced by an older live generation
+    ///   posing as the head.
+    /// * **A rolled-back lineage stays listed.** `live_id` / `live_generation`
+    ///   name the highest generation with truth at least `live_min_truth`
+    ///   (picked in the head's order, under the same row security). A lineage
+    ///   whose head is deprecated but which still has a live generation is
+    ///   returned (agents still find and run that generation through
+    ///   `find_workflow*`, so an enumeration that dropped it would undercount
+    ///   what is in use). Only a lineage with NO live generation is omitted,
+    ///   unless `include_without_live` is set.
+    /// * **Keyed on the lineage, not on time.** A lineage that gains a
+    ///   generation while a caller pages keeps its `canonical_name`, so it is
+    ///   returned exactly once; a `(created_at, id)` key would move it past the
+    ///   cursor and return it again.
+    /// * **`generations` counts only rows this connection reads.** The window
+    ///   count runs under the same row security as the head pick; a generation
+    ///   the caller cannot read is neither counted nor picked as head.
+    ///
+    /// Generic over the executor and viewer-less for the same reason as
+    /// [`Self::search_hierarchical_by_text`] (recorded in
+    /// `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`): the statement reads
+    /// `workflows` alone, whose row security returns exactly the rows the
+    /// caller's stamp may read, so the caller MUST run it on a viewer-stamped
+    /// read.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn list_hierarchical_lineage_heads<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        after: Option<&str>,
+        live_min_truth: f64,
+        include_without_live: bool,
+        limit: i64,
+    ) -> Result<Vec<HierarchicalLineageHeadRow>, sqlx::Error> {
+        sqlx::query_as::<_, HierarchicalLineageHeadRow>(
+            "WITH heads AS ( \
+                 SELECT DISTINCT ON (canonical_name) \
+                        id, canonical_name, generation, goal, parent_id, created_at, \
+                        truth_value, \
+                        count(*) OVER (PARTITION BY canonical_name) AS generations \
+                 FROM workflows \
+                 WHERE ($1::text IS NULL OR canonical_name > $1::text) \
+                 ORDER BY canonical_name, generation DESC, created_at DESC, id ASC \
+             ) \
+             SELECT h.id, h.canonical_name, h.generation, h.goal, h.parent_id, h.created_at, \
+                    h.truth_value, h.generations, \
+                    live.id AS live_id, live.generation AS live_generation \
+             FROM heads h \
+             LEFT JOIN LATERAL ( \
+                 SELECT w.id, w.generation \
+                 FROM workflows w \
+                 WHERE w.canonical_name = h.canonical_name \
+                   AND w.truth_value >= $2 \
+                 ORDER BY w.generation DESC, w.created_at DESC, w.id ASC \
+                 LIMIT 1 \
+             ) live ON true \
+             WHERE $3 OR live.id IS NOT NULL \
+             ORDER BY h.canonical_name \
+             LIMIT $4",
+        )
+        .bind(after)
+        .bind(live_min_truth)
+        .bind(include_without_live)
+        .bind(limit)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// One page of the FLAT workflow store: `workflow`-labelled claims the
+    /// viewer may read, keyset-paginated on the claim id (pass the last id of
+    /// the previous page as `after`, exclusive). No text filter and no truth
+    /// filter: `include_retired = false` omits only the claims that are not
+    /// current (`deprecate_workflow` sets `is_current = false`).
+    ///
+    /// The flat-store half of the MCP `list_workflows` enumeration; [`Self::list`]
+    /// orders by truth and has no cursor, so it cannot enumerate past one page.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn list_flat_page<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        after: Option<Uuid>,
+        include_retired: bool,
+        limit: i64,
+    ) -> Result<Vec<FlatWorkflowPageRow>, sqlx::Error> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.content, c.truth_value, c.labels, \
+                    COALESCE(c.is_current, true) AS is_current \
+             FROM claims c \
+             WHERE 'workflow' = ANY(c.labels) \
+               AND ($1::uuid IS NULL OR c.id > $1::uuid) \
+               AND ($2 OR c.is_current IS NULL OR c.is_current = true) \
+               /* {VISIBILITY:c} */ \
+             ORDER BY c.id \
+             LIMIT $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, FlatWorkflowPageRow>(&sql)
+            .bind(after)
+            .bind(include_retired)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(executor).await
+    }
+
     /// Cosine-similarity search over `workflows.goal_embedding`.
     ///
     /// Mirrors `find_by_embedding` (flat) but reads the hierarchical
@@ -2334,7 +2732,8 @@ impl WorkflowRepository {
     /// # The executor is generic for COHESION, not because `workflows` is protected
     ///
     /// Since migration 183 `workflows` has row security keyed on the plan's
-    /// tenancy (an UPDATE reaches only a row the session reads), so the
+    /// tenancy, and since 237 an UPDATE reaches only a row whose owner group
+    /// the session WRITES (any other row matches nothing), so the
     /// connection matters here as for the `claims` UPDATE this call cascades
     /// from. It is generic so that the two
     /// halves of one deprecation can share a transaction: a `claims` row flipped
@@ -2376,6 +2775,67 @@ impl WorkflowRepository {
         .execute(executor)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// The `truth_value` of `workflows` row `id` as this connection reads it,
+    /// `None` when it reads no such row (unknown, or hidden by row security).
+    ///
+    /// A deprecation asks it after a `truth_value` write that changed nothing,
+    /// to tell "already deprecated" (0.05) apart from "the database filtered
+    /// the write out": since migration 237 an UPDATE reaches only a row whose
+    /// owner group the session writes, so a caller the entry point admitted
+    /// by another arm can match no row without any error.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn truth_value_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<f64>, sqlx::Error> {
+        sqlx::query_scalar("SELECT truth_value FROM workflows WHERE id = $1")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+    }
+
+    /// The truth value a deprecation leaves on a `workflows` row.
+    pub const DEPRECATED_TRUTH: f64 = 0.05;
+
+    /// Deprecate `workflows` row `id` (`truth_value` to
+    /// [`Self::DEPRECATED_TRUTH`]) through migration 237's audited admin
+    /// definer, `epigraph_admin_deprecate_workflow_row`, on the caller's
+    /// stamped transaction. Returns the rows CHANGED (0 for a row already
+    /// deprecated).
+    ///
+    /// For the workflow authority gate's admin arm only: since 237 the
+    /// `workflows` UPDATE policy admits only a writer of the row's owner
+    /// group, and the admin arm admits a caller that writes none. The definer
+    /// re-checks the session principal's live `claims:admin` grant through
+    /// `client_id` (111's predicate) and writes the `workflows.admin_write`
+    /// audit row itself, with `details` under its own facts, on the same
+    /// transaction. It writes `truth_value` only, and only that one value.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` carrying the definer's refusal: `42501` (`ADM01`
+    /// no principal, `ADM02` no live grant, `WFO01` an elevated session) or
+    /// `P0002` (`ADM04`, no such row); nothing is written then.
+    pub async fn admin_deprecate_row(
+        conn: &mut sqlx::PgConnection,
+        client_id: Uuid,
+        token_jti: Uuid,
+        id: Uuid,
+        details: &serde_json::Value,
+    ) -> Result<u64, sqlx::Error> {
+        let changed: i64 = sqlx::query_scalar(
+            "SELECT public.epigraph_admin_deprecate_workflow_row($1, $2, $3, $4)",
+        )
+        .bind(client_id)
+        .bind(token_jti)
+        .bind(id)
+        .bind(details)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(u64::try_from(changed).unwrap_or(0))
     }
 
     /// Whether a hierarchical `workflows` row with this id is visible on this
@@ -2629,22 +3089,42 @@ impl WorkflowRepository {
     /// statement takes a fresh snapshot that sees the first one's 0.05. Taking
     /// the locks in id order means two such calls cannot deadlock each other.
     ///
+    /// # Through the lock definer, one row at a time
+    ///
+    /// The rows are the ones the session READS (183's `workflows_read`), read
+    /// on the stamp with no lock, and each is then locked through migration
+    /// 237's `epigraph_workflow_lock_readable`, in id order from here (not
+    /// from a sort inside one statement, whose call order is the planner's).
+    /// A plain `SELECT ... FOR UPDATE` on the stamp would not do since 237: a
+    /// row lock is checked against the owner-scoped UPDATE policy, so it would
+    /// lock only the rows whose owner group the caller WRITES, and a PUBLIC
+    /// lineage may hold generations in different owner groups (a new
+    /// generation of a public lineage the caller does not write lands in the
+    /// caller's own group). Two deprecations of such a lineage would then each
+    /// lock only their own row, and the write skew above would be back.
+    ///
     /// # Errors
-    /// Returns `sqlx::Error` if the query fails.
-    pub async fn lock_lineages_for_deprecation<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn lock_lineages_for_deprecation(
+        conn: &mut sqlx::PgConnection,
         ids: &[Uuid],
     ) -> Result<(), sqlx::Error> {
-        sqlx::query_scalar::<_, Uuid>(
+        let rows: Vec<Uuid> = sqlx::query_scalar(
             "SELECT w.id FROM workflows w \
               WHERE w.canonical_name IN ( \
                     SELECT t.canonical_name FROM workflows t WHERE t.id = ANY($1::uuid[])) \
-              ORDER BY w.id \
-                FOR UPDATE",
+              ORDER BY w.id",
         )
         .bind(ids)
-        .fetch_all(executor)
+        .fetch_all(&mut *conn)
         .await?;
+        for row in rows {
+            // `false` is a row deleted since the read: nothing left to lock.
+            let _: bool = sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
+                .bind(row)
+                .fetch_one(&mut *conn)
+                .await?;
+        }
         Ok(())
     }
 
@@ -2963,6 +3443,106 @@ fn provable_plan_steps(rows: &[(Uuid, Option<String>, Option<i32>)]) -> Vec<Uuid
     steps
 }
 
+/// A claim's `properties->>'level'` as the plan-order readers parse it.
+fn plan_level(level: Option<&str>) -> Option<i64> {
+    level.and_then(|v| v.trim().parse::<i64>().ok())
+}
+
+/// One row of migration 259's `epigraph_plan_step_skeleton`: an `executes`
+/// edge of the plan, in plan-index order. `token` names its claim within one
+/// result (two edges onto one claim share it); `claim_id` is set only for a
+/// claim the caller passed as visible.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+struct SkeletonRow {
+    token: i32,
+    claim_id: Option<Uuid>,
+    level: Option<String>,
+    plan_index: Option<i32>,
+    /// Tokens this claim has a `step_follows` edge to.
+    successors: Vec<i32>,
+}
+
+/// The steps of the WHOLE plan `skeleton` describes, in plan order
+/// ([`provable_plan_steps`], then [`WorkflowRepository::order_by_step_follows`]
+/// over every step), up to the first one that is not in `visible`.
+///
+/// The ordering runs on synthetic ids made from the tokens, so a masked claim
+/// is a distinct member of the chain that can never be confused with a real
+/// id; only a token that carries a visible claim id maps back.
+#[must_use]
+fn visible_plan_prefix(skeleton: &[SkeletonRow], visible: &[Uuid]) -> Vec<Uuid> {
+    let synthetic = |token: i32| Uuid::from_u128(u128::from(token.unsigned_abs()));
+    let rows: Vec<(Uuid, Option<String>, Option<i32>)> = skeleton
+        .iter()
+        .map(|r| (synthetic(r.token), r.level.clone(), r.plan_index))
+        .collect();
+    let provable: std::collections::HashSet<Uuid> =
+        provable_plan_steps(&rows).into_iter().collect();
+    let steps: Vec<Uuid> = skeleton
+        .iter()
+        .filter(|r| plan_level(r.level.as_deref()) == Some(2))
+        .map(|r| synthetic(r.token))
+        .collect();
+    let follows: Vec<(Uuid, Uuid)> = skeleton
+        .iter()
+        .flat_map(|r| {
+            r.successors
+                .iter()
+                .map(move |n| (synthetic(r.token), synthetic(*n)))
+        })
+        .collect();
+    let mut claim_of: HashMap<Uuid, Uuid> = HashMap::new();
+    for r in skeleton {
+        if let Some(id) = r.claim_id {
+            claim_of.insert(synthetic(r.token), id);
+        }
+    }
+    let visible: std::collections::HashSet<Uuid> = visible.iter().copied().collect();
+    WorkflowRepository::order_by_step_follows(&steps, &follows)
+        .into_iter()
+        .map_while(|t| {
+            if !provable.contains(&t) {
+                return None;
+            }
+            claim_of.get(&t).copied().filter(|id| visible.contains(id))
+        })
+        .collect()
+}
+
+/// The plan order `viewer` is shown, cut at the first step whose position
+/// its own rows do not prove: `rows` are the `executes` targets it reads
+/// (`(claim id, level text, plan_index)`, every level, in plan-index order),
+/// `steps` their level-2 ids in that order, `follows` the `step_follows`
+/// pairs among them it reads. The chain is
+/// [`WorkflowRepository::order_by_step_follows`], as in
+/// `resolve_steps_to_heads*`, so element N is the step shown at slot N.
+#[must_use]
+fn viewer_plan_order(
+    rows: &[(Uuid, Option<String>, Option<i32>)],
+    steps: &[Uuid],
+    follows: &[(Uuid, Uuid)],
+) -> Vec<Uuid> {
+    let provable: std::collections::HashSet<Uuid> = provable_plan_steps(rows).into_iter().collect();
+    WorkflowRepository::order_by_step_follows(steps, follows)
+        .into_iter()
+        .take_while(|id| provable.contains(id))
+        .collect()
+}
+
+/// The longest common prefix of the whole plan's order (`whole`, from
+/// [`visible_plan_prefix`]) and the order the caller is shown (`shown`, from
+/// [`viewer_plan_order`]): the slots on which the true step and the shown step
+/// are the same claim. See [`WorkflowRepository::plan_step_claim_ids`].
+#[must_use]
+fn common_plan_prefix(whole: &[Uuid], shown: &[Uuid]) -> Vec<Uuid> {
+    whole
+        .iter()
+        .zip(shown)
+        .take_while(|(w, v)| w == v)
+        .map(|(w, _)| *w)
+        .collect()
+}
+
 /// The `step_follows` pairs `(source, target)` with BOTH ends in `ids` that
 /// `viewer` can see, retracted rows included: the edge set
 /// [`WorkflowRepository::order_by_step_follows`] walks. Retracted rows count
@@ -3038,12 +3618,23 @@ impl WorkflowRepository {
     ///   walked from its head, and the paths are concatenated in the plan
     ///   order of their EARLIEST member, so a phase's chain stays in its
     ///   phase's place even when `add_step` put an unindexed step at its head.
-    /// * When the pairs do not describe disjoint simple paths over the set (a
-    ///   step with two successors or two predecessors, or a cycle), there is
-    ///   no single chain to follow, and `plan_order` is returned unchanged.
-    ///   That is the shape two generations of one `canonical_name` produce
-    ///   when they keep the same step texts in a different order: their step
-    ///   claims, and so their `step_follows` edges, are shared.
+    /// * A pair IMPLIED by a longer path over the set is dropped before the
+    ///   walk: with `a -> x -> b` present, `a -> b` says nothing more. That is
+    ///   the shape `add_step` leaves when it inserts `x` between `a` and `b`
+    ///   while another generation of the same `canonical_name` still executes
+    ///   both: the shared `a -> b` edge stays, because that generation's own
+    ///   chain is `a -> b` (backlog 14335111). The reduction is computed only
+    ///   on an acyclic pair set, where it is unique; it can change no answer
+    ///   that was already a chain, because in disjoint simple paths every
+    ///   step has at most one successor and no pair is implied by another
+    ///   path.
+    /// * When the remaining pairs do not describe disjoint simple paths over
+    ///   the set (a step with two successors or two predecessors, or a
+    ///   cycle), there is no single chain to follow, and `plan_order` is
+    ///   returned unchanged. That is the shape two generations of one
+    ///   `canonical_name` produce when they keep the same step texts in a
+    ///   different order: their step claims, and so their `step_follows`
+    ///   edges, are shared.
     #[must_use]
     pub fn order_by_step_follows(plan_order: &[Uuid], follows: &[(Uuid, Uuid)]) -> Vec<Uuid> {
         let rank: HashMap<Uuid, usize> = plan_order
@@ -3055,12 +3646,13 @@ impl WorkflowRepository {
             // One claim on two `executes` edges: no single position to give it.
             return plan_order.to_vec();
         }
+        let Some(follows) = Self::reduce_implied_follows(&rank, follows) else {
+            // A cycle: no order to walk.
+            return plan_order.to_vec();
+        };
         let mut next: HashMap<Uuid, Uuid> = HashMap::new();
         let mut prev: HashMap<Uuid, Uuid> = HashMap::new();
-        for (a, b) in follows {
-            if a == b || !rank.contains_key(a) || !rank.contains_key(b) {
-                continue;
-            }
+        for (a, b) in &follows {
             match next.get(a) {
                 Some(existing) if existing != b => return plan_order.to_vec(),
                 _ => {}
@@ -3098,6 +3690,85 @@ impl WorkflowRepository {
         }
         paths.sort_by_key(|(earliest, _)| *earliest);
         paths.into_iter().flat_map(|(_, path)| path).collect()
+    }
+
+    /// The distinct `follows` pairs over `rank`'s members (self-pairs and
+    /// pairs with an end outside the set dropped), minus every pair `a -> b`
+    /// for which `b` is also reachable from another successor of `a`: the
+    /// transitive reduction of the pair graph. `None` when the pairs contain a
+    /// cycle, where no reduction is unique and the caller falls back to plan
+    /// order anyway.
+    fn reduce_implied_follows(
+        rank: &HashMap<Uuid, usize>,
+        follows: &[(Uuid, Uuid)],
+    ) -> Option<Vec<(Uuid, Uuid)>> {
+        let mut pairs: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut distinct: std::collections::HashSet<(Uuid, Uuid)> =
+            std::collections::HashSet::new();
+        let mut succ: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for (a, b) in follows {
+            if a == b
+                || !rank.contains_key(a)
+                || !rank.contains_key(b)
+                || !distinct.insert((*a, *b))
+            {
+                continue;
+            }
+            pairs.push((*a, *b));
+            succ.entry(*a).or_default().push(*b);
+        }
+
+        // Kahn's algorithm: every node is removed exactly when the pairs are
+        // acyclic.
+        let mut indegree: HashMap<Uuid, usize> = rank.keys().map(|id| (*id, 0)).collect();
+        for (_, b) in &pairs {
+            *indegree.entry(*b).or_default() += 1;
+        }
+        let mut ready: Vec<Uuid> = indegree
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut removed = 0usize;
+        while let Some(id) = ready.pop() {
+            removed += 1;
+            for n in succ.get(&id).map(Vec::as_slice).unwrap_or_default() {
+                let d = indegree.get_mut(n).expect("every successor is a member");
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(*n);
+                }
+            }
+        }
+        if removed != rank.len() {
+            return None;
+        }
+
+        // `b` reachable from `from` without using the direct pair `a -> b`.
+        let reaches = |from: Uuid, target: Uuid| -> bool {
+            let mut stack = vec![from];
+            let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+            while let Some(cur) = stack.pop() {
+                if cur == target {
+                    return true;
+                }
+                if seen.insert(cur) {
+                    stack.extend(succ.get(&cur).into_iter().flatten().copied());
+                }
+            }
+            false
+        };
+        Some(
+            pairs
+                .iter()
+                .copied()
+                .filter(|(a, b)| {
+                    !succ[a]
+                        .iter()
+                        .any(|other| other != b && reaches(*other, *b))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -3202,6 +3873,175 @@ mod tests {
         (0..n).map(|_| Uuid::new_v4()).collect()
     }
 
+    /// A skeleton row: `(token, visible claim, level, plan_index, successors)`.
+    fn sk(
+        token: i32,
+        claim_id: Option<Uuid>,
+        level: i64,
+        plan_index: Option<i32>,
+        successors: &[i32],
+    ) -> SkeletonRow {
+        SkeletonRow {
+            token,
+            claim_id,
+            level: Some(level.to_string()),
+            plan_index,
+            successors: successors.to_vec(),
+        }
+    }
+
+    /// Backlog a1474e22: `[a, b, c]` indexed and visible, `x` unindexed and
+    /// masked, chained `a -> x -> b -> c`. Plan order is `[a, x, b, c]`, so
+    /// the caller's list is `[a]`: `b` is NOT its step 1.
+    #[test]
+    fn a_masked_unindexed_chain_member_cuts_the_list() {
+        let v = ids(3);
+        let (a, b, c) = (v[0], v[1], v[2]);
+        let skeleton = [
+            sk(1, Some(a), 2, Some(0), &[4]),
+            sk(2, Some(b), 2, Some(1), &[3]),
+            sk(3, Some(c), 2, Some(2), &[]),
+            sk(4, None, 2, None, &[2]),
+        ];
+        assert_eq!(visible_plan_prefix(&skeleton, &v), vec![a]);
+        // A caller that reads `x` too gets the whole chain in plan order.
+        let x = Uuid::new_v4();
+        let mut all = skeleton.clone();
+        all[3].claim_id = Some(x);
+        assert_eq!(visible_plan_prefix(&all, &[a, b, c, x]), vec![a, x, b, c]);
+    }
+
+    /// A masked PHASE moves no step: the steps after it keep their slots.
+    #[test]
+    fn a_masked_phase_does_not_cut_the_list() {
+        let v = ids(2);
+        let skeleton = [
+            sk(1, None, 1, Some(0), &[]),
+            sk(2, Some(v[0]), 2, Some(1), &[3]),
+            sk(3, Some(v[1]), 2, Some(2), &[]),
+        ];
+        assert_eq!(visible_plan_prefix(&skeleton, &v), v);
+    }
+
+    /// An ordinal gap on the WHOLE plan (an edge deleted from it) still stops
+    /// the list, as it did when only the caller's rows were read.
+    #[test]
+    fn a_gap_in_the_whole_plans_ordinals_still_cuts() {
+        let v = ids(2);
+        let skeleton = [
+            sk(1, Some(v[0]), 2, Some(0), &[]),
+            sk(2, Some(v[1]), 2, Some(2), &[]),
+        ];
+        assert_eq!(visible_plan_prefix(&skeleton, &v), vec![v[0]]);
+    }
+
+    /// A token is only an id inside one result: a claim id the skeleton
+    /// returns but the caller did not pass as visible is not listed.
+    #[test]
+    fn only_a_claim_the_caller_reads_is_listed() {
+        let v = ids(2);
+        let skeleton = [
+            sk(1, Some(v[0]), 2, Some(0), &[]),
+            sk(2, Some(v[1]), 2, Some(1), &[]),
+        ];
+        assert_eq!(visible_plan_prefix(&skeleton, &v[..1]), vec![v[0]]);
+    }
+
+    /// `(id, level, plan_index)` rows for [`viewer_plan_order`].
+    fn vrow(id: Uuid, level: i64, plan_index: Option<i32>) -> (Uuid, Option<String>, Option<i32>) {
+        (id, Some(level.to_string()), plan_index)
+    }
+
+    /// A hidden `step_follows` edge `c -> a` between steps the caller reads
+    /// closes the whole plan's chain `a -> y -> b -> c` into a cycle, so the
+    /// whole order falls back to plan-index order `a, b, c, y`; the caller is
+    /// shown `a, y, b, c`. Only slot 0 agrees.
+    #[test]
+    fn a_hidden_cycle_edge_between_visible_steps_keeps_only_agreeing_slots() {
+        let v = ids(4);
+        let (a, b, c, y) = (v[0], v[1], v[2], v[3]);
+        let skeleton = [
+            sk(1, Some(a), 2, Some(0), &[4]),
+            sk(2, Some(b), 2, Some(1), &[3]),
+            sk(3, Some(c), 2, Some(2), &[1]),
+            sk(4, Some(y), 2, None, &[2]),
+        ];
+        let whole = visible_plan_prefix(&skeleton, &v);
+        assert_eq!(whole, vec![a, b, c, y]);
+        let rows = [
+            vrow(a, 2, Some(0)),
+            vrow(b, 2, Some(1)),
+            vrow(c, 2, Some(2)),
+            vrow(y, 2, None),
+        ];
+        let shown = viewer_plan_order(&rows, &[a, b, c, y], &[(a, y), (y, b), (b, c)]);
+        assert_eq!(shown, vec![a, y, b, c]);
+        assert_eq!(common_plan_prefix(&whole, &shown), vec![a]);
+    }
+
+    /// A hidden edge `a -> c` that the visible chain `a -> y -> b -> c`
+    /// already implies is not a fork: `order_by_step_follows` reduces the
+    /// pairs transitively first (`reduce_implied_follows`, the generation-
+    /// sharing fix), so the whole plan's order is the caller's chain and every
+    /// slot agrees. (Written before that reduction, this test expected the
+    /// edge to fork the whole order back to plan-index order.)
+    #[test]
+    fn a_hidden_edge_the_visible_chain_implies_changes_no_slot() {
+        let v = ids(4);
+        let (a, b, c, y) = (v[0], v[1], v[2], v[3]);
+        let skeleton = [
+            sk(1, Some(a), 2, Some(0), &[3, 4]),
+            sk(2, Some(b), 2, Some(1), &[3]),
+            sk(3, Some(c), 2, Some(2), &[]),
+            sk(4, Some(y), 2, None, &[2]),
+        ];
+        let whole = visible_plan_prefix(&skeleton, &v);
+        let rows = [
+            vrow(a, 2, Some(0)),
+            vrow(b, 2, Some(1)),
+            vrow(c, 2, Some(2)),
+            vrow(y, 2, None),
+        ];
+        let shown = viewer_plan_order(&rows, &[a, b, c, y], &[(a, y), (y, b), (b, c)]);
+        assert_eq!(shown, vec![a, y, b, c]);
+        assert_eq!(whole, vec![a, y, b, c], "the implied edge is reduced away");
+        assert_eq!(common_plan_prefix(&whole, &shown), vec![a, y, b, c]);
+    }
+
+    /// A hidden second `executes` edge onto `b` (ordinal 3) makes the whole
+    /// plan number `a, b, c, b`; the caller reads `a, b, c`. Its index 3 must
+    /// not resolve.
+    #[test]
+    fn a_hidden_duplicate_executes_edge_adds_no_slot() {
+        let v = ids(3);
+        let (a, b, c) = (v[0], v[1], v[2]);
+        let skeleton = [
+            sk(1, Some(a), 2, Some(0), &[]),
+            sk(2, Some(b), 2, Some(1), &[]),
+            sk(3, Some(c), 2, Some(2), &[]),
+            sk(2, Some(b), 2, Some(3), &[]),
+        ];
+        let whole = visible_plan_prefix(&skeleton, &v);
+        assert_eq!(whole, vec![a, b, c, b]);
+        let rows = [
+            vrow(a, 2, Some(0)),
+            vrow(b, 2, Some(1)),
+            vrow(c, 2, Some(2)),
+        ];
+        let shown = viewer_plan_order(&rows, &v, &[]);
+        assert_eq!(common_plan_prefix(&whole, &shown), vec![a, b, c]);
+    }
+
+    /// The caller's own order still stops at the first step its own rows do
+    /// not prove (an ordinal gap), so the common prefix does too.
+    #[test]
+    fn the_callers_own_gap_still_cuts_the_common_prefix() {
+        let v = ids(2);
+        let rows = [vrow(v[0], 2, Some(0)), vrow(v[1], 2, Some(2))];
+        assert_eq!(viewer_plan_order(&rows, &v, &[]), vec![v[0]]);
+        assert_eq!(common_plan_prefix(&v, &[v[0]]), vec![v[0]]);
+    }
+
     /// `add_step(position = 1)` into `[a, b, c]`: the insert `x` is unindexed,
     /// so plan_index order lists it last, and the chain puts it second.
     #[test]
@@ -3246,6 +4086,52 @@ mod tests {
             vec![(a, b), (a, c)],
             vec![(a, c), (b, c)],
             vec![(a, b), (b, c), (c, a)],
+        ] {
+            assert_eq!(
+                WorkflowRepository::order_by_step_follows(&plan, &follows),
+                plan,
+                "{follows:?}"
+            );
+        }
+    }
+
+    /// `add_step` inserted `x` between `a` and `b` in one generation and kept
+    /// `a -> b` because another generation still executes both: the pair is
+    /// implied by `a -> x -> b` and the chain is `a, x, b, c`. A pair implied
+    /// through a longer detour is dropped the same way. The other generation,
+    /// which does not execute `x`, still reads `a -> b`.
+    #[test]
+    fn a_pair_implied_by_a_longer_path_does_not_fork_the_chain() {
+        let v = ids(5);
+        let (a, b, c, x, y) = (v[0], v[1], v[2], v[3], v[4]);
+        let got = WorkflowRepository::order_by_step_follows(
+            &[a, b, c, x],
+            &[(a, b), (a, x), (x, b), (b, c)],
+        );
+        assert_eq!(got, vec![a, x, b, c]);
+        let got = WorkflowRepository::order_by_step_follows(
+            &[a, b, c, x, y],
+            &[(a, b), (a, x), (x, y), (y, b), (b, c)],
+        );
+        assert_eq!(got, vec![a, x, y, b, c]);
+        let got = WorkflowRepository::order_by_step_follows(
+            &[c, b, a],
+            &[(a, b), (a, x), (x, b), (b, c)],
+        );
+        assert_eq!(got, vec![a, b, c], "the generation without x");
+    }
+
+    /// The reduction drops only IMPLIED pairs: a fork whose branches never
+    /// meet, or a cycle with an implied-looking chord, still falls back.
+    #[test]
+    fn the_reduction_does_not_resolve_a_real_fork_or_a_cycle() {
+        let v = ids(4);
+        let (a, b, c, d) = (v[0], v[1], v[2], v[3]);
+        let plan = vec![a, b, c, d];
+        for follows in [
+            vec![(a, b), (a, c), (c, d)],
+            vec![(a, b), (b, c), (a, c), (c, a)],
+            vec![(a, b), (b, c), (c, d), (a, d), (d, b)],
         ] {
             assert_eq!(
                 WorkflowRepository::order_by_step_follows(&plan, &follows),

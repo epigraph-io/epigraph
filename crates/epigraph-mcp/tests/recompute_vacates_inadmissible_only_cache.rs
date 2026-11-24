@@ -32,6 +32,10 @@
 //!   group claims); that frame owns the cache instead and refolds it from the
 //!   admissible input (backlog 8d720490 (1): the owner rule ranks a frame
 //!   with an admissible input first);
+//!   On the application role a NON-owner's recompute takes that move too
+//!   (migration 243, backlog 0296077b), and on every path the move drops
+//!   the verdict on the hidden fold: the classifier is binary-frame only, so
+//!   `claim_validity`'s fold carries none;
 //! * a widening act (publicize, share) keeps the recorded owner instead
 //!   (`cache_owner_frame_keeping_recorded`), and falls back to that rule only
 //!   when the claim records none;
@@ -49,7 +53,7 @@ mod fixture;
 use epigraph_crypto::AgentSigner;
 use epigraph_db::repos::derivation_scope::DerivationScopeRepository;
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
+use epigraph_db::{MassFunctionRepository, ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
     ensure_binary_frame, preview_claim_belief_on_frame, recompute_claim_belief_on_frame,
     recompute_claim_cached_belief, resolve_claim_validity_frame,
@@ -187,10 +191,7 @@ async fn recompute_beliefs(
 
 /// A BBA on (`claim`, `frame`) by `agent` citing `evidence`, with `t` on TRUE.
 async fn store(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Uuid, t: f64) {
-    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
-        .await
-        .expect("evidence perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,
@@ -482,18 +483,18 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
     .expect("recompute while every source is public");
     let before = cache(&pool, claim).await;
     assert!(
-        before.0.is_some() && before.5 == Some(w.binary),
-        "PREMISE: binary_truth owns a filled cache ({before:?})"
+        before.0.is_some()
+            && before.5 == Some(w.binary)
+            && before.6.as_deref() == Some("supported"),
+        "PREMISE: binary_truth owns a filled cache with a verdict on that fold ({before:?})"
     );
     hide(&pool, hidden_ev, w.group, w.member).await;
 
     // The member can read the hidden evidence and the author cannot; the
     // owner rule's admissibility is the fold's, which answers the same for
     // both on the application role. Neither owns this public claim (the
-    // fixture's claim is not in either's group), and migration 114 lets a
-    // non-owner refresh the cache only on the frame it already carries, so
-    // the re-pointing recompute runs where the bulk recomputers run: on the
-    // privileged connection.
+    // fixture's claim is not in either's group), so their writes reach
+    // migration 114's non-owner definer.
     let scoped = app_role(&pool).await;
     for (who, viewer) in [("member", &w.member_viewer), ("author", &w.author_viewer)] {
         assert_eq!(
@@ -504,12 +505,14 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
         );
     }
 
-    // KNOWN RESIDUAL (request path, until a privileged recompute runs): the
-    // same recompute by a NON-OWNER on the application role folds
-    // `claim_validity`, and migration 114 declines that write because the
-    // recorded frame is `binary_truth`. The cache keeps the hidden-evidence
-    // fold, and the recompute must say it wrote nothing (backlog 8d720490
-    // (2): it used to answer true here).
+    // The request path, with no privileged recompute (backlog 0296077b): a
+    // NON-OWNER's recompute on the application role folds `claim_validity`,
+    // and migration 243 lets the definer take that write, because the
+    // recorded frame, `binary_truth`, holds no input any reader of the claim
+    // may read and `claim_validity` is the frame the owner rule elects. Before
+    // 243 the definer declined it and the cache kept the hidden-evidence fold
+    // until a maintenance recompute ran. The second writer then refreshes the
+    // fold on the frame the cache now records.
     for (who, viewer) in [("member", &w.member_viewer), ("author", &w.author_viewer)] {
         let mut tx = scoped.begin_as(viewer).await.expect("stamped app session");
         let wrote = recompute_claim_cached_belief(&mut tx, viewer, claim)
@@ -517,25 +520,97 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
             .expect("non-owner recompute on the application role");
         tx.commit().await.expect("commit");
         assert!(
-            !wrote,
-            "a declined non-owner write by the {who} must not report the cache as written"
+            wrote,
+            "the {who}'s non-owner recompute must write the owner-rule frame's fold over \
+             the hidden-evidence cache"
         );
-        let unchanged = cache(&pool, claim).await;
-        assert!(
-            unchanged.5 == Some(w.binary) && near(unchanged.0, before.0.unwrap_or(f64::NAN)),
-            "RESIDUAL: the {who}'s declined write leaves the binary_truth cache as it was; \
-             it is {unchanged:?} (before {before:?})"
-        );
+        assert_holds_fold_of(&pool, &w.public, claim, validity, &before).await;
     }
+    let repoints: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT agent_id FROM security_events \
+          WHERE event_type = 'claims.foreign_aggregate_write' \
+            AND details->>'action' = 'belief_cache_repoint' \
+            AND details->>'claim_id' = $1::text",
+    )
+    .bind(claim)
+    .fetch_all(&pool)
+    .await
+    .expect("read the re-point audit");
+    assert_eq!(
+        repoints,
+        vec![Some(w.member)],
+        "the member's write is the one audited re-point (migration 243); the author's is a \
+         refresh on the frame the cache then records"
+    );
+    assert_holds_fold_of(&pool, &w.public, claim, validity, &before).await;
+    assert_eq!(
+        cache(&pool, claim).await.6,
+        None,
+        "the verdict on the hidden fold (`supported`) must not survive the move: \
+         claim_validity's fold carries no verdict"
+    );
+}
 
+/// The PRIVILEGED twin of `an_admissible_input_on_another_frame_takes_the_cache`,
+/// and what makes the one-time deploy recompute sufficient: the maintenance
+/// `recompute_beliefs` moves the cache to `claim_validity` on the owner's
+/// statement (no migration-243 arm runs there), and must not leave the
+/// `binary_truth` verdict on the hidden fold behind. The classifier is defined
+/// on the binary frame only, so before this the label was never rewritten
+/// once the cache recorded another frame, and `get_claim` went on serving it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_beliefs_drops_the_hidden_folds_verdict_when_the_cache_moves(pool: PgPool) {
+    let w = world(&pool, "r80-verdict-moves").await;
+    let validity =
+        resolve_claim_validity_frame(&mut pool.acquire().await.expect("acquire"), &w.public)
+            .await
+            .expect("claim_validity");
+    let claim = fixture::seed_public_claim(&pool, w.author, "r80 verdict follows the move").await;
+    let open_ev = fixture::seed_evidence(&pool, claim, "observation").await;
+    store(&pool, claim, validity, w.author, open_ev, 0.7).await;
+    let hidden_ev = fixture::seed_evidence(&pool, claim, "document").await;
+    store(&pool, claim, w.binary, w.member, hidden_ev, 0.9).await;
     recompute_claim_cached_belief(
         &mut pool.acquire().await.expect("acquire"),
         &w.public,
         claim,
     )
     .await
-    .expect("recompute after the evidence is hidden");
+    .expect("recompute while every source is public");
+    let before = cache(&pool, claim).await;
+    assert!(
+        before.5 == Some(w.binary) && before.6.as_deref() == Some("supported"),
+        "PREMISE: binary_truth owns the cache, with its verdict ({before:?})"
+    );
+    hide(&pool, hidden_ev, w.group, w.member).await;
+
+    let server = server(&pool, fixture::scoped_pool(&pool).await);
+    let report = recompute_beliefs(&pool, &server, claim).await;
+    assert_eq!(report["errors"], serde_json::json!([]), "{report}");
     assert_holds_fold_of(&pool, &w.public, claim, validity, &before).await;
+    assert_eq!(
+        cache(&pool, claim).await.6,
+        None,
+        "recompute_beliefs moved the cache to claim_validity but kept the verdict on the \
+         hidden binary_truth fold"
+    );
+    let got = json_of(
+        &tools::claims::get_claim(
+            &server,
+            &w.author_viewer,
+            GetClaimParams {
+                claim_id: claim.to_string(),
+                frame_id: None,
+                perspective_id: None,
+            },
+        )
+        .await
+        .expect("get_claim"),
+    );
+    assert!(
+        got["classification"].is_null(),
+        "get_claim served a verdict derived from evidence the reader cannot read: {got}"
+    );
 }
 
 /// The cache owner frame of `claim` as `viewer` resolves it on the

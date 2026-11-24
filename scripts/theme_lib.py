@@ -100,11 +100,13 @@ def public_label_source(alias="c"):
         its `cluster-<id>` placeholder;
       * refine_clusters.interactive_label (cluster_labels via
         train_and_apply): the operator who types the sub-label names is shown
-        only public members' text.
+        only public members' text;
+      * anchor_papers_to_themes (the `anchor_label` property of INSTANTIATES
+        edges, from the judge's `refined_anchor_label` or the candidate's
+        label): stored only when the paper claim and a review L2 candidate
+        both pass it, else NO_PUBLIC_SOURCE_ANCHOR_LABEL. Its judge still
+        reads the text, as its verdict decides membership only.
     Checked and NOT routed through it, each for its stated reason:
-      * anchor_papers_to_themes writes no theme row: its LLM-derived
-        `refined_anchor_label` is stored as an edge property through the API,
-        so it is outside theme labels (a separate question);
       * project_to_themes copies cluster_labels (filtered above);
         split_theme, maintain_themes.auto_split_theme and the
         create-with-centroid route write placeholder or derived labels;
@@ -126,9 +128,9 @@ def public_label_source(alias="c"):
         already read.
     Labels stored before this rule existed are not rewritten by it: re-run
     label_themes_llm with --relabel-all (and re-label cluster runs) to replace
-    them. That run reads only themes with a 1536-d `centroid`; a seeded theme
-    whose section had only 3072-d embeddings has none and needs a separate
-    relabel.
+    them. That run reads every theme, whatever its centroid (1536-d, 3072-d
+    only, or none), so a seeded theme whose section had only 3072-d
+    embeddings is relabelled too.
     """
     return f"({alias}.visibility = 'public' AND {not_intake_owned(alias)})"
 

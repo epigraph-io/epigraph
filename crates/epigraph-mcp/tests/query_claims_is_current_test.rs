@@ -158,9 +158,7 @@ async fn seed_claim(
         .as_bytes()
         .iter()
         .copied()
-        // `repeat(..).take(..)`, not `repeat_n`: this crate's clippy MSRV is
-        // 1.75 and `iter::repeat_n` is 1.82+.
-        .chain(std::iter::repeat(0).take(16))
+        .chain(std::iter::repeat_n(0, 16))
         .take(32)
         .collect();
     sqlx::query(

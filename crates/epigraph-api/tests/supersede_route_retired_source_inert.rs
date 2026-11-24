@@ -64,11 +64,39 @@ async fn plant_interval(pool: &PgPool, claim: Uuid, bel: f64, pl: f64) {
 }
 
 async fn keyed_on(pool: &PgPool, edge: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
-        .bind(edge)
-        .fetch_one(pool)
-        .await
-        .expect("count edge-keyed rows")
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("count edge-keyed rows")
+}
+
+/// Live BBAs keyed on an edge sourced at `retired`, held by a current claim:
+/// what SPEC §11 K10(2) says must be empty after the cascade (the MCP twin's
+/// global assertion).
+async fn live_rows_from_retired_source(pool: &PgPool, retired: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions mf \
+           JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
+           JOIN claims h ON h.id = mf.claim_id \
+          WHERE e.source_type = 'claim' AND e.source_id = $1 \
+            AND h.is_current AND mf.retracted_at IS NULL",
+    )
+    .bind(retired)
+    .fetch_one(pool)
+    .await
+    .expect("count rows from the retired source")
+}
+
+fn report_ids(body: &serde_json::Value, key: &str) -> Vec<String> {
+    body["belief_cascade"][key]
+        .as_array()
+        .unwrap_or_else(|| panic!("belief_cascade.{key} is an array: {body}"))
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
 }
 
 async fn betp(pool: &PgPool, claim: Uuid) -> Option<f64> {
@@ -99,9 +127,15 @@ async fn an_http_supersede_invalidates_the_retired_refuters_edge_bba() {
     let supporter = common::seed_claim(&pool, &format!("k10 http supporter {tag}")).await;
     plant_interval(&pool, supporter, 0.6, 0.7).await;
     let target = common::seed_claim(&pool, &format!("k10 http target {tag}")).await;
+    let lonely = common::seed_claim(&pool, &format!("k10 http only contradicted {tag}")).await;
     let refutes = wire(&pool, refuter, target, "refutes").await;
     let supports = wire(&pool, supporter, target, "supports").await;
+    let contradicts = wire(&pool, refuter, lonely, "contradicts").await;
     let before = betp(&pool, target).await.expect("PREMISE: cached BetP");
+    assert!(
+        betp(&pool, lonely).await.is_some(),
+        "PREMISE: the contradicted claim has a cache"
+    );
 
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/claims/{refuter}/supersede"))
@@ -164,16 +198,34 @@ async fn an_http_supersede_invalidates_the_retired_refuters_edge_bba() {
         (after - coherent).abs() < 1e-12,
         "cache {after} equals the fold of what survives {coherent}"
     );
-    let targets: Vec<String> = body["belief_cascade"]["targets"]
-        .as_array()
-        .expect("targets")
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
+    let targets = report_ids(&body, "targets");
     assert!(
         targets.contains(&target.to_string()),
         "the HTTP report names the re-derived target: {body}"
     );
+
+    // Backlog 7c1bdeec (3): the unbacked case and the global assertion.
+    assert_eq!(
+        keyed_on(&pool, contradicts).await,
+        0,
+        "the contradicts BBA is invalidated, not re-minted from the successor"
+    );
+    assert_eq!(
+        betp(&pool, lonely).await,
+        None,
+        "a claim whose only BBA came from the retired claim is unbacked"
+    );
+    assert_eq!(
+        report_ids(&body, "unbacked"),
+        vec![lonely.to_string()],
+        "the HTTP report names the unbacked claim: {body}"
+    );
+    assert_eq!(
+        live_rows_from_retired_source(&pool, refuter).await,
+        0,
+        "no live BBA keyed on an edge sourced at the retired claim remains on a current claim"
+    );
+    assert_eq!(report_ids(&body, "errors"), Vec::<String>::new(), "{body}");
 }
 
 async fn preview_betp(pool: &PgPool, claim: Uuid) -> f64 {

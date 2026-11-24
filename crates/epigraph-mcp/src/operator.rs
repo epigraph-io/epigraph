@@ -124,7 +124,8 @@ pub fn check_operator_transport(
         return Err(format!(
             "--operator-id / EPIGRAPH_OPERATOR_ID ({operator}) requires a declared signer identity \
              (--agent-key, or the separate signing key EPIGRAPH_AGENT_IDENTITY_PUBKEY with \
-             EPIGRAPH_AGENT_SIGNING_KEY). Without one this process signs as a fresh random \
+             EPIGRAPH_AGENT_SIGNING_KEY or EPIGRAPH_AGENT_SIGNING_KEY_FILE). Without one this \
+             process signs as a fresh random \
              agent, and linking it would enrol a new throwaway writer in the operator's group on \
              every start."
         ));

@@ -14,6 +14,17 @@
 //!   --agent-key <base64-encoded-32-byte-secret>
 //! ```
 //!
+//! # Licence gate (backlog 1a462cc1)
+//!
+//! A claim's `supporting_text` (and a figure's image and caption) is
+//! publisher text. It is shipped verbatim only when `source.licence` permits
+//! retention (`epigraph_ingest::common::licence::passage_retention_permitted`,
+//! the same allowlist as the document-ingest path). Under any other licence,
+//! or none, the passage evidence carries the citation, a locator (page and
+//! section) and the passage's BLAKE3 hash instead, and figures are not
+//! attached; the run prints what it withheld. `--allow-verbatim` is the
+//! operator override for a source the operator has the right to republish.
+//!
 //! # Input Format
 //!
 //! ```json
@@ -22,7 +33,8 @@
 //!     "doi": "10.1000/example",
 //!     "title": "Example Paper",
 //!     "authors": ["Author One"],
-//!     "journal": "Nature"
+//!     "journal": "Nature",
+//!     "licence": "CC-BY-4.0"
 //!   },
 //!   "claims": [
 //!     {
@@ -41,6 +53,7 @@
 //! ```
 
 use epigraph_crypto::{AgentSigner, ContentHasher, SignedEntity};
+use epigraph_ingest::common::licence::passage_retention_permitted;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -59,6 +72,9 @@ struct Args {
     agent_key: String,
     /// Dry run mode - validate and show packets without submitting
     dry_run: bool,
+    /// Ship verbatim passages and figures whatever `source.licence` says
+    /// (operator override of the licence gate)
+    allow_verbatim: bool,
 }
 
 impl Args {
@@ -69,6 +85,7 @@ impl Args {
         let mut endpoint = "http://localhost:8080".to_string();
         let mut agent_key = "generate".to_string();
         let mut dry_run = false;
+        let mut allow_verbatim = false;
 
         let mut i = 1;
         while i < args.len() {
@@ -96,6 +113,9 @@ impl Args {
                 "--dry-run" | "-n" => {
                     dry_run = true;
                 }
+                "--allow-verbatim" => {
+                    allow_verbatim = true;
+                }
                 "--help" | "-h" => {
                     return Err(USAGE.to_string());
                 }
@@ -113,6 +133,7 @@ impl Args {
             endpoint,
             agent_key,
             dry_run,
+            allow_verbatim,
         })
     }
 }
@@ -125,6 +146,8 @@ Options:
   -e, --endpoint <URL>     API endpoint [default: http://localhost:8080]
   -k, --agent-key <KEY>    Base64-encoded 32-byte agent key, or 'generate' [default: generate]
   -n, --dry-run            Validate and show packets without submitting
+      --allow-verbatim     Ship supporting passages and figures verbatim even when
+                           source.licence does not permit retention (operator override)
   -h, --help               Show this help message";
 
 /// Maximum allowed input file size (100 MB). Prevents OOM from malicious or
@@ -157,6 +180,12 @@ struct LiteratureSource {
     authors: Vec<AuthorEntry>,
     #[allow(dead_code)]
     journal: Option<String>,
+    /// The source's licence (an SPDX id such as `CC-BY-4.0`). Decides whether
+    /// supporting passages and figures may be shipped verbatim; absent means
+    /// unknown, which withholds them. `license` (US spelling) is read too, so
+    /// a producer that spells it that way is not silently treated as unknown.
+    #[serde(default, alias = "license")]
+    licence: Option<String>,
 }
 
 /// Author entry — backward-compatible with plain strings or enriched objects
@@ -311,14 +340,55 @@ struct EpistemicPacket {
     signature: String,
 }
 
+/// The server's `routes::submit::ClaimSubmission` in the shape the server
+/// RE-serializes it, because the packet signature covers the server's
+/// canonical bytes (`EpistemicPacket::signable_bytes`): `idempotency_key`,
+/// `properties` (`null`) and `labels` (`[]`) are always present, as the
+/// server writes them; an absent `initial_truth` is skipped (the server
+/// refuses `null`).
 #[derive(Debug, Serialize)]
 struct ClaimSubmission {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     initial_truth: Option<f64>,
     agent_id: Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<String>,
+    properties: Option<serde_json::Value>,
+    labels: Vec<String>,
+}
+
+/// The bytes the submit route verifies a packet signature over: the canonical
+/// JSON of `(claim, evidence, reasoning_trace)`, signature excluded, as the
+/// server's `EpistemicPacket::signable_bytes` builds them.
+#[derive(Serialize)]
+struct PacketSignable<'a> {
+    claim: &'a ClaimSubmission,
+    evidence: &'a [EvidenceSubmission],
+    reasoning_trace: &'a ReasoningTraceSubmission,
+}
+
+/// The packet signature: raw Ed25519 by the claim's agent over
+/// [`PacketSignable`], which the server checks when
+/// `EPIGRAPH_REQUIRE_SIGNATURES` is on.
+fn packet_signature(
+    signer: &AgentSigner,
+    claim: &ClaimSubmission,
+    evidence: &[EvidenceSubmission],
+    reasoning_trace: &ReasoningTraceSubmission,
+) -> String {
+    // Canonicalize the packet as the server will PARSE it (JSON text read
+    // back), so each float is the f64 the server derives from the request.
+    let wire = serde_json::to_vec(&PacketSignable {
+        claim,
+        evidence,
+        reasoning_trace,
+    })
+    .expect("a packet of strings, numbers and JSON values always serializes");
+    let as_parsed: serde_json::Value =
+        serde_json::from_slice(&wire).expect("serde_json reads back its own output");
+    let canonical =
+        epigraph_crypto::to_canonical_bytes(&as_parsed).expect("a JSON value always serializes");
+    hex::encode(signer.sign(&canonical))
 }
 
 #[derive(Debug, Serialize)]
@@ -373,6 +443,17 @@ struct SubmitResponse {
 struct CreateAgentRequest {
     public_key: String,
     display_name: Option<String>,
+    /// `seed-derived` for a key computable from a public seed (the server then
+    /// stores it as no verifier and provisions no OAuth client); omitted for a
+    /// real signer, which the server takes as `ed25519`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_kind: Option<&'static str>,
+    /// With `key_kind`: the hex signature, under `public_key`, of
+    /// `key_kind_declaration_message(key_kind, public_key)`, proving this
+    /// caller holds the key it declares (the server refuses a declaration
+    /// without it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_kind_proof: Option<String>,
 }
 
 /// Response from POST /agents
@@ -386,28 +467,50 @@ struct AgentResponse {
 /// Generate a deterministic Ed25519 signer from a seed string.
 /// Uses BLAKE3(seed) as the 32-byte secret key, so the same seed always
 /// produces the same keypair.
+///
+/// The seed is PUBLIC (`<doi>:<author name>`), so anyone can compute this
+/// private key: it NAMES an author and must never sign a claim, evidence or
+/// edge (backlog 57943a39). It leaves this file only through
+/// [`author_agent_request`]: its public half, and the domain-separated
+/// proof that declares it `seed-derived`.
 fn deterministic_signer(seed: &str) -> AgentSigner {
     let hash = ContentHasher::hash(seed.as_bytes());
     let key_bytes: [u8; 32] = hash[..32].try_into().expect("BLAKE3 produces 32 bytes");
     AgentSigner::from_bytes(&key_bytes).expect("valid Ed25519 key from BLAKE3 output")
 }
 
+/// The POST /agents body for one author of the paper `doi`: the public half
+/// of the deterministic `<doi>:<name>` key (so the same author of the same
+/// paper is the same agent on every run), declared `seed-derived` because
+/// its private half is computable by anyone, with the proof of possession
+/// the server requires for that declaration. The server stores it so that no
+/// verifier accepts the key and gives it no OAuth client.
+fn author_agent_request(doi: &str, name: &str) -> CreateAgentRequest {
+    let seed = format!("{doi}:{name}");
+    let author = deterministic_signer(&seed);
+    let public_key = author.public_key();
+    let proof = author.sign(&epigraph_crypto::key_kind_declaration_message(
+        "seed-derived",
+        &public_key,
+    ));
+    CreateAgentRequest {
+        public_key: hex::encode(public_key),
+        display_name: Some(name.to_string()),
+        key_kind: Some("seed-derived"),
+        key_kind_proof: Some(hex::encode(proof)),
+    }
+}
+
 /// Register an agent via the API. Returns the server-assigned agent ID.
 async fn register_agent(
     client: &reqwest::Client,
     endpoint: &str,
-    signer: &AgentSigner,
-    display_name: &str,
+    req: &CreateAgentRequest,
 ) -> Result<Uuid, String> {
-    let req = CreateAgentRequest {
-        public_key: hex::encode(signer.public_key()),
-        display_name: Some(display_name.to_string()),
-    };
-
     let url = format!("{endpoint}/agents");
     let resp = client
         .post(&url)
-        .json(&req)
+        .json(req)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -430,17 +533,80 @@ async fn register_agent(
 // PACKET BUILDER
 // =============================================================================
 
+/// Whether this run may ship the source's passages and figures verbatim: the
+/// source's licence permits retention, or the operator passed
+/// `--allow-verbatim`.
+fn verbatim_permitted(source: &LiteratureSource, allow_verbatim: bool) -> bool {
+    allow_verbatim || passage_retention_permitted(source.licence.as_deref())
+}
+
+/// The `raw_content` of a claim's passage evidence. Verbatim
+/// `supporting_text` when `verbatim` holds; otherwise the citation, a locator
+/// a reader holding the paper can follow, and the passage's BLAKE3 hash, worded
+/// like the document-ingest writer's body (`literature_evidence_body`).
+fn passage_evidence_body(
+    source: &LiteratureSource,
+    claim: &ExtractedClaim,
+    verbatim: bool,
+) -> String {
+    if verbatim {
+        return claim.supporting_text.clone();
+    }
+    let mut locator = claim
+        .page
+        .map_or_else(|| "full document".to_string(), |p| format!("page {p}"));
+    if let Some(section) = &claim.section {
+        locator.push_str(&format!(", section {section:?}"));
+    }
+    let passage_hash = hex::encode(ContentHasher::hash(claim.supporting_text.as_bytes()));
+    let licence = source.licence.as_deref().map_or_else(
+        || "licence unknown".to_string(),
+        |l| format!("licence: {l}"),
+    );
+    format!(
+        "Source: {} (DOI: {}). Locator: {locator}. Passage BLAKE3: {passage_hash}. \
+         Passage not retained ({licence}).",
+        source.title, source.doi
+    )
+}
+
+/// What the licence gate kept out of a run's packets, for the operator log:
+/// `None` when nothing was withheld.
+fn withheld_summary(extraction: &LiteratureExtraction, allow_verbatim: bool) -> Option<String> {
+    if verbatim_permitted(&extraction.source, allow_verbatim) {
+        return None;
+    }
+    let figures = extraction
+        .figures
+        .iter()
+        .filter(|f| f.image_base64.is_some())
+        .count();
+    Some(format!(
+        "Licence gate ({}): withheld {} supporting passage(s) (stored as locator + BLAKE3 \
+         hash) and {figures} figure(s). Pass --allow-verbatim only for a source you may \
+         republish.",
+        extraction
+            .source
+            .licence
+            .as_deref()
+            .unwrap_or("licence unknown"),
+        extraction.claims.len(),
+    ))
+}
+
 fn build_packets(
     extraction: &LiteratureExtraction,
     signer: &AgentSigner,
     agent_id: Uuid,
+    allow_verbatim: bool,
 ) -> Vec<EpistemicPacket> {
+    let verbatim = verbatim_permitted(&extraction.source, allow_verbatim);
     extraction
         .claims
         .iter()
         .map(|claim| {
-            // Build literature text evidence
-            let raw_content = claim.supporting_text.clone();
+            // Build literature text evidence (licence-gated, backlog 1a462cc1)
+            let raw_content = passage_evidence_body(&extraction.source, claim, verbatim);
             let content_hash = ContentHasher::hash(raw_content.as_bytes());
             let content_hash_hex = hex::encode(content_hash);
 
@@ -465,7 +631,9 @@ fn build_packets(
             // Find figures near this claim's page and create Figure evidence.
             // Uses ±2 page proximity: main text figures are often on adjacent pages.
             // Cap at 3 figures per claim to avoid bloating packets.
-            if let Some(claim_page) = claim.page {
+            // A figure's image and caption are publisher content too: under a
+            // licence that does not permit retention none is attached.
+            if let (true, Some(claim_page)) = (verbatim, claim.page) {
                 let mut fig_count = 0u32;
                 for fig in &extraction.figures {
                     if fig_count >= 3 {
@@ -533,12 +701,14 @@ fn build_packets(
                 initial_truth: None, // Let the engine calculate from evidence
                 agent_id,
                 idempotency_key: None,
+                properties: None,
+                labels: Vec::new(),
             };
 
-            // The submit/packet endpoint requires a placeholder signature (128 hex zeros)
-            // until Ed25519 verification is wired up server-side. Real signatures are
-            // rejected by the current server implementation (see submit.rs validation).
-            let packet_signature = "0".repeat(128);
+            // Signed over the submit route's canonical bytes, so the packet
+            // passes with EPIGRAPH_REQUIRE_SIGNATURES on.
+            let packet_signature =
+                packet_signature(signer, &claim_submission, &evidence_items, &trace);
 
             EpistemicPacket {
                 claim: claim_submission,
@@ -687,8 +857,15 @@ async fn main() {
         id
     } else {
         let client = auth_client.clone();
-        let display_name = format!("literature-ingester:{}", extraction.source.doi);
-        match register_agent(&client, &args.endpoint, &signer, &display_name).await {
+        // The run's own signer: a random or operator-supplied key, a real
+        // verifier (it signs the evidence), so no `key_kind` is declared.
+        let req = CreateAgentRequest {
+            public_key: hex::encode(signer.public_key()),
+            display_name: Some(format!("literature-ingester:{}", extraction.source.doi)),
+            key_kind: None,
+            key_kind_proof: None,
+        };
+        match register_agent(&client, &args.endpoint, &req).await {
             Ok(id) => {
                 println!("Registered agent: {id}");
                 id
@@ -701,8 +878,20 @@ async fn main() {
     };
 
     // Build packets
-    let packets = build_packets(&extraction, &signer, agent_id);
+    let packets = build_packets(&extraction, &signer, agent_id, args.allow_verbatim);
     println!("Built {} epistemic packets", packets.len());
+    match withheld_summary(&extraction, args.allow_verbatim) {
+        Some(summary) => eprintln!("{summary}"),
+        None if args.allow_verbatim
+            && !passage_retention_permitted(extraction.source.licence.as_deref()) =>
+        {
+            eprintln!(
+                "Licence gate overridden by --allow-verbatim ({}): passages and figures ship verbatim.",
+                extraction.source.licence.as_deref().unwrap_or("licence unknown")
+            );
+        }
+        None => {}
+    }
 
     if args.dry_run {
         println!("\n--- DRY RUN MODE ---");
@@ -817,15 +1006,15 @@ async fn main() {
     let mut submitted = 0;
     let mut failed = 0;
 
-    // Register per-author agents (deterministic keys so same author → same keypair)
+    // Register per-author agents (deterministic keys so same author → same
+    // agent), declared seed-derived: they name the authors and sign nothing.
     let mut author_agents: std::collections::HashMap<String, Uuid> =
         std::collections::HashMap::new();
 
     for author in &extraction.source.authors {
         let name = author.name();
-        let seed = format!("{}:{}", extraction.source.doi, name);
-        let author_signer = deterministic_signer(&seed);
-        match register_agent(&client, &args.endpoint, &author_signer, name).await {
+        let req = author_agent_request(&extraction.source.doi, name);
+        match register_agent(&client, &args.endpoint, &req).await {
             Ok(id) => {
                 println!("Registered author agent: {name} → {id}");
                 author_agents.insert(name.to_string(), id);
@@ -1191,7 +1380,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         assert_eq!(packets.len(), 2, "Should produce one packet per claim");
 
@@ -1217,7 +1406,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         // Evidence should have a valid hex-encoded signature
         let sig_hex = packets[0].evidence[0].signature.as_ref().unwrap();
@@ -1252,7 +1441,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         assert!(
             packets[0]
@@ -1302,7 +1491,7 @@ mod tests {
 
         let extraction: LiteratureExtraction = serde_json::from_str(json).unwrap();
         let signer = AgentSigner::generate();
-        let packets = build_packets(&extraction, &signer, Uuid::new_v4());
+        let packets = build_packets(&extraction, &signer, Uuid::new_v4(), false);
 
         assert!(packets.is_empty());
     }
@@ -1334,7 +1523,8 @@ mod tests {
             "source": {
                 "doi": "10.1000/fig-test",
                 "title": "Paper With Figures",
-                "authors": ["Test Author"]
+                "authors": ["Test Author"],
+                "licence": "CC-BY-4.0"
             },
             "claims": [
                 {
@@ -1415,7 +1605,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         // First claim is on page 10, figure 2a is also on page 10
         assert_eq!(
@@ -1475,7 +1665,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         // Verify figure evidence hash matches raw_content
         let fig_evidence = &packets[0].evidence[1]; // Figure evidence on page 10
@@ -1630,7 +1820,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         assert_eq!(packets.len(), 2);
         // First claim has methodology "instrumental" from enriched JSON
@@ -1647,7 +1837,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         // All claims should default to "extraction" methodology
         for packet in &packets {
@@ -1671,6 +1861,51 @@ mod tests {
         assert!(extraction.claims[1].instruments_used.is_empty());
         assert_eq!(extraction.claims[1].reagents_involved, vec!["TIMe-Ge"]);
         assert!(extraction.claims[1].conditions.is_empty());
+    }
+
+    /// Backlog 57943a39: an author's key is computable from the DOI and the
+    /// name, so its registration must declare it `seed-derived` (the server
+    /// then stores no verifier and provisions no OAuth client). Before, the
+    /// body carried no `key_kind` and the server stored an `ed25519` signer
+    /// with an active client. The key is still the deterministic one, so the
+    /// same author of the same paper stays one agent.
+    #[test]
+    fn an_author_is_registered_as_a_seed_derived_key() {
+        let doi = "10.48550/arXiv.2508.16798";
+        let body = serde_json::to_value(author_agent_request(doi, "Huff, T.")).unwrap();
+        assert_eq!(body["key_kind"], "seed-derived", "{body}");
+        assert_eq!(
+            body["public_key"],
+            hex::encode(deterministic_signer(&format!("{doi}:Huff, T.")).public_key()),
+            "{body}"
+        );
+        assert_eq!(body["display_name"], "Huff, T.", "{body}");
+        // The proof of possession the server requires with the declaration.
+        let key: [u8; 32] = hex::decode(body["public_key"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let proof: [u8; 64] = hex::decode(body["key_kind_proof"].as_str().expect("proof"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(epigraph_crypto::SignatureVerifier::verify(
+            &key,
+            &epigraph_crypto::key_kind_declaration_message("seed-derived", &key),
+            &proof
+        )
+        .unwrap());
+
+        // The run's own signer is a real verifier: no declaration at all.
+        let run = CreateAgentRequest {
+            public_key: hex::encode(AgentSigner::generate().public_key()),
+            display_name: None,
+            key_kind: None,
+            key_kind_proof: None,
+        };
+        let body = serde_json::to_value(run).unwrap();
+        assert!(body.get("key_kind").is_none(), "{body}");
+        assert!(body.get("key_kind_proof").is_none(), "{body}");
     }
 
     #[test]
@@ -1714,5 +1949,193 @@ mod tests {
         assert!(extraction.source.authors[0].affiliations().is_empty());
         assert_eq!(extraction.source.authors[1].name(), "Detailed, A.");
         assert_eq!(extraction.source.authors[1].affiliations(), &["MIT"]);
+    }
+
+    // =========================================================================
+    // LICENCE GATE (backlog 1a462cc1)
+    // =========================================================================
+
+    /// One claim near one figure, under `licence` (omitted when `None`).
+    fn licensed_extraction(licence: Option<&str>) -> LiteratureExtraction {
+        let mut json = serde_json::json!({
+            "source": {
+                "doi": "10.9999/t88-licence",
+                "title": "Licence Gate Paper",
+                "authors": ["Gate, L."]
+            },
+            "claims": [{
+                "statement": "The film conducts above 40 K",
+                "page": 7,
+                "section": "Results",
+                "confidence": 0.8,
+                "supporting_text": LICENSED_PASSAGE
+            }],
+            "figures": [{
+                "page": 7,
+                "figure_id": "fig3",
+                "caption": "Figure 3. Publisher caption text.",
+                "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            }]
+        });
+        if let Some(l) = licence {
+            json["source"]["licence"] = serde_json::json!(l);
+        }
+        serde_json::from_value(json).expect("fixture parses")
+    }
+
+    const LICENSED_PASSAGE: &str =
+        "Publisher prose the evidence table must not republish verbatim, word for word";
+
+    /// The withheld shape: no passage, no figure image or caption, a body
+    /// whose stored hash is its own digest, and the passage's BLAKE3.
+    fn assert_withheld(packets: &[EpistemicPacket], why: &str) {
+        assert_eq!(packets.len(), 1);
+        let p = &packets[0];
+        let passage_hash = hex::encode(ContentHasher::hash(LICENSED_PASSAGE.as_bytes()));
+        for ev in &p.evidence {
+            let raw = ev.raw_content.as_deref().unwrap_or("");
+            assert!(
+                !raw.contains(LICENSED_PASSAGE),
+                "verbatim passage shipped ({why}): {raw}"
+            );
+            assert!(
+                !matches!(ev.evidence_type, EvidenceTypeSubmission::Figure { .. }),
+                "publisher figure shipped ({why})"
+            );
+            assert_eq!(
+                ev.content_hash,
+                hex::encode(ContentHasher::hash(raw.as_bytes())),
+                "content_hash must be the digest of the body the server checks"
+            );
+        }
+        let body = p.evidence[0].raw_content.as_deref().unwrap();
+        assert!(
+            body.contains(&format!("Passage BLAKE3: {passage_hash}.")),
+            "the passage hash pins the withheld text: {body}"
+        );
+        assert!(
+            body.contains("page 7"),
+            "a locator a reader can follow: {body}"
+        );
+        assert!(body.contains("Passage not retained"), "{body}");
+    }
+
+    #[test]
+    fn non_open_licence_input_emits_no_verbatim_passage() {
+        let signer = AgentSigner::generate();
+        let packets = build_packets(
+            &licensed_extraction(Some("CC-BY-NC-4.0")),
+            &signer,
+            Uuid::new_v4(),
+            false,
+        );
+        assert_withheld(&packets, "CC-BY-NC-4.0");
+    }
+
+    #[test]
+    fn unknown_licence_input_emits_no_verbatim_passage() {
+        let signer = AgentSigner::generate();
+        let packets = build_packets(&licensed_extraction(None), &signer, Uuid::new_v4(), false);
+        assert_withheld(&packets, "no licence");
+        assert!(
+            withheld_summary(&licensed_extraction(None), false).is_some_and(|s| s
+                .contains("withheld 1 supporting passage(s)")
+                && s.contains("1 figure(s)"))
+        );
+    }
+
+    #[test]
+    fn open_licence_ships_passage_and_figure_verbatim() {
+        let signer = AgentSigner::generate();
+        let extraction = licensed_extraction(Some("CC-BY-4.0"));
+        let packets = build_packets(&extraction, &signer, Uuid::new_v4(), false);
+        assert_eq!(
+            packets[0].evidence[0].raw_content.as_deref(),
+            Some(LICENSED_PASSAGE)
+        );
+        assert!(packets[0]
+            .evidence
+            .iter()
+            .any(|e| matches!(e.evidence_type, EvidenceTypeSubmission::Figure { .. })));
+        assert_eq!(withheld_summary(&extraction, false), None);
+    }
+
+    #[test]
+    fn us_spelled_license_key_is_read() {
+        // A producer writing `license` must not be silently read as "unknown".
+        let mut json = serde_json::json!({
+            "source": {"doi": "10.9999/t88-us", "title": "US Spelling", "authors": []},
+            "claims": [{
+                "statement": "s", "page": 1, "confidence": 0.5,
+                "supporting_text": LICENSED_PASSAGE
+            }]
+        });
+        json["source"]["license"] = serde_json::json!("CC-BY-4.0");
+        let extraction: LiteratureExtraction = serde_json::from_value(json).unwrap();
+        assert_eq!(extraction.source.licence.as_deref(), Some("CC-BY-4.0"));
+        let packets = build_packets(&extraction, &AgentSigner::generate(), Uuid::new_v4(), false);
+        assert_eq!(
+            packets[0].evidence[0].raw_content.as_deref(),
+            Some(LICENSED_PASSAGE)
+        );
+    }
+
+    #[test]
+    fn allow_verbatim_overrides_a_restrictive_licence() {
+        let signer = AgentSigner::generate();
+        let extraction = licensed_extraction(Some("All rights reserved"));
+        let packets = build_packets(&extraction, &signer, Uuid::new_v4(), true);
+        assert_eq!(
+            packets[0].evidence[0].raw_content.as_deref(),
+            Some(LICENSED_PASSAGE)
+        );
+        assert_eq!(packets[0].evidence.len(), 2, "passage + figure");
+        assert_eq!(withheld_summary(&extraction, true), None);
+    }
+
+    // =========================================================================
+    // PACKET SIGNATURE (sibling of backlog 7d9e60c6)
+    // =========================================================================
+
+    /// What `routes/submit.rs` does with `require_packet_signatures` on: parse
+    /// the wire JSON into the server's packet, recompute `signable_bytes()`,
+    /// verify the signature under the claim agent's key.
+    fn server_accepts(packet: &EpistemicPacket, signer: &AgentSigner) -> bool {
+        // The request body as bytes, parsed the way axum's `Json` parses it.
+        let wire = serde_json::to_vec(packet).expect("client packet serializes");
+        let server: epigraph_api::routes::submit::EpistemicPacket =
+            serde_json::from_slice(&wire).expect("server parses the client packet");
+        let canonical = server.signable_bytes().expect("canonical bytes");
+        let Ok(sig) = <[u8; 64]>::try_from(hex::decode(&server.signature).unwrap()) else {
+            return false;
+        };
+        epigraph_crypto::SignatureVerifier::verify(&signer.public_key(), &canonical, &sig)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn literature_packets_verify_like_the_server() {
+        let signer = AgentSigner::generate();
+        // Open licence: a text passage AND a figure in the signed evidence.
+        let open = build_packets(
+            &licensed_extraction(Some("CC-BY-4.0")),
+            &signer,
+            Uuid::new_v4(),
+            false,
+        );
+        // Withheld: the locator + hash body.
+        let withheld = build_packets(&licensed_extraction(None), &signer, Uuid::new_v4(), false);
+        // A float with a long shortest representation travels as JSON text.
+        let mut awkward = licensed_extraction(None);
+        awkward.claims[0].confidence = 0.1 + 0.2;
+        let awkward = build_packets(&awkward, &signer, Uuid::new_v4(), false);
+        for p in open.iter().chain(&withheld).chain(&awkward) {
+            assert_ne!(p.signature, "0".repeat(128), "no placeholder signature");
+            assert!(
+                server_accepts(p, &signer),
+                "a literature packet must pass require_packet_signatures verification"
+            );
+            assert!(!server_accepts(p, &AgentSigner::generate()));
+        }
     }
 }

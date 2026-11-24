@@ -79,12 +79,13 @@
 //!   other end, and an edge from a claim outside the run to a moving trace
 //!   takes the exact meet too (co-owned, reported as `CO-OWNED-EDGE`; a public
 //!   one holds the claim, `public-row`).
-//!   `epigraph_node_tenancy` (070), and so the trigger, count such a node as
-//!   public (a workflow excepted since migration 219, which meets it with its
-//!   own row, as this tool does): left alone, the trigger would put an edge
-//!   from a source-private context on `('group', TARGET)` alone, which
-//!   source-only members lose and target-only members gain while it names a
-//!   node they cannot read. The
+//!   `epigraph_node_tenancy` (070), and so the trigger, counted such a node as
+//!   public until migrations 219 (a workflow) and 258 (a frame, context,
+//!   perspective or community) met it with its own row, as this tool does; a
+//!   reasoning trace is still counted as public. Left alone, a trigger that
+//!   counts the node as public puts an edge from a source-private node on
+//!   `('group', TARGET)` alone, which source-only members lose and target-only
+//!   members gain while it names a node they cannot read. The
 //!   tool writes the exact meet instead (co-owned with the node's group) and
 //!   reports every edge to a group-private node that is not the target's
 //!   (`SOURCE-NODE-EDGE` lines and a count). A public node, or one in the
@@ -105,6 +106,22 @@
 //! names (`IRREVERSIBLE-EDGE` lines and a count): those claims will not be
 //! reversible by this tool.
 //!
+//! `--refuse-irreversible` holds such claims instead of moving them (HELD
+//! `irreversible`, reported as `HELD-UNDER-LOCK` lines; under `--apply` the
+//! run then exits 3, as for any other hold). Each batch is first PROBED in a
+//! transaction that is always rolled back and records into memory only, the
+//! claims an `IRREVERSIBLE-EDGE` names are taken out, and the probe repeats
+//! until none is named; only then does the real batch run, so the manifest
+//! never records a claim the run does not move. Should the real batch
+//! still find an `IRREVERSIBLE-EDGE` (an edge inserted on a moving claim
+//! between the probe's rollback and the batch's locks), it is rolled back as
+//! a failed batch (exit 2), never committed. A verdict is per batch (an
+//! edge to a claim of a later batch is judged against that claim as it is
+//! now), so the flag can hold a claim conservatively; a larger
+//! `--batch-size` judges more claims together. Restoring such an edge's
+//! recorded tuple exactly is not offered: that tuple is wider than its
+//! endpoints, which is what the reversal refuses to write.
+//!
 //! An edge is accepted only when its new meet is at least as narrow as its
 //! current tuple with the source replaced by the target; otherwise it holds
 //! its claim (`edge-would-widen`).
@@ -116,7 +133,18 @@
 //! (`LOCKED-PER-BATCH`), so a concurrent INSERT on a moving claim either
 //! commits before the batch reads its rows or is stamped after the move: no
 //! edge or fragment lands on the pre-move tuple behind the batch. That blocks
-//! every write to those tables on the instance while a batch runs.
+//! every write to those tables on the instance while a batch runs. Each
+//! `BATCH` line prints how long its transaction held those locks (`locks
+//! held <ms> ms`; for a batch whose every claim `--refuse-irreversible`
+//! held, the longest of its probes, which take the same locks) and the
+//! result prints the longest over every transaction, probes included
+//! (`longest lock hold`):
+//! about the stall a concurrent edge or fragment writer sees, per batch (it
+//! is timed from the transaction's begin, so a wait to acquire the locks is
+//! included). A dry run takes the same locks for the same reads and writes,
+//! but an apply also fsyncs the manifest and commits while holding them, so
+//! a dry run's figure at the intended `--batch-size` is a LOWER BOUND for
+//! the apply's (`docs/deploy.md`).
 //!
 //! Every moved claim is `('group', TARGET)`; every recorded row ends exactly
 //! where the rule above puts it and no row became public; the per-table row
@@ -218,6 +246,10 @@ pub struct Options {
     pub lock_timeout: String,
     /// How many claims the dry-run sample lists row by row.
     pub sample: usize,
+    /// Hold, instead of moving, every claim this run predicts `reown-reverse`
+    /// could not reverse (an `IRREVERSIBLE-EDGE` names it): see
+    /// [`run`]'s per-batch probe.
+    pub refuse_irreversible: bool,
 }
 
 /// Refuse obviously bad options before connecting.
@@ -300,6 +332,12 @@ pub enum Hold {
         table: String,
         id: String,
     },
+    /// `--refuse-irreversible`: an edge of the claim would be an
+    /// `IRREVERSIBLE-EDGE` (its recorded tuple is wider than the meet of its
+    /// endpoints after a restore, so `reown-reverse` would hold the claim).
+    Irreversible {
+        edges: Vec<String>,
+    },
 }
 
 impl Hold {
@@ -318,6 +356,7 @@ impl Hold {
             Self::Pinned { .. } => "pinned",
             Self::EdgeWouldWiden { .. } => "edge-would-widen",
             Self::ChangedSinceRecorded { .. } => "changed",
+            Self::Irreversible { .. } => "irreversible",
         }
     }
 }
@@ -374,6 +413,12 @@ impl fmt::Display for Hold {
                 f,
                 "{table} {id} changed since this run recorded it (another writer); its recorded \
                  prior would be stale"
+            ),
+            Self::Irreversible { edges } => write!(
+                f,
+                "--refuse-irreversible: edge(s) {} would be IRREVERSIBLE-EDGE (reown-reverse \
+                 would hold this claim), so it is not moved",
+                edges.join(",")
             ),
         }
     }
@@ -454,11 +499,14 @@ fn model_readable(
 /// table carries its own `(owner_group_id, visibility)`: entity type -> table.
 ///
 /// `epigraph_node_tenancy` (070) answers `('public', world)` for every type but
-/// claim, evidence and (since migration 219) workflow, so the trigger's meet
+/// claim, evidence, workflow (since migration 219), paper (since migration
+/// 246) and frame, context, perspective and community (since migration 258),
+/// so the trigger's meet
 /// treats such a node as public even when the row itself is group-private (a
-/// frame, context, perspective or community, migration 062; a reasoning trace,
-/// which follows its claim; a workflow, migration 183, until 219). A workflow
-/// stays in this map: reading its own row agrees with the oracle. Read from the schema,
+/// reasoning trace, which follows its claim; a workflow, migration 183, until
+/// 219; the four registries, migration 062, until 258). The types the oracle
+/// meets (a workflow, a paper, the four registries) stay in this map: reading
+/// their own row agrees with it. Read from the schema,
 /// not from `entity_types.tenancy_tier` (which still says `derived` for
 /// `workflow`), so a type that gains tenancy columns later is covered.
 pub type NodeTypes = BTreeMap<String, String>;
@@ -887,7 +935,7 @@ struct Known {
 #[derive(Clone, Copy)]
 struct Ctx<'a> {
     specs: &'a [TableSpec],
-    /// Every table each batch locks (`batch_lock_tables`).
+    /// Every table each batch locks (`tables::batch_lock_tables`).
     unkeyed: &'a [String],
     nodes: &'a NodeTypes,
     source: Uuid,
@@ -1007,29 +1055,6 @@ async fn sealed_claims_of(
         }
     }
     Ok(out)
-}
-
-/// The tables every batch (apply and reverse) holds `SHARE ROW EXCLUSIVE` on
-/// for its duration: the derived tables with no key to claims
-/// (`tables::unkeyed_tables`), plus `edges` and `harvester_fragments`.
-///
-/// Why the last two: a concurrent INSERT of an edge (or fragment) on a moving
-/// claim is stamped by its trigger from the claim as that statement reads it,
-/// so one that read the claim before the batch's commit would land on the
-/// pre-move (source) tuple after the commit, outside every check. The lock
-/// makes such an INSERT either commit before the batch reads its rows (the
-/// batch then sees and moves it) or wait until the batch commits (its trigger,
-/// which reads the claim with a fresh snapshot, then sees the move). Cost: a
-/// batch, dry runs included, blocks every edge and fragment write on the
-/// instance while it runs; keep batches short.
-fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = unkeyed.to_vec();
-    for t in ["edges", "harvester_fragments"] {
-        if !out.iter().any(|u| u == t) {
-            out.push(t.to_string());
-        }
-    }
-    out
 }
 
 /// Read every row the candidates carry and decide, per row, whether it
@@ -1401,6 +1426,9 @@ async fn run_batch(
 
     let views_before = three_views(conn, ctx, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Migration 240: the recorded runs of a flat workflow claim this batch
+    // re-tenants follow it, and the census accounts for them.
+    let runs = tables::RunsFollow::before(conn, &claim_ids).await?;
     // Migration 210's Atlas map epochs, as they stand before the first write.
     let mut map_epochs = tables::MapEpochs::before(conn).await?;
 
@@ -1578,6 +1606,9 @@ async fn run_batch(
             }
         }
         me.expect_into(conn, &mut expect_counts).await?;
+    }
+    if let Some(r) = runs.as_ref() {
+        v.extend(r.expect_into(conn, &mut expect_counts).await?);
     }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
@@ -1846,6 +1877,80 @@ pub struct RunReport {
     pub irreversible_claims: usize,
     pub manifest_rows: usize,
     pub audit_written: bool,
+    /// How long each batch transaction (probes included) held the
+    /// `LOCKED-PER-BATCH` locks.
+    pub lock_hold: LockHold,
+}
+
+/// The per-transaction lock-hold times of a run: every batch transaction
+/// (and every `--refuse-irreversible` probe) holds `SHARE ROW EXCLUSIVE` on
+/// the `LOCKED-PER-BATCH` tables from its first statement to its end, which
+/// is the longest any edge or fragment write on the instance waits on it.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct LockHold {
+    pub transactions: usize,
+    pub max_ms: u128,
+}
+
+impl LockHold {
+    fn record(&mut self, ms: u128) {
+        self.transactions += 1;
+        self.max_ms = self.max_ms.max(ms);
+    }
+}
+
+/// `--refuse-irreversible`'s probe of one batch: run it in a transaction that
+/// is always rolled back, recording into memory only and writing no audit
+/// row, and take out every claim an `IRREVERSIBLE-EDGE` verdict names (HELD
+/// `irreversible`, with the edges). Removing a claim changes the batch's
+/// moving set and so the other verdicts, so repeat until no claim is named.
+/// A probe that fails returns the batch as it stands: the real batch then
+/// meets the same failure and reports it. Also returns the longest lock hold
+/// of this batch's probes (each is recorded in `lock_hold` too).
+///
+/// A verdict is per batch: an edge whose other end moves in a LATER batch is
+/// judged against that end as it is now, so the probe may hold a claim the
+/// whole run would not have left irreversible. Listing such claims in one
+/// batch (`--batch-size`) judges them together.
+async fn probe_irreversible(
+    conn: &mut PgConnection,
+    ctx: &Ctx<'_>,
+    mut claims: Vec<Uuid>,
+    known: &Known,
+    lock_hold: &mut LockHold,
+) -> anyhow::Result<(Vec<Uuid>, Vec<(Uuid, Hold)>, u128)> {
+    let mut refused: Vec<(Uuid, Hold)> = Vec::new();
+    let mut longest: u128 = 0;
+    let probe_ctx = Ctx { sample: 0, ..*ctx };
+    while !claims.is_empty() {
+        let started = std::time::Instant::now();
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        let mut scratch = Sink::Memory(Default::default(), 0);
+        let r = run_batch(&mut tx, &probe_ctx, &claims, &mut scratch, known, None).await;
+        tx.rollback().await?;
+        let held_ms = started.elapsed().as_millis();
+        lock_hold.record(held_ms);
+        longest = longest.max(held_ms);
+        let Ok(b) = r else { break };
+        let mut named: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
+        for (edge, verdict) in &b.irreversible {
+            if let Some((_, cs)) = verdict {
+                for c in cs {
+                    named.entry(*c).or_default().push(edge.clone());
+                }
+            }
+        }
+        if named.is_empty() {
+            break;
+        }
+        claims.retain(|c| !named.contains_key(c));
+        refused.extend(
+            named
+                .into_iter()
+                .map(|(c, edges)| (c, Hold::Irreversible { edges })),
+        );
+    }
+    Ok((claims, refused, longest))
 }
 
 /// The exit code for `report` (see the module doc).
@@ -1941,7 +2046,7 @@ pub async fn run(
             t.name
         );
     }
-    let unkeyed = batch_lock_tables(&tables::unkeyed_tables(conn, &specs).await?);
+    let unkeyed = tables::batch_lock_tables(&tables::unkeyed_tables(conn, &specs).await?);
     let nodes = node_types(conn).await?;
     tables::probe_session_switch(conn).await?;
     let guard = super::hide::guard_status(conn).await?;
@@ -2093,6 +2198,7 @@ pub async fn run(
             "already": already.len(),
         },
         "batch_size": opts.batch_size,
+        "refuse_irreversible": opts.refuse_irreversible,
     });
 
     let mut known = Known::default();
@@ -2103,6 +2209,32 @@ pub async fn run(
     let mut node_edges: BTreeMap<String, String> = BTreeMap::new();
     let mut irreversible: BTreeMap<String, Irreversible> = BTreeMap::new();
     for (i, batch) in batches.iter().enumerate() {
+        // `--refuse-irreversible`: probe the batch first, in a transaction
+        // that is always rolled back and records into memory only (so the
+        // manifest never names a claim this run does not move), and drop
+        // every claim an IRREVERSIBLE-EDGE names; repeat until none is named.
+        // Each probe holds the batch's locks for its own duration.
+        let mut claims: Vec<Uuid> = batch.to_vec();
+        let mut probe_ms: u128 = 0;
+        if opts.refuse_irreversible {
+            let (kept, refused, longest) =
+                probe_irreversible(conn, &ctx, claims, &known, &mut report.lock_hold).await?;
+            claims = kept;
+            probe_ms = longest;
+            report.held_under_lock.extend(refused);
+        }
+        if claims.is_empty() {
+            // The probes held the same locks: report their longest hold, as
+            // every BATCH line does.
+            writeln!(
+                out,
+                "BATCH {}/{total}\tOK\t0 claim(s) moved (every claim held by \
+                 --refuse-irreversible; the figure is its probes')\tlocks held {probe_ms} ms",
+                i + 1
+            )?;
+            continue;
+        }
+        let started = std::time::Instant::now();
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let audit =
             (opts.apply && !report.audit_written).then_some((&audit_details, opts.operator));
@@ -2110,12 +2242,39 @@ pub async fn run(
             sample: ctx.sample.saturating_sub(sampled),
             ..ctx
         };
-        let r = run_batch(&mut tx, &ctx_i, batch, &mut sink, &known, audit).await;
+        let mut r = run_batch(&mut tx, &ctx_i, &claims, &mut sink, &known, audit).await;
+        // The probe ran in its own transaction: an edge inserted on a moving
+        // claim between the probe's rollback and this batch's locks can make
+        // a claim irreversible that the probe passed. Under the flag such a
+        // batch is never committed; it fails like an invariant violation.
+        if opts.refuse_irreversible {
+            if let Ok(b) = &r {
+                let late: Vec<String> = b
+                    .irreversible
+                    .iter()
+                    .filter_map(|(_, v)| v.as_ref().map(|(line, _)| line.clone()))
+                    .collect();
+                if !late.is_empty() {
+                    r = Err(BatchError::Invariant(
+                        late.into_iter()
+                            .map(|l| {
+                                format!(
+                                    "--refuse-irreversible: an edge became irreversible after \
+                                     the probe (a concurrent write); re-run the dry run: {l}"
+                                )
+                            })
+                            .collect(),
+                    ));
+                }
+            }
+        }
         if opts.apply && r.is_ok() {
             tx.commit().await?;
         } else {
             tx.rollback().await?;
         }
+        let held_ms = started.elapsed().as_millis();
+        report.lock_hold.record(held_ms);
         match r {
             Ok(b) => {
                 report.claims_moved += b.claims_moved;
@@ -2150,13 +2309,17 @@ pub async fn run(
                 }
                 writeln!(
                     out,
-                    "BATCH {}/{total}\tOK\t{} claim(s) moved",
+                    "BATCH {}/{total}\tOK\t{} claim(s) moved\tlocks held {held_ms} ms",
                     i + 1,
                     b.claims_moved
                 )?;
             }
             Err(e) => {
-                writeln!(out, "BATCH {}/{total}\tROLLED BACK\t{e}", i + 1)?;
+                writeln!(
+                    out,
+                    "BATCH {}/{total}\tROLLED BACK\t{e}\tlocks held {held_ms} ms",
+                    i + 1
+                )?;
                 report.batch_failures.push((i + 1, e.to_string()));
                 if opts.apply {
                     writeln!(out, "STOPPED: no further batch was attempted")?;
@@ -2224,6 +2387,15 @@ pub async fn run(
         report.irreversible_edges, report.irreversible_claims
     )?;
     writeln!(out, "  manifest row records: {}", report.manifest_rows)?;
+    writeln!(
+        out,
+        "  longest lock hold: {} ms over {} transaction(s) at --batch-size {} (each from the \
+         transaction's begin, lock waits included, to its commit or rollback: every edge and \
+         fragment write on the instance may wait about this long per batch; an apply also \
+         fsyncs the manifest and commits while holding the locks, so a dry run's figure is a \
+         lower bound)",
+        report.lock_hold.max_ms, report.lock_hold.transactions, opts.batch_size
+    )?;
     writeln!(
         out,
         "  invariants: {}",
@@ -2674,6 +2846,9 @@ async fn reverse_batch(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let views_before = three_views(conn, &ctx, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Migration 240: the recorded runs of a flat workflow claim this batch
+    // re-tenants follow it, and the census accounts for them.
+    let runs = tables::RunsFollow::before(conn, &claim_ids).await?;
     // Migration 210's Atlas map epochs, as they stand before the first write.
     let mut map_epochs = tables::MapEpochs::before(conn).await?;
     let claims_prior = fetch_claims(conn, &claim_ids, false).await?;
@@ -2845,6 +3020,9 @@ async fn reverse_batch(
         }
         me.expect_into(conn, &mut expect_counts).await?;
     }
+    if let Some(r) = runs.as_ref() {
+        v.extend(r.expect_into(conn, &mut expect_counts).await?);
+    }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
         &expect_counts,
@@ -2963,7 +3141,7 @@ pub async fn reverse_manifest(
         res.claim_posts.len(),
         res.rows.len()
     )?;
-    let locks = batch_lock_tables(unkeyed);
+    let locks = tables::batch_lock_tables(unkeyed);
     let nodes = node_types(conn).await?;
     let rc = RevCtx {
         specs,
@@ -3138,6 +3316,7 @@ mod tests {
             batch_size: 10,
             lock_timeout: "5s".into(),
             sample: 0,
+            refuse_irreversible: false,
         };
         assert!(validate(&o).is_ok());
         o.reason = " ".into();

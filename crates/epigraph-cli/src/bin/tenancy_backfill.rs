@@ -115,11 +115,11 @@
 //! residue ([`INSTANCE_WIDE_REGISTRIES`]).
 //!
 //! Every writer of `perspectives` declares `TenancyDecl::instance_wide()`
-//! (`('public', world)`) on purpose: `PerspectiveRepository::create`,
-//! `ensure_evidence_perspective` and `ensure_edge_perspective`. Migration 077's
+//! (`('public', world)`) on purpose: `PerspectiveRepository::create` (and,
+//! before migration 267 moved the per-evidence / per-edge keys onto
+//! `mass_functions`' own slot, the two synthetic-row writers). Migration 077's
 //! registry WITH CHECK admits exactly that declaration, and a perspective is a
-//! lens, or a per-evidence / per-edge key on `mass_functions`, not authored
-//! content. So `run` does not re-own a perspective and `verify` does not count
+//! lens, not authored content. So `run` does not re-own a perspective and `verify` does not count
 //! a world-owned one as residue. An earlier revision walked `perspectives` as
 //! an agent-keyed arm on `owner_agent_id`; once the DS auto-wire began
 //! recording an `owner_agent_id` on the synthetic perspectives, every
@@ -161,13 +161,19 @@
 //! world-owned rows that SHOULD have moved and reports the platform corpus.
 //!
 //! `--entity <name>` runs one arm alone (e.g. `recall_events` without the
-//! claims walk). `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
+//! claims walk). `--entity registry-edges` re-meets every edge with a
+//! non-public frame, context, perspective or community endpoint (migration
+//! 258; see [`registry_edge_remeet`]); its `--dry-run` lists what it would
+//! re-meet, by relationship and transition, and what it holds or skips (an
+//! edge with a dangling endpoint). Below 258 it refuses to write, and its dry
+//! run measures what 258's section 4 will re-tenant. `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
 //! once the budget is spent and exits 3 ("partial, re-run to resume"); the
 //! cursor of every committed batch is already persisted.
 //!
 //! Usage:
 //!     epigraph-tenancy-backfill run --legacy-owner operator|platform [--batch-size 5000]
-//!         [--dry-run] [--entity claims|communities|perspectives|recall-events|harvester-fragments]
+//!         [--dry-run]
+//!         [--entity claims|communities|perspectives|recall-events|harvester-fragments|registry-edges]
 //!         [--max-runtime 2h]
 //!     epigraph-tenancy-backfill verify [--legacy-owner operator|platform]
 //!
@@ -182,6 +188,13 @@ use uuid::Uuid;
 /// The role migrations 070/071 re-own their `SECURITY DEFINER` bodies to, and
 /// the role `epigraph_definer_bypass()` (migration 067) tests membership of.
 const MAINTENANCE_ROLE: &str = "epigraph_maintenance";
+
+/// Migration 251's NOLOGIN owner of the retracted-BBA grant ledger, and the
+/// registered definer it took over from the maintenance role (194's helper,
+/// which reads the ledger only that owner may). [`verify_bba_guard_owner`]
+/// checks that role, its three functions and the ledger in full.
+const LEDGER_OWNER_ROLE: &str = "epigraph_bba_guard_owner";
+const LEDGER_OWNED_DEFINERS: &[&str] = &["epigraph_mf_purge_granted"];
 
 /// The world group: a SHAPE CONSTANT, never an owner (plan §2.3).
 const WORLD: Uuid = Uuid::nil();
@@ -406,6 +419,9 @@ enum Entity {
     Perspectives,
     RecallEvents,
     HarvesterFragments,
+    /// Re-meet every edge with a non-public frame, context, perspective or
+    /// community endpoint (migration 258).
+    RegistryEdges,
 }
 
 /// `90m`, `2h`, `3600s`, or bare seconds.
@@ -597,6 +613,9 @@ async fn run(
                 );
             }
         }
+        if wants(Entity::RegistryEdges) {
+            remeet_registry_edges(pool, true, entity.is_some()).await?;
+        }
         return Ok(RunEnd::Complete);
     }
 
@@ -648,6 +667,9 @@ async fn run(
     }
     if wants(Entity::HarvesterFragments) {
         backfill_harvester_fragments(pool).await?;
+    }
+    if wants(Entity::RegistryEdges) {
+        remeet_registry_edges(pool, false, entity.is_some()).await?;
     }
     if let Some(e) = entity {
         println!(
@@ -1194,10 +1216,9 @@ fn fragment_restampable() -> String {
 /// * **The 17 claim-derived tables and `edges`** are stamped by 070 arms (c)
 ///   and (d). Their residual should already be zero; this records the measured
 ///   count rather than asserting it.
-/// * **`frames` and `contexts` carry no owner column of any kind** — verified
-///   against `information_schema`: `frames` has `parent_frame_id`, `contexts`
-///   has none. There is nothing to derive an owner from, so they stay
-///   `('public', world)`.
+/// * **`frames` and `contexts`** carry tenancy columns (migration 062) but no
+///   author to derive an owner from, and every writer declares them
+///   instance-wide, so they stay `('public', world)`.
 /// * **`perspectives`** has an `owner_agent_id`, and **`communities`** a
 ///   projected group of its own, but every writer of either declares the row
 ///   instance-wide on purpose (module doc), so their world-owned rows are a
@@ -1211,10 +1232,16 @@ fn fragment_restampable() -> String {
 /// world-owned row that is `visibility = 'public'` is explicitly permitted, and
 /// that is exactly what these rows are. It also matches 070 arm (b), which
 /// stamps `('public', world)` for an edge between two public endpoints.
-/// Re-stamp every WORLD-OWNED edge that touches a non-public claim or evidence
-/// endpoint (the rows `verify`'s edge check fails on) to the meet of its
-/// endpoints, exactly as 070 arm (d) computes it (migration 122 section 8's
-/// set-based form, same CASE expressions and guards). Returns the rows changed.
+/// Re-stamp every WORLD-OWNED edge that touches a non-public endpoint (the
+/// rows `verify`'s edge checks fail on) to the meet of its endpoints, exactly
+/// as 070 arm (d) computes it (migration 122 section 8's set-based form, same
+/// CASE expressions and guards; every endpoint type 258's cascade reads from
+/// its own row, [`MET_ENDPOINTS`]). Returns the rows changed.
+///
+/// `arms` is which of the oracle's later arms are applied ([`OracleArms`]):
+/// below 258 the oracle still meets a frame, context, perspective or
+/// community as public (below 246, a paper), so this reads them as public too
+/// rather than stamp a meet the database's own re-meets disagree with.
 ///
 /// Arm (d) repairs such an edge only when a claim UPDATE touches one of its
 /// endpoints. Under `--legacy-owner operator` every world-owned claim moves, so
@@ -1223,8 +1250,11 @@ fn fragment_restampable() -> String {
 /// group-private endpoint stayed world-owned, and `run` / `verify` failed on it
 /// with no command to fix it (review C4). Run in both modes: it touches only
 /// rows `verify` fails on.
-async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Result<u64> {
-    Ok(sqlx::query(
+async fn settle_world_edges_with_private_endpoints(
+    pool: &PgPool,
+    arms: OracleArms,
+) -> anyhow::Result<u64> {
+    Ok(sqlx::query(&format!(
         "UPDATE edges e
             SET owner_group_id    = m.g,
                 visibility        = m.v,
@@ -1243,20 +1273,8 @@ async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Res
                               THEN t.g
                          ELSE NULL END AS co
                FROM edges e2
-               LEFT JOIN claims   sc ON e2.source_type = 'claim'    AND sc.id = e2.source_id
-               LEFT JOIN evidence se ON e2.source_type = 'evidence' AND se.id = e2.source_id
-               LEFT JOIN claims   tc ON e2.target_type = 'claim'    AND tc.id = e2.target_id
-               LEFT JOIN evidence te ON e2.target_type = 'evidence' AND te.id = e2.target_id
-               CROSS JOIN LATERAL (
-                 SELECT COALESCE(sc.owner_group_id, se.owner_group_id,
-                                 '00000000-0000-0000-0000-000000000000'::uuid) AS g,
-                        COALESCE(sc.visibility, se.visibility,
-                                 'public'::character varying(16)) AS v) s
-               CROSS JOIN LATERAL (
-                 SELECT COALESCE(tc.owner_group_id, te.owner_group_id,
-                                 '00000000-0000-0000-0000-000000000000'::uuid) AS g,
-                        COALESCE(tc.visibility, te.visibility,
-                                 'public'::character varying(16)) AS v) t
+               {s_side}
+               {t_side}
               WHERE e2.owner_group_id = $1
                 AND (s.v <> 'public' OR t.v <> 'public')
            ) m
@@ -1266,15 +1284,343 @@ async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Res
             AND NOT (e.visibility = 'group' AND m.v = 'public')
             AND (e.owner_group_id, e.visibility, e.co_owner_group_id)
                 IS DISTINCT FROM (m.g, m.v, m.co)",
-    )
+        s_side = endpoint_side_sql("source", "s", arms),
+        t_side = endpoint_side_sql("target", "t", arms),
+    ))
     .bind(WORLD)
     .execute(pool)
     .await?
     .rows_affected())
 }
 
+// =============================================================================
+// registry edges (migration 258)
+// =============================================================================
+
+/// The four instance-wide registries as edge-endpoint types: (entity type,
+/// table). Migration 258 meets each with its OWN row (`owner_group_id`,
+/// `visibility`, migration 062) in `epigraph_node_tenancy` and in the claim
+/// cascade; before it they counted as `('public', world)`.
+const REGISTRY_ENDPOINTS: &[(&str, &str)] = &[
+    ("frame", "frames"),
+    ("context", "contexts"),
+    ("perspective", "perspectives"),
+    ("community", "communities"),
+];
+
+/// Every endpoint type the meet reads from its own row at head (258's
+/// `epigraph_propagate_tenancy`, rebuilt over 246's): (entity type, table,
+/// join-alias stem). Any other type (agent, task, trace) contributes
+/// `('public', world)`.
+const MET_ENDPOINTS: &[(&str, &str, &str)] = &[
+    ("claim", "claims", "c"),
+    ("evidence", "evidence", "e"),
+    ("workflow", "workflows", "w"),
+    // 246: a paper's row carries its ingest's tenancy.
+    ("paper", "papers", "a"),
+    ("frame", "frames", "f"),
+    ("context", "contexts", "x"),
+    ("perspective", "perspectives", "p"),
+    ("community", "communities", "m"),
+];
+
+/// Which of the oracle's later arms a database has, read from the catalog:
+/// 246's `paper` arm and 258's four registry arms. A type whose arm is absent
+/// is met as `('public', world)`, as that database's oracle meets it (and,
+/// below 246, `papers` has no tenancy columns to read).
+#[derive(Debug, Clone, Copy)]
+struct OracleArms {
+    /// 246's `paper` arm ([`paper_endpoints_met`]).
+    papers: bool,
+    /// 258's frame, context, perspective and community arms
+    /// ([`registry_endpoints_met`]).
+    registries: bool,
+}
+
+impl OracleArms {
+    async fn of(pool: &PgPool) -> anyhow::Result<Self> {
+        Ok(Self {
+            papers: paper_endpoints_met(pool).await?,
+            registries: registry_endpoints_met(pool).await?,
+        })
+    }
+
+    fn meets(self, ty: &str) -> bool {
+        if REGISTRY_ENDPOINTS.iter().any(|(r, _)| *r == ty) {
+            self.registries
+        } else if ty == "paper" {
+            self.papers
+        } else {
+            true
+        }
+    }
+}
+
+/// One side of edge alias `e2`, as 258's propagation reads it: a LEFT JOIN per
+/// [`MET_ENDPOINTS`] type (aliases `<side letter><stem>`) and a `CROSS JOIN
+/// LATERAL` named `side_alias` with that endpoint's `(g, v)`. A type whose
+/// arm `arms` lacks (the [`REGISTRY_ENDPOINTS`] below 258, `paper` below 246)
+/// is left out, so the endpoint counts as `('public', world)` as that
+/// database's oracle meets it.
+fn endpoint_side_sql(column: &str, side_alias: &str, arms: OracleArms) -> String {
+    let met: Vec<&(&str, &str, &str)> = MET_ENDPOINTS
+        .iter()
+        .filter(|(ty, _, _)| arms.meets(ty))
+        .collect();
+    let joins: String = met
+        .iter()
+        .map(|(ty, table, stem)| {
+            format!(
+                " LEFT JOIN public.{table} {side_alias}{stem} \
+                   ON e2.{column}_type = '{ty}' AND {side_alias}{stem}.id = e2.{column}_id"
+            )
+        })
+        .collect();
+    let col = |c: &str| {
+        met.iter()
+            .map(|(_, _, stem)| format!("{side_alias}{stem}.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{joins} CROSS JOIN LATERAL (\
+           SELECT COALESCE({g}, '00000000-0000-0000-0000-000000000000'::uuid) AS g, \
+                  COALESCE({v}, 'public'::character varying(16)) AS v) {side_alias}",
+        g = col("owner_group_id"),
+        v = col("visibility"),
+    )
+}
+
+/// The label of an edge [`registry_edge_remeet`] cannot re-meet: its current
+/// tuple names a group outside the meet, and the two together need three
+/// groups, more than an edge can carry.
+const REGISTRY_EDGE_HELD: &str = "held: needs three groups";
+
+/// The label of an edge [`registry_edge_remeet`] skips because its other
+/// endpoint no longer exists: an UPDATE of `edges` fires `edges_validate_refs`
+/// on every row it writes, so writing it would abort the whole statement
+/// (migration 175's header; 258 section 4 skips the same rows). Takes
+/// precedence over [`REGISTRY_EDGE_HELD`].
+const REGISTRY_EDGE_DANGLING: &str = "skipped: dangling endpoint";
+
+/// The re-meet of every edge with a NON-PUBLIC frame, context, perspective or
+/// community endpoint (migration 258 section 4's statement, read from the
+/// endpoints' own rows rather than through `epigraph_node_tenancy`, which is
+/// revoked from PUBLIC): `apply` writes it, otherwise it only counts. Returns
+/// `(relationship, transition, count)` rows; a transition of
+/// [`REGISTRY_EDGE_HELD`] or [`REGISTRY_EDGE_DANGLING`] is never written.
+///
+/// The rule is the cascade's meet (072, 120), never widening: an edge is
+/// written only when the meet is `group`. One addition, which only a ONE-TIME
+/// repair needs: an edge that is already group-private keeps every group it
+/// requires. A legacy edge DECLARED `('group', G)` between a public claim and a
+/// frame private to H met to `('group', H)` alone would hand G's edge to H's
+/// members; it is met to `(H, co-owner G)` instead (readable only by a member
+/// of both). When the meet and the current tuple need more than two groups the
+/// edge is held and reported.
+///
+/// A registry row re-tenanted AFTER 258 does not re-meet its edges by itself
+/// (there is no trigger on the four tables); this is the repair, and `verify`
+/// fails while it has anything to write.
+async fn registry_edge_remeet(
+    pool: &PgPool,
+    apply: bool,
+) -> anyhow::Result<Vec<(String, String, i64)>> {
+    // The registry endpoints are read from their own rows even below 258 (the
+    // dry run measures what 258's section 4 will re-tenant); every other type
+    // as the database's oracle meets it.
+    let reg_arms = OracleArms {
+        registries: true,
+        ..OracleArms::of(pool).await?
+    };
+    let reg_edges = REGISTRY_ENDPOINTS
+        .iter()
+        .flat_map(|(ty, table)| {
+            ["source", "target"].into_iter().map(move |side| {
+                format!(
+                    "SELECT x.id FROM public.edges x JOIN public.{table} r \
+                       ON x.{side}_type = '{ty}' AND x.{side}_id = r.id \
+                      WHERE r.visibility <> 'public'"
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ");
+    let sql = format!(
+        "WITH reg_edges AS ({reg_edges}), \
+         m AS ( \
+           SELECT e2.id, e2.relationship, \
+                  (public.validate_edge_reference(e2.source_id, e2.source_type) \
+                   AND public.validate_edge_reference(e2.target_id, e2.target_type)) AS refs_ok, \
+                  e2.owner_group_id AS old_g, e2.visibility AS old_v, \
+                  e2.co_owner_group_id AS old_co, \
+                  CASE WHEN s.v = 'public' AND t.v = 'public' \
+                            THEN '00000000-0000-0000-0000-000000000000'::uuid \
+                       WHEN s.v = 'public' THEN t.g \
+                       WHEN t.v = 'public' THEN s.g \
+                       ELSE s.g END AS g, \
+                  CASE WHEN s.v = 'public' AND t.v = 'public' \
+                            THEN 'public'::character varying(16) \
+                       ELSE 'group'::character varying(16) END AS v, \
+                  CASE WHEN s.v = 'group' AND t.v = 'group' AND s.g <> t.g \
+                            THEN t.g ELSE NULL END AS co \
+             FROM reg_edges k JOIN public.edges e2 ON e2.id = k.id \
+             {s_side} {t_side} \
+         ), \
+         n AS ( \
+           SELECT m.*, \
+                  ARRAY(SELECT DISTINCT x FROM unnest(ARRAY[ \
+                          m.co, \
+                          CASE WHEN m.old_v = 'group' THEN m.old_g END, \
+                          CASE WHEN m.old_v = 'group' THEN m.old_co END]) x \
+                         WHERE x IS NOT NULL AND x <> m.g) AS others \
+             FROM m WHERE m.v = 'group' \
+         ), \
+         d AS ( \
+           SELECT n.id, n.relationship, n.g, n.v, n.others[1] AS co, \
+                  cardinality(n.others) > 1 AS held, n.refs_ok, \
+                  CASE WHEN n.old_v = 'public' THEN 'public to group' \
+                       WHEN n.others[1] IS NOT NULL AND n.old_co IS NULL THEN 'group to co-owned' \
+                       WHEN n.old_g IS DISTINCT FROM n.g THEN 'group to another group' \
+                       ELSE 'co-owner changed' END AS transition \
+             FROM n \
+            WHERE (n.old_g, n.old_v, n.old_co) IS DISTINCT FROM (n.g, n.v, n.others[1]) \
+         ) {tail}",
+        s_side = endpoint_side_sql("source", "s", reg_arms),
+        t_side = endpoint_side_sql("target", "t", reg_arms),
+        tail = if apply {
+            format!(
+                ", upd AS ( \
+                   UPDATE public.edges e \
+                      SET owner_group_id = d.g, visibility = d.v, co_owner_group_id = d.co \
+                     FROM d WHERE e.id = d.id AND NOT d.held AND d.refs_ok \
+                   RETURNING d.relationship, d.transition) \
+                 SELECT relationship, transition, count(*)::bigint FROM upd GROUP BY 1, 2 \
+                 UNION ALL \
+                 SELECT relationship, \
+                        CASE WHEN NOT d.refs_ok THEN '{REGISTRY_EDGE_DANGLING}' \
+                             ELSE '{REGISTRY_EDGE_HELD}' END, \
+                        count(*)::bigint FROM d \
+                  WHERE d.held OR NOT d.refs_ok GROUP BY 1, 2 \
+                 ORDER BY 1, 2"
+            )
+        } else {
+            format!(
+                "SELECT relationship, \
+                        CASE WHEN NOT refs_ok THEN '{REGISTRY_EDGE_DANGLING}' \
+                             WHEN held THEN '{REGISTRY_EDGE_HELD}' ELSE transition END, \
+                        count(*)::bigint \
+                   FROM d GROUP BY 1, 2 ORDER BY 1, 2"
+            )
+        },
+    );
+    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+}
+
+/// Whether migration 246 is applied: `epigraph_node_tenancy` meets a `paper`
+/// endpoint with its own row. Read from the catalog (the oracle's body), as
+/// [`registry_endpoints_met`]; a later re-statement of the oracle keeps the arm.
+async fn paper_endpoints_met(pool: &PgPool) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc p \
+                         WHERE p.oid = to_regprocedure('public.epigraph_node_tenancy(uuid, text)') \
+                           AND p.prosrc LIKE '%p_type = ''paper''%')",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Whether migration 258 is applied: `epigraph_node_tenancy` meets a `frame`
+/// endpoint with its own row. Read from the catalog (the oracle's body), not
+/// from `_sqlx_migrations` (see the 086 gate); a later re-statement of the
+/// oracle keeps the arm.
+async fn registry_endpoints_met(pool: &PgPool) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc p \
+                         WHERE p.oid = to_regprocedure('public.epigraph_node_tenancy(uuid, text)') \
+                           AND p.prosrc LIKE '%p_type = ''frame''%')",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The totals of [`registry_edge_remeet`]'s rows.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RegistryEdgeTotals {
+    /// Re-met (or, counting, to re-meet).
+    remet: i64,
+    /// Held: the meet and the current tuple need three groups.
+    held: i64,
+    /// Skipped: an endpoint no longer exists.
+    dangling: i64,
+}
+
+fn registry_edge_totals(rows: &[(String, String, i64)]) -> RegistryEdgeTotals {
+    rows.iter()
+        .fold(RegistryEdgeTotals::default(), |mut acc, (_, t, c)| {
+            match t.as_str() {
+                REGISTRY_EDGE_HELD => acc.held += c,
+                REGISTRY_EDGE_DANGLING => acc.dangling += c,
+                _ => acc.remet += c,
+            }
+            acc
+        })
+}
+
+/// `run --entity registry-edges` (and the same step of a full run): re-meet,
+/// or with `dry_run` count, every edge [`registry_edge_remeet`] covers, and
+/// print one line per relationship and transition.
+///
+/// Below migration 258 ([`registry_endpoints_met`]) the WRITE is refused when
+/// the arm was asked for by name (`explicit`) and skipped with a note in a full
+/// run: the database's own re-meets (206's and 215's publicize, the claim
+/// cascade) still meet a registry row as public there and would undo it, and
+/// 258's section 4 performs the same re-meet when it applies. The dry run is
+/// allowed: it reads the endpoint rows directly, so below 258 it measures what
+/// section 4 will re-tenant (the pre-migration count).
+async fn remeet_registry_edges(pool: &PgPool, dry_run: bool, explicit: bool) -> anyhow::Result<()> {
+    let met = registry_endpoints_met(pool).await?;
+    if !met && !dry_run {
+        if explicit {
+            anyhow::bail!(
+                "registry-edges: migration 258 (which meets a frame, context, perspective or \
+                 community endpoint with its own row) has not been applied; apply it first (its \
+                 section 4 performs this re-meet). `--dry-run` measures what it will re-tenant."
+            );
+        }
+        println!(
+            "run: NOTE: skipping registry-edges: migration 258 has not been applied (its section \
+             4 performs this re-meet when it applies)."
+        );
+        return Ok(());
+    }
+    let rows = registry_edge_remeet(pool, !dry_run).await?;
+    let RegistryEdgeTotals {
+        remet: n,
+        held,
+        dangling,
+    } = registry_edge_totals(&rows);
+    let verb = if dry_run { "would re-meet" } else { "re-met" };
+    println!(
+        "{}registry-edges: {verb} {n} edge(s) with a non-public frame, context, perspective or \
+         community endpoint; {held} held (their meet and current tuple need three groups); \
+         {dangling} skipped with a dangling endpoint.{}",
+        if dry_run { "dry-run: " } else { "run: " },
+        if met {
+            ""
+        } else {
+            " (Migration 258 is not applied: this is what its section 4 will re-tenant.)"
+        }
+    );
+    for (relationship, transition, count) in &rows {
+        println!("  {relationship}\t{transition}\t{count}");
+    }
+    Ok(())
+}
+
 async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()> {
-    let edges = settle_world_edges_with_private_endpoints(pool).await?;
+    let arms = OracleArms::of(pool).await?;
+    let edges = settle_world_edges_with_private_endpoints(pool, arms).await?;
     if edges > 0 {
         tracing::info!(
             edges,
@@ -1720,6 +2066,22 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // CLOSED and SILENTLY the same way: no team is added to an operated
     // agent's read set. The owner is load-bearing.
     ("epigraph_readable_teams", 234),
+    // 236, the unbound live-membership read (235's body, moved out of
+    // `epigraph_live_memberships`, which now answers for the session principal
+    // only and reads through this). It reads `group_memberships` and `groups`
+    // (FORCEd) for an agent that need not be the stamped principal: under a
+    // non-member owner both reads are filtered, so every viewer resolves to
+    // public-only and the two team lists answer "no team" (loud for reads,
+    // silent for defaults, fail-closed). The owner is load-bearing.
+    ("epigraph_live_memberships_unbound", 236),
+    // 267, whether a BBA (any writer's) is keyed on an edge's slot, asked by
+    // the edge-withdraw path for the edge's writer. Its reads of the FORCEd
+    // `mass_functions` and `edges` are row-security filtered under a
+    // non-member owner, so it fails CLOSED and SILENTLY: an edge whose only
+    // BBAs are other writers' rows on claims the caller cannot read records
+    // no `edge_retract` deferral, and those BBAs outlive the edge until the
+    // legacy sweep finds them. The owner is load-bearing.
+    ("epigraph_edge_bbas_keyed", 267),
     // 206's default-team write changes only the principal's own `agents` row
     // and writes a principal-attributed audit row, both of which 077 admits
     // for any owner, and its authority check goes through the read above, so a
@@ -1790,7 +2152,8 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // then passed and filed, as under the proper owner.
     ("epigraph_bug_report_gate", 207),
     ("epigraph_bug_report_preflight", 207),
-    // 208, the authorship countersign route (MCP `countersign_authorship`).
+    // 208, the authorship countersign definer (MCP `countersign_authorship`
+    // and REST `POST /api/v1/papers/:id/authors/countersign`).
     // Its read and UPDATE of the FORCEd `operator_links` and of `edges` are
     // admitted by `epigraph_definer_bypass()` (the owner). Under a non-member
     // owner it fails CLOSED and loud for an operator acting for its agent
@@ -1834,6 +2197,32 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // and the gate admits an evolve of a step a hidden plan runs. That is the
     // stake this entry reports.
     ("epigraph_step_lineage_executors", 219),
+    // 237, the row lock (a hierarchical outcome report's and `add_step`'s plan
+    // lock) and the outcome counter write on a `workflows` row the caller
+    // READS (237 narrows the row's UPDATE policy to writers of its owner
+    // group). Both fail CLOSED under a non-member owner: the bodies' reads and
+    // UPDATE are then row-security filtered as the caller's would be, so the
+    // lock answers "no row" for a caller that does not write the owner group
+    // (every such reader's report is answered not-found, and such a caller's
+    // `add_step` runs unlocked) and the counter write raises WFO04 (loud).
+    // The owner is load-bearing.
+    ("epigraph_workflow_lock_readable", 237),
+    ("epigraph_workflow_record_outcome", 237),
+    // 237, the audited admin deprecation of a `workflows` row the admin does
+    // not write (the workflow authority gate's admin arm). Fails CLOSED under
+    // a non-member owner: its UPDATE is row-security filtered, so the
+    // deprecation is refused as unchanged-but-live, and its audit INSERT is
+    // refused by `security_events_append`. The owner is load-bearing.
+    ("epigraph_admin_deprecate_workflow_row", 237),
+    // 268 (backlog bedd59b7 / 24a9f4fa), the content-free, paged prompt-history
+    // read behind 161's gate, for the GET /api/v1/agents/:id/prompt-history
+    // listing. It reads the FORCEd `agent_prompt_snapshots` and
+    // `agent_succession`, whose read policy admits only
+    // `epigraph_definer_bypass()`: under a non-member owner it sees no
+    // succession and no snapshot, so every listing answers "this agent ran
+    // nothing and has no lineage" (quiet, the stake that makes the owner a
+    // control here).
+    ("epigraph_agent_prompt_history_meta", 268),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -1851,7 +2240,9 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // Fails CLOSED under a non-member owner: such an owner holds no privilege
     // on `mass_function_purge_grants` (only `epigraph_maintenance` does), so
     // its read is refused and every delete of a retracted row, the purge
-    // definer's included, errors with nothing deleted (loud).
+    // definer's included, errors with nothing deleted (loud). Since 251 its
+    // owner is the ledger's (`LEDGER_OWNER_ROLE`), which the ownership check
+    // accepts for it and `verify_bba_guard_owner` checks.
     ("epigraph_mf_purge_granted", 194),
     // 194 (H10), the audited purge of retracted mass functions. Fails CLOSED
     // under a non-member owner: its grant INSERT is refused (no privilege on
@@ -2322,7 +2713,278 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 238 (backlog b5f6883b), 074's sealed-claim widening guard, re-stated as
+    // a definer trigger body. Fails OPEN and QUIETLY under a non-member owner:
+    // its only read is of the FORCEd `claim_encryption`, which 077's policy
+    // then filters exactly as the updating session's own read would, so a
+    // sealed claim whose ciphertext group the owner cannot see reads as
+    // unsealed and is made public with no error. The owner is the control.
+    // NOT version-gated, unlike the other entries here: the presence gate in
+    // `applicable_definer_functions` skips only a MISSING function, and 074
+    // has installed this name (as an INVOKER body) since long before 238, so
+    // the entry is always checked and `238` only names the migration in a
+    // NOTE. On a database between 074 and 237 whose migration runner is
+    // neither a superuser nor a member of `epigraph_maintenance`, `verify`
+    // from a 238-aware binary therefore reports 074's invoker body as a
+    // FAIL although its owner does not matter yet; apply 238 and re-run. The
+    // same caveat `DEFINER_FUNCTIONS` records for its 070 bodies.
+    ("epigraph_claims_block_widening", 238),
+    // 239 (backlog 54018ca1), agent-key rotation: retires a key and records
+    // its successor in one call, executed by maintenance sessions only (239
+    // revokes the application role's INSERT on `agent_keys` and grants it no
+    // EXECUTE here). Under an APP-owned body it would run with the
+    // application role's rights and fail CLOSED with 42501 on the INSERT
+    // (nothing written, loud); under the migration runner's superuser it
+    // keeps working with more authority than intended (083's case).
+    // `agent_keys` has no row security, so a non-member owner changes nothing
+    // else.
+    ("epigraph_agent_key_rotate", 239),
+    // 240 (backlog 88cf603b), a recorded run's stamp from its workflow. Its
+    // reads of the FORCEd `workflows` and `claims` are admitted for every
+    // writer by `epigraph_definer_bypass()` (the owner). Under a non-member
+    // owner they are filtered to what the session itself reads, so a run of
+    // a workflow the session cannot read is refused 23503 instead of 42501:
+    // fail CLOSED (loud). Not measured: a filtered `workflows` row whose id is
+    // also a readable claim's would take the claim's pair.
+    ("epigraph_behavioral_execution_inherit_tenancy", 240),
+    // 240, the runs-follow-their-workflow re-stamp (AFTER UPDATE of a
+    // `workflows` row's pair). Its UPDATE is admitted by
+    // `behavioral_executions_maintenance_update`: `epigraph_bypass()` (keyed
+    // on `session_user`, so a maintenance session's re-tenant still follows
+    // under any owner) or `epigraph_definer_bypass()` (the owner). Under a
+    // non-member owner a re-tenant made from any other session (a
+    // maintenance-owned definer the application calls, for one) matches no
+    // run and raises nothing: fail OPEN (quiet). The narrowed workflow's runs
+    // keep the old pair and stay readable to its old readers; only the
+    // operator CLIs' `tables::RunsFollow` check would notice.
+    ("epigraph_workflow_behavioral_executions_follow", 240),
+    // 240, the same re-stamp for a flat workflow CLAIM's runs (AFTER UPDATE of
+    // a claim's pair). The same stake as the `workflows` re-stamp above: fail
+    // OPEN (quiet). Its read of `workflows` (to leave a hierarchical id to
+    // that trigger) is filtered too under a non-member owner; not measured.
+    ("epigraph_claim_behavioral_executions_follow", 240),
+    // 250 (backlog a278f16d), the events provenance guards. Both fail CLOSED
+    // under a non-member owner, which holds no privilege on
+    // `mass_function_masses_writes` (only `epigraph_maintenance` does): the
+    // AFTER trigger body's upsert is refused, so every `mass_functions` INSERT
+    // and every masses UPDATE errors 42501 with nothing written (loud, every
+    // BBA write halted); the `events` guard's read of that table is refused,
+    // so every `claim.assessed` record from a non-bypass session errors
+    // (the assess path refused). Its bypass arm reads `epigraph_bypass()`
+    // (session_user), which the owner does not change. Under the migration
+    // runner's superuser both keep working with more authority than intended.
+    ("epigraph_mass_function_masses_written", 250),
+    ("epigraph_events_assessment_guard", 250),
+    // 254 (backlog 7149132e), the cycle walk of MCP `link_hierarchical`'s
+    // workflow references (`EdgeRepository::reaches_in_force_conn`). Its read
+    // of the FORCEd `edges` is admitted by `epigraph_definer_bypass()` (the
+    // owner). Under a non-member owner the walk is row-security filtered to
+    // the calling session's stamp, so a cycle closed through an edge that
+    // session cannot read is admitted: fail OPEN, the defect the function
+    // closes. The owner is load-bearing.
+    ("epigraph_edges_reach", 254),
+    // 255 (backlog 9ee6799d), the operator's audited write of
+    // `papers.licence`, whose application-role INSERT and UPDATE 255 revokes.
+    // Under a non-member owner it fails CLOSED: its `security_events` audit
+    // INSERT is refused by `security_events_paper_licence_privileged` (no
+    // `epigraph_definer_bypass()`), so every set errors 42501 and the licence
+    // UPDATE rolls back with it (loud). Under the migration runner's
+    // superuser it keeps working with more authority than intended.
+    ("epigraph_set_paper_licence", 255),
+    // 259 (backlog a1474e22), the outcome reports' unfiltered plan skeleton:
+    // a plan's `executes` edges and `step_follows` pairs with every claim the
+    // caller does not read masked. Fails OPEN and SILENT under a non-member
+    // owner: its reads of the FORCEd `edges` and `claims` are then filtered to
+    // what the calling session reads, so a hidden unindexed step inside a
+    // plan's chain is invisible to it too, and a report's `step_index` is
+    // attributed to the step one slot further on with no signal. That is the
+    // stake this entry reports.
+    ("epigraph_plan_step_skeleton", 259),
+    // 260 (backlog 969f01f6), the `edges_tenancy_declared` trigger body that
+    // records an edge's declared tenancy. It reads each endpoint through
+    // `epigraph_node_tenancy`, which is revoked from PUBLIC: under an
+    // APP-owned (non-member) body every INSERT of a `group` edge errors 42501
+    // with nothing written (loud, fail CLOSED); a re-point only carries the
+    // row's record and reads nothing. Under the migration runner's superuser
+    // it keeps working with more authority than intended (083's case), which
+    // only this check reports.
+    ("epigraph_edges_record_declaration", 260),
+    // 263, the person-facing team groups and invitations. The four writes
+    // read and write the FORCEd `groups`, `group_memberships` and
+    // `group_invitations` and the `group.` audit family through
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner every
+    // create, invite, accept and decline is refused by those policies (42501,
+    // loud) with nothing written. The two reads go through the same arm:
+    // under a non-member owner `epigraph_my_group_invitations` sees no row
+    // (quiet, the invitee is shown nothing to accept) and `epigraph_my_groups`
+    // reads `groups` filtered to the caller's stamp (fewer groups, never
+    // more). The roster grant check reads `team_group_roster_grants`, whose
+    // privileges only the maintenance role holds: under a non-member owner it
+    // fails 42501 inside both 164 guards, so every person act fails CLOSED
+    // (loud) and every other path through the guards is unchanged.
+    ("epigraph_person_create_team_group", 263),
+    ("epigraph_invite_to_team_group", 263),
+    ("epigraph_accept_group_invitation", 263),
+    ("epigraph_decline_group_invitation", 263),
+    ("epigraph_my_groups", 263),
+    ("epigraph_my_group_invitations", 263),
+    ("epigraph_team_group_roster_granted", 263),
+    // 264 (backlog 9073f0a5), the role-successor restore. It reads the
+    // FORCEd `role_agents`, `agent_succession` and `agent_prompt_snapshots`
+    // through `epigraph_definer_bypass()` and writes `role_agents` through
+    // 166's policies. Under a non-member owner it fails CLOSED and LOUD:
+    // the folder read sees no snapshot, so every successor is refused ROL04,
+    // and the attach and detach writes are refused by the policies.
+    ("epigraph_restore_role_successor", 264),
+    // 269, the agent-lookup card's reverse binding read (find_agent /
+    // get_agent): the agents whose operator link names an agent. Its read of
+    // the FORCEd `operator_links` is admitted by `epigraph_definer_bypass()`
+    // (the owner). Under a non-member owner it reads no link: fail CLOSED,
+    // fewer humans shown, never more.
+    ("epigraph_agents_linked_to_operator", 269),
+    // 269, the agent-lookup card's role attachments. Its read of the FORCEd
+    // `role_agents` is admitted by `epigraph_definer_bypass()` (the owner).
+    // Under a non-member owner it reads no row: fail CLOSED, no attachment
+    // shown.
+    ("epigraph_disclosed_role_attachments", 269),
 ];
+
+/// Registered definers that a LATER migration re-owns from
+/// `epigraph_maintenance` to a dedicated NOLOGIN role that is itself a member
+/// of `epigraph_maintenance` (so [`verify_definer_ownership`]'s predicate
+/// still holds for them) and must be owned by EXACTLY that role at head:
+/// `(function, owner role, migration)`. [`verify_dedicated_definer_owners`]
+/// reports one that the migration could not re-own.
+const DEDICATED_OWNER_DEFINERS: &[(&str, &str, i64)] = &[
+    // 257 (backlog 9cec11f7): the retire verb runs as a role no login can act
+    // as, and only that role holds UPDATE (retired) on `operator_links`, so a
+    // maintenance login cannot retire a link directly and the table guard can
+    // tell the verb from any other statement. Left with `epigraph_maintenance`
+    // (257 could not create the role or re-own the verb; it NOTICEs and keeps
+    // 191's grants) the verb still works, but a maintenance login can retire a
+    // link directly, unserialised and with a forgeable audit `via` / reason:
+    // fail OPEN, which only this check reports.
+    (
+        "epigraph_retire_operator_link",
+        "epigraph_operator_link_retirer",
+        257,
+    ),
+];
+
+/// [`DEDICATED_OWNER_DEFINERS`] against the catalog. Returns the number of
+/// failing checks.
+///
+/// Whether the re-owning migration has run is read from the catalog, not from
+/// `_sqlx_migrations` (as [`applicable_definer_functions`]): 257 re-bodies
+/// `epigraph_operator_links_retire_only` to name its owner role, so a body
+/// that names the role is 257's. A database without it is NOTEd as unchecked.
+async fn verify_dedicated_definer_owners(pool: &PgPool) -> anyhow::Result<usize> {
+    let mut failures = 0usize;
+    for (name, role, version) in DEDICATED_OWNER_DEFINERS {
+        let applied: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_proc p
+                              JOIN pg_namespace n ON n.oid = p.pronamespace
+                             WHERE n.nspname = 'public'
+                               AND p.proname = 'epigraph_operator_links_retire_only'
+                               AND strpos(p.prosrc, $1) > 0)",
+        )
+        .bind(role)
+        .fetch_one(pool)
+        .await?;
+        if !applied {
+            eprintln!(
+                "NOTE: skipping the dedicated-owner check for public.{name}: migration \
+                 {version}, which re-owns it to {role}, has not been applied. Until it is, \
+                 this check is UNCHECKED, not passing."
+            );
+            continue;
+        }
+        let owners: Vec<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(p.proowner)::text
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname = $1
+              ORDER BY p.oid",
+        )
+        .bind(name)
+        .fetch_all(pool)
+        .await?;
+        if owners.is_empty() || owners.iter().any(|o| o != role) {
+            failures += 1;
+            eprintln!(
+                "FAIL: public.{name} is owned by {owners:?}, not '{role}'. Migration {version} \
+                 only NOTICEs when the migrating login cannot create that role, grant it \
+                 '{MAINTENANCE_ROLE}', or re-own the function (it must be a superuser), and then \
+                 keeps the previous owner and grants: the control is OFF. Provision the role \
+                 (NOLOGIN, a member of '{MAINTENANCE_ROLE}' only) and re-run migration \
+                 {version}'s last DO block as a superuser."
+            );
+        }
+    }
+    Ok(failures)
+}
+
+/// The role migration 257 re-owns the operator-link retire verb to.
+const OPERATOR_LINK_RETIRER_ROLE: &str = "epigraph_operator_link_retirer";
+
+/// Every way a non-superuser can act as `$1` (a role oid), or make itself
+/// able to: migration 257's isolation check, the same predicate. `MEMBER`
+/// counts any membership, direct or indirect, whatever its INHERIT / SET /
+/// ADMIN options (on PostgreSQL 16 an ADMIN-only grant confers neither USAGE
+/// nor SET, but its holder can grant the role to itself); an ADMIN OPTION row
+/// is named on its own; and a CREATEROLE login can administer roles. One
+/// text per fault.
+const RETIRER_ISOLATION_FAULTS_SQL: &str = "\
+    SELECT r.rolname::text || ' is a member of the role' \
+      FROM pg_roles r \
+     WHERE r.oid <> $1 AND NOT r.rolsuper AND pg_has_role(r.oid, $1, 'MEMBER') \
+    UNION ALL \
+    SELECT r.rolname::text || ' holds ADMIN OPTION on the role' \
+      FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member \
+     WHERE m.roleid = $1 AND m.admin_option AND NOT r.rolsuper \
+    UNION ALL \
+    SELECT r.rolname::text || ' is CREATEROLE' \
+      FROM pg_roles r \
+     WHERE r.rolcreaterole AND NOT r.rolsuper AND r.oid <> $1 \
+    ORDER BY 1";
+
+/// Migration 257's role isolation, re-checked against the LIVE catalog (backlog
+/// 9cec11f7): only the retire verb may run as
+/// [`OPERATOR_LINK_RETIRER_ROLE`], which alone holds UPDATE (retired) on
+/// `operator_links`. 257 refuses to apply over a role that is not isolated,
+/// but a grant made after it (a hand `GRANT ... WITH ADMIN OPTION`, a new
+/// CREATEROLE login) would silently reopen the direct, unserialised retire
+/// with a forgeable audit; this reports it. Returns the number of failing
+/// checks (one per fault). On a `&mut PgConnection` so a test can stage a
+/// grant in a transaction it never commits (roles are cluster-wide).
+async fn verify_operator_link_retirer_isolation(
+    conn: &mut sqlx::PgConnection,
+) -> anyhow::Result<usize> {
+    let role: Option<sqlx::postgres::types::Oid> =
+        sqlx::query_scalar("SELECT oid FROM pg_roles WHERE rolname = $1")
+            .bind(OPERATOR_LINK_RETIRER_ROLE)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(role) = role else {
+        // Before 257, or a cluster where it could not create the role:
+        // `verify_dedicated_definer_owners` reports the latter.
+        return Ok(0);
+    };
+    let faults: Vec<String> = sqlx::query_scalar(RETIRER_ISOLATION_FAULTS_SQL)
+        .bind(role)
+        .fetch_all(&mut *conn)
+        .await?;
+    for fault in &faults {
+        eprintln!(
+            "FAIL: '{OPERATOR_LINK_RETIRER_ROLE}' (migration 257) is not isolated: {fault}. Only \
+             the operator-link retire verb may run as that role, which alone holds UPDATE (retired) on \
+             operator_links; a non-superuser that can act as it, or grant it to itself, can \
+             retire a link directly, unserialised and with a forgeable audit. Revoke the grant \
+             or the attribute. A cluster with no superuser (a managed service whose admin login \
+             is CREATEROLE) cannot hold this control: see docs/deploy.md, migration 257."
+        );
+    }
+    Ok(faults.len())
+}
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
 /// actually EXISTS on this database.
@@ -2482,6 +3144,10 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                 );
             }
             Some((_, true)) => {}
+            // 251: the ledger's helper belongs to the ledger's owner, which no
+            // login can act as; `verify_bba_guard_owner` checks it in full.
+            Some((rolname, false))
+                if rolname == LEDGER_OWNER_ROLE && LEDGER_OWNED_DEFINERS.contains(&f.as_str()) => {}
             Some((rolname, false)) => {
                 failures += 1;
                 eprintln!(
@@ -2499,8 +3165,907 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
     Ok(failures)
 }
 
-/// Migration 107's EXECUTE grants to `epigraph_app`, which the ownership check
-/// above does not see. Returns the number of failing checks.
+/// The EXECUTE register [`verify_operator_function_grants`] checks: `(name,
+/// signature, app_must_execute)` per definer whose callers matter. `name`
+/// keys the presence check (the act-taking overloads are keyed on
+/// `epigraph_consume_admin_act`, see their note); `signature` is what is
+/// checked. Module scope so the tests can hold it against
+/// [`DEFERRED_DEFINER_FUNCTIONS`] (backlog a2b079a1).
+const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
+    (
+        "epigraph_operator_actor",
+        "public.epigraph_operator_actor(uuid)",
+        true,
+    ),
+    (
+        "epigraph_operator_of_author",
+        "public.epigraph_operator_of_author(uuid)",
+        true,
+    ),
+    (
+        "epigraph_operates_agents",
+        "public.epigraph_operates_agents(uuid)",
+        true,
+    ),
+    (
+        "epigraph_link_operator",
+        "public.epigraph_link_operator(uuid, uuid)",
+        false,
+    ),
+    (
+        "epigraph_link_retired_agent",
+        "public.epigraph_link_retired_agent(uuid, uuid)",
+        false,
+    ),
+    // 116 (batch HTTP-id): the attested retire of a former shared signer
+    // is a link function too, so the request DSN must not call it.
+    (
+        "epigraph_link_retired_shared_signer",
+        "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])",
+        false,
+    ),
+    // 122 (operator binding). `default_decl_for_author` calls the check on
+    // the request path, so a missing grant is 42501 on every default-decl
+    // claim write once armed; the three reads it and the trigger use are
+    // app-callable for the same reason. Arming is a maintenance act.
+    (
+        "epigraph_require_bound_author",
+        "public.epigraph_require_bound_author(uuid)",
+        true,
+    ),
+    (
+        "epigraph_author_binding",
+        "public.epigraph_author_binding(uuid)",
+        true,
+    ),
+    (
+        "epigraph_is_human_operator",
+        "public.epigraph_is_human_operator(uuid)",
+        true,
+    ),
+    (
+        "epigraph_operator_binding_enforced",
+        "public.epigraph_operator_binding_enforced()",
+        true,
+    ),
+    (
+        "epigraph_arm_operator_binding",
+        "public.epigraph_arm_operator_binding()",
+        false,
+    ),
+    (
+        "epigraph_operator_writes_group",
+        "public.epigraph_operator_writes_group(uuid, uuid)",
+        true,
+    ),
+    (
+        "epigraph_require_operator_scope",
+        "public.epigraph_require_operator_scope(uuid, uuid)",
+        true,
+    ),
+    // Registering a human is a maintenance act; the request DSN must not.
+    (
+        "epigraph_register_human_operator",
+        "public.epigraph_register_human_operator(uuid, text, uuid)",
+        false,
+    ),
+    // The writer binding the claims trigger applies (review SEC-1/2/4):
+    // the request path's workflow-ingest caller check calls the first two,
+    // and every read is app-callable for the trigger's own reason.
+    (
+        "epigraph_require_bound_writer",
+        "public.epigraph_require_bound_writer(uuid)",
+        true,
+    ),
+    (
+        "epigraph_require_writer_scope",
+        "public.epigraph_require_writer_scope(uuid, uuid)",
+        true,
+    ),
+    (
+        "epigraph_require_attributable",
+        "public.epigraph_require_attributable(uuid, uuid, boolean)",
+        true,
+    ),
+    (
+        "epigraph_human_of",
+        "public.epigraph_human_of(uuid, boolean)",
+        true,
+    ),
+    (
+        "epigraph_operator_binding_armed",
+        "public.epigraph_operator_binding_armed()",
+        true,
+    ),
+    (
+        "epigraph_revoke_human_operator",
+        "public.epigraph_revoke_human_operator(uuid, text)",
+        false,
+    ),
+    // Registering a system agent (migration 148) is a maintenance act.
+    (
+        "epigraph_register_system_agent",
+        "public.epigraph_register_system_agent(text, uuid, text)",
+        false,
+    ),
+    // 149 (the author-binding allowlist): allowing and revoking a client
+    // are maintenance acts, and the read helper is reached only through
+    // the two re-bodied binding reads above.
+    (
+        "epigraph_allow_author_binding_client",
+        "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_revoke_author_binding_client",
+        "public.epigraph_revoke_author_binding_client(uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_allowlisted_operator",
+        "public.epigraph_allowlisted_operator(uuid)",
+        false,
+    ),
+    // A link function: the request DSN must never record links.
+    (
+        "epigraph_link_legacy_authors",
+        "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
+        false,
+    ),
+    // 123 (the custodian role): the request path reads its OWN role
+    // (subject-bound readers) and the audit trail; granting, ending,
+    // recording a custodial act and the unbound roster read are
+    // maintenance acts the request DSN must never call.
+    (
+        "epigraph_live_role_assignment",
+        "public.epigraph_live_role_assignment(uuid, text, timestamp with time zone)",
+        false,
+    ),
+    (
+        "epigraph_role_assignment_for",
+        "public.epigraph_role_assignment_for(uuid, text, timestamp with time zone)",
+        true,
+    ),
+    (
+        "epigraph_holds_role",
+        "public.epigraph_holds_role(uuid, text, timestamp with time zone)",
+        true,
+    ),
+    (
+        "epigraph_grant_role",
+        "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_end_role_assignment",
+        "public.epigraph_end_role_assignment(uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_record_custodial_act",
+        "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_platform_audit",
+        "public.epigraph_platform_audit(timestamp with time zone, integer)",
+        true,
+    ),
+    // 124 (passkeys): the unauthenticated enrollment ceremony runs on the
+    // request DSN, so its three definers (the reader, the challenge store,
+    // the completion) are app-callable; opening a ticket and revoking a
+    // passkey are maintenance acts the request DSN must never call.
+    (
+        "epigraph_create_passkey_enrollment",
+        "public.epigraph_create_passkey_enrollment(uuid, text, text)",
+        false,
+    ),
+    (
+        "epigraph_enrollment_for_ceremony",
+        "public.epigraph_enrollment_for_ceremony(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_passkey_enrollment_challenge",
+        "public.epigraph_set_passkey_enrollment_challenge(uuid, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_complete_passkey_enrollment",
+        "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean)",
+        true,
+    ),
+    (
+        "epigraph_revoke_passkey",
+        "public.epigraph_revoke_passkey(uuid, text)",
+        false,
+    ),
+    // 125 (elevation): the ticket API, the unauthenticated ceremony, the
+    // elevate grant and the viewer's liveness check all run on the request
+    // DSN, so the nine principal-bound or ticket-keyed definers are
+    // app-callable. The three unbound helpers are NOT: "who may elevate",
+    // "whose family is this" for any person would be a roster oracle, and
+    // ending another person's expired sessions is not the request DSN's.
+    (
+        "epigraph_create_elevation_ticket",
+        "public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea)",
+        true,
+    ),
+    (
+        "epigraph_ticket_for_ceremony",
+        "public.epigraph_ticket_for_ceremony(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_elevation_ticket_challenge",
+        "public.epigraph_set_elevation_ticket_challenge(uuid, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_passkeys_for_ticket",
+        "public.epigraph_passkeys_for_ticket(uuid)",
+        true,
+    ),
+    (
+        "epigraph_confirm_elevation",
+        "public.epigraph_confirm_elevation(uuid, bytea, bigint, boolean, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_redeem_elevation_ticket",
+        "public.epigraph_redeem_elevation_ticket(uuid, bytea, uuid)",
+        true,
+    ),
+    (
+        "epigraph_elevation_live",
+        "public.epigraph_elevation_live(uuid, uuid)",
+        true,
+    ),
+    (
+        "epigraph_end_elevation",
+        "public.epigraph_end_elevation(uuid, text)",
+        true,
+    ),
+    (
+        "epigraph_is_elevated",
+        "public.epigraph_is_elevated()",
+        true,
+    ),
+    (
+        "epigraph_live_elevating_assignment",
+        "public.epigraph_live_elevating_assignment(uuid, timestamp with time zone)",
+        false,
+    ),
+    (
+        "epigraph_family_of_person_is_live",
+        "public.epigraph_family_of_person_is_live(uuid, uuid, uuid)",
+        false,
+    ),
+    (
+        "epigraph_elevated_access_ready",
+        "public.epigraph_elevated_access_ready()",
+        false,
+    ),
+    (
+        "epigraph_elevation_session_is_live",
+        "public.epigraph_elevation_session_is_live(uuid)",
+        false,
+    ),
+    (
+        "epigraph_end_expired_elevations",
+        "public.epigraph_end_expired_elevations(uuid, uuid)",
+        false,
+    ),
+    // 127 (the elevated-access log): the API's response layer and the MCP
+    // tool-call wrapper record on the request DSN, and the subject's read
+    // policy calls the admin-group helper as the application role, so all
+    // three are app-callable: the recorder refuses an unelevated
+    // connection (ELV07), the helper answers only for the caller, and the
+    // audit reader returns nothing to an unentitled caller.
+    (
+        "epigraph_record_elevated_access",
+        "public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])",
+        true,
+    ),
+    (
+        "epigraph_admin_group_ids",
+        "public.epigraph_admin_group_ids()",
+        true,
+    ),
+    (
+        "epigraph_elevated_access_audit",
+        "public.epigraph_elevated_access_audit(timestamp with time zone, integer)",
+        true,
+    ),
+    // 128 (the admin-scope arming switch): the token endpoint reads the
+    // switch and records the would-strip measurement on the request DSN,
+    // so both are app-callable; arming and disarming are maintenance acts.
+    (
+        "epigraph_admin_scopes_armed",
+        "public.epigraph_admin_scopes_armed()",
+        true,
+    ),
+    (
+        "epigraph_record_admin_scope_would_strip",
+        "public.epigraph_record_admin_scope_would_strip(uuid, text, text[])",
+        true,
+    ),
+    (
+        "epigraph_set_admin_scope_enforcement",
+        "public.epigraph_set_admin_scope_enforcement(boolean, text)",
+        false,
+    ),
+    // 130 (pending admin acts): proposing (elevation-gated) and the
+    // act-keyed confirmation ceremony run on the request DSN, so they are
+    // app-callable; consuming an act, the passkey oracle and the
+    // act-taking forms of the maintenance verbs are maintenance acts.
+    (
+        "epigraph_propose_admin_act",
+        "public.epigraph_propose_admin_act(text, jsonb, text, text)",
+        true,
+    ),
+    (
+        "epigraph_act_for_ceremony",
+        "public.epigraph_act_for_ceremony(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_admin_act_challenge",
+        "public.epigraph_set_admin_act_challenge(uuid, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_passkeys_for_act",
+        "public.epigraph_passkeys_for_act(uuid)",
+        true,
+    ),
+    // 200: the anchored enrollment page's reader, app-callable like 124's
+    // ceremony reader; the compromised revoke is a maintenance act like
+    // 124's revoke, which the request DSN must never call.
+    (
+        "epigraph_enrollment_anchor",
+        "public.epigraph_enrollment_anchor(uuid)",
+        true,
+    ),
+    (
+        "epigraph_revoke_passkey_compromised",
+        "public.epigraph_revoke_passkey_compromised(uuid, text)",
+        false,
+    ),
+    // 206: claim visibility controls, all five app-callable. The two
+    // reads run on every claim write that names no visibility
+    // (`ClaimRepository::resolve_visibility_choice`), so a
+    // missing grant there is 42501 on every default write, an outage like
+    // 107's actor read; the three writes are the publicize, share and
+    // default-team surfaces, which would be refused outright.
+    (
+        "epigraph_writable_teams",
+        "public.epigraph_writable_teams(uuid)",
+        true,
+    ),
+    // 234: `Viewer::resolve` asks it on EVERY viewer resolution, so a
+    // missing grant would be 42501 on every request (an outage), not a
+    // feature quietly off. The repo maps only 42883 (no such function,
+    // migration not yet applied) to "no team".
+    (
+        "epigraph_readable_teams",
+        "public.epigraph_readable_teams(uuid)",
+        true,
+    ),
+    (
+        "epigraph_default_group",
+        "public.epigraph_default_group(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_default_group",
+        "public.epigraph_set_default_group(uuid)",
+        true,
+    ),
+    (
+        "epigraph_publicize_claims",
+        "public.epigraph_publicize_claims(uuid[], text)",
+        true,
+    ),
+    (
+        "epigraph_share_claims_with_team",
+        "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
+        true,
+    ),
+    // 209: the private-default read runs on every claim write that names
+    // no visibility (a missing grant is 42501 on every default write); the
+    // setter is the API, MCP and operator-CLI default surface.
+    (
+        "epigraph_default_private",
+        "public.epigraph_default_private(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_agent_default_group",
+        "public.epigraph_set_agent_default_group(uuid, uuid, boolean)",
+        true,
+    ),
+    // 207: the bug-report intake's two definers run on the request DSN
+    // (MCP submit_bug_report / list_my_bug_reports), so both are
+    // app-callable; a missing grant refuses every report (42501).
+    (
+        "epigraph_submit_bug_report",
+        "public.epigraph_submit_bug_report(text, text, text, text, text, text, text, bytea, bytea, text)",
+        true,
+    ),
+    (
+        "epigraph_my_bug_reports",
+        "public.epigraph_my_bug_reports(integer)",
+        true,
+    ),
+    // 207: the preflight runs on the request DSN before the embedding
+    // call; the caller gate takes a principal as an argument, so the
+    // request DSN must never call it (an oracle for any agent).
+    (
+        "epigraph_bug_report_preflight",
+        "public.epigraph_bug_report_preflight()",
+        true,
+    ),
+    (
+        "epigraph_bug_report_gate",
+        "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
+        false,
+    ),
+    // 213: every agent client_credentials and refresh grant records its
+    // assertion nonce on the request DSN; a missing grant refuses every
+    // agent mint (500).
+    (
+        "epigraph_oauth_assertion_nonce_consume",
+        "public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)",
+        true,
+    ),
+    (
+        "epigraph_confirm_admin_act",
+        "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_has_live_passkey",
+        "public.epigraph_has_live_passkey(uuid)",
+        false,
+    ),
+    // The act-taking OVERLOADS share their names with the 123 / 124
+    // forms, and the presence check below reads the name; each is
+    // therefore keyed on `epigraph_consume_admin_act`, which exists
+    // exactly when 130 (and so the overload) does.
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text, uuid)",
+        false,
+    ),
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_end_role_assignment(uuid, text, uuid)",
+        false,
+    ),
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb, uuid)",
+        false,
+    ),
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
+        false,
+    ),
+    // 131: the proposer's own acts, principal-bound, on the request DSN.
+    (
+        "epigraph_admin_acts_of_principal",
+        "public.epigraph_admin_acts_of_principal(integer)",
+        true,
+    ),
+    // 161: the shared link body is a link function (maintenance only);
+    // the identity registration belongs to the attestor role alone; the
+    // prompt-history read is principal-gated and called on the request DSN.
+    (
+        "epigraph_link_operator_body",
+        "public.epigraph_link_operator_body(uuid, uuid, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_register_agent_identity",
+        "public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_agent_prompt_history",
+        "public.epigraph_agent_prompt_history(uuid)",
+        true,
+    ),
+    // 161 (review CR6): the cut-over's legacy-key backfill is a
+    // maintenance act; the request DSN never runs it.
+    (
+        "epigraph_backfill_legacy_agent_keys",
+        "public.epigraph_backfill_legacy_agent_keys()",
+        false,
+    ),
+    // 164 re-states 077's viewer group-set read; `Viewer::resolve` calls
+    // it on the request DSN.
+    (
+        "epigraph_live_memberships",
+        "public.epigraph_live_memberships(uuid)",
+        true,
+    ),
+    // 164: creating a team group and changing its roster are maintenance
+    // acts; the request DSN must never call them.
+    (
+        "epigraph_create_team_group",
+        "public.epigraph_create_team_group(text, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_team_group_add_member",
+        "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
+        false,
+    ),
+    (
+        "epigraph_team_group_remove_member",
+        "public.epigraph_team_group_remove_member(uuid, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_team_group_set_member_role",
+        "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
+        false,
+    ),
+    // 165: binding a role to a group is a maintenance act, and the
+    // derivation and the roster answer for any principal (a roster
+    // oracle); the request DSN calls none of them. It reaches the
+    // derivation only through `epigraph_live_memberships` and the claims
+    // trigger's writer scope, both maintenance-owned.
+    (
+        "epigraph_define_group_role",
+        "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
+        false,
+    ),
+    (
+        "epigraph_bind_group_role",
+        "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
+        false,
+    ),
+    // 179: the mode-taking overloads of the same two verbs (a binding
+    // that admits the holder and the role's attached agents only).
+    (
+        "epigraph_bind_group_role",
+        "public.epigraph_bind_group_role(text, uuid, text, text, text)",
+        false,
+    ),
+    (
+        "epigraph_define_group_role",
+        "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
+        false,
+    ),
+    (
+        "epigraph_end_group_role_binding",
+        "public.epigraph_end_group_role_binding(uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_role_derived_memberships",
+        "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
+        false,
+    ),
+    (
+        "epigraph_group_role_roster",
+        "public.epigraph_group_role_roster(uuid, timestamp with time zone)",
+        false,
+    ),
+    // 166: attaching and detaching a role's agents is a maintenance act;
+    // the request DSN asks whether an agent may run, and reaches the write
+    // check only through the maintenance-owned writer checks; never the
+    // gate's any-time form.
+    (
+        "epigraph_attach_agent_to_role",
+        "public.epigraph_attach_agent_to_role(text, uuid, timestamp with time zone, \
+         timestamp with time zone, text)",
+        false,
+    ),
+    (
+        "epigraph_detach_agent_from_role",
+        "public.epigraph_detach_agent_from_role(text, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_role_agent_gate",
+        "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",
+        false,
+    ),
+    (
+        "epigraph_role_agent_may_run",
+        "public.epigraph_role_agent_may_run(uuid)",
+        true,
+    ),
+    (
+        "epigraph_require_role_holder",
+        "public.epigraph_require_role_holder(uuid)",
+        false,
+    ),
+    // The author relief and the write trigger are reached only from
+    // maintenance-owned definers and triggers; the application role
+    // EXECUTEs neither.
+    (
+        "epigraph_agent_is_retired",
+        "public.epigraph_agent_is_retired(uuid)",
+        false,
+    ),
+    (
+        "epigraph_role_agent_write_check",
+        "public.epigraph_role_agent_write_check()",
+        false,
+    ),
+    // 180: the legacy-parent rule reads the FORCEd `operator_links` in its
+    // own maintenance-owned frame, so an app grant would be an existence
+    // oracle over links the application role cannot read; recording a
+    // succession after the fact is a maintenance act.
+    (
+        "epigraph_is_legacy_fleet_parent",
+        "public.epigraph_is_legacy_fleet_parent(uuid)",
+        false,
+    ),
+    (
+        "epigraph_record_legacy_succession",
+        "public.epigraph_record_legacy_succession(uuid, uuid, text, text)",
+        false,
+    ),
+    // 181: the member-removal route marks the re-key obligation through
+    // it on the request DSN; without the grant every removal is 42501.
+    (
+        "epigraph_mark_group_reseal_required",
+        "public.epigraph_mark_group_reseal_required(uuid)",
+        true,
+    ),
+    // 191: retiring a live link is a maintenance act; an app grant would
+    // let the request DSN end an agent's authority (and revoke its
+    // membership) for any agent.
+    (
+        "epigraph_retire_operator_link",
+        "public.epigraph_retire_operator_link(uuid, text, boolean)",
+        false,
+    ),
+    // 198: the request path builds the agent-lookup card through it;
+    // without the grant find_agent / get_agent fail 42501.
+    (
+        "epigraph_disclosed_role_assignments",
+        "public.epigraph_disclosed_role_assignments(uuid[])",
+        true,
+    ),
+    // 199: every claim read (REST GET /api/v1/claims/:id, MCP get_claim)
+    // calls it on the request DSN for `authored_by.prompt_snapshot`;
+    // without the grant every claim read is 42501.
+    (
+        "epigraph_agent_prompt_snapshot_at",
+        "public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz, boolean)",
+        true,
+    ),
+    // 199: every claim read calls it on the request DSN for
+    // `authored_by.human` (the filer's and each ingester's human);
+    // without the grant every claim read is 42501.
+    (
+        "epigraph_operator_bound_at",
+        "public.epigraph_operator_bound_at(uuid, timestamptz)",
+        true,
+    ),
+    // 208: MCP `countersign_authorship` calls it on the request DSN as
+    // the caller; without the grant every countersign is 42501.
+    (
+        "epigraph_countersign_authorship",
+        "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
+        true,
+    ),
+    // 219: the `evolve_step` gate calls it on the request DSN (REST and
+    // MCP); without the grant every evolve of an executed step is 42501.
+    (
+        "epigraph_step_lineage_executors",
+        "public.epigraph_step_lineage_executors(uuid)",
+        true,
+    ),
+    // The deferred definers from 161 on that the register missed until its
+    // completeness ratchet (backlog a2b079a1); each expectation is the grant
+    // its migration makes. 168: MCP `resolve_challenge` resolves through it
+    // on the request DSN.
+    (
+        "epigraph_resolve_challenge",
+        "public.epigraph_resolve_challenge(uuid, text, jsonb)",
+        true,
+    ),
+    // 184: `retract_bba` / `unretract_bba` call them on the request DSN; each
+    // decides the caller's own authority over the BBA.
+    (
+        "epigraph_retract_mass_function",
+        "public.epigraph_retract_mass_function(uuid, text, uuid, uuid)",
+        true,
+    ),
+    (
+        "epigraph_unretract_mass_function",
+        "public.epigraph_unretract_mass_function(uuid, text, uuid, uuid)",
+        true,
+    ),
+    // 193: the claim-role read (`claim_role`) calls it on the request DSN;
+    // 193 grants it to the application role.
+    (
+        "epigraph_claim_is_compound",
+        "public.epigraph_claim_is_compound(uuid)",
+        true,
+    ),
+    // 194: the retracted-row delete guard asks the grant helper as the
+    // deleting session (the application role included); the purge itself is
+    // a maintenance act the request DSN must never call.
+    (
+        "epigraph_mf_purge_granted",
+        "public.epigraph_mf_purge_granted(uuid)",
+        true,
+    ),
+    (
+        "epigraph_purge_mass_functions",
+        "public.epigraph_purge_mass_functions(uuid[], text)",
+        false,
+    ),
+    // 202: `WorkflowRepository` calls it on the request DSN; 202 grants it
+    // to the application role.
+    (
+        "epigraph_workflow_name_has_hidden_rows",
+        "public.epigraph_workflow_name_has_hidden_rows(text)",
+        true,
+    ),
+    // 210: the atlas map's epoch bump is reached only from its maintenance-
+    // owned stale triggers; an app grant would let the request DSN mark any
+    // team's map stale.
+    (
+        "epigraph_atlas_map_bump",
+        "public.epigraph_atlas_map_bump(uuid[], uuid[])",
+        false,
+    ),
+    // 236: the unbound live-membership read answers for ANY agent, so the
+    // request DSN must never execute it (that is the whole of 236); only
+    // maintenance-owned definers and the maintenance DSN call it.
+    (
+        "epigraph_live_memberships_unbound",
+        "public.epigraph_live_memberships_unbound(uuid)",
+        false,
+    ),
+    // 237: every hierarchical outcome report (REST and MCP) calls both on
+    // the request DSN, and every `add_step` the lock; without the grants
+    // each of those is 42501.
+    (
+        "epigraph_workflow_lock_readable",
+        "public.epigraph_workflow_lock_readable(uuid)",
+        true,
+    ),
+    (
+        "epigraph_workflow_record_outcome",
+        "public.epigraph_workflow_record_outcome(uuid, boolean, double precision)",
+        true,
+    ),
+    // 237: the MCP `deprecate_workflow` admin arm calls it on the request
+    // DSN; without the grant every admin deprecation of a row the admin
+    // does not write is 42501.
+    (
+        "epigraph_admin_deprecate_workflow_row",
+        "public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb)",
+        true,
+    ),
+    // 255: setting a paper's licence is a maintenance act; an app grant
+    // would let the request DSN mark any source open-licensed, and so make
+    // ingest retain its publisher text.
+    (
+        "epigraph_set_paper_licence",
+        "public.epigraph_set_paper_licence(uuid, text, text)",
+        false,
+    ),
+    // 259: every outcome report that names a step calls it on the request
+    // DSN (MCP and REST); without the grant those reports are 42501.
+    (
+        "epigraph_plan_step_skeleton",
+        "public.epigraph_plan_step_skeleton(uuid, uuid[])",
+        true,
+    ),
+    // 263: the person-facing team-group surface (REST and MCP) calls the
+    // six on the request DSN as the caller; without a grant each answers
+    // 42501. The roster grant check is called by 164's INVOKER group-row
+    // guard on every application INSERT into `groups` that it selects;
+    // without the grant those inserts fail 42501 instead of GRM06.
+    (
+        "epigraph_person_create_team_group",
+        "public.epigraph_person_create_team_group(text, text)",
+        true,
+    ),
+    (
+        "epigraph_invite_to_team_group",
+        "public.epigraph_invite_to_team_group(uuid, uuid, text, text)",
+        true,
+    ),
+    (
+        "epigraph_accept_group_invitation",
+        "public.epigraph_accept_group_invitation(uuid)",
+        true,
+    ),
+    (
+        "epigraph_decline_group_invitation",
+        "public.epigraph_decline_group_invitation(uuid)",
+        true,
+    ),
+    (
+        "epigraph_my_groups",
+        "public.epigraph_my_groups()",
+        true,
+    ),
+    (
+        "epigraph_my_group_invitations",
+        "public.epigraph_my_group_invitations()",
+        true,
+    ),
+    (
+        "epigraph_team_group_roster_granted",
+        "public.epigraph_team_group_roster_granted(uuid, uuid)",
+        true,
+    ),
+    // 264: restoring a role's successor attaches identities by name, a
+    // maintenance act like 166's attach; the request DSN never calls it.
+    (
+        "epigraph_restore_role_successor",
+        "public.epigraph_restore_role_successor(text, uuid, uuid, timestamp with time zone, \
+         text)",
+        false,
+    ),
+    // 239: the key rotation definer. No EXECUTE for the application role
+    // (239 section 1c: it would re-open the INSERT 239 revokes from it).
+    (
+        "epigraph_agent_key_rotate",
+        "public.epigraph_agent_key_rotate(uuid, bytea)",
+        false,
+    ),
+    // 254: the hierarchical cycle walk, called by the application's edge
+    // writers.
+    (
+        "epigraph_edges_reach",
+        "public.epigraph_edges_reach(uuid, uuid, text[])",
+        true,
+    ),
+    // 269: the agent-lookup card's reverse binding read (find_agent /
+    // get_agent, on the request DSN); without the grant every card is
+    // 42501.
+    (
+        "epigraph_agents_linked_to_operator",
+        "public.epigraph_agents_linked_to_operator(uuid)",
+        true,
+    ),
+    // 269: the agent-lookup card's role attachments, same path.
+    (
+        "epigraph_disclosed_role_attachments",
+        "public.epigraph_disclosed_role_attachments(uuid[])",
+        true,
+    ),
+    // 268: the prompt-history listing calls it on the request DSN; without
+    // the grant every listing is 42501.
+    (
+        "epigraph_agent_prompt_history_meta",
+        "public.epigraph_agent_prompt_history_meta(uuid, integer, uuid, timestamptz, uuid, integer)",
+        true,
+    ),
+    // 267: every edge withdrawal on the application role
+    // (`EdgeRepository::withdraw_edge_bbas_conn`) asks it first, so a
+    // missing grant is 42501 on every edge retract, delete and rewire.
+    (
+        "epigraph_edge_bbas_keyed",
+        "public.epigraph_edge_bbas_keyed(uuid)",
+        true,
+    ),
+];
+
+/// The EXECUTE grants to `epigraph_app` of the definers in
+/// [`OPERATOR_FUNCTION_GRANTS`] (migration 107's first, then every deferred
+/// definer from 161 on that is not a trigger), which the ownership check above
+/// does not see. Returns the number of failing checks.
 ///
 /// # Why this is its own check
 ///
@@ -2522,712 +4087,16 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
 ///   `epigraph_link_retired_agent`, 116's `epigraph_link_retired_shared_signer`)
 ///   must NOT be. A grant there lets the request
 ///   DSN record operator links, which is the whole of 107's trust basis.
+/// * every later entry carries its own note in the register: a `true` one
+///   names the request path that calls it (and fails 42501 without the
+///   grant), a `false` one what an app grant would let the request DSN do.
+///   The FAIL lines below are worded for any entry, and point there.
 ///
 /// Each function is checked only when it exists (the same deferral as
 /// [`DEFERRED_DEFINER_FUNCTIONS`]), and the whole check only when the app role
 /// exists — with no `epigraph_app` there is no grant to be wrong.
 async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize> {
     const APP_ROLE: &str = "epigraph_app";
-    const GRANTS: &[(&str, &str, bool)] = &[
-        (
-            "epigraph_operator_actor",
-            "public.epigraph_operator_actor(uuid)",
-            true,
-        ),
-        (
-            "epigraph_operator_of_author",
-            "public.epigraph_operator_of_author(uuid)",
-            true,
-        ),
-        (
-            "epigraph_operates_agents",
-            "public.epigraph_operates_agents(uuid)",
-            true,
-        ),
-        (
-            "epigraph_link_operator",
-            "public.epigraph_link_operator(uuid, uuid)",
-            false,
-        ),
-        (
-            "epigraph_link_retired_agent",
-            "public.epigraph_link_retired_agent(uuid, uuid)",
-            false,
-        ),
-        // 116 (batch HTTP-id): the attested retire of a former shared signer
-        // is a link function too, so the request DSN must not call it.
-        (
-            "epigraph_link_retired_shared_signer",
-            "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])",
-            false,
-        ),
-        // 122 (operator binding). `default_decl_for_author` calls the check on
-        // the request path, so a missing grant is 42501 on every default-decl
-        // claim write once armed; the three reads it and the trigger use are
-        // app-callable for the same reason. Arming is a maintenance act.
-        (
-            "epigraph_require_bound_author",
-            "public.epigraph_require_bound_author(uuid)",
-            true,
-        ),
-        (
-            "epigraph_author_binding",
-            "public.epigraph_author_binding(uuid)",
-            true,
-        ),
-        (
-            "epigraph_is_human_operator",
-            "public.epigraph_is_human_operator(uuid)",
-            true,
-        ),
-        (
-            "epigraph_operator_binding_enforced",
-            "public.epigraph_operator_binding_enforced()",
-            true,
-        ),
-        (
-            "epigraph_arm_operator_binding",
-            "public.epigraph_arm_operator_binding()",
-            false,
-        ),
-        (
-            "epigraph_operator_writes_group",
-            "public.epigraph_operator_writes_group(uuid, uuid)",
-            true,
-        ),
-        (
-            "epigraph_require_operator_scope",
-            "public.epigraph_require_operator_scope(uuid, uuid)",
-            true,
-        ),
-        // Registering a human is a maintenance act; the request DSN must not.
-        (
-            "epigraph_register_human_operator",
-            "public.epigraph_register_human_operator(uuid, text, uuid)",
-            false,
-        ),
-        // The writer binding the claims trigger applies (review SEC-1/2/4):
-        // the request path's workflow-ingest caller check calls the first two,
-        // and every read is app-callable for the trigger's own reason.
-        (
-            "epigraph_require_bound_writer",
-            "public.epigraph_require_bound_writer(uuid)",
-            true,
-        ),
-        (
-            "epigraph_require_writer_scope",
-            "public.epigraph_require_writer_scope(uuid, uuid)",
-            true,
-        ),
-        (
-            "epigraph_require_attributable",
-            "public.epigraph_require_attributable(uuid, uuid, boolean)",
-            true,
-        ),
-        (
-            "epigraph_human_of",
-            "public.epigraph_human_of(uuid, boolean)",
-            true,
-        ),
-        (
-            "epigraph_operator_binding_armed",
-            "public.epigraph_operator_binding_armed()",
-            true,
-        ),
-        (
-            "epigraph_revoke_human_operator",
-            "public.epigraph_revoke_human_operator(uuid, text)",
-            false,
-        ),
-        // Registering a system agent (migration 148) is a maintenance act.
-        (
-            "epigraph_register_system_agent",
-            "public.epigraph_register_system_agent(text, uuid, text)",
-            false,
-        ),
-        // 149 (the author-binding allowlist): allowing and revoking a client
-        // are maintenance acts, and the read helper is reached only through
-        // the two re-bodied binding reads above.
-        (
-            "epigraph_allow_author_binding_client",
-            "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_revoke_author_binding_client",
-            "public.epigraph_revoke_author_binding_client(uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_allowlisted_operator",
-            "public.epigraph_allowlisted_operator(uuid)",
-            false,
-        ),
-        // A link function: the request DSN must never record links.
-        (
-            "epigraph_link_legacy_authors",
-            "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
-            false,
-        ),
-        // 123 (the custodian role): the request path reads its OWN role
-        // (subject-bound readers) and the audit trail; granting, ending,
-        // recording a custodial act and the unbound roster read are
-        // maintenance acts the request DSN must never call.
-        (
-            "epigraph_live_role_assignment",
-            "public.epigraph_live_role_assignment(uuid, text, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_role_assignment_for",
-            "public.epigraph_role_assignment_for(uuid, text, timestamp with time zone)",
-            true,
-        ),
-        (
-            "epigraph_holds_role",
-            "public.epigraph_holds_role(uuid, text, timestamp with time zone)",
-            true,
-        ),
-        (
-            "epigraph_grant_role",
-            "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_end_role_assignment",
-            "public.epigraph_end_role_assignment(uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_record_custodial_act",
-            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb)",
-            false,
-        ),
-        (
-            "epigraph_platform_audit",
-            "public.epigraph_platform_audit(timestamp with time zone, integer)",
-            true,
-        ),
-        // 124 (passkeys): the unauthenticated enrollment ceremony runs on the
-        // request DSN, so its three definers (the reader, the challenge store,
-        // the completion) are app-callable; opening a ticket and revoking a
-        // passkey are maintenance acts the request DSN must never call.
-        (
-            "epigraph_create_passkey_enrollment",
-            "public.epigraph_create_passkey_enrollment(uuid, text, text)",
-            false,
-        ),
-        (
-            "epigraph_enrollment_for_ceremony",
-            "public.epigraph_enrollment_for_ceremony(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_passkey_enrollment_challenge",
-            "public.epigraph_set_passkey_enrollment_challenge(uuid, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_complete_passkey_enrollment",
-            "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean)",
-            true,
-        ),
-        (
-            "epigraph_revoke_passkey",
-            "public.epigraph_revoke_passkey(uuid, text)",
-            false,
-        ),
-        // 125 (elevation): the ticket API, the unauthenticated ceremony, the
-        // elevate grant and the viewer's liveness check all run on the request
-        // DSN, so the nine principal-bound or ticket-keyed definers are
-        // app-callable. The three unbound helpers are NOT: "who may elevate",
-        // "whose family is this" for any person would be a roster oracle, and
-        // ending another person's expired sessions is not the request DSN's.
-        (
-            "epigraph_create_elevation_ticket",
-            "public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea)",
-            true,
-        ),
-        (
-            "epigraph_ticket_for_ceremony",
-            "public.epigraph_ticket_for_ceremony(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_elevation_ticket_challenge",
-            "public.epigraph_set_elevation_ticket_challenge(uuid, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_passkeys_for_ticket",
-            "public.epigraph_passkeys_for_ticket(uuid)",
-            true,
-        ),
-        (
-            "epigraph_confirm_elevation",
-            "public.epigraph_confirm_elevation(uuid, bytea, bigint, boolean, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_redeem_elevation_ticket",
-            "public.epigraph_redeem_elevation_ticket(uuid, bytea, uuid)",
-            true,
-        ),
-        (
-            "epigraph_elevation_live",
-            "public.epigraph_elevation_live(uuid, uuid)",
-            true,
-        ),
-        (
-            "epigraph_end_elevation",
-            "public.epigraph_end_elevation(uuid, text)",
-            true,
-        ),
-        (
-            "epigraph_is_elevated",
-            "public.epigraph_is_elevated()",
-            true,
-        ),
-        (
-            "epigraph_live_elevating_assignment",
-            "public.epigraph_live_elevating_assignment(uuid, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_family_of_person_is_live",
-            "public.epigraph_family_of_person_is_live(uuid, uuid, uuid)",
-            false,
-        ),
-        (
-            "epigraph_elevated_access_ready",
-            "public.epigraph_elevated_access_ready()",
-            false,
-        ),
-        (
-            "epigraph_elevation_session_is_live",
-            "public.epigraph_elevation_session_is_live(uuid)",
-            false,
-        ),
-        (
-            "epigraph_end_expired_elevations",
-            "public.epigraph_end_expired_elevations(uuid, uuid)",
-            false,
-        ),
-        // 127 (the elevated-access log): the API's response layer and the MCP
-        // tool-call wrapper record on the request DSN, and the subject's read
-        // policy calls the admin-group helper as the application role, so all
-        // three are app-callable: the recorder refuses an unelevated
-        // connection (ELV07), the helper answers only for the caller, and the
-        // audit reader returns nothing to an unentitled caller.
-        (
-            "epigraph_record_elevated_access",
-            "public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])",
-            true,
-        ),
-        (
-            "epigraph_admin_group_ids",
-            "public.epigraph_admin_group_ids()",
-            true,
-        ),
-        (
-            "epigraph_elevated_access_audit",
-            "public.epigraph_elevated_access_audit(timestamp with time zone, integer)",
-            true,
-        ),
-        // 128 (the admin-scope arming switch): the token endpoint reads the
-        // switch and records the would-strip measurement on the request DSN,
-        // so both are app-callable; arming and disarming are maintenance acts.
-        (
-            "epigraph_admin_scopes_armed",
-            "public.epigraph_admin_scopes_armed()",
-            true,
-        ),
-        (
-            "epigraph_record_admin_scope_would_strip",
-            "public.epigraph_record_admin_scope_would_strip(uuid, text, text[])",
-            true,
-        ),
-        (
-            "epigraph_set_admin_scope_enforcement",
-            "public.epigraph_set_admin_scope_enforcement(boolean, text)",
-            false,
-        ),
-        // 130 (pending admin acts): proposing (elevation-gated) and the
-        // act-keyed confirmation ceremony run on the request DSN, so they are
-        // app-callable; consuming an act, the passkey oracle and the
-        // act-taking forms of the maintenance verbs are maintenance acts.
-        (
-            "epigraph_propose_admin_act",
-            "public.epigraph_propose_admin_act(text, jsonb, text, text)",
-            true,
-        ),
-        (
-            "epigraph_act_for_ceremony",
-            "public.epigraph_act_for_ceremony(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_admin_act_challenge",
-            "public.epigraph_set_admin_act_challenge(uuid, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_passkeys_for_act",
-            "public.epigraph_passkeys_for_act(uuid)",
-            true,
-        ),
-        // 200: the anchored enrollment page's reader, app-callable like 124's
-        // ceremony reader; the compromised revoke is a maintenance act like
-        // 124's revoke, which the request DSN must never call.
-        (
-            "epigraph_enrollment_anchor",
-            "public.epigraph_enrollment_anchor(uuid)",
-            true,
-        ),
-        (
-            "epigraph_revoke_passkey_compromised",
-            "public.epigraph_revoke_passkey_compromised(uuid, text)",
-            false,
-        ),
-        // 206: claim visibility controls, all five app-callable. The two
-        // reads run on every claim write that names no visibility
-        // (`ClaimRepository::resolve_visibility_choice`), so a
-        // missing grant there is 42501 on every default write, an outage like
-        // 107's actor read; the three writes are the publicize, share and
-        // default-team surfaces, which would be refused outright.
-        (
-            "epigraph_writable_teams",
-            "public.epigraph_writable_teams(uuid)",
-            true,
-        ),
-        // 234: `Viewer::resolve` asks it on EVERY viewer resolution, so a
-        // missing grant would be 42501 on every request (an outage), not a
-        // feature quietly off. The repo maps only 42883 (no such function,
-        // migration not yet applied) to "no team".
-        (
-            "epigraph_readable_teams",
-            "public.epigraph_readable_teams(uuid)",
-            true,
-        ),
-        (
-            "epigraph_default_group",
-            "public.epigraph_default_group(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_default_group",
-            "public.epigraph_set_default_group(uuid)",
-            true,
-        ),
-        (
-            "epigraph_publicize_claims",
-            "public.epigraph_publicize_claims(uuid[], text)",
-            true,
-        ),
-        (
-            "epigraph_share_claims_with_team",
-            "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
-            true,
-        ),
-        // 209: the private-default read runs on every claim write that names
-        // no visibility (a missing grant is 42501 on every default write); the
-        // setter is the API, MCP and operator-CLI default surface.
-        (
-            "epigraph_default_private",
-            "public.epigraph_default_private(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_agent_default_group",
-            "public.epigraph_set_agent_default_group(uuid, uuid, boolean)",
-            true,
-        ),
-        // 207: the bug-report intake's two definers run on the request DSN
-        // (MCP submit_bug_report / list_my_bug_reports), so both are
-        // app-callable; a missing grant refuses every report (42501).
-        (
-            "epigraph_submit_bug_report",
-            "public.epigraph_submit_bug_report(text, text, text, text, text, text, text, bytea, bytea, text)",
-            true,
-        ),
-        (
-            "epigraph_my_bug_reports",
-            "public.epigraph_my_bug_reports(integer)",
-            true,
-        ),
-        // 207: the preflight runs on the request DSN before the embedding
-        // call; the caller gate takes a principal as an argument, so the
-        // request DSN must never call it (an oracle for any agent).
-        (
-            "epigraph_bug_report_preflight",
-            "public.epigraph_bug_report_preflight()",
-            true,
-        ),
-        (
-            "epigraph_bug_report_gate",
-            "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
-            false,
-        ),
-        // 213: every agent client_credentials and refresh grant records its
-        // assertion nonce on the request DSN; a missing grant refuses every
-        // agent mint (500).
-        (
-            "epigraph_oauth_assertion_nonce_consume",
-            "public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)",
-            true,
-        ),
-        (
-            "epigraph_confirm_admin_act",
-            "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
-            false,
-        ),
-        (
-            "epigraph_has_live_passkey",
-            "public.epigraph_has_live_passkey(uuid)",
-            false,
-        ),
-        // The act-taking OVERLOADS share their names with the 123 / 124
-        // forms, and the presence check below reads the name; each is
-        // therefore keyed on `epigraph_consume_admin_act`, which exists
-        // exactly when 130 (and so the overload) does.
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text, uuid)",
-            false,
-        ),
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_end_role_assignment(uuid, text, uuid)",
-            false,
-        ),
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb, uuid)",
-            false,
-        ),
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
-            false,
-        ),
-        // 131: the proposer's own acts, principal-bound, on the request DSN.
-        (
-            "epigraph_admin_acts_of_principal",
-            "public.epigraph_admin_acts_of_principal(integer)",
-            true,
-        ),
-        // 161: the shared link body is a link function (maintenance only);
-        // the identity registration belongs to the attestor role alone; the
-        // prompt-history read is principal-gated and called on the request DSN.
-        (
-            "epigraph_link_operator_body",
-            "public.epigraph_link_operator_body(uuid, uuid, jsonb)",
-            false,
-        ),
-        (
-            "epigraph_register_agent_identity",
-            "public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)",
-            false,
-        ),
-        (
-            "epigraph_agent_prompt_history",
-            "public.epigraph_agent_prompt_history(uuid)",
-            true,
-        ),
-        // 161 (review CR6): the cut-over's legacy-key backfill is a
-        // maintenance act; the request DSN never runs it.
-        (
-            "epigraph_backfill_legacy_agent_keys",
-            "public.epigraph_backfill_legacy_agent_keys()",
-            false,
-        ),
-        // 164 re-states 077's viewer group-set read; `Viewer::resolve` calls
-        // it on the request DSN.
-        (
-            "epigraph_live_memberships",
-            "public.epigraph_live_memberships(uuid)",
-            true,
-        ),
-        // 164: creating a team group and changing its roster are maintenance
-        // acts; the request DSN must never call them.
-        (
-            "epigraph_create_team_group",
-            "public.epigraph_create_team_group(text, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_team_group_add_member",
-            "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
-            false,
-        ),
-        (
-            "epigraph_team_group_remove_member",
-            "public.epigraph_team_group_remove_member(uuid, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_team_group_set_member_role",
-            "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
-            false,
-        ),
-        // 165: binding a role to a group is a maintenance act, and the
-        // derivation and the roster answer for any principal (a roster
-        // oracle); the request DSN calls none of them. It reaches the
-        // derivation only through `epigraph_live_memberships` and the claims
-        // trigger's writer scope, both maintenance-owned.
-        (
-            "epigraph_define_group_role",
-            "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
-            false,
-        ),
-        (
-            "epigraph_bind_group_role",
-            "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
-            false,
-        ),
-        // 179: the mode-taking overloads of the same two verbs (a binding
-        // that admits the holder and the role's attached agents only).
-        (
-            "epigraph_bind_group_role",
-            "public.epigraph_bind_group_role(text, uuid, text, text, text)",
-            false,
-        ),
-        (
-            "epigraph_define_group_role",
-            "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
-            false,
-        ),
-        (
-            "epigraph_end_group_role_binding",
-            "public.epigraph_end_group_role_binding(uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_role_derived_memberships",
-            "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_group_role_roster",
-            "public.epigraph_group_role_roster(uuid, timestamp with time zone)",
-            false,
-        ),
-        // 166: attaching and detaching a role's agents is a maintenance act;
-        // the request DSN asks whether an agent may run, and reaches the write
-        // check only through the maintenance-owned writer checks; never the
-        // gate's any-time form.
-        (
-            "epigraph_attach_agent_to_role",
-            "public.epigraph_attach_agent_to_role(text, uuid, timestamp with time zone, \
-             timestamp with time zone, text)",
-            false,
-        ),
-        (
-            "epigraph_detach_agent_from_role",
-            "public.epigraph_detach_agent_from_role(text, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_role_agent_gate",
-            "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_role_agent_may_run",
-            "public.epigraph_role_agent_may_run(uuid)",
-            true,
-        ),
-        (
-            "epigraph_require_role_holder",
-            "public.epigraph_require_role_holder(uuid)",
-            false,
-        ),
-        // The author relief and the write trigger are reached only from
-        // maintenance-owned definers and triggers; the application role
-        // EXECUTEs neither.
-        (
-            "epigraph_agent_is_retired",
-            "public.epigraph_agent_is_retired(uuid)",
-            false,
-        ),
-        (
-            "epigraph_role_agent_write_check",
-            "public.epigraph_role_agent_write_check()",
-            false,
-        ),
-        // 180: the legacy-parent rule reads the FORCEd `operator_links` in its
-        // own maintenance-owned frame, so an app grant would be an existence
-        // oracle over links the application role cannot read; recording a
-        // succession after the fact is a maintenance act.
-        (
-            "epigraph_is_legacy_fleet_parent",
-            "public.epigraph_is_legacy_fleet_parent(uuid)",
-            false,
-        ),
-        (
-            "epigraph_record_legacy_succession",
-            "public.epigraph_record_legacy_succession(uuid, uuid, text, text)",
-            false,
-        ),
-        // 181: the member-removal route marks the re-key obligation through
-        // it on the request DSN; without the grant every removal is 42501.
-        (
-            "epigraph_mark_group_reseal_required",
-            "public.epigraph_mark_group_reseal_required(uuid)",
-            true,
-        ),
-        // 191: retiring a live link is a maintenance act; an app grant would
-        // let the request DSN end an agent's authority (and revoke its
-        // membership) for any agent.
-        (
-            "epigraph_retire_operator_link",
-            "public.epigraph_retire_operator_link(uuid, text, boolean)",
-            false,
-        ),
-        // 198: the request path builds the agent-lookup card through it;
-        // without the grant find_agent / get_agent fail 42501.
-        (
-            "epigraph_disclosed_role_assignments",
-            "public.epigraph_disclosed_role_assignments(uuid[])",
-            true,
-        ),
-        // 199: every claim read (REST GET /api/v1/claims/:id, MCP get_claim)
-        // calls it on the request DSN for `authored_by.prompt_snapshot`;
-        // without the grant every claim read is 42501.
-        (
-            "epigraph_agent_prompt_snapshot_at",
-            "public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz, boolean)",
-            true,
-        ),
-        // 199: every claim read calls it on the request DSN for
-        // `authored_by.human` (the filer's and each ingester's human);
-        // without the grant every claim read is 42501.
-        (
-            "epigraph_operator_bound_at",
-            "public.epigraph_operator_bound_at(uuid, timestamptz)",
-            true,
-        ),
-        // 208: MCP `countersign_authorship` calls it on the request DSN as
-        // the caller; without the grant every countersign is 42501.
-        (
-            "epigraph_countersign_authorship",
-            "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
-            true,
-        ),
-        // 219: the `evolve_step` gate calls it on the request DSN (REST and
-        // MCP); without the grant every evolve of an executed step is 42501.
-        (
-            "epigraph_step_lineage_executors",
-            "public.epigraph_step_lineage_executors(uuid)",
-            true,
-        ),
-    ];
-
     let app_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
             .bind(APP_ROLE)
@@ -3237,7 +4106,7 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         return Ok(0);
     }
     let mut failures = 0usize;
-    for (name, signature, app_must_execute) in GRANTS {
+    for (name, signature, app_must_execute) in OPERATOR_FUNCTION_GRANTS {
         // Presence by SIGNATURE, not by name: a name can exist through an
         // older overload while the registered signature is installed by a
         // migration not applied yet (179's text overloads beside 165's
@@ -3274,16 +4143,20 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             failures += 1;
             if *app_must_execute {
                 eprintln!(
-                    "FAIL: {APP_ROLE} cannot EXECUTE {signature}. Migration 107 grants it only if \
-                     the role existed when 107 ran; without it every claim write on the app DSN \
-                     fails with 42501 (the authoring path calls it per write). Re-issue: GRANT \
+                    "FAIL: {APP_ROLE} cannot EXECUTE {signature}. Its migration grants it only \
+                     when the role exists, so a cluster where {APP_ROLE} was provisioned after \
+                     that migration ran carries no grant, and the request-DSN path that calls \
+                     it fails with 42501 (for 107's actor read, every claim write; the entry's \
+                     note in OPERATOR_FUNCTION_GRANTS names the caller). Re-issue: GRANT \
                      EXECUTE ON FUNCTION {signature} TO {APP_ROLE};"
                 );
             } else {
                 eprintln!(
-                    "FAIL: {APP_ROLE} CAN EXECUTE {signature}. The request DSN could then record \
-                     operator links itself, which is the whole of migration 107's trust basis. \
-                     Re-issue: REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {APP_ROLE};"
+                    "FAIL: {APP_ROLE} CAN EXECUTE {signature}, a definer only maintenance may \
+                     call. The request DSN could then perform its act itself (for 107's link \
+                     functions, record operator links, the whole of 107's trust basis; the \
+                     entry's note in OPERATOR_FUNCTION_GRANTS says what it allows). Re-issue: \
+                     REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {APP_ROLE};"
                 );
             }
         }
@@ -3463,6 +4336,44 @@ async fn verify_no_maintenance_create_on_public(pool: &PgPool) -> anyhow::Result
     Ok(1)
 }
 
+/// 251 (backlog 6bdac68f): `epigraph_bba_guard_owner`, the NOLOGIN owner of
+/// the retracted-BBA grant ledger, is reachable by no role and owns only the
+/// ledger's three functions, and only it can write the ledger. The migration
+/// refuses to apply otherwise, but a grant made AFTER it (a role granted the
+/// owner, ADMIN OPTION on it, a CREATEROLE role, `pg_write_all_data` or a
+/// direct privilege on the ledger given to a login, a trigger on the ledger)
+/// silently reopens what it closed: a login that can act as the owner, or
+/// write the ledger, deletes or un-retracts a retracted BBA with no record.
+/// Every fault `epigraph_bba_guard_owner_faults()` names is a failure. Skipped
+/// (with a NOTE) before 251.
+async fn verify_bba_guard_owner(pool: &PgPool) -> anyhow::Result<usize> {
+    let applies: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('public.epigraph_bba_guard_owner_faults()') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !applies {
+        eprintln!(
+            "NOTE: skipping the retracted-BBA ledger check — migration 251 has not been \
+             applied, so public.epigraph_bba_guard_owner_faults() does not exist."
+        );
+        return Ok(0);
+    }
+    let faults: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(public.epigraph_bba_guard_owner_faults())")
+            .fetch_all(pool)
+            .await?;
+    for fault in &faults {
+        eprintln!(
+            "FAIL: retracted-BBA ledger: {fault}. Only the ledger's three functions may act as \
+             {LEDGER_OWNER_ROLE} or write public.mass_function_purge_grants; while this holds, \
+             a session that can deletes or un-retracts a retracted BBA with no record. Remove \
+             the membership, attribute, privilege or object named (docs/deploy.md, the 251 row)."
+        );
+    }
+    Ok(faults.len())
+}
+
 /// 166: every public table the application role can write carries the
 /// role-holder write check (`role_agent_write_check`, a BEFORE ... FOR EACH
 /// STATEMENT trigger) on INSERT, UPDATE, DELETE and TRUNCATE, except
@@ -3538,9 +4449,12 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     let mut failures = 0usize;
 
     failures += verify_definer_ownership(pool).await?;
+    failures += verify_dedicated_definer_owners(pool).await?;
+    failures += verify_operator_link_retirer_isolation(&mut *pool.acquire().await?).await?;
     failures += verify_operator_function_grants(pool).await?;
     failures += verify_no_maintenance_create_on_public(pool).await?;
     failures += verify_role_holder_write_check_coverage(pool).await?;
+    failures += verify_bba_guard_owner(pool).await?;
 
     // A4. NOT the plan's rationale: an earlier revision of this comment said
     // "the derivation is total, because claims.agent_id is NOT NULL". NOT NULL
@@ -3710,6 +4624,65 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
         );
     }
 
+    // The THIRD edge shape (migration 258): an edge with a non-public frame,
+    // context, perspective or community endpoint that is not on its
+    // endpoints' meet. Before 258 the oracle met those endpoints as public,
+    // so such an edge could be world-owned (readable by anyone, naming the
+    // private registry row) or owned by its other endpoint's group alone;
+    // 258's section 4 re-met every one, but a registry row re-tenanted after
+    // it does not re-meet its edges by itself. Read from the endpoints' own
+    // rows, as above, never through `epigraph_node_tenancy`.
+    //
+    // Below 258 the check is SKIPPED, and says so: this pre-flight runs before
+    // the migrations of a release, and on a database whose oracle still meets
+    // a registry row as public every edge onto a private one is off its meet
+    // until 258's own re-meet runs. Read from the catalog (the oracle's body),
+    // not from `_sqlx_migrations`, as the 086 gate does.
+    let registry_met = registry_endpoints_met(pool).await?;
+    let RegistryEdgeTotals {
+        remet: registry_stale,
+        held: registry_held,
+        dangling: registry_dangling,
+    } = if registry_met {
+        registry_edge_totals(&registry_edge_remeet(pool, false).await?)
+    } else {
+        eprintln!(
+            "NOTE: skipping the registry-edge check: migration 258, which meets a frame, \
+             context, perspective or community endpoint with its own row, has not been \
+             applied. Until it is, this check is UNCHECKED, not passing."
+        );
+        RegistryEdgeTotals::default()
+    };
+    if registry_stale > 0 {
+        failures += 1;
+        eprintln!(
+            "FAIL: {registry_stale} edge(s) with a non-public frame, context, perspective or \
+             community endpoint are not on their endpoints' meet (migration 258), so a reader \
+             outside the registry row's group can read an edge naming it. Remediation: \
+             `epigraph-tenancy-backfill run --legacy-owner <decision> --entity registry-edges \
+             --dry-run`, then the same without `--dry-run`."
+        );
+    }
+    if registry_held > 0 {
+        failures += 1;
+        eprintln!(
+            "FAIL: {registry_held} edge(s) with a non-public frame, context, perspective or \
+             community endpoint need three groups (their meet plus the groups their current \
+             tuple requires), more than an edge can carry; `--entity registry-edges` holds \
+             them. An operator decides each one (delete it, or re-declare an endpoint)."
+        );
+    }
+    if registry_dangling > 0 {
+        failures += 1;
+        eprintln!(
+            "FAIL: {registry_dangling} edge(s) with a non-public frame, context, perspective \
+             or community endpoint are off their endpoints' meet and name an endpoint that no \
+             longer exists, so no UPDATE can re-meet them (`edges_validate_refs` refuses the \
+             write) and `--entity registry-edges` skips them. Remediation: an operator deletes \
+             each dangling edge (or restores its missing endpoint), then re-runs `verify`."
+        );
+    }
+
     for t in TIER_A {
         if INSTANCE_WIDE_REGISTRIES.contains(t) || matches!(*t, "edges" | "claims" | "evidence") {
             continue;
@@ -3870,7 +4843,10 @@ async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
 /// or an unqualified `epigraph_<f>(` (resolved on `search_path` public).
 #[cfg(test)]
 mod definer_register_tests {
-    use super::{DEFERRED_DEFINER_FUNCTIONS, DEFINER_FUNCTIONS};
+    use super::{
+        DEDICATED_OWNER_DEFINERS, DEFERRED_DEFINER_FUNCTIONS, DEFINER_FUNCTIONS,
+        OPERATOR_FUNCTION_GRANTS,
+    };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
@@ -4336,11 +5312,62 @@ mod definer_register_tests {
         );
 
         let owned: BTreeSet<&str> = rows.iter().map(|(_, n, _)| n.as_str()).collect();
+        let dedicated: BTreeSet<&str> = DEDICATED_OWNER_DEFINERS
+            .iter()
+            .map(|(n, _, _)| *n)
+            .collect();
+        // 251: registered, but owned by the ledger's NOLOGIN owner at head.
+        let ledger_owned: BTreeSet<&str> = super::LEDGER_OWNED_DEFINERS.iter().copied().collect();
         let listed: BTreeSet<&str> = register()
             .into_iter()
             .chain(INVOKER_EXEMPT.iter().copied())
             .chain(PRE_REGISTER_DEFINERS.iter().copied())
+            .filter(|n| !dedicated.contains(n))
+            .filter(|n| !ledger_owned.contains(n))
             .collect();
+        // A dedicated-owner definer is owned by EXACTLY its role at head (a
+        // silently no-opped re-own leaves it with epigraph_maintenance, which
+        // the `owned` equality below would then report as unlisted).
+        for (name, role, version) in DEDICATED_OWNER_DEFINERS {
+            assert!(
+                register().contains(name),
+                "DEDICATED_OWNER_DEFINERS names public.{name}, which is not registered"
+            );
+            let owners: Vec<String> = sqlx::query_scalar(
+                "SELECT pg_get_userbyid(p.proowner)::text FROM pg_proc p \
+                   JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  WHERE n.nspname = 'public' AND p.proname = $1",
+            )
+            .bind(name)
+            .fetch_all(&pool)
+            .await
+            .expect("owner of a dedicated-owner definer");
+            assert!(
+                !owners.is_empty() && owners.iter().all(|o| o == role),
+                "public.{name} must be owned by {role} at head (migration {version}); found \
+                 {owners:?}"
+            );
+        }
+        for name in &ledger_owned {
+            assert!(
+                register().contains(name),
+                "LEDGER_OWNED_DEFINERS names public.{name}, which is not registered"
+            );
+            let owner: String = sqlx::query_scalar(
+                "SELECT pg_get_userbyid(p.proowner)::text FROM pg_proc p \
+                   JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  WHERE n.nspname = 'public' AND p.proname = $1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("public.{name}: {e}"));
+            assert_eq!(
+                owner,
+                super::LEDGER_OWNER_ROLE,
+                "public.{name} is listed as the ledger owner's at head"
+            );
+        }
         let unlisted: Vec<&&str> = owned.difference(&listed).collect();
         assert!(
             unlisted.is_empty(),
@@ -4421,6 +5448,120 @@ mod definer_register_tests {
                 "public.{name} is exempt as dropped by {version}, but {recreated:?} name it again"
             );
         }
+    }
+
+    /// Migration 257 (backlog 9cec11f7): `verify` reports a retire verb that
+    /// 257 could not re-own to its dedicated role (the NOTICE path: the verb
+    /// keeps working as `epigraph_maintenance`, and the direct-retire control
+    /// is silently off). CONTROL: at head it passes.
+    ///
+    /// Verified to fail: the check's owner comparison removed -> 0 failures
+    /// after the re-own back.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_a_retire_verb_257_could_not_reown(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_dedicated_definer_owners(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        sqlx::query(
+            "ALTER FUNCTION public.epigraph_retire_operator_link(uuid, text, boolean) \
+             OWNER TO epigraph_maintenance",
+        )
+        .execute(&pool)
+        .await
+        .expect("re-own the verb back");
+        assert_eq!(
+            super::verify_dedicated_definer_owners(&pool)
+                .await
+                .expect("check"),
+            1,
+            "a verb left with epigraph_maintenance is reported"
+        );
+    }
+
+    /// Migration 257's role isolation, re-checked by `verify` after the
+    /// migration (T69 review): a non-superuser granted the retirer role WITH
+    /// ADMIN OPTION only (no INHERIT, no SET: on PostgreSQL 16 it can still
+    /// grant the role to itself), and a non-superuser CREATEROLE login, are
+    /// each reported. The offending roles live in ONE transaction that is
+    /// rolled back: roles are cluster-wide, and a committed one would make
+    /// 257 refuse to apply in every database migrating beside this test.
+    /// CONTROL: at head, and in the clean transaction, it passes.
+    ///
+    /// Verified to fail: the check's MEMBER / ADMIN OPTION arms removed (the
+    /// old USAGE / SET predicate) -> the ADMIN-only holder is not reported;
+    /// the CREATEROLE arm removed -> the CREATEROLE login is not reported.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_a_retirer_role_that_is_not_isolated(pool: sqlx::PgPool) {
+        let mut conn = pool.acquire().await.expect("acquire");
+        assert_eq!(
+            super::verify_operator_link_retirer_isolation(&mut conn)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        let pg16: bool =
+            sqlx::query_scalar("SELECT current_setting('server_version_num')::integer >= 160000")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("server version");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let admin_only = format!("t69_retirer_admin_{suffix}");
+        let creator = format!("t69_retirer_createrole_{suffix}");
+
+        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+        sqlx::query(&format!("CREATE ROLE {admin_only} NOLOGIN NOINHERIT"))
+            .execute(&mut *tx)
+            .await
+            .expect("create the admin-only role");
+        let grant = if pg16 {
+            format!(
+                "GRANT epigraph_operator_link_retirer TO {admin_only} \
+                 WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+            )
+        } else {
+            format!("GRANT epigraph_operator_link_retirer TO {admin_only} WITH ADMIN OPTION")
+        };
+        sqlx::query(&grant)
+            .execute(&mut *tx)
+            .await
+            .expect("grant the retirer role with ADMIN OPTION only");
+        let admin_faults = super::verify_operator_link_retirer_isolation(&mut tx)
+            .await
+            .expect("check with the ADMIN-only grant");
+        sqlx::query(&format!(
+            "REVOKE epigraph_operator_link_retirer FROM {admin_only}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("revoke it again");
+        let clean = super::verify_operator_link_retirer_isolation(&mut tx)
+            .await
+            .expect("check after the revoke");
+        sqlx::query(&format!("CREATE ROLE {creator} NOLOGIN CREATEROLE"))
+            .execute(&mut *tx)
+            .await
+            .expect("create a CREATEROLE role");
+        let creator_faults = super::verify_operator_link_retirer_isolation(&mut tx)
+            .await
+            .expect("check with the CREATEROLE role");
+        tx.rollback()
+            .await
+            .expect("rollback: the roles are never committed");
+
+        assert!(
+            admin_faults >= 1,
+            "an ADMIN-only holder of the retirer role is reported"
+        );
+        assert_eq!(clean, 0, "CONTROL: with the grant revoked it passes");
+        assert_eq!(
+            creator_faults, 1,
+            "a non-superuser CREATEROLE login is reported"
+        );
     }
 
     /// `verify`'s app-grant check runs as a PRE-FLIGHT, before later
@@ -4560,6 +5701,381 @@ mod definer_register_tests {
                     .expect("check"),
                 n + 1,
                 "a stray app grant on {signature} is reported"
+            );
+        }
+    }
+
+    /// `verify` reports a ledger the owner no longer alone writes (251,
+    /// backlog 6bdac68f): a login granted INSERT on it, and row security
+    /// enabled on it, are each a failure. CONTROL: at head it passes. Both
+    /// faults are local to this test's database (a GRANT of the owner role
+    /// itself would be cluster-wide; `bba_guard_owner.rs` covers those inside
+    /// rolled-back transactions).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_a_ledger_another_role_can_write(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_bba_guard_owner(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        let login = format!("t63_ledger_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE ROLE {login} LOGIN NOSUPERUSER"))
+            .execute(&pool)
+            .await
+            .expect("a login");
+        sqlx::query(&format!(
+            "GRANT INSERT ON public.mass_function_purge_grants TO {login}"
+        ))
+        .execute(&pool)
+        .await
+        .expect("a stray grant");
+        let one = super::verify_bba_guard_owner(&pool).await.expect("check");
+        sqlx::query("ALTER TABLE public.mass_function_purge_grants ENABLE ROW LEVEL SECURITY")
+            .execute(&pool)
+            .await
+            .expect("row security on the ledger");
+        let two = super::verify_bba_guard_owner(&pool).await.expect("check");
+        sqlx::query(&format!(
+            "REVOKE ALL ON public.mass_function_purge_grants FROM {login}"
+        ))
+        .execute(&pool)
+        .await
+        .expect("revoke");
+        sqlx::query(&format!("DROP ROLE {login}"))
+            .execute(&pool)
+            .await
+            .expect("drop the login");
+        assert_eq!(one, 1, "a login that can write the ledger is reported");
+        assert_eq!(two, 2, "and row security on it as well");
+    }
+
+    // -----------------------------------------------------------------------
+    // The EXECUTE register's completeness (backlog a2b079a1)
+    // -----------------------------------------------------------------------
+
+    /// From this migration on, every [`DEFERRED_DEFINER_FUNCTIONS`] entry has
+    /// an EXECUTE expectation in [`OPERATOR_FUNCTION_GRANTS`] or is a named
+    /// exemption below. 161 is where the register was last audited complete;
+    /// the earlier deferred definers predate it and are not held to it.
+    const GRANT_REGISTER_COMPLETE_FROM: i64 = 161;
+
+    /// Deferred definers from [`GRANT_REGISTER_COMPLETE_FROM`] on with no
+    /// EXECUTE expectation, because each is a TRIGGER function: PostgreSQL
+    /// refuses to call one directly ("trigger functions can only be called as
+    /// triggers"), and does not check EXECUTE when its trigger fires, so a
+    /// grant to the application role on one opens nothing and checking it
+    /// would test nothing. `grant_exemptions_are_trigger_functions_and_not_stale`
+    /// holds each entry to that reason: a later body that is no longer
+    /// `RETURNS trigger` fails it, and the function must then be registered
+    /// with its expectation.
+    const GRANT_EXEMPT_TRIGGERS: &[&str] = &[
+        // 164: the team-group roster guard.
+        "epigraph_team_group_roster_verbs_only",
+        // 165: the role-binding guards and audit.
+        "epigraph_group_role_bindings_guard_insert",
+        "epigraph_group_role_bindings_guard_update",
+        "epigraph_group_role_bindings_refuse_delete",
+        "epigraph_group_role_bindings_audit",
+        // 166: the role-agent guards, audit and lineage follow.
+        "epigraph_role_agents_guard_insert",
+        "epigraph_role_agents_guard_update",
+        "epigraph_role_agents_audit",
+        "epigraph_role_agents_follow_lineage",
+        // 173: the audit-report tenancy inheritance and follow.
+        "epigraph_audit_report_inherit_tenancy",
+        "epigraph_fragment_audit_reports_follow",
+        // 197: the atlas layout narrowing guard.
+        "epigraph_atlas_layout_narrowed",
+        // 200: the passkey act-confirmer guard and the anchored revoke.
+        "epigraph_person_authenticators_guard_act_confirmer",
+        "epigraph_person_authenticators_revoke_anchored",
+        // 210: the atlas map's statement and row stale markers (the bump
+        // they call, `epigraph_atlas_map_bump`, is a plain function and is
+        // registered).
+        "epigraph_atlas_map_stale",
+        "epigraph_atlas_map_stale_row",
+        // 212: the sealed-row vector guards.
+        "epigraph_refuse_sealed_claim_vector",
+        "epigraph_refuse_sealed_evidence_vector",
+        // 217: the factor triggers on edges and claims.
+        "auto_create_factor_from_edge",
+        "deactivate_superseded_factors",
+        // 238: the claims widening guard.
+        "epigraph_claims_block_widening",
+        // 240: the behavioral-execution tenancy inheritance and its follows.
+        "epigraph_behavioral_execution_inherit_tenancy",
+        "epigraph_workflow_behavioral_executions_follow",
+        "epigraph_claim_behavioral_executions_follow",
+        // 250: the masses-written marker and the assessment-event guard.
+        "epigraph_mass_function_masses_written",
+        "epigraph_events_assessment_guard",
+        // 260: the edge declaration recorder.
+        "epigraph_edges_record_declaration",
+    ];
+
+    /// The function names [`OPERATOR_FUNCTION_GRANTS`] checks, read from each
+    /// entry's SIGNATURE (`public.<name>(..)`), not its presence key: the
+    /// act-taking overloads are keyed on another function's name.
+    fn granted_function_names() -> BTreeSet<&'static str> {
+        OPERATOR_FUNCTION_GRANTS
+            .iter()
+            .map(|(_, signature, _)| {
+                let name = signature
+                    .strip_prefix("public.")
+                    .expect("a register signature is public-qualified");
+                &name[..name
+                    .find('(')
+                    .expect("a register signature has an argument list")]
+            })
+            .collect()
+    }
+
+    /// The `CREATE [OR REPLACE] FUNCTION` header (up to the body's ` as `) of
+    /// the LAST migration that creates `public.<name>`, normalised.
+    fn latest_create_header(migs: &[Migration], name: &str) -> Option<(String, String)> {
+        let mut found = None;
+        for m in migs {
+            for (i, n) in function_refs(&m.sql) {
+                if n != name {
+                    continue;
+                }
+                let before = m.sql[..i].trim_end();
+                if before.ends_with("create or replace function")
+                    || before.ends_with("create function")
+                {
+                    let tail = &m.sql[i..];
+                    let end = tail.find(" as ").unwrap_or(tail.len());
+                    found = Some((m.file.clone(), tail[..end].to_string()));
+                }
+            }
+        }
+        found
+    }
+
+    /// The deferred definers from [`GRANT_REGISTER_COMPLETE_FROM`] on that
+    /// `granted` lacks and no exemption covers.
+    fn deferred_definers_without_an_execute_expectation(granted: &BTreeSet<&str>) -> Vec<String> {
+        DEFERRED_DEFINER_FUNCTIONS
+            .iter()
+            .filter(|(name, version)| {
+                *version >= GRANT_REGISTER_COMPLETE_FROM
+                    && !granted.contains(name)
+                    && !GRANT_EXEMPT_TRIGGERS.contains(name)
+            })
+            .map(|(name, version)| format!("{name} (migration {version})"))
+            .collect()
+    }
+
+    /// Commit 8737e31e found the grant register missing migration 180's two
+    /// definers, so an application-role EXECUTE grant on either was invisible
+    /// to `verify`. Every deferred definer from 161 on must carry an EXECUTE
+    /// expectation (or be an exempt trigger function), so the next migration
+    /// that adds a definer to the deferred list must also decide whether the
+    /// request DSN may call it.
+    #[test]
+    fn every_deferred_definer_from_161_has_an_execute_expectation() {
+        let missing = deferred_definers_without_an_execute_expectation(&granted_function_names());
+        assert!(
+            missing.is_empty(),
+            "deferred definers with no EXECUTE expectation in OPERATOR_FUNCTION_GRANTS: \
+             {missing:?}. Add each with its signature and whether epigraph_app must \
+             EXECUTE it (read the migration's GRANT/REVOKE), so `verify` reports a stray \
+             or a missing application-role grant; a trigger function goes in \
+             GRANT_EXEMPT_TRIGGERS instead"
+        );
+    }
+
+    /// MUTATION PROBE: the ratchet is not vacuous. Dropping any one non-exempt
+    /// deferred definer from the granted set is reported, by name.
+    #[test]
+    fn dropping_a_grant_expectation_is_reported() {
+        let granted = granted_function_names();
+        let mut probed = 0;
+        for (name, version) in DEFERRED_DEFINER_FUNCTIONS {
+            if *version < GRANT_REGISTER_COMPLETE_FROM || GRANT_EXEMPT_TRIGGERS.contains(name) {
+                continue;
+            }
+            let mut without = granted.clone();
+            without.remove(name);
+            let missing = deferred_definers_without_an_execute_expectation(&without);
+            assert_eq!(
+                missing,
+                vec![format!("{name} (migration {version})")],
+                "removing {name}'s expectation must be reported, alone"
+            );
+            probed += 1;
+        }
+        assert!(probed > 50, "only {probed} deferred definers were probed");
+    }
+
+    /// Each exemption holds its reason: it is a deferred definer from 161 on,
+    /// it has no grant expectation (an overlap would hide which rule applies),
+    /// and the last migration that creates it declares it `RETURNS trigger`.
+    #[test]
+    fn grant_exemptions_are_trigger_functions_and_not_stale() {
+        let migs = migrations();
+        let granted = granted_function_names();
+        let mut bad = Vec::new();
+        for name in GRANT_EXEMPT_TRIGGERS {
+            let deferred = DEFERRED_DEFINER_FUNCTIONS
+                .iter()
+                .any(|(n, v)| n == name && *v >= GRANT_REGISTER_COMPLETE_FROM);
+            if !deferred {
+                bad.push(format!(
+                    "{name}: not a deferred definer from {GRANT_REGISTER_COMPLETE_FROM} on"
+                ));
+            }
+            if granted.contains(name) {
+                bad.push(format!("{name}: exempt AND in OPERATOR_FUNCTION_GRANTS"));
+            }
+            match latest_create_header(&migs, name) {
+                None => bad.push(format!("{name}: no migration creates it")),
+                Some((file, header)) if !header.contains(" returns trigger") => bad.push(format!(
+                    "{name}: {file} creates it as `{header}`, not a trigger function"
+                )),
+                Some(_) => {}
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "GRANT_EXEMPT_TRIGGERS entries that no longer hold their reason:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// The expectations the completeness ratchet added (backlog a2b079a1) are
+    /// checked by `verify`: at head they all pass; a stray application-role
+    /// grant on a maintenance-only one (194's purge, 210's epoch bump) is
+    /// reported, and so is a revoked grant on an app-callable one (193's role
+    /// read).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_grant_check_reports_drift_on_the_ratchet_added_definers(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        for (n, stmt) in [
+            "GRANT EXECUTE ON FUNCTION public.epigraph_purge_mass_functions(uuid[], text) \
+             TO epigraph_app",
+            "GRANT EXECUTE ON FUNCTION public.epigraph_atlas_map_bump(uuid[], uuid[]) \
+             TO epigraph_app",
+            "REVOKE EXECUTE ON FUNCTION public.epigraph_claim_is_compound(uuid) \
+             FROM PUBLIC, epigraph_app",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+            assert_eq!(
+                super::verify_operator_function_grants(&pool)
+                    .await
+                    .expect("check"),
+                n + 1,
+                "drift is reported after: {stmt}"
+            );
+        }
+    }
+}
+
+/// [`MET_ENDPOINTS`] and [`REGISTRY_ENDPOINTS`] are hand copies of the arms of
+/// `epigraph_node_tenancy`. Pin them against the latest migration that
+/// re-states the oracle, so a new arm (or a dropped one) cannot leave
+/// `settle_world_edges_with_private_endpoints` and `verify`'s registry check
+/// meeting an endpoint as public that the database meets with its own row.
+#[cfg(test)]
+mod met_endpoints_tests {
+    use super::{MET_ENDPOINTS, REGISTRY_ENDPOINTS};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// The body of the LAST `CREATE [OR REPLACE] FUNCTION
+    /// public.epigraph_node_tenancy` among the migrations (by version), with
+    /// `--` comments removed, and that migration's file name.
+    fn latest_oracle_body() -> (String, String) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+        let mut latest: Option<(i64, String, String)> = None;
+        for entry in std::fs::read_dir(&dir).expect("read migrations/") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            let digits: String = file.chars().take_while(char::is_ascii_digit).collect();
+            let Ok(version) = digits.parse::<i64>() else {
+                continue;
+            };
+            let sql: String = std::fs::read_to_string(&path)
+                .expect("read migration")
+                .lines()
+                .map(|l| l.find("--").map_or(l, |i| &l[..i]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The definition, not a REVOKE / ALTER naming the function.
+            let Some(at) = ["CREATE OR REPLACE FUNCTION", "CREATE FUNCTION"]
+                .iter()
+                .find_map(|c| sql.find(&format!("{c} public.epigraph_node_tenancy(")))
+            else {
+                continue;
+            };
+            let rest = &sql[at..];
+            let open = rest.find("$$").expect("oracle body opens with $$");
+            let close = rest[open + 2..]
+                .find("$$")
+                .expect("oracle body closes with $$");
+            let body = rest[open + 2..open + 2 + close].to_string();
+            if latest.as_ref().is_none_or(|(v, _, _)| version > *v) {
+                latest = Some((version, file, body));
+            }
+        }
+        let (_, file, body) = latest.expect("some migration defines epigraph_node_tenancy");
+        (file, body)
+    }
+
+    /// Every `p_type = '<type>'` arm of `body`.
+    fn arms(body: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut rest = body;
+        while let Some(i) = rest.find("p_type = '") {
+            rest = &rest[i + "p_type = '".len()..];
+            let end = rest.find('\'').expect("arm literal closes");
+            out.insert(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn met_endpoints_match_the_oracle_arms() {
+        let (file, body) = latest_oracle_body();
+        let oracle = arms(&body);
+        assert!(
+            oracle.contains("claim") && oracle.contains("evidence"),
+            "CALIBRATION: the arm scan reads {file}'s oracle body; got {oracle:?}"
+        );
+        let met: BTreeSet<String> = MET_ENDPOINTS
+            .iter()
+            .map(|(ty, _, _)| (*ty).to_string())
+            .collect();
+        assert_eq!(
+            met, oracle,
+            "MET_ENDPOINTS must list exactly the endpoint types {file}'s \
+             epigraph_node_tenancy meets with their own row"
+        );
+    }
+
+    #[test]
+    fn registry_endpoints_are_met_endpoints() {
+        for (ty, table) in REGISTRY_ENDPOINTS {
+            assert!(
+                MET_ENDPOINTS
+                    .iter()
+                    .any(|(t, tb, _)| t == ty && tb == table),
+                "REGISTRY_ENDPOINTS' ({ty}, {table}) is not in MET_ENDPOINTS"
             );
         }
     }

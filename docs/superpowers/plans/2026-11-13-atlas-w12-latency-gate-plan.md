@@ -87,9 +87,13 @@ so a regression that answers a fast 404 cannot read as green.
   Samples cycle over distinct levels.
 - **Cold:** a fresh `ScopedPool`, `AppState`, listener and client per sample
   (no pooled connection, no statement cache), and a level not asked for
-  before. A fresh PROCESS is not part of the per-PR run; the staging script's
-  separate `--release` invocation is the closest it comes, and that is stated
-  as a gap.
+  before. A fresh PROCESS was not part of the first version; the staging
+  script's separate `--release` invocation was the closest it came, and that
+  was stated as a gap.
+- **Process** (added for backlog 01d7e2ff): a fresh `server` binary per
+  sample (`tests/common/served.rs`), on a production-shaped app login, its
+  first request timed on a level neither arm above asked for, held to the
+  cold budget. Per PR 3 samples per type, in staging 8.
 
 The report (`ATLAS_LATENCY_REPORT`, a path) is JSON: scale, build profile,
 seed and request counts, and n, p50, p95 and max per type and warm/cold, plus
@@ -205,6 +209,12 @@ the old scan measured 34 ms and the gate could not see it.
 
 **Gaps:** cold is a fresh pool, server and client in one process, not a fresh
 process (and not a cold OS page cache: the seed has just written the rows).
+*Closed for the process (backlog 01d7e2ff, 2026-11-23):* the gate now has a
+third arm, `process`: one `server` binary per sample, logged in as a
+NOSUPERUSER member of `epigraph_app` (posture armed), its first request
+timed per level type against the cold budget, beside the in-process cold
+numbers; start-up is reported, not gated. Still not measured: a cold
+Postgres buffer cache or OS page cache.
 Prod's buffer-cache state, concurrent load, real leaf sizes once W9 assembles
 leaves, and the network between browser and server are not measured.
 

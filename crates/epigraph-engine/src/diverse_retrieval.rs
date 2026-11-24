@@ -76,12 +76,13 @@ pub const MAX_CANDIDATE_POOL: u32 = 1000;
 /// therefore runs as an iterative HNSW scan
 /// (`ClaimThemeRepository::nearest_theme_coverage_since`), which keeps
 /// scanning until K matching rows are found, bounded by
-/// `hnsw.max_scan_tuples` (default 20,000). The coverage fraction is still
-/// computed over the rows actually returned (see
+/// `hnsw.max_scan_tuples` (default 20,000); a probe that comes back with
+/// fewer than K rows is retried as an exact scan (backlog 28b79b1e), so a
+/// short count means the viewer's visible neighbourhood really is that small
+/// (or the retry hit its timeout and kept the short count). The coverage
+/// fraction is computed over the rows actually returned (see
 /// [`epigraph_db::NeighbourhoodThemeCoverage::probed`]), and there is
-/// deliberately no minimum on that count: a floor cannot tell a scan cut off
-/// at `max_scan_tuples` from a viewer whose visible neighbourhood is
-/// genuinely small.
+/// deliberately no minimum on that count.
 pub const THEME_COVERAGE_PROBE_K: i32 = 40;
 
 /// Minimum fraction of the query's nearest neighbourhood that diverse mode

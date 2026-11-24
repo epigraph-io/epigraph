@@ -48,6 +48,18 @@ fn request(supports: bool, confidence: f64) -> AssessClaimRequest {
     .expect("AssessClaimRequest deserializes")
 }
 
+/// The handler's state: the test pool plus a `ScopedPool` over the same
+/// database (the harness superuser's, stamped). `assess_claim` reads and
+/// writes on `AppState::write_as` (backlog 74feb76b), and the
+/// `EPIGRAPH_COMPOUND_WRITE_GUARD` decision (backlog 7435772c) reads on that
+/// same transaction. A state with no scoped pool refuses the call, as it
+/// should in production.
+async fn assess_state(pool: &PgPool) -> AppState {
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+    state.scoped = Some(viewer_fixture::scoped_pool(pool).await);
+    state
+}
+
 async fn assess(
     pool: &PgPool,
     caller: Uuid,
@@ -55,7 +67,7 @@ async fn assess(
     req: AssessClaimRequest,
 ) -> AssessClaimResponse {
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve caller");
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let state = assess_state(pool).await;
     let Json(resp) = assess_claim(
         write_scope(),
         ViewerExtractor(viewer),
@@ -240,7 +252,13 @@ async fn the_rest_publish_path_refuses_a_forged_assessment_record(pool: PgPool) 
     let claim = seed_public_claim(&pool, author, "assess writer record: forgery").await;
     let real = assess(&pool, writer, claim, request(true, 0.9)).await;
 
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    // The forger posts AS ITSELF: since backlog 1dea9589 a body `actor_id`
+    // must be the caller (or an agent it speaks for), and the actor is decided
+    // on a viewer-stamped read, so the state carries a scoped pool.
+    let state = AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(&pool).await,
+        ApiConfig::default(),
+    );
     let post = |event_type: &str| {
         let body: CreateEventRequest = serde_json::from_value(serde_json::json!({
             "event_type": event_type,
@@ -256,7 +274,20 @@ async fn the_rest_publish_path_refuses_a_forged_assessment_record(pool: PgPool) 
             },
         }))
         .expect("CreateEventRequest deserializes");
-        create_event(write_scope(), State(state.clone()), Json(body))
+        let state = state.clone();
+        let pool = pool.clone();
+        async move {
+            let viewer = Viewer::resolve(&pool, forger)
+                .await
+                .expect("resolve forger");
+            create_event(
+                write_scope_as(forger),
+                ViewerExtractor(viewer),
+                State(state),
+                Json(body),
+            )
+            .await
+        }
     };
 
     for spelling in ["claim.assessed", "  claim.assessed\t", "Claim.Assessed"] {
@@ -320,7 +351,7 @@ async fn a_failed_record_refuses_the_call_and_stores_no_assessment(pool: PgPool)
     let viewer = Viewer::resolve(&pool, caller)
         .await
         .expect("resolve caller");
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let state = assess_state(&pool).await;
     let result = assess_claim(
         write_scope(),
         ViewerExtractor(viewer),
@@ -344,11 +375,59 @@ async fn a_failed_record_refuses_the_call_and_stores_no_assessment(pool: PgPool)
     );
 }
 
+/// Re-assessing with the masses the slot already holds files no second
+/// record (backlog a278f16d, migration 250).
+///
+/// Migration 250's `events_assessment_guard` admits a record on an
+/// application session only when the same transaction wrote the slot row's
+/// masses, and an upsert of identical masses writes none, so a record of it
+/// would be refused and the call would answer 500 (that refusal is pinned at
+/// the database level by `epigraph-db/tests/assessment_event_reservation.rs::
+/// an_identical_reassessment_writes_no_masses_and_is_detected`). The route
+/// therefore files no record when `slot_holds_masses` says the slot already
+/// holds the masses. This runs on the harness pool, where the guard admits
+/// every record, so it isolates the route's decision: red with
+/// `assess_claim`'s `masses_unchanged` check removed (a second record lands).
+/// A third call with new masses is recorded again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_identical_reassessment_files_no_second_record(pool: PgPool) {
+    let (author, _) = seed_agent_with_group(&pool, "assess-same-author").await;
+    let (caller, _) = seed_agent_with_group(&pool, "assess-same-caller").await;
+    let claim = seed_public_claim(&pool, author, "assess writer record: identical").await;
+
+    let first = assess(&pool, caller, claim, request(true, 0.9)).await;
+    assert_eq!(assessment_events(&pool, claim).await.len(), 1);
+
+    let second = assess(&pool, caller, claim, request(true, 0.9)).await;
+    assert_eq!(
+        second.mass_function_id, first.mass_function_id,
+        "PREMISE: the same slot row"
+    );
+    let events = assessment_events(&pool, claim).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "no record of a call that wrote no masses: {events:?}"
+    );
+
+    assess(&pool, caller, claim, request(false, 0.7)).await;
+    let events = assessment_events(&pool, claim).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "a call that changes the masses is recorded"
+    );
+    assert_eq!(events[1].0, Some(caller));
+}
+
 /// The `claims:write` scope the write handlers now take as their first
 /// extractor (backlog f00d75ab). A direct handler call stands in for the
 /// bearer middleware, so it supplies the scope the route checks.
 fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
-    let principal = uuid::Uuid::new_v4();
+    write_scope_as(uuid::Uuid::new_v4())
+}
+
+fn write_scope_as(principal: Uuid) -> epigraph_api::middleware::bearer::RequireScopeWrite {
     epigraph_api::middleware::bearer::RequireScopeWrite(
         epigraph_api::middleware::bearer::AuthContext {
             client_id: principal,

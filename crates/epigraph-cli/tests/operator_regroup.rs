@@ -1699,6 +1699,11 @@ async fn seed_node(pool: &PgPool, ty: &str, owner: Uuid, visibility: &str) -> Uu
             "INSERT INTO communities (id, name, owner_group_id, visibility) \
              VALUES ($1, $2, $3, $4)"
         }
+        // Migration 246: a paper row carries its ingest's tenancy.
+        "paper" => {
+            "INSERT INTO papers (id, doi, owner_group_id, visibility) \
+             VALUES ($1, $2, $3, $4)"
+        }
         other => panic!("no seeder for node type {other}"),
     };
     sqlx::query(sql)
@@ -1731,8 +1736,8 @@ async fn typed_edge(pool: &PgPool, a: Uuid, a_ty: &str, b: Uuid, b_ty: &str) -> 
 }
 
 /// A fresh SRC claim C linked to a SRC-private node of type `ty` (the node is
-/// the edge's source end when `node_first`). The trigger counts the node as
-/// public, so the edge starts on C's tuple. Regrouping C writes the EXACT meet
+/// the edge's source end when `node_first`). The node is in C's group, so the
+/// edge starts on C's tuple. Regrouping C writes the EXACT meet
 /// (co-owned by SRC through the node), reports it as a SOURCE-NODE-EDGE, and
 /// neither a SRC-only nor a DST-only reader reads it; reversing puts every
 /// row back byte for byte.
@@ -1749,7 +1754,7 @@ async fn a_source_node_edge_is_co_owned_and_reported(pool: PgPool, ty: &str, nod
     assert_eq!(
         edge(&pool, e).await,
         (fx.src, "group".to_string(), None),
-        "the trigger counts the {ty} as public"
+        "the {ty} and C are both SRC's"
     );
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
@@ -1828,6 +1833,7 @@ fn row_table(ty: &str) -> &'static str {
         "context" => "contexts",
         "perspective" => "perspectives",
         "community" => "communities",
+        "paper" => "papers",
         other => panic!("no table for {other}"),
     }
 }
@@ -1855,6 +1861,13 @@ async fn a_perspective_edge_takes_the_exact_meet(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_community_edge_takes_the_exact_meet(pool: PgPool) {
     a_source_node_edge_is_co_owned_and_reported(pool, "community", true).await;
+}
+
+/// A group paper (migration 246) asserting the moving claim: the paper is the
+/// edge's source end, as an ingest's `asserts` edge is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paper_edge_takes_the_exact_meet(pool: PgPool) {
+    a_source_node_edge_is_co_owned_and_reported(pool, "paper", true).await;
 }
 
 /// A reasoning trace is an entity type with its own tenancy that FOLLOWS its
@@ -2148,7 +2161,8 @@ async fn the_node_types_are_every_tenanted_entity_type(pool: PgPool) {
     assert!(
         r.stdout.lines().any(|l| l.starts_with(
             "NODE-TYPES\tcommunity=communities,context=contexts,frame=frames,\
-             perspective=perspectives,trace=reasoning_traces,workflow=workflows\t"
+             paper=papers,perspective=perspectives,trace=reasoning_traces,\
+             workflow=workflows\t"
         )),
         "{}",
         r.show()
@@ -2191,20 +2205,43 @@ async fn an_edge_to_a_public_node_goes_to_the_target(pool: PgPool) {
     assert!(r.stdout.contains("source-node edges: 0"), "{}", r.show());
 }
 
+/// Put edge `e` back on `(owner, group)` with no co-owner: the claim's tuple
+/// alone, which is how a database stamped an edge onto a group-private frame,
+/// context, perspective or community before migration 258 met such a node with
+/// its own row. No writer produces this row any more; legacy databases hold it.
+async fn stamp_before_258(pool: &PgPool, e: Uuid, owner: Uuid) {
+    sqlx::query(
+        "UPDATE edges SET owner_group_id = $2, visibility = 'group', co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(e)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("restore the pre-258 stamp");
+}
+
 /// An edge to a node of a THIRD group is met with that group (it keeps
 /// requiring it) and reported. Its recorded prior, the claim's tuple alone,
 /// was already wider than the node: the reversal will not write it back and
 /// holds the claim instead, which the dry run and the apply both report
-/// (IRREVERSIBLE-EDGE and its count). The node is a CONTEXT, which the trigger
-/// still meets as public; since migration 219 a workflow endpoint is met with
-/// its own row, so an edge from a workflow is stamped exactly at insert and
-/// never has this stale prior.
+/// (IRREVERSIBLE-EDGE and its count). Since migrations 219 (workflow) and 258
+/// (frame, context, perspective, community) the trigger meets such a node with
+/// its own row, so a NEW edge is stamped exactly at insert and never has this
+/// stale prior; an edge stamped before 258 still does, and that is the row
+/// this test rebuilds ([`stamp_before_258`]).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: PgPool) {
     let fx = seed(&pool).await;
     let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in H's context").await;
     let node = seed_node(&pool, "context", fx.h_group, "group").await;
     let e = typed_edge(&pool, node, "context", c, "claim").await;
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.h_group, "group".to_string(), Some(fx.src)),
+        "CALIBRATION: since 258 the trigger meets the context with its own row"
+    );
+    stamp_before_258(&pool, e, fx.src).await;
     assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
@@ -2276,14 +2313,20 @@ async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: 
 /// than the node (a SOURCE-only reader read an edge naming a TARGET-private
 /// node), so the reversal will not write it back and holds the claim
 /// instead. The dry run and the apply both say so up front (IRREVERSIBLE-EDGE
-/// and its count). A context, not a workflow: see
-/// [`an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds`].
+/// and its count). The stale prior is an edge stamped before migration 258:
+/// see [`an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds`].
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds(pool: PgPool) {
     let fx = seed(&pool).await;
     let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in DST's context").await;
     let node = seed_node(&pool, "context", fx.dst, "group").await;
     let e = typed_edge(&pool, node, "context", c, "claim").await;
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.dst, "group".to_string(), Some(fx.src)),
+        "CALIBRATION: since 258 the trigger meets the context with its own row"
+    );
+    stamp_before_258(&pool, e, fx.src).await;
     assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
@@ -2855,4 +2898,293 @@ async fn a_concurrent_edge_insert_on_a_moving_claim_is_waited_for_and_moved(pool
         "the edge committed during the batch was moved with its claim\n{}",
         run.show()
     );
+}
+
+/// Backlog b1e2151c (1): `--refuse-irreversible` holds, instead of moving, a
+/// claim the run predicts `reown-reverse` could not reverse, and moves the
+/// rest of its batch. `c` has an edge to a context of the TARGET (its
+/// recorded prior is wider than the node: IRREVERSIBLE-EDGE without the
+/// flag, see `an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds`);
+/// `b` is an ordinary claim of the SAME batch. With the flag the dry run and
+/// the apply hold `c` (HELD-UNDER-LOCK `irreversible`, naming the edge) and
+/// report no irreversible edge; the apply moves `b` only, exits 3 (a listed
+/// claim was held), leaves `c` and its edge untouched, and its manifest never
+/// names `c` or the edge, so the run it recorded reverses cleanly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refuse_irreversible_holds_the_irreversible_claim_and_moves_the_rest_of_its_batch(
+    pool: PgPool,
+) {
+    let fx = seed(&pool).await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in DST's context").await;
+    let node = seed_node(&pool, "context", fx.dst, "group").await;
+    let e = typed_edge(&pool, node, "context", c, "claim").await;
+    // Since migration 258 the trigger meets the context with its own row, so
+    // only an edge stamped before 258 (its prior wider than the node) is
+    // irreversible: see `an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds`.
+    stamp_before_258(&pool, e, fx.src).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c, fx.b]);
+    let flag: &[&str] = &["--refuse-irreversible"];
+    let dry = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &dir.join("dry.jsonl"),
+            apply_count: None,
+            extra: flag,
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        has_line(
+            &dry.stdout,
+            "HELD-UNDER-LOCK\t",
+            &[&c.to_string(), "irreversible", &e.to_string()]
+        ),
+        "the dry run holds C, naming its edge\n{}",
+        dry.show()
+    );
+    assert!(
+        !dry.stdout
+            .lines()
+            .any(|l| l.starts_with("IRREVERSIBLE-EDGE\t")),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("irreversible edges: 0 "),
+        "{}",
+        dry.show()
+    );
+
+    // One claim per batch: batch 1 holds C only, so every claim of it is
+    // held. Its BATCH line still reports a lock hold (its probe's: the probe
+    // takes the same locks), and the result counts the probes' transactions
+    // as well as the real batches'.
+    let single = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &dir.join("single.jsonl"),
+            apply_count: None,
+            extra: &["--refuse-irreversible", "--batch-size", "1"],
+        },
+    )
+    .await;
+    assert_eq!(single.code, 0, "{}", single.show());
+    let all_held: Vec<&str> = single
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("BATCH ") && l.contains("every claim held by"))
+        .collect();
+    assert_eq!(all_held.len(), 1, "{}", single.show());
+    assert!(
+        lock_hold_of(all_held[0]).is_some(),
+        "the all-held batch reports its probe's lock hold: {}",
+        all_held[0]
+    );
+    let batch_lines = single
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("BATCH "))
+        .count();
+    let (_, transactions) = longest_lock_hold(&single.stdout)
+        .unwrap_or_else(|| panic!("no longest lock hold line\n{}", single.show()));
+    assert!(
+        transactions > batch_lines,
+        "the probes' transactions are counted too ({transactions} over {batch_lines} \
+         batch(es))\n{}",
+        single.show()
+    );
+
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(2),
+            extra: flag,
+        },
+    )
+    .await;
+    assert_eq!(r.code, 3, "a listed claim was held\n{}", r.show());
+    assert!(
+        has_line(
+            &r.stdout,
+            "HELD-UNDER-LOCK\t",
+            &[&c.to_string(), "irreversible", &e.to_string()]
+        ),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("claims moved: 1"), "{}", r.show());
+    assert_eq!(row(&pool, "claims", c).await, grp(fx.src), "C is not moved");
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.src, "group".to_string(), None),
+        "C's edge is untouched"
+    );
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.dst), "B is moved");
+    let manifest = std::fs::read_to_string(&mf).expect("manifest");
+    assert!(
+        !manifest.contains(&c.to_string()) && !manifest.contains(&e.to_string()),
+        "the manifest never records the held claim or its edge"
+    );
+    assert!(manifest.contains(&fx.b.to_string()), "B is recorded");
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(
+        rv.code,
+        0,
+        "the recorded run reverses cleanly\n{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.src));
+}
+
+/// The `locks held <ms> ms` figure of a `BATCH` line, if it has one.
+fn lock_hold_of(line: &str) -> Option<u128> {
+    line.split("locks held ")
+        .nth(1)
+        .and_then(|t| t.strip_suffix(" ms"))
+        .and_then(|t| t.parse::<u128>().ok())
+}
+
+/// `(longest, transactions)` from the result's `longest lock hold` line.
+fn longest_lock_hold(stdout: &str) -> Option<(u128, usize)> {
+    let l = stdout.lines().find(|l| l.contains("longest lock hold: "))?;
+    let rest = l.split("longest lock hold: ").nth(1)?;
+    let (ms, rest) = rest.split_once(" ms over ")?;
+    let (n, _) = rest.split_once(" transaction(s)")?;
+    Some((ms.parse().ok()?, n.parse().ok()?))
+}
+
+/// Backlog b1e2151c (2): every batch transaction reports how long it held
+/// the LOCKED-PER-BATCH locks, and the result reports the longest, with the
+/// batch size: the per-batch stall a concurrent edge or fragment writer
+/// sees. A dry run reports it too (it takes the same locks).
+///
+/// The figure is measured, not printed: a concurrent edge writer holds
+/// `ROW EXCLUSIVE` on `edges` (what an INSERT takes) until batch 1 is seen
+/// WAITING for its `LOCK TABLE` in `pg_stat_activity`, then for a known
+/// interval more. Batch 1's figure (timed from its begin, waits included)
+/// must cover that interval, the result's longest must be the largest
+/// `BATCH` figure, and it must count both transactions. A figure that is not
+/// timed, timed from after the locks, or never recorded fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_batch_reports_how_long_it_held_the_instance_wide_locks(pool: PgPool) {
+    const HELD_MS: u64 = 1000;
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a, fx.b]);
+    let url = fixture::database_url_for(&pool).await;
+
+    let mut writer = pool.begin().await.expect("begin the concurrent writer");
+    sqlx::query("LOCK TABLE public.edges IN ROW EXCLUSIVE MODE")
+        .execute(&mut *writer)
+        .await
+        .expect("the writer's lock");
+    let (src, dst, op) = (
+        fx.src.to_string(),
+        fx.dst.to_string(),
+        fx.operator.to_string(),
+    );
+    let child = Command::new(BIN)
+        .args([
+            "regroup-claims",
+            "--claims-file",
+            ids.to_str().unwrap(),
+            "--source-group",
+            &src,
+            "--target-group",
+            &dst,
+            "--operator",
+            &op,
+            "--manifest-out",
+            dir.join("dry.jsonl").to_str().unwrap(),
+            "--batch-size",
+            "1",
+            "--lock-timeout",
+            "120s",
+        ])
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env(DSN_ENV, &url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn epigraph-operator");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                             WHERE datname = current_database() \
+                               AND pid <> pg_backend_pid() \
+                               AND wait_event_type = 'Lock' \
+                               AND query LIKE 'LOCK TABLE %')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "batch 1 never waited on the concurrent writer's lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(HELD_MS));
+    writer.rollback().await.expect("release the writer's lock");
+    let out = child
+        .wait_with_output()
+        .expect("wait for epigraph-operator");
+    let dry = Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    };
+
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    let batches: Vec<&str> = dry
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("BATCH "))
+        .collect();
+    assert_eq!(batches.len(), 2, "{}", dry.show());
+    let figures: Vec<u128> = batches
+        .iter()
+        .map(|l| {
+            lock_hold_of(l).unwrap_or_else(|| panic!("a BATCH line without its lock hold: {l}"))
+        })
+        .collect();
+    assert!(
+        figures[0] >= u128::from(HELD_MS),
+        "batch 1 waited at least {HELD_MS} ms behind the writer, and its figure includes the \
+         wait: {figures:?}\n{}",
+        dry.show()
+    );
+    let (longest, transactions) = longest_lock_hold(&dry.stdout)
+        .unwrap_or_else(|| panic!("no longest lock hold line\n{}", dry.show()));
+    assert_eq!(
+        longest,
+        *figures.iter().max().unwrap(),
+        "the longest is the largest BATCH figure\n{}",
+        dry.show()
+    );
+    assert_eq!(transactions, 2, "{}", dry.show());
+    assert!(dry.stdout.contains("at --batch-size 1"), "{}", dry.show());
 }

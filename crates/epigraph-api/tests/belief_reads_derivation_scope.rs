@@ -77,7 +77,7 @@ async fn discount_bba(
     evidence: Option<Uuid>,
     t: f64,
 ) {
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,
@@ -95,8 +95,7 @@ async fn discount_bba(
     .expect("store a BBA");
 }
 
-/// Evidence on `claim` narrowed to `group` (the shape `hide-evidence` leaves),
-/// with its evidence perspective.
+/// Evidence on `claim` narrowed to `group` (the shape `hide-evidence` leaves).
 async fn narrowed_evidence(pool: &PgPool, claim: Uuid, group: Uuid, owner: Uuid) -> Uuid {
     let ev = seed_evidence(pool, claim, "document").await;
     // Pinned, as `epigraph-operator hide-evidence` pins it (migration 110):
@@ -116,9 +115,7 @@ async fn narrowed_evidence(pool: &PgPool, claim: Uuid, group: Uuid, owner: Uuid)
         .execute(pool)
         .await
         .expect("narrow the evidence");
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, ev, Some(owner))
-        .await
-        .expect("evidence perspective");
+    let _ = owner;
     ev
 }
 
@@ -334,7 +331,7 @@ async fn conflict_batch_never_serves_a_bba_derived_from_sources_the_reader_canno
 
     // A later BBA on `a`, refuting it, citing evidence hidden from its readers.
     let hidden = narrowed_evidence(&pool, a, group, member).await;
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_for_evidence(
         &pool,
         a,
         frame,

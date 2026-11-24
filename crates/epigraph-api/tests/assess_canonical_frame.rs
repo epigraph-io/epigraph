@@ -35,9 +35,9 @@
 //! slot perspective records the owner, and `perspectives.owner_agent_id` is a
 //! foreign key, so the nil-principal public viewer cannot call it). That is
 //! deliberate: this file pins
-//! the handler's FRAME and CACHE semantics, not its tenancy (the stamping of
-//! `assess.rs`'s one raw-pool site is a separate change), so an RLS refusal
-//! must not be able to make an arm pass or fail.
+//! the handler's FRAME and CACHE semantics, not its tenancy (the handler's
+//! stamped transaction under row security is `assess_app_role.rs`), so an RLS
+//! refusal must not be able to make an arm pass or fail.
 
 #![cfg(feature = "db")]
 
@@ -73,6 +73,22 @@ fn request_on(frame: Uuid, supports: bool, confidence: f64) -> AssessClaimReques
     req
 }
 
+/// The handler's state: the test pool plus a `ScopedPool` over the same
+/// database (the harness superuser's, stamped). `assess_claim` reads and
+/// writes on `AppState::write_as` (backlog 74feb76b), and the
+/// `EPIGRAPH_COMPOUND_WRITE_GUARD` decision (backlog 7435772c) reads on that
+/// same transaction. A state with no scoped pool refuses the call, as it
+/// should in production.
+///
+/// The guard is pinned to `warn` (the default), so no environment of the
+/// test process can turn a compound assessment below into a refusal.
+async fn assess_state(pool: &PgPool) -> AppState {
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default())
+        .with_compound_write_guard(epigraph_engine::belief_modes::CompoundWriteGuard::Warn);
+    state.scoped = Some(viewer_fixture::scoped_pool(pool).await);
+    state
+}
+
 /// `Viewer` is not `Clone`, so each call resolves its own viewer for `caller`.
 async fn try_assess(
     pool: &PgPool,
@@ -81,7 +97,7 @@ async fn try_assess(
     req: AssessClaimRequest,
 ) -> Result<AssessClaimResponse, ApiError> {
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve caller");
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let state = assess_state(pool).await;
     let Json(resp) = assess_claim(
         write_scope(),
         ViewerExtractor(viewer),
@@ -611,10 +627,19 @@ async fn another_route_cannot_write_into_an_assessment_slot(pool: PgPool) {
         "nothing written"
     );
 
-    let other = Uuid::new_v4();
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, other, Some(caller))
-        .await
-        .expect("another perspective");
+    let other = epigraph_db::PerspectiveRepository::create(
+        &pool,
+        "another perspective",
+        None,
+        Some(caller),
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("another perspective")
+    .id;
     let viewer = Viewer::resolve(&pool, caller).await.expect("viewer");
     let scoped_state = AppState::with_scoped_pool(
         viewer_fixture::scoped_pool(&pool).await,
@@ -632,6 +657,65 @@ async fn another_route_cannot_write_into_an_assessment_slot(pool: PgPool) {
     assert_eq!(
         rows_on(&pool, claim, first.frame_id).await.len(),
         before.len() + 1
+    );
+}
+
+/// Backlog 1777638e (migration 267): the owner's assessment slot is a
+/// column of its BBA (`slot_kind = 'assessment'`, `slot_id` = the derived
+/// slot id), not a `perspectives` row: assess writes no perspective, and a
+/// second call replaces the one row on that slot. On the code before 267 the
+/// first assertion fails (assess wrote an `evidence`-typed perspective with
+/// the slot's id first).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_assessment_slot_is_a_column_and_writes_no_perspective(pool: PgPool) {
+    let (claim, _viewer, caller) = seed_claim(&pool, "assess slot column").await;
+    let first = assess(&pool, caller, claim, request(true, 0.9, None)).await;
+    let second = assess(&pool, caller, claim, request(false, 0.6, None)).await;
+    let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(caller));
+
+    let slot_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM perspectives \
+          WHERE perspective_type IN ('edge', 'evidence') OR id = $1",
+    )
+    .bind(slot)
+    .fetch_one(&pool)
+    .await
+    .expect("count slot-shaped perspectives");
+    assert_eq!(
+        slot_rows, 0,
+        "assess writes no perspectives row for its slot"
+    );
+
+    type Key = (
+        Uuid,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<String>,
+        Option<Uuid>,
+    );
+    let keys: Vec<Key> = sqlx::query_as(
+        "SELECT id, source_agent_id, perspective_id, slot_kind, slot_id \
+               FROM mass_functions WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(claim)
+    .bind(first.frame_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read the assessment rows");
+    assert_eq!(
+        keys,
+        vec![(
+            first.mass_function_id,
+            Some(caller),
+            None,
+            Some("assessment".to_string()),
+            Some(slot)
+        )],
+        "one row on the owner's assessment slot, with no perspective"
+    );
+    assert_eq!(
+        second.mass_function_id, first.mass_function_id,
+        "the second call replaced the slot's row in place"
     );
 }
 
@@ -1082,7 +1166,7 @@ async fn assessing_a_compound_stores_the_row_but_leaves_its_cache(pool: PgPool) 
     let twin = seed_public_claim(&pool, caller, "assess a standalone twin").await;
 
     let twin_before = set_sentinel_cache(&pool, twin, None).await;
-    assess(&pool, caller, twin, request(true, 0.8, None)).await;
+    let twin_resp = assess(&pool, caller, twin, request(true, 0.8, None)).await;
     assert_ne!(
         full_cache(&pool, twin).await,
         twin_before,
@@ -1106,6 +1190,24 @@ async fn assessing_a_compound_stores_the_row_but_leaves_its_cache(pool: PgPool) 
         full_cache(&pool, compound).await,
         before,
         "assess must not refold a compound's own rows into its cache"
+    );
+    // EPIGRAPH_COMPOUND_WRITE_GUARD=warn (backlog 7435772c): the response
+    // names the compound and the atom to assess instead.
+    let target = resp
+        .deprecated_compound_target
+        .expect("warn reports the compound target");
+    assert_eq!(target.claim_id, compound);
+    assert_eq!(
+        target
+            .visible_atoms
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>(),
+        vec![leaf]
+    );
+    assert!(
+        twin_resp.deprecated_compound_target.is_none(),
+        "a standalone claim carries no compound target"
     );
 }
 

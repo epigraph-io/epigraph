@@ -165,41 +165,35 @@ async fn claim_frame(pool: &PgPool, claim: Uuid, frame: Uuid, index: i32) {
     .expect("seed claim_frames");
 }
 
-/// A perspective row with id `id`, as an edge-keyed or evidence-keyed BBA
-/// needs for its `perspective_id`.
-async fn perspective(pool: &PgPool, id: Uuid, owner: Uuid, world: Uuid) {
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, owner_agent_id, perspective_type, visibility, \
-                                   owner_group_id) \
-         VALUES ($1, 'atlas-flow', $2, 'evidence', 'public', $3)",
-    )
-    .bind(id)
-    .bind(owner)
-    .bind(world)
-    .execute(pool)
-    .await
-    .expect("seed perspective");
-}
-
-/// A BBA on `claim`; tenancy inherited from the claim.
+/// A BBA on `claim`; tenancy inherited from the claim. `slot`: the id the
+/// BBA is keyed on (migration 267), an evidence slot when it is `evidence`,
+/// an edge slot otherwise.
 async fn bba(
     pool: &PgPool,
     claim: Uuid,
     frame: Uuid,
     source_agent: Uuid,
-    perspective: Option<Uuid>,
+    slot: Option<Uuid>,
     evidence: Option<Uuid>,
     masses: serde_json::Value,
 ) -> Uuid {
+    let kind = slot.map(|s| {
+        if Some(s) == evidence {
+            "evidence"
+        } else {
+            "edge"
+        }
+    });
     sqlx::query_scalar(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, \
                                      masses, evidence_id, source_strength) \
-         VALUES ($1, $2, $3, $4, $5, $6, 0.5) RETURNING id",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 0.5) RETURNING id",
     )
     .bind(claim)
     .bind(frame)
     .bind(source_agent)
-    .bind(perspective)
+    .bind(kind)
+    .bind(slot)
     .bind(masses)
     .bind(evidence)
     .fetch_one(pool)
@@ -397,7 +391,6 @@ async fn proxy_weights_do_not_move_when_any_belief_moves(pool: PgPool) {
     ];
     let ev = evidence_row(&pool, a).await;
     evidence_edge(&pool, ev, a, "supports").await;
-    perspective(&pool, ev, x, world).await;
     bba(
         &pool,
         a,
@@ -425,7 +418,6 @@ async fn proxy_weights_do_not_move_when_any_belief_moves(pool: PgPool) {
     }
     let targets = [b, c, a, c, a];
     for (&link, &target) in links.iter().zip(&targets) {
-        perspective(&pool, link, x, world).await;
         bba(
             &pool,
             target,

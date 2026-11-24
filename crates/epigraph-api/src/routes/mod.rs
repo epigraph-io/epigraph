@@ -64,6 +64,10 @@ pub mod conflicts;
 pub mod context;
 #[cfg(feature = "db")]
 pub mod conventions;
+/// The REST twin of MCP `countersign_authorship` (backlog 04c02296). Its
+/// types compile in both builds (the OpenAPI derive names them); its handler
+/// is db-only and registered only in the db router.
+pub mod countersign;
 pub mod cross_source;
 pub mod crud;
 pub mod edges;
@@ -110,6 +114,9 @@ pub mod ingest;
 pub mod lineage;
 #[cfg(feature = "db")]
 pub mod mcp_tools;
+/// HTTP twins of MCP read tools that had no route (backlog fff61b9e).
+#[cfg(feature = "db")]
+pub mod mcp_twins;
 #[cfg(feature = "db")]
 pub mod methods;
 #[cfg(test)]
@@ -143,6 +150,9 @@ pub mod structural;
 pub mod submit;
 #[cfg(feature = "db")]
 pub mod tasks;
+/// Person-facing keyless team groups and consented invitations (migration 263).
+#[cfg(feature = "db")]
+pub mod team_groups;
 #[cfg(any(test, feature = "db"))]
 pub(crate) mod text;
 #[cfg(feature = "db")]
@@ -276,7 +286,8 @@ pub(crate) async fn open_scoped_read<'a>(
 // from both router variants in PR-03 and is served only by the internal
 // listener that `bin/server.rs` binds (`EPIGRAPH_METRICS_ADDR`).
 use crate::middleware::{
-    bearer_auth_middleware, optional_bearer_auth_middleware, rate_limit_middleware,
+    address_rate_limit_middleware, bearer_auth_middleware, optional_bearer_auth_middleware,
+    rate_limit_middleware,
 };
 use crate::state::AppState;
 use axum::{
@@ -392,7 +403,7 @@ pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
 ///
 /// ## `oauth` — anonymous by construction
 ///
-/// The 11 `/oauth/*` and `/.well-known/*` endpoints. Discovery and token
+/// The 12 `/oauth/*` and `/.well-known/*` endpoints. Discovery and token
 /// issuance must precede authentication, so they cannot sit behind it.
 ///
 /// # What changed in PR-03
@@ -419,6 +430,11 @@ pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
 /// charged to its principal and an anonymous one to its client address
 /// (`middleware::rate_limit`). A request to a protected route without a valid
 /// token is refused 401 by the bearer layer before it reaches the limiter.
+///
+/// When it carries `AppState::address_rate_limiter` (backlog 20210eaa), every
+/// request except `/health` is ALSO charged to its client address,
+/// outside the bearer layers and routing, so 401s and unknown-path 404s are
+/// counted and refused before any token is read.
 ///
 /// When it carries none but carries `AppState::guest_rate_limiter` (guest
 /// reads on, no limiter configured: the operator's ruling of 2026-11-16), the
@@ -534,6 +550,13 @@ pub fn create_router_with_extensions(
         .route("/api/v1/ingest/paper", post(ingest::ingest_paper))
         .route("/api/v1/ingest/paper-url", post(ingest::ingest_paper))
         .route("/api/v1/papers", post(papers::create_paper))
+        // A named author confirms or declines an ingester's naming of them
+        // (migration 208's definer, as the caller; MCP twin
+        // `countersign_authorship`).
+        .route(
+            "/api/v1/papers/:id/authors/countersign",
+            post(countersign::countersign_authorship),
+        )
         .route("/api/v1/edges", post(edges::create_edge))
         .route(
             "/api/v1/edges/hierarchical",
@@ -734,6 +757,25 @@ pub fn create_router_with_extensions(
         // interface table say. The `/rotate-key` spelling this comment used to
         // carry was never served by anything.
         .route("/api/v1/groups/:id/rotate", post(groups::rotate_key))
+        // Person-facing keyless team groups and consented invitations
+        // (migration 263, `routes/team_groups.rs`): a Person creates a group
+        // and invites another Person, whose membership goes live only when
+        // they accept. `/groups/team` and `/groups/mine` are static segments,
+        // matched ahead of `/groups/:id`.
+        .route("/api/v1/groups/team", post(team_groups::create_team_group))
+        .route("/api/v1/groups/mine", get(team_groups::my_groups))
+        .route(
+            "/api/v1/groups/:id/invitations",
+            post(team_groups::invite_to_group),
+        )
+        .route(
+            "/api/v1/group-invitations/:id/accept",
+            post(team_groups::accept_invitation),
+        )
+        .route(
+            "/api/v1/group-invitations/:id/decline",
+            post(team_groups::decline_invitation),
+        )
         // Admin OAuth client management
         .route(
             "/api/v1/admin/clients/:id/approve",
@@ -1227,7 +1269,27 @@ pub fn create_router_with_extensions(
         // MCP tool discovery. Moved behind auth: the same catalog is
         // available to an authenticated caller over MCP `list_tools`, so an
         // anonymous copy only gave a scanner a free capability map.
-        .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
+        .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools))
+        // HTTP twins of MCP read tools (backlog fff61b9e): each runs the
+        // tool's own function on the caller's stamped read, under the tool's
+        // scope. See `routes/mcp_twins.rs`.
+        .route(
+            "/api/v1/ingest/structure-source",
+            post(mcp_twins::structure_source),
+        )
+        .route(
+            "/api/v1/ingest/already-ingested",
+            get(mcp_twins::check_already_ingested),
+        )
+        .route(
+            "/api/v1/claims/undecomposed",
+            get(mcp_twins::query_undecomposed_claims),
+        )
+        .route("/api/v1/claims/:id/verify", get(mcp_twins::verify_claim))
+        .route(
+            "/api/v1/alternative-sets/suggestions",
+            get(mcp_twins::suggest_alternative_sets),
+        );
 
     // Authentication for `protected`: OAuth2 Bearer, unconditionally.
     //
@@ -1432,6 +1494,7 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        .route("/.well-known/jwks.json", get(crate::oauth::jwks_document))
         // Anonymous, so held to `ANONYMOUS_BODY_LIMIT` rather than the
         // global limit the merged router sets below.
         .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
@@ -1443,15 +1506,25 @@ pub fn create_router_with_extensions(
         ))
         .layer(middleware::map_response(oauth_response_headers));
 
-    // The body limit is the outermost layer. Rate limiting is NOT layered
-    // here: each of the three routers above installs it where it can see the
-    // principal (inside the bearer layers), so a merged-router layer could
-    // only ever key on the address. Health endpoints bypass it internally.
+    // The principal rate limiter is NOT layered here: each of the three
+    // routers above installs it where it can see the principal (inside the
+    // bearer layers), so a merged-router layer could only ever key on the
+    // address. Health endpoints bypass it internally.
+    //
+    // The PER-ADDRESS limiter (backlog 20210eaa) is, on purpose, and
+    // outermost: outside the bearer layers and outside routing, so the
+    // bearer layer's per-request reads, its 401s and unknown-path 404s are
+    // all charged to the client address, and a refused request reaches none
+    // of them. A no-op unless `AppState::address_rate_limiter` is set.
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(oauth)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            address_rate_limit_middleware,
+        ))
         .with_state(state)
 }
 
@@ -1484,6 +1557,11 @@ pub fn create_router_with_extensions(
 /// charged to its principal and an anonymous one to its client address
 /// (`middleware::rate_limit`). A request to a protected route without a valid
 /// token is refused 401 by the bearer layer before it reaches the limiter.
+///
+/// When it carries `AppState::address_rate_limiter` (backlog 20210eaa), every
+/// request except `/health` is ALSO charged to its client address,
+/// outside the bearer layers and routing, so 401s and unknown-path 404s are
+/// counted and refused before any token is read.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
     create_router_with_extensions(state, Vec::new())
@@ -1958,6 +2036,7 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        .route("/.well-known/jwks.json", get(crate::oauth::jwks_document))
         // Anonymous, so held to `ANONYMOUS_BODY_LIMIT` rather than the
         // global limit the merged router sets below.
         .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
@@ -1969,15 +2048,25 @@ pub fn create_router_with_extensions(
         ))
         .layer(middleware::map_response(oauth_response_headers));
 
-    // The body limit is the outermost layer. Rate limiting is NOT layered
-    // here: each of the three routers above installs it where it can see the
-    // principal (inside the bearer layers), so a merged-router layer could
-    // only ever key on the address. Health endpoints bypass it internally.
+    // The principal rate limiter is NOT layered here: each of the three
+    // routers above installs it where it can see the principal (inside the
+    // bearer layers), so a merged-router layer could only ever key on the
+    // address. Health endpoints bypass it internally.
+    //
+    // The PER-ADDRESS limiter (backlog 20210eaa) is, on purpose, and
+    // outermost: outside the bearer layers and outside routing, so the
+    // bearer layer's per-request reads, its 401s and unknown-path 404s are
+    // all charged to the client address, and a refused request reaches none
+    // of them. A no-op unless `AppState::address_rate_limiter` is set.
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(oauth)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            address_rate_limit_middleware,
+        ))
         .with_state(state)
 }
 

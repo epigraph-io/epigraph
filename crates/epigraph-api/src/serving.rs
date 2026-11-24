@@ -23,6 +23,7 @@ use std::time::Duration;
 use axum::http::{Request, Response, StatusCode};
 use axum::Router;
 use tower::ServiceBuilder;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::request_id::{
     MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
@@ -152,13 +153,113 @@ impl ServeSettings {
     }
 }
 
-/// Wrap the application router in the request-id, trace and timeout layers.
+/// The request pool's maximum number of connections.
+pub const DB_MAX_CONNECTIONS_ENV: &str = "EPIGRAPH_DB_MAX_CONNECTIONS";
+/// The request pool's per-connection `statement_timeout`, in milliseconds;
+/// `0` (like unset) leaves the database's own setting in place.
+pub const DB_STATEMENT_TIMEOUT_ENV: &str = "EPIGRAPH_DB_STATEMENT_TIMEOUT_MS";
+
+/// The request pool's size before this setting existed (sqlx's
+/// `PgPool::connect` default, which `epigraph_db::ScopedPoolOptions::default`
+/// reproduces), kept as the default.
+pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
+
+/// The request pool's sizing and statement timeout (backlog b4c4337f), read
+/// once at boot like [`ServeSettings`].
+///
+/// Before these existed `bin/server.rs` built its pool with
+/// `ScopedPoolOptions::default()`: ten connections and no statement timeout,
+/// so the pool could not be sized to the host or to Postgres'
+/// `max_connections` without a code change, and a runaway query held one of
+/// the ten for as long as it ran. Every default is that behaviour.
+///
+/// The timeout is a session `SET statement_timeout` issued once on each new
+/// connection, so it holds only on a session-mode endpoint: behind a
+/// transaction-mode pooler (`EPIGRAPH_SESSION_GUC_MODE=transaction`) the
+/// setting lands on whichever server connection the pooler handed out and is
+/// not reliable. A handler that sets its own timeout (`SET LOCAL`, or a
+/// session `SET` it restores) overrides it for that statement.
+///
+/// The "request pool" is the process's only pool, so the timeout bounds every
+/// statement on it, not only request handlers: the webhook dispatcher, the
+/// tenancy gauge and canary sampler and the boot checks share it. Time a
+/// statement spends waiting on a lock counts against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestPoolSettings {
+    /// The most connections the request pool holds open.
+    pub max_connections: u32,
+    /// Each connection's `statement_timeout`; `None` leaves the database's.
+    pub statement_timeout: Option<Duration>,
+}
+
+impl Default for RequestPoolSettings {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_DB_MAX_CONNECTIONS,
+            statement_timeout: None,
+        }
+    }
+}
+
+impl RequestPoolSettings {
+    /// Parse the raw variable values (`None` = unset; blank = unset). A value
+    /// that does not parse is an error, not a default.
+    pub fn parse(
+        max_connections: Option<&str>,
+        statement_timeout_ms: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut settings = Self::default();
+        if let Some(raw) = blank_is_unset(max_connections) {
+            settings.max_connections =
+                raw.parse::<u32>().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                    format!("{DB_MAX_CONNECTIONS_ENV}={raw:?} is not a positive whole number")
+                })?;
+        }
+        if let Some(raw) = blank_is_unset(statement_timeout_ms) {
+            settings.statement_timeout = match whole_number(DB_STATEMENT_TIMEOUT_ENV, raw)? {
+                0 => None,
+                ms => Some(Duration::from_millis(ms)),
+            };
+        }
+        Ok(settings)
+    }
+
+    /// Read and parse the variables from the process environment.
+    pub fn from_env() -> Result<Self, String> {
+        let var = |name: &str| std::env::var(name).ok();
+        Self::parse(
+            var(DB_MAX_CONNECTIONS_ENV).as_deref(),
+            var(DB_STATEMENT_TIMEOUT_ENV).as_deref(),
+        )
+    }
+
+    /// The pool options these settings describe; everything else (the
+    /// acquire timeout) is `ScopedPoolOptions::default()`'s.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn pool_options(&self) -> epigraph_db::ScopedPoolOptions {
+        epigraph_db::ScopedPoolOptions {
+            max_connections: self.max_connections,
+            statement_timeout: self.statement_timeout,
+            ..epigraph_db::ScopedPoolOptions::default()
+        }
+    }
+}
+
+/// Wrap the application router in the request-id, trace, timeout and
+/// panic-catching layers.
 ///
 /// Outermost first: a request id is set (an incoming `x-request-id` is kept
 /// when [`is_acceptable_request_id`] passes it, otherwise a UUID is minted),
 /// the request is traced in a span carrying that id, the id is copied onto the
-/// response, and the handler runs under the timeout. So a 408 from the timeout
-/// is traced and carries the id too.
+/// response, the handler runs under the timeout, and a panic in it is caught.
+/// So a 408 from the timeout is traced and carries the id too.
+///
+/// The panic layer (backlog b4c4337f) is innermost: a handler that panics is
+/// answered `500` with the body `Service panicked` (the panic message is
+/// logged at ERROR inside the request span, never sent), traced and carrying
+/// the request id. Without it the panic unwound into hyper, which dropped the
+/// connection with no response at all.
 ///
 /// Every response is logged once at INFO (status and latency) by
 /// [`log_response`], and a 408 at WARN: tower-http's default response event is
@@ -170,6 +271,7 @@ impl ServeSettings {
 /// `/oauth/callback` carry authorization codes and state there), no headers
 /// (bearer tokens), and not the passkey ceremonies' path credentials.
 pub fn apply_layers(router: Router, settings: &ServeSettings) -> Router {
+    let router = router.layer(CatchPanicLayer::new());
     let router = match settings.request_timeout {
         Some(timeout) => router.layer(TimeoutLayer::new(timeout)),
         None => router,
@@ -448,6 +550,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_request_pool_defaults_are_the_pre_existing_pool() {
+        let unset = RequestPoolSettings::parse(None, None).expect("defaults");
+        assert_eq!(unset, RequestPoolSettings::default());
+        assert_eq!(
+            RequestPoolSettings::parse(Some(" "), Some("")).expect("blank"),
+            unset
+        );
+        #[cfg(feature = "db")]
+        assert_eq!(
+            unset.pool_options(),
+            epigraph_db::ScopedPoolOptions::default(),
+            "unset must build exactly the pool the server built before"
+        );
+    }
+
+    #[test]
+    fn the_request_pool_values_are_read_and_a_zero_timeout_is_off() {
+        let s = RequestPoolSettings::parse(Some("25"), Some("15000")).expect("valid");
+        assert_eq!(s.max_connections, 25);
+        assert_eq!(s.statement_timeout, Some(Duration::from_millis(15_000)));
+        #[cfg(feature = "db")]
+        {
+            let o = s.pool_options();
+            assert_eq!(o.max_connections, 25);
+            assert_eq!(o.statement_timeout, Some(Duration::from_millis(15_000)));
+            assert_eq!(
+                o.acquire_timeout,
+                epigraph_db::ScopedPoolOptions::default().acquire_timeout
+            );
+        }
+        let off = RequestPoolSettings::parse(None, Some("0")).expect("zero");
+        assert_eq!(off.statement_timeout, None);
+    }
+
+    #[test]
+    fn malformed_request_pool_values_are_refused_and_named() {
+        for (max, timeout, var) in [
+            (Some("0"), None, DB_MAX_CONNECTIONS_ENV),
+            (Some("ten"), None, DB_MAX_CONNECTIONS_ENV),
+            (Some("-1"), None, DB_MAX_CONNECTIONS_ENV),
+            (None, Some("30s"), DB_STATEMENT_TIMEOUT_ENV),
+            (None, Some("-5"), DB_STATEMENT_TIMEOUT_ENV),
+        ] {
+            let err = RequestPoolSettings::parse(max, timeout)
+                .expect_err("a malformed value must refuse, not default");
+            assert!(err.contains(var), "the refusal must name {var}: {err}");
+        }
+    }
+
     fn slow_router() -> Router {
         Router::new()
             .route(
@@ -494,6 +646,41 @@ mod tests {
         );
         // Calibration: a request inside the timeout is served.
         let fast = call(apply_layers(slow_router(), &settings), "/fast", None).await;
+        assert_eq!(fast.status(), StatusCode::OK);
+    }
+
+    /// b4c4337f: a panicking handler is answered 500, with the request id and
+    /// without the panic message, and the router keeps serving. Without the
+    /// panic layer the panic unwinds out of `oneshot` and fails this test.
+    #[tokio::test]
+    async fn a_panicking_handler_is_answered_500_with_its_request_id() {
+        let router = slow_router().route(
+            "/panic",
+            get(|| async {
+                if std::hint::black_box(true) {
+                    panic!("handler exploded: secret-detail-7731");
+                }
+                "unreachable"
+            }),
+        );
+        let app = apply_layers(router, &ServeSettings::default());
+        let response = call(app.clone(), "/panic", Some("req-panic-1")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "req-panic-1",
+            "the 500 carries the request id"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("secret-detail-7731"),
+            "the panic message must not reach the client: {body}"
+        );
+        // The service is still up after the panic.
+        let fast = call(app, "/fast", None).await;
         assert_eq!(fast.status(), StatusCode::OK);
     }
 

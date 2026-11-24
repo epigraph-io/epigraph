@@ -134,7 +134,7 @@ pub struct RewireSummary {
 /// - Keyed on the STORED row's `source_agent_id`, not on the source claim's
 ///   author as [`EDGE_QUERY`] is: the live
 ///   `link_epistemic` path and migration 114's writer-owned rows store other
-///   agents, and the upsert key is `(claim, frame, source_agent, perspective)`,
+///   agents, and the upsert key is `(claim, frame, source_agent, edge slot)`,
 ///   so re-wiring under a different agent would add a second BBA for the edge
 ///   that double-counts in combine, and the stored row would be replaced
 ///   rather than rewritten in place (losing its owner; see
@@ -173,7 +173,7 @@ SELECT DISTINCT ON (e.id)
        COALESCE(mf.source_agent_id, e.signer_id, src.agent_id) AS agent_id,
        e.source_id, e.target_id, e.relationship, mf.frame_id
 FROM mass_functions mf
-JOIN edges e ON e.id = mf.perspective_id
+JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id
 JOIN claims tgt ON tgt.id = e.target_id
 JOIN claims src ON src.id = e.source_id
 WHERE mf.combination_method = 'edge_factor'
@@ -358,7 +358,7 @@ async fn delete_edge_rows(
     let (keep_frame, keep_agent) = keep.unzip();
     sqlx::query_as(
         "DELETE FROM mass_functions \
-          WHERE perspective_id = $1 AND claim_id = $2 \
+          WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2 \
             AND combination_method = 'edge_factor' AND retracted_at IS NULL \
             AND NOT ($3::uuid IS NOT NULL AND frame_id = $3 \
                      AND source_agent_id IS NOT DISTINCT FROM $4) \
@@ -376,15 +376,28 @@ async fn delete_edge_rows(
 /// Recompute `target` on every frame in `frames` (deduplicated, `last`
 /// recomputed last because the claim's cached scalars are last-writer-wins);
 /// clear its cache when it holds no BBA at all any more.
+///
+/// Every recompute goes through the single atom-cache writer
+/// (`epigraph_engine::edge_factor::recompute_atom_cache`, backlog 2be5efb8),
+/// never a claim-cache writer directly: a COMPOUND target is left exactly as
+/// it was (its belief is a query over its leaves, so neither a refold of its
+/// remaining rows nor the clear below may touch its cache), and any other
+/// target gets the fold its frame ran before (`LegacyFold::Frame`) while the
+/// process folds `legacy`. The clear runs only when every recompute took
+/// that legacy fold: the atom-cache writer never NULLs a cache.
+///
+/// `cause` is what the target's AEF input was before this edge's rows were
+/// deleted ([`aef_input_before_removal`]).
 async fn recompute_after_removal(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     target: Uuid,
     frames: &[Uuid],
     last: Uuid,
+    cause: epigraph_engine::edge_factor::CacheWriteCause,
 ) -> Result<(), String> {
     use epigraph_db::MassFunctionRepository;
-    use epigraph_engine::edge_factor::recompute_claim_belief_on_frame;
+    use epigraph_engine::edge_factor::{recompute_atom_cache, AtomCacheOutcome, LegacyFold};
 
     let mut ordered: Vec<Uuid> = Vec::new();
     for f in frames.iter().copied().filter(|f| *f != last) {
@@ -395,8 +408,15 @@ async fn recompute_after_removal(
     if frames.contains(&last) {
         ordered.push(last);
     }
+    let mut all_legacy = true;
     for frame in ordered {
-        recompute_claim_belief_on_frame(&mut *conn, viewer, target, frame).await?;
+        let outcome =
+            recompute_atom_cache(&mut *conn, viewer, target, cause, LegacyFold::Frame(frame))
+                .await?;
+        all_legacy &= matches!(outcome, AtomCacheOutcome::Legacy { .. });
+    }
+    if !all_legacy {
+        return Ok(());
     }
     let remaining = MassFunctionRepository::get_for_claim(&mut *conn, viewer, target)
         .await
@@ -407,6 +427,28 @@ async fn recompute_after_removal(
             .map_err(|e| format!("clear unbacked belief: {e}"))?;
     }
     Ok(())
+}
+
+/// The `cause` [`recompute_after_removal`] passes the atom-cache writer for
+/// `target`, read BEFORE any of the edge's rows is deleted: under an AEF fold,
+/// the target's AEF input as the writer reads it (so an atom whose last input
+/// this rewire removes is vacated, not left on its old value); under the
+/// `legacy` fold, which never reads it, `Organic` without the read.
+async fn aef_input_before_removal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    target: Uuid,
+) -> Result<epigraph_engine::edge_factor::CacheWriteCause, String> {
+    use epigraph_engine::atom_items::AtomFoldMode;
+    use epigraph_engine::edge_factor::{aef_input_before, AtomCacheSettings, CacheWriteCause};
+
+    let settings = AtomCacheSettings::current();
+    if settings.fold == AtomFoldMode::Legacy {
+        return Ok(CacheWriteCause::Organic);
+    }
+    Ok(CacheWriteCause::EvidenceRemoved(
+        aef_input_before(conn, viewer, target, settings).await?,
+    ))
 }
 
 /// Targeted mode's inputs to [`rewire_one`]: the guards, and the callback
@@ -474,7 +516,7 @@ async fn rewire_one(
     // DISTINCT ON), locked, with the tenancy a rewrite must keep.
     let selected: Option<(Uuid, Uuid, String, bool)> = sqlx::query_as(
         "SELECT id, owner_group_id, visibility::text, writer_owned FROM mass_functions \
-          WHERE perspective_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
+          WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
             AND retracted_at IS NULL \
           ORDER BY created_at, id LIMIT 1 FOR UPDATE",
     )
@@ -512,6 +554,7 @@ async fn rewire_one(
         }
     }
     let keep = (binary, edge.agent_id);
+    let cause = aef_input_before_removal(&mut tx, viewer, edge.target_id).await?;
     let others = delete_edge_rows(&mut tx, edge, Some(keep)).await?;
     if targeted.is_some() && !others.is_empty() {
         // The decision saw one live row at the key; a second appeared since.
@@ -554,7 +597,7 @@ async fn rewire_one(
             sqlx::query(
                 "UPDATE mass_functions \
                     SET owner_group_id = $5, visibility = $6, writer_owned = $7 \
-                  WHERE perspective_id = $1 AND claim_id = $2 AND frame_id = $3 \
+                  WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2 AND frame_id = $3 \
                     AND source_agent_id = $4 \
                     AND (owner_group_id, visibility::text, writer_owned) \
                         IS DISTINCT FROM ($5, $6, $7)",
@@ -575,7 +618,8 @@ async fn rewire_one(
             if other_frames.iter().any(|f| *f != binary) {
                 let mut frames = other_frames.clone();
                 frames.push(binary);
-                recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary).await?;
+                recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary, cause)
+                    .await?;
             }
             if let (Some((target_before, row_before, predicted)), Some((_, on_capture))) =
                 (proceed.take(), targeted.as_mut())
@@ -599,7 +643,9 @@ async fn rewire_one(
                     tracing::warn!(edge = %edge.edge_id, target = %edge.target_id,
                         "targeted rewire: written cache differs from the predicted fold; rolled back");
                     tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
-                    return Ok(EdgeResult::only(EdgeRewrite::Held(HeldBucket::TargetStale)));
+                    return Ok(EdgeResult::only(EdgeRewrite::Held(
+                        HeldBucket::PostWireMismatch,
+                    )));
                 }
                 // Recorded BEFORE the commit, so no committed rewrite lacks
                 // its snapshot record.
@@ -620,7 +666,8 @@ async fn rewire_one(
                     .map(|(_, f)| f),
             );
             frames.push(binary);
-            recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary).await?;
+            recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary, cause)
+                .await?;
             if outcome == EdgeFactorOutcome::Vacuous {
                 EdgeRewrite::RemovedVacuous
             } else {
@@ -679,11 +726,18 @@ pub enum HeldBucket {
     RowMixed,
     /// The refold would vacate the target (ruling R-80).
     WouldVacate,
+    /// Apply only: the cache the wire WROTE differs from the fold the
+    /// decision predicted over the same rows (the cache writer's owner
+    /// guard declined, or a write landed between the decision and the
+    /// wire). Rolled back. Kept apart from `target_stale`, a decision-time
+    /// verdict on the stored cache, so a real mismatch between the predicted
+    /// fold and the cache writer is not hidden among stale targets.
+    PostWireMismatch,
 }
 
 impl HeldBucket {
     /// Every bucket, in report order.
-    pub const ALL: [HeldBucket; 9] = [
+    pub const ALL: [HeldBucket; 10] = [
         HeldBucket::Supersedes,
         HeldBucket::CompoundEnd,
         HeldBucket::OffKeyOrDuplicate,
@@ -693,6 +747,7 @@ impl HeldBucket {
         HeldBucket::TargetStale,
         HeldBucket::RowMixed,
         HeldBucket::WouldVacate,
+        HeldBucket::PostWireMismatch,
     ];
 
     /// The bucket's report name.
@@ -708,6 +763,7 @@ impl HeldBucket {
             HeldBucket::TargetStale => "target_stale",
             HeldBucket::RowMixed => "row_mixed",
             HeldBucket::WouldVacate => "would_vacate",
+            HeldBucket::PostWireMismatch => "post_wire_mismatch",
         }
     }
 
@@ -784,6 +840,9 @@ pub enum TargetedVerdict {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TargetedDecision {
     pub verdict: TargetedVerdict,
+    /// The source's `(belief, plausibility, open_world_mass)` `p1` was built
+    /// from (the stored or overlaid cache).
+    pub source: Option<(f64, f64, Option<f64>)>,
     pub stored: Option<StoredEdgeRow>,
     pub p0: Option<EdgeBba>,
     pub p1: Option<EdgeBba>,
@@ -796,6 +855,7 @@ impl TargetedDecision {
     fn hold(bucket: HeldBucket) -> Self {
         Self {
             verdict: TargetedVerdict::Hold(bucket),
+            source: None,
             stored: None,
             p0: None,
             p1: None,
@@ -837,7 +897,7 @@ SELECT DISTINCT ON (e.id)
        COALESCE(mf.source_agent_id, e.signer_id, src.agent_id) AS agent_id,
        e.source_id, e.target_id, e.relationship, mf.frame_id
 FROM mass_functions mf
-JOIN edges e ON e.id = mf.perspective_id
+JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id
 JOIN claims tgt ON tgt.id = e.target_id
 JOIN claims src ON src.id = e.source_id
 WHERE mf.combination_method = 'edge_factor'
@@ -850,6 +910,41 @@ WHERE mf.combination_method = 'edge_factor'
   AND ($2::uuid[] IS NULL OR e.id = ANY($2))
 ORDER BY e.id, mf.created_at, mf.id
 "#;
+
+/// The edges sourced at `$1` that hold a live `edge_factor` row on their
+/// target but that [`TARGETED_REWIRE_EDGE_QUERY`] does not select, because
+/// the edge is no longer in force or an endpoint is no longer current
+/// (design report field `not_selectable`): reported, so a pass's reach is
+/// not understated by what it silently skipped. One row per edge, by id.
+pub const TARGETED_UNSELECTABLE_EDGE_QUERY: &str = r#"
+SELECT DISTINCT e.id
+FROM mass_functions mf
+JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id
+JOIN claims tgt ON tgt.id = e.target_id
+JOIN claims src ON src.id = e.source_id
+WHERE mf.combination_method = 'edge_factor'
+  AND mf.retracted_at IS NULL
+  AND mf.claim_id = e.target_id
+  AND e.source_type = 'claim' AND e.target_type = 'claim'
+  AND e.source_id = ANY($1)
+  AND NOT (tgt.is_current AND src.is_current
+           AND (e.valid_to IS NULL OR e.valid_to > now()))
+ORDER BY e.id
+"#;
+
+/// Run [`TARGETED_UNSELECTABLE_EDGE_QUERY`]: the edge ids, ordered.
+///
+/// # Errors
+/// The query's error.
+pub async fn unselectable_targeted_edges(
+    conn: &mut sqlx::PgConnection,
+    sources: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(TARGETED_UNSELECTABLE_EDGE_QUERY)
+        .bind(sources)
+        .fetch_all(&mut *conn)
+        .await
+}
 
 /// Run [`TARGETED_REWIRE_EDGE_QUERY`].
 ///
@@ -933,14 +1028,14 @@ pub async fn edge_shape(
                 public.epigraph_claim_is_compound(e.source_id) \
                   OR public.epigraph_claim_is_compound(e.target_id), \
                 (SELECT count(*) FROM mass_functions m \
-                  WHERE m.perspective_id = e.id AND m.claim_id = e.target_id \
+                  WHERE m.slot_kind = 'edge' AND m.slot_id = e.id AND m.claim_id = e.target_id \
                     AND m.combination_method = 'edge_factor' AND m.retracted_at IS NULL), \
                 (SELECT count(*) FROM mass_functions m \
-                  WHERE m.perspective_id = e.id AND m.claim_id = e.target_id \
+                  WHERE m.slot_kind = 'edge' AND m.slot_id = e.id AND m.claim_id = e.target_id \
                     AND m.combination_method = 'edge_factor' AND m.retracted_at IS NULL \
                     AND m.frame_id = $2 AND m.source_agent_id = $3), \
                 EXISTS (SELECT 1 FROM mass_functions m \
-                         WHERE m.perspective_id = e.id AND m.claim_id = e.target_id \
+                         WHERE m.slot_kind = 'edge' AND m.slot_id = e.id AND m.claim_id = e.target_id \
                            AND m.retracted_at IS NOT NULL) \
            FROM edges e WHERE e.id = $1",
     )
@@ -1003,7 +1098,7 @@ pub async fn selected_edge_row(
 ) -> Result<Option<Uuid>, String> {
     sqlx::query_scalar(
         "SELECT id FROM mass_functions \
-          WHERE perspective_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
+          WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
             AND retracted_at IS NULL \
           ORDER BY created_at, id LIMIT 1",
     )
@@ -1243,6 +1338,7 @@ pub async fn decide_targeted(
         });
     let mut decision = TargetedDecision {
         verdict: TargetedVerdict::Proceed,
+        source: Some(current),
         stored: Some(stored.clone()),
         p0: p0.clone(),
         p1: Some(p1.clone()),

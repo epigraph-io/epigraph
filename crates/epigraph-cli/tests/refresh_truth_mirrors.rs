@@ -39,7 +39,7 @@ use epigraph_cli::belief_cache::{
 use epigraph_cli::belief_mode_check::MODE_CHECK_REFUSED_EXIT;
 use epigraph_cli::truth_mirror::{
     apply, begin_dry_run_tx, cas_refresh, dry_run, plan_candidates, read_truth_records, restore,
-    write_truth_record, Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord,
+    write_truth_record, Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord, TxMode,
 };
 use epigraph_core::{ClaimId, TruthValue};
 use epigraph_db::repos::claim_role::{self, ClaimRole};
@@ -700,7 +700,8 @@ async fn two_chained_waves_refresh_to_the_last_and_a_broken_chain_is_left_untouc
         old_chained.to_bits(),
         "old = first.before"
     );
-    assert_eq!(r.waves, vec!["E-pass-1".to_string(), "L1".to_string()]);
+    // Chain order (L1 ran first), not name order.
+    assert_eq!(r.waves, vec!["L1".to_string(), "E-pass-1".to_string()]);
     assert_eq!(report.bucket_of(broken), Some(Bucket::BrokenChain));
     assert_untouched(&pool, broken, tb, vb, "broken chain").await;
 }
@@ -713,7 +714,13 @@ async fn a_claim_without_a_live_mirror_writer_row_is_left_untouched(pool: PgPool
     let (_scoped, viewer) = fixture::bypass(&pool).await;
     let control = mirror_claim(&pool, author, 0.731_37).await;
     let no_writer = mirror_claim(&pool, author, 0.682_91).await;
-    let records = wave(&pool, &[control, no_writer], "L1").await;
+    let retracted = mirror_claim(&pool, author, 0.655_13).await;
+    let records = wave(&pool, &[control, no_writer, retracted], "L1").await;
+    // `retracted`'s auto_wire rows are all retracted, through the retraction
+    // definer (the real path): it has auto_wire rows, none live.
+    retract_all_mass_rows(&pool, retracted, author).await;
+    let tr = truth_of(&pool, retracted).await;
+    let vr = row_version(&pool, retracted).await;
     // Hand-set: its rows were written by another method (the cache and the
     // fold are unchanged, so only this rule fails).
     sqlx::query("UPDATE mass_functions SET combination_method = 'conjunctive' WHERE claim_id = $1")
@@ -729,6 +736,37 @@ async fn a_claim_without_a_live_mirror_writer_row_is_left_untouched(pool: PgPool
     assert_refreshed(&pool, control, &report).await;
     assert_eq!(report.bucket_of(no_writer), Some(Bucket::NoMirrorWriter));
     assert_untouched(&pool, no_writer, t, v, "no mirror writer").await;
+    assert_eq!(report.bucket_of(retracted), Some(Bucket::NoMirrorWriter));
+    assert_untouched(&pool, retracted, tr, vr, "only retracted auto_wire rows").await;
+}
+
+/// Every mass function of `claim` marked retracted, by `principal`.
+/// Hand-set on the privileged test session (the retraction guard admits a
+/// bypass session): `epigraph_retract_mass_function` needs a writer of the
+/// row's owning group, which this fixture does not build. Checks none is
+/// live while at least one is still an `auto_wire` row.
+async fn retract_all_mass_rows(pool: &PgPool, claim: Uuid, principal: Uuid) {
+    sqlx::query(
+        "UPDATE mass_functions \
+            SET retracted_at = now(), retracted_by = $2, retract_reason = 'refresh test' \
+          WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .bind(principal)
+    .execute(pool)
+    .await
+    .expect("retract");
+    let (live, auto_wire): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE retracted_at IS NULL), \
+                count(*) FILTER (WHERE combination_method = 'auto_wire') \
+           FROM mass_functions WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("count");
+    assert_eq!(live, 0, "precondition: no live row");
+    assert!(auto_wire > 0, "precondition: an auto_wire row, retracted");
 }
 
 // ── (10) the dry run writes nothing ────────────────────────────────────────
@@ -753,9 +791,21 @@ async fn the_dry_run_writes_nothing_and_reports_the_would_change_set(pool: PgPoo
     for (&id, (t, v)) in [a, b].iter().zip(before) {
         assert_untouched(&pool, id, t, v, "dry run").await;
     }
+    // The dry run's own transaction reported itself read-only and
+    // repeatable-read: it ran in `begin_dry_run_tx`'s transaction, where any
+    // write fails (test (15)).
+    assert_eq!(
+        report.transaction,
+        Some(TxMode {
+            read_only: "on".into(),
+            isolation: "repeatable read".into(),
+        })
+    );
     let json = report.to_json(true, false, records.len());
     assert_eq!(json["buckets"]["refresh"]["count"], 2);
     assert_eq!(json["refresh"].as_array().unwrap().len(), 2);
+    assert_eq!(json["transaction"]["read_only"], "on");
+    assert_eq!(json["transaction"]["isolation"], "repeatable read");
 }
 
 // ── (11) restore ───────────────────────────────────────────────────────────
@@ -1283,4 +1333,865 @@ async fn the_dry_run_transaction_is_read_only_and_repeatable_read(pool: PgPool) 
     );
     tx.rollback().await.unwrap();
     assert_untouched(&pool, a, t, v, "read-only tx").await;
+}
+
+// ── (16) the compare-and-set re-checks every workflow/step arm ─────────────
+
+/// The four arms of the workflow-or-step rule, each on its own claim, each
+/// present on the row the CAS writes: the CAS refuses all four on the exact
+/// values (an arm committed after the locked read is caught by the write),
+/// and writes the control.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_compare_and_set_refuses_every_workflow_or_step_arm(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let step_by_edge = mirror_claim(&pool, author, 0.682_91).await;
+    let step_by_lineage = mirror_claim(&pool, author, 0.655_13).await;
+    let workflow_row_claim = mirror_claim(&pool, author, 0.701_77).await;
+    let workflow_label = mirror_claim(&pool, author, 0.718_23).await;
+    // Hand-set structure, one arm per claim, as test (4) builds it.
+    let workflow_root = Uuid::new_v4();
+    workflow_row(&pool, workflow_root, control).await;
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes')",
+    )
+    .bind(workflow_root)
+    .bind(step_by_edge)
+    .execute(&pool)
+    .await
+    .expect("executes edge");
+    sqlx::query("UPDATE claims SET step_lineage_id = gen_random_uuid() WHERE id = $1")
+        .bind(step_by_lineage)
+        .execute(&pool)
+        .await
+        .unwrap();
+    workflow_row(&pool, workflow_row_claim, workflow_row_claim).await;
+    sqlx::query("UPDATE claims SET labels = array_append(labels, 'workflow') WHERE id = $1")
+        .bind(workflow_label)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    let mut wrote = Vec::new();
+    for (id, arm) in [
+        (step_by_edge, "executes in-edge"),
+        (step_by_lineage, "step_lineage_id"),
+        (workflow_row_claim, "workflows row"),
+        (workflow_label, "workflow label"),
+    ] {
+        let t = truth_of(&pool, id).await;
+        let p = cache_of(&pool, id).await.pignistic_prob.unwrap();
+        let v = row_version(&pool, id).await;
+        if cas_refresh(&mut conn, id, t, p, 0.612_3).await.unwrap() {
+            wrote.push(arm);
+        } else {
+            assert_untouched(&pool, id, t, v, arm).await;
+        }
+    }
+    assert!(wrote.is_empty(), "the CAS wrote a claim with: {wrote:?}");
+    let t = truth_of(&pool, control).await;
+    let p = cache_of(&pool, control).await.pignistic_prob.unwrap();
+    assert!(
+        cas_refresh(&mut conn, control, t, p, 0.612_3)
+            .await
+            .unwrap(),
+        "control: the exact values on a plain claim match"
+    );
+}
+
+// ── (17) a claim superseded after the refresh, then restored ───────────────
+
+/// `actor` supersedes `old` through the real act (the privileged test pool);
+/// the predecessor's `truth_value` is not touched by it.
+async fn supersede(pool: &PgPool, old: Uuid, actor: Uuid) {
+    let t = truth_of(pool, old).await;
+    ClaimRepository::supersede(
+        pool,
+        ClaimId::from_uuid(old),
+        &format!("a restatement of {old}"),
+        TruthValue::clamped(0.6),
+        "refresh truth mirrors test",
+        epigraph_db::SupersedeActor::new(actor, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await
+    .expect("supersede");
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(old)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(!current, "precondition: the predecessor is retired");
+    assert_eq!(
+        truth_of(pool, old).await.to_bits(),
+        t.to_bits(),
+        "precondition: the supersede left the predecessor's truth_value"
+    );
+}
+
+/// Backlog 7e8a0ee2: the restore is a faithful undo (it also restores a claim
+/// superseded after the refresh, whose truth_value still holds what the
+/// refresh wrote, as `restore_belief_cache` restores its cache), and it says
+/// so: that claim is `restored_not_current`, never counted `restored`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_superseded_after_the_refresh_is_restored_and_reported_not_current(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let live = mirror_claim(&pool, author, 0.731_37).await;
+    let retired = mirror_claim(&pool, author, 0.682_91).await;
+    let t_live = truth_of(&pool, live).await;
+    let t_retired = truth_of(&pool, retired).await;
+    let records = wave(&pool, &[live, retired], "L1").await;
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+    assert_eq!(report.ids(Bucket::Refresh), vec![live, retired]);
+
+    supersede(&pool, retired, author).await;
+
+    let dry = restore(&pool, &written, 1, true).await.unwrap();
+    assert_eq!(dry.restored, vec![live], "dry run");
+    assert_eq!(dry.restored_not_current, vec![retired], "dry run");
+
+    let out = restore(&pool, &written, 1, false).await.unwrap();
+    assert_eq!(
+        out.restored,
+        vec![live],
+        "only the live claim counts restored"
+    );
+    assert_eq!(out.restored_not_current, vec![retired]);
+    assert!(out.superseded_since_refresh.is_empty() && out.missing.is_empty());
+    assert_eq!(truth_of(&pool, live).await.to_bits(), t_live.to_bits());
+    assert_eq!(
+        truth_of(&pool, retired).await.to_bits(),
+        t_retired.to_bits(),
+        "the faithful undo restores the retired row too"
+    );
+    let names: Vec<&str> = out.buckets().iter().map(|(n, _)| *n).collect();
+    assert!(names.contains(&"restored_not_current"), "{names:?}");
+
+    let again = restore(&pool, &written, 1, false).await.unwrap();
+    assert_eq!(again.already_restored, vec![retired, live]);
+}
+
+// ── (18) a mirror superseded after the wave, through apply ─────────────────
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mirror_superseded_after_the_wave_is_not_current_through_apply(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let retired = mirror_claim(&pool, author, 0.682_91).await;
+    let records = wave(&pool, &[control, retired], "L1").await;
+    supersede(&pool, retired, author).await;
+    // Still a mirror of the old cache, with the wave's cache: only the
+    // currency rule fails.
+    let c = plan_candidates(&records)
+        .into_iter()
+        .find(|c| c.claim_id == retired)
+        .unwrap();
+    assert_eq!(Some(truth_of(&pool, retired).await), c.old);
+    assert_eq!(cache_of(&pool, retired).await, c.written);
+    let t = truth_of(&pool, retired).await;
+    let v = row_version(&pool, retired).await;
+
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+
+    assert_refreshed(&pool, control, &report).await;
+    assert_eq!(report.bucket_of(retired), Some(Bucket::NotCurrent));
+    assert!(written.iter().all(|r| r.claim_id != retired));
+    assert_untouched(&pool, retired, t, v, "not current").await;
+}
+
+// ── (19) a missing claim, through apply and through the restore ────────────
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_missing_claim_is_reported_missing_by_apply_and_by_the_restore(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let mut records = wave(&pool, &[control], "L1").await;
+    // A wave record for a claim that does not exist (deleted since, or a
+    // record file from another database).
+    let ghost = Uuid::new_v4();
+    let mut ghost_rec = records[0].clone();
+    ghost_rec.claim_id = ghost;
+    records.push(ghost_rec);
+
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+    assert_refreshed(&pool, control, &report).await;
+    assert_eq!(report.bucket_of(ghost), Some(Bucket::Missing));
+    assert_eq!(
+        written.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![control]
+    );
+
+    let mut with_ghost = written.clone();
+    let mut g = written[0].clone();
+    g.claim_id = ghost;
+    with_ghost.push(g);
+    let out = restore(&pool, &with_ghost, 1, false).await.unwrap();
+    assert_eq!(out.missing, vec![ghost]);
+    assert_eq!(out.restored, vec![control]);
+    assert!(out.already_restored.is_empty() && out.superseded_since_refresh.is_empty());
+}
+
+// ── (20) a non-BetP cache column moved since the wave ──────────────────────
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cache_moved_since_the_wave_in_a_column_other_than_betp_is_left_untouched(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let belief_moved = mirror_claim(&pool, author, 0.682_91).await;
+    let empty_moved = mirror_claim(&pool, author, 0.655_13).await;
+    let records = wave(&pool, &[control, belief_moved, empty_moved], "L1").await;
+    // Hand-set (no writer moves one cache column alone): BetP, and so the
+    // mirror and the CAS's cache test, stay exactly as the wave left them.
+    for (id, col) in [(belief_moved, "belief"), (empty_moved, "mass_on_empty")] {
+        sqlx::query(&format!(
+            "UPDATE claims SET {col} = COALESCE({col}, 0) + 1e-6 WHERE id = $1"
+        ))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let snaps = [
+        (
+            belief_moved,
+            truth_of(&pool, belief_moved).await,
+            row_version(&pool, belief_moved).await,
+        ),
+        (
+            empty_moved,
+            truth_of(&pool, empty_moved).await,
+            row_version(&pool, empty_moved).await,
+        ),
+    ];
+    for (id, _, _) in &snaps {
+        let c = plan_candidates(&records)
+            .into_iter()
+            .find(|c| c.claim_id == *id)
+            .unwrap();
+        assert_eq!(
+            cache_of(&pool, *id).await.pignistic_prob,
+            c.written.pignistic_prob,
+            "precondition: BetP unmoved"
+        );
+    }
+
+    let (report, _) = run_apply(&pool, &viewer, &records, false).await;
+
+    assert_refreshed(&pool, control, &report).await;
+    for (id, t, v) in snaps {
+        assert_eq!(report.bucket_of(id), Some(Bucket::SupersededSinceWave));
+        assert_untouched(&pool, id, t, v, "a non-BetP cache column moved").await;
+    }
+}
+
+// ── (21) end to end through a real cache-only wave writer ──────────────────
+
+/// The wave is `recompute_betp`'s own writer (`write_wave_claim`, a
+/// standalone wave under the AEF), which rewrites the cache, never
+/// `truth_value`, and records through `WaveLog` into a real wave file.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mirror_is_refreshed_from_a_recompute_betp_wave_file(pool: PgPool) {
+    use epigraph_cli::recompute_betp::{write_wave_claim, WaveLog, WaveRole};
+    use epigraph_engine::atom_items::{AtomFoldMode, CompoundSourceEdges};
+    use epigraph_engine::edge_factor::AtomCacheSettings;
+
+    let dir = scratch_dir();
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    // A second BBA, from another source, stored WITHOUT a fold
+    // (`MassFunctionRepository::store`, the writer that stores a row and
+    // leaves the cache): the cache, and so the mirror, still reflect the
+    // first row only, and the wave's fold of both moves BetP.
+    let frame: Uuid = sqlx::query_scalar("SELECT frame_id FROM mass_functions WHERE claim_id = $1")
+        .bind(a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let other = seed_agent(&pool).await;
+    epigraph_db::MassFunctionRepository::store(
+        &pool,
+        a,
+        frame,
+        Some(other),
+        &serde_json::json!({ "1": 0.4, "0,1": 0.6 }),
+        Some(0.0),
+        Some("auto_wire"),
+        Some("empirical"),
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store a second BBA");
+    let old = truth_of(&pool, a).await;
+    let cache_before = cache_of(&pool, a).await;
+    assert_eq!(
+        cache_before.pignistic_prob.map(f64::to_bits),
+        Some(old.to_bits()),
+        "precondition: still a mirror after the unfolded store"
+    );
+
+    let wave_file = dir.join("standalone-wave.jsonl");
+    let at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let log = WaveLog::open(&wave_file, "standalone-aef", at).expect("open the wave log");
+    let o = write_wave_claim(
+        &pool,
+        &viewer,
+        a,
+        WaveRole::Standalone,
+        AtomCacheSettings {
+            fold: AtomFoldMode::Aef,
+            compound_source_edges: CompoundSourceEdges::Frozen,
+            vacate_on_evidence_removal: true,
+        },
+        &log,
+    )
+    .await
+    .expect("write_wave_claim");
+    assert!(o.changed, "precondition: the wave moved the cache: {o:?}");
+    assert_ne!(
+        cache_of(&pool, a).await.pignistic_prob,
+        cache_before.pignistic_prob,
+        "precondition: the wave moved BetP"
+    );
+    assert_eq!(
+        truth_of(&pool, a).await.to_bits(),
+        old.to_bits(),
+        "precondition: the wave writer left truth_value"
+    );
+    let records = read_wave(std::io::BufReader::new(
+        std::fs::File::open(&wave_file).unwrap(),
+    ))
+    .expect("read the wave file");
+    assert_eq!(records.len(), 1);
+
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+
+    assert_refreshed(&pool, a, &report).await;
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].truth_before.to_bits(), old.to_bits());
+    assert_eq!(written[0].waves, vec!["standalone-aef".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── (22) the binary: argument refusals write nothing ───────────────────────
+
+/// A refreshable mirror `a`, its wave file, and its state before the run.
+struct Refusal {
+    url: String,
+    dir: PathBuf,
+    a: Uuid,
+    wave_file: PathBuf,
+    t: f64,
+    v: (i64, DateTime<Utc>),
+}
+
+async fn refusal_fixture(pool: &PgPool) -> Refusal {
+    let url = fixture::database_url_for(pool).await;
+    let dir = scratch_dir();
+    let author = seed_agent(pool).await;
+    let a = mirror_claim(pool, author, 0.731_37).await;
+    let records = wave(pool, &[a], "L1").await;
+    let wave_file = dir.join("L1.jsonl");
+    let mut buf = Vec::new();
+    for r in &records {
+        write_wave_record(&mut buf, r).unwrap();
+    }
+    std::fs::write(&wave_file, buf).unwrap();
+    let t = truth_of(pool, a).await;
+    let v = row_version(pool, a).await;
+    Refusal {
+        url,
+        dir,
+        a,
+        wave_file,
+        t,
+        v,
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_refuses_an_existing_record_and_leaves_no_report(pool: PgPool) {
+    let Refusal {
+        url,
+        dir,
+        a,
+        wave_file,
+        t,
+        v,
+    } = refusal_fixture(&pool).await;
+    let w = wave_file.to_str().unwrap();
+    // An existing --record: refused before the database, the record kept
+    // as it was, and no report left behind.
+    let existing = dir.join("EXISTING-RECORD.jsonl");
+    std::fs::write(&existing, b"an operator's earlier record\n").unwrap();
+    let report = dir.join("existing.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--apply",
+            "--record",
+            existing.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert!(!o.status.success(), "an existing record was accepted");
+    assert_eq!(
+        std::fs::read(&existing).unwrap(),
+        b"an operator's earlier record\n"
+    );
+    assert!(!report.exists(), "a refused run left its report behind");
+    assert_untouched(&pool, a, t, v, "existing record").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_refuses_a_record_without_apply(pool: PgPool) {
+    let Refusal {
+        url,
+        dir,
+        a,
+        wave_file,
+        t,
+        v,
+    } = refusal_fixture(&pool).await;
+    let w = wave_file.to_str().unwrap();
+    // --record without --apply: a usage error, never an apply.
+    let record = dir.join("NO-APPLY-RECORD.jsonl");
+    let report = dir.join("no-apply.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--record",
+            record.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "--record without --apply");
+    assert!(!record.exists() && !report.exists());
+    assert_untouched(&pool, a, t, v, "--record without --apply").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_refuses_include_round_with_restore(pool: PgPool) {
+    let Refusal {
+        url, dir, a, t, v, ..
+    } = refusal_fixture(&pool).await;
+    // --include-round with --restore: a usage error, nothing restored.
+    // The record would restore `a` to 0.4 if the run went ahead.
+    let restore_record = dir.join("RESTORE-RECORD.jsonl");
+    let mut rec = Vec::new();
+    write_truth_record(
+        &mut rec,
+        &TruthRecord {
+            claim_id: a,
+            truth_before: 0.4,
+            truth_written: t,
+            cache_old: 0.4,
+            cache_new: t,
+            waves: vec!["L1".into()],
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+    std::fs::write(&restore_record, rec).unwrap();
+    let report = dir.join("restore-round.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--restore",
+            restore_record.to_str().unwrap(),
+            "--include-round",
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "--include-round with --restore");
+    assert!(!report.exists());
+    assert_untouched(&pool, a, t, v, "--include-round with --restore").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── (23) a run that stops still writes its (partial) report ────────────────
+
+/// A test-only trigger that refuses any `truth_value` write to `id` (an
+/// error at a known batch, deterministically).
+async fn refuse_truth_writes_to(pool: &PgPool, id: Uuid) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION refresh_test_refuse() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+           RAISE EXCEPTION 'refresh test: refused write of %', OLD.id; END $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS refresh_test_refuse ON claims")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER refresh_test_refuse BEFORE UPDATE OF truth_value ON claims \
+         FOR EACH ROW WHEN (OLD.id = '{id}'::uuid) EXECUTE FUNCTION refresh_test_refuse()"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn report_json(path: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path).expect("the report file");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("report {text:?}: {e}"))
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_that_stops_writes_a_partial_report_of_what_it_committed(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let author = seed_agent(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    let b = mirror_claim(&pool, author, 0.682_91).await;
+    let (ta, tb) = (truth_of(&pool, a).await, truth_of(&pool, b).await);
+    let records = wave(&pool, &[a, b], "L1").await;
+    assert_eq!(
+        plan_candidates(&records)
+            .iter()
+            .map(|c| c.claim_id)
+            .collect::<Vec<_>>(),
+        vec![a, b],
+        "precondition: a runs in the first batch"
+    );
+    let wave_file = dir.join("L1.jsonl");
+    let mut buf = Vec::new();
+    for r in &records {
+        write_wave_record(&mut buf, r).unwrap();
+    }
+    std::fs::write(&wave_file, buf).unwrap();
+    let w = wave_file.to_str().unwrap();
+
+    // The refresh: batch 1 (a) commits, batch 2 (b) fails.
+    refuse_truth_writes_to(&pool, b).await;
+    let r1 = dir.join("R1.jsonl");
+    let rep1 = dir.join("apply-1.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--apply",
+            "--batch",
+            "1",
+            "--record",
+            r1.to_str().unwrap(),
+            "--report",
+            rep1.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "the run must stop");
+    let j = report_json(&rep1);
+    assert_eq!(j["partial"], true);
+    assert!(
+        j["error"].as_str().unwrap().contains("refused write"),
+        "{}",
+        j["error"]
+    );
+    assert_eq!(j["buckets"]["refresh"]["ids"], serde_json::json!([a]));
+    assert_eq!(j["claims"], 1, "only the committed batch's outcomes");
+    let recs1 =
+        read_truth_records(std::io::BufReader::new(std::fs::File::open(&r1).unwrap())).unwrap();
+    assert_eq!(
+        recs1.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![a]
+    );
+    assert_ne!(truth_of(&pool, a).await.to_bits(), ta.to_bits());
+    assert_eq!(truth_of(&pool, b).await.to_bits(), tb.to_bits());
+
+    // A complete run says so.
+    sqlx::query("DROP TRIGGER refresh_test_refuse ON claims")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let r2 = dir.join("R2.jsonl");
+    let rep2 = dir.join("apply-2.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--apply",
+            "--batch",
+            "1",
+            "--record",
+            r2.to_str().unwrap(),
+            "--report",
+            rep2.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let j = report_json(&rep2);
+    assert_eq!(j["partial"], false);
+    assert!(j["error"].is_null());
+    assert_eq!(j["buckets"]["refresh"]["ids"], serde_json::json!([b]));
+
+    // The restore of both records (last first: b, then a), stopped at a.
+    let r3 = dir.join("R3.jsonl");
+    let mut both = std::fs::read(&r1).unwrap();
+    both.extend(std::fs::read(&r2).unwrap());
+    std::fs::write(&r3, both).unwrap();
+    refuse_truth_writes_to(&pool, a).await;
+    let rep3 = dir.join("restore.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--restore",
+            r3.to_str().unwrap(),
+            "--batch",
+            "1",
+            "--report",
+            rep3.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "the restore must stop");
+    let j = report_json(&rep3);
+    assert_eq!(j["partial"], true);
+    assert_eq!(j["buckets"]["restored"]["ids"], serde_json::json!([b]));
+    assert_eq!(truth_of(&pool, b).await.to_bits(), tb.to_bits());
+    assert_ne!(truth_of(&pool, a).await.to_bits(), ta.to_bits());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── (24) a run that cannot connect still writes its (partial) report ───────
+
+/// The fixture's URL with its database renamed to one that does not exist:
+/// the server refuses the connection at once (3D000), after the binary has
+/// created its outputs.
+async fn url_of_a_missing_database(pool: &PgPool) -> String {
+    let url = fixture::database_url_for(pool).await;
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(url.matches(db.as_str()).count(), 1, "precondition: {url}");
+    url.replacen(db.as_str(), "refresh_truth_mirrors_no_such_db", 1)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_that_cannot_connect_still_writes_a_partial_report(pool: PgPool) {
+    let bad = url_of_a_missing_database(&pool).await;
+    let dir = scratch_dir();
+    let author = seed_agent(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    let records = wave(&pool, &[a], "L1").await;
+    let wave_file = dir.join("L1.jsonl");
+    let mut buf = Vec::new();
+    for r in &records {
+        write_wave_record(&mut buf, r).unwrap();
+    }
+    std::fs::write(&wave_file, buf).unwrap();
+
+    // An apply: the report says why it stopped, and the record is empty
+    // (nothing was written).
+    let record = dir.join("RECORD.jsonl");
+    let report = dir.join("apply.json");
+    let o = run_bin(
+        &dir,
+        &bad,
+        &[
+            "--waves",
+            wave_file.to_str().unwrap(),
+            "--apply",
+            "--record",
+            record.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let j = report_json(&report);
+    assert_eq!(j["partial"], true);
+    assert!(
+        j["error"].as_str().unwrap().contains("maintenance pool"),
+        "{}",
+        j["error"]
+    );
+    assert_eq!(j["claims"], 0);
+    assert!(std::fs::read(&record).unwrap().is_empty());
+
+    // A restore, likewise.
+    let restore_record = dir.join("RESTORE-RECORD.jsonl");
+    let mut rec = Vec::new();
+    write_truth_record(
+        &mut rec,
+        &TruthRecord {
+            claim_id: a,
+            truth_before: 0.4,
+            truth_written: truth_of(&pool, a).await,
+            cache_old: 0.4,
+            cache_new: 0.6,
+            waves: vec!["L1".into()],
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+    std::fs::write(&restore_record, rec).unwrap();
+    let report = dir.join("restore.json");
+    let o = run_bin(
+        &dir,
+        &bad,
+        &[
+            "--restore",
+            restore_record.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let j = report_json(&report);
+    assert_eq!(j["partial"], true);
+    assert_eq!(j["buckets"]["restored"]["count"], 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── (25) a batch that fails after a recorded write ─────────────────────────
+//
+// The record is written BEFORE its batch commits, so a write recorded early
+// in a batch that later fails (a refused statement on another claim, a
+// deadlock, a dropped connection) is in the record file although it rolled
+// back, and the partial report, which holds only committed batches, leaves
+// it out. The record is the superset to reconcile from: a restore of it
+// finds the rolled-back write `already_restored` and writes nothing.
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_batch_leaves_its_recorded_write_in_the_record_but_not_the_report(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let author = seed_agent(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    let b = mirror_claim(&pool, author, 0.682_91).await;
+    let records = wave(&pool, &[a, b], "L1").await;
+    // The batch runs in plan order: the first claim's write is recorded,
+    // then the second's is refused and the whole batch rolls back.
+    let order: Vec<Uuid> = plan_candidates(&records)
+        .iter()
+        .map(|c| c.claim_id)
+        .collect();
+    assert_eq!(order.len(), 2, "precondition: two candidates");
+    let (first, second) = (order[0], order[1]);
+    let (t_first, t_second) = (truth_of(&pool, first).await, truth_of(&pool, second).await);
+    let wave_file = dir.join("L1.jsonl");
+    let mut buf = Vec::new();
+    for r in &records {
+        write_wave_record(&mut buf, r).unwrap();
+    }
+    std::fs::write(&wave_file, buf).unwrap();
+
+    refuse_truth_writes_to(&pool, second).await;
+    let record = dir.join("RECORD.jsonl");
+    let report = dir.join("apply.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            wave_file.to_str().unwrap(),
+            "--apply",
+            "--batch",
+            "2",
+            "--record",
+            record.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "the run must stop");
+
+    // The record lists the first claim's write; the database does not hold it.
+    let recs = read_truth_records(std::io::BufReader::new(
+        std::fs::File::open(&record).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        recs.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![first],
+        "the record lists the write recorded before the batch failed"
+    );
+    assert_eq!(
+        truth_of(&pool, first).await.to_bits(),
+        t_first.to_bits(),
+        "the recorded write rolled back with its batch"
+    );
+    assert_eq!(truth_of(&pool, second).await.to_bits(), t_second.to_bits());
+
+    // The partial report holds no outcome of the failed batch.
+    let j = report_json(&report);
+    assert_eq!(j["partial"], true);
+    assert_eq!(j["claims"], 0, "no batch committed: {j}");
+    assert_eq!(j["buckets"]["refresh"]["count"], 0, "{j}");
+
+    // Reconciling from the record: the restore writes nothing and says so.
+    sqlx::query("DROP TRIGGER refresh_test_refuse ON claims")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rep = dir.join("restore.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--restore",
+            record.to_str().unwrap(),
+            "--report",
+            rep.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let j = report_json(&rep);
+    assert_eq!(j["partial"], false);
+    assert_eq!(
+        j["buckets"]["already_restored"]["ids"],
+        serde_json::json!([first])
+    );
+    assert_eq!(j["buckets"]["restored"]["count"], 0);
+    assert_eq!(truth_of(&pool, first).await.to_bits(), t_first.to_bits());
+    let _ = std::fs::remove_dir_all(&dir);
 }

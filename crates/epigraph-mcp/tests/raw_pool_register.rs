@@ -246,12 +246,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         ENGINE_POOL_PARAM,
     ),
-    (
-        "epigraph-engine/src/source_dependence.rs",
-        "bba_sources_for_rows_on_pool",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
     // ── epigraph-mcp: identity, auth, plumbing ───────────────────────────
     ("epigraph-mcp/src/auth.rs", "is_revoked", 1, PRE_VIEWER),
     (
@@ -374,79 +368,12 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         PRE_VIEWER,
     ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "operator_arm_allows",
-        2,
-        PRE_VIEWER,
-    ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "delegate_arm_allows",
-        1,
-        PRE_VIEWER,
-    ),
     // ── epigraph-mcp: tables without row security ────────────────────────
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "check_already_ingested",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "paper_already_ingested",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "preflight_write_authority",
-        1,
-        NO_ROW_SECURITY,
-    ),
     (
         "epigraph-mcp/src/tools/ingestion.rs",
         "resolve_ingest_visibility",
         1,
         DEFINER_RESOLUTION,
-    ),
-    (
-        "epigraph-mcp/src/tools/memory.rs",
-        "recall_post_embed",
-        1,
-        "NO_ROW_SECURITY: the `&server.pool` argument to themes::resolve_theme_selector, for its \
-         claim_themes label lookup (a registry with no tenancy); every claim-derived read of \
-         the page runs on the caller's stamped read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/paper_queries.rs",
-        "query_paper",
-        1,
-        "NO_ROW_SECURITY: the `papers` lookup (find_paper_by_document_key); every claim-derived \
-         read below it runs on the caller's stamped read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "get_theme",
-        1,
-        "NO_ROW_SECURITY: the `&server.pool` argument to resolve_theme_selector, for its \
-         claim_themes label lookup; the summary and member reads run on the caller's stamped \
-         read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "list_themes",
-        1,
-        "NO_ROW_SECURITY: ClaimThemeRepository::count_summaries over claim_themes, corpus-wide by \
-         design; the page itself runs on the caller's stamped read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "resolve_theme_selector",
-        1,
-        "NO_ROW_SECURITY: its `pool` parameter serves only ClaimThemeRepository::find_by_label \
-         over claim_themes; the viewer-filtered summary read takes the caller's stamped `conn`.",
     ),
     (
         "epigraph-mcp/src/tools/matching.rs",
@@ -482,24 +409,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-mcp/src/tools/ingestion.rs",
         "begin_ingest_tx",
-        1,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_reporting",
-        2,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_spine",
-        2,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "ensure_paper_node",
         1,
         REGISTERED_WRITE,
     ),
@@ -565,20 +474,23 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-mcp/src/tools/workflows.rs",
         "report_workflow_outcome",
-        2,
+        1,
         "One NO_SCOPED_POOL_FALLBACK (WorkflowRepository::exists without a ScopedPool; with one \
-         the existence check is viewer_reads_row on read_as) and one REGISTERED_WRITE \
-         (BehavioralExecutionRepository::create, a table with no tenancy).",
+         the existence check is viewer_reads_row on read_as). The run row \
+         (BehavioralExecutionRepository::create) moved onto the author's stamp when migration \
+         240 gave behavioral_executions its workflow's tenancy (backlog 88cf603b).",
     ),
     (
         "epigraph-mcp/src/unauthenticated_reader.rs",
-        "find_or_create",
+        "find_reserved",
         2,
-        "NO_ROW_SECURITY: finds or creates the `--allow-unauthenticated-http` reader agent by its \
-         public key (AgentRepository::get_by_public_key / create, twice for the lost-race \
-         lookup); `agents` carries no tenancy row security, and there is no caller to stamp \
-         from because this IS the identity the listener reads as. Registered under the \
-         operator's 2026-11-16 approval, the one HIGH_WATER raise.",
+        "NO_ROW_SECURITY: finds migration 241's reserved `--allow-unauthenticated-http` reader \
+         agent by its public key (AgentRepository::get_by_public_key) and counts the un-revoked \
+         OAuth clients naming it (OAuthClientRepository::count_unrevoked_for_agent, backlog \
+         14a38166); neither `agents` nor `oauth_clients` carries tenancy row security, and \
+         there is no caller to stamp from because this IS the identity the listener reads as. \
+         Registered under the operator's 2026-11-16 approval, the one HIGH_WATER raise (was \
+         find_or_create's get_by_public_key / create pair; same count).",
     ),
     (
         "epigraph-mcp/src/unauthenticated_reader.rs",
@@ -601,8 +513,23 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// no caller to stamp them from. The operator approved exactly that raise on
 /// 2026-11-16 and no other; every other new site is converted, not registered
 /// against a higher ceiling. #875 then converted the recall helpers onto the
-/// caller's stamped connection, removing four rows: 86 -> 82.
-const HIGH_WATER: usize = 82;
+/// caller's stamped connection, removing four rows: 86 -> 82. Backlog
+/// 06f5c5b2 moved the theme label lookup and `count_summaries` onto the
+/// caller's stamped read, removing four more: 82 -> 78.
+/// Migration 246 (backlog 34864fb5) gave `papers` row security, so the ingest
+/// tools' `papers` writes moved onto the ingesting agent's stamped transaction,
+/// removing four rows (six sites): 78 -> 72 (82 -> 76 on its own branch).
+/// Their `papers` reads (`check_already_ingested`, `paper_already_ingested`,
+/// `query_paper`) then moved onto the caller's stamped read: 72 -> 69.
+/// Migration 240 (backlog 88cf603b) moved `report_workflow_outcome`'s run row
+/// onto the author's stamp: 69 -> 68 (82 -> 81 on its own branch).
+/// The ownership gate's link arms (`operator_arm_allows`,
+/// `delegate_arm_allows`) then moved onto the act's own transaction (backlog
+/// 9a5bc055), removing three: 68 -> 65 (82 -> 79 on its own branch).
+/// Backlog 7a2cfa54 deleted `source_dependence::bba_sources_for_rows_on_pool`,
+/// whose last caller (`compare_methods`' no-ScopedPool arm) was already gone:
+/// 65 -> 64 (82 -> 81 on its own branch).
+const HIGH_WATER: usize = 64;
 
 // ===========================================================================
 // The scanner.

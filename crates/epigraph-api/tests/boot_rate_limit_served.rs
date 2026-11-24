@@ -23,6 +23,10 @@
 //!   non-guest route is never refused;
 //! - with `EPIGRAPH_RATE_LIMIT=off`, the guest routes are never refused.
 //!
+//! And, for backlog 20210eaa, with `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM`: 401s
+//! and unknown-path 404s from one peer are refused 429 past the per-address
+//! limit, before the bearer layer runs.
+//!
 //! Verified to fail: without the `with_rate_limiter` install in `main` the
 //! fourth request is answered normally; serving with plain
 //! `axum::serve(listener, app)` (no connect info) puts both peers in one
@@ -236,6 +240,83 @@ async fn the_served_binary_limits_each_anonymous_peer_separately(pool: PgPool) {
         get_from(b, port, None).await,
         200,
         "a second peer ({b}) must have its own bucket: the served router sees the TCP peer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The per-address limiter (backlog 20210eaa)
+// ---------------------------------------------------------------------------
+
+/// With `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` set (and no principal limiter), the
+/// served binary charges every request to its TCP peer OUTSIDE the bearer
+/// layer and routing:
+///
+/// - a peer that floods a protected route with a junk bearer gets `RPM` 401s
+///   (the calibration: the bearer layer refused them), then 429: refused
+///   before the bearer layer read the token;
+/// - a second peer that floods unknown paths gets `RPM` 404s, then 429;
+/// - the throttled peer's `/health` is still 200 (the liveness probe is
+///   exempt), and a third peer is served.
+///
+/// Fails on the parent commit (no per-address limiter: the 401s and 404s go
+/// on forever), and with the per-address layer moved inside the protected
+/// router's bearer layer (the 401s never become 429).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_served_binary_limits_401s_and_unknown_paths_per_address(pool: PgPool) {
+    let db_url = fixture::database_url_for(&pool).await;
+    let (_server, port) = tokio::task::spawn_blocking(move || {
+        start_server(
+            &db_url,
+            &[("EPIGRAPH_RATE_LIMIT_ADDRESS_RPM", &RPM.to_string())],
+        )
+    })
+    .await
+    .expect("join");
+
+    let a = Ipv4Addr::new(127, 0, 0, 1);
+    let b = Ipv4Addr::new(127, 0, 0, 2);
+    let c = Ipv4Addr::new(127, 0, 0, 3);
+    let junk = Some("Authorization: Bearer not-a-token");
+
+    for n in 1..=RPM {
+        assert_eq!(
+            get_path_from(a, port, "/api/v1/claims", junk).await,
+            401,
+            "CALIBRATION: junk-bearer request {n} of {RPM} from {a} is refused by the \
+             bearer layer"
+        );
+    }
+    assert_eq!(
+        get_path_from(a, port, "/api/v1/claims", junk).await,
+        429,
+        "junk-bearer request {} from {a} must be refused by the per-address limiter, \
+         before the bearer layer",
+        RPM + 1
+    );
+    assert_eq!(
+        get_path_from(a, port, "/health", None).await,
+        200,
+        "the liveness probe is exempt from the per-address limiter"
+    );
+
+    for n in 1..=RPM {
+        assert_eq!(
+            get_path_from(b, port, &format!("/no-such-route/{n}"), None).await,
+            404,
+            "CALIBRATION: unknown path {n} of {RPM} from {b} is a 404"
+        );
+    }
+    assert_eq!(
+        get_path_from(b, port, "/no-such-route/again", None).await,
+        429,
+        "unknown-path request {} from {b} must be refused by the per-address limiter",
+        RPM + 1
+    );
+
+    assert_eq!(
+        get_path_from(c, port, "/no-such-route/c", None).await,
+        404,
+        "a third peer ({c}) has its own address bucket"
     );
 }
 

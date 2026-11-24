@@ -1298,6 +1298,45 @@ restart.
   workflow-ingest identity is kept off the allowlist only by the operator's
   care (the allow command's agent-client warning). **Applied to throwaway databases only,
   NOT to any deployed database.**
+  **Correction (2026-11-23, backlog 38d9dc79).** Two sentences above, and the
+  same two in the applied file's header, are no longer true. The `.sql` file
+  is not edited (it is applied; a changed checksum breaks deploy).
+  - "Nothing on the token, bearer, viewer or webhook path reads the
+    registry" is false. The bearer layers (REST `bearer_auth_middleware`
+    and `optional_bearer_auth_middleware`, and MCP `call_tool`) read it on
+    every request that carries a delegated run token (`dlg`), and the
+    run-token grant reads it before it mints one. Both go through
+    `AgentRepository::delegated_principal_pool`, which calls
+    `epigraph_author_binding` and `epigraph_human_of`. The viewer can reach
+    it for any principal: `Viewer::resolve` reads
+    `epigraph_live_memberships`, which calls `epigraph_human_of` for
+    team-group rows (since 164) and reads `author_binding_clients` directly
+    for personal-group rows (since 235). Webhook delivery
+    resolves its subscriber through `Viewer::resolve`, so it reads it too.
+    The mint's operated-agent refusal (`refuse_operated_agent`) still does
+    not consult it.
+  - "Read only by `epigraph_author_binding` and `epigraph_human_of`" is
+    false too. The readers below are what a grep for
+    `author_binding_clients` and `epigraph_allowlisted_operator` under
+    `migrations/` and `crates/` found on 2026-11-23. The list is not a
+    maintained register: repeat that grep for the current set.
+    - Read the table directly: 165's `epigraph_group_role_roster`
+      (maintenance sessions only), 199's `epigraph_operator_bound_at`,
+      208's `epigraph_countersign_authorship`, and 235's
+      `epigraph_team_group_remove_member` and `epigraph_live_memberships`.
+    - On the request path, on the caller's own connection (149 grants
+      `epigraph_app` SELECT on the table): the agent card's operator field,
+      `epigraph-db` `repos/agent_lookup.rs::operator_binding_sql`, read by
+      `AgentLookupRepository::find` and `card`, so by MCP `find_agent` and
+      `get_agent` and the REST agent search.
+    - Call 149's `epigraph_allowlisted_operator`: role derivation
+      (`epigraph_role_derived_memberships`, 165, rewritten in 179 and 195,
+      which the viewer reaches through `epigraph_live_memberships`) and
+      207's `epigraph_bug_report_gate`.
+  Behaviour is pinned by `epigraph-api/tests/delegated_run_token_viewer.rs`,
+  `epigraph-mcp/tests/delegated_run_token_viewer.rs`,
+  `epigraph-db/tests/delegated_principal.rs` and
+  `epigraph-db/tests/personal_group_allowlisted_writer.rs`.
 - **150**: public `drop_uq_claims_content_hash_agent` (drain U044, backlog
   00f1a517) — `ALTER TABLE claims DROP CONSTRAINT IF EXISTS
   uq_claims_content_hash_agent`, so every database matches the long-lived one
@@ -2233,7 +2272,8 @@ restart.
   DELETE on `events`) is not added here; the maintenance role can still delete
   or rewrite any `events` row (follow-up, file header). Pinned by
   `app_role_table_lockdown.rs::the_app_role_cannot_delete_or_rewrite_events`,
-  `::the_maintenance_role_still_deletes_events_the_app_role_cannot`, the
+  `::the_maintenance_role_still_deletes_events_the_app_role_cannot` (renamed
+  `::neither_role_deletes_a_provenance_event_directly` and inverted by 250), the
   allowlist ratchet, and
   `epigraph-cli/tests/prune_recall_events_maintenance.rs` (the retention job
   still prunes on a maintenance login; an application login's own DELETE on
@@ -3116,9 +3156,10 @@ restart.
   passage (`passage_retention_permitted`: an exact allowlist of public
   domain, CC0, CC BY and CC BY-SA SPDX ids; never NC/ND, and free text fails
   closed); otherwise the row carries the citation, a locator and the
-  passage's BLAKE3 hash only. Ingest never writes the column; by convention
-  an operator sets it (not enforced: the application role keeps UPDATE on
-  the REGISTRY table `papers`). `papers` carries no tenancy, so no policy
+  passage's BLAKE3 hash only. Ingest never writes the column; an operator
+  sets it (a convention at 226: the application role kept UPDATE on the
+  REGISTRY table `papers`; enforced since 255, which also audits each set
+  through `epigraph_set_paper_licence`). `papers` carries no tenancy, so no policy
   changes. Sets `lock_timeout = '3s'`. **Scope:** evidence rows only; a
   level-2 paragraph claim's `content` still holds the paragraph text. The
   locator's byte span (a reproducible hash check) exists for Tier-1
@@ -3403,6 +3444,1051 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **236**: `live_memberships_principal_bound` (backlog fad5a6c4). `epigraph_live_memberships(agent)`
+  answers only for the session principal (`epigraph_principal_id()`), a maintenance session
+  (`epigraph_bypass()`) or a superuser session, and no rows for anyone else: an application
+  session no longer lists another agent's memberships (direct and role-derived) by naming its
+  id. 235's body moves verbatim into the NEW `epigraph_live_memberships_unbound(agent)`, owned
+  by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and never granted to `epigraph_app`;
+  206's `epigraph_writable_teams` and 234's `epigraph_readable_teams` are re-stated with their
+  one call re-pointed at it (they answer exactly as before). An md5 precondition refuses to
+  apply over any other body of the three. Both definers are on 172's `pg_catalog, pg_temp`
+  path (the register of definers resolving through `public` shrinks by one). The binaries stamp
+  the principal they ask about for the one statement (`list_live_for_agent`: the agent;
+  `delegated_principal_pool`: the delegator). The stamp is a transport, not an authority
+  boundary: the change removes the ambient answer, not what a holder of the application DSN
+  can stamp. Pinned by `epigraph-db/tests/live_memberships_principal_bound.rs` (the unstamped
+  and the stamped-as-another refusals, the maintenance answer, the viewer resolve on an
+  unstamped app pool and that its stamp ends with the statement, the team lists, the catalog
+  and the caller list, the undo) and `schema_contract.rs::migration_165_derived_arms_survive_at_head`.
+  Undo: `docs/runbooks/236-undo.sql`. **Deploy order: BINARIES FIRST.** A binary that
+  predates 236 resolves every viewer to public-only and refuses every delegated run token on a
+  database with 236. That includes every service linking an older `epigraph-db` (bump its
+  pin first). `EPIGRAPH_MIGRATE_ON_BOOT` applies every embedded migration too, so the first
+  restarted server of a 236-embedding build would apply 236 before the other binaries are
+  upgraded: unset it on every unit for this rollout and apply 236 with `epigraph-migrate`
+  only once every viewer-resolving binary is upgraded (or ship the binary change in a
+  release before the one that embeds 236). The team lists `epigraph_writable_teams(agent)` /
+  `epigraph_readable_teams(agent)` still answer for any agent on the application role (an
+  open residual for a separate change). **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **237**: public `workflows_update_owner_scope` (backlog 524f89c1). 183's
+  `workflows_update` admitted an UPDATE of any row the session READS (public rows, and
+  group rows to readers), so any application-role session could rewrite a public
+  workflow's `truth_value`, counters or `metadata.epigraph_submitted_by` (the key the
+  workflow authority gate's submitter arm trusts) by a direct statement. Three parts:
+  (1) two SECURITY DEFINER functions for the hierarchical outcome report, which any
+  reader of the plan may make: `epigraph_workflow_lock_readable(uuid)` locks a row the
+  session reads (183's read predicate restated) and `epigraph_workflow_record_outcome(uuid,
+  boolean, double precision)` computes the four counters in SQL
+  (`HierarchicalOutcomeCounters::after_report`'s rule) and writes only those keys; both
+  refuse an elevated session, sit on 172's pinned path, are owned by
+  `epigraph_maintenance` and granted to `epigraph_app` only, and are registered in
+  `epigraph-tenancy-backfill`. `WorkflowRepository::record_hierarchical_outcome` now calls
+  them. (2) A RESTRICTIVE `workflows_update_owner` FOR UPDATE policy (117's shape): 077's
+  bypass arms OR `owner_group_id = ANY (epigraph_writable_groups())`, so a direct UPDATE or
+  row lock reaches a row only for a writer of its owner group (public rows included), a
+  maintenance session or a maintenance-owned body. (3) `workflows_submitter_immutable`, a
+  BEFORE UPDATE OF metadata trigger: an ordinary session may not change or remove a
+  recorded submitter (recording a first one is unchanged). (4) The audited admin path:
+  `epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb)` (111's shape) re-checks
+  the session principal's live `claims:admin` grant through the token's client, refuses an
+  elevated session, sets `truth_value = 0.05` and nothing else, and writes the
+  `workflows.admin_write` audit row itself; the MCP `deprecate_workflow` admin arm calls it.
+  NOT backed by the database: the entry points' submitter, operator and delegate arms for a
+  caller that does not write the row's owner group; such a caller's `truth_value` UPDATE
+  matches no row, so both `deprecate_workflow` entry points (MCP hierarchical and flat, REST
+  flat mirror) now refuse the call, nothing written, unless the row already reads 0.05. The
+  plan lock (`add_step`) and a deprecation's lineage lock go through
+  `epigraph_workflow_lock_readable`, so they still hold every row the caller reads. The
+  admin's retirement of a plan's CLAIMS in a group it does not write was refused by
+  `claims_tenancy` before 237 and still is. Pinned by
+  `epigraph-db/tests/workflows_update_owner_scope.rs` (as `epigraph_app`: counter parity
+  on odd stored shapes, unreadable rows, the variance bound, non-writer UPDATEs and locks
+  refused, writer and maintenance admitted, the submitter guard, the lineage lock across
+  owner groups, the admin definer's grant check and audit, the undo; each part mutation-
+  or removal-tested), `epigraph-mcp/tests/deprecate_workflow_owner_scope_app_role.rs`,
+  `workflows_tenancy.rs` and `epigraph-api/tests/workflow_pin_read_contract.rs` (h). Undo:
+  `docs/runbooks/237-undo.sql` (tested: run twice). Slot 237 was assigned by the
+  2026-11-22 backlog triage. **Deploy order (binding): migrate and roll out the binary
+  TOGETHER.** A pre-237 binary on a 237 database answers every outcome report from a caller
+  that does not write the plan's owner group 404 (its `FOR UPDATE` sees no row), runs such a
+  caller's `add_step` without its plan lock, and commits such a caller's deprecation with
+  the row left live; a 237 binary on a pre-237 database fails every outcome report, every
+  `add_step` and every hierarchical deprecation 42883 (no definer). `embed_backfill` writes
+  `goal_embedding` on its maintenance connection (`MaintenancePool` refuses an
+  unprivileged one), so 237 does not narrow it. Before migrating,
+  measure the rows whose recorded submitter does not write the owner group (they lose the
+  identity arms' database writes): `SELECT w.visibility, count(*) FROM workflows w WHERE
+  w.metadata ? 'epigraph_submitted_by' AND NOT EXISTS (SELECT 1 FROM
+  epigraph_live_memberships((w.metadata->>'epigraph_submitted_by')::uuid) m WHERE
+  m.group_id = w.owner_group_id AND m.role IN ('writer','admin')) GROUP BY 1`, and the
+  rows with no recorded submitter. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **238**: public `claims_block_widening_definer` (backlog b5f6883b). Re-states 074's
+  `epigraph_claims_block_widening()` (the body of the `claims_block_widening` trigger) as
+  SECURITY DEFINER, owned by `epigraph_maintenance`, on 172's form (`SET search_path =
+  pg_catalog, pg_temp`, `public.claim_encryption` and `pg_catalog.current_setting`
+  qualified). Before it, the SEALED arm's `EXISTS` on `claim_encryption` ran under the
+  caller's row security, so an application session that writes a sealed claim's owner group
+  but is not in the group its ciphertext is keyed to (a seal row written before 232, or by a
+  role 232's policies do not reach) saw no row and could make the claim public with a raw
+  `UPDATE` and the self-settable declassify GUC. A definer trigger body rather than a
+  callable `claim_is_sealed(uuid)` helper: the helper would need EXECUTE for `epigraph_app`
+  and be a seal-existence oracle; a trigger body cannot be called and needs no EXECUTE.
+  Same arms, RAISE texts, SQLSTATE (42501) and trigger; EXECUTE stays revoked from PUBLIC.
+  Guarded: refuses (55000) unless the live body is 074's (md5 of `prosrc`). Registered in
+  `tenancy_backfill.rs` `DEFERRED_DEFINER_FUNCTIONS` (fails OPEN under a non-member owner).
+  Pinned by `epigraph-db/tests/sealed_claim_widening_definer.rs` (the publicize commits a
+  public sealed claim below 238 and is refused at 238; a member of the ciphertext group, an
+  unsealed claim with and without the GUC answer as before at both; the catalog shape; the
+  md5 guard; the undo). Undo: `docs/runbooks/238-undo.sql` (tested: run twice, it returns the
+  `public` catalog to below 238; run it as the migration runner, which gets the function
+  back). It repairs no existing row: measure claims that are public with a
+  `claim_encryption` row, and seal rows whose `group_id` differs from the claim's
+  `owner_group_id`, before and after. At 238 a caller outside the ciphertext's group that
+  tries the make-public without the declassify GUC gets the SEALED text instead of the
+  declassify text: one bit about a claim it can already update. **Pre-deploy check:** the
+  live body must be 074's, or the guard refuses (55000) and 238 does not apply:
+  `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+  'public.epigraph_claims_block_widening()'::regprocedure` must be
+  `7d9079127fe7ad6c7195047421e87c0e`. **Deploy order:** none; no binary depends on it.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **239**: public `agent_keys_app_role_writes` (backlog 54018ca1). 118 kept the
+  application role's INSERT on `agent_keys` and granted it
+  `epigraph_agent_key_set_status` with no caller check; 161 closed only the attested types
+  (`signing`, `identity-legacy`). So an application session could still plant a key of any
+  other type for any agent, and rotate or revoke any agent's non-attested key, which the
+  HTTP routes refuse unless the caller is the agent or an admin. 239: (a) REVOKE INSERT on
+  `agent_keys` from `epigraph_app` (it now holds SELECT only); (b) re-states
+  `epigraph_agent_key_set_status` from 163's body on 172's path form (`pg_catalog,
+  pg_temp`) with one new gate for every key type: a privileged session, the key's own
+  agent (`epigraph_principal_id()`), or an admin (armed: elevated; unarmed: live instance
+  admin), else `AK03` / 42501; (c) adds `epigraph_agent_key_rotate(old key, new public
+  key)`, SECURITY DEFINER owned by `epigraph_maintenance`, EXECUTE to `epigraph_maintenance`
+  ONLY (an application grant would admit no legitimate call, since the one caller rotates a
+  `signing` key, and would let a DSN holder that stamps itself as the victim record a key
+  through the definer): under the same AK02 and AK03 gates it retires the active old key
+  (closing its window) and inserts the new 32-byte key with the old row's agent and type,
+  valid from where the old window closed, in one statement (`AK01` for a key no longer
+  active, `AK04` for a wrong-length key). The HTTP rotate and revoke routes now run on a
+  transaction stamped with the caller's viewer, and rotation is the one definer call; on the
+  application role the rotation is refused 42501 (no EXECUTE), as AK02 refused it before.
+  The status definer's AK03 gate reads the session principal GUC, which a holder of the
+  application DSN can set itself (so it can still retire or revoke a victim's non-attested
+  key); the INSERT revoke and the AK02 gates do not depend on it. The database cannot see
+  `claims:admin`: an unarmed admin token whose principal is not a live instance admin is now
+  refused AK03 at the database. Pinned by `epigraph-db/tests/agent_keys_app_role_writes.rs`
+  (insert refused for every type; another agent and an unstamped session refused, the agent,
+  an unarmed instance admin, an armed elevated custodian and a maintenance session admitted,
+  an armed non-elevated admin refused; no application EXECUTE on the rotation definer, and,
+  under a test-local grant standing in for a future grantee, its refusals, its admin arms
+  and its atomic success; the route's repository calls on
+  an application-role `ScopedPool`; the undo, run twice). The insert, status and rotation
+  tests were measured red on the series without 239; removing the REVOKE or forcing either
+  caller gate open each fails at least one of them. Also pinned by
+  `app_role_table_lockdown.rs` (`agent_keys` joins `NO_WRITE`). Undo:
+  `docs/runbooks/239-undo.sql`. Slot 239 was assigned by the 2026-11-22 backlog triage;
+  checked before claiming: no origin branch carries a `239`. **Deploy order:** migrate
+  before rolling out the 239 binary (its rotation calls the new definer). A pre-239 binary
+  on a migrated database still revokes through the status definer, unstamped, so it is
+  refused AK03 for every key: migrate and roll the binary out together. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+- **240**: `behavioral_executions_tenancy` (backlog 88cf603b). A workflow's recorded runs had
+  no tenancy and no row security (069 ledgered the table in `tenancy_exempt`), so every
+  application session read every run (goal text and embedding, step beliefs, tool pattern) of
+  every workflow, group-private plans included. Adds `owner_group_id` and `visibility` (062's
+  shape and constraints, NOT NULL, no default), backfilled from each run's workflow (the
+  `workflows` row, else the flat workflow claim; an orphan run refuses the migration, `BEX01`),
+  a BEFORE INSERT stamp from the workflow over any declaration (a run of no workflow is
+  `23503`), and two follow triggers that re-stamp a workflow's runs when its `workflows` row or
+  flat workflow claim changes its pair. Row security ENABLEd and FORCEd: read is public or a
+  session group; INSERT uses the same READ predicate (a reader of a public plan records a run
+  of it, a non-reader is refused `42501`); UPDATE only by the maintenance session and its
+  definers; 115's `_delete_owner` and owner guard; 126's three refusal-only elevated policies
+  (T-PLAN). The `tenancy_exempt` row goes. Pinned by
+  `epigraph-db/tests/behavioral_executions_tenancy.rs` (the app-role leak test, the follow on
+  narrowing and restore, the stamp, the orphan refusal, the write rule, the undo) and the
+  tenancy ratchets. Undo: `docs/runbooks/240-undo.sql`. **Deploy order:** migrate before, or
+  with, the binary built with it (see `docs/deploy.md`).
+- **241**: `unauthenticated_reader_reserved` (backlogs 37844e1d, 14a38166). Creates the
+  `--allow-unauthenticated-http` reader agent's row (`mcp-unauthenticated-reader`, public key
+  the ASCII bytes `epigraph-mcp:unauthenticated-rdr`) if no row holds the key, adopting an
+  existing one as it is. Two INVOKER triggers with no bypass or definer escape:
+  `agents_reserve_unauthenticated_reader_key` refuses the key to every other INSERT and key
+  UPDATE (42501 `RDR01`), and `group_memberships_refuse_unauthenticated_reader` refuses every
+  INSERT of a live row of the reader and every revival of a revoked one (42501 `RDR02`), so a
+  `groups:admin` holder can no longer close the read-only listeners by adding the reader to a
+  group. Revoking a legacy live row, and updating one that is already live (key rotation),
+  stay open. The listener now only looks the row up, and refuses a row that holds a live
+  membership or is the principal of an un-revoked OAuth client (only a row from before 241
+  can). Pinned by `epigraph-db/tests/unauthenticated_reader_reserved.rs` (the app-role admin
+  refusal with calibration, the superuser and definer refusals, the key reservation, the
+  adoption of a pre-existing row, the undo) and
+  `epigraph-mcp/tests/unauthenticated_listener_public_only.rs`. Undo:
+  `docs/runbooks/241-undo.sql`. **Before deploying**, measure the reader row on the target
+  (241's header section 3 has the query); expected no row, or one with no live membership and
+  no un-revoked client. **Deploy order (binding):** migrate before rolling out a 241
+  `epigraph-mcp` binary: it no longer creates the reader, so on an unmigrated database the
+  read-only listener refuses every content call. **Applied to throwaway databases only, NOT
+  to any deployed database.**
+- **242**: `share_publicize_operated_agent_and_fragment_hold` (backlog ecd842bf, fc33ef1a;
+  share-with-team spec ruling R1 and section 4.6). Re-states 215's
+  `epigraph_publicize_claims` and `epigraph_share_claims_with_team` (an md5 precondition
+  refuses to apply over any other body, 55000). (1) An operated agent, one whose
+  `epigraph_human_of(principal, false)` is another agent (an operator link of any state, or a
+  client allowance), is refused by both acts with the new outcome `refused_not_human`
+  (the spec's name for R1's refusal)
+  (403 / INVALID_REQUEST), whatever memberships it holds itself; before, an operated agent that
+  was itself a writer of the target team (share) or an admin of the owning team (publicize)
+  acted on its own authority. Share's target test names `via = 'own'` only. Not R1's whole
+  human gate: an agent with no operator link and no client allowance (for example a
+  role-attached agent that has neither) is still judged by its own memberships.
+  (2) Share holds a harvester fragment that a moved claim cites and a claim outside the call
+  also cites, unless that claim is already in the target team: the fragment keeps its pair
+  (its audit reports with it, 173) and 215's source rule then runs on the post-hold
+  fragments. A co-citer already in the team does not hold it, so co-citing claims shared in
+  separate calls end with the fragment and source in the team. Publicize adds no hold of its
+  own (218's arm (d) guard already keeps a group fragment another group claim cites; a
+  fragment whose other citers are all public goes public). Both audit rows count the held
+  fragments as `harvester_fragments_held`. 218's arm (d) is unchanged. Audit rows carry
+  `migration` 242. Pinned by
+  `epigraph-mcp/tests/claim_visibility_cascade_app_role.rs` (the operated agent with its own
+  writer / admin membership, a retired link, the human's control call; the share hold, the
+  share and publicize of co-citing claims in two calls, publicize with a group and with a
+  PUBLIC other citer) and
+  `epigraph-db/tests/share_publicize_operated_fragment_undo.rs` (the undo, run twice; the md5
+  precondition). Undo: `docs/runbooks/242-undo.sql` (re-states 215's two bodies). Slot 242
+  was assigned by the 2026-11-22 backlog triage (T21). **Deploy order:** none required; a
+  binary without the new refusal text answers the generic "refused". Operated agents that
+  share or publicize today start being refused. Before migrating, measure (on a role that
+  may execute `epigraph_live_memberships`, so role-derived memberships, 165, count; link and
+  membership state is read NOW, not as of each act; the client-allowance arm is not
+  counted): shares by an agent with a live operator link that is itself a member of the
+  target team, `SELECT count(*) FROM security_events s WHERE s.event_type =
+  'claim.shared_with_team' AND EXISTS (SELECT 1 FROM operator_links l WHERE l.agent_id =
+  s.agent_id AND NOT l.retired) AND EXISTS (SELECT 1 FROM epigraph_live_memberships(s.agent_id)
+  m WHERE m.group_id = (s.details->>'to_group_id')::uuid)`; publicizes by such an agent that
+  is itself an admin of an owning group, `SELECT count(*) FROM security_events s WHERE
+  s.event_type = 'claim.publicized' AND EXISTS (SELECT 1 FROM operator_links l WHERE
+  l.agent_id = s.agent_id AND NOT l.retired) AND EXISTS (SELECT 1 FROM
+  epigraph_live_memberships(s.agent_id) m JOIN jsonb_array_elements_text(s.details->
+  'owner_group_ids') g(id) ON m.group_id = g.id::uuid WHERE m.role = 'admin')`; and every act
+  242 would now refuse, `SELECT s.event_type, count(*) FROM security_events s WHERE
+  s.event_type IN ('claim.shared_with_team', 'claim.publicized') AND EXISTS (SELECT 1 FROM
+  operator_links l WHERE l.agent_id = s.agent_id) GROUP BY 1`. **Applied to throwaway
+  databases only, NOT to any deployed database.**
+- **243**: `foreign_cache_repoint_off_inadmissible_frame` (backlog 0296077b). Re-states 114's
+  `epigraph_foreign_belief_cache` (an md5 precondition refuses to apply over any other body;
+  path stays 190's `pg_catalog, public, pg_temp`, owner and grants unchanged) with ONE new
+  arm: a non-owner's write may re-point a public claim's cache off the frame it records (R)
+  to frame P when, read with definer rights, the claim is not a compound, R holds no
+  cache-admissible combine input, and P is `binary_truth` with an admissible input or
+  `claim_validity` with one while `binary_truth` has none (the frame the cache-owner rule
+  elects). Before it, after evidence on a public claim was narrowed, a request-path
+  recompute by anyone but the owner was declined and every reader kept being served a fold
+  of the hidden evidence until a privileged recompute ran. An accepted re-point also clears
+  `claims.classification` (the verdict on the hidden fold; the engine computes no verdict
+  off `binary_truth`, so nothing would overwrite it), and is audited as
+  `claims.foreign_aggregate_write` with `action = 'belief_cache_repoint'`, the cleared
+  classification in its before/after. Every other re-point is still a no-op, as in 114. The
+  three owner-rule predicates are inlined verbatim; `epigraph-db/tests/foreign_cache_repoint.rs`
+  pins the arm, the verdict clear, each refusal (mutation-tested), that verbatim copy, and
+  the undo. Undo: `docs/runbooks/243-undo.sql`. Shipped with an engine change in the same PR:
+  `edge_factor::recompute_combined_belief` now clears `classification` whenever it writes
+  the cache on a frame with no verdict, so an owner or maintenance recompute also drops a
+  stale label. **Deploy order:** migration and binary in either order. **Recommended after
+  both:** a one-time `recompute_beliefs` on the maintenance DSN, run by the NEW binary (the
+  old one leaves the stale verdict). Claims that already hold a fold of narrowed evidence
+  are otherwise cleared only at their next owner-rule recompute on a stamped or maintenance
+  session; nothing runs at the narrowing act itself.
+- **246**: `papers_tenancy` (backlog 34864fb5, option 2 of
+  `docs/tenancy/papers-tenancy-followup.md`). A `papers` row carries the tenancy of the ingest
+  that wrote it: `visibility` and `owner_group_id` in 183's tier-A shape (no default,
+  `papers_require_tenancy`, 115's owner guard plus `epigraph_papers_visibility_guard`), every
+  existing row backfilled to `('public', world)`, ENABLEd and FORCEd row security (read public
+  or a group in the read set, insert a written group, update a readable row, no application
+  delete, 126-style elevated write refusals). 001's `UNIQUE (doi)` constraints are replaced by
+  the unique index `papers_document_key_scope_key` on `(doi, scope)` (a public row's scope is
+  the world group, a group row's its owner): one public row per document, one row per group
+  for private copies. Re-states 219's `epigraph_node_tenancy` (a `paper` arm) and
+  `epigraph_propagate_tenancy` (paper joins), behind an md5 precondition on 219's bodies.
+  Pinned by `epigraph-db/tests/papers_tenancy.rs` (backfill, shape, app-role scope and
+  refusals, edge meet and re-meet, the undo) and
+  `epigraph-mcp/tests/paper_tenancy_app_role.rs`. Undo: `docs/runbooks/246-undo.sql`
+  (refuses while a paper is private or a key has two rows). **Deploy order:** migrate and
+  roll the binary out together: a pre-246 binary's paper writes are refused by
+  `papers_require_tenancy` (document ingest and `POST /api/v1/papers` fail), and a 246 binary
+  names columns and an index a pre-246 database lacks (its boot posture check also lists
+  `papers` as FORCEd).
+- **247**: public `maintenance_delete_claim_frames` (backlog 8ca08222) — `GRANT DELETE ON public.claim_frames TO epigraph_maintenance`, role-guarded
+  like 158, and nothing else. An un-mark's reversal deletes the frame bindings its mark's
+  repair copied onto the canonical (`copied_frames`); 070 gives the maintenance role no
+  DELETE, so on a NOSUPERUSER maintenance login that statement failed with "permission
+  denied for table claim_frames" and the whole un-mark rolled back, leaving the duplicate
+  marked. A grant, not a definer: every definer here is owned by `epigraph_maintenance`, so
+  a definer would need the same privilege (restricting its callers, as 161 does, does not
+  help when the caller is the maintenance role itself). **Effective reach:** while 158
+  stands, none new over bindings: the role already UPDATEs and INSERTs `claim_frames` (070)
+  and can delete a whole frame, with its bindings, through 158's cascade. If 158's frame
+  deletion is ever revoked, this grant becomes the role's one way to remove a binding, so
+  weigh it in that decision; it deletes no frame and no BBA, so the un-mark stays correct
+  either way. Also unblocks `scripts/migrate_provenance_bba.py --rollback` on a maintenance
+  login. Pinned by
+  `epigraph-engine/tests/unmark_unbinds_frame_on_maintenance.rs` (red without 247). Undo:
+  `docs/runbooks/247-undo.sql`. **Deploy order:** none required; no binary change. The
+  grant is skipped when `epigraph_maintenance` does not exist yet (as in 158); after
+  migrating, or after creating the role later, check
+  `has_table_privilege('epigraph_maintenance', 'public.claim_frames', 'DELETE')`.
+
+- **248**: `role_attach_register_first_and_may_run_self` (backlog 30ec8d72, 1afdc93d).
+  Re-states 166's `epigraph_attach_agent_to_role` and `epigraph_role_agent_may_run` (an
+  md5 precondition refuses to apply over any other body; owners and grants unchanged).
+  The attach verb now refuses `ROL03` (nothing written) an identity the host's
+  registration would still ADOPT (never registered, no authored claim, and fresh by 161's
+  own freshness scan, copied verbatim), because the attachment would make that first
+  registration abort `AID09` for good; an identity the registration refuses anyway is
+  attached as before. A direct maintenance INSERT into `role_agents` is unchanged.
+  `epigraph_role_agent_may_run` answers a privileged session and an
+  `epigraph_identity_attestor` login about any agent, and any other session only about
+  its own stamped principal (`42501` otherwise), so an application session can no longer
+  enumerate the role roster; `AgentRepository::role_agent_may_run` stamps the agent it
+  asks about, transaction-local. This NARROWS 1afdc93d, it does not close it: the stamp is
+  a session setting, and a session holding the application DSN can re-stamp per row inside
+  one statement and still enumerate the whole roster; it stops enumeration only by code
+  that stamps its own principal honestly (166 disclosed no less). Pinned by
+  `epigraph-db/tests/role_attached_agents.rs`
+  (`attaching_an_identity_the_host_has_not_registered_is_refused`, replacing the pinned
+  AID09 case, and `may_run_answers_an_app_session_only_about_its_own_principal`). Undo:
+  `docs/runbooks/248-undo.sql`. **Deploy order:** `epigraph-mcp-full` built with this
+  file's repository change first (or together), for every copy on an application login,
+  including the binary the host mounts into agent containers: an older binary asks
+  unstamped and refuses to boot after the migration. Rolling that binary back after 248
+  needs `248-undo.sql` first. The host asks on its attestor login, exempt by membership
+  only: check `pg_has_role('<host attestor login>', 'epigraph_identity_attestor',
+  'MEMBER')` before migrating. The attach refusal is decided at attach time: a binding
+  that let the attach through and is removed before the first registration still leaves
+  that registration to abort `AID09`.
+- **249**: public `role_derivation_time_aware` (backlog 2b54c270, part 2). Re-states 195's
+  `epigraph_role_derived_memberships(uuid, timestamptz)` so that it answers an instant T from
+  what was recorded by T: an attachment counts from its `created_at`, a detach from its
+  `detached_at` (the row asked about, every hop of a copy chain, the row made by name that
+  ends the lineage walk, and the sticky detached-row read), a succession from its
+  `attested_at`. A later detach, revert, edit or dated-back attach no longer changes the
+  answer (or the roster's `--at`) for an earlier instant. An instant at or after the asking
+  transaction's start (`p_at >= now()`) is the present: every record the snapshot sees
+  counts, so every live gate (they ask at `now()` or `clock_timestamp()`) answers exactly as
+  under 195, a detach committed after the transaction began included. Adds the plain index
+  `idx_role_agents_agent_role (agent_id, role)`: the time-aware read of the row asked about
+  cannot use 166's partial index, and without it every call paid a JIT compile (0.55 to
+  0.8 s measured; 3 to 4 ms with it). Limits kept: the folder test still reads snapshots at
+  any time, and the operator link, the client allowance and the group's status are read as
+  they stand now (suspending a group later empties every earlier instant's answer). An md5
+  precondition refuses (`55000`, nothing changed) over any body but 195's
+  (`1c5c6925547d6aa0d0a54e718ce6bd47`); a later re-statement starts from 249's
+  (`58caa9ae65e89485b4fac1bb26959fdd`). Signature, owner, ACL and `search_path` unchanged;
+  no grant. Pinned by `epigraph-db/tests/group_role_membership.rs` (the 249 section: one
+  test per kind of record, each failing on 195's body or on its conjunct reverted alone; one
+  present-instant test per site that reads a record's time, each failing with that site's
+  present clause reverted alone; the planner-estimate test that fails without the index; and
+  two pins of the cross-folder limits of 195, part 1 of the item),
+  `schema_contract.rs::migration_179_attached_arm_survives_at_head` (249's fragments) and
+  `legacy_fleet_parent.rs` (`migration_249_refuses_to_restate_a_body_it_was_not_written_from`,
+  `the_249_undo_restores_the_catalog_below_249`). Undo: `docs/runbooks/249-undo.sql`
+  (restores 195's body byte for byte and drops the index; run it BEFORE `195-undo.sql`).
+  **Deploy order:** after 195; no binary depends on it. The index is built inside the
+  migration's transaction (writers of `role_agents` wait for it; the table is small).
+- **250**: public `events_write_guards` (two guards on the provenance record).
+  **Section 1** (backlog 062d7767): the maintenance role prunes `events` only
+  through the SECURITY DEFINER `epigraph_prune_telemetry_events(retention_days)`,
+  which deletes rows whose `event_type` is exactly one of
+  `epigraph_prunable_event_types()` (`{tool.invoked}`, equal to
+  `epigraph_db::PRUNABLE_EVENT_TYPES`) older than the window, and
+  `REVOKE DELETE, UPDATE, TRUNCATE ON public.events FROM epigraph_maintenance`
+  (it keeps SELECT and INSERT). Before this any maintenance session could
+  delete or rewrite any `events` row, provenance included, and UPDATE alone
+  could re-type a provenance row so the prune deleted it. The definer is owned
+  by the owner of `events` (read from `pg_class`), never by the maintenance
+  role, whose DELETE the revoke removes; the migration refuses (42501) if that
+  owner is or is a member of `epigraph_maintenance`. EXECUTE to
+  `epigraph_maintenance` only; the body also requires `epigraph_bypass()`. Its
+  path is `pg_catalog, public, pg_temp` because each delete fires 001's
+  INVOKER `cascade_delete_edges` (unqualified `DELETE FROM edges`); registered
+  in `definer_search_path_ratchet.rs`. `RecallEventRepository::
+  prune_telemetry_events` calls the definer and `count_prunable_events` reads
+  the same list. `AgentRepository::delete`'s `actor_id` detach now needs the
+  owner DSN (its callers are superuser test fixtures). Pinned by
+  `epigraph-db/tests/events_telemetry_prune_definer.rs` (a maintenance
+  session's DELETE / UPDATE / TRUNCATE of a `claim.created` row refused 42501;
+  the prune on a maintenance session deletes only the expired telemetry row and
+  its cascade still runs; the app role cannot execute it; the owner and
+  grants; the type list; the undo),
+  `app_role_table_lockdown.rs::neither_role_deletes_a_provenance_event_directly`
+  and `epigraph-cli/tests/prune_recall_events_maintenance.rs` (the real binary
+  on a non-superuser maintenance login). Undo: `docs/runbooks/250-undo.sql`.
+  **Deploy order (coupled):** apply 250 and deploy the binary that calls the
+  definer together, before the next `prune_recall_events` run; out of order
+  the job exits non-zero having deleted nothing from `events` (no data loss).
+  Before migrating, measure who owns `public.events` and whether that role is
+  a member of `epigraph_maintenance` (the migration refuses if so).
+  **Section 2** (backlog a278f16d): `claim.assessed` is reserved in the
+  database, not only at the REST and MCP publish surfaces. New table
+  `mass_function_masses_writes (mass_function_id PK, written_xact xid8)`: the
+  top-level transaction that last wrote each mass function's masses, upserted
+  by the maintenance-owned definer `epigraph_mass_function_masses_written()`
+  from two AFTER row triggers on `mass_functions` (`..._ins` on INSERT,
+  `..._upd` WHEN `OLD.masses IS DISTINCT FROM NEW.masses`). The application
+  role holds no privilege on it; maintenance holds SELECT, INSERT, UPDATE. A
+  side table rather than a column so `mass_functions` row images (stored and
+  compared byte for byte by the K10 undo and other restore tools) keep their
+  shape. The BEFORE INSERT
+  OR UPDATE row trigger `events_assessment_guard` (WHEN the lower-cased type
+  contains `claim.assessed`) runs the maintenance-owned definer
+  `epigraph_events_assessment_guard()` (172's path, EXECUTE revoked from
+  PUBLIC): a maintenance or superuser session (`epigraph_bypass()`) is
+  admitted; any other session is refused 42501 for a padded (Unicode
+  whitespace included, `epigraph_event_type_norm(text)` mirrors Rust's
+  `str::trim`) or re-cased spelling, and for the exact type unless the
+  payload's `mass_function_id`, `claim_id`, `frame_id`, `owner_agent_id` name a
+  `mass_functions` row for that claim, frame and `source_agent_id` whose
+  `mass_function_masses_writes.written_xact = pg_current_xact_id()`, and
+  `actor_id = assessed_by`.
+  So a record needs a masses write in the same transaction: a stranger's
+  self-stamped no-op UPDATE (`SET masses = masses`), a caller-written stamp, a
+  tenancy-only update, a savepoint rolled back, or a 32-bit xid match from
+  another epoch is refused; a write under a savepoint is admitted. A validating
+  trigger rather than a route-called definer: a definer the application role
+  calls with its own payload would admit the same forgery. `assess_claim` asks
+  `MassFunctionRepository::slot_holds_masses` (row locked) before its upsert
+  and files no record when the slot already holds those masses (that upsert
+  writes no masses, so its record would be refused). Residual: the tenancy
+  GUCs are session-settable, so any application-DSN holder can genuinely
+  rewrite a slot row's masses (or write them away and back) and hold a true
+  record of that write; the database binds the record to a masses write, not
+  to an authenticated identity. Pinned by
+  `epigraph-db/tests/assessment_event_reservation.rs` (forgeries, spellings
+  and malformed ids refused on a stamped `epigraph_app` session; the route's
+  shape admitted and each binding field mutated; the stranger's touch and
+  stamp write refused, a real rewrite admitted; savepoint and nested
+  writes admitted, a rolled-back one refused; the epoch-aware bind; identical
+  masses not recordable and detected; maintenance admitted, a pin) and
+  `epigraph-api/tests/assess_writer_recorded.rs` (the route; an identical
+  re-assessment on an application-role pool answers 200 with no second
+  record). Undo: `docs/runbooks/250-undo.sql` (drops the table and its
+  triggers too). Every masses write now costs one side-table upsert; rows of
+  deleted mass functions are not removed (they name finished transactions).
+  **Deploy order for section 2 (one way):** deploy the binary whose
+  `assess_claim` skips the record for identical masses before or with 250;
+  it runs on either side of it. The older binary on top of 250 answers 500 to
+  an identical re-assessment (rolled back, nothing changes).
+  **Operator data repair (not done by the migration):** rows of the type
+  written before 250 are unchecked. `events.created_at` and
+  `events.graph_version` are both caller-supplied, so neither is a trustworthy
+  cut-off: IMMEDIATELY BEFORE applying 250, snapshot the ids, on the owner
+  DSN, e.g. `CREATE TABLE ops_pre250_assessed AS SELECT id FROM events WHERE
+  strpos(lower(event_type), 'claim.assessed') > 0` (deliberately broad: the
+  guard's own WHEN test), then after migrating classify
+  exactly those ids with `SELECT e.id, e.event_type, e.created_at, e.actor_id,
+  CASE WHEN epigraph_event_type_norm(e.event_type) <> 'claim.assessed' THEN
+  'other_type' WHEN mf.id IS NULL THEN 'no_slot_row' WHEN
+  mf.claim_id::text IS DISTINCT FROM e.payload->>'claim_id' OR
+  mf.frame_id::text IS DISTINCT FROM e.payload->>'frame_id' OR
+  mf.source_agent_id::text IS DISTINCT FROM e.payload->>'owner_agent_id' THEN
+  'fields_mismatch' WHEN e.actor_id::text IS DISTINCT FROM
+  e.payload->>'assessed_by' THEN 'actor_not_assessed_by' ELSE 'consistent'
+  END FROM events e JOIN ops_pre250_assessed p ON p.id = e.id LEFT JOIN
+  mass_functions mf ON mf.id::text = e.payload->>'mass_function_id'`
+  (`consistent` is necessary, not sufficient, for a genuine record). Rows
+  outside the snapshot passed the guard, so the procedure can only
+  over-classify. Drop the snapshot table afterwards.
+- **251**: public `retracted_bba_guard_owner` (backlog 6bdac68f). Closes the residual 184
+  and 194 recorded: a maintenance login could write a row of `mass_function_purge_grants`
+  itself (the maintenance role held INSERT on it because its definers needed it) and then
+  delete a retracted BBA with no audit row, and could set `epigraph.mf_unretract_id` and
+  clear a retraction with no audit row (184's clear guard admitted any statement run as the
+  maintenance role). Moving the definers to a NOLOGIN owner is not enough on its own: the
+  definers write tables whose policies and triggers call maintenance-owned functions, which
+  any maintenance login may `ALTER` (to SECURITY INVOKER, or onto a path that searches the
+  session's `pg_temp` first for type names), and 184's INVOKER guard did not list `pg_temp`,
+  so a session's own type in `pg_temp` could run its code as the owner. 251 therefore keeps
+  the privileged frame tiny: `mass_function_purge_grants` becomes an append-only LEDGER
+  (`kind` purge/unretract, `grant_login` = `session_user`, `granted_at`, and the consumption
+  `consumed_at`, `consumed_login`, `consumed_row`; an identity key replaces (mf_id, xact_id);
+  an index on (xact_id, mf_id, kind)), owned by the runner, with no trigger and no row
+  security. `epigraph_bba_guard_owner` (NOLOGIN, no attribute, a member of no role, granted
+  to none) holds only SELECT, INSERT and UPDATE of the three consumption columns on it, and
+  owns exactly three SECURITY DEFINER functions on `pg_catalog, pg_temp` that touch nothing
+  but the ledger: `epigraph_mf_guard_grant(kind, ids, reason, granted_by)` (EXECUTE:
+  maintenance), `epigraph_mf_guard_consume(kind, id, row)` (EXECUTE: maintenance,
+  application, a non-superuser `mass_functions` owner) and 194's `epigraph_mf_purge_granted`
+  (now: unconsumed purge grants). 194's delete guard and 184's clear arm admit only by
+  consuming a grant with `to_jsonb(OLD)`; the retract guard's path now lists `pg_temp` last.
+  The purge and un-retract definers stay maintenance-owned and write their grants through
+  `epigraph_mf_guard_grant` (the purge keeps them instead of deleting them; the un-retract
+  no longer sets the marker, whose `proconfig` entry stays, inert). `REVOKE ALL` on the
+  ledger from the maintenance role. `epigraph_bba_guard_owner_faults()` (SECURITY INVOKER,
+  runner-owned, EXECUTE to the maintenance role): every way the owner or the ledger could
+  be reached, `{}` when sound (a member of it, ADMIN-only grants included; ADMIN OPTION on
+  it; any non-superuser CREATEROLE role; any other role that can write the ledger,
+  `pg_write_all_data` included; the owner's attributes, memberships, extra objects or ledger
+  DELETE/TRUNCATE/UPDATE; a trigger or row security on the ledger); the migration refuses
+  `55000` unless it is `{}` at the end, and `epigraph-tenancy-backfill verify` reports every
+  fault. Preconditions (`55000`, nothing changed): the md5 and `proconfig` of the five bodies
+  it re-states are those at 250 (retract guard, delete guard, helper, purge and un-retract
+  definers; the retract guard may also be on `pg_catalog, public, pg_temp`, the interim
+  mitigation of backlog eff4aaf5), and `epigraph_maintenance` exists. A login that may not create the role or
+  re-own to it is refused `42501`. An existing owner role holding the maintenance role (an
+  earlier draft of this change) has that membership revoked. What a maintenance login can
+  still do: call `epigraph_mf_guard_grant` itself (the definers its role owns must) and then
+  delete or un-retract, as it could through the definers; the ledger keeps a row it cannot
+  remove, naming its login and the row's content. Not changed: 184's MARK arm still admits a
+  maintenance session. Pinned by `epigraph-db/tests/bba_guard_owner.rs` (what runs as the
+  owner at head, the fault check calibrated on every way to reach it, the bodies before,
+  the refusals, the earlier draft's membership, the undo), `bba_retract.rs`
+  (`no_session_runs_its_own_code_as_the_ledger_owner`: a `pg_temp` type trap through the
+  un-retract definer, a flipped maintenance-owned definer, a flipped statement trigger and
+  the ledger's own functions, on real maintenance and application logins; the forged clear
+  and the ledger row of a real un-retract), `mass_function_purge_guard.rs` (d, d2, d3, d4,
+  e, f, g), `schema_contract.rs`, `epigraph-cli`'s register test and
+  `verify_reports_a_ledger_another_role_can_write`, and `operator_delete_frames.rs` (the
+  census). Undo: `docs/runbooks/251-undo.sql` (restores the five bodies, the retract guard
+  on `pg_catalog, public, pg_temp` rather than 184's path, and 194's table shape; keep the
+  ledger first; leaves the role and names the statement that drops it).
+  Slot assigned by the 2026-11-22 backlog triage; checked before claiming: no migration on
+  main or any origin branch carries a `251`. **Deploy order:** install the `delete-frames`
+  built with 251 together with it (an older one refuses its purge over 251, rolled back);
+  the API and MCP binaries need no change. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **252**: `admin_audit_agent_key_events` (backlog 6492de67). Re-states 112's
+  `epigraph_admin_audit_write` (an md5 precondition refuses to apply over any other body)
+  to accept two more event types, `agent_keys.admin_rotate` and `agent_keys.admin_revoke`,
+  beside `workflows.admin_write`; ADM01/ADM02/ADM03 and the row it writes are 112's. Path
+  `pg_catalog, public, pg_temp` (190's); owner and grants unchanged. The API's
+  `rotate_agent_key` / `revoke_agent_key` write one such row when a `claims:admin` caller
+  changes ANOTHER agent's key, on the key change's own transaction; the override now also
+  needs a live `claims:admin` grant on the token's client record (ADM02, 403). Pinned by
+  `epigraph-db/tests/admin_audit_agent_key_events.rs` (the accepted and refused types, the
+  grant re-check, the path, the precondition, the undo) and
+  `epigraph-api/tests/agent_mutation_auth_test.rs`. `epigraph_agent_key_set_status` is not
+  touched (a later re-statement starts from 163's body). Undo:
+  `docs/runbooks/252-undo.sql` (roll the binary back first). **Deploy order:** migrate
+  FIRST: a binary ahead of 252 is refused ADM03 on every admin rotation or revocation of
+  another agent's key (self-rotation and self-revocation are unaffected).
+- **253**: `reown_legacy_edges_excludes_server_signers` (backlog 2f39eee7). Re-states 120's
+  `epigraph_reown_legacy_edges_to_signer` (an md5 precondition refuses to apply over any other
+  body; the path stays 190's `pg_catalog, public, pg_temp`). The function now excludes every
+  server signer itself, on every call, whatever `p_exclude_signers` says: (a) every agent named
+  `epigraph-api-signer` (the API's registered edge signer), (b) every agent that signed a claim
+  another agent authored (the MCP server signs its callers' claims), (c) every agent that signed
+  an edge whose `writer_group_id` is neither world nor the group the function would re-own that
+  signer to (an HTTP route's edge records its caller's group), (d) every agent with an attested
+  `signing` key row (any status) that has signed an edge and authored no claim (a server agent
+  provisioned with its own signing row). A wrong exclusion only leaves an
+  edge world-owned (administrative), the safe direction. `p_exclude_signers` stays mandatory
+  (RLE01) for the legacy bulk attestation keys, and for an API signing with another agent's bare
+  public key that no arm names (boot warns about that shape). The audit row gains
+  `auto_excluded_signers` (count) and `auto_excluded` (the excluded ids per arm) and says
+  `migration` 253. Arms (b) and (c) read `claims` and `edges` once per call. Owner and
+  grant unchanged. Pinned by `epigraph-db/tests/writer_owned_edges.rs`
+  (`the_legacy_reown_never_follows_a_server_signer_whatever_the_list`, each arm
+  mutation-tested; `the_253_undo_restores_120s_body_on_190s_path`). Undo:
+  `docs/runbooks/253-undo.sql`. **Deploy order:** none required; no binary calls the function.
+- **254**: public `hierarchical_cycle_walk_definer` (backlog 7149132e). Adds the SECURITY
+  DEFINER `epigraph_edges_reach(from, to, relationships)`, which answers whether `from`
+  reaches `to` along in-force edges of the named relationships, read with definer rights
+  (not row-security filtered). Only `invokes`, `executes` and `depends_on` may be walked
+  (anything else, an empty set or a NULL is 22023). `EdgeRepository::reaches_in_force_conn`,
+  the cycle guard of MCP `link_hierarchical`, now calls it instead of walking inline on the
+  caller's stamped transaction, so a cycle closed through an edge the caller cannot read is
+  refused (before, the walk skipped that edge and the cycle was written). The refusal names
+  only the two endpoints the caller already read. The advisory lock stays a separate,
+  earlier statement in the Rust caller (a STABLE function reads its calling statement's
+  snapshot). Owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted to
+  `epigraph_app` and `epigraph_maintenance` (guarded, as in 193); registered in
+  `tenancy_backfill.rs` `DEFERRED_DEFINER_FUNCTIONS` (a non-member owner fails OPEN).
+  Pinned by `epigraph-db/tests/edge_reach_definer.rs` (the hidden-edge walk on an
+  `epigraph_app` stamp, the relationship refusal, the catalog shape, the two-session
+  advisory-lock race) and `epigraph-mcp/tests/link_hierarchical_hidden_cycle.rs` (the
+  refusal end to end on the application role, nothing written, no hidden id named).
+  Does not repair cycles that already exist. Undo: `docs/runbooks/254-undo.sql`.
+  **Deploy order:** migrate BEFORE rolling out a 254 binary: without the function every
+  cycle-checked `link_hierarchical` call fails 42883 and writes nothing. Undo only after
+  rolling every 254 binary back.
+- **255**: public `paper_licence_operator_only` (backlog 9ee6799d). Makes 226's
+  "an operator sets `papers.licence`" an enforced rule. `epigraph_app` loses table-level
+  INSERT and UPDATE on `papers`; it gets back INSERT on every column except `licence` (read
+  from the catalog) and UPDATE on `title` and `journal` only (an allowlist). So an
+  application session can neither UPDATE a paper's licence, nor INSERT a paper naming one
+  (pre-registering a not-yet-ingested DOI as open), nor set it in an `ON CONFLICT DO
+  UPDATE`, nor UPDATE `doi` or `id` to move an open-licensed row onto a paywalled DOI
+  (ingest finds the paper by DOI, then reads that row's licence); SELECT and DELETE are
+  unchanged, and the request path's writers (`PaperRepository::get_or_create`,
+  `POST /api/v1/papers`) INSERT only `doi`, `title` and `journal` and UPDATE only `title`
+  and `journal`. The operator path is the SECURITY DEFINER
+  `epigraph_set_paper_licence(paper uuid, licence text, reason text)` on 172's form, owned by
+  `epigraph_maintenance`, EXECUTE revoked from PUBLIC and `epigraph_app`: it refuses a blank
+  reason or an unknown paper (`LIC01`..`LIC03`, 22023), sets or clears (NULL) the licence
+  (226's CHECK still applies), writes one `security_events` row `paper.licence_set`
+  (paper, DOI, previous, new, reason, session user) and returns the previous licence. A
+  RESTRICTIVE insert policy `security_events_paper_licence_privileged` reserves the
+  `paper.licence` event prefix (case- and blank-insensitive) for a privileged or definer
+  frame stamped `now()`, as 123 does for `platform.`. Re-states the column comment. Refuses
+  (`LIC09`, 55000, nothing applied) if `epigraph_app` can still INSERT `licence`, or UPDATE
+  any column but `title` and `journal`, by any route afterwards. A later migration that adds
+  a `papers` column the request path writes must grant it to `epigraph_app` column-level, and
+  one the request path UPDATEs must also extend the allowlist in
+  `paper_licence_operator_only.rs` (which fails until it does). **Not closed:** the maintenance DSN can still UPDATE `licence` directly, without
+  the audit row (as in 123); the application role can still write publisher text into
+  `evidence.raw_content` directly; licences set before 255 carry no audit row. Pinned by
+  `epigraph-db/tests/paper_licence_operator_only.rs` (each refusal mutation-tested, the
+  `doi`/`id` re-point refused, the application writers as controls, the column ratchet, the
+  definer's audit) and
+  `paper_licence_operator_only_undo.rs`; `epigraph-mcp/tests/ingest_evidence_passage_retention.rs`
+  now sets licences through the definer. Undo: `docs/runbooks/255-undo.sql`. **Operator
+  path:** on the maintenance DSN, `SELECT epigraph_set_paper_licence('<paper id>',
+  'CC-BY-4.0', '<where the licence was read>');` (by id: DOI spellings are canonicalised in
+  the application). **Deploy order:** none required; no binary depends on it.
+- **256**: `derived_writer_scope_read_committed` (backlog a8cabb45). Re-states 166's
+  `epigraph_require_writer_scope` (an md5 precondition refuses to apply over any other body)
+  so that 165's role-DERIVED writer arm admits a write only under READ COMMITTED. Under
+  REPEATABLE READ or SERIALIZABLE the derivation reads the transaction's first snapshot, so an
+  assignment or binding ended by another session after it still read as live and the writer
+  kept writing into the role's group (165's documented residual); 166 had closed that for
+  agents only (ROL01), leaving a human role holder. Now, under any level other than READ
+  COMMITTED, a write the derived arm would admit is refused OPL02 ("a write through a role
+  binding is admitted only under READ COMMITTED"), after the privileged-session exemption;
+  122's direct arm and both existing OPL02 refusals are unchanged. Same signature, STABLE,
+  owner, grants and search path. The derivation (`epigraph_role_derived_memberships`, 195's
+  body) and `epigraph_live_memberships` (235's body) are NOT touched. Residual: 122's direct
+  arm reads `group_memberships` through the same snapshot. Pinned by
+  `epigraph-db/tests/derived_writer_scope_read_committed.rs` (an assignment or binding ended
+  from a second session mid-transaction: the REPEATABLE READ and SERIALIZABLE writer is
+  refused, and lands on 166's body; READ COMMITTED, direct-arm, privileged and agent
+  controls; the undo, twice, and both refusals over a foreign body) and
+  `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
+  `docs/runbooks/256-undo.sql` (run it before `166-undo.sql`). **Deploy order:** none; no
+  binary depends on it. Before applying, measure that no login writing as a human principal
+  on the application role has a non-default `default_transaction_isolation`
+  (`pg_db_role_setting`): such writes through a role binding are refused after 256.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **257**: `operator_link_retire_owner_role` (backlog 9cec11f7). After 191 a maintenance
+  LOGIN inherited the maintenance role's UPDATE (retired) on `operator_links`, so it could
+  retire a link with a direct UPDATE that took no `epigraph.operator_links` advisory lock
+  (unserialised against the link writers and membership grants) and whose audit `via` /
+  reason came from a session-settable setting. Creates `epigraph_operator_link_retirer`
+  (NOLOGIN, a member of `epigraph_maintenance` only; an existing role with any elevated
+  attribute, LOGIN, or another membership raises 55000, as does a non-superuser that is a
+  MEMBER of it in any form (an ADMIN-only grant included), holds ADMIN OPTION on it, or is
+  CREATEROLE; `tenancy_backfill verify` re-runs that isolation check later), re-owns
+  `epigraph_retire_operator_link` to it (EXECUTE still the maintenance role's alone), and
+  moves UPDATE (retired) from `epigraph_maintenance` to it: the verb is the only
+  non-superuser path, and a direct UPDATE is refused 42501. Re-bodies 191's
+  `epigraph_operator_links_retire_only` (md5 precondition): a non-superuser flip outside the
+  verb is refused (OLR05, 42501; the arm holds if the column is ever re-granted), and every
+  UPDATE outside the verb, a superuser's included, clears `epigraph.operator_link_retire`
+  before the audit trigger reads it, so an audit row's `via` / reason are the verb's or
+  `direct` with none. A superuser still retires directly (outside every guard), now always
+  audited `via = direct`. Also re-bodies 191's verb and `epigraph_operator_links_audit` (md5
+  preconditions; owners, ACLs and paths kept) so a `--revoke-membership` retire records each
+  revoked membership's id and role in the audit row (`revoked_memberships`, `[]` when none;
+  backlog 452a1330), not only the count. If the migrating login is not a superuser, or
+  cannot create the role, grant it, or re-own the verb, the file NOTICEs and keeps 191's
+  owner and grants; the guard's new arms stay off, and `tenancy_backfill verify` reports it
+  as a FAIL (`DEDICATED_OWNER_DEFINERS`; a role that is not isolated is a FAIL too).
+  Pinned by `epigraph-db/tests/operator_link_retire.rs`,
+  `schema_contract.rs::migration_191_retire_operator_link_is_owned_and_granted` and
+  `operator_link_retire_owner_undo.rs`. Undo: `docs/runbooks/257-undo.sql`. **Deploy order:**
+  none against other migrations; apply as a superuser, on a cluster with no non-superuser
+  CREATEROLE role (257 refuses otherwise). A cluster with no superuser (a managed service
+  whose admin login is CREATEROLE) is an unsupported configuration for this control: 257
+  takes the NOTICE path, and a hand-provisioned role fails `verify`'s isolation check
+  because that admin login is CREATEROLE (and, on PG 16, holds ADMIN on a role it
+  creates). **Applied to throwaway databases
+  only, NOT to any deployed database.**
+- **258**: public `registry_endpoint_tenancy` (backlog a07c25c0). A `frame`,
+  `context`, `perspective` or `community` edge endpoint contributes its own row's
+  tenancy (062's `owner_group_id`, `visibility`) to the edge's meet. Re-states 246's
+  `epigraph_node_tenancy(uuid, text)` with the four arms and 246's
+  `epigraph_propagate_tenancy()` with a LEFT JOIN per table per endpoint (nothing else
+  in either body changes; CREATE OR REPLACE keeps owner and ACL, and the owner is
+  re-set). Re-meets, once, every edge with a non-public registry endpoint (group meet
+  only, never widening; an already-private edge keeps every group it requires, so a
+  legacy declaration becomes co-owned; an edge that would need three groups is held;
+  an edge whose other endpoint no longer exists is skipped, since writing it would
+  trip `edges_validate_refs` and abort the migration) and RAISEs a NOTICE with the
+  counts. So an edge from a public claim onto a
+  group-private registry row is that row's group's, and one onto another group's
+  claim is co-owned. Not changed: re-tenanting a registry row does not re-meet its
+  edges by itself (no trigger on the four tables, as on `workflows`);
+  `epigraph-tenancy-backfill run --entity registry-edges` (with `--dry-run` first) is
+  the repair, and `verify` fails while such an edge is off its meet or held. A GUARD
+  refuses to apply 258 unless both functions still hold 246's bodies (md5 of
+  `prosrc`; 258 was written against 219's and rebuilt over 246's, which re-stated
+  both first, when the two were merged); the undo carries the same guard against
+  258's bodies and restores 246's. Pinned by
+  `epigraph-db/tests/registry_endpoint_tenancy.rs` (application role, per type),
+  `epigraph-db/tests/registry_endpoint_tenancy_undo.rs` and
+  `epigraph-cli/tests/backfill_idempotence.rs`. Must run as the maintenance role or a
+  superuser (it refuses otherwise). Undo: `docs/runbooks/258-undo.sql` (tested: run
+  twice, it returns the `public` catalog to below 258; the edges it narrowed stay
+  narrowed). **Deploy order:** migrate, then run the `epigraph-tenancy-backfill` built
+  with it (`verify`). Another open change re-stating the same two functions must be
+  re-stated over the merged body (the guard of whichever applies second refuses).
+- **259**: public `plan_step_skeleton` (backlog a1474e22). Adds the definer
+  `epigraph_plan_step_skeleton(workflow uuid, visible uuid[])`: a plan's `executes` edges
+  (every level, in the plan-order readers' key: ordinal, `created_at`, claim id) and the
+  `step_follows` pairs among their targets, read UNFILTERED, with every claim not in
+  `visible` masked to a per-result token. `WorkflowRepository::plan_step_claim_ids` (the
+  outcome reports' `step_index` lookup) now orders the WHOLE plan through it and lists the
+  caller's steps only up to the first one it cannot read, AND only on the slots where that
+  order agrees with the order the caller's own rows give (the definer masks claims, not
+  edges, so a hidden edge between visible steps may refuse a slot but never move one). A
+  hidden unindexed step inside a plan's chain (an `add_step` insert another group owns) no
+  longer shifts the visible steps after it onto its slot. Owned by `epigraph_maintenance` (registered in
+  `epigraph-tenancy-backfill verify`: fails OPEN under another owner), EXECUTE revoked from
+  PUBLIC, granted to `epigraph_app`. Pinned by
+  `epigraph-mcp/tests/hierarchical_outcome_stamped_reads.rs` (app role: the hidden chain
+  member, the member control, a hidden step of another plan, a hidden trailing ordinal, a
+  hidden `step_follows` edge and a hidden second `executes` edge between visible steps) and
+  `epigraph-db/tests/plan_step_skeleton_definer.rs` (owner, grants, masking, the undo). Undo:
+  `docs/runbooks/259-undo.sql`. **Deploy order:** migrate BEFORE the binary; a 259 binary
+  calls the definer on every outcome report that names a step.
+- **260**: public `edge_declared_tenancy` (backlog 969f01f6). Adds
+  `edges.declared_owner_group_id` and `edges.declared_co_owner_group_id` (nullable, no
+  default, no foreign key) and the definer trigger `edges_tenancy_declared`
+  (`epigraph_edges_record_declaration()`, 172's search-path form, owned by
+  `epigraph_maintenance`), BEFORE INSERT OR UPDATE OF source_id, target_id, firing right after
+  `edges_tenancy`: a `group` row whose endpoints are both public (the tuple 072's no-widening
+  arm kept) records its (owner, co-owner) as the declaration; every other INSERT records none,
+  whatever the caller bound; a re-point carries the row's record unchanged (never creates
+  or discards one). Records the existing
+  declarations once (every `group` edge whose endpoints are both public now, by the trigger's
+  own oracle `epigraph_node_tenancy`: claim, evidence and workflow endpoints by a join on
+  their tables, every other endpoint by one oracle call per distinct node, so from 258 on an
+  edge onto a group-private frame, context, perspective or community records none; edges
+  with a dangling endpoint are skipped and counted in a NOTICE). `edges_owner_immutable` also watches
+  the two columns (a non-privileged change is 42501). `epigraph_edges_tenancy` and
+  `epigraph_propagate_tenancy` are NOT re-stated. The privatization re-meet
+  (`PrivatizationRepository::recompute_boundary_meet_conn`) reads the record: a declared edge
+  is never readable outside its endpoints' meet; it keeps owner and visibility, narrowed to
+  the intersection with its meet (co-owner) when that is expressible, otherwise (stacked
+  states only) it takes the meet, keeping the declared owner where the meet allows; a revert
+  restores the declaration exactly; each such edge is recorded in the plan's audit trail
+  (`kind = 'edge'`, `edge.hold` / `edge.unmet`). Pinned by
+  `epigraph-db/tests/privatization_declared_edges.rs` (record, forgery, immutability, re-point,
+  apply/revert of claim and workflow edges with app-role reads, the inexpressible and stacked
+  cases bounded by the meet, the backfill, the undo) and
+  `epigraph-api/tests/privatization_declared_edges.rs` (the apply and revert jobs). Undo:
+  `docs/runbooks/260-undo.sql`. **Deploy order:** migrate BEFORE rolling out the 260 binary
+  (its re-meet reads the new columns; on an unmigrated database it fails with 42703, moot while
+  the privatization lifecycle answers 501 under D9); undo only after rolling it back. The ADD
+  COLUMN's ACCESS EXCLUSIVE lock on `edges` is held through the backfill's scan of the `group`
+  edges: apply in a maintenance window after measuring
+  `SELECT count(*) FROM edges WHERE visibility = 'group'`. **Order with #1022 (258):** merge
+  after #1022; safe either way (260 first records a pre-existing `group` edge onto a
+  group-private registry row as declared, as its trigger would until 258 applies; still
+  bounded by the meet; measure the non-public rows of the four registries). **Applied to throwaway
+  databases only, NOT to any deployed database.**
+- **261**: public `jobs_run_after` (backlog 6cf042a9). Adds `jobs.run_after
+  timestamptz` (nullable, no default, no CHECK: a catalog change, no scan), the
+  earliest time a pending row may be claimed; NULL means due now. The drain
+  (`jobs_drain::drain`) used to put a retryable failure straight back to
+  `pending`, so the next timer run re-ran it whatever `JobHandler::backoff`
+  declared; it now writes `now() + handler.backoff(retry_count - 1)` on the
+  database clock (`PostgresJobQueue::requeue_after`), and the claims
+  (`dequeue_of_types`, `JobQueue::dequeue`) and `count_pending_of_types` skip a
+  row whose time has not come. Enqueuers never write it. No grant, policy,
+  function or trigger. Pinned by `epigraph-jobs/tests/requeue_after_test.rs`,
+  `epigraph-api/tests/drain_jobs.rs` and
+  `epigraph-db/tests/jobs_run_after_undo.rs`. Undo: `docs/runbooks/261-undo.sql`
+  (tested: run twice, it returns the `public` catalog to below 261); a deferred
+  row becomes due at once, as under the older drain. Slot 261 was assigned to
+  this batch; checked before claiming: no migration on main or any origin
+  branch carries a `261`. **Deploy order:** migrate before rolling out the 261
+  `drain_jobs` (its claim names the column; on an older schema every run fails
+  with 42703); an older `drain_jobs` ignores it; undo only after rolling every
+  261 `drain_jobs` back. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **262**: `stop_decomposes_to_factor_mint` (backlog 444b1f4a; atom-level belief SPEC §6.2,
+  D3). Re-states 217's `auto_create_factor_from_edge` (an md5 precondition refuses to apply
+  over any other body) with one addition: an early `RETURN NEW` for a `decomposes_to` edge, so
+  the edge trigger mints no BP factor for a decomposition. `edge_to_factor_type` is unchanged
+  (graph views, clustering and the atlas flow read it for edge weights). The dedup / supersede
+  cascades' set form of the body (`REGENERATE_EDGE_FACTORS_SQL`) skips `decomposes_to` in the
+  same change. Existing rows are NOT deleted here: the operator runs
+  `decomposes_to_factor_sweep` (epigraph-cli) on the maintenance DSN, which exports a manifest
+  of every factor `bp_readable_factor_sql` hides (keyed and legacy) and, with `--apply`,
+  deletes exactly those rows (`--restore <manifest>` re-inserts them). Owner and grants
+  unchanged. Pinned by `epigraph-db/tests/factor_repo_bp_readable.rs::trigger_mints_no_decomposes_to_factor`,
+  `unmark_duplicate.rs::mark_gives_the_canonical_a_factor_for_every_edge_it_inherits`,
+  `epigraph-api/tests/bp_atom_level_retire_apply.rs::bp_parallel_supports_and_decomposes_to`
+  and `epigraph-cli/tests/decomposes_to_factor_sweep.rs`. Undo: `docs/runbooks/262-undo.sql`
+  (re-states 217's body; swept rows come back only through `--restore`). Undo 262 BEFORE
+  217: `217-undo.sql` re-states 038's body with no precondition, so run first on a database
+  at 262 it silently drops the skip too. **Deploy order:**
+  migrate; deploy the binaries (the cascade change); then `decomposes_to_factor_sweep
+  --manifest-out <file>` (dry run; EXPLAIN its selection and pass `--statement-timeout-ms`
+  on a large corpus), review, `--manifest-out <new file> --apply --expect <file>` (refused
+  unless the live selection is exactly the reviewed one), and `--remaining` must print 0.
+- **263**: `person_team_groups_and_invitations` (backlog ee9e05b4). A Person (a registered
+  human operator, signed in as themselves) creates a keyless team group in 164's
+  `did:epigraph:group:` namespace and becomes its one admin
+  (`epigraph_person_create_team_group(name, reason)`; one active group per name PER CREATOR,
+  TGP06), recorded in the new `person_team_groups`; only those groups are invitable (an
+  operator-made 164 team group has the same shape and its admins get TGP07, so its roster
+  stays the operator's audited verbs'). A live admin invites another Person
+  (`epigraph_invite_to_team_group(group, invitee, role, reason)`), which writes a `pending`
+  row in the new `group_invitations` and NO membership; only the invitee accepts
+  (`epigraph_accept_group_invitation`: one new roster
+  row at the invited role, decided under the group row lock the 164 verbs take, refused
+  TGP05 once answered or when its sender is no longer a live admin) or declines
+  (`epigraph_decline_group_invitation`). Two reads: `epigraph_my_groups()` and
+  `epigraph_my_group_invitations()`. All SECURITY DEFINER on 172's path, owned by
+  `epigraph_maintenance`, EXECUTE to `epigraph_app` only; the caller is
+  `epigraph_principal_id()`; operated agents and delegated run tokens are refused TGP01.
+  **This reverses 164's boundary for Person-made groups:** 164 kept roster writes
+  maintenance-only because a holder of the application credential can stamp any principal;
+  263 keys them on that stamp, so such a holder can forge an invite and its acceptance (header
+  section 2). Detection only: every audit row carries `session_user`. Accepting also gives
+  the invitee's live-linked agents read access (234), and write access at writer/admin (206).
+  Re-states 176's two team-group guards (md5 precondition; the undo has one too, accepting
+  263's or 176's bodies) with one admission each, on
+  INSERT only: a row of the new `team_group_roster_grants` (194's purge-grant shape, keyed
+  on `pg_current_xact_id()`, no application privilege) that the definer writes for the one
+  row it inserts and deletes before it returns; every other path keeps 176's GRM05 / GRM06
+  text. One `group.` audit row per act (`team_created`, `invitation_created`,
+  `member_added` with `arm = 'invitation'`, `invitation_declined`), attributed to the
+  caller, without 164's caller-settable `actor`. `group_invitations` is FORCEd with
+  privileged policies only (166's shape). Refusal codes TGP01..TGP09 (header section 6).
+  Registered in `tenancy_backfill.rs` (both registers) and `elevation_arms_census.rs`.
+  Pinned by `epigraph-db/tests/person_team_groups.rs`,
+  `epigraph-db/tests/person_team_groups_undo.rs`, and the REST and MCP twins'
+  app-role tests. Undo: `docs/runbooks/263-undo.sql` (tested: run twice, it returns the
+  `public` catalog to below 263, restoring 176's guards byte for byte, and refuses 55000
+  over a guard a later migration re-bodied; it LOSES every invitation row and the
+  `person_team_groups` record, and keeps the groups and memberships). Checked before
+  claiming: slot 263 was assigned to this change. **Deploy order:** migrate, then roll out
+  the binary that
+  serves the routes and tools (a binary ahead of the migration answers 42883 on them); human
+  OAuth clients need `groups:write` / `groups:read` granted to reach them. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+- **264**: public `role_successor_restore` (backlog 9073f0a5). Adds the maintenance-only
+  SECURITY DEFINER `epigraph_restore_role_successor(role, root, successor, valid_to, reason)`:
+  after a role's root identity was detached, re-attaching it by name did not give the group back
+  to its running successor, whose old succession copy (chained to the root's DETACHED row) still
+  covered the window (166's follow copies into gaps only), so recovery was the manual
+  detach-the-stale-copy-then-attach-by-name pair. The verb does that pair in ONE audited act,
+  under 107's and 166's advisory locks: it attaches the root by name (or keeps its live row made
+  by name; a root that never held a row made by name for the role is refused, so a middle
+  identity cannot be named to undo its own detach), then, only where a copy written fresh from
+  the root's row would admit the successor
+  (179's folder rule against the root; 195's sticky detach on the successor; every row of its
+  covering copies' chains below the root's row live; 195's walk up `agent_succession` reaching no
+  other detached identity), detaches the successor's covering rows and attaches it by name until
+  the root row's end (a finite end ends the successor with the root). The walk runs before the
+  "nothing to do" answer, so `successor_unchanged` means admitted. Refusals are `ROL04`, nothing
+  written. Writes one `platform.role_successor_restored` audit row (with its `outcome`, also when
+  only the root was attached) beside 166's per-row events, and reports
+  registered descendants still out. No body is re-stated: the derivation, the registration and
+  the follow are unchanged (so it does not depend on any re-statement of
+  `epigraph_role_derived_memberships`). `epigraph-operator restore-role-successor` drives it
+  (dry run by rollback). Owned by `epigraph_maintenance`, EXECUTE for that role only (revoked
+  from `epigraph_app`), `search_path = pg_catalog, pg_temp`. Pinned by
+  `epigraph-db/tests/role_successor_restore.rs`. Undo: `docs/runbooks/264-undo.sql` (roll the
+  CLI back first). **Deploy order:** migrate first, then the CLI.
+- **266**: public `compromised_revoke_pass_cap` (backlog 51fe91bf; slot 266 assigned
+  by the 2026-11-22 backlog triage). Re-states 214's `epigraph_revoke_passkey_compromised(uuid,
+  text)` (same signature, result columns, isolation refusal, lock-and-walk fixpoint, UPDATE
+  and audit mode) with one change: the pass cap is read once, before any lock, from the
+  setting `epigraph.compromised_revoke_max_passes`, used only when it is one or two digits
+  from 1 to 31; anything else (unset, empty, non-numeric, 0, negative, 32 or more) leaves
+  214's 32. The setting can only LOWER the cap, so it can only turn a revoke whose lineage
+  grew during its lock wait into the 40001 refusal with nothing revoked; it never revokes
+  less or loops longer. It exists so that the refusal, which 32 passes made unreachable,
+  is tested. The 40001 HINT now names the setting. A precondition checks the md5 of 214's
+  body (`645f997359d64646702e3db2f86ed7ca`) and RAISEs `55000` (changing nothing) over any
+  other. Owner and grants unchanged; it stays registered at 200 in `tenancy_backfill.rs`.
+  Pinned by `epigraph-db/tests/pending_admin_acts.rs`
+  (`the_compromised_revoke_refuses_40001_once_its_pass_cap_is_spent`,
+  `the_pass_cap_setting_never_refuses_an_ordinary_revoke`,
+  `the_266_undo_restores_214s_compromised_revoke`). Undo: `docs/runbooks/266-undo.sql`
+  (tested: run twice, it returns the `public` catalog to 265's; it refuses `55000` over any
+  body but 266's or 214's); run it BEFORE `214-undo.sql`. **Deploy order:** no binary
+  depends on it and none sets the setting; apply whenever. Operator note: a value set on
+  the role or database (`ALTER ROLE .. SET`) would apply to every revoke; clear it with
+  `ALTER ROLE epigraph_maintenance RESET epigraph.compromised_revoke_max_passes`.
+- **267**: `mass_functions_bba_slot` (backlog 1777638e, the residual of 63bb3d2e). Edge,
+  evidence and assessment BBAs are keyed on `mass_functions`' own slot (`slot_kind` in
+  `edge` / `evidence` / `assessment`, `slot_id`, both nullable, no foreign key) instead of a
+  pseudo-row of `perspectives` (`perspective_type` `edge` / `evidence`), so `perspectives`
+  holds viewpoints only. A slot row is one a slot writer wrote (typed `edge` named
+  `edge_factor`, typed `evidence` named `evidence_grounded`). It moves every slot-keyed row
+  (`perspective_id` to the slot: an edge's for an edge-typed row or an `edge_factor` row on
+  an edge's id, an evidence row's for a key that is an evidence row's id whatever the label,
+  otherwise an assessment for `discount`), FAILS CLOSED (55000, nothing changed) on a row it
+  cannot classify (A1), on a slot-shaped row it would leave behind or an `edge_factor` row
+  whose edge is gone (A3), on a
+  `community_members` row naming a slot row (A2), on an edge naming a slot row as a
+  `perspective` endpoint (A4: it would dangle; a past `dekg migrate` wrote CONTRIBUTES_TO
+  edges from every BBA's perspective) and on a perspective typed `edge` / `evidence` under
+  another name (A5: a viewpoint, `create_perspective` never validated the type); rebuilds the unique key as
+  `mass_functions_unique_per_key UNIQUE NULLS NOT DISTINCT (claim_id, frame_id,
+  source_agent_id, perspective_id, slot_kind, slot_id)` with `mass_functions_slot_shape`
+  and `idx_mass_functions_slot`; deletes the slot rows (a perspective that is not a slot
+  row is kept even when BBAs move off it: it is a viewpoint 267 has no copy of) and
+  adds `perspectives_not_bba_slot` (a `create_perspective` with either type is then refused
+  with 23514).
+  Re-states 194's `epigraph_cascade_delete_edge_bbas`, 115's `epigraph_dedup_move_bbas`
+  and 120's `epigraph_record_cascade_deferral` on the slot (an md5 precondition refuses to
+  apply over any other body) and adds `epigraph_edge_bbas_keyed(uuid)` (SECURITY DEFINER,
+  owner `epigraph_maintenance`, EXECUTE to `epigraph_app` and `epigraph_maintenance`):
+  whether any writer's BBA is keyed on an edge's slot, answered only to the edge's writer,
+  which the edge-withdraw path asks before it records an `edge_retract` deferral. It also
+  re-states 243's `epigraph_foreign_belief_cache` (md5 precondition on 243's body; added
+  when the 2026-11-23 staging integration merged 267 over 243): only its inlined owner-rule
+  predicates change, to read the slot, so a moved edge-factor row is admissible through its
+  edge slot alone and never through a NULL `perspective_id`; the undo re-states 243's body.
+  Pinned by `epigraph-db/tests/foreign_cache_repoint.rs` (the body carries the Rust predicates
+  verbatim) and by
+  `epigraph-db/tests/bba_slot_migration_267.rs` (the legacy shapes, each refusal, the
+  undo), `perspective_list_internal_types.rs`, `perspective_evidence_fk_tests.rs`, and the
+  writer tests `epigraph-mcp/tests/bba_slot_writers.rs` and
+  `epigraph-api/tests/assess_canonical_frame.rs::the_assessment_slot_is_a_column_and_writes_no_perspective`.
+  Before migrating, measure on the deployed database. Below, SLOT stands for the slot-row
+  test `((p.perspective_type = 'edge' AND p.name = 'edge_factor') OR (p.perspective_type =
+  'evidence' AND p.name = 'evidence_grounded'))`, the exact set 267 deletes; each query
+  computes what the migration computes:
+  - what 267 deletes and moves: `SELECT p.perspective_type, p.name, count(*) FROM
+    perspectives p WHERE p.perspective_type IN ('edge','evidence') GROUP BY 1, 2` and
+    `SELECT p.perspective_type, mf.combination_method, count(*) FROM mass_functions mf JOIN
+    perspectives p ON p.id = mf.perspective_id WHERE SLOT GROUP BY 1, 2` (A1 refuses an
+    `evidence`-typed row whose label is neither `auto_wire` nor `discount`);
+  - A3, expected no rows: `SELECT mf.combination_method, count(*) FROM mass_functions mf
+    JOIN perspectives p ON p.id = mf.perspective_id WHERE NOT (SLOT OR
+    (mf.combination_method = 'edge_factor' AND EXISTS (SELECT 1 FROM edges e WHERE e.id =
+    mf.perspective_id)) OR (mf.combination_method = 'auto_wire' AND EXISTS (SELECT 1 FROM
+    evidence v WHERE v.id = mf.perspective_id))) AND (p.name IN ('edge_factor',
+    'evidence_grounded') OR EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id) OR
+    mf.combination_method = 'edge_factor') GROUP BY 1`. A row here is a slot-shaped row 267
+    would leave behind, or an `edge_factor` row whose edge is gone, keyed on a perspective
+    that is not a slot row (before 267 the cache's edge arm kept it out; decide it by hand,
+    for example delete it, since no edge vouches for it);
+  - A2, expected 0: `SELECT count(*) FROM community_members cm JOIN perspectives p ON p.id =
+    cm.perspective_id WHERE SLOT`;
+  - A4, expected 0 (an operator decision otherwise: delete or re-point those edges first):
+    `SELECT count(*) FROM edges e JOIN perspectives p ON (e.source_type = 'perspective' AND
+    p.id = e.source_id) OR (e.target_type = 'perspective' AND p.id = e.target_id) WHERE
+    SLOT`;
+  - A5, expected 0 (retype them first): `SELECT count(*) FROM perspectives p WHERE
+    p.perspective_type IN ('edge','evidence') AND NOT SLOT`;
+  - viewpoints 267 KEEPS although it moves their BBAs to a slot (for information):
+    `SELECT count(DISTINCT p.id) FROM mass_functions mf JOIN perspectives p ON p.id =
+    mf.perspective_id WHERE NOT SLOT AND ((mf.combination_method = 'edge_factor' AND
+    EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)) OR
+    (mf.combination_method = 'auto_wire' AND EXISTS (SELECT 1 FROM evidence v WHERE v.id =
+    mf.perspective_id)))`;
+  - `pg_total_relation_size('mass_functions')`: the key rebuild holds ACCESS EXCLUSIVE on
+    the table for one index build.
+
+  Undo: `docs/runbooks/267-undo.sql` (re-creates the slot rows from each slot's earliest
+  BBA; a kept viewpoint takes its BBAs back unchanged).
+
+  **Deploy order:** every binary that writes a BBA and the migration go TOGETHER, writers
+  stopped between them. On a database at 267, a binary built before 267 fails on EVERY BBA
+  write, not only the slot writes: `MassFunctionRepository::store_keyed` upserts with
+  `ON CONFLICT (claim_id, frame_id, source_agent_id, perspective_id)`, which no unique index
+  matches once 267 drops `mass_functions_unique_per_perspective`, so genuine-perspective and
+  unscoped writes fail with 42P10 too. Its slot writers are also refused by
+  `perspectives_not_bba_slot` (23514). In the other direction, a 267 binary on a database
+  before 267 writes slot columns that do not exist. Swap together, from one build:
+  - the API (`server`, `drain_jobs`);
+  - the MCP server (`epigraph-mcp-full`), including every agent container image that
+    bundles it. Restart every stdio MCP client too: each keeps the old binary open until it
+    is restarted;
+  - the `epigraph-cli` binaries the timers and operators run that store, move or restore
+    BBAs: among them `backfill_factors`, `recompute_claim_belief`, `recompute_betp`,
+    `replay_deferred_cascades`, `restore_edge_factors`, `sweep_retired_source_bbas`,
+    `sweep_semantic_duplicates`, `unmark_duplicate` and `operator`. The read paths changed
+    too (an edge's BBAs are found on the slot), so the safe rule is every binary of the
+    workspace.
+
+  Rolling back means the undo with the binaries rolled back first (see its header).
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **268**: public `agent_prompt_history_meta` (backlog bedd59b7, 24a9f4fa). Adds the
+  SECURITY DEFINER `epigraph_agent_prompt_history_meta(agent, after_depth, after_agent,
+  after_first_seen, after_snapshot, limit)`: 161's prompt-history gate (its admin assignment
+  token for token, AID06 for a refused caller) and walk, returning 161's rows WITHOUT the four
+  file-content columns (each file by its key only; `agent_prompt_blobs` is never read) plus the
+  whole walk's `lineage_min_depth` / `lineage_max_depth`, one keyset page at a time in the order
+  `(abs(depth), depth, agent_id, first_seen, snapshot_id)` (limit NULL/below 1 = 100, clamped
+  to 1000; a half position is 22023). Owned by `epigraph_maintenance` on 172's
+  `pg_catalog, pg_temp` path, EXECUTE granted to `epigraph_app` and `epigraph_maintenance`
+  (guarded). GET /api/v1/agents/:id/prompt-history lists through it with `?limit=` /
+  `?after=` and a per-page byte budget, answering `truncated` and `next_cursor`; the blob
+  route still reads one file through 161. Pinned by
+  `epigraph-db/tests/prompt_history_meta_definer.rs` (catalog shape and content-free result,
+  the listing with the owner's blob SELECT revoked, gate text and caller parity with 161,
+  paging at every page size) and `epigraph-api/tests/agent_prompt_history_route.rs`. Undo:
+  `docs/runbooks/268-undo.sql`. **Deploy order:** migrate BEFORE the binary that lists
+  through it (without it every listing is a 500, 42883); an older binary ignores it.
+- **269**: public `agent_card_disclosure_readers` (backlog 0e419970, the agent-lookup card
+  follow-ups of PR #774). Adds two SECURITY DEFINER reads. `epigraph_agents_linked_to_operator(operator)`:
+  the agents whose 107 operator link names an agent (retired links included), the inverse of
+  `epigraph_operator_of_author`. It decides nothing: the card feeds each such agent, and each agent
+  a 149 allowance names, to the same forward binding rule that fills `operator_human`, and shows
+  the operator as `kind = human` (`operator_of_bound_agent`) when some agent is currently bound to
+  it. No registration or client status is read. Second, `epigraph_disclosed_role_attachments(agents[])`:
+  the 166 `role_agents` attachments of up to 200 agents that are not detached and inside their
+  window now (a roster, not the set 179 admits: a succession copy of a detached root still lists,
+  a future-dated row does not), one per (agent, role), shown only when the session principal IS
+  the agent, is its LIVE human (`epigraph_human_of(agent, true)`, the binding the card's
+  `operator_human` shows), or the session is privileged (`epigraph_bypass()`; an elevated
+  application-role viewer is not); no outsider arm (166 writes no public projection of an
+  attachment, so wider disclosure is left to a ruling). The principal arms trust the stamped
+  `epigraph.principal_id`, which any application-DSN login can set: before 269 only a
+  maintenance session read `role_agents` (same trust class as 198's own-assignments arm). Both
+  on 172's form (`pg_catalog, pg_temp`), owned by `epigraph_maintenance`, EXECUTE granted to `epigraph_app` (guarded;
+  `tenancy_backfill` registers both). Pinned by `epigraph-db/tests/agent_lookup.rs`
+  (`a_human_some_agent_is_bound_to_reads_as_human_to_every_reader`,
+  `role_attachments_are_shown_to_the_agent_its_live_human_and_maintenance_sessions_only`, the
+  catalog and 200-cap tests). Undo:
+  `docs/runbooks/269-undo.sql`. **Deploy order:** migrate BEFORE the binary: a binary built
+  against 269 calls it on every `find_agent` / `get_agent` card and answers 42883 without it.
+- **271**: `function_search_path_pg_temp_last` (backlog eff4aaf5). 190 put `pg_temp` last on
+  every SECURITY DEFINER path; 271 does the same for every other function that pins one,
+  and pins every trigger function. A catalog sweep over every function and procedure
+  outside the system schemas and extensions: a pinned path without `pg_temp` gets
+  `, pg_temp` appended, an empty path becomes `pg_catalog, pg_temp`, an unpinned trigger
+  function (returns `trigger` or is attached to one; not `c`/`internal`) gets
+  `pg_catalog, <its schema>, pg_temp`, and a path listing `pg_temp` before another schema,
+  or one to rebuild whose items are not plain lower-case names or `"$user"`, is refused
+  (55000, nothing changed; a stored path is owner-controlled text, so 271 rebuilds it from
+  validated items with `quote_ident` and never splices it into a statement). Items are read
+  as PostgreSQL reads them (unquoted: ASCII lower-cased; quoted: quotes stripped), so a
+  stored `PG_TEMP` is `pg_temp`. A postcondition refuses (55000) if either rule is
+  still broken. `ALTER ROUTINE .. SET search_path` only: no body, owner, ACL or other
+  config entry moves, so md5-of-`prosrc` preconditions still hold. At 235 it changes 19
+  functions: nine SECURITY INVOKER bodies on a path without `pg_temp` (six triggers, on
+  `mass_functions`, `edges`, `claims`, `agents`, `agent_keys` and `match_candidates`, plus
+  `epigraph_lockdown_privileged`, `epigraph_identity_attestor_faults` and
+  `epigraph_edge_writer_scope`), and ten unpinned trigger functions. Why: an INVOKER body
+  runs as its caller, which inside a definer is the definer's owner, and a path without
+  `pg_temp` resolves the caller's temporary types and relations first; 184's retract
+  guard, fired by the application-executable un-retract definer, did exactly that as the
+  maintenance role. Pinned by `epigraph-db/tests/function_search_path_pg_temp_ratchet.rs`
+  (both catalog rules, calibrated with probes; the behavioural proof on a real
+  NOSUPERUSER application login, which fails below 271; what 271 changes, its refusal,
+  its empty-path / other-schema / procedure branches, its letter-case reading, the
+  precheck and the undo). `TEMP` on the database is NOT revoked here (the application role
+  holds it through PUBLIC; see the header). Precheck: `docs/runbooks/271-precheck.sql`
+  lists every function 271 would refuse. Undo: `docs/runbooks/271-undo.sql` (reverts each
+  function only while its body is still the 235 body and its path is 271's, so it also
+  reverts an identical out-of-band fix). **Deploy order:** none against the binaries. A
+  lower-numbered migration applied after 271 is not swept by it and must state `pg_temp`
+  last itself. A test database applies migrations in version order, where 271 would mask
+  one; `a_lower_migration_applied_after_271_keeps_both_rules` applies everything up to
+  235, then 271, then the rest (production's order) and fails on one that breaks either
+  rule.
 
 ## `-- no-transaction` migrations
 

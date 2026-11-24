@@ -1344,6 +1344,19 @@ pub async fn create_hierarchical_edge(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    // The reserved keys (`epigraph_db::RESERVED_EDGE_PROPERTIES`: the act
+    // marker, the dedup identity, the ingest record) are written only by the
+    // act or the ingest, as on `POST /api/v1/edges` (backlog 3676c459).
+    if let Some(reason) = request
+        .properties
+        .as_ref()
+        .and_then(epigraph_db::reserved_edge_property_refusal)
+    {
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: reason.to_string(),
+        });
+    }
 
     // Tight relationship allow-list — narrower than VALID_RELATIONSHIPS by design.
     if !is_hierarchical_relationship(&request.relationship) {
@@ -1684,6 +1697,19 @@ pub async fn relate_claims(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    // The reserved keys (`epigraph_db::RESERVED_EDGE_PROPERTIES`: the act
+    // marker, the dedup identity, the ingest record) are written only by the
+    // act or the ingest, as on `POST /api/v1/edges` (backlog 3676c459).
+    if let Some(reason) = request
+        .properties
+        .as_ref()
+        .and_then(epigraph_db::reserved_edge_property_refusal)
+    {
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: reason.to_string(),
+        });
+    }
 
     if source_id == request.target_claim_id {
         return Err(ApiError::ValidationError {
@@ -2945,8 +2971,9 @@ pub struct ClaimEvidenceListResponse {
 ///
 /// `GET /api/v1/claims/:id/supporting-evidence`
 ///
-/// Returns edges with relationship SUPPORTS pointing TO this claim,
-/// joined with evidence details.
+/// Returns evidence whose `supports` edge (either stored spelling) points TO
+/// this claim, joined with evidence details. The response's `relationship`
+/// label is `SUPPORTS`.
 #[cfg(feature = "db")]
 pub async fn supporting_evidence(
     State(state): State<AppState>,
@@ -2954,15 +2981,27 @@ pub async fn supporting_evidence(
     Query(_params): Query<EvidenceAccessParams>,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
-    evidence_by_relationship(&state, claim_id, "SUPPORTS", &viewer).await
+    evidence_by_relationship(
+        &state,
+        claim_id,
+        &[epigraph_core::edge::relationships::SUPPORTS],
+        "SUPPORTS",
+        &viewer,
+    )
+    .await
 }
 
 /// Get all contradicting evidence for a claim
 ///
 /// `GET /api/v1/claims/:id/contradicting-evidence`
 ///
-/// Returns edges with relationship CONTRADICTS pointing TO this claim,
-/// joined with evidence details.
+/// Returns evidence whose edge to this claim argues AGAINST it, joined with
+/// evidence details: both weakening relationships
+/// (`epigraph_db::repos::edge::WEAKENING_RELATIONSHIPS`, `contradicts` and
+/// `refutes`), each in either stored spelling. Every evidence write stores
+/// its refuting edge as `refutes` (backlog 2d60f619); matching `CONTRADICTS`
+/// alone made a claim refuted through that path look uncontested (backlog
+/// 548a3c42). The response's `relationship` label stays `CONTRADICTS`.
 #[cfg(feature = "db")]
 pub async fn contradicting_evidence(
     State(state): State<AppState>,
@@ -2970,14 +3009,24 @@ pub async fn contradicting_evidence(
     Query(_params): Query<EvidenceAccessParams>,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
-    evidence_by_relationship(&state, claim_id, "CONTRADICTS", &viewer).await
+    evidence_by_relationship(
+        &state,
+        claim_id,
+        epigraph_db::repos::edge::WEAKENING_RELATIONSHIPS,
+        "CONTRADICTS",
+        &viewer,
+    )
+    .await
 }
 
+/// `relationships` is what the read matches (each in every stored spelling);
+/// `label` is only the response's `relationship` field.
 #[cfg(feature = "db")]
 async fn evidence_by_relationship(
     state: &AppState,
     claim_id: Uuid,
-    relationship: &str,
+    relationships: &[&str],
+    label: &str,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
     let mut read = state.read_as(viewer).await.map_err(|e| {
@@ -3008,7 +3057,7 @@ async fn evidence_by_relationship(
         &mut *read,
         viewer,
         claim_id,
-        relationship,
+        relationships,
     )
     .await
     .map_err(|e| ApiError::InternalError {
@@ -3029,7 +3078,7 @@ async fn evidence_by_relationship(
     let total = evidence.len();
     Ok(Json(ClaimEvidenceListResponse {
         claim_id,
-        relationship: relationship.to_string(),
+        relationship: label.to_string(),
         evidence,
         total,
     }))

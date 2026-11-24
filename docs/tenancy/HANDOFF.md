@@ -207,10 +207,19 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   `protocol_source`, `counterfactual_scenarios.scenario_a` / `scenario_b`,
   `learning_events.lesson` / `resolution`, `match_candidates.verifier_rationale`
   (whose `(claim_a, claim_b)` pair is itself a near-duplicate oracle over the
-  private corpus), and `behavioral_executions.goal_text` / `goal_embedding`.
+  private corpus), and `behavioral_executions.goal_text` / `goal_embedding`
+  (closed by migration 240, backlog 88cf603b, for a workflow's OWN runs:
+  each run carries its workflow's tenancy under FORCEd row security, and its
+  exemption row is gone. OPEN residual, no longer recorded in the registry: a
+  run follows its workflow only, never its `step_claim_id`, so a run of a
+  public plan that names a group-private step, and a run recorded before its
+  step was narrowed while its plan stays public (a partial privatization),
+  keep that step's id, tool pattern and deviation reasons public.
+  `reown-workflows` reports such runs as `behavioral_executions_unhidden`).
   This is exactly the failure class the plan's §12 summary names — *"a derived
   table nobody listed keeps the plaintext public after privatization"*. The
   registry CATCHES it; it does not CLOSE it. All twelve `tenancy_exempt` rows
+  (eleven since migration 240 covered `behavioral_executions`)
   carry `reviewed_by = 'PENDING'`, which is honest — nothing in PR-05 could
   cause a review — but it means the registry's "named reviewer" property is
   currently unmet for every row. `tenancy_coverage.rs::

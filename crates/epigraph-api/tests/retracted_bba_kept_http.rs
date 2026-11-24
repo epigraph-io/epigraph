@@ -5,7 +5,9 @@
 //! replayed), `POST /api/v1/claims/:id/dedup` (its repair and its re-wire of
 //! re-sourced edges), `POST /api/v1/claims/:id/undedup` and
 //! `DELETE /api/v1/edges/:id` with its maintenance replay; each act
-//! completes, and the cascade counts what it kept.
+//! completes, and the cascade counts what it kept. Also
+//! `PATCH /api/v1/edges/:id` retiring an edge (and its replay), and a
+//! deferred dedup with its replay.
 //!
 //! Handlers are invoked directly with the caller's `ViewerExtractor`, as
 //! `own_claim_authority_http.rs` does. Known limit: the router's wiring and
@@ -25,7 +27,7 @@ use axum::Json;
 use epigraph_api::middleware::bearer::AuthContext;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::middleware::ClientType;
-use epigraph_api::routes::edges::delete_edge;
+use epigraph_api::routes::edges::{delete_edge, patch_edge, PatchEdgeRequest};
 use epigraph_api::routes::versioning::{
     mark_duplicate, supersede_claim, unmark_duplicate, DedupRequest, SupersedeRequest,
 };
@@ -115,13 +117,6 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     .fetch_one(pool)
     .await
     .expect("seed edge");
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'edge_factor', 'edge')",
-    )
-    .bind(id)
-    .execute(pool)
-    .await
-    .expect("seed the edge's perspective");
     id
 }
 
@@ -136,12 +131,12 @@ async fn frame(pool: &PgPool, tag: &str) -> Uuid {
 }
 
 async fn bba(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, perspective: Uuid) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_in_slot(
         pool,
         claim,
         frame,
         Some(agent),
-        Some(perspective),
+        epigraph_db::BbaSlot::Edge(perspective),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("edge_factor"),
@@ -408,12 +403,12 @@ async fn app_bba(pool: &PgPool, agent: Uuid, claim: Uuid, frame: Uuid, perspecti
     let v = viewer(pool, agent).await;
     as_role(pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &v, agent).await;
-        let id = MassFunctionRepository::store_with_perspective(
+        let id = MassFunctionRepository::store_in_slot(
             &mut *conn,
             claim,
             frame,
             Some(agent),
-            Some(perspective),
+            epigraph_db::BbaSlot::Edge(perspective),
             &serde_json::json!({"0": 0.6, "0,1": 0.4}),
             None,
             Some("test"),
@@ -500,7 +495,7 @@ async fn http_dedup_inline_rewires_a_resourced_edge_past_another_keys_retracted_
     );
     let rewired: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM mass_functions \
-          WHERE claim_id = $1 AND perspective_id = $2 AND source_agent_id = $3 \
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2 AND source_agent_id = $3 \
             AND retracted_at IS NULL",
     )
     .bind(xc)
@@ -607,14 +602,21 @@ async fn http_undedup_keeps_a_retracted_cached_key_and_reports_drift(pool: PgPoo
     );
 }
 
-/// Sites 4 and 5 over HTTP (`DELETE /edges/:id`) and its replay: the edge's
-/// owner retracts it. In the request (the application-session caller arm of
-/// `withdraw_edge_bbas_conn`) the owner's live edge BBA goes and its
-/// retracted one stays; the maintenance replay removes the other writer's
-/// live one and keeps its retracted one. Neither half fails.
-#[sqlx::test(migrations = "../../migrations")]
-async fn http_delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) {
-    let state = app_role_state(&pool, false).await;
+/// An edge `a -> b` its owner wrote on the application role, with four
+/// edge-keyed BBAs on `b`: the owner's live one and its retracted one, and
+/// another writer's live one and retracted one.
+struct EdgeWithdrawalWorld {
+    owner: Uuid,
+    b: Uuid,
+    e: Uuid,
+    own_live: Uuid,
+    own_retracted: Uuid,
+    foreign_live: Uuid,
+    foreign_retracted: Uuid,
+}
+
+async fn edge_withdrawal_world(pool: &PgPool) -> EdgeWithdrawalWorld {
+    let pool = pool.clone();
     let (owner, _) = seed_agent_with_group(&pool, "k4a-http-edge-owner").await;
     let (foreign, _) = seed_agent_with_group(&pool, "k4a-http-edge-foreign").await;
     let author = seed_agent_with_group(&pool, "k4a-http-edge-author").await.0;
@@ -637,13 +639,6 @@ async fn http_delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) 
         (conn, e)
     })
     .await;
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'edge_factor', 'edge')",
-    )
-    .bind(e)
-    .execute(&pool)
-    .await
-    .expect("seed the edge's perspective");
     let own_live = app_bba(&pool, owner, b, f1, e).await;
     let own_retracted = app_bba(&pool, owner, b, f2, e).await;
     let foreign_live = app_bba(&pool, foreign, b, f1, e).await;
@@ -651,6 +646,34 @@ async fn http_delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) 
     retract_through_definer(&pool, own_retracted).await;
     retract_through_definer(&pool, foreign_retracted).await;
 
+    EdgeWithdrawalWorld {
+        owner,
+        b,
+        e,
+        own_live,
+        own_retracted,
+        foreign_live,
+        foreign_retracted,
+    }
+}
+
+/// Sites 4 and 5 over HTTP (`DELETE /edges/:id`) and its replay: the edge's
+/// owner retracts it. In the request (the application-session caller arm of
+/// `withdraw_edge_bbas_conn`) the owner's live edge BBA goes and its
+/// retracted one stays; the maintenance replay removes the other writer's
+/// live one and keeps its retracted one. Neither half fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) {
+    let state = app_role_state(&pool, false).await;
+    let EdgeWithdrawalWorld {
+        owner,
+        b,
+        e,
+        own_live,
+        own_retracted,
+        foreign_live,
+        foreign_retracted,
+    } = edge_withdrawal_world(&pool).await;
     let status = delete_edge(
         ViewerExtractor(viewer(&pool, owner).await),
         State(state),
@@ -687,5 +710,122 @@ async fn http_delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) 
         row_state(&pool, foreign_live).await,
         None,
         "and removes its live one"
+    );
+}
+
+/// Site 4's twin over HTTP (`PATCH /edges/:id` with a past `valid_to`): it
+/// reaches the same caller arm of `withdraw_edge_bbas_conn` as the DELETE.
+/// The owner's live edge BBA goes and its retracted one stays; the
+/// maintenance replay removes the other writer's live one and keeps its
+/// retracted one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_patch_edge_retiring_an_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) {
+    let state = app_role_state(&pool, false).await;
+    let w = edge_withdrawal_world(&pool).await;
+    let Json(resp) = patch_edge(
+        ViewerExtractor(viewer(&pool, w.owner).await),
+        State(state),
+        with_scopes(w.owner, &["edges:write"]),
+        Path(w.e),
+        Json(PatchEdgeRequest {
+            valid_to: Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            properties: None,
+        }),
+    )
+    .await
+    .expect("the owner retires its edge");
+    assert!(resp.valid_to.is_some(), "calibration: the edge is retired");
+    assert_eq!(
+        row_state(&pool, w.own_retracted).await,
+        Some((w.b, true)),
+        "the request keeps the owner's retracted edge BBA"
+    );
+    assert_eq!(
+        row_state(&pool, w.own_live).await,
+        None,
+        "and deletes its live one"
+    );
+    assert_eq!(
+        row_state(&pool, w.foreign_live).await,
+        Some((w.b, false)),
+        "calibration: another writer's live row waits for the replay"
+    );
+
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    assert_eq!(
+        row_state(&pool, w.foreign_retracted).await,
+        Some((w.b, true)),
+        "the replay keeps another writer's retracted edge BBA"
+    );
+    assert_eq!(
+        row_state(&pool, w.foreign_live).await,
+        None,
+        "and removes its live one"
+    );
+}
+
+/// Site 2 over HTTP with NO maintenance connection: the dedup's repair is
+/// deferred, and the maintenance replay (the production path) keeps both
+/// retracted rows where they are and the live copy a retracted holder blocks
+/// on the duplicate, without failing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_dedup_deferred_replay_keeps_retracted_rows_and_the_live_copy_they_block(
+    pool: PgPool,
+) {
+    let state = app_role_state(&pool, false).await;
+    let (h, hg) = seed_agent_with_group(&pool, "k4a-http-deferred-h").await;
+    let (x, xg) = seed_agent_with_group(&pool, "k4a-http-deferred-x").await;
+    let dup = claim_of(&pool, h, hg, "k4a http deferred duplicate").await;
+    let canonical = claim_of(&pool, h, hg, "k4a http deferred canonical").await;
+    let xc = claim_of(&pool, x, xg, "k4a http deferred citer").await;
+    let e = edge(&pool, xc, dup).await;
+    let (f1, f2) = (frame(&pool, "dd1").await, frame(&pool, "dd2").await);
+    let live_copy = bba(&pool, dup, f1, x, e).await;
+    let retracted_holder = bba(&pool, canonical, f1, x, e).await;
+    let retracted_copy = bba(&pool, dup, f2, x, e).await;
+    let live_holder = bba(&pool, canonical, f2, x, e).await;
+    retract_through_definer(&pool, retracted_holder).await;
+    retract_through_definer(&pool, retracted_copy).await;
+
+    let Json(resp) = mark_duplicate(
+        ViewerExtractor(viewer(&pool, h).await),
+        State(state),
+        human(h),
+        Path(dup),
+        Json(DedupRequest {
+            canonical_id: canonical,
+            reason: None,
+        }),
+    )
+    .await
+    .expect("the author's dedup");
+    let cascade = serde_json::to_value(&resp.cascade).expect("cascade");
+    assert_eq!(cascade["status"], "deferred", "PREMISE: {cascade}");
+
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    assert_eq!(
+        row_state(&pool, retracted_copy).await,
+        Some((dup, true)),
+        "the replay keeps the retracted copy where it is"
+    );
+    assert_eq!(
+        row_state(&pool, retracted_holder).await,
+        Some((canonical, true)),
+        "and the retracted holder"
+    );
+    assert_eq!(
+        row_state(&pool, live_copy).await,
+        Some((dup, false)),
+        "the live copy a retracted holder blocks stays on the duplicate"
+    );
+    assert_eq!(
+        row_state(&pool, live_holder).await,
+        Some((canonical, false))
+    );
+    assert!(
+        !is_current(&pool, dup).await,
+        "calibration: the mark landed"
     );
 }

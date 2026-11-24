@@ -8,6 +8,8 @@ pub mod atlas_naming;
 #[cfg(feature = "db")]
 pub mod atlas_nightly;
 #[cfg(feature = "db")]
+pub mod atlas_undo;
+#[cfg(feature = "db")]
 pub mod atomicity_sweep;
 #[cfg(feature = "db")]
 pub mod backfill_factors;
@@ -22,7 +24,12 @@ pub mod bootstrap;
 pub mod bridge;
 #[cfg(feature = "db")]
 pub mod cache_owner_audit;
+pub mod contamination_split;
 pub mod decompose;
+#[cfg(feature = "db")]
+pub mod decomposes_to_factor_sweep;
+#[cfg(feature = "db")]
+pub mod dekg_frames;
 #[cfg(feature = "db")]
 pub mod edge_rewire;
 #[cfg(feature = "db")]

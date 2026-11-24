@@ -46,12 +46,14 @@ async fn chain(pool: &PgPool, viewer: &Viewer) -> Chain {
     let ab = wired_edge(pool, viewer, author, a, b, "supports").await;
     let bc = wired_edge(pool, viewer, author, b, c, "contradicts").await;
     let held_edge = wired_edge(pool, viewer, author, a, m, "supports").await;
-    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
-        .bind(held_edge)
-        .bind(STALE_PRE_401)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE mass_functions SET masses = $2::jsonb WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(held_edge)
+    .bind(STALE_PRE_401)
+    .execute(pool)
+    .await
+    .unwrap();
     refold(pool, viewer, m).await;
     let wave = vec![move_claim(pool, viewer, a, EVIDENCE_B).await];
     Chain {
@@ -282,6 +284,83 @@ async fn predict_seeds_from_the_wave_and_refuses_an_unknown_state(pool: PgPool) 
     let _ = (ch.bc, ch.c);
 }
 
+/// Overwrite claim `id`'s seven cache columns with `c`.
+async fn set_cache(pool: &PgPool, id: Uuid, c: &CacheColumns) {
+    sqlx::query(
+        "UPDATE claims SET belief = $2, plausibility = $3, pignistic_prob = $4, \
+                mass_on_empty = $5, mass_on_missing = $6, belief_frame_id = $7, \
+                classification = $8 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(c.belief)
+    .bind(c.plausibility)
+    .bind(c.pignistic_prob)
+    .bind(c.mass_on_empty)
+    .bind(c.mass_on_missing)
+    .bind(c.belief_frame_id)
+    .bind(&c.classification)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Backlog ed2f99a8: the apply refuses a wave claim whose state is not the
+/// one the accepted predict worked from, and writes nothing. The operator
+/// accepts a predict; then the wave claim `a` is rewritten (a value neither
+/// the wave's `before` nor its `written`): the apply refuses
+/// `l1_state_unknown`, and no edge row, cache or snapshot record is written.
+/// Put back to the wave's `before` (the predict would overlay `written`, the
+/// apply cannot): refused `l1_state_before`, nothing written. Back at the
+/// wave's `written`, the same apply runs and rewrites what the predict said.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_apply_refuses_a_wave_claim_rewritten_since_the_predict(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+    let accepted = predict(&pool, &viewer, &ch.wave).await;
+    assert_eq!(
+        accepted.would_rewrite(),
+        vec![ch.ab, ch.bc],
+        "PREMISE: the accepted predict rewrites the chain"
+    );
+    let o = opts();
+    let seed = seed_from_waves(&ch.wave, o.epsilon);
+
+    // Rewritten since the predict.
+    sqlx::query("UPDATE claims SET belief = 0.33 WHERE id = $1")
+        .bind(ch.a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state = fingerprint(&pool).await;
+    let (mut w, mut r) = (Vec::new(), Vec::new());
+    let err = run_targeted_rewire(&pool, &viewer, &seed, &o, &mut w, &mut r)
+        .await
+        .expect_err("a wave claim rewritten since the predict is refused");
+    assert!(err.to_string().contains("l1_state_unknown"), "{err}");
+    assert!(err.to_string().contains(&ch.a.to_string()), "{err}");
+    assert!(w.is_empty() && r.is_empty(), "no snapshot record");
+    assert_eq!(fingerprint(&pool).await, state, "the refused apply wrote");
+
+    // Back at the wave's `before`.
+    set_cache(&pool, ch.a, &ch.wave[0].before).await;
+    let state = fingerprint(&pool).await;
+    let (mut w, mut r) = (Vec::new(), Vec::new());
+    let err = run_targeted_rewire(&pool, &viewer, &seed, &o, &mut w, &mut r)
+        .await
+        .expect_err("a wave claim back at its before is refused");
+    assert!(err.to_string().contains("l1_state_before"), "{err}");
+    assert!(w.is_empty() && r.is_empty(), "no snapshot record");
+    assert_eq!(fingerprint(&pool).await, state, "the refused apply wrote");
+
+    // At the wave's `written` again: the state the predict used. It runs.
+    set_cache(&pool, ch.a, &ch.wave[0].written).await;
+    let (mut w, mut r) = (Vec::new(), Vec::new());
+    let applied = run_targeted_rewire(&pool, &viewer, &seed, &o, &mut w, &mut r)
+        .await
+        .expect("the apply runs from the predicted state");
+    assert_eq!(applied.rewired(), 2, "{applied:?}");
+}
+
 /// The fixed-point verify after an apply (§1.5 (b)) when an L1 claim was
 /// also a rewire TARGET: `a → b` with both `a` and `b` moved by L1. After the
 /// apply, `b` holds the rewire's value, neither its L1 `before` nor its L1
@@ -370,10 +449,10 @@ async fn targeted_predict_apply_and_restore_run_on_a_maintenance_login(pool: PgP
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, masses, \
                                      combination_method, source_strength, evidence_type, locality_tag, \
                                      retracted_at, retracted_by, retract_reason) \
-         VALUES ($1, $2, $3, $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
+         VALUES ($1, $2, $3, 'edge', $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
                  now(), $3, 'cal4 maint fixture')",
     )
     .bind(held_target)
@@ -672,7 +751,20 @@ async fn predict_converges_on_a_cycle_and_equals_the_apply(pool: PgPool) {
     let b = fresh_claim(&pool, &viewer, author, frame, "pcycle b", TARGET_EVIDENCE).await;
     let _ab = wired_edge(&pool, &viewer, author, a, b, "supports").await;
     let _ba = wired_edge(&pool, &viewer, author, b, a, "supports").await;
+    // An edge from `a` with a live row but no longer in force: `a` is a
+    // source again in later passes (the cycle brings it back), and the
+    // edge is still ONE unselectable edge.
+    let x = fresh_claim(&pool, &viewer, author, frame, "pcycle x", TARGET_EVIDENCE).await;
+    let gone = wired_edge(&pool, &viewer, author, a, x, "supports").await;
     settle(&pool, &viewer, &[a, b]).await;
+    sqlx::query(
+        "UPDATE edges SET valid_from = now() - interval '2 hours', \
+                          valid_to = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(gone)
+    .execute(&pool)
+    .await
+    .unwrap();
     let wave = vec![move_claim(&pool, &viewer, a, EVIDENCE_B).await];
     let o = TargetedRunOptions {
         max_passes: 200,
@@ -713,6 +805,22 @@ async fn predict_converges_on_a_cycle_and_equals_the_apply(pool: PgPool) {
     );
     assert!(predicted.totals.held.is_empty(), "{:?}", predicted.totals);
     assert_eq!(
+        predicted.totals.scc_sizes,
+        vec![2],
+        "the two-claim cycle is one component"
+    );
+    let per_pass: usize = predicted.passes.iter().map(|p| p.not_selectable).sum();
+    assert!(
+        per_pass > 1,
+        "PREMISE: `a` is a source in more than one pass: {:?}",
+        predicted.passes
+    );
+    assert_eq!(
+        predicted.totals.not_selectable, 1,
+        "one distinct unselectable edge, not a per-pass sum"
+    );
+    assert_eq!(applied.not_selectable, 1, "{applied:?}");
+    assert_eq!(
         predicted.would_rewrite(),
         records.iter().map(|x| x.edge_id).collect::<Vec<_>>(),
         "the predict's rewrites, in visit order, are the apply's"
@@ -743,4 +851,166 @@ async fn predict_converges_on_a_cycle_and_equals_the_apply(pool: PgPool) {
         "the verify moves no target by more than 1e-9: {:?}",
         verify.totals
     );
+}
+
+/// The design report's remaining fields, each against an oracle outside the
+/// predict:
+///
+/// * `d_row_other` (P0 − M_s): ~0 for the `r173` row (it IS the wire from the
+///   source's pre-move interval) and large for the pre-#401 row; `d_row_cal`
+///   (P1 − P0) is the move itself, non-zero;
+/// * `ow_clamped`: set only on the edge whose source stores an open-world
+///   mass wider than its interval;
+/// * `not_selectable`: an edge sourced at the moved claim, holding a live
+///   row, but no longer in force, is counted, not silently skipped;
+/// * `d_edge_belief` / `d_edge_plausibility`: on a fresh target R is the
+///   stored cache, so they equal what the real apply then moves the stored
+///   belief and plausibility by;
+/// * `top_movers`: every moved target, largest |d_edge| first;
+/// * `scc_sizes`: a chain has no cycle.
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_reports_row_components_movers_and_unselectable_edges(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+    let author = seed_agent(&pool, "predict-report").await;
+    let frame = binary_frame(&pool, &viewer).await;
+    // A source whose stored open-world mass (0.999) exceeds its interval's
+    // width, wired and then moved like `a`.
+    let wide = fresh_claim(&pool, &viewer, author, frame, "wide ow", EVIDENCE_A).await;
+    sqlx::query("UPDATE claims SET open_world_mass = 0.999 WHERE id = $1")
+        .bind(wide)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let y = fresh_claim(
+        &pool,
+        &viewer,
+        author,
+        frame,
+        "wide ow target",
+        TARGET_EVIDENCE,
+    )
+    .await;
+    let wide_edge = wired_edge(&pool, &viewer, author, wide, y, "supports").await;
+    // An edge from `a` whose row is live but which is no longer in force.
+    let x = fresh_claim(
+        &pool,
+        &viewer,
+        author,
+        frame,
+        "retired target",
+        TARGET_EVIDENCE,
+    )
+    .await;
+    let gone = wired_edge(&pool, &viewer, author, ch.a, x, "supports").await;
+    sqlx::query(
+        "UPDATE edges SET valid_from = now() - interval '2 hours', \
+                          valid_to = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(gone)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut wave = ch.wave.clone();
+    wave.push(move_claim(&pool, &viewer, wide, EVIDENCE_B).await);
+    let stored_b = cache(&pool, ch.b).await;
+
+    let report = predict(&pool, &viewer, &wave).await;
+
+    let edge = |id: Uuid| {
+        report
+            .edges
+            .iter()
+            .find(|e| e.edge_id == id)
+            .unwrap_or_else(|| panic!("edge {id} reached: {:?}", report.edges))
+    };
+    let ab = edge(ch.ab);
+    assert!(
+        ab.d_row_other.expect("ab has a baseline") < 1e-12,
+        "an r173 row is the baseline wire: {ab:?}"
+    );
+    assert!(ab.d_row_cal.expect("ab has a baseline") > 1e-3, "{ab:?}");
+    assert!(!ab.ow_clamped, "{ab:?}");
+    assert!(!ab.mass_unreadable, "{ab:?}");
+    let held = edge(ch.held_edge);
+    assert_eq!(held.outcome, "row_mixed");
+    assert!(
+        held.d_row_other.expect("held has a baseline") > 1e-3,
+        "the pre-#401 row is stale for another reason: {held:?}"
+    );
+    let wide_e = edge(wide_edge);
+    let (bel, pl): (f64, f64) =
+        sqlx::query_as("SELECT belief, plausibility FROM claims WHERE id = $1")
+            .bind(wide)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        0.999 > pl - bel + 1e-12,
+        "PREMISE: ow exceeds the width {}",
+        pl - bel
+    );
+    assert!(wide_e.ow_clamped, "{wide_e:?}");
+    assert_eq!(wide_e.outcome, "rewire", "{wide_e:?}");
+    assert!(
+        report.edges.iter().all(|e| e.edge_id != gone),
+        "an edge out of force is not selected"
+    );
+    assert_eq!(report.passes[0].not_selectable, 1, "{:?}", report.passes);
+    assert_eq!(report.totals.not_selectable, 1, "{:?}", report.totals);
+    assert!(report.totals.scc_sizes.is_empty(), "{:?}", report.totals);
+    assert_eq!(report.totals.mass_unreadable, 0, "{:?}", report.totals);
+
+    let movers: Vec<Uuid> = report
+        .totals
+        .top_movers
+        .iter()
+        .map(|m| m.target_id)
+        .collect();
+    let mut moved: Vec<Uuid> = report
+        .targets
+        .iter()
+        .filter(|(_, t)| t.d_edge.is_some())
+        .map(|(id, _)| *id)
+        .collect();
+    moved.sort_unstable();
+    let mut sorted = movers.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, moved, "every moved target is listed");
+    for pair in report.totals.top_movers.windows(2) {
+        assert!(pair[0].d_edge.abs() >= pair[1].d_edge.abs(), "{pair:?}");
+    }
+    for m in &report.totals.top_movers {
+        assert_eq!(Some(m.d_edge), report.targets[&m.target_id].d_edge);
+    }
+
+    let o = opts();
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    run_targeted_rewire(
+        &pool,
+        &viewer,
+        &seed_from_waves(&wave, o.epsilon),
+        &o,
+        &mut w,
+        &mut r,
+    )
+    .await
+    .expect("apply");
+    let written_b = cache(&pool, ch.b).await;
+    let t = &report.targets[&ch.b];
+    assert!(t.fresh, "{t:?}");
+    assert_close(
+        t.d_edge_belief.expect("d_edge_belief"),
+        written_b.belief.unwrap() - stored_b.belief.unwrap(),
+        1e-9,
+        "d_edge on belief",
+    );
+    assert_close(
+        t.d_edge_plausibility.expect("d_edge_plausibility"),
+        written_b.plausibility.unwrap() - stored_b.plausibility.unwrap(),
+        1e-9,
+        "d_edge on plausibility",
+    );
+    assert!(t.d_edge_belief.unwrap().abs() > 1e-6, "{t:?}");
 }

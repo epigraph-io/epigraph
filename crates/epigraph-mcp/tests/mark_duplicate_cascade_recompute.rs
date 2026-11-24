@@ -2,22 +2,23 @@
 //! `mark_duplicate` — PREREGISTRATION.md criterion C5 / BCH-EG-K03.
 //!
 //! `mark_duplicate` mutates only `edges` and `claims`. Edge-factor BBAs are
-//! stored on the edge's **target** claim keyed `perspective_id = edge_id`, so
+//! stored on the edge's **target** claim keyed on the edge's slot
+//! (`slot_kind = 'edge'`, `slot_id = edge_id`; migration 267), so
 //! the dedup leaves two distinct classes of wreckage behind:
 //!
 //!   (a) **orphaned** — the diamond-duplicate pre-delete removes an edge whose
-//!       BBA survives (`mass_functions.perspective_id` FKs `perspectives(id)`,
-//!       and `perspectives` has no FK back to `edges`, so nothing cascades).
+//!       BBA survives (the edge slot has no FK to `edges`, so nothing
+//!       cascades).
 //!       That phantom supporter keeps being combined forever.
 //!
 //!   (b) **stranded** — `UPDATE edges SET target_id = canonical` re-points an
 //!       edge while its BBA stays on `dup`, so `canonical` under-counts that
 //!       supporter permanently. It will never self-heal:
-//!       `MassFunctionRepository::exists_for_perspective` is keyed on
-//!       `perspective_id` alone and ignores `claim_id`, so
+//!       `MassFunctionRepository::exists_for_edge` is keyed on the edge
+//!       alone and ignores `claim_id`, so
 //!       `auto_wire_edge_if_epistemic` short-circuits forever.
 //!
-//! Checking only (a) — "no BBA whose perspective_id lacks a live edge" — passes
+//! Checking only (a) — "no edge-slot BBA whose edge is gone" — passes
 //! while (b) is still broken, which is why both invariants are asserted.
 
 #[path = "viewer_fixture.rs"]
@@ -142,7 +143,7 @@ async fn edge_bba(
 ) -> Option<(Uuid, serde_json::Value)> {
     sqlx::query_as(
         "SELECT e.id, mf.masses FROM edges e \
-         JOIN mass_functions mf ON mf.perspective_id = e.id \
+         JOIN mass_functions mf ON mf.slot_kind = 'edge' AND mf.slot_id = e.id \
          WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3",
     )
     .bind(s)
@@ -182,26 +183,24 @@ async fn cached_betp(pool: &PgPool, claim_id: Uuid) -> Option<f64> {
         .expect("read cached BetP")
 }
 
-/// Every edge-perspective BBA whose `perspective_id` no longer names a live
-/// edge. Must be zero: it is a phantom supporter.
+/// Every edge-slot BBA whose edge no longer exists. Must be zero: it is a phantom supporter.
 async fn orphaned_bba_count(pool: &PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions mf \
-         JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge' \
-         WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)",
+         WHERE mf.slot_kind = 'edge' \
+           AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.slot_id)",
     )
     .fetch_one(pool)
     .await
     .expect("count orphaned BBAs")
 }
 
-/// Every edge-perspective BBA that no longer sits on its edge's current
+/// Every edge-slot BBA that no longer sits on its edge's current
 /// target. Must be zero: it is an invisible supporter.
 async fn stranded_bba_count(pool: &PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions mf \
-         JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge' \
-         JOIN edges e ON e.id = mf.perspective_id \
+         JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
          WHERE e.target_type = 'claim' AND e.target_id <> mf.claim_id",
     )
     .fetch_one(pool)
@@ -275,7 +274,7 @@ async fn diamond_and_migration_leave_no_orphaned_or_stranded_bba(pool: PgPool) {
         stranded_bba_count(&pool).await,
         0,
         "(b) the U->dup edge was re-pointed at canonical; its BBA must move \
-         too, or canonical under-counts U permanently (exists_for_perspective \
+         too, or canonical under-counts U permanently (exists_for_edge \
          ignores claim_id, so nothing will ever re-wire it)"
     );
 

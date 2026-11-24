@@ -76,6 +76,29 @@ pub struct ReapedJob {
     pub one_attempt: bool,
 }
 
+/// A privatization plan left in a RUNNING state (`applying` or `reverting`)
+/// with no `pending` or `running` apply or revert job naming it, found by
+/// [`PostgresJobQueue::stranded_privatization_plans`] (backlog e8c8dd03).
+///
+/// Nothing will move such a plan: its job ended (failed by the reaper after
+/// its crash re-deliveries, failed by its handler, or cancelled) without the
+/// plan reaching `applied`, `reverted` or `failed`. Its claims may be partly
+/// moved. Recovery is the operator's: abort the plan, then revert it (see
+/// `docs/tenancy.md`, "A plan stranded in `applying` or `reverting`").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StrandedPlan {
+    /// The plan.
+    pub plan_id: Uuid,
+    /// `applying` or `reverting`.
+    pub state: String,
+    /// The newest apply or revert job naming the plan, if any.
+    pub last_job_id: Option<Uuid>,
+    /// That job's state (`failed`, `cancelled`, or `completed`).
+    pub last_job_state: Option<String>,
+    /// That job's `error_message`.
+    pub last_job_error: Option<String>,
+}
+
 // ============================================================================
 // PostgreSQL Job Queue
 // ============================================================================
@@ -306,6 +329,10 @@ impl JobQueue for PostgresJobQueue {
     ///
     /// The job's state is atomically updated to `Running` in the same transaction.
     ///
+    /// A pending row whose `run_after` (migration 261) is still in the future
+    /// is skipped: it is waiting out its handler's backoff
+    /// ([`PostgresJobQueue::requeue_after`]).
+    ///
     /// # Returns
     ///
     /// - `Some(Job)` if a pending job was found and claimed
@@ -320,6 +347,7 @@ impl JobQueue for PostgresJobQueue {
                 SELECT id
                 FROM jobs
                 WHERE state = 'pending'
+                  AND (run_after IS NULL OR run_after <= now())
                 ORDER BY created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -707,6 +735,10 @@ impl PostgresJobQueue {
     /// * a job that failed and was put back to `pending` in this run is
     ///   excluded, so its retry waits for the next run instead of spinning.
     ///
+    /// A pending row whose `run_after` (migration 261) is still in the future
+    /// is not claimed either: it is waiting out its handler's backoff
+    /// ([`Self::requeue_after`]). NULL is due now.
+    ///
     /// # Errors
     /// `JobError::ProcessingFailed` on a database error, or when the claimed
     /// row cannot be parsed.
@@ -724,6 +756,7 @@ impl PostgresJobQueue {
                 WHERE state = 'pending'
                   AND job_type = ANY($1)
                   AND NOT (id = ANY($2))
+                  AND (run_after IS NULL OR run_after <= now())
                 ORDER BY created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -750,8 +783,11 @@ impl PostgresJobQueue {
         row.map(|r| job_from_row(&r)).transpose()
     }
 
-    /// How many `pending` jobs have a type in `job_types` and an id not in
-    /// `exclude`: the work [`Self::dequeue_of_types`] would still hand out.
+    /// How many `pending` jobs have a type in `job_types`, an id not in
+    /// `exclude`, and no `run_after` in the future: the work
+    /// [`Self::dequeue_of_types`] would still hand out now. A row waiting out
+    /// its backoff is not counted, so a run whose only leftover work is
+    /// deferred retries has not run out of time.
     ///
     /// # Errors
     /// `JobError::ProcessingFailed` on a database error.
@@ -763,7 +799,8 @@ impl PostgresJobQueue {
     ) -> Result<i64, JobError> {
         sqlx::query_scalar(
             "SELECT count(*) FROM jobs \
-              WHERE state = 'pending' AND job_type = ANY($1) AND NOT (id = ANY($2))",
+              WHERE state = 'pending' AND job_type = ANY($1) AND NOT (id = ANY($2)) \
+                AND (run_after IS NULL OR run_after <= now())",
         )
         .bind(job_types)
         .bind(exclude)
@@ -771,6 +808,66 @@ impl PostgresJobQueue {
         .await
         .map_err(|e| JobError::ProcessingFailed {
             message: format!("Failed to count pending jobs: {e}"),
+        })
+    }
+
+    /// The longest delay [`Self::requeue_after`] stores: 30 days. A handler's
+    /// `backoff` is clamped to it, so an absurd custom value cannot overflow
+    /// the database's interval arithmetic (which would abort the drain run
+    /// with the job still `running`) and a job is never parked for ever.
+    pub const MAX_REQUEUE_DELAY: std::time::Duration =
+        std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+    /// Put `job` back to `pending` after a retryable failure, not to be
+    /// claimed before `delay` has passed: writes its `retry_count` and
+    /// `error_message`, clears `started_at` and `completed_at`, and sets
+    /// `run_after` (migration 261) to the database's `now() + delay`. Returns
+    /// the stored `run_after`.
+    ///
+    /// The drain (`jobs_drain::drain` in `epigraph-api`) calls this with the
+    /// handler's [`crate::JobHandler::backoff`], which the in-process worker
+    /// loop honours by sleeping. The time is computed on the DATABASE clock
+    /// because the claims compare it with the database's `now()`; a host
+    /// clock ahead of or behind it would shorten or stretch the wait.
+    /// `delay` is clamped to [`Self::MAX_REQUEUE_DELAY`].
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error, or when no row has
+    /// the job's id.
+    #[instrument(skip(self, job), fields(job_id = %job.id, job_type = %job.job_type))]
+    pub async fn requeue_after(
+        &self,
+        job: &Job,
+        delay: std::time::Duration,
+    ) -> Result<DateTime<Utc>, JobError> {
+        let id: Uuid = job.id.into();
+        let micros =
+            i64::try_from(delay.min(Self::MAX_REQUEUE_DELAY).as_micros()).unwrap_or(i64::MAX);
+        let run_after: Option<DateTime<Utc>> = sqlx::query_scalar(
+            r"
+            UPDATE jobs
+               SET state = 'pending',
+                   retry_count = $2,
+                   error_message = $3,
+                   started_at = NULL,
+                   completed_at = NULL,
+                   updated_at = now(),
+                   run_after = now() + make_interval(secs => $4::double precision / 1000000)
+             WHERE id = $1
+            RETURNING run_after
+            ",
+        )
+        .bind(id)
+        .bind(job.retry_count as i32)
+        .bind(&job.error_message)
+        .bind(micros)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to requeue job: {e}"),
+        })?;
+        run_after.ok_or_else(|| JobError::ProcessingFailed {
+            message: format!("Failed to requeue job {id}: no such row"),
         })
     }
 
@@ -797,6 +894,70 @@ impl PostgresJobQueue {
             message: format!("Failed to count pending jobs of unregistered types: {e}"),
         })?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Every privatization plan in `applying` or `reverting` that no `pending`
+    /// or `running` apply or revert job names: a [`StrandedPlan`] (backlog
+    /// e8c8dd03), ordered by plan id. One read; it writes nothing.
+    ///
+    /// The apply and revert jobs are one-attempt rows, so once the reaper
+    /// fails one after [`MAX_CRASH_REDELIVERIES`] crash re-deliveries, or its
+    /// handler fails on a fault that is not a refusal (a refusal sets the plan
+    /// `failed` itself), the plan keeps its running state with nothing left to
+    /// finish it. The dispatch writes the state flip and the job in one
+    /// transaction, so a plan in a running state with no live job is never a
+    /// dispatch in progress.
+    ///
+    /// A job names its plan in its payload (`EpiGraphJob`'s externally tagged
+    /// `{"PrivatizationApply": {"plan_id": …}}` or `PrivatizationRevert`);
+    /// the reseal job is keyed on a group and cannot strand a plan.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error.
+    #[instrument(skip(self))]
+    pub async fn stranded_privatization_plans(&self) -> Result<Vec<StrandedPlan>, JobError> {
+        /// `(plan id, plan state, last job id, its state, its error)`.
+        type Row = (Uuid, String, Option<Uuid>, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "WITH named AS ( \
+                    SELECT j.id, j.state, j.error_message, j.created_at, \
+                           COALESCE(j.payload -> 'PrivatizationApply' ->> 'plan_id', \
+                                    j.payload -> 'PrivatizationRevert' ->> 'plan_id') AS plan_id \
+                      FROM jobs j \
+                     WHERE j.job_type IN ($1, $2) \
+                 ) \
+                 SELECT p.id, p.state::text, last.id, last.state, last.error_message \
+                   FROM privatization_plans p \
+                   LEFT JOIN LATERAL ( \
+                        SELECT n.id, n.state, n.error_message FROM named n \
+                         WHERE n.plan_id = p.id::text \
+                         ORDER BY n.created_at DESC, n.id DESC LIMIT 1 \
+                   ) last ON true \
+                  WHERE p.state IN ('applying', 'reverting') \
+                    AND NOT EXISTS (SELECT 1 FROM named n \
+                                     WHERE n.plan_id = p.id::text \
+                                       AND n.state IN ('pending', 'running')) \
+                  ORDER BY p.id",
+        )
+        .bind(crate::privatization::APPLY_JOB_TYPE)
+        .bind(crate::privatization::REVERT_JOB_TYPE)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to read stranded privatization plans: {e}"),
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(plan_id, state, last_job_id, last_job_state, last_job_error)| StrandedPlan {
+                    plan_id,
+                    state,
+                    last_job_id,
+                    last_job_state,
+                    last_job_error,
+                },
+            )
+            .collect())
     }
 
     /// Set every `pending` job whose type is in `job_types` to `cancelled`,

@@ -47,12 +47,16 @@ new with mode 0600, so no umask exposes it (W1 fixed the same class).
 `versions` the compute records are typed (four keys, short version strings or
 null) before they go into the run's `params`.
 
-**Undo.** There is no `reverse` subcommand yet (deferred). A standalone
-`apply --apply` writes ONE new `atlas_map_runs` row and its levels, and as the
-map's latest finished run it is what is served. To undo it, delete that run
-row by the `run_id` the apply report prints, as the maintenance login; its
-levels go with it (`ON DELETE CASCADE`), and the previous finished run is
-served again. Nothing else is written.
+**Undo.** A standalone `apply --apply` writes ONE new `atlas_map_runs` row
+and its levels, and as the map's latest finished run it is what is served.
+Deleting that run row removes its levels too (`ON DELETE CASCADE`), and the
+previous finished run is served again. Nothing else is written. The
+`reverse` subcommand was deferred here and added later (backlog b3e39c55):
+`atlas_meaning reverse --map M --run-id R [--apply]` (and the same verb on
+`atlas_links`) does that delete under the map's publish lock, after checking
+that the run belongs to the map, was written by that binary's apply, and is
+not the source of a later nightly or naming run; dry run by default, and the
+applied delete writes a `security_events` audit row.
 
 **The off-box rule.** The export holds claim ids, embeddings, and for each
 claim the list of its attachment nodes (its agents and evidence, after W3's

@@ -44,6 +44,8 @@ use crate::state::AppState;
 pub mod atlas;
 pub mod atlas_level;
 pub mod atlas_maps;
+pub mod atlas_sources;
+pub mod atlas_timeline;
 pub mod core;
 pub mod degraded;
 pub mod entities;

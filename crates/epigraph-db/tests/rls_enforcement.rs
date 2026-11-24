@@ -320,6 +320,16 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE and TRUNCATE for every role, a superuser included, short of disabling \
          triggers.",
     ),
+    // ---- Migration 240: a workflow's recorded runs. --------------------------
+    (
+        "behavioral_executions",
+        "DELETE",
+        "A recorded run (240) is never deleted by the application: 118 revoked its DELETE \
+         grant, and no route or tool removes a run. Under FORCE the absent permissive \
+         DELETE policy default-denies every non-superuser role, and 240's restrictive \
+         `behavioral_executions_delete_owner` would hold a delete to the owner group's \
+         writers if one were ever added.",
+    ),
     // ---- Migration 221: hierarchical outcome reports. ----------------------
     (
         "workflow_outcome_reports",
@@ -354,6 +364,14 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          absent DELETE policy default-denies every non-superuser role, 166 grants DELETE to \
          nobody, and its guards refuse DELETE and TRUNCATE for every role, a superuser \
          included, short of disabling triggers.",
+    ),
+    (
+        "group_invitations",
+        "DELETE",
+        "A team-group invitation (263) is answered, never deleted: an accepted or declined \
+         row is the record of who invited whom and what was decided. Under FORCE the absent \
+         DELETE policy default-denies every non-superuser role, and 263 grants DELETE to \
+         nobody.",
     ),
 ];
 
@@ -435,6 +453,8 @@ const PROTECTED: &[&str] = &[
     "atlas_map_runs",
     "atlas_map_levels",
     "workflow_outcome_reports",
+    "behavioral_executions",
+    "group_invitations",
 ];
 
 // ===========================================================================
@@ -736,12 +756,19 @@ async fn viewer_resolve_still_sees_memberships_on_an_unstamped_connection(pool: 
 
     let (via_function, direct) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         set_gucs(&mut conn, "", "", "").await;
-        let via_function: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM public.epigraph_live_memberships($1)")
-                .bind(agent)
-                .fetch_one(&mut *conn)
-                .await
-                .expect("definer read");
+        // Since migration 236 the definer answers only for the session
+        // principal, so this reads it the way `list_live_for_agent` does: the
+        // statement stamps the agent as its own principal for itself, and
+        // the connection is otherwise unstamped (the direct read below).
+        let via_function: i64 = sqlx::query_scalar(
+            "SELECT count(*) \
+               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid AS p) s \
+              CROSS JOIN LATERAL public.epigraph_live_memberships(s.p)",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("definer read");
         let direct: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND revoked_at IS NULL",
         )
@@ -1609,6 +1636,17 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_countersign_authorship` definer.",
         ),
         (
+            "security_events_paper_licence_privileged",
+            "paper.licence",
+            "255's RESTRICTIVE insert policy: its row-only arm (the trimmed, lower-cased event \
+             type does not start `paper.licence`) says WHICH rows the restriction applies to, \
+             and grants nothing. A restrictive policy is AND-ed with the permissive \
+             `security_events_append`, so every other row still needs 077's attribution arms; a \
+             licence audit row needs one of the two session arms beside it (`epigraph_bypass()` \
+             / `epigraph_definer_bypass()`), i.e. the maintenance session or the \
+             `epigraph_set_paper_licence` definer.",
+        ),
+        (
             "workflow_outcome_reports_read",
             "workflow_outcome_reports.workflow_id",
             "221's read policy: its arm `EXISTS (SELECT 1 FROM workflows w WHERE w.id = \
@@ -2072,11 +2110,31 @@ const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
 /// Tables the application role must NOT read at all, by design: `(table,
 /// why)`. Exact in both directions: each must exist and grant `epigraph_app`
 /// no SELECT, table- or column-level.
-const NO_APP_SELECT: &[(&str, &str)] = &[(
-    "mass_function_purge_grants",
-    "migration 194 (H10): the purge definer's grant rows; REVOKE ALL from epigraph_app \
-     (SPEC 2.8), read only through the epigraph_mf_purge_granted definer",
-)];
+const NO_APP_SELECT: &[(&str, &str)] = &[
+    (
+        "mass_function_masses_writes",
+        "migration 250 (backlog a278f16d): which transaction last wrote each mass function's \
+         masses; REVOKE ALL from epigraph_app, written by the masses-write trigger definer and \
+         read by the claim.assessed guard definer only",
+    ),
+    (
+        "mass_function_purge_grants",
+        "migration 194 (H10): the purge definer's grant rows; REVOKE ALL from epigraph_app \
+         (SPEC 2.8), read only through the epigraph_mf_purge_granted definer",
+    ),
+    (
+        "person_team_groups",
+        "migration 263 (backlog triage T75): which keyless team groups a Person made and may \
+         invite to; REVOKE ALL from epigraph_app, so it cannot mark a group invitable, written \
+         by epigraph_person_create_team_group and read through the 263 definers only",
+    ),
+    (
+        "team_group_roster_grants",
+        "migration 263 (backlog triage T75): per-transaction admissions of one roster row for \
+         the 164 groups guards; REVOKE ALL from epigraph_app, so it cannot grant itself a \
+         roster row, written and read only by the 263 definers",
+    ),
+];
 
 /// Every relation in `public` is reachable by `epigraph_app` on a FRESH migrate.
 ///

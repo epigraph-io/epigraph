@@ -51,7 +51,7 @@
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 //!     epigraph-operator regroup-claims --claims-file claims.txt --source-group <uuid> \
 //!         --target-group <uuid> --operator <uuid> --manifest-out regroup-1.jsonl \
-//!         [--apply --confirm-count N --ruling TEXT --reason TEXT]
+//!         [--refuse-irreversible] [--apply --confirm-count N --ruling TEXT --reason TEXT]
 //!     epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 //!     epigraph-operator reown-workflows --canonical-names-file lineages.txt \
 //!         --target-group <team-uuid> --operator <uuid> [--from-group <uuid>] \
@@ -79,6 +79,8 @@
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
 //!         --agent-system-prompt-hash H) [--apply]
 //!     epigraph-operator retire-link --agent <uuid> --reason TEXT [--revoke-membership] [--apply]
+//!     epigraph-operator restore-role-successor --role role:K --root <uuid> --successor <uuid> \
+//!         [--valid-to <RFC3339>] --reason TEXT [--apply]
 //!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
 //!     epigraph-operator link-legacy-authors --operator <uuid> [--exclude-agents-file F] \
 //!         [--quiet-days 30 | --no-quiet-window] [--apply]
@@ -119,6 +121,11 @@
 //!     epigraph-operator end-group-role-binding --binding <uuid> --reason TEXT [--apply]
 //!     epigraph-operator group-roster --group <uuid> [--at <RFC3339>]
 //!         (MEMBER: derived by a role binding; DIRECT: a row of the group's own roster)
+//!     epigraph-operator role-attach --role role:K --agent <uuid> [--valid-from <RFC3339>] \
+//!         [--valid-to <RFC3339>] --reason TEXT [--apply]
+//!         (COPY: a succession copy the attach writes; MEMBERSHIP GAINED|LOST|KEPT)
+//!     epigraph-operator role-detach --role role:K --agent <uuid> --reason TEXT [--apply]
+//!         (DETACHED: a row the detach ends; MEMBERSHIP GAINED|LOST|KEPT)
 //!     epigraph-operator group-member add --group <uuid> --agent <uuid> --role reader|writer|admin \
 //!         --reason TEXT [--apply]
 //!         (a verb-made team group; or, --role writer only, the personal group of the operator
@@ -140,7 +147,8 @@ use epigraph_cli::operator::{
     self, admin_scopes, approve_client, arm, backfill_markers, bind, binding_client, client_scope,
     client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
     evidence_edges, group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked,
-    reown_workflows, restrict, retire_link, reverse, system_agent, team_group, workflow_submitter,
+    reown_workflows, restrict, retire_link, reverse, role_agent, role_restore, system_agent,
+    team_group, workflow_submitter,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -469,6 +477,62 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Attach an agent identity to a platform role (migration 166's
+    /// `role_agents`, through `epigraph_attach_agent_to_role`). The attach
+    /// restricts the agent (it writes nothing while its human does not hold
+    /// the role) and, where the role is bound in `attached_agents` mode
+    /// (migration 179), admits it to the group. It also attaches every
+    /// registered successor of the identity (the lineage follow, chained
+    /// since migration 195): each is printed as a `COPY` line. Register the
+    /// identity through the host's attestor FIRST: an identity attached
+    /// before its first registration makes that registration abort (AID09);
+    /// the verb prints `UNREGISTERED` for an identity the host never
+    /// registered. Prints the role-derived memberships of every identity the
+    /// act can change, before vs after (as of the window's opening when
+    /// `--valid-from` is later than now, `EVALUATED-AT`). Without `--apply`,
+    /// the attachment, its copies and their audit rows roll back.
+    RoleAttach {
+        /// The catalog role key (`role:<lowercase-key>`).
+        #[arg(long)]
+        role: String,
+        /// The agent identity to attach (never a human or a role node: ROL02).
+        #[arg(long)]
+        agent: Uuid,
+        /// When the attachment opens (default: now; never back-dated).
+        #[arg(long)]
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        /// When it closes (default: open-ended).
+        #[arg(long)]
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Recorded on the attachment and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, everything rolls back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Detach an agent identity from a platform role now: every un-detached
+    /// attachment it holds for the role, in any window (through
+    /// `epigraph_detach_agent_from_role`). Final per row and sticky per
+    /// identity (migration 195): no succession copy admits it again, only an
+    /// attachment by name. It also cuts off the copies chained through it and
+    /// the successors below it that hold no live attachment made by name;
+    /// their role-derived memberships are printed before vs after. Without
+    /// `--apply`, the detach and its audit rows roll back.
+    RoleDetach {
+        /// The catalog role key (`role:<lowercase-key>`).
+        #[arg(long)]
+        role: String,
+        /// The agent identity to detach.
+        #[arg(long)]
+        agent: Uuid,
+        /// Recorded on each detached row and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, everything rolls back.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Who holds a group at an instant. `MEMBER` lines: through its role
     /// bindings (migration 165), each role holder and each agent registered
     /// to one. `DIRECT` lines: the group's own live roster rows (what
@@ -604,6 +668,37 @@ enum Command {
         #[arg(long)]
         revoke_membership: bool,
         /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Give a role's running successor the group back after its root
+    /// identity was detached (migration 264): attach the root by name (or
+    /// keep its live row made by name), detach the successor's stale
+    /// succession copy and attach the successor by name, in one audited act.
+    /// Refused (ROL04, nothing written) unless a copy written fresh from the
+    /// root's row would admit the successor.
+    RestoreRoleSuccessor {
+        /// The role key the identities are attached to.
+        #[arg(long)]
+        role: String,
+        /// The identity the operator attached by name (and detached), whose
+        /// row the successor's stale copy chains through. It must have held
+        /// a row made by name for the role (refused ROL04 otherwise): a
+        /// middle identity that only ever held copies is not a root.
+        #[arg(long)]
+        root: Uuid,
+        /// The identity the job runs now.
+        #[arg(long)]
+        successor: Uuid,
+        /// When the root's NEW row ends (RFC 3339; default never). Only when
+        /// the root is not attached by name now; the successor's row ends
+        /// with the root's.
+        #[arg(long)]
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Recorded on the new rows, the detach and the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, every row and audit row roll back.
         #[arg(long)]
         apply: bool,
     },
@@ -974,6 +1069,11 @@ enum Command {
         /// How many claims the dry run lists row by row.
         #[arg(long, default_value_t = 3)]
         sample: usize,
+        /// Hold (HELD `irreversible`), instead of moving, every claim an
+        /// `IRREVERSIBLE-EDGE` names: a claim `reown-reverse` could not
+        /// reverse. Each batch is probed first in a rolled-back transaction.
+        #[arg(long)]
+        refuse_irreversible: bool,
     },
     /// Move listed workflow LINEAGES (every generation, the plan claims they
     /// execute, the rows those carry, and their plan edges) out of the source
@@ -1410,7 +1510,7 @@ struct ClientStatusArgs {
     /// The client's `oauth_clients.id` (not its `client_id` string).
     #[arg(long)]
     client: Uuid,
-    /// Recorded in the audit row. Required, not blank.
+    /// Recorded in the audit row. Required, not blank, at most 1000 characters.
     #[arg(long)]
     reason: String,
     /// Commit. Without it, the change and its audit row roll back.
@@ -1458,6 +1558,11 @@ async fn main_inner() -> anyhow::Result<i32> {
     // reason, before any connection is made.
     if let Command::ApproveClient { scopes, reason, .. } = &cli.command {
         approve_client::validate(scopes, reason)?;
+    }
+    // delete-frames: a reason outside the purge definer's 1..2000-character
+    // bound, before any connection is made (not at the apply's purge).
+    if let Command::DeleteFrames { reason, .. } = &cli.command {
+        delete_frames::validate_reason(reason)?;
     }
     // A grant names its window explicitly; refused before any connection.
     let window = if let Command::GrantRole {
@@ -1659,6 +1764,7 @@ async fn main_inner() -> anyhow::Result<i32> {
         batch_size,
         lock_timeout,
         sample,
+        refuse_irreversible,
     } = &cli.command
     {
         let o = regroup::Options {
@@ -1674,6 +1780,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             batch_size: *batch_size,
             lock_timeout: lock_timeout.clone(),
             sample: *sample,
+            refuse_irreversible: *refuse_irreversible,
         };
         regroup::validate(&o)?;
         Some(o)
@@ -1737,6 +1844,18 @@ async fn main_inner() -> anyhow::Result<i32> {
         }
         Command::EndGroupRoleBinding { reason, .. } => {
             team_group::validate_text("--reason", reason)?;
+        }
+        Command::RoleAttach {
+            role,
+            valid_from,
+            valid_to,
+            reason,
+            ..
+        } => {
+            role_agent::validate(role, reason, *valid_from, *valid_to)?;
+        }
+        Command::RoleDetach { role, reason, .. } => {
+            role_agent::validate(role, reason, None, None)?;
         }
         _ => {}
     }
@@ -1860,12 +1979,22 @@ async fn main_inner() -> anyhow::Result<i32> {
                 act,
                 apply,
             };
-            match custodian::custodial_supersede(&mut conn, &req).await? {
+            // The act and the successor's embedding run on one maintenance
+            // session: the embedding is stored through its bypass viewer.
+            // The verb's plain connection is returned first, so the session
+            // is the only one this verb holds (the pool allows two).
+            drop(conn);
+            let mut session = db
+                .session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+                .await?;
+            let (mconn, viewer) = session.split();
+            let embedder = epigraph_cli::embedding_service();
+            match custodian::custodial_supersede(mconn, viewer, embedder.as_deref(), &req).await? {
                 custodian::SupersedeOutcome::Done(r) => {
                     println!(
                         "{}SUPERSEDED\told={}\tnew={}\tauthor={}\towner={}\t\
                          cascade_deferral={}\tcustodial_act={}\tassignment={assignment}\t\
-                         actor={actor}{}",
+                         actor={actor}{}\tembedded={}",
                         if r.applied { "" } else { "WOULD BE " },
                         r.old,
                         r.new,
@@ -1874,17 +2003,21 @@ async fn main_inner() -> anyhow::Result<i32> {
                         r.cascade_deferral,
                         r.act_event,
                         r.admin_act
-                            .map_or_else(String::new, |a| format!("\tact={a}"))
+                            .map_or_else(String::new, |a| format!("\tact={a}")),
+                        r.embedded
                     );
                     if r.applied {
                         println!(
                             "NOTE: the edge migration and the belief cascade run from the \
                              cascade deferral, in the next replay_deferred_cascades run."
                         );
-                        println!(
-                            "NOTE: the successor has no embedding until the next embedding \
-                             backfill; it is a live_missing row until then."
-                        );
+                        if !r.embedded {
+                            println!(
+                                "NOTE: the successor was not embedded (no OPENAI_API_KEY, or the \
+                                 provider failed); it is a live_missing row until the next \
+                                 embedding backfill."
+                            );
+                        }
                     } else {
                         println!(
                             "DRY RUN: the supersede, its cascade deferral and its audit row were \
@@ -2207,6 +2340,35 @@ async fn main_inner() -> anyhow::Result<i32> {
             }
             Ok(0)
         }
+        Command::RoleAttach {
+            role,
+            agent,
+            valid_from,
+            valid_to,
+            reason,
+            apply,
+        } => {
+            let o = role_agent::attach(
+                &mut conn, &role, agent, valid_from, valid_to, &reason, apply,
+            )
+            .await?;
+            for l in role_agent::describe_attach(&role, agent, &o) {
+                println!("{l}");
+            }
+            Ok(0)
+        }
+        Command::RoleDetach {
+            role,
+            agent,
+            reason,
+            apply,
+        } => {
+            let o = role_agent::detach(&mut conn, &role, agent, &reason, apply).await?;
+            for l in role_agent::describe_detach(&role, agent, &o) {
+                println!("{l}");
+            }
+            Ok(0)
+        }
         Command::GroupRoster { group, at } => {
             let rows = group_role::roster(&mut conn, group, at).await?;
             for row in &rows {
@@ -2447,6 +2609,23 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the retire and its audit row were rolled back.");
             }
             Ok(outcome.exit_code())
+        }
+        Command::RestoreRoleSuccessor {
+            role,
+            root,
+            successor,
+            valid_to,
+            reason,
+            apply,
+        } => {
+            let steps =
+                role_restore::run(&mut conn, &role, root, successor, valid_to, &reason, apply)
+                    .await?;
+            println!("{}", role_restore::describe(&steps, apply));
+            if !apply {
+                println!("DRY RUN: every attach, detach and audit row was rolled back.");
+            }
+            Ok(0)
         }
         Command::ApproveClient {
             client,

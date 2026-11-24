@@ -330,9 +330,15 @@ async fn a_processed_by_stamp_is_world_owned_and_read_as_the_caller(pool: PgPool
     let (member, _) = fixture::seed_agent_with_group(&pool, "ingest-member").await;
     let (stranger, _) = fixture::seed_agent_with_group(&pool, "ingest-stranger").await;
     let doi = "10.5555/raw-pool-probe";
-    let paper = epigraph_db::PaperRepository::get_or_create(&pool, doi, Some("t"), None)
-        .await
-        .expect("paper");
+    let paper = epigraph_db::PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("t"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("paper");
     let server = app_server(&pool).await;
     let scoped = server_scoped(&pool).await;
     let mut tx = scoped

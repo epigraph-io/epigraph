@@ -57,21 +57,42 @@ async fn store(
     persp: Option<Uuid>,
     m: serde_json::Value,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        agent,
-        persp,
-        &m,
-        None,
-        None,
-        None,
-        Some("empirical"),
-        "unknown",
-        None,
-    )
-    .await
+    match persp {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                agent,
+                epigraph_db::BbaSlot::Edge(edge),
+                &m,
+                None,
+                None,
+                None,
+                Some("empirical"),
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                agent,
+                None,
+                &m,
+                None,
+                None,
+                None,
+                Some("empirical"),
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
     .expect("store bba")
 }
 
@@ -112,11 +133,6 @@ async fn an_unmark_reverses_the_recorded_repair_and_rederives_the_duplicate(pool
     .fetch_one(&pool)
     .await
     .expect("edge");
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge')")
-        .bind(e)
-        .execute(&pool)
-        .await
-        .expect("perspective");
     let other_writers_bba = store(
         &pool,
         dup,
@@ -670,7 +686,16 @@ async fn an_unmark_refuses_when_the_mark_is_not_the_one_authorized(pool: PgPool)
     let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, checked)
         .await
         .expect_err("a different mark");
-    assert!(matches!(err, UnmarkRefusal::Act(_)), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            UnmarkRefusal::Act {
+                kind: epigraph_db::RefusalKind::State,
+                ..
+            }
+        ),
+        "a mark that moved since the caller was checked is a state refusal: {err:?}"
+    );
     assert_eq!(
         current(&pool, dup).await,
         (Some(other), false),
@@ -803,11 +828,6 @@ async fn an_unmark_rederives_both_claims_and_the_far_end_and_filters_the_report(
     .fetch_one(&pool)
     .await
     .expect("edge");
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge')")
-        .bind(e)
-        .execute(&pool)
-        .await
-        .expect("perspective");
     let far_bba = store(
         &pool,
         far,
@@ -819,7 +839,8 @@ async fn an_unmark_rederives_both_claims_and_the_far_end_and_filters_the_report(
     .await;
     let far_edge_bba = |pool: PgPool| async move {
         sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+            "SELECT id FROM mass_functions \
+              WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2",
         )
         .bind(far)
         .bind(e)
@@ -971,7 +992,7 @@ async fn a_returning_input_clears_the_duplicates_cached_row_from_its_slot(pool: 
         serde_json::json!({"0": 0.9, "0,1": 0.1}),
     )
     .await;
-    let assess = epigraph_db::MassFunctionRepository::store_with_perspective(
+    let assess = MassFunctionRepository::store_with_perspective(
         &pool,
         dup,
         f,
@@ -997,7 +1018,7 @@ async fn a_returning_input_clears_the_duplicates_cached_row_from_its_slot(pool: 
     .expect("act");
     let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
     apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_with_perspective(
         &pool,
         dup,
         f,
@@ -1305,8 +1326,12 @@ async fn an_authorized_unmark_refuses_a_chain_that_changed_without_naming_it(poo
     )
     .await
     .expect_err("the chain changed since the caller was checked");
-    let UnmarkRefusal::Act(msg) = &err else {
-        panic!("an act refusal: {err:?}");
+    let UnmarkRefusal::Act {
+        kind: epigraph_db::RefusalKind::State,
+        message: msg,
+    } = &err
+    else {
+        panic!("a state refusal of the act: {err:?}");
     };
     assert!(
         msg.contains("replaced again") && !msg.contains(&replacement.to_string()),
@@ -1342,8 +1367,12 @@ async fn an_authorized_unmark_refuses_a_chain_that_changed_without_naming_it(poo
     )
     .await
     .expect_err("no current canonical any more");
-    let UnmarkRefusal::Act(msg) = &err else {
-        panic!("an act refusal: {err:?}");
+    let UnmarkRefusal::Act {
+        kind: epigraph_db::RefusalKind::State,
+        message: msg,
+    } = &err
+    else {
+        panic!("a state refusal of the act: {err:?}");
     };
     assert!(
         msg.contains("replaced again") && !msg.contains(&replacement.to_string()),
@@ -1509,4 +1538,93 @@ async fn an_unmark_follows_a_chain_of_replacements_to_the_current_canonical(pool
             "no factor of the restored edge is left on {retired}: {after:?}"
         );
     }
+}
+
+/// An act that fails WITHOUT refusing (here a lock timeout: another
+/// transaction holds the duplicate's row) is the un-mark's failure, not an
+/// act refusal (backlog dca9ed56). An act refusal's text is sent to the caller
+/// as its reason (HTTP 4xx, MCP invalid params); a failure's is not (HTTP 500,
+/// MCP internal error, the text kept in the server log). Before the fix every
+/// error of the act was stringified into the refusal, driver text included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_that_fails_without_refusing_is_a_failure_not_a_refusal(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let author = new_agent(&pool).await;
+    let canonical = new_claim(&pool, author, "canonical").await;
+    let dup = new_claim(&pool, author, "duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("act");
+    let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
+    apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
+
+    // Another transaction holds the duplicate's row, so the act's first
+    // statement (its row lock) times out.
+    let mut holder = pool.begin().await.expect("holder");
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
+        .bind(dup)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the duplicate's row");
+    sqlx::query("SET lock_timeout = '200ms'")
+        .execute(&mut *conn)
+        .await
+        .expect("lock_timeout");
+
+    let ut = trigger(CascadeCause::Undedup, author, dup, Some(canonical));
+    let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
+        .await
+        .expect_err("the act cannot lock the duplicate");
+    let UnmarkRefusal::Failed(why) = &err else {
+        panic!("a lock timeout is a failure, not an act refusal: {err:?}");
+    };
+    assert!(
+        why.contains("lock timeout"),
+        "calibration: the act failed on the held row lock: {why}"
+    );
+    holder.rollback().await.expect("release");
+    sqlx::query("RESET lock_timeout")
+        .execute(&mut *conn)
+        .await
+        .expect("reset");
+    assert_eq!(
+        current(&pool, dup).await,
+        (Some(canonical), false),
+        "nothing changed"
+    );
+}
+
+/// The act's own refusal keeps its kind and its words (backlog dca9ed56): a
+/// claim that is not a marked duplicate is a STATE refusal (HTTP 409), and the
+/// text the repo wrote for the caller is the refusal's message, unwrapped.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmark_of_a_claim_that_is_no_duplicate_is_a_state_refusal(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let author = new_agent(&pool).await;
+    let claim = new_claim(&pool, author, "never marked").await;
+    let other = new_claim(&pool, author, "not its canonical").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let ut = trigger(CascadeCause::Undedup, author, claim, Some(other));
+    let err = apply_unmark(&mut conn, &viewer, &viewer, &ut, claim, other)
+        .await
+        .expect_err("not a duplicate");
+    let UnmarkRefusal::Act {
+        kind: epigraph_db::RefusalKind::State,
+        message,
+    } = &err
+    else {
+        panic!("a state refusal of the act: {err:?}");
+    };
+    assert!(
+        message.starts_with("unmark_duplicate: claim")
+            && message.contains("is not a retired duplicate"),
+        "the repo's own words, not a wrapped error: {message}"
+    );
+    assert_eq!(err.to_string(), *message, "Display is the message");
+    assert_eq!(current(&pool, claim).await, (None, true), "nothing changed");
 }

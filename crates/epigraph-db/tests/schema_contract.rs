@@ -3680,7 +3680,12 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
 /// keeps every fragment below (and adds its own to this list). 235 re-states
 /// `epigraph_live_memberships` (the personal-group lapse) and 164's
 /// `epigraph_team_group_add_member` (the personal-group arm); their fragments
-/// are pinned here too.
+/// are pinned here too. 236 moves the live-membership body, verbatim, into the
+/// maintenance-only `epigraph_live_memberships_unbound`, and makes
+/// `epigraph_live_memberships` the twin's rows for the session principal only;
+/// the fragments follow the body, and the bind is pinned on the bound read.
+/// 256 re-states the writer scope (the derived arm admits only under READ
+/// COMMITTED); its fragment is pinned too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
     for (signature, fragments) in [
@@ -3693,10 +3698,20 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
                 // statement's clock.
                 "public.epigraph_role_derived_memberships(p_agent, clock_timestamp())",
                 "d.role = 'writer'",
+                // 256: the derived arm admits only under READ COMMITTED.
+                "v_derived AND current_setting('transaction_isolation') = 'read committed'",
             ][..],
         ),
         (
             "public.epigraph_live_memberships(uuid)",
+            &[
+                // 236: the twin's rows, for the session principal only.
+                "public.epigraph_live_memberships_unbound(p_agent)",
+                "p_agent = public.epigraph_principal_id()",
+            ][..],
+        ),
+        (
+            "public.epigraph_live_memberships_unbound(uuid)",
             &[
                 // 164's verb-made-group conjunct.
                 "did:epigraph:group:%",
@@ -3927,8 +3942,22 @@ async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
         "JOIN public.agent_succession s",
         "ON s.child_agent_id = l.agent_id",
         "AND dr.inherited_from IS NULL",
-        "AND dr.detached_at IS NULL",
+        "AND (dr.detached_at IS NULL",
         "AND dd.detached_at IS NOT NULL",
+        // 249: an earlier instant's answer is not changed by a later record.
+        // Each row, detach and succession counts from when it was recorded,
+        // and at the present (`p_at >= now()`) every record the snapshot
+        // sees counts. Losing a time test lets a later detach, succession or
+        // dated-back attach rewrite who held the group at a past instant (the
+        // roster's `--at`); losing the present clause lets a live gate admit
+        // an identity whose detach committed after its transaction began.
+        "AND (ra.created_at <= p_at OR p_at >= now())",
+        "OR (p_at < ra.detached_at AND p_at < now()))",
+        "OR (p_at < hop.detached_at",
+        "WHERE (s.attested_at <= p_at",
+        "AND (dr.created_at <= p_at",
+        "OR (p_at < dr.detached_at",
+        "AND (dd.detached_at <= p_at",
     ] {
         assert!(
             body.contains(fragment),
@@ -4024,14 +4053,19 @@ async fn migration_195_follow_chains_its_copies_at_head(pool: PgPool) {
 }
 
 /// Migration 191 (backlog 4dec90c2, the audited retire of a live operator
-/// link): the verb is a SECURITY DEFINER owned by `epigraph_maintenance` on
-/// 172's `pg_catalog, pg_temp` path with an explicit ACL that neither PUBLIC
-/// nor the application role can execute; the maintenance role may UPDATE
-/// exactly the `retired` column of `operator_links` (no other column, no
-/// table-wide UPDATE, no DELETE); the audit trigger fires AFTER INSERT and
-/// UPDATE (of `retired`), and the retire-only guard BEFORE UPDATE. The owner
-/// is pinned because the harness migrates as a superuser, so a silently
-/// no-opped `OWNER TO` would pass every behavioural test.
+/// link), as migration 257 (backlog 9cec11f7) leaves it at head: the verb is
+/// a SECURITY DEFINER on 172's `pg_catalog, pg_temp` path with an explicit
+/// ACL that neither PUBLIC nor the application role can execute and the
+/// maintenance role can; it is owned by `epigraph_operator_link_retirer`, a
+/// NOLOGIN member of `epigraph_maintenance` (and of nothing else) that no
+/// other non-superuser role can act as, and that role alone may UPDATE
+/// exactly the `retired` column of `operator_links`. The maintenance role
+/// holds no UPDATE on the table at all (no column, no table-wide UPDATE, no
+/// DELETE), so a maintenance login cannot retire a link directly. The audit
+/// trigger fires AFTER INSERT and UPDATE (of `retired`), and the retire-only
+/// guard BEFORE UPDATE. The owner is pinned because the harness migrates as a
+/// superuser, so a silently no-opped `OWNER TO` would pass every behavioural
+/// test.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
     let signature = "public.epigraph_retire_operator_link(uuid, text, boolean)";
@@ -4048,7 +4082,10 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
     let (secdef, owner, vol, acl, config) =
         meta.unwrap_or_else(|| panic!("{signature} must exist (migration 191)"));
     assert!(secdef, "{signature} must be SECURITY DEFINER");
-    assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+    assert_eq!(
+        owner, "epigraph_operator_link_retirer",
+        "{signature} owner (257)"
+    );
     assert_eq!(vol, "v", "{signature} volatility");
     assert!(acl.is_some(), "{signature} must carry an EXPLICIT ACL");
     assert_eq!(
@@ -4056,6 +4093,40 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
         Some(vec!["search_path=pg_catalog, pg_temp".to_string()]),
         "{signature} resolves in pg_catalog only, pg_temp last"
     );
+
+    // 257's owner role: NOLOGIN, no elevated attribute, a member of the
+    // maintenance role only, and nobody else (no non-superuser) can act as it
+    // or make itself able to: no MEMBER in any form (an ADMIN-only grant
+    // included), no ADMIN OPTION holder, and no CREATEROLE login.
+    let (login, elevated, memberships, actors): (bool, bool, Vec<String>, Vec<String>) =
+        sqlx::query_as(
+            "SELECT r.rolcanlogin, \
+                    (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb \
+                     OR r.rolreplication), \
+                    ARRAY(SELECT g.rolname::text FROM pg_auth_members m \
+                            JOIN pg_roles g ON g.oid = m.roleid \
+                           WHERE m.member = r.oid ORDER BY 1), \
+                    ARRAY(SELECT o.rolname::text FROM pg_roles o \
+                           WHERE o.oid <> r.oid AND NOT o.rolsuper \
+                             AND (pg_has_role(o.oid, r.oid, 'MEMBER') \
+                                  OR o.rolcreaterole \
+                                  OR EXISTS (SELECT 1 FROM pg_auth_members a \
+                                              WHERE a.roleid = r.oid AND a.member = o.oid \
+                                                AND a.admin_option)) \
+                           ORDER BY 1) \
+               FROM pg_roles r WHERE r.rolname = 'epigraph_operator_link_retirer'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("257's owner role exists");
+    assert!(!login, "the retirer role is NOLOGIN");
+    assert!(!elevated, "the retirer role carries no elevated attribute");
+    assert_eq!(memberships, vec!["epigraph_maintenance".to_string()]);
+    assert!(
+        actors.is_empty(),
+        "no role can act as the retirer: {actors:?}"
+    );
+
     for (role, expected) in [
         ("public", false),
         ("epigraph_app", false),
@@ -4089,7 +4160,9 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
         );
     }
     for (role, col, expected) in [
-        ("epigraph_maintenance", "retired", true),
+        ("epigraph_operator_link_retirer", "retired", true),
+        ("epigraph_operator_link_retirer", "operator_id", false),
+        ("epigraph_maintenance", "retired", false),
         ("epigraph_maintenance", "operator_id", false),
         ("epigraph_maintenance", "operator_group_id", false),
         ("epigraph_maintenance", "agent_id", false),
@@ -4131,10 +4204,13 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
 
 /// Migration 194 (H10; SPEC §2.8, §7.1 "New tables"): the purge-grant table is
 /// no application role's to read or write (077's default privileges would
-/// otherwise grant `epigraph_app` everything on a new table), the maintenance
-/// role holds exactly what its two definers need, the table stays owned by
-/// the migration runner, and the purge definer is executable by the
-/// maintenance role alone.
+/// otherwise grant `epigraph_app` everything on a new table), the table stays
+/// owned by the migration runner, and the purge definer is executable by the
+/// maintenance role alone. Since 251 (backlog 6bdac68f) the table is a ledger
+/// only `epigraph_bba_guard_owner` holds anything on (SELECT, INSERT, and
+/// UPDATE of the three consumption columns: no DELETE, no table-wide UPDATE),
+/// through the three functions it owns; the maintenance role holds nothing on
+/// it, so a maintenance login cannot write, rewrite or remove a grant itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_maintenance_only(
     pool: PgPool,
@@ -4179,12 +4255,38 @@ async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_mainte
                 .fetch_one(&pool)
                 .await
                 .expect("privilege");
+        assert!(
+            !maintenance,
+            "epigraph_maintenance must hold no {privilege} on {table} (251)"
+        );
+        let guard_owner: bool =
+            sqlx::query_scalar("SELECT has_table_privilege('epigraph_bba_guard_owner', $1, $2)")
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
         assert_eq!(
-            maintenance,
-            matches!(privilege, "SELECT" | "INSERT" | "DELETE"),
-            "epigraph_maintenance {privilege} on {table}"
+            guard_owner,
+            matches!(privilege, "SELECT" | "INSERT"),
+            "epigraph_bba_guard_owner {privilege} on {table}"
         );
     }
+    let owner_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_attribute a \
+          WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+            AND has_column_privilege('epigraph_bba_guard_owner', a.attrelid, a.attnum, 'UPDATE') \
+          ORDER BY 1",
+    )
+    .bind(table)
+    .fetch_all(&pool)
+    .await
+    .expect("column privileges");
+    assert_eq!(
+        owner_columns,
+        vec!["consumed_at", "consumed_login", "consumed_row"],
+        "the owner updates only the consumption columns (251)"
+    );
     let column_level: bool = sqlx::query_scalar(
         "SELECT has_any_column_privilege('epigraph_app', $1, 'SELECT') \
              OR has_any_column_privilege('epigraph_app', $1, 'INSERT') \
@@ -4199,9 +4301,17 @@ async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_mainte
         "no column-level grant to epigraph_app on {table}"
     );
 
-    for (signature, app_executes) in [
-        ("public.epigraph_purge_mass_functions(uuid[], text)", false),
-        ("public.epigraph_mf_purge_granted(uuid)", true),
+    for (signature, app_executes, owned_by) in [
+        (
+            "public.epigraph_purge_mass_functions(uuid[], text)",
+            false,
+            "epigraph_maintenance",
+        ),
+        (
+            "public.epigraph_mf_purge_granted(uuid)",
+            true,
+            "epigraph_bba_guard_owner",
+        ),
     ] {
         let (secdef, owner, acl): (bool, String, Option<String>) = sqlx::query_as(
             "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, p.proacl::text \
@@ -4212,7 +4322,7 @@ async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_mainte
         .await
         .unwrap_or_else(|e| panic!("{signature} must exist (migration 194): {e}"));
         assert!(secdef, "{signature} is SECURITY DEFINER");
-        assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+        assert_eq!(owner, owned_by, "{signature} owner (251)");
         assert!(
             acl.is_some(),
             "{signature} carries an explicit ACL (no PUBLIC default)"

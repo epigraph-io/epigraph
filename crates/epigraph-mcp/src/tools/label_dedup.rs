@@ -7,7 +7,8 @@
 //! one by one with `mark_duplicate`. Every family a profile names must be
 //! declared `family_kind: "index"` (`FAMILY_NOT_INDEX`) and be on this
 //! server's allowlist, [`INDEX_FAMILIES_ENV`] (`FAMILY_NOT_ALLOWED`; empty
-//! refuses every family), decided from the profile alone, before any read.
+//! refuses every family), decided from the profile alone, before any family
+//! read (a `profile_claim_id` profile is itself read first, as the caller).
 //!
 //! # The profile
 //!
@@ -23,12 +24,22 @@
 //!   regular file. When the process was also given a pin
 //!   ([`PROFILE_PIN_ENV`]), `profile_hash` must equal it, so the agent
 //!   talking to the process cannot pick another profile. `profile_json` is
-//!   refused.
-//! * **HTTP**: `profile_json` only.
+//!   refused. `profile_claim_id` is read only when the process has a pin
+//!   (`PROFILE_CLAIM_REFUSED` otherwise), and the pin is checked before the
+//!   claim is read: a claim is something the agent talking to the process
+//!   can write, so without a pin it could choose its own profile.
+//! * **HTTP**: `profile_json` or `profile_claim_id`.
+//!
+//! Exactly one source per call (`PROFILE_SOURCE_REQUIRED`). A
+//! `profile_claim_id` names a claim whose `content` is the profile's exact
+//! bytes, read like the family on a connection stamped from the caller's
+//! viewer, current or not: the bytes are pinned by `profile_hash` either
+//! way. Every plan, apply and probe answer reports the source in
+//! `profile_source` (`{"kind": "claim", "claim_id": ..}` for a stored
+//! profile), so a run records the stored profile it was planned from.
 //!
 //! A missing file and an unreadable one give the same `PROFILE_NOT_FOUND`
-//! answer. `profile_claim_id` (a stored profile claim) is reserved and
-//! refused until stamped private reads exist for it.
+//! answer, and so do a missing claim and one the caller cannot read.
 //!
 //! # Reads
 //!
@@ -141,7 +152,7 @@ pub mod codes {
     pub const PROFILE_NOT_FOUND: &str = "PROFILE_NOT_FOUND";
     pub const PROFILE_TOO_LARGE: &str = "PROFILE_TOO_LARGE";
     pub const PROFILE_SOURCE_REQUIRED: &str = "PROFILE_SOURCE_REQUIRED";
-    pub const PROFILE_CLAIM_DEFERRED: &str = "PROFILE_CLAIM_DEFERRED";
+    pub const PROFILE_CLAIM_REFUSED: &str = "PROFILE_CLAIM_REFUSED";
     pub const PROFILE_HASH_MISMATCH: &str = "PROFILE_HASH_MISMATCH";
     pub const INVALID_ARGUMENT: &str = "INVALID_ARGUMENT";
     pub const PLAN_DRIFT: &str = "PLAN_DRIFT";
@@ -262,59 +273,120 @@ struct ProfileArgs<'a> {
     hash: &'a str,
 }
 
-/// Load and verify the profile for this transport. Returns the profile and
-/// its canonical hash.
-fn load_profile(
+/// A loaded, hash-verified profile and where it came from.
+struct LoadedProfile {
+    profile: LabelDedupProfile,
+    /// The canonical (trimmed, lowercase) profile hash.
+    hash: String,
+    /// `{"kind": "path" | "inline"}` or `{"kind": "claim", "claim_id": ..}`:
+    /// reported with every plan and apply, so a run records which stored
+    /// profile claim it was planned from.
+    source: Value,
+}
+
+/// Load and verify the profile for this transport. See the module doc.
+async fn load_profile(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     args: &ProfileArgs<'_>,
-) -> Result<(LabelDedupProfile, String), McpError> {
-    if args.claim_id.is_some() {
-        return Err(refusal(
-            codes::PROFILE_CLAIM_DEFERRED,
-            "reading the profile from a stored claim is not available yet; pass profile_path \
-             (stdio) or profile_json (HTTP)",
-        ));
-    }
+) -> Result<LoadedProfile, McpError> {
     let http = auth.is_some();
     let cfg = &server.label_dedup;
-    let bytes = match (args.path, args.json) {
-        (Some(_), Some(_)) | (None, None) => {
-            return Err(refusal(
-                codes::PROFILE_SOURCE_REQUIRED,
-                "pass exactly one of profile_path (stdio) or profile_json (HTTP)",
-            ))
-        }
-        (Some(_), None) if http => {
-            return Err(refusal(
-                codes::PROFILE_PATH_REFUSED,
-                "profile_path is read only on stdio; over HTTP pass profile_json",
-            ))
-        }
-        (None, Some(_)) if !http => {
-            return Err(refusal(
-                codes::PROFILE_JSON_REFUSED,
-                "on stdio the profile is read from profile_path under this server's profile \
-                 root, never inline",
-            ))
-        }
-        (Some(path), None) => {
+    let (bytes, source) = match (args.path, args.json, args.claim_id) {
+        (Some(path), None, None) => {
+            if http {
+                return Err(refusal(
+                    codes::PROFILE_PATH_REFUSED,
+                    "profile_path is read only on stdio; over HTTP pass profile_json or \
+                     profile_claim_id",
+                ));
+            }
             check_pin(cfg.profile_pin.as_deref(), args.hash)?;
-            read_profile_file(cfg.profile_root.as_deref(), path)?
+            (
+                read_profile_file(cfg.profile_root.as_deref(), path)?,
+                json!({"kind": "path"}),
+            )
         }
-        (None, Some(text)) => {
+        (None, Some(text), None) => {
+            if !http {
+                return Err(refusal(
+                    codes::PROFILE_JSON_REFUSED,
+                    "on stdio the profile is read from profile_path under this server's \
+                     profile root, never inline",
+                ));
+            }
             if text.len() > MAX_PROFILE_BYTES {
                 return Err(refusal(
                     codes::PROFILE_TOO_LARGE,
                     format!("the profile is larger than {MAX_PROFILE_BYTES} bytes"),
                 ));
             }
-            text.as_bytes().to_vec()
+            (text.as_bytes().to_vec(), json!({"kind": "inline"}))
+        }
+        (None, None, Some(raw)) => {
+            if !http {
+                // A claim is something the agent talking to this process
+                // can write, so on stdio it may name one only when the
+                // process pins the profile bytes.
+                if cfg.profile_pin.is_none() {
+                    return Err(refusal(
+                        codes::PROFILE_CLAIM_REFUSED,
+                        "on stdio profile_claim_id is read only when this server was started \
+                         with a profile pin (EPIGRAPH_MCP_PROFILE_PIN); pass profile_path",
+                    ));
+                }
+                check_pin(cfg.profile_pin.as_deref(), args.hash)?;
+            }
+            let id = parse_id(raw)?;
+            (
+                read_profile_claim(server, viewer, id).await?,
+                json!({"kind": "claim", "claim_id": id}),
+            )
+        }
+        _ => {
+            return Err(refusal(
+                codes::PROFILE_SOURCE_REQUIRED,
+                "pass exactly one of profile_path (stdio), profile_json (HTTP) or \
+                 profile_claim_id",
+            ))
         }
     };
     let (profile, hash) =
         LabelDedupProfile::load_pinned(&bytes, args.hash).map_err(|e| engine_refusal(&e))?;
-    Ok((profile, canonical_hash(&hash)))
+    Ok(LoadedProfile {
+        profile,
+        hash: canonical_hash(&hash),
+        source,
+    })
+}
+
+/// The content of the profile claim `id`, read on a connection stamped from
+/// the caller's `viewer`: a claim the caller cannot read gives the same
+/// `PROFILE_NOT_FOUND` answer as one that does not exist.
+async fn read_profile_claim(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    id: Uuid,
+) -> Result<Vec<u8>, McpError> {
+    let mut read = server.read_as(viewer, "label_dedup_profile").await?;
+    let claim = ClaimRepository::get_by_id_conn(&mut read, viewer, ClaimId::from_uuid(id))
+        .await
+        .map_err(db_caller_error)?;
+    read.commit().await.map_err(db_caller_error)?;
+    let Some(claim) = claim else {
+        return Err(refusal(
+            codes::PROFILE_NOT_FOUND,
+            format!("profile_claim_id {id}: no readable profile claim with this id"),
+        ));
+    };
+    if claim.content.len() > MAX_PROFILE_BYTES {
+        return Err(refusal(
+            codes::PROFILE_TOO_LARGE,
+            format!("the profile is larger than {MAX_PROFILE_BYTES} bytes"),
+        ));
+    }
+    Ok(claim.content.into_bytes())
 }
 
 /// On stdio with a pin, the caller's hash must be the pin.
@@ -501,14 +573,17 @@ fn parse_as_of(raw: Option<&str>) -> Result<Option<NaiveDate>, McpError> {
 struct Prepared {
     profile: LabelDedupProfile,
     profile_hash: String,
+    profile_source: Value,
     run_tag: String,
     as_of: Option<NaiveDate>,
     sections: Vec<Section>,
     max: MaxClaims,
 }
 
-fn prepare(
+#[allow(clippy::too_many_arguments)]
+async fn prepare(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     profile: &ProfileArgs<'_>,
     run_tag: &str,
@@ -519,11 +594,12 @@ fn prepare(
     let max = MaxClaims::resolve(server.label_dedup.max_claims_cap, max_claims)?;
     let sections = parse_sections(sections)?;
     let as_of = parse_as_of(as_of)?;
-    let (profile, profile_hash) = load_profile(server, auth, profile)?;
-    check_families(&profile, &server.label_dedup.index_families)?;
+    let loaded = load_profile(server, viewer, auth, profile).await?;
+    check_families(&loaded.profile, &server.label_dedup.index_families)?;
     Ok(Prepared {
-        profile,
-        profile_hash,
+        profile: loaded.profile,
+        profile_hash: loaded.hash,
+        profile_source: loaded.source,
         run_tag: run_tag.to_string(),
         as_of,
         sections,
@@ -532,9 +608,9 @@ fn prepare(
 }
 
 /// Every family the profile names must be declared an index and be on this
-/// server's allowlist, decided from the profile alone, before any read: label
-/// dedup is bookkeeping on an operational index and must never be pointed at
-/// a family of knowledge claims.
+/// server's allowlist, decided from the profile alone, before any family
+/// read: label dedup is bookkeeping on an operational index and must never be
+/// pointed at a family of knowledge claims.
 fn check_families(
     profile: &LabelDedupProfile,
     allowed: &std::collections::BTreeSet<String>,
@@ -705,6 +781,7 @@ async fn compute_plan(
         plan,
         at: read.at,
         foreign_duplicates: read.foreign_duplicates,
+        profile_source: p.profile_source.clone(),
     })
 }
 
@@ -713,6 +790,8 @@ struct Planned {
     plan: engine::Plan,
     at: DateTime<Utc>,
     foreign_duplicates: Vec<Value>,
+    /// Where the profile came from ([`LoadedProfile::source`]).
+    profile_source: Value,
 }
 
 /// The plan as the tools return it: the engine's plan plus the snapshot time,
@@ -723,6 +802,7 @@ fn plan_json(planned: &Planned, max: MaxClaims) -> Result<Value, McpError> {
     v["coverage"]["snapshot_at"] = json!(planned.at.to_rfc3339());
     v["coverage"]["foreign_duplicates_ignored"] = json!(planned.foreign_duplicates);
     v["max_claims"] = max.json();
+    v["profile_source"] = planned.profile_source.clone();
     v["write_units"] = serde_json::to_value(plan.write_units()).map_err(internal_error)?;
     Ok(v)
 }
@@ -883,7 +963,9 @@ async fn member_not_owned(
         return Ok(Some(format!("claim {id} is not readable by this identity")));
     };
     Ok(
-        match crate::tools::claims::require_owner_or_admin(server, auth, caller, author).await {
+        match crate::tools::claims::require_owner_or_admin(server, &mut *conn, auth, caller, author)
+            .await
+        {
             Ok(OwnershipGrant::UndeclaredSigner) => Some(format!(
                 "claim {id} is authored by agent {author}; this server has no declared signer, \
                  so whether it may act for that agent is undecided"
@@ -1115,9 +1197,11 @@ async fn write_check(
                     .map(|why| format!("not_owner: {why}"));
             let owned = reason.is_none();
             let grant = if auth.is_some() {
-                crate::tools::claims::require_owner_or_admin(server, auth, caller, author)
-                    .await
-                    .ok()
+                crate::tools::claims::require_owner_or_admin(
+                    server, &mut read, auth, caller, author,
+                )
+                .await
+                .ok()
             } else {
                 None
             };
@@ -1127,8 +1211,10 @@ async fn write_check(
                 .chain(&w.remove)
                 .any(|l| l == crate::tools::claims::RETIREMENT_LABEL || retirement.contains(l));
             let (gate, retire_grant) = if touches {
-                match crate::tools::claims::require_owner_or_admin(server, auth, caller, author)
-                    .await
+                match crate::tools::claims::require_owner_or_admin(
+                    server, &mut read, auth, caller, author,
+                )
+                .await
                 {
                     Ok(OwnershipGrant::UndeclaredSigner) => {
                         reason.get_or_insert_with(|| {
@@ -1188,6 +1274,7 @@ pub async fn plan_label_dedup(
 ) -> Result<CallToolResult, McpError> {
     let prepared = prepare(
         server,
+        viewer,
         auth,
         &ProfileArgs {
             path: params.profile_path.as_deref(),
@@ -1199,7 +1286,8 @@ pub async fn plan_label_dedup(
         params.as_of.as_deref(),
         &params.sections,
         params.max_claims,
-    )?;
+    )
+    .await?;
     let planned = compute_plan(server, viewer, &prepared).await?;
     let mut out = plan_json(&planned, prepared.max)?;
     let plan = &planned.plan;
@@ -1246,6 +1334,7 @@ pub async fn apply_label_dedup(
     server.reject_if_read_only()?;
     let prepared = prepare(
         server,
+        viewer,
         auth,
         &ProfileArgs {
             path: params.profile_path.as_deref(),
@@ -1257,7 +1346,8 @@ pub async fn apply_label_dedup(
         params.as_of.as_deref(),
         &params.sections,
         params.max_claims,
-    )?;
+    )
+    .await?;
     let planned = match compute_plan(server, viewer, &prepared).await {
         Ok(planned) => planned,
         // The family read fit `max_claims` but not the engine's pairwise
@@ -1268,6 +1358,7 @@ pub async fn apply_label_dedup(
             v["refusal"] = json!({"code": RESOURCE_CAP, "message": e.message});
             v["plan"] = Value::Null;
             v["max_claims"] = prepared.max.json();
+            v["profile_source"] = prepared.profile_source.clone();
             return success_json(&v);
         }
         Err(e) => return Err(e),
@@ -1277,6 +1368,7 @@ pub async fn apply_label_dedup(
         v["applied_plan_hash"] = Value::Null;
         v["refusal"] = json!({"code": code, "message": message});
         v["plan"] = plan_json(&planned, prepared.max)?;
+        v["profile_source"] = prepared.profile_source.clone();
         success_json(&v)
     };
     let plan = &planned.plan;
@@ -1296,6 +1388,7 @@ pub async fn apply_label_dedup(
         let mut v = nothing_applied("nothing_to_do");
         v["applied_plan_hash"] = json!(plan.plan_hash);
         v["coverage"] = plan_json(&planned, prepared.max)?["coverage"].clone();
+        v["profile_source"] = prepared.profile_source.clone();
         return success_json(&v);
     }
 
@@ -1354,6 +1447,7 @@ pub async fn apply_label_dedup(
         "review": review,
         "coverage": plan_json(&planned, prepared.max)?["coverage"].clone(),
         "max_claims": prepared.max.json(),
+        "profile_source": prepared.profile_source,
     }))
 }
 
@@ -1631,8 +1725,9 @@ pub async fn probe_label_dedup(
         }));
     }
     let max = MaxClaims::resolve(server.label_dedup.max_claims_cap, params.max_claims)?;
-    let (profile, _hash) = load_profile(
+    let loaded = load_profile(
         server,
+        viewer,
         auth,
         &ProfileArgs {
             path: params.profile_path.as_deref(),
@@ -1640,7 +1735,9 @@ pub async fn probe_label_dedup(
             claim_id: params.profile_claim_id.as_deref(),
             hash: &params.profile_hash,
         },
-    )?;
+    )
+    .await?;
+    let profile = loaded.profile;
     check_families(&profile, &server.label_dedup.index_families)?;
     let specs = profile
         .probe_reads(params.include_closed_signals)
@@ -1676,6 +1773,7 @@ pub async fn probe_label_dedup(
             "snapshot_at": at.to_rfc3339(),
         },
         "max_claims": max.json(),
+        "profile_source": loaded.source,
     }))
 }
 

@@ -31,7 +31,8 @@ ignore = [
                          #   (DecodingKey::from_rsa_components in
                          #   epigraph-api oauth/providers/google.rs and
                          #   cloudflare_access.rs), and epigraph's own tokens
-                         #   are signed HS256 (epigraph-auth JwtConfig). An RSA
+                         #   are signed HS256 or EdDSA (epigraph-auth
+                         #   JwtConfig; EdDSA via ed25519, not rsa). An RSA
                          #   private key outside tests re-opens this entry.
     "RUSTSEC-2026-0459", # libsqlite3-sys <0.39: its bundled SQLite (before
                          #   3.54.0) can return uninitialized page-cache memory
@@ -55,9 +56,15 @@ ignore = [
                          #   rusqlite; revisit when a sqlx release allows
                          #   libsqlite3-sys >=0.39. `cargo audit` cannot see
                          #   that condition break once this ID is ignored, so
-                         #   the blocking ratchet is
+                         #   the blocking ratchets are
                          #   crates/epigraph-auth/tests/sqlite_never_compiled.rs
-                         #   (workspace manifests + Cargo.lock dependants).
+                         #   (workspace manifests + Cargo.lock dependants) and
+                         #   the `lint` CI job's step "SQLite is never compiled
+                         #   (resolved dependency graph)",
+                         #   .github/scripts/sqlite-never-compiled.sh, which
+                         #   runs `cargo tree` over the feature-resolved graph
+                         #   and so also sees a crate outside the workspace
+                         #   enabling sqlx's `sqlite` feature.
     "RUSTSEC-2024-0384", # instant: unmaintained. Transitive via `ascent`
                          #   (Datalog engine) — not removable by us.
     "RUSTSEC-2024-0436", # paste: unmaintained. Transitive via `ascent`.
@@ -76,7 +83,11 @@ ignore = [
                          #   constructs an EC key (no EncodingKey/DecodingKey
                          #   ::from_ec_*, no from_jwk), and every Validation
                          #   pins RS256 (Google / Cloudflare Access public
-                         #   keys) or HS256 (epigraph-auth), so the ES256 /
+                         #   keys), or takes HS256 / EdDSA from the token
+                         #   header in epigraph-auth `JwtConfig::verify`, which
+                         #   refuses any other algorithm before a key is
+                         #   chosen and builds its Ed25519 keys by hand
+                         #   (`from_ed_der`, no from_jwk), so the ES256 /
                          #   ES384 code paths never run, and an EC VERIFY
                          #   would handle public data only. An EC private key
                          #   or an ES* algorithm in production re-opens this
@@ -165,8 +176,8 @@ ignore = [
 #     API (the pipeline is a commented-out TODO). No crate constructs a
 #     BaggagePropagator or TextMapPropagator, or calls
 #     set_text_map_propagator / extract_with_context.
-#   - epigraph-mcp/src/otel.rs is not in the module tree (no `mod otel`), and
-#     it builds an exporter only, not a propagator.
+#   - epigraph-mcp has no OpenTelemetry code (its unwired otel.rs, an
+#     exporter only, was deleted; backlog e6ed6cc9).
 #   Fix = opentelemetry/opentelemetry_sdk/opentelemetry-otlp 0.27 -> >=0.32.1
 #   plus the matching tracing-opentelemetry. That is a breaking API move, not
 #   a lockfile bump. Revisit this entry when the `otel` pipeline is wired up,

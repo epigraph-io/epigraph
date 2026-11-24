@@ -250,6 +250,56 @@ async fn reporting_an_outcome_requires_the_claims_write_scope(pool: PgPool) {
     );
 }
 
+/// Backlog 36f4ce96: the flat outcome route has no report row to key a retry
+/// on, so it REFUSES an `idempotency_key` (400, naming the hierarchical route
+/// that supports it) rather than accept it and count the retry as a second
+/// run. The refusal moves no truth value, no counter and writes no behavioral
+/// row, on a retry too. Calibration: the same report without the key is
+/// admitted and counts one use.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_flat_outcome_route_refuses_an_idempotency_key(pool: PgPool) {
+    let w = world(pool, "flat-outcome-key").await;
+    let uri = format!("/api/v1/workflows/{}/outcome", w.workflow);
+    let mut body = json!({ "success": true, "outcome_details": "keyed run", "quality": 1.0 });
+    let before = w.footprint().await;
+
+    body["idempotency_key"] = json!("flat-run-1");
+    for attempt in ["first", "retry"] {
+        let (status, out) = w
+            .call(Method::POST, &uri, w.owner, READ_WRITE, Some(&body))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{attempt}: a keyed flat report is refused 400: {out}"
+        );
+        assert!(
+            out.to_string().contains(
+                "`idempotency_key` is supported on POST /api/v1/workflows/hierarchical/:id/outcome only"
+            ),
+            "{attempt}: the refusal names the route that supports the key: {out}"
+        );
+        assert_eq!(
+            w.footprint().await,
+            before,
+            "{attempt}: a refused report moves no truth value, no counter and writes no row"
+        );
+    }
+
+    body.as_object_mut()
+        .expect("an object body")
+        .remove("idempotency_key");
+    let (status, out) = w
+        .call(Method::POST, &uri, w.owner, READ_WRITE, Some(&body))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: the same report without the key: {out}"
+    );
+    assert_eq!(w.footprint().await.2, before.2 + 1, "one use counted");
+}
+
 /// `DELETE /api/v1/workflows/:id` retires the workflow; a read-only token
 /// leaves it current.
 #[sqlx::test(migrations = "../../migrations")]

@@ -401,8 +401,8 @@ pub struct Attached {
     /// other claim endpoint.
     pub neighbours: BTreeSet<Uuid>,
     /// Migration 114's `writer_owned`, on a table that carries it; `None`
-    /// elsewhere. Read by `restrict-claims` (a narrowing clears it), ignored
-    /// by the re-own.
+    /// elsewhere. Read by `restrict-claims` (a narrowing clears it) and by the
+    /// re-own (a public-to-public move leaves the row on its writer's group).
     pub writer_owned: Option<bool>,
     /// Evidence only: `evidence_type`, `labels` and the first 80 characters of
     /// `raw_content`, for the hide selectors and their preview.
@@ -771,6 +771,47 @@ pub async fn lock_unkeyed_tables(conn: &mut PgConnection, tables: &[String]) -> 
     Ok(())
 }
 
+/// The tables every batch of a NARROWING or re-grouping act (`restrict-claims`
+/// and `regroup-claims`, apply, dry run and reverse) holds `SHARE ROW
+/// EXCLUSIVE` on for its duration: the derived tables with no key to claims
+/// ([`unkeyed_tables`]), plus `edges` and `harvester_fragments`.
+///
+/// Why `edges`: a concurrent edge INSERT on a moving claim is stamped by its
+/// trigger from the claim as that statement reads it, and an edge has no
+/// foreign key to `claims` (its endpoints are polymorphic), so nothing makes
+/// it wait for the batch's `FOR UPDATE` on the claim. One that read the claim
+/// before the batch's commit would land on the pre-move tuple after the
+/// commit, outside every check (for a restriction: a PUBLIC edge on a claim
+/// that is now group-private). The lock makes such an INSERT either commit
+/// before the batch reads its rows (the batch then sees and moves it) or wait
+/// until the batch commits (its trigger, which reads the claim with a fresh
+/// snapshot, then sees the move).
+///
+/// `harvester_fragments` is defence in depth, not a second closed gap: a
+/// fragment takes its tenancy from the AFTER INSERT statement trigger on
+/// `harvester_claim_provenance` (migration 089, ranked by 218), and that
+/// insert's foreign key to `claims` already takes `KEY SHARE` on the claim,
+/// which waits for the batch's `FOR UPDATE` (or makes the batch wait). The
+/// lock keeps any other fragment writer that reads a claim's tenancy without
+/// that key serialised too. Only the edge race is exercised by a test.
+///
+/// Cost: a batch, dry runs included, blocks every edge and fragment write on
+/// the instance while it runs; keep batches short.
+///
+/// `reown-claims` does not use this list: it moves public claims to another
+/// public owner, and a public edge's tuple does not depend on its endpoints'
+/// owners (migration 120), so a stale stamp there is still the right one.
+#[must_use]
+pub fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = unkeyed.to_vec();
+    for t in ["edges", "harvester_fragments"] {
+        if !out.iter().any(|u| u == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
 /// Row-change counters for the current transaction, per `public` table:
 /// `(inserted, updated, deleted)`, from `pg_stat_xact_user_tables`.
 ///
@@ -815,6 +856,120 @@ pub async fn layout_epoch_bump_due(conn: &mut PgConnection) -> anyhow::Result<bo
     )
     .fetch_one(&mut *conn)
     .await?)
+}
+
+/// `(run id, run owner, run visibility, parent owner, parent visibility)`; the
+/// parent half is `None` for a run whose workflow no longer exists.
+type RunAndParentPair = (Uuid, Uuid, String, Option<Uuid>, Option<String>);
+
+/// The recorded workflow runs (`behavioral_executions`) a batch's tenancy
+/// changes re-stamp (migration 240, backlog 88cf603b), accounted exactly.
+///
+/// A run carries its workflow's `(owner_group_id, visibility)`: the
+/// `workflows` row when one has the run's `workflow_id`, else the flat
+/// workflow claim. 240's follow triggers re-stamp a parent's runs when the
+/// parent's pair changes, so a batch that narrows, moves or restores a claim
+/// or a workflow row also updates every run of it whose pair differs. Those
+/// updates are rows the batch's census must account for.
+///
+/// A batch takes [`RunsFollow::before`] with its `counters_before` (before its
+/// first write), naming every parent it may re-tenant (a superset is fine: the
+/// count is a before/after difference, not a prediction), and adds
+/// [`RunsFollow::expect_into`] to its expected counts. That also CHECKS the
+/// follow: each of those runs must now carry its parent's pair, so a run left
+/// behind (a follow trigger lost or disabled) fails the batch rather than
+/// staying readable to its parent's old readers. A no-op on a database before
+/// 240, where the table carries no tenancy.
+#[derive(Debug, Default)]
+pub struct RunsFollow {
+    /// Run id -> `(owner_group_id, visibility)` before the batch's first write.
+    before: BTreeMap<Uuid, (Uuid, String)>,
+}
+
+impl RunsFollow {
+    /// The current pair of every run of `parents` (claim or workflow ids).
+    /// `None` before migration 240.
+    ///
+    /// # Errors
+    /// A query fails.
+    pub async fn before(conn: &mut PgConnection, parents: &[Uuid]) -> anyhow::Result<Option<Self>> {
+        let tenanted: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                             WHERE table_schema = 'public' \
+                               AND table_name = 'behavioral_executions' \
+                               AND column_name = 'owner_group_id')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .context("probing behavioral_executions for migration 240")?;
+        if !tenanted {
+            return Ok(None);
+        }
+        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+            "SELECT id, owner_group_id, visibility::text FROM behavioral_executions \
+              WHERE workflow_id = ANY($1)",
+        )
+        .bind(parents)
+        .fetch_all(&mut *conn)
+        .await
+        .context("reading the runs of the batch's parents")?;
+        Ok(Some(Self {
+            before: rows.into_iter().map(|(id, g, v)| (id, (g, v))).collect(),
+        }))
+    }
+
+    /// Add the runs whose pair changed to `expected["behavioral_executions"]`
+    /// (one UPDATE each), and return one violation per run that does not now
+    /// carry its parent's pair.
+    ///
+    /// # Errors
+    /// A query fails.
+    pub async fn expect_into(
+        &self,
+        conn: &mut PgConnection,
+        expected: &mut BTreeMap<String, (i64, i64, i64)>,
+    ) -> anyhow::Result<Vec<String>> {
+        if self.before.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<Uuid> = self.before.keys().copied().collect();
+        let rows: Vec<RunAndParentPair> = sqlx::query_as(
+            "SELECT be.id, be.owner_group_id, be.visibility::text, \
+                    COALESCE(w.owner_group_id, c.owner_group_id), \
+                    COALESCE(w.visibility::text, c.visibility::text) \
+               FROM behavioral_executions be \
+               LEFT JOIN workflows w ON w.id = be.workflow_id \
+               LEFT JOIN claims c ON c.id = be.workflow_id \
+              WHERE be.id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await
+        .context("re-reading the runs of the batch's parents")?;
+        let mut changed = 0_i64;
+        let mut v = Vec::new();
+        for (id, g, vis, pg, pv) in rows {
+            if self.before.get(&id) != Some(&(g, vis.clone())) {
+                changed += 1;
+            }
+            if let (Some(pg), Some(pv)) = (pg, pv) {
+                if (pg, pv.as_str()) != (g, vis.as_str()) {
+                    v.push(format!(
+                        "behavioral_executions {id}: the run carries ({vis}, {g}) but its \
+                         workflow is ({pv}, {pg}); migration 240's follow trigger did not \
+                         re-stamp it"
+                    ));
+                }
+            }
+        }
+        if changed > 0 {
+            expected
+                .entry("behavioral_executions".to_string())
+                .or_default()
+                .1 += changed;
+        }
+        Ok(v)
+    }
 }
 
 /// The world group: the key of the public Atlas map (migration 210).

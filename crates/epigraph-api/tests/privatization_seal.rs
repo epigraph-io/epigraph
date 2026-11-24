@@ -2343,3 +2343,459 @@ fn the_preview_names_exactly_the_tables_the_seal_deletes() {
         told.len()
     );
 }
+
+// =========================================================================
+// Every field of every lifecycle response (backlog bf85800e, F-PR18b-A1)
+// =========================================================================
+
+/// What a lifecycle response body must never name, and the check.
+///
+/// Ids are searched in hyphenated and plain form, content by its text. The
+/// bodies are searched as SERIALIZED JSON, so a field added to any of these
+/// responses later is covered without editing the test.
+struct Forbidden {
+    ids: Vec<(&'static str, Uuid)>,
+    text: Vec<(&'static str, String)>,
+}
+
+impl Forbidden {
+    /// The first forbidden thing `body` names, described, or `None`.
+    fn first_named(&self, body: &serde_json::Value) -> Option<String> {
+        let text = body.to_string();
+        for (name, id) in &self.ids {
+            for form in [id.hyphenated().to_string(), id.simple().to_string()] {
+                if text.contains(&form) {
+                    return Some(format!("{name} ({id})"));
+                }
+            }
+        }
+        self.text
+            .iter()
+            .find(|(_, content)| text.contains(content.as_str()))
+            .map(|(name, _)| (*name).to_string())
+    }
+
+    fn assert_names_none(&self, surface: &str, body: &serde_json::Value) {
+        if let Some(named) = self.first_named(body) {
+            panic!("{surface}: {named} appears in the response body: {body}");
+        }
+    }
+}
+
+/// A response body as the wire carries it.
+fn wire<T: serde::Serialize>(response: &T) -> serde_json::Value {
+    serde_json::to_value(response).expect("the response serializes")
+}
+
+/// **Every field of every privatization LIFECYCLE response names only what
+/// its reader may be told** (backlog bf85800e; the residual of tenancy
+/// finding F-PR18b-A1, whose first discharge covered the preview, the item
+/// pages, `GET /plans/:id` and `GET /plans` in
+/// `privatization_routes.rs::every_plan_response_field_names_only_what_the_reader_can_read`).
+///
+/// One `seal` plan is walked through every remaining surface, each through
+/// its ROUTE: approve (by a co-admin), apply, the seal manifest, the seal
+/// commit, the unseal manifest, the unseal commit, revert, abort (of the
+/// reverting plan), and the audit read (by the author and by the co-admin).
+/// Each whole body is serialized and searched for what lies OUTSIDE the plan
+/// and outside the reader's groups:
+///
+/// * a boundary edge from the selected claim, owned by another group;
+/// * the claim at that edge's far end, and its content;
+/// * that group, and its author;
+/// * that group's evidence row held ON the selected claim (evidence can bear
+///   on several claims, so the seal neither serves nor encrypts another
+///   group's row), and its body.
+///
+/// The selected claim itself is deliberately one the reader can read (the
+/// author's public claim, moved into the target group by the apply): whether
+/// a lifecycle surface may name a selected claim the reader cannot read is
+/// the item walk's rule, measured by the test cited above, and is not
+/// re-decided here. Each absence is calibrated by the PRESENCE of the
+/// readable counterpart in the same body (the plan id, the job id, the
+/// selected claim, its content, its own evidence row, a non-zero count), so
+/// an empty body cannot pass.
+///
+/// Like the test cited above it runs on `split_state`, whose scoped arm is
+/// the harness superuser, so the row security of the handlers' reads is not
+/// in play there and the handlers' own assembly is what is measured. The
+/// audit read is ALSO driven through a state whose scoped arm is downgraded
+/// to `epigraph_app`, unfiltered and keyed on an entity, so the audit policy
+/// applies to the handler's own read (the policy's two arms in isolation are
+/// `crates/epigraph-db/tests/privatization_authz.rs::privatization_audit_entity_rows_follow_the_callers_group_adminship`).
+/// The seal and unseal manifests are read by the author only: after the
+/// group-admin authority gate both read on the maintenance session, not under
+/// the reader's row security, so which admin reads them does not change the
+/// body.
+///
+/// # Verified to fail (mutations, each restored)
+///
+/// - Seal manifest: `SEAL_EVIDENCE_OWNER_PREDICATE` replaced by `true` -> the
+///   manifest serves the held row and its body.
+/// - Audit: `load_audit_conn`'s plan filter dropped -> the fixture audit row
+///   of ANOTHER group's plan, naming the far-end claim, is served.
+/// - Audit: `get_audit` reading on the maintenance session instead of
+///   `read_as` -> the application-role reads serve that fixture row.
+/// - Unseal manifest: `unseal_manifest_page_conn`'s plan filter dropped -> the
+///   far-end claim's fixture ciphertext row (an item of that other plan) is
+///   served.
+/// - Seal manifest: `seal_manifest_page_conn`'s plan filter dropped -> the
+///   far-end claim and its content are served.
+/// - The fixed-shape bodies (`PlanStateResponse`, `DispatchResponse`,
+///   `CommitResponse`) carry no entity field; [`Forbidden`] is calibrated
+///   non-vacuous on each of them by injecting a forbidden id into the body.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_lifecycle_response_field_names_only_what_the_reader_can_read(pool: PgPool) {
+    use axum::extract::{Path, Query, State};
+    use axum::{Extension, Json};
+    use epigraph_api::middleware::bearer::ViewerExtractor;
+    use epigraph_db::visibility::Viewer;
+
+    let subject_text = format!("bf85800e selected readable text {}", Uuid::new_v4());
+    let held_text = format!("bf85800e another group's held evidence {}", Uuid::new_v4());
+    let far_text = format!("bf85800e unreadable far-end text {}", Uuid::new_v4());
+
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let co_admin = fx::add_admin(&pool, world.target_group, "bf85800e-co").await;
+    viewer_fixture::make_custodian(&pool, co_admin).await;
+    let (outsider, elsewhere) =
+        viewer_fixture::seed_agent_with_group(&pool, "bf85800e-elsewhere").await;
+
+    let subject = seed_subject(&pool, &world, &subject_text).await;
+    let own_evidence: Uuid =
+        sqlx::query_scalar("SELECT id FROM evidence WHERE claim_id = $1 ORDER BY id LIMIT 1")
+            .bind(subject)
+            .fetch_one(&pool)
+            .await
+            .expect("the subject's own evidence row");
+    let held = seed_held_body(&pool, subject, elsewhere, &held_text).await;
+    let far = viewer_fixture::seed_group_claim(&pool, outsider, elsewhere, &far_text).await;
+    let edge = viewer_fixture::seed_edge_owned_by(&pool, subject, far, "group", elsewhere).await;
+
+    // ANOTHER group's sealed plan over the far-end claim: a plan row, its
+    // item, an audit row naming the claim, and the claim's ciphertext row.
+    // FIXTURE rows (triggers off, one superuser transaction), there so that a
+    // surface which stops keying on ITS plan would name the far-end claim:
+    // nothing below reads them on the unmutated code.
+    let mut tx = pool.begin().await.expect("begin the other plan's fixture");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("fixture rows without the plan guards");
+    let other_plan: Uuid = sqlx::query_scalar(
+        "INSERT INTO privatization_plans (mode, target_group_id, selector, created_by, state) \
+         VALUES ('seal', $1, '{}'::jsonb, $2, 'applied') RETURNING id",
+    )
+    .bind(elsewhere)
+    .bind(outsider)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the other group's plan");
+    sqlx::query(
+        "INSERT INTO privatization_plan_items (plan_id, kind, entity_id, depth, via, \
+             before_visibility, before_owner_group_id, before_had_embedding, state) \
+         VALUES ($1, 'claim', $2, 0, 'seed', 'group', $3, false, 'applied')",
+    )
+    .bind(other_plan)
+    .bind(far)
+    .bind(elsewhere)
+    .execute(&mut *tx)
+    .await
+    .expect("its item");
+    sqlx::query(
+        "INSERT INTO privatization_audit (plan_id, actor_agent_id, action, kind, entity_id) \
+         VALUES ($1, $2, 'item.seal', 'claim', $3)",
+    )
+    .bind(other_plan)
+    .bind(outsider)
+    .bind(far)
+    .execute(&mut *tx)
+    .await
+    .expect("its audit row");
+    sqlx::query(
+        "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, \
+                                       encrypted_content) \
+         VALUES ($1, $2, 0, 'fully_private', '\\x00'::bytea)",
+    )
+    .bind(far)
+    .bind(elsewhere)
+    .execute(&mut *tx)
+    .await
+    .expect("its ciphertext row");
+    tx.commit().await.expect("commit the other plan's fixture");
+
+    let forbidden = Forbidden {
+        ids: vec![
+            ("the other group's plan", other_plan),
+            ("the boundary edge the reader cannot read", edge),
+            ("the claim at that edge's far end", far),
+            ("the other group", elsewhere),
+            ("the other group's author", outsider),
+            (
+                "the other group's evidence held on the selected claim",
+                held,
+            ),
+        ],
+        text: vec![
+            ("the far-end claim's content", far_text.clone()),
+            ("the held evidence's body", held_text.clone()),
+        ],
+    };
+    let state = fx::split_state(&pool).await;
+    let viewer = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            ViewerExtractor(
+                Viewer::resolve(&pool, agent)
+                    .await
+                    .expect("resolve the reader's viewer"),
+            )
+        }
+    };
+
+    // ---- create (not a surface of this test; the cited test owns it) ----
+    let (_, Json(preview)) = routes::create_plan(
+        viewer(world.actor).await,
+        State(state.clone()),
+        Some(Extension(fx::auth_for(world.actor))),
+        Json(routes::CreatePlanRequest {
+            mode: Some("seal".to_string()),
+            target_group_id: world.target_group,
+            seeds: routes::PlanSeeds {
+                ids: Some(routes::SeedIds {
+                    claims: vec![subject],
+                }),
+                predicate: None,
+                saved_query: None,
+            },
+            closure: None,
+            on_conflict: None,
+            pad_to: Some(i32::try_from(PAD_TO).unwrap()),
+        }),
+    )
+    .await
+    .expect("create the seal plan");
+    let plan = preview.plan_id;
+    let plan_text = plan.to_string();
+
+    // A fixed-shape body: the plan id is present, nothing else is named.
+    let fixed = |surface: &str, body: serde_json::Value, also: &[String]| {
+        let text = body.to_string();
+        assert!(
+            text.contains(&plan_text) && also.iter().all(|a| text.contains(a.as_str())),
+            "CALIBRATION: {surface} names the plan and {also:?}: {text}"
+        );
+        forbidden.assert_names_none(surface, &body);
+        // The check is not vacuous on this body's shape.
+        let mut injected = body.clone();
+        injected["plan_id"] = serde_json::json!(edge);
+        assert!(
+            forbidden.first_named(&injected).is_some(),
+            "CALIBRATION: a forbidden id injected into {surface} is caught"
+        );
+    };
+
+    // ---- approve, by a co-admin ----
+    let Json(approved) = routes::approve_plan(
+        viewer(co_admin).await,
+        State(state.clone()),
+        Some(Extension(fx::auth_for(co_admin))),
+        Path(plan),
+    )
+    .await
+    .expect("a co-admin approves");
+    fixed("POST /plans/:id/approve", wire(&approved), &[]);
+
+    // ---- apply, then the job ----
+    let (_, Json(applied)) = routes::apply_plan(
+        viewer(world.actor).await,
+        State(state.clone()),
+        Some(Extension(fx::auth_for(world.actor))),
+        Path(plan),
+        Json(routes::ApplyRequest {
+            plan_digest: preview.plan_digest.clone(),
+            acknowledge_author_loss: None,
+        }),
+    )
+    .await
+    .expect("apply");
+    fixed(
+        "POST /plans/:id/apply",
+        wire(&applied),
+        &[applied.job_id.to_string()],
+    );
+    let scoped = fx::scoped(&pool).await;
+    fx::run_apply(
+        &scoped,
+        &fx::apply_job(plan, world.actor, &applied.correlation_id),
+        50,
+    )
+    .await
+    .expect("the apply job runs");
+    assert_eq!(fx::plan_state(&pool, plan).await, "applied");
+
+    // ---- the seal manifest and commit ----
+    let manifest = fetch_seal_manifest(&pool, &world, plan)
+        .await
+        .expect("the seal manifest");
+    let manifest_wire = wire(&manifest);
+    let manifest_text = manifest_wire.to_string();
+    assert!(
+        manifest_text.contains(&subject.to_string())
+            && manifest_text.contains(&subject_text)
+            && manifest_text.contains(&own_evidence.to_string()),
+        "CALIBRATION: the seal manifest serves the selected claim, its content and its own \
+         evidence row: {manifest_text}"
+    );
+    forbidden.assert_names_none("GET /plans/:id/seal-manifest", &manifest_wire);
+
+    let sealed = post_seal_commit(&pool, &world, plan, seal_body(&manifest).await)
+        .await
+        .expect("the seal commit");
+    assert_eq!(
+        sealed.committed, 1,
+        "CALIBRATION: the seal commit sealed it"
+    );
+    fixed("POST /plans/:id/seal-commit", wire(&sealed), &[]);
+
+    // ---- the unseal manifest and commit ----
+    let unseal = fetch_unseal_manifest(&pool, &world, plan).await;
+    let unseal_wire = wire(&unseal);
+    assert!(
+        unseal_wire.to_string().contains(&subject.to_string()),
+        "CALIBRATION: the unseal manifest names the sealed claim: {unseal_wire}"
+    );
+    forbidden.assert_names_none("GET /plans/:id/unseal-manifest", &unseal_wire);
+
+    let unsealed = post_unseal_commit(
+        &pool,
+        &world,
+        plan,
+        routes::UnsealCommitRequest {
+            items: unseal.items.iter().map(unseal_entry).collect(),
+        },
+    )
+    .await
+    .expect("the unseal commit");
+    assert_eq!(unsealed.committed, 1, "CALIBRATION: the unseal restored it");
+    fixed("POST /plans/:id/unseal-commit", wire(&unsealed), &[]);
+
+    // ---- revert, then abort the reverting plan ----
+    let (_, Json(reverting)) = routes::revert_plan(
+        viewer(world.actor).await,
+        State(state.clone()),
+        Some(Extension(fx::auth_for(world.actor))),
+        Path(plan),
+        Json(routes::RevertRequest {
+            plan_digest: echoed_digest(&pool, plan).await,
+        }),
+    )
+    .await
+    .expect("revert");
+    fixed(
+        "POST /plans/:id/revert",
+        wire(&reverting),
+        &[reverting.job_id.to_string()],
+    );
+    let Json(aborted) = routes::abort_plan(
+        viewer(world.actor).await,
+        State(state.clone()),
+        Some(Extension(fx::auth_for(world.actor))),
+        Path(plan),
+    )
+    .await
+    .expect("abort the reverting plan");
+    assert_eq!(aborted.state, "failed");
+    fixed("POST /plans/:id/abort", wire(&aborted), &[]);
+
+    // ---- the audit read, by the author and by the co-admin ----
+    for (who, reader) in [("the author", world.actor), ("a co-admin", co_admin)] {
+        let Json(audit) = routes::get_audit(
+            viewer(reader).await,
+            State(state.clone()),
+            Some(Extension(fx::auth_for(reader))),
+            Query(routes::AuditQueryParams {
+                plan_id: Some(plan),
+                entity_id: None,
+                since: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{who}: the audit read is served: {e:?}"));
+        assert!(
+            audit
+                .events
+                .iter()
+                .any(|e| e.entity_id == Some(subject) && e.plan_id == plan),
+            "CALIBRATION: {who}'s audit names the selected claim's rows: {audit:?}"
+        );
+        forbidden.assert_names_none(&format!("{who}: GET /audit"), &wire(&audit));
+    }
+
+    // ---- the audit read under the APPLICATION role ----
+    // `split_state`'s scoped arm is the harness superuser, so the loop above
+    // measures the handler's own filters and not the row security its read
+    // runs under. Here the scoped arm is downgraded to `epigraph_app` (the
+    // maintenance arm stays attached, or the lifecycle answers 501), so the
+    // audit policy applies to the handler's own read. Neither an UNFILTERED
+    // read nor one keyed on the far-end claim may name the other group's
+    // plan; the same reads keyed on nothing and on the selected claim still
+    // serve this plan's rows (the calibration).
+    let app_state = {
+        let url = viewer_fixture::database_url_for(&pool).await;
+        let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+            &url,
+            epigraph_db::SessionGucMode::Session,
+            "epigraph_app",
+        )
+        .await
+        .expect("an application-role scoped pool")
+        .with_maintenance_pool(pool.clone());
+        let raw = viewer_fixture::downgraded_pool(&pool, "epigraph_app").await;
+        let mut app_state =
+            epigraph_api::AppState::with_db(raw, epigraph_api::ApiConfig::default());
+        app_state.scoped = Some(scoped);
+        app_state
+    };
+    for (who, reader) in [("the author", world.actor), ("a co-admin", co_admin)] {
+        let mut reads = Vec::new();
+        for entity_id in [None, Some(subject), Some(far)] {
+            let Json(audit) = routes::get_audit(
+                viewer(reader).await,
+                State(app_state.clone()),
+                Some(Extension(fx::auth_for(reader))),
+                Query(routes::AuditQueryParams {
+                    plan_id: None,
+                    entity_id,
+                    since: None,
+                    limit: None,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{who}: the app-role audit read ({entity_id:?}) is served: {e:?}")
+            });
+            reads.push((entity_id, audit));
+        }
+        for (entity_id, audit) in &reads {
+            let surface = format!("{who}: GET /audit?entity_id={entity_id:?} (app role)");
+            if *entity_id == Some(far) {
+                assert!(
+                    audit.events.is_empty(),
+                    "{surface} serves no row: {audit:?}"
+                );
+            } else {
+                assert!(
+                    audit
+                        .events
+                        .iter()
+                        .any(|e| e.entity_id == Some(subject) && e.plan_id == plan),
+                    "CALIBRATION: {surface} names the selected claim's rows: {audit:?}"
+                );
+            }
+            forbidden.assert_names_none(&surface, &wire(audit));
+        }
+    }
+}

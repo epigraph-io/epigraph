@@ -292,7 +292,7 @@ async fn evidence_by_relationship_sees_both_spellings(pool: PgPool) {
     let mut read = BTreeMap::new();
     for rel in ["SUPPORTS", "supports", "CONTRADICTS"] {
         let ids: BTreeSet<Uuid> =
-            EvidenceRepository::by_relationship_for_claim(&pool, &viewer, claim, rel)
+            EvidenceRepository::by_relationship_for_claim(&pool, &viewer, claim, &[rel])
                 .await
                 .expect("by_relationship_for_claim")
                 .into_iter()

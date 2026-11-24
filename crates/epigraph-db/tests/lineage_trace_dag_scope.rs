@@ -94,7 +94,7 @@ async fn ancestor_walk_trace_dag_is_viewer_scoped(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn descendant_walk_trace_dag_is_viewer_scoped(pool: PgPool) {
     let dag = seed_dag(&pool, "tdag-desc").await;
-    let out = LineageRepository::get_descendants(&pool, &dag.viewer, dag.start, None)
+    let out = LineageRepository::get_descendants(&pool, &dag.viewer, dag.start, None, None)
         .await
         .expect("get_descendants");
     let trace = out

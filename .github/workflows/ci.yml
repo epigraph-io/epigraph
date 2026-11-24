@@ -163,7 +163,8 @@ jobs:
   test-shard:
     name: test (${{ matrix.shard }})
     needs: plan
-    # An affected plan can hold no shard at all (a docs-only change). The job
+    # An affected plan can hold no shard at all (for example a Python change
+    # outside .github/scripts; a docs/ change selects the doc_links scan). The job
     # is then skipped rather than started with an empty matrix, which GitHub
     # rejects, and the `test` gate accepts the skip because the plan said so.
     if: ${{ fromJSON(needs.plan.outputs.run)['test-shard'] }}
@@ -479,6 +480,14 @@ jobs:
           cargo test -p epigraph-api --features integration --locked --no-fail-fast
           --test lineage_integration_tests --test semantic_search_tests
           -- --test-threads=1
+      - name: epigraph-api `tls` boot tests
+        # tests/boot_tls_served.rs boots the server's TLS serve path (rate
+        # limiter keyed on the peer, SIGTERM drain and its grace bound). It
+        # needs the `tls` feature AND a migrated database; `lint-features`,
+        # which runs the other `tls` tests, has no database (backlog a65cc870).
+        run: >-
+          cargo test -p epigraph-api --features tls --locked --no-fail-fast
+          --test boot_tls_served
       - name: epigraph-jobs `integration` feature tests
         # The integration-gated arms of postgres_queue_tests and the whole of
         # cluster_graph_neighborhoods_test. cluster_graph_test's gated arm is
@@ -631,6 +640,20 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
           df -ih / ; df -h /
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Self-test the SQLite dependency-graph check
+        # Throwaway workspaces outside the checkout: a postgres-only sqlx
+        # passes, a non-member crate enabling sqlx's `sqlite` feature (as a
+        # normal or a dev dependency) fails, and a graph without the control
+        # crate fails as vacuous. Proves the next step can still go red.
+        run: .github/scripts/test-sqlite-never-compiled.sh
+      - name: SQLite is never compiled (resolved dependency graph)
+        # The blocking ratchet behind the RUSTSEC-2026-0459 ignore in
+        # .cargo/audit.toml. crates/epigraph-auth/tests/sqlite_never_compiled.rs
+        # scans workspace manifests and Cargo.lock, which cannot show a crate
+        # outside the workspace enabling sqlx/sqlite in its own manifest;
+        # `cargo tree` over the feature-resolved graph can. It needs the
+        # registry, hence a step here (network) rather than a test.
+        run: .github/scripts/sqlite-never-compiled.sh
       - name: Clippy
         # --all-targets is load-bearing, not cosmetic. Without it cargo lints
         # only lib+bin targets, so `tests/`, `examples/` and `benches/` are
@@ -821,18 +844,22 @@ jobs:
   # on any skip not named in its --allow list, which also covers skips the flag
   # does not govern (e.g. test_git_ingest_reconciler's integration arm when it
   # cannot find the ingest_git binary built above). No skip is allowed:
-  # test_executed_dedup_removes_the_duplicate_from_recall needs a running API
-  # and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), and
-  # tests/ci/with_test_api.sh provides both around that step: it serves
-  # epigraph_py_test with the `server` binary built above, mints a per-run
-  # claims:write + claims:admin token, and stops the server when pytest exits,
-  # so it cannot outlive the step into tests/theme's table wipes (backlog
-  # 03fd7e00).
+  # the executed-dedup arms need a running API and bearer tokens
+  # (DEDUP_TEST_API_BASE, DEDUP_TEST_TOKEN, DEDUP_TEST_WRITER_*), and
+  # tests/ci/with_test_api.sh provides them around that step: it serves
+  # epigraph_py_test with the `server` binary built above, mints two per-run
+  # tokens, claims:write + claims:admin for another agent's cluster and
+  # claims:write only for an author marking its own duplicate (backlog
+  # 32905f60), and stops the server when pytest exits, so it cannot outlive
+  # the step into tests/theme's table wipes (backlog 03fd7e00).
   #
-  # The database arms connect as the service container's superuser, so RLS is
-  # bypassed: they verify the scripts' logic against the migrated schema, not
-  # role or tenancy scoping (a script run as a non-superuser role seeing only
-  # part of the rows is outside what they can catch).
+  # FIXTURES connect as the service container's superuser. The SCRIPTS under
+  # test connect as a non-superuser maintenance login, the role they use in
+  # production (EPIGRAPH_PYTEST_MAINTENANCE_DSN below, tests/db_roles.py;
+  # backlog 9d02a5e0), so a missing grant or a forced policy without a bypass
+  # arm fails here, and tests/theme/test_script_session_role.py pins that the
+  # login is not privileged and that row security on claims is forced. The API
+  # server itself still connects as the superuser.
   #
   # Advisory at first (continue-on-error, the `audit` precedent): promote it to
   # a hard gate once it has been stable on main.
@@ -864,6 +891,15 @@ jobs:
       # Migration 216: see the `test` job. The Python fixtures write through the
       # same superuser, so the migrate step grants it epigraph_seed.
       EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
+      # The SCRIPTS under test do not run as that superuser (backlog 9d02a5e0):
+      # in production they connect on MAINTENANCE_DATABASE_URL, a non-superuser,
+      # NOBYPASSRLS login in epigraph_maintenance, so a missing grant or a forced
+      # policy without a bypass arm must fail here too. The migrate step creates
+      # this login (tests/ci/provision_test_roles.py) with a random, masked,
+      # expiring password and exports EPIGRAPH_PYTEST_MAINTENANCE_DSN through
+      # $GITHUB_ENV; tests/db_roles.py hands it to the scripts and, with
+      # EPIGRAPH_PYTEST_REQUIRE_DB=1, fails an arm that would fall back to the
+      # superuser. Fixtures keep the superuser.
       SQLX_OFFLINE: "true"
       CARGO_BUILD_JOBS: "2"
     steps:
@@ -884,9 +920,14 @@ jobs:
       - name: Install Python test dependencies
         # A venv, not the system interpreter (PEP 668), from a pinned file, and
         # no extra setup action (the trust surface stays the pinned actions).
+        # tests/requirements-ci.txt is compiled from tests/requirements-ci.in
+        # with every transitive package pinned and sha256-hashed:
+        # --require-hashes refuses any artifact whose hash is not listed (a
+        # substituted or re-uploaded wheel), and --only-binary keeps pip from
+        # building an sdist, whose build dependencies would be unhashed.
         run: |
           python3 -m venv "$RUNNER_TEMP/pyenv"
-          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet -r tests/requirements-ci.txt
+          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet --require-hashes --only-binary :all: -r tests/requirements-ci.txt
           echo "$RUNNER_TEMP/pyenv/bin" >> "$GITHUB_PATH"
       - name: Create and migrate the Python test database
         run: |
@@ -901,6 +942,7 @@ jobs:
           export DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
           export MIGRATION_DATABASE_URL="$DATABASE_URL"
           ./target/debug/epigraph-migrate
+          TEST_ROLES_DATABASE_URL="$DATABASE_URL" python3 tests/ci/provision_test_roles.py --env-file "$GITHUB_ENV"
       - name: Python tests (scripts/tests, tests/dedup)
         run: |
           export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
@@ -920,13 +962,16 @@ jobs:
       - name: Python tests (NLI stance client and service)
         # scripts/lib/test_nli_stance.py and the services/nli stub tests ran
         # nowhere (backlog 4ea6edba). The service's web dependencies are
-        # installed at the versions services/nli/requirements.txt pins; its
-        # model dependencies (torch, transformers) are not, so
-        # test_model_smoke.py, which downloads a model, stays out.
+        # installed at the versions services/nli/requirements.txt pins (read
+        # from that file, so a pin bump is what CI tests); its model
+        # dependencies (torch, transformers) are not, so test_model_smoke.py,
+        # which downloads a model, stays out.
         run: |
-          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet fastapi==0.111.0 pydantic==2.7.4
+          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet \
+            $(grep -E '^(fastapi|starlette|pydantic)==' services/nli/requirements.txt)
           python3 -m pytest -rs scripts/lib/test_nli_stance.py \
-            services/nli/test_app.py services/nli/test_requirements_floor.py
+            services/nli/test_app.py services/nli/test_requirements_floor.py \
+            services/nli/test_dockerfile.py
       - name: SciFact conformal calibration check
         # The 1,189 gold-labelled SciFact fixtures: held-out split-conformal
         # coverage and efficiency, plus --check, which fails when the shipped
@@ -953,9 +998,17 @@ jobs:
   # backlog a2fa31b1 — sqlx 0.7->0.8 + reqwest 0.11->0.12 migrations), so the
   # job is GREEN on current advisories and a genuinely NEW one still turns it
   # red. It stays advisory (continue-on-error) by design — not a gate.
+  #
+  # The job also runs pip-audit over tests/requirements-ci.txt, the Python test
+  # dependencies the `python` job installs, so a published advisory against one
+  # of those pins turns it red too. The pip-audit steps run even when cargo
+  # audit fails (`!cancelled()`), so one ecosystem's finding cannot hide the
+  # other's; the step that failed names the ecosystem.
   audit:
     name: Security audit (advisory)
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the `python` job: tests/requirements-audit.txt
+    # is compiled for the image's python3 (3.12) and installed binary-only.
+    runs-on: ubuntu-24.04
     # Same bound as `test`. `continue-on-error` makes a FAILURE advisory; it
     # does nothing about a HANG, which still occupies a runner for six hours.
     timeout-minutes: 90
@@ -972,6 +1025,85 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit
+      - name: Install pip-audit
+        # Hash-locked like the test dependencies (tests/requirements-audit.txt),
+        # into its own venv, so the auditing tool is not an unpinned download.
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pip-audit"
+          "$RUNNER_TEMP/pip-audit/bin/pip" install --quiet --require-hashes --only-binary :all: -r tests/requirements-audit.txt
+      - name: Audit Python test dependencies
+        # Reads the locked file directly (--disable-pip --require-hashes: no
+        # resolution, no install) and checks every pinned package, transitive
+        # ones included, against the PyPI advisory data. --strict fails rather
+        # than skipping a package it cannot audit.
+        if: ${{ !cancelled() }}
+        run: '"$RUNNER_TEMP/pip-audit/bin/pip-audit" --strict --progress-spinner off --disable-pip --require-hashes -r tests/requirements-ci.txt'
+
+  # Advisory: the Atlas W6 layout digests on a SECOND CPU architecture
+  # (backlog c7c6e7ce). A stored layout level is reused while its input hash
+  # matches, and that hash covers LAYOUT_ALGO and the constants, not the
+  # machine; the layout may be computed off the box. So the pinned digests in
+  # atlas_layout::force::tests::the_layout_output_is_pinned_to_the_algorithm_tag
+  # must come out the same on arm64 as on x86_64, or stored positions could be
+  # reused under a computation that does not reproduce them. This job runs
+  # exactly that one test on a GitHub-hosted arm64 runner.
+  #
+  # Advisory (continue-on-error) until its first runs are read: a failure means
+  # the digests differ on arm64, which is a finding to act on (pin the layout
+  # compute to one architecture, or make the arithmetic architecture-exact
+  # and re-pin under a new LAYOUT_ALGO), not a broken PR. To keep it off the
+  # shared runner cap, it builds only when the change touches the layout code
+  # or this file (or on a push to main that does), and otherwise ends after
+  # the diff check.
+  layout-digest-arm64:
+    name: Atlas layout digests on arm64 (advisory)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      SQLX_OFFLINE: "true"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The change's base commit must be present for the diff below.
+          fetch-depth: 0
+      - name: Decide whether the layout code changed
+        id: scope
+        env:
+          # SHAs reach the script through env, never interpolated into the
+          # shell body. A push that created the branch has an all-zero
+          # `before`; then (and on any diff failure) the job runs.
+          SCAN_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          SCAN_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if ! changed=$(git diff --name-only "$SCAN_BASE" "$SCAN_HEAD" 2>/dev/null); then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s\n' "$changed" | grep -qE '^(crates/epigraph-cli/src/atlas_layout/|\.github/workflows/ci\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "the layout code is unchanged: nothing to check on arm64"
+          fi
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        if: steps.scope.outputs.run == 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        if: steps.scope.outputs.run == 'true'
+      - name: Run the pinned layout digest test
+        if: steps.scope.outputs.run == 'true'
+        # --no-default-features: the layout module needs no database, and the
+        # test prints the four digests it got, so a mismatch is readable from
+        # the log without a second run.
+        run: |
+          uname -m
+          cargo test -p epigraph-cli --no-default-features --locked --lib \
+            atlas_layout::force::tests::the_layout_output_is_pinned_to_the_algorithm_tag \
+            -- --exact --nocapture
 
   # Secret scan, a HARD gate (no continue-on-error). epigraph is a public repo,
   # so a credential committed on a PR branch is published the moment it is

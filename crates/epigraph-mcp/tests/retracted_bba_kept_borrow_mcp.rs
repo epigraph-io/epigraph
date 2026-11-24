@@ -96,13 +96,6 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     .fetch_one(pool)
     .await
     .expect("seed edge");
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'edge_factor', 'edge')",
-    )
-    .bind(id)
-    .execute(pool)
-    .await
-    .expect("seed the edge's perspective");
     id
 }
 
@@ -134,12 +127,12 @@ async fn world(pool: &PgPool) -> World {
     let b = claim_of(pool, x, xg, "h10 borrow downstream").await;
     let e = edge(pool, old, b).await;
     let f = frame(pool).await;
-    let retracted = MassFunctionRepository::store_with_perspective(
+    let retracted = MassFunctionRepository::store_in_slot(
         pool,
         b,
         f,
         Some(author),
-        Some(e),
+        epigraph_db::BbaSlot::Edge(e),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("edge_factor"),

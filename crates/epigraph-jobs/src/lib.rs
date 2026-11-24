@@ -55,7 +55,7 @@ pub use async_trait::async_trait;
 // PostgreSQL job queue module
 mod postgres_queue;
 pub use postgres_queue::{
-    PostgresJobQueue, ReapedJob, ENQUEUE_UNIQUE_LOCK_CLASS, MAX_CRASH_REDELIVERIES,
+    PostgresJobQueue, ReapedJob, StrandedPlan, ENQUEUE_UNIQUE_LOCK_CLASS, MAX_CRASH_REDELIVERIES,
     REAPED_REDELIVERIES_SPENT_MESSAGE, REAPED_SPENT_MESSAGE,
 };
 
@@ -692,6 +692,23 @@ impl JobRunner {
                 Err(e)
             }
         }
+    }
+
+    /// The backoff the handler registered for `job_type` declares before retry
+    /// `attempt` (0 = the first retry), as [`JobHandler::backoff`]; `None` when
+    /// no handler for the type is registered. The same lookup as
+    /// [`Self::process_job`], before and after [`Self::start`].
+    ///
+    /// The worker loop sleeps this long before it re-enqueues; the drain
+    /// (`jobs_drain::drain` in `epigraph-api`), which has no loop to sleep in,
+    /// stores it as the row's not-before time instead
+    /// ([`PostgresJobQueue::requeue_after`]).
+    #[must_use]
+    pub fn retry_backoff(&self, job_type: &str, attempt: u32) -> Option<Duration> {
+        self.handlers_mut
+            .get(job_type)
+            .or_else(|| self.handlers.get(job_type))
+            .map(|h| h.backoff(attempt))
     }
 
     /// Get list of all registered job types.

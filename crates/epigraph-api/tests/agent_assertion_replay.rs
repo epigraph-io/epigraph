@@ -7,15 +7,16 @@
 //! refresh token as often as it was replayed inside that window. Driven
 //! through the real `/oauth/token` route against a `#[sqlx::test]` database:
 //!
-//! * `client_credentials`: the same assertion twice -> 200, then 401 with no
-//!   token; a FRESH assertion by the same client right after -> 200
-//!   (calibration: the refusal is the replay, not the client's state); another
-//!   client's assertion carrying the same nonce bytes -> 200 (the record is per
-//!   client).
+//! * `client_credentials`: the same assertion twice -> 200, then 400
+//!   `invalid_client` with no token; a FRESH assertion by the same client
+//!   right after -> 200 (calibration: the refusal is the replay, not the
+//!   client's state); another client's assertion carrying the same nonce
+//!   bytes -> 200 (the record is per client).
 //! * the refresh grant, where an agent authenticates with the same assertion
-//!   check: an assertion already spent on `client_credentials` -> 401, an
-//!   assertion replayed after one successful refresh -> 401, and each refusal
-//!   leaves the presented refresh token usable with a fresh assertion.
+//!   check: an assertion already spent on `client_credentials` -> 400
+//!   `invalid_client`, an assertion replayed after one successful refresh ->
+//!   400 `invalid_client` (RFC 6749 section 5.2, backlog 31d799b3), and each
+//!   refusal leaves the presented refresh token usable with a fresh assertion.
 //!
 //! The grants this file cannot see (the definer's EXECUTE grant to the
 //! application role, the revoked table DML) are measured as `epigraph_app` in
@@ -164,10 +165,11 @@ async fn a_replayed_client_credentials_assertion_is_refused(pool: PgPool) {
     let (status, body) = post_token(&app, credentials_grant(&client_id, &captured)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "the same assertion presented again inside its window must be refused: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
     assert!(body.get("refresh_token").is_none(), "{body}");
 
     // Calibration: the client itself is fine; a fresh assertion mints.
@@ -215,10 +217,11 @@ async fn a_replayed_assertion_is_refused_on_the_refresh_grant(pool: PgPool) {
     let (status, body) = post_token(&app, refresh_grant(&r0, &client_id, &minted_with)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "an assertion already spent on client_credentials is a replay on refresh: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
 
     // r0 was left intact by that refusal.
     let refreshed_with = fresh_assertion(&key);
@@ -234,10 +237,11 @@ async fn a_replayed_assertion_is_refused_on_the_refresh_grant(pool: PgPool) {
     let (status, body) = post_token(&app, refresh_grant(&r1, &client_id, &refreshed_with)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "an assertion replayed on a second refresh must be refused: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
 
     let (status, body) =
         post_token(&app, refresh_grant(&r1, &client_id, &fresh_assertion(&key))).await;
@@ -287,8 +291,134 @@ async fn an_assertion_spent_on_one_spelling_of_a_key_is_refused_on_another(pool:
     let (status, body) = post_token(&app, credentials_grant(&upper, &captured)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "the same signed assertion replayed under the other spelling of the key: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
+}
+
+/// Backlog 57943a39: an agent client whose key is held by a `seed-derived`
+/// agent (migration 230) is refused on BOTH grants that run the assertion
+/// check. The key here is derived exactly as `ingest_literature` derived its
+/// author keys, `BLAKE3("<doi>:<name>")` as the Ed25519 secret, so anyone who
+/// knows the paper and the name can sign the assertion; the check verified the
+/// signature under `client_id` and never read `agents.key_kind`.
+///
+/// Calibration on the SAME client: while the agent row is `ed25519` the
+/// assertion mints (and yields a refresh chain), so the refusals after the
+/// row is re-marked are a function of `key_kind`, not of the client or key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_derived_agent_key_cannot_authenticate(pool: PgPool) {
+    let seed = blake3::hash(b"10.0000/example.0001:Ada Example");
+    let key = SigningKey::from_bytes(seed.as_bytes());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: as an ed25519 row the key mints: {body}"
+    );
+    let refresh = refresh_token_of(&body);
+
+    // The operator's repair: the row is marked for what its key is.
+    sqlx::query("UPDATE agents SET key_kind = 'seed-derived' WHERE public_key = $1")
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("re-mark seed-derived");
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "client_credentials minted for a seed-derived key: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
+
+    let (status, body) = post_token(
+        &app,
+        refresh_grant(&refresh, &client_id, &fresh_assertion(&key)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the refresh grant accepted a seed-derived key's assertion: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
+}
+
+/// The refusal is "anything but `ed25519`", not `seed-derived` only: the
+/// unkeyed LLM identity (`BLAKE3("llm-agent:{model}:{prompt hash}")`) is
+/// stored as `derived` (migration 161) and migration 230 could not re-mark it,
+/// so its key is just as computable. Calibrated on the SAME client: it mints
+/// while the row is `ed25519`, and is refused once the row is `derived`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_derived_agent_key_cannot_authenticate(pool: PgPool) {
+    let seed = blake3::hash(b"llm-agent:example-model:0000");
+    let key = SigningKey::from_bytes(seed.as_bytes());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: as an ed25519 row the key mints: {body}"
+    );
+
+    sqlx::query("UPDATE agents SET key_kind = 'derived' WHERE public_key = $1")
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("mark derived");
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "client_credentials minted for a derived (non-verifier) key: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
+}
+
+/// The refusal reads the kind of an agent that HOLDS the key; a key no agent
+/// holds is not refused. That is every `/oauth/register` agent client: its own
+/// key has no agents row (it is linked to a separate `derived` principal at
+/// mint time), so a refusal that treated "no row" as "not a verifier" would
+/// lock all of them out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_client_whose_key_no_agent_holds_still_authenticates(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    // Detach the client from the fixture's agent row and drop the row, so the
+    // key is held by no agent, as for a client `/oauth/register` created.
+    sqlx::query("UPDATE oauth_clients SET agent_id = NULL WHERE client_id = $1")
+        .bind(&client_id)
+        .execute(&pool)
+        .await
+        .expect("detach client");
+    sqlx::query("DELETE FROM agents WHERE public_key = $1")
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("drop agent row");
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an agent client whose key no agent holds must still mint: {body}"
+    );
 }

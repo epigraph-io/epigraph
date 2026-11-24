@@ -54,12 +54,13 @@
 //! rows of a different kind and get one of their own:
 //!
 //! * [`CREATION_LABEL`] (`auto_wire:creation`): an `auto_wire` row with no
-//!   perspective. Only the creation writers store that shape:
+//!   perspective and no slot. Only the creation writers store that shape:
 //!   `ds_auto::auto_wire_ds_for_claim` (the creation BBA of `submit_claim` /
 //!   `memorize`) and `ds_auto::auto_wire_ds_batch` (batch ingest's
 //!   self-assertion, `epigraph_engine::source_dependence::INGEST_ASSERTION_METHOD`).
 //!   Every `auto_wire` evidence write (`auto_wire_ds_update`) files under the
-//!   evidence id as its perspective;
+//!   evidence row's slot (`slot_kind = 'evidence'`, migration 267; its
+//!   perspective before 267);
 //! * [`WORKFLOW_OUTCOME_LABEL`] (`auto_wire:workflow_outcome`): an `auto_wire`
 //!   evidence row whose evidence is a `report_workflow_outcome` observation
 //!   (`evidence.properties`: `type` `observation`, `method`
@@ -366,11 +367,12 @@ async fn fold_inputs(
     let template = ingest_template_predicate("mf.", "f.");
     // The replay label, one CASE (module docs). The arms are disjoint: the
     // template has no `combination_method`, and the two `auto_wire` arms
-    // split on the perspective.
+    // split on the key (no perspective and no slot: the creation row).
     let sql = format!(
         "SELECT mf.claim_id, \
                 CASE WHEN {template} THEN '{INGEST_TEMPLATE_LABEL}' \
                      WHEN mf.combination_method = 'auto_wire' AND mf.perspective_id IS NULL \
+                          AND mf.slot_id IS NULL \
                           THEN '{CREATION_LABEL}' \
                      WHEN mf.combination_method = 'auto_wire' AND EXISTS ( \
                           SELECT 1 FROM evidence e WHERE e.id = mf.evidence_id \

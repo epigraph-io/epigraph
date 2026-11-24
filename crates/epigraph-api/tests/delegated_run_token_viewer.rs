@@ -141,21 +141,27 @@ fn assert_refused(what: &str, (status, body): (StatusCode, String)) {
     );
 }
 
-/// `POST /api/v1/evidence` with `access` and a body the handler itself refuses
-/// (an `evidence_type` no variant matches): a route that resolves NO viewer,
-/// where reaching the handler shows as its own 400 and nothing is written.
-async fn submit_evidence(state: &AppState, access: &str) -> (StatusCode, String) {
+/// `POST /api/v1/analyses` with `access` and a body the handler itself
+/// refuses (an empty `analysis_type`): a route that resolves NO viewer (no
+/// `ViewerExtractor`; it gates on the `AuthContext` and `claims:write`), where
+/// reaching the handler shows as its own 400 and nothing is written.
+///
+/// (This was `POST /api/v1/evidence` until backlog 73d4f7ff gave
+/// `create_evidence` a `ViewerExtractor`; a route that resolves a viewer would
+/// no longer show that the MIDDLEWARE, not the extractor, refuses.)
+async fn submit_viewerless(state: &AppState, access: &str) -> (StatusCode, String) {
     let body = serde_json::json!({
+        "analysis_type": "   ",
+        "method_description": "delegated viewerless probe",
+        "inference_path": "probe",
         "agent_id": Uuid::new_v4(),
-        "claim_id": Uuid::new_v4(),
-        "raw_content": "delegated evidence probe",
-        "evidence_type": {"no_such_variant": {}},
+        "input_evidence_ids": [],
     });
     let resp = create_router(state.clone())
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/evidence")
+                .uri("/api/v1/analyses")
                 .header(header::AUTHORIZATION, format!("Bearer {access}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body.to_string()))
@@ -170,7 +176,7 @@ async fn submit_evidence(state: &AppState, access: &str) -> (StatusCode, String)
 
 /// The delegation is checked on EVERY request that carries `dlg`, in the
 /// bearer middleware, not only where a viewer is resolved. `POST
-/// /api/v1/evidence` resolves none: a live delegation reaches its handler
+/// /api/v1/analyses` resolves none: a live delegation reaches its handler
 /// (which refuses the body itself, 400), and the same token is refused there
 /// with the switch off and on the next request after the link retires.
 #[sqlx::test(migrations = "../../migrations")]
@@ -182,22 +188,22 @@ async fn a_dead_delegation_is_refused_at_a_route_that_resolves_no_viewer(pool: P
         d.delegator_client,
         d.principal,
         Some(d.delegator),
-        &["claims:read", "evidence:submit"],
+        &["claims:read", "claims:write"],
     );
-    let (status, body) = submit_evidence(&st, &access).await;
+    let (status, body) = submit_viewerless(&st, &access).await;
     assert!(
-        status == StatusCode::BAD_REQUEST && body.contains("evidence_type"),
+        status == StatusCode::BAD_REQUEST && body.contains("analysis_type"),
         "CALIBRATION: a live delegation reaches the handler, which refuses the body: \
          {status} {body}"
     );
     assert_refused(
         "switch off",
-        submit_evidence(&AppState::with_db(pool.clone(), config()), &access).await,
+        submit_viewerless(&AppState::with_db(pool.clone(), config()), &access).await,
     );
     delegation::retire_link(&pool, d.principal).await;
     assert_refused(
         "after the link was retired",
-        submit_evidence(&st, &access).await,
+        submit_viewerless(&st, &access).await,
     );
 }
 
@@ -779,13 +785,13 @@ async fn no_code_path_branches_on_the_client_type_of_sub_for_a_dlg_token(pool: P
             sub,
             d.principal,
             Some(d.delegator),
-            &["claims:read", "evidence:submit"],
+            &["claims:read", "claims:write"],
         );
         let viewer = read(&st, &access).await;
         assert_admitted(&format!("sub = {row}: the viewer route"), viewer.clone());
-        let (status, body) = submit_evidence(&st, &access).await;
+        let (status, body) = submit_viewerless(&st, &access).await;
         assert!(
-            status == StatusCode::BAD_REQUEST && body.contains("evidence_type"),
+            status == StatusCode::BAD_REQUEST && body.contains("analysis_type"),
             "sub = {row}: the route without a viewer reaches its handler: {status} {body}"
         );
         answers.push((row, viewer.0, status));
@@ -1013,5 +1019,100 @@ async fn a_webhook_subscription_for_a_dlg_principal_is_still_refused(pool: PgPoo
     assert!(
         !attempted.contains(&delegated_sub.id),
         "a delegated principal's subscription was delivered to: {attempted:?}"
+    );
+}
+
+/// `POST /oauth/introspect` with `token`: `(status, active)`, `active` being
+/// `None` when the body carries no boolean `active`.
+async fn introspect(state: &AppState, token: &str) -> (StatusCode, Option<bool>, String) {
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/introspect")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": token }).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let body = String::from_utf8_lossy(&bytes).to_string();
+    let active = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["active"].as_bool());
+    (status, active, body)
+}
+
+/// Introspection answers what the API answers (backlog 8d6c886f): a delegated
+/// run token is `active: true` only while its delegation is live. It used to
+/// check the signature and the revocation denylist only, so a token whose
+/// operator link had been retired, or that the process's switch refuses,
+/// introspected as active until it expired while every API route refused it.
+///
+/// CALIBRATION: the live delegation introspects active (and is admitted by a
+/// route), and the same principal's token WITHOUT `dlg` stays active after
+/// the retire, so the `false` answers are the delegation check, not the
+/// token's signature, expiry or principal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspection_reports_a_delegated_token_inactive_once_its_delegation_ends(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "introspect").await;
+    let st = state(&pool, RunTokens::On);
+    let access = dlg_token(&st, &d);
+    let plain = token(&st, d.delegator_client, d.principal, None);
+
+    let (status, active, body) = introspect(&st, &access).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        active,
+        Some(true),
+        "CALIBRATION: a live delegation introspects active: {body}"
+    );
+    assert_admitted(
+        "CALIBRATION: and the API admits it",
+        read(&st, &access).await,
+    );
+
+    // The switch off: the API refuses every delegated token, so does introspection.
+    let (status, active, body) =
+        introspect(&AppState::with_db(pool.clone(), config()), &access).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(active, Some(false), "switch off: {body}");
+    assert!(
+        !body.contains("\"sub\""),
+        "an inactive answer says nothing else about the token: {body}"
+    );
+
+    // A scope outside the delegated ceiling: refused whatever the delegation says.
+    let wide = token_with(
+        &st,
+        d.delegator_client,
+        d.principal,
+        Some(d.delegator),
+        &["claims:read", "agents:write"],
+    );
+    assert_eq!(
+        introspect(&st, &wide).await.1,
+        Some(false),
+        "a dlg token outside the delegated ceiling"
+    );
+
+    // The operator link retired: the next introspection says so, no restart.
+    delegation::retire_link(&pool, d.principal).await;
+    assert_refused("CALIBRATION: the API refuses it", read(&st, &access).await);
+    let (status, active, body) = introspect(&st, &access).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        active,
+        Some(false),
+        "a delegated token whose operator link was retired introspected active: {body}"
+    );
+    assert_eq!(
+        introspect(&st, &plain).await.1,
+        Some(true),
+        "CALIBRATION: a token without `dlg` is not subject to the delegation check"
     );
 }

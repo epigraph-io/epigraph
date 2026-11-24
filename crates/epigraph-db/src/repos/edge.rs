@@ -70,8 +70,9 @@ pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
 ///
 /// `edges` is bitemporal via `valid_from` / `valid_to` (migration 001), but until
 /// this predicate existed the column was decorative: exactly ONE query in the
-/// workspace filtered on it (`get_current_edges`), and 6 of 987,857 production
-/// rows carried a value. Every belief-bearing read saw retracted edges as live.
+/// workspace filtered on it (`EdgeRepository::get_current_edges`, since removed:
+/// it had no caller, and it was also the last byte-exact relationship filter
+/// that took a `relationship` parameter, backlog 5ff9c9d9), and 6 of 987,857 production rows carried a value. Every belief-bearing read saw retracted edges as live.
 ///
 /// That absence is why `MatchCandidateRepo::retire` hard-DELETEs edges rather
 /// than retracting them — a soft retraction that nothing honours retracts
@@ -176,8 +177,8 @@ pub struct BbaCleanup {
     pub deleted: u64,
     /// The `cascade.deferred` row (cause `edge_retract`) that hands every
     /// other writer's BBAs keyed on the edge to the administrative replay;
-    /// `None` when the edge carries no edge-factor perspective (so no BBA can
-    /// be keyed on it) or the retraction is future-dated.
+    /// `None` when no BBA is keyed on the edge's slot or the retraction is
+    /// future-dated.
     pub deferral_event_id: Option<Uuid>,
 }
 
@@ -265,6 +266,28 @@ pub struct ClaimLinkRow {
     pub target_id: Uuid,
     /// Lower-cased relationship name.
     pub relationship: String,
+}
+
+/// Before an `executes` edge onto a claim is inserted, take that claim's step
+/// lineage lock in SHARE mode (`WorkflowRepository::lock_step_lineage_shared`,
+/// backlog bf2e9aa6), held to the end of the writer's transaction, so the
+/// edge serializes against an `evolve_step` of the lineage, whose authority
+/// gate must see it; a target this session cannot read is refused as not
+/// found. Any other edge takes no lock. On a connection only: a
+/// transaction-scoped lock taken on a pool executor would end with its own
+/// statement, so [`EdgeRepository::create`] on a pool takes none (no
+/// `executes` writer uses that form; every one writes on its transaction).
+async fn lock_executes_target(
+    conn: &mut sqlx::PgConnection,
+    relationship: &str,
+    target_type: &str,
+    target_id: Uuid,
+) -> Result<(), DbError> {
+    if target_type == "claim" && canonical_relationship(relationship) == "executes" {
+        crate::repos::workflow::WorkflowRepository::lock_step_lineage_shared(conn, target_id)
+            .await?;
+    }
+    Ok(())
 }
 
 impl EdgeRepository {
@@ -394,6 +417,7 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Uuid, DbError> {
+        lock_executes_target(&mut *conn, relationship, target_type, target_id).await?;
         let Some(key) = key else {
             return Self::create(
                 &mut *conn,
@@ -807,6 +831,7 @@ impl EdgeRepository {
     ) -> Result<(EdgeRow, bool), DbError> {
         use sqlx::Acquire;
         let mut tx = conn.begin().await?;
+        lock_executes_target(&mut tx, relationship, target_type, target_id).await?;
 
         // VISIBILITY-EXEMPT (both spellings): dedup probe inside a WRITE path
         // (`create_or_get`). It must see an existing edge regardless of who is
@@ -1968,9 +1993,10 @@ impl EdgeRepository {
     /// runs, in the act's own transaction (migration 120; D1 names edge-keyed
     /// BBA deletes an administrative cascade).
     ///
-    /// When the edge carries an edge-factor perspective (`perspectives.id =
-    /// edge`, `perspective_type = 'edge'`: every BBA keyed on the edge hangs off
-    /// it, by FK) and the act withdrew it (see [`EdgeWithdrawal`]):
+    /// When a BBA is keyed on the edge's slot (`mass_functions.slot_kind =
+    /// 'edge'`, `slot_id` = the edge, migration 267; any writer's, asked of
+    /// 267's `epigraph_edge_bbas_keyed`, which answers only the edge's writer)
+    /// and the act withdrew it (see [`EdgeWithdrawal`]):
     ///
     /// * (b) it FIRST records a `cause = 'edge_retract'` deferral through
     ///   120's `epigraph_record_cascade_deferral` (the session must own or
@@ -2007,15 +2033,15 @@ impl EdgeRepository {
         oauth: Option<&serde_json::Value>,
         reason: &str,
     ) -> Result<BbaCleanup, DbError> {
-        // Reads only whether an edge-factor perspective exists for the edge the
-        // caller's act touches, the edge's own `valid_to`, and whether the
-        // session owns it. An edge the session does not own is left alone: the
+        // Reads only whether a BBA is keyed on the edge the caller's act
+        // touches (through 267's definer: the rows are other writers' too, and
+        // readable only under their claims' tenancy), the edge's own
+        // `valid_to`, and whether the session owns it. An edge the session does not own is left alone: the
         // act itself is refused by row security (and rolls back), and the
         // deferral definer would refuse it anyway.
         let (keyed, withdrawn, owned): (bool, bool, bool) = sqlx::query_as(
             "-- VISIBILITY-EXEMPT: the state of an edge the caller's act touches.\n\
-             SELECT EXISTS (SELECT 1 FROM perspectives p \
-                             WHERE p.id = $1 AND p.perspective_type = 'edge'), \
+             SELECT public.epigraph_edge_bbas_keyed($1), \
                     COALESCE((SELECT CASE WHEN $2 THEN true \
                                           ELSE e.valid_to IS NOT NULL AND e.valid_to <= now() END \
                                 FROM edges e WHERE e.id = $1), false), \
@@ -2066,7 +2092,7 @@ impl EdgeRepository {
         // folds it (rulings R-79, R-103).
         let deleted = sqlx::query(
             "DELETE FROM mass_functions \
-              WHERE perspective_id = $1 \
+              WHERE slot_kind = 'edge' AND slot_id = $1 \
                 AND owner_group_id = ANY (public.epigraph_writable_groups()) \
                 AND retracted_at IS NULL",
         )
@@ -2081,9 +2107,9 @@ impl EdgeRepository {
     }
 
     /// The administrative half of an `edge_retract` cascade, on the
-    /// MAINTENANCE connection: remove every LIVE BBA keyed on the edge (keyed on
-    /// `perspective_type = 'edge'`, so a genuine perspective's BBAs are never
-    /// touched) and return the claims they lived on. A RETRACTED row
+    /// MAINTENANCE connection: remove every LIVE BBA keyed on the edge's slot
+    /// (`slot_kind = 'edge'`, migration 267, so a genuine perspective's BBAs are
+    /// never touched) and return the claims they lived on. A RETRACTED row
     /// (migration 184) is kept for audit (rulings R-79, R-103).
     ///
     /// STATE-DERIVED: it acts only while the edge row is absent or out of force
@@ -2118,10 +2144,8 @@ impl EdgeRepository {
         let claims: Vec<Uuid> = sqlx::query_scalar(
             "WITH gone AS ( \
                  DELETE FROM mass_functions mf \
-                  USING perspectives p \
-                  WHERE p.id = mf.perspective_id \
-                    AND p.id = $1 \
-                    AND p.perspective_type = 'edge' \
+                  WHERE mf.slot_kind = 'edge' \
+                    AND mf.slot_id = $1 \
                     AND mf.retracted_at IS NULL \
                  RETURNING mf.claim_id) \
              SELECT claim_id FROM gone",
@@ -2140,9 +2164,9 @@ impl EdgeRepository {
         })
     }
 
-    /// The edges whose BBAs outlived them: an edge-factor perspective
-    /// (`perspective_type = 'edge'`) with LIVE BBAs keyed on it whose edge is
-    /// absent or out of force. An edge holding only retracted rows is not
+    /// The edges whose BBAs outlived them: an edge slot (`slot_kind = 'edge'`,
+    /// migration 267) with LIVE BBAs keyed on it whose edge is absent or out
+    /// of force. An edge holding only retracted rows is not
     /// listed: the removal keeps those (migration 184), so listing it would
     /// spend the sweep's `limit` on an edge it can do nothing for. The one-shot legacy sweep
     /// (`replay_deferred_cascades --sweep-withdrawn-edge-bbas`) removes their
@@ -2158,14 +2182,13 @@ impl EdgeRepository {
     ) -> Result<Vec<Uuid>, DbError> {
         Ok(sqlx::query_scalar(
             "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
-             SELECT p.id FROM perspectives p \
-              WHERE p.perspective_type = 'edge' \
-                AND EXISTS (SELECT 1 FROM mass_functions mf \
-                             WHERE mf.perspective_id = p.id AND mf.retracted_at IS NULL) \
+             SELECT DISTINCT mf.slot_id FROM mass_functions mf \
+              WHERE mf.slot_kind = 'edge' \
+                AND mf.retracted_at IS NULL \
                 AND NOT EXISTS (SELECT 1 FROM edges e \
-                                 WHERE e.id = p.id \
+                                 WHERE e.id = mf.slot_id \
                                    AND (e.valid_to IS NULL OR e.valid_to > now())) \
-              ORDER BY p.id \
+              ORDER BY mf.slot_id \
               LIMIT $1",
         )
         .bind(limit)
@@ -2220,7 +2243,7 @@ impl EdgeRepository {
     /// Derived artifacts (`factors`, `bp_messages`, `mass_functions`) are NOT
     /// touched here and should still be deleted by the caller: they are
     /// materializations — `factors` are built by the `edges_auto_factor` trigger,
-    /// BBAs are keyed `perspective_id = edge_id` — so removing them is cache
+    /// BBAs are keyed on the edge's slot (`slot_kind = 'edge'`) — so removing them is cache
     /// invalidation, not data loss, and they regenerate from live edges.
     ///
     /// # Errors
@@ -2292,10 +2315,13 @@ impl EdgeRepository {
     /// discards a node already reached, so it terminates on a graph that
     /// already holds a cycle.
     ///
-    /// Run it on the writer's STAMPED transaction: `edges_tenancy` bounds the
-    /// walk to edges that session reads, so an edge it cannot see does not
-    /// count toward a cycle (a cycle closed only through another group's
-    /// private edge is not refused).
+    /// The walk runs in migration 254's SECURITY DEFINER
+    /// `public.epigraph_edges_reach`, which reads every in-force edge whatever
+    /// the session's stamp (backlog 7149132e): a cycle closed through an edge
+    /// the caller cannot read is still a cycle. It returns only the boolean,
+    /// so the caller learns nothing about which edges closed the path. The
+    /// definer walks only `invokes`, `executes` and `depends_on` and refuses
+    /// any other relationship (22023, surfaced as `QueryFailed`).
     ///
     /// It first takes a transaction-scoped advisory lock keyed on the walked
     /// relationship set, held until the caller's transaction ends. Two
@@ -2303,10 +2329,13 @@ impl EdgeRepository {
     /// insert one after the other: the second's walk runs on a fresh READ
     /// COMMITTED snapshot that sees the first's committed edge, so the pair
     /// cannot both pass and commit a 2-cycle. Call it on the transaction that
-    /// then writes the edge.
+    /// then writes the edge. The lock and the walk are two statements on
+    /// purpose: the definer is STABLE and reads its calling statement's
+    /// snapshot, so the walk's statement must start after the lock is held.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// Returns `DbError::QueryFailed` if the database query fails, including
+    /// on a database without migration 254 (42883): the guard fails closed.
     #[instrument(skip(conn))]
     pub async fn reaches_in_force_conn(
         conn: &mut sqlx::PgConnection,
@@ -2321,21 +2350,12 @@ impl EdgeRepository {
             .bind(format!("edges.reaches:{}", key.join(",")))
             .execute(&mut *conn)
             .await?;
-        let reached: bool = sqlx::query_scalar(&format!(
-            "WITH RECURSIVE reach(node) AS ( \
-                 SELECT $1::uuid \
-               UNION \
-                 SELECT e.target_id FROM reach r \
-                   JOIN edges e ON e.source_id = r.node \
-                  WHERE e.relationship = ANY($3) AND {EDGE_IN_FORCE} \
-             ) \
-             SELECT EXISTS (SELECT 1 FROM reach WHERE node = $2)"
-        ))
-        .bind(from)
-        .bind(to)
-        .bind(&rels)
-        .fetch_one(&mut *conn)
-        .await?;
+        let reached: bool = sqlx::query_scalar("SELECT public.epigraph_edges_reach($1, $2, $3)")
+            .bind(from)
+            .bind(to)
+            .bind(&rels)
+            .fetch_one(&mut *conn)
+            .await?;
         Ok(reached)
     }
 
@@ -2679,60 +2699,6 @@ impl EdgeRepository {
             LIMIT $1
             "#,
             limit,
-            viewer.bypass_bind(),
-            viewer.group_bind().unwrap_or(&[]),
-        )
-        .fetch_all(executor)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| EdgeRow {
-                id: row.id,
-                source_id: row.source_id,
-                source_type: row.source_type,
-                target_id: row.target_id,
-                target_type: row.target_type,
-                relationship: row.relationship,
-                properties: row.properties,
-                valid_from: row.valid_from,
-                valid_to: row.valid_to,
-            })
-            .collect())
-    }
-
-    /// Get currently-valid edges for an entity with a specific relationship.
-    /// Returns edges where valid_to IS NULL (ongoing or atemporal).
-    #[instrument(skip(executor, viewer))]
-    pub async fn get_current_edges<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        entity_id: Uuid,
-        relationship: &str,
-    ) -> Result<Vec<EdgeRow>, DbError> {
-        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
-        // spliced. This is the STATIC TRANSCRIPTION of
-        // `Viewer::edge_predicate_fragment` (PR-13): the co-ownership
-        // INTERSECTION, not the plain predicate. Same arity and the SAME two
-        // binds as before — `co_owner_group_id` (migration 072) reads the group
-        // array a second time. A cross-group edge is visible only to a
-        // principal in BOTH groups; `co_owner_group_id IS NULL` is the
-        // single-owner case and short-circuits.
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
-            FROM edges
-            WHERE (source_id = $1 OR target_id = $1)
-              AND relationship = $2
-              AND valid_to IS NULL
-              AND ($3::bool OR visibility = 'public'
-                   OR (owner_group_id = ANY($4::uuid[])
-                       AND (co_owner_group_id IS NULL
-                            OR co_owner_group_id = ANY($4::uuid[]))))
-            ORDER BY valid_from DESC NULLS LAST
-            "#,
-            entity_id,
-            relationship,
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )

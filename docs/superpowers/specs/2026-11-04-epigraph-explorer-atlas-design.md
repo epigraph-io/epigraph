@@ -340,8 +340,8 @@ Shown as stored; no cleanup in this work:
 | Phase | Delivers | Needs | Status (tree checked 2026-11-14) |
 |---|---|---|---|
 | P3a | Topics: regions, themes, claims, claim rings, cross-theme bundles, search, deep links | backlog `f9b4a488`, `2b5bd83e`, `4321ae80`, `57917c13`, `7f359a86`, `cadfc550`, `864368a8` | In the tree: `services/explorer` registers `/atlas` and `/bff/atlas/layout`, `/theme/{id}/claims`, `/claim/{id}`, `/links`, `/search`, `/resolve/{key}` |
-| P3b | Provenance panel and Sources view | backlog `fe75ef36`, `da4a8bc1`, `48421526`, `b7354adc` | Sources view not in the tree: no `/bff/atlas/sources` route, and `ClaimContext` deliberately has no `papers` field (`src/upstream/atlas.rs`). Provenance panel: not checked |
-| P3c | Timeline | backlog `ea26d7aa`; history route already on `main` | Not in the tree: no `/bff/atlas/timeline` route, nothing named timeline in `static/atlas.js` |
+| P3b | Provenance panel and Sources view | backlog `fe75ef36`, `da4a8bc1`, `48421526`, `b7354adc` | Partly in the tree: `/bff/atlas/sources` (over `GET /sources/overview`) and a theme's Sources panel (`static/atlas_views.js`, `showSourcesPanel` in `static/atlas.js`), offered only without a map list since it reads the viewer's own claims. Not built: a Sources tab with its own zoomable view and `x…` keys, people behind agents, and the provenance panel's `authored_by` and ingestion notes. `ClaimContext` still has no `papers` field (`src/upstream/atlas.rs`) |
+| P3c | Timeline | backlog `ea26d7aa`; history route already on `main` | Partly in the tree: `/bff/atlas/timeline` (over `GET /claims?theme_id=&include_links=true`) and a theme's Timeline panel, one SVG lane with ticks and arcs, offered only without a map list. Not built: a Timeline tab with one lane per theme or source, zoom, `tc-` keys and supersede chains |
 | P3d | Notion: guest surface, link cards, tours | backlog `1deb9dbf`; a Notion OAuth client for the Explorer | Not in the tree: no `/bff/atlas/tour/{id}` route, nothing named tour or Notion in `static/atlas.js` |
 | P3e | Neighbourhood level | backlog `01e0b839` | Not found in `static/atlas.js` |
 

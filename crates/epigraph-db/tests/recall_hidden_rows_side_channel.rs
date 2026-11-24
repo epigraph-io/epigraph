@@ -15,7 +15,9 @@
 //! it empties tells the viewer how many hidden rows sit near the query. The
 //! fix is pgvector's iterative scan (`hnsw.iterative_scan = strict_order`),
 //! which keeps scanning until `LIMIT` visible rows are found (bounded by
-//! `hnsw.max_scan_tuples`, default 20,000).
+//! `hnsw.max_scan_tuples`, default 20,000), plus an exact retry of a pass that
+//! comes back short, which covers that bound (backlog 28b79b1e; the
+//! `*_past_max_scan_tuples` tests at the end of this file).
 //!
 //! Scope: the five legs pinned below, which serve `recall`,
 //! `recall_with_context`'s flat seeds, the library `recall`, and the diverse
@@ -66,6 +68,8 @@ fn vec_angle(deg: f64) -> String {
 
 struct World {
     viewer: Viewer,
+    /// The viewer's own agent: every visible row is authored by it.
+    agent: Uuid,
     foreign_agent: Uuid,
     foreign_group: Uuid,
 }
@@ -102,6 +106,7 @@ async fn world(pool: &PgPool) -> (World, Vec<Uuid>) {
     (
         World {
             viewer,
+            agent,
             foreign_agent,
             foreign_group,
         },
@@ -520,5 +525,316 @@ async fn hidden_rows_do_not_change_the_theme_coverage_probe(pool: PgPool) {
         after, before,
         "nearest_theme_coverage_since: {HIDDEN} rows the viewer cannot read changed the \
          coverage probe, so they now decide whether the viewer gets diverse or flat recall"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Past `hnsw.max_scan_tuples` (backlog 28b79b1e)
+// ---------------------------------------------------------------------------
+//
+// The iterative scan above keeps scanning until `LIMIT` visible rows are
+// found, but only up to `hnsw.max_scan_tuples` (pgvector default 20,000).
+// A viewer with more hidden rows than that nearer the query than its own got
+// a short page. These tests are the scaled-down equivalent: the bound is set
+// to `SCALED_MAX_SCAN_TUPLES` on the test connection (the code under test
+// never sets it) and `HIDDEN_PAST_BOUND` hidden rows, five times the bound,
+// sit nearer the query than every visible row. A calibration proves the
+// bound really cuts the iterative scan short on that connection, so a full
+// page can only come from the read's own fallback.
+
+/// Stand-in for pgvector's default `hnsw.max_scan_tuples` of 20,000.
+const SCALED_MAX_SCAN_TUPLES: i64 = 60;
+/// Hidden rows nearer the query than every visible row: well past the bound.
+const HIDDEN_PAST_BOUND: usize = 300;
+
+/// `n` foreign rows, all nearer the query (0°..29°) than every visible row
+/// (30°..35.5°) and lexically stronger, as in [`seed_hidden`]. With a
+/// `theme`, each row joins it BEFORE it gets its embedding: assigning the
+/// theme afterwards would be a second, non-HOT update of an embedded row,
+/// which leaves a dead entry in the HNSW graph for every row and (measured)
+/// can disconnect a live one, failing the reach calibration.
+async fn seed_hidden_n(pool: &PgPool, w: &World, n: usize, theme: Option<Uuid>) {
+    for i in 0..n {
+        let id = fixture::seed_group_claim(
+            pool,
+            w.foreign_agent,
+            w.foreign_group,
+            &format!(
+                "side channel hidden claim {i} {} habitat",
+                "quokka ".repeat(VISIBLE + 8).trim_end()
+            ),
+        )
+        .await;
+        if let Some(t) = theme {
+            sqlx::query("UPDATE claims SET theme_id = $1 WHERE id = $2")
+                .bind(t)
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("assign hidden row to theme");
+        }
+        fixture::set_claim_embedding(pool, id, &vec_angle(29.0 * i as f64 / n as f64)).await;
+    }
+}
+
+/// `VACUUM claims`, so the HNSW graph drops (and repairs around) the dead
+/// node each embedded row leaves behind when the theme assignment above
+/// rewrites it (a non-HOT update: `theme_id` is indexed). Measured without
+/// it: with the 300 hidden rows inserted around those dead nodes, the reach
+/// calibration failed for exactly the 12 rewritten visible rows. A REINDEX is
+/// no substitute: a bulk build of this arc left the visible rows unreachable
+/// in every non-theme case.
+async fn vacuum_claims(pool: &PgPool) {
+    sqlx::query("VACUUM claims")
+        .execute(pool)
+        .await
+        .expect("VACUUM claims");
+}
+
+/// [`hnsw_conn`] plus `hnsw.max_scan_tuples = SCALED_MAX_SCAN_TUPLES` at
+/// session level, set after the calibrations have loaded the `vector`
+/// library (a value set before the library loads can be discarded), and
+/// read back.
+async fn bounded_hnsw_conn(
+    pool: &PgPool,
+    n_rows: i64,
+) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    let mut conn = hnsw_conn(pool, n_rows).await;
+    sqlx::query(&format!(
+        "SET hnsw.max_scan_tuples = {SCALED_MAX_SCAN_TUPLES}"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("SET hnsw.max_scan_tuples");
+    let bound: String = sqlx::query_scalar("SELECT current_setting('hnsw.max_scan_tuples')")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read hnsw.max_scan_tuples");
+    assert_eq!(
+        bound,
+        SCALED_MAX_SCAN_TUPLES.to_string(),
+        "calibration: hnsw.max_scan_tuples did not take on the test connection"
+    );
+    conn
+}
+
+/// Calibration: on `conn`, an iterative HNSW scan restricted to the viewer's
+/// own rows (the visible set, by author) under the scaled bound returns FEWER
+/// than `LIMIT` rows. Without this, pgvector handing back its leftover
+/// candidates at the bound could let a read pass with no fallback at all.
+async fn assert_bound_cuts_the_iterative_scan(conn: &mut sqlx::PgConnection, viewer_agent: Uuid) {
+    use sqlx::Connection;
+    let mut tx = conn.begin().await.expect("BEGIN");
+    sqlx::query(
+        "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                set_config('hnsw.ef_search', '40', true)",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("iterative scan settings");
+    let reached: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM (SELECT c.id FROM claims c \
+         WHERE c.embedding IS NOT NULL AND c.agent_id = $1 \
+         ORDER BY c.embedding <=> '{}'::vector LIMIT {LIMIT}) s",
+        vec_angle(0.0)
+    ))
+    .bind(viewer_agent)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("bounded iterative probe");
+    tx.rollback().await.expect("ROLLBACK");
+    assert!(
+        reached < LIMIT,
+        "calibration: hnsw.max_scan_tuples = {SCALED_MAX_SCAN_TUPLES} did not cut the \
+         iterative scan short ({reached} of {LIMIT} visible rows reached), so this test \
+         cannot tell a fallback from no fallback"
+    );
+}
+
+/// As `on_hnsw!`, on a [`bounded_hnsw_conn`]. With `Some(agent)`, the bound
+/// is first proven to cut the iterative scan short for that agent's rows (the
+/// hidden rows must be seeded by then; the baseline passes `None`).
+macro_rules! on_bounded_hnsw {
+    ($pool:expr, $n:expr, $calibrate_for:expr, |$conn:ident| $body:expr) => {{
+        use sqlx::Connection;
+        let mut pooled = bounded_hnsw_conn($pool, $n).await;
+        if let Some(agent) = $calibrate_for {
+            assert_bound_cuts_the_iterative_scan(&mut pooled, agent).await;
+        }
+        let mut tx = pooled.begin().await.expect("BEGIN");
+        let before = hnsw_scans(&mut tx).await;
+        let out = {
+            let $conn: &mut sqlx::PgConnection = &mut tx;
+            $body
+        };
+        let after = hnsw_scans(&mut tx).await;
+        tx.rollback().await.expect("ROLLBACK");
+        (out, after > before)
+    }};
+}
+
+fn assert_full_page_past_the_bound<T: PartialEq + std::fmt::Debug>(
+    leg: &str,
+    before: &[T],
+    after: &[T],
+    own_rows_in_baseline: usize,
+) {
+    assert_eq!(
+        before.len(),
+        LIMIT as usize,
+        "{leg}: calibration: the baseline page is not full ({} of {LIMIT})",
+        before.len()
+    );
+    assert_eq!(
+        own_rows_in_baseline, LIMIT as usize,
+        "{leg}: calibration: the baseline must be the viewer's own rows only"
+    );
+    assert_eq!(
+        after,
+        before,
+        "{leg}: {HIDDEN_PAST_BOUND} hidden rows nearer the query than the viewer's own, more \
+         than hnsw.max_scan_tuples ({SCALED_MAX_SCAN_TUPLES} here, 20,000 by default), changed \
+         its page (count {} -> {}). The iterative scan stopped at the bound and the read did \
+         not fall back to an exact scan",
+        before.len(),
+        after.len()
+    );
+}
+
+async fn flat_page(conn: &mut sqlx::PgConnection, viewer: &Viewer) -> Vec<(Uuid, f64)> {
+    ClaimRepository::semantic_search_flat(
+        &mut *conn,
+        viewer,
+        epigraph_db::FlatRanking::Query(&vec_angle(0.0)),
+        -1.0,
+        None,
+        None,
+        None,
+        None,
+        LIMIT,
+        None,
+        0,
+    )
+    .await
+    .expect("semantic_search_flat")
+    .into_iter()
+    .map(|h| (h.claim_id, h.similarity))
+    .collect()
+}
+
+/// Runs `$page` before and after seeding [`HIDDEN_PAST_BOUND`] hidden rows,
+/// on bounded connections, and asserts the page did not move.
+macro_rules! past_bound_case {
+    ($pool:expr, $leg:expr, $theme:expr, |$conn:ident, $w:ident, $t:ident| $page:expr) => {{
+        let pool: &PgPool = $pool;
+        let ($w, visible) = world(pool).await;
+        let viewer_agent = $w.agent;
+        let $t: Option<Uuid> = if $theme {
+            Some(theme_holding_every_claim(pool, None).await)
+        } else {
+            None
+        };
+        if $theme {
+            vacuum_claims(pool).await;
+        }
+        let (before, _) = on_bounded_hnsw!(pool, VISIBLE as i64, None::<Uuid>, |$conn| $page);
+        seed_hidden_n(pool, &$w, HIDDEN_PAST_BOUND, $t).await;
+        let (after, used_index) = on_bounded_hnsw!(
+            pool,
+            (VISIBLE + HIDDEN_PAST_BOUND) as i64,
+            Some(viewer_agent),
+            |$conn| $page
+        );
+        assert!(
+            used_index,
+            "{}: calibration: the first pass was not served by idx_claims_embedding_hnsw",
+            $leg
+        );
+        (before, after, visible)
+    }};
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn scoped_embedding_page_fills_past_max_scan_tuples(pool: PgPool) {
+    let (before, after, visible) =
+        past_bound_case!(&pool, "search_by_embedding_scoped", false, |conn, w, _t| {
+            scoped_page(conn, &w.viewer).await
+        });
+    let own = before.iter().filter(|(id, _)| visible.contains(id)).count();
+    assert_full_page_past_the_bound("search_by_embedding_scoped", &before, &after, own);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_seed_page_fills_past_max_scan_tuples(pool: PgPool) {
+    let (before, after, visible) = past_bound_case!(
+        &pool,
+        "search_by_embedding_since_conn",
+        false,
+        |conn, w, _t| seed_page(conn, &w.viewer).await
+    );
+    let own = before.iter().filter(|(id, _)| visible.contains(id)).count();
+    assert_full_page_past_the_bound("search_by_embedding_since_conn", &before, &after, own);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn hybrid_page_fills_past_max_scan_tuples(pool: PgPool) {
+    let (before, after, visible) =
+        past_bound_case!(&pool, "search_hybrid_scoped", false, |conn, w, _t| {
+            hybrid_page(conn, &w.viewer).await
+        });
+    let own = before
+        .iter()
+        .filter(|(id, ..)| visible.contains(id))
+        .count();
+    assert!(
+        before
+            .iter()
+            .all(|(_, _, dense, lex)| dense.is_some() && *lex),
+        "calibration: every baseline hit must come from both legs: {before:?}"
+    );
+    assert_full_page_past_the_bound("search_hybrid_scoped", &before, &after, own);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn flat_semantic_page_fills_past_max_scan_tuples(pool: PgPool) {
+    let (before, after, visible) =
+        past_bound_case!(&pool, "semantic_search_flat", false, |conn, w, _t| {
+            flat_page(conn, &w.viewer).await
+        });
+    let own = before.iter().filter(|(id, _)| visible.contains(id)).count();
+    assert_full_page_past_the_bound("semantic_search_flat", &before, &after, own);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_theme_candidates_fill_past_max_scan_tuples(pool: PgPool) {
+    let (before, after, visible) = past_bound_case!(
+        &pool,
+        "claims_in_themes_at_dim_since",
+        true,
+        |conn, w, t| theme_candidates_page(conn, &w.viewer, t.expect("theme")).await
+    );
+    let own = before.iter().filter(|(id, _)| visible.contains(id)).count();
+    assert_full_page_past_the_bound("claims_in_themes_at_dim_since", &before, &after, own);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn theme_coverage_probe_counts_past_max_scan_tuples(pool: PgPool) {
+    let (before, after, _visible) =
+        past_bound_case!(&pool, "nearest_theme_coverage_since", true, |conn, w, t| {
+            coverage_probe(conn, &w.viewer, t.expect("theme")).await
+        });
+    assert_eq!(
+        before,
+        NeighbourhoodThemeCoverage {
+            probed: VISIBLE as i64,
+            reachable: VISIBLE as i64,
+        },
+        "calibration: the baseline probe must see every visible row, all reachable"
+    );
+    assert_eq!(
+        after, before,
+        "nearest_theme_coverage_since: {HIDDEN_PAST_BOUND} hidden rows past \
+         hnsw.max_scan_tuples ({SCALED_MAX_SCAN_TUPLES} here) shrank the coverage probe; \
+         the probe did not fall back to an exact scan"
     );
 }

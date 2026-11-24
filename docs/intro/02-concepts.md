@@ -136,15 +136,24 @@ everywhere. Three seed strategies are in use today:
 Every seed above is an IDENTIFIER, never a credential: anyone can compute
 its private half, so an agent named by one must not sign. An agent row
 created for such a key is stored with `key_kind = 'seed-derived'`
-(migration 230). `AgentRepository::public_key_if_signer`, the key source of
-the packet-signature check, refuses such a key. Three other verifiers do
-not read `key_kind` yet: `verify_claim`, the edge-signature check and the
-OAuth `client_credentials` assertion check still accept a signature under
-the agent's bare public key.
+(migration 230), and no signature verifier accepts it:
+`AgentRepository::public_key_if_signer` (the packet-signature check's key
+source), `verify_claim`'s bare-key fallback and the edge-signature check
+admit an agent's bare key only when `key_kind = 'ed25519'` and never admit a
+`seed-derived` agent's `identity-legacy` key (the same key, written by
+migration 161's backfill), and the OAuth agent assertion check
+(`client_credentials` and refresh) refuses a key held by any agent whose
+`key_kind` is not `ed25519` (backlog 57943a39). A client that registers such a key through `POST /api/v1/agents`
+declares it with `"key_kind": "seed-derived"` and a `"key_kind_proof"`, its
+signature of `epigraph_crypto::key_kind_declaration_message` under the key
+(so nobody can declare a key they do not hold), and the route then provisions
+no OAuth client for it. Rows written before these checks may still be stored
+as `ed25519`; re-marking them `seed-derived` is an operator task, and it is
+enough for every verifier above.
 
 A seed is not the only way the MCP server gets its identity. It picks its signer in this order (`select_signer` in `crates/epigraph-mcp/src/main.rs`), first match wins:
 
-1. `EPIGRAPH_AGENT_IDENTITY_PUBKEY` together with `EPIGRAPH_AGENT_SIGNING_KEY`: the agent is named by the identity key and signs with a separate random key. Both are required, and they cannot be combined with `--agent-key`.
+1. `EPIGRAPH_AGENT_IDENTITY_PUBKEY` together with the signing key, from the 0600 file `EPIGRAPH_AGENT_SIGNING_KEY_FILE` names or from `EPIGRAPH_AGENT_SIGNING_KEY` (one of the two): the agent is named by the identity key and signs with a separate random key. Both are required, and they cannot be combined with `--agent-key`.
 2. `--agent-model` (with `--agent-system-prompt` or `--agent-system-prompt-hash`) is REFUSED: it derived the signing key from the public seed above. It is checked first, so it never falls through to another rung.
 3. `--agent-key` (`EPIGRAPH_MCP_AGENT_KEY`): a fixed 32-byte secret key that you generate once and keep. This is what the [quickstart](01-quickstart.md) sets up.
 4. None of these: the server generates a fresh keypair on every launch and says so on stderr. Each launch then authors as a different agent, and the server warns that ownership cannot be decided for such a signer.
@@ -274,7 +283,7 @@ A **frame** is the hypothesis space a single mass function is defined over — `
 
 A **perspective** is a *viewpoint*: an agent-owned (or community-owned) lens that selects, weights, or filters claims when computing belief. The same atom can carry different BetP values from different perspectives without one overwriting the other — disagreement stays visible instead of being averaged away. Perspectives have a `perspective_type` ("analytical", "narrative", etc.), an optional list of `frame_ids` they operate over, and a `confidence_calibration` factor in `[0, 1]`.
 
-Two `perspective_type` values are **internal BBA slots, not viewpoints**: `edge` (one row per epistemic edge, whose id is the edge's id, named `edge_factor`) and `evidence` (one row per evidence row, sharing that evidence row's id, named `evidence_grounded`). The belief layer writes them so a mass function can be keyed to its edge or evidence row through the `mass_functions.perspective_id` foreign key. Nobody chooses them as a lens, so `list_perspectives`, `GET /api/v1/perspectives` and `GET /api/v1/agents/:id/perspectives` leave them out; they are still readable by id. Do not create a perspective of either type yourself.
+Edge, evidence and assessment mass functions are **not** perspectives. Each is keyed by its own slot on the mass function (`mass_functions.slot_kind` is `edge`, `evidence` or `assessment`, and `slot_id` is the edge's id, the evidence row's id, or the owner's assessment slot), so `perspectives` holds viewpoints only. A mass function has at most one of a perspective (`perspective_id`) and a slot. Before migration 267 these keys were synthetic `perspectives` rows typed `edge` and `evidence`; 267 moved them onto the slot and deleted those rows. The two types are now reserved: `create_perspective` (MCP and REST) refuses them with a validation error, and the database refuses them with a CHECK.
 
 ```json
 // mcp__epigraph__list_perspectives  →
@@ -296,23 +305,21 @@ Two `perspective_type` values are **internal BBA slots, not viewpoints**: `edge`
 ]
 ```
 
-The `perspectives` table also has a second, internal use that is not a
-viewpoint. A machine-written mass function is keyed by
-`(claim, frame, agent, perspective)`, and `mass_functions.perspective_id`
-is a foreign key, so the kernel creates a synthetic perspective row to
-give each such mass function its own slot:
+A machine-written mass function that needs a key of its own is keyed
+by `(claim, frame, agent, slot)` instead of a perspective:
 
-- one per epistemic edge: `name = 'edge_factor'`,
-  `perspective_type = 'edge'`, and the row's `id` is the edge's id
-  (`PerspectiveRepository::ensure_edge_perspective`);
-- one per evidence row or assessment slot: `name = 'evidence_grounded'`,
-  `perspective_type = 'evidence'`; for an evidence row it shares the
-  evidence id (`PerspectiveRepository::ensure_evidence_perspective`).
+- the edge factor, one per epistemic edge: `slot_kind = 'edge'`,
+  `slot_id` = the edge's id (`MassFunctionRepository::store_in_slot`);
+- the DS evidence auto-wire, one per evidence row: `slot_kind =
+  'evidence'`, `slot_id` = the evidence row's id
+  (`MassFunctionRepository::store_for_evidence`);
+- `/claims/:id/assess`, one per owner: `slot_kind = 'assessment'`,
+  `slot_id` = the owner's derived assessment slot (also through
+  `store_in_slot`).
 
-These rows are slots, not lenses. `list_perspectives` does not filter
-them out (`PerspectiveRepository::list` has no `perspective_type`
-predicate), so on a graph with epistemic edges or evidence its output
-includes rows of those two types; skip them when you choose a lens.
+These are slots, not lenses, and none of them is a `perspectives` row,
+so `list_perspectives` returns viewpoints only, and a lens read of an
+edge or evidence id answers not found.
 
 A **theme** is a topical cluster derived from semantic clustering
 over claim embeddings. Themes are stored as rows in `claim_themes`

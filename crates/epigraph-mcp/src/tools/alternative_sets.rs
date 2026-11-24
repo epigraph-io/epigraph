@@ -78,15 +78,48 @@ pub async fn suggest_alternative_sets(
     viewer: &epigraph_db::visibility::Viewer,
     params: SuggestAlternativeSetsParams,
 ) -> Result<CallToolResult, McpError> {
-    let target_filter = match params.target_claim_id.as_deref() {
-        Some(s) => Some(parse_uuid(s)?),
-        None => None,
-    };
-    let min_strength = params.min_pair_strength.clamp(0.0, 1.0);
-
+    // Parsed before a connection is taken, as it always was.
+    let target_filter = parse_target(&params)?;
     let mut read = server.read_as(viewer, "suggest_alternative_sets").await?;
+    let answer = scan_suggestions(&mut read, viewer, target_filter, &params).await?;
+    read.commit().await.map_err(internal_error)?;
+    success_json(&answer)
+}
+
+/// The candidates `suggest_alternative_sets` answers with, read on `conn`, the
+/// caller's viewer-stamped read: the ONE implementation the MCP tool and its
+/// HTTP twin (`GET /api/v1/alternative-sets/suggestions`, in `epigraph-api`'s
+/// `routes::mcp_twins`) both run, so the two cannot drift. The caller commits.
+///
+/// # Errors
+/// `invalid_params` for a malformed `target_claim_id`; a redacted internal
+/// error when the scan fails.
+pub async fn suggest_alternative_sets_on(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: &SuggestAlternativeSetsParams,
+) -> Result<SuggestAlternativeSetsResponse, McpError> {
+    let target_filter = parse_target(params)?;
+    scan_suggestions(conn, viewer, target_filter, params).await
+}
+
+fn parse_target(params: &SuggestAlternativeSetsParams) -> Result<Option<Uuid>, McpError> {
+    params
+        .target_claim_id
+        .as_deref()
+        .map(parse_uuid)
+        .transpose()
+}
+
+async fn scan_suggestions(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    target_filter: Option<Uuid>,
+    params: &SuggestAlternativeSetsParams,
+) -> Result<SuggestAlternativeSetsResponse, McpError> {
+    let min_strength = params.min_pair_strength.clamp(0.0, 1.0);
     let candidates = epigraph_db::AlternativeSetRepository::scan_candidates(
-        &mut *read,
+        &mut *conn,
         viewer,
         target_filter,
         min_strength,
@@ -105,5 +138,5 @@ pub async fn suggest_alternative_sets(
     })
     .collect();
 
-    success_json(&SuggestAlternativeSetsResponse { candidates })
+    Ok(SuggestAlternativeSetsResponse { candidates })
 }

@@ -368,12 +368,13 @@ async fn contradicts_from_refuted_source_writes_no_belief(pool: PgPool) {
         betp.is_none_or(|p| p <= 0.5 + 1e-9),
         "a refuted contradictor must not raise its target above neutral; got {betp:?}"
     );
-    let bba_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1")
-            .bind(edge_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count edge-factor BBA rows");
+    let bba_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count edge-factor BBA rows");
     assert_eq!(
         bba_count, 0,
         "a refuted contradictor restricts to the vacuous [0, 1]: no BBA may be stored"
@@ -580,7 +581,7 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
     // must not be re-triggerable into duplicate rows on a further re-hit.
     let bba_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions mf \
-         JOIN edges e ON e.id = mf.perspective_id \
+         JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
          WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = 'supports'",
     )
     .bind(source)
@@ -622,7 +623,7 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
     );
     let bba_count_after_third: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions mf \
-         JOIN edges e ON e.id = mf.perspective_id \
+         JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
          WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = 'supports'",
     )
     .bind(source)
@@ -844,7 +845,7 @@ async fn qualifies_edge_is_created_but_does_not_move_belief(pool: PgPool) {
     );
     let bbas: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions mf \
-         JOIN edges e ON e.id = mf.perspective_id \
+         JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
          WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = 'qualifies'",
     )
     .bind(caveat)
@@ -972,12 +973,13 @@ async fn equivalent_to_edge_is_created_without_belief_or_bp_factor(pool: PgPool)
         (after - before).abs() < 1e-12,
         "an EQUIVALENT_TO edge must not move the target's belief: {before} -> {after}"
     );
-    let bbas: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1::uuid")
-            .bind(&resp.edge_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count EQUIVALENT_TO BBAs");
+    let bbas: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1::uuid",
+    )
+    .bind(&resp.edge_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count EQUIVALENT_TO BBAs");
     assert_eq!(
         bbas, 0,
         "no mass function may be materialized for EQUIVALENT_TO"
@@ -1573,12 +1575,13 @@ async fn belief_wired_false_names_its_reason(pool: PgPool) {
         edge_rows, 1,
         "a failed wiring leaves the edge committed: {failed}"
     );
-    let bba_rows: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
-            .bind(edge_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count edge BBA");
+    let bba_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count edge BBA");
     assert_eq!(bba_rows, 0, "the failed wiring stored no BBA: {failed}");
 }
 

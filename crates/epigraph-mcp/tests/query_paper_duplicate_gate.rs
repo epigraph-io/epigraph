@@ -55,9 +55,15 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
     // `do_ingest_document_spine` attaches immediately after creating the claim
     // row, but the `paper -asserts-> claim` edge — written later in the same
     // loop iteration — was never created.
-    PaperRepository::get_or_create(&pool, doi, Some("Random-Set Large Language Models"), None)
-        .await
-        .expect("create paper");
+    PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("Random-Set Large Language Models"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("create paper");
 
     let agent = Agent::new([9u8; 32], Some("test-extractor".to_string()));
     let agent_row = AgentRepository::create(&pool, &agent)

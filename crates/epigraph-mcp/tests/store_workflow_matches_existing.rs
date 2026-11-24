@@ -533,3 +533,59 @@ async fn a_match_names_the_lineage_head_not_a_superseded_generation(pool: PgPool
     assert_eq!(json["generation"], serde_json::json!(1), "{json}");
     assert_eq!(json["canonical_name"], serde_json::json!(canonical));
 }
+
+/// A failed match READ matches nothing and the store goes on, as REST
+/// `POST /api/v1/workflows` does (review of 51d599a9: one input, one answer
+/// on either transport). The failure is made real: a provider of another
+/// dimension, whose vector pgvector refuses to compare with the stored
+/// 1536-dimension goal embedding of the first store.
+///
+/// Verified to fail on the code before this change: the store answered the
+/// match read's error as INTERNAL_ERROR and stored nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_match_read_stores_as_without_matching(pool: PgPool) {
+    let (server, viewer) = server_with_goal_embedder(&pool).await;
+    let tag = Uuid::new_v4().simple().to_string();
+    let original = store(
+        &server,
+        &viewer,
+        &format!("Deploy the Rust binary to the Windows server {tag}"),
+        None,
+    )
+    .await;
+
+    let scoped = fixture::scoped_pool(&pool).await;
+    let short = McpEmbedder::new(pool.clone(), None)
+        .with_scoped_pool(scoped.clone())
+        .with_generator(std::sync::Arc::new(|_: &str| Ok(vec![1.0_f32; 8])));
+    let other_dim = EpiGraphMcpFull::new(
+        pool.clone(),
+        AgentSigner::from_bytes(&[0x5Eu8; 32]).expect("signer"),
+        short,
+        false,
+    )
+    .with_scoped_pool(scoped);
+    let base = row_count(&pool).await;
+
+    let reworded = store(
+        &other_dim,
+        &viewer,
+        &format!("Deploy Rust binary to Windows server {tag}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        reworded["matched_existing"],
+        serde_json::json!(false),
+        "{reworded}"
+    );
+    assert_ne!(
+        reworded["workflow_id"], original["workflow_id"],
+        "{reworded}"
+    );
+    assert_eq!(
+        row_count(&pool).await,
+        base + 1,
+        "the store went on as it would without matching"
+    );
+}

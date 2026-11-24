@@ -31,9 +31,6 @@
 //!
 //! | file | handler | endpoints -> relationship | in D8 scope | disposition |
 //! |---|---|---|---|---|
-//! | assess.rs | assess_claim | claim -> frame WITHIN_FRAME | no | structural |
-//! | assess.rs | assess_claim | evidence -> claim SUPPORTS | yes | DEAD WRITE: the source id is a `mass_functions` id typed `evidence`; `edges_validate_refs` refuses it (measured) and `let _` swallows the error, so no edge lands |
-//! | assess.rs | assess_claim | evidence -> claim CONTRADICTS | yes | DEAD WRITE, as above |
 //! | belief.rs | submit_evidence | claim -> context SCOPED_BY | no | structural |
 //! | belief.rs | submit_evidence | claim -> frame WITHIN_FRAME | no | structural |
 //! | belief.rs | submit_evidence | evidence -> claim SUPPORTS | yes | DEAD WRITE: the same `mass_functions`-id-as-evidence shape |
@@ -45,12 +42,9 @@
 //! | claims.rs | create_claim | claim -> evidence DERIVED_FROM | yes | holds a `Viewer`; a post-commit best-effort statement; conversion deferred (no direct test harness for the signed create path yet) |
 //! | community.rs | add_member | perspective -> community MEMBER_OF | no | structural |
 //! | conventions.rs | learn_convention | agent -> claim AUTHORED | no | structural |
-//! | conventions.rs | learn_convention | evidence -> claim SUPPORTS | yes | holds no `Viewer` (an `AuthContext` only) |
 //! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
 //! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
-//! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes | holds no `Viewer` |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
-//! | spans.rs | create_span | agent -> span attributed_to | no |
 //! | spans.rs | close_span | span -> claim generated | no |
 //! | spans.rs | close_span | span -> claim uses_evidence | no |
 //! | experiment_loop.rs | create_experiment | experiment -> claim tests_hypothesis | no |
@@ -144,7 +138,10 @@ const ROUTES: &str = "crates/epigraph-api/src/routes";
 /// The unstamped HTTP edge writes, per file. Lower a row when a handler is
 /// stamped; delete it at zero. Never raise one.
 const UNSTAMPED: &[(&str, usize)] = &[
-    ("assess.rs", 3),
+    // `assess.rs` (3) is gone (backlog 74feb76b): `assess_claim` writes its
+    // WITHIN_FRAME edge on its stamped transaction, and its two DEAD
+    // `evidence -> claim` SUPPORTS / CONTRADICTS writes (a `mass_functions` id
+    // typed `evidence`, refused by `edges_validate_refs`) were deleted.
     // `belief.rs` (6) is gone: `submit_evidence`'s WITHIN_FRAME, SCOPED_BY
     // and CONTRIBUTES_TO edges are written on its stamped transaction (fb9cff66).
     // 3 before the claim visibility controls folded `create_claim_core`'s
@@ -159,14 +156,13 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
     // "What this file does NOT see").
-    // 2 before backlog f64cf9c6: `create_reasoning_trace` writes its HAS_TRACE
-    // edge on the caller's stamped `AppState::write_as` transaction.
-    ("crud.rs", 1),
     // R-50: moved here from RAW_INSERTS (its four raw INSERTs became
     // `EdgeRepository::create_signed` on the same raw pool); not new writes.
     ("experiment_loop.rs", 4),
     ("perspective.rs", 1),
-    ("spans.rs", 3),
+    // 3 -> 2 (backlog 1dea9589): `create_span`'s attributed_to edge is written
+    // on the caller's stamped transaction. `close_span`'s two remain.
+    ("spans.rs", 2),
 ];
 
 /// The total the register may never exceed. 28 before U012 (`cross_source.rs`
@@ -181,7 +177,18 @@ const UNSTAMPED: &[(&str, usize)] = &[
 /// `crud.rs` row fell 2 -> 1.
 /// 26 -> 25 (backlog 2d60f619, merged on staging batch 4): `learn_convention`'s
 /// evidence -> claim edge moved into the evidence write (`conventions.rs` 4 -> 3).
-const HIGH_WATER: usize = 25;
+/// 25 -> 24 (backlog 73d4f7ff): `create_evidence` writes its `DERIVED_FROM`
+/// edge on the caller's stamped transaction, and `crud.rs` left the register
+/// (its earlier row: 2 before backlog f64cf9c6 stamped `create_reasoning_trace`'s
+/// `HAS_TRACE`). `learn_convention`'s and `create_evidence`'s
+/// `evidence -> claim` `supports` edges, written inside
+/// `EvidenceRepository::create`, are stamped by the same change; this scanner
+/// never counted them.
+/// 24 -> 23 (backlog 1dea9589): `create_span`'s `attributed_to` edge is
+/// written on the caller's stamped transaction (`spans.rs` 3 -> 2).
+/// 23 -> 20 (backlog 74feb76b; 25 -> 22 on its own branch): `assess_claim`
+/// was stamped and its `assess.rs` row (3) deleted.
+const HIGH_WATER: usize = 20;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

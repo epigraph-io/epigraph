@@ -171,6 +171,66 @@ pub fn admitted_signature_keys(
     out
 }
 
+/// When [`admitted_signature_keys`] stops admitting `key`, seen from `now`
+/// ([`key_admission_end`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAdmissionEnd {
+    /// Not admitted at `now`.
+    NotAdmitted,
+    /// Admitted at `now`, and no recorded window ends it (a bare agent key,
+    /// or an active row with no `valid_until`).
+    Open,
+    /// Admitted at `now` and up to, not including, this instant.
+    At(DateTime<Utc>),
+}
+
+/// The first instant at or after `now` from which [`admitted_signature_keys`]
+/// no longer admits `key` for these rows and bare agent key. The rule is only
+/// re-evaluated, never restated: admission can only STOP where some window
+/// closes (a `valid_until`; an opening window only adds admission, and the
+/// bare agent key has no window), so the rule is asked at each `valid_until`
+/// after `now`, in order. One row closing while another still admits the same
+/// bytes (or opens exactly then) is not an end.
+///
+/// A RUNNING signer uses it to stop BEFORE a known cut-over rather than an
+/// interval after it (backlog `07ed8d4d`).
+#[must_use]
+pub fn key_admission_end(
+    rows: &[KeyLifecycle<'_>],
+    agent_key: Option<&[u8]>,
+    key: &[u8; 32],
+    now: DateTime<Utc>,
+) -> KeyAdmissionEnd {
+    let admits = |at| {
+        admitted_signature_keys(rows, agent_key, at)
+            .iter()
+            .any(|a| a.key == *key)
+    };
+    if !admits(now) {
+        return KeyAdmissionEnd::NotAdmitted;
+    }
+    let mut bounds: Vec<DateTime<Utc>> = rows
+        .iter()
+        .filter_map(|r| r.valid_until)
+        .filter(|t| *t > now)
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    bounds
+        .into_iter()
+        .find(|t| !admits(*t))
+        .map_or(KeyAdmissionEnd::Open, KeyAdmissionEnd::At)
+}
+
+/// [`key_admission_end`] for a signer's key, read from the database
+/// ([`AgentKeyRepository::signer_key_admission`]): `checked_at` is the
+/// DATABASE clock, the clock that dates the rows the verifier judges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignerKeyAdmission {
+    pub checked_at: DateTime<Utc>,
+    pub end: KeyAdmissionEnd,
+}
+
 /// One ATTESTED key (`signing` or `identity-legacy`) of a claim's author or
 /// signer, as [`AgentKeyRepository::attested_keys_for_claim`] returns it.
 ///
@@ -196,6 +256,10 @@ pub struct AgentKeyRepository;
 
 impl AgentKeyRepository {
     /// Store a new agent key.
+    ///
+    /// A direct INSERT. Since migration 239 the application role holds no
+    /// INSERT on `agent_keys`, so this runs only on a privileged connection;
+    /// the request path records a key through [`Self::rotate`].
     ///
     /// # Errors
     /// Returns `DbError::DuplicateKey` if a key with the same ID already exists.
@@ -294,6 +358,65 @@ impl AgentKeyRepository {
         .await?)
     }
 
+    /// Whether, and until when, the edge verifier admits `public_key` as
+    /// `signer_id`'s key, judged at the database's `clock_timestamp()`: the
+    /// verifier's own reads (every `agent_keys` row of the signer, `key_type`
+    /// and `status` in the SQL spelling, and its bare `agents.public_key`)
+    /// passed through [`key_admission_end`], i.e. [`admitted_signature_keys`],
+    /// the one admission rule (`repos::edge_signature::verify_conn`).
+    ///
+    /// A RUNNING signer asks this before it keeps signing: a key revoked,
+    /// rotated out or past its window while the process runs would otherwise
+    /// go on signing rows the verifier refuses. The database clock, not the
+    /// caller's, because an edge's `created_at` (what the verifier judges)
+    /// comes from it. A pool, like [`Self::rows_with_public_key`]: not a
+    /// request-path read, and `agent_keys` / `agents.public_key` carry no
+    /// tenancy to filter.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if a query fails.
+    pub async fn signer_key_admission(
+        pool: &PgPool,
+        signer_id: Uuid,
+        public_key: &[u8; 32],
+    ) -> Result<SignerKeyAdmission, DbError> {
+        type Row = (
+            Vec<u8>,
+            String,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT public_key, lower(btrim(key_type)), lower(btrim(status)), \
+                    valid_from, valid_until \
+               FROM agent_keys WHERE agent_id = $1 ORDER BY created_at, id",
+        )
+        .bind(signer_id)
+        .fetch_all(pool)
+        .await?;
+        let (agent_key, checked_at): (Option<Vec<u8>>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT (SELECT public_key FROM agents WHERE id = $1), clock_timestamp()",
+        )
+        .bind(signer_id)
+        .fetch_one(pool)
+        .await?;
+        let lifecycle: Vec<KeyLifecycle<'_>> = rows
+            .iter()
+            .map(|(key, key_type, status, from, until)| KeyLifecycle {
+                public_key: key,
+                key_type,
+                status,
+                valid_from: *from,
+                valid_until: *until,
+            })
+            .collect();
+        Ok(SignerKeyAdmission {
+            checked_at,
+            end: key_admission_end(&lifecycle, agent_key.as_deref(), public_key, checked_at),
+        })
+    }
+
     /// The attested keys (`signing`, `identity-legacy`; any status) of a
     /// claim's AUTHOR (`claims.agent_id`) and of its SIGNER
     /// (`claims.signer_id`), for `verify_claim`'s key binding (agent identity
@@ -303,6 +426,16 @@ impl AgentKeyRepository {
     /// either to the application role, while any other type (`encryption`,
     /// `dual_purpose`) is application-insertable, so a key planted under one
     /// of those must never make a signature verify.
+    ///
+    /// Never the `identity-legacy` row of a `seed-derived` agent (backlog
+    /// 57943a39): that row carries the agent's own `agents.public_key`, whose
+    /// private half is computable from a public seed. Migration 161's backfill
+    /// wrote one for every agent that existed before 230 marked such keys, so
+    /// without this filter re-marking a row `seed-derived` (the operator
+    /// repair) would still leave it verifying through its legacy row. The
+    /// kind is read per KEY ROW's agent, so a seed-derived author never hides
+    /// a real signer's legacy key. A `derived` agent's legacy row is kept: it
+    /// binds pre-cut-over signatures and its window is closed at cut-over.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -319,8 +452,11 @@ impl AgentKeyRepository {
                    k.valid_from, k.valid_until
               FROM claims c
               JOIN agent_keys k ON k.agent_id = c.agent_id OR k.agent_id = c.signer_id
+              JOIN agents a ON a.id = k.agent_id
              WHERE c.id = $1
                AND lower(btrim(k.key_type)) IN ('signing', 'identity-legacy')
+               AND NOT (lower(btrim(k.key_type)) = 'identity-legacy'
+                        AND a.key_kind = 'seed-derived')
                /* {VISIBILITY:c} */
              ORDER BY k.created_at, k.id
             "#,
@@ -337,8 +473,11 @@ impl AgentKeyRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, key_id: Uuid) -> Result<Option<AgentKeyRow>, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        key_id: Uuid,
+    ) -> Result<Option<AgentKeyRow>, DbError> {
         let row = sqlx::query!(
             r#"
             SELECT
@@ -349,7 +488,7 @@ impl AgentKeyRepository {
             "#,
             key_id
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row.map(|r| AgentKeyRow {
@@ -379,9 +518,9 @@ impl AgentKeyRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_active_key(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_active_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         agent_id: AgentId,
         key_type: &str,
     ) -> Result<Option<AgentKeyRow>, DbError> {
@@ -397,7 +536,7 @@ impl AgentKeyRepository {
         )
         .bind(agent_uuid)
         .bind(key_type)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row)
@@ -447,14 +586,25 @@ impl AgentKeyRepository {
 
     /// Update a key's status (and optional revocation fields).
     ///
-    /// Used for key rotation (status → 'rotated') and revocation (status → 'revoked').
+    /// Used for revocation (status → 'revoked'); rotation goes through
+    /// [`Self::rotate`], which also records the new key.
+    ///
+    /// Since migration 239 the definer moves a key only for the key's own
+    /// agent (the executor's stamped principal), an admin, or a maintenance
+    /// session, so on the application role `executor` must be a connection
+    /// stamped with the caller's viewer (`ScopedPool::begin_as`); an
+    /// unstamped one is refused `AK03` (42501) for every key.
     ///
     /// # Errors
     /// Returns `DbError::NotFound` if no key with the given ID exists.
-    /// Returns `DbError::QueryFailed` for other database errors.
-    #[instrument(skip(pool))]
-    pub async fn update_status(
-        pool: &PgPool,
+    /// Returns `DbError::QueryFailed` for other database errors, a `42501`
+    /// refusal (`AK02`, `AK03`) and an illegal transition (`AK01`) included.
+    ///
+    /// Generic over the executor so a handler can run it on the same
+    /// transaction as the key's other writes and its audit row.
+    #[instrument(skip(executor))]
+    pub async fn update_status<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         key_id: Uuid,
         status: &str,
         revocation_reason: Option<&str>,
@@ -473,13 +623,49 @@ impl AgentKeyRepository {
         .bind(status)
         .bind(revocation_reason)
         .bind(revoked_by)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         row.ok_or_else(|| DbError::NotFound {
             entity: "AgentKey".to_string(),
             id: key_id,
         })
+    }
+
+    /// Rotate one key: retire `old_key_id` (`rotated`, its window closed) and
+    /// record `new_public_key` as the active key of the SAME agent and type,
+    /// valid from where the old window closed, in one statement (migration
+    /// 239's `epigraph_agent_key_rotate`). The agent and type come from the
+    /// old row, never from the caller.
+    ///
+    /// Only `epigraph_maintenance` executes the definer: on the application
+    /// role the call is refused 42501 (permission denied for the function)
+    /// before its body runs. Inside, it admits the old key's own agent (the
+    /// executor's stamped principal), an admin, or a maintenance session
+    /// (`AK03`, 42501 otherwise), and moves a `signing` or `identity-legacy`
+    /// key only on a maintenance session (`AK02`, 42501).
+    ///
+    /// Returns `None` when no key `old_key_id` exists.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` on a refusal (no EXECUTE, `AK02`,
+    /// `AK03`: 42501), an old key that is no longer active (`AK01`: 22023) or
+    /// any other database error.
+    #[instrument(skip(executor, new_public_key))]
+    pub async fn rotate<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        old_key_id: Uuid,
+        new_public_key: &[u8; 32],
+    ) -> Result<Option<AgentKeyRow>, DbError> {
+        Ok(sqlx::query_as::<_, AgentKeyRow>(
+            "SELECT id, agent_id, public_key, key_type, status, valid_from, valid_until, \
+                    revocation_reason, revoked_by, created_at \
+             FROM public.epigraph_agent_key_rotate($1, $2)",
+        )
+        .bind(old_key_id)
+        .bind(new_public_key.as_slice())
+        .fetch_optional(executor)
+        .await?)
     }
 
     /// Full update of a key row.
@@ -579,6 +765,125 @@ mod tests {
             admitted_signature_keys(&[row("identity-legacy")], Some(&key), at),
             vec![],
             "a revoked attested row did not govern the bare key"
+        );
+    }
+
+    /// Backlog 07ed8d4d: a running signer stops before its key's admission
+    /// ends, so the end must be the verifier's: no end for a bare key, the
+    /// row's `valid_until` for a single row, and NOT the first row's end while
+    /// a second row carrying the same bytes still admits it (overlapping, or
+    /// opening, with the skew, exactly as the first closes).
+    ///
+    /// Verified to fail: the first `valid_until` returned without re-asking
+    /// the rule (`.find(..)` -> `.next()`) -> fails, first at the other key's
+    /// row, and the overlap and hand-over cases encode the same mistake.
+    #[test]
+    fn the_admission_end_is_where_the_verifier_stops_admitting() {
+        static KEY: [u8; 32] = [7u8; 32];
+        static OTHER: [u8; 32] = [8u8; 32];
+        let key = KEY;
+        let now = Utc::now();
+        let h = chrono::Duration::hours;
+        let skew = chrono::Duration::seconds(KEY_VALID_FROM_SKEW_SECS);
+        let row = |public_key: &'static [u8; 32],
+                   status,
+                   from: DateTime<Utc>,
+                   until: Option<DateTime<Utc>>| KeyLifecycle {
+            public_key,
+            key_type: "signing",
+            status,
+            valid_from: from,
+            valid_until: until,
+        };
+
+        // A bare agent key, no attested row carrying it: no end.
+        assert_eq!(
+            key_admission_end(&[], Some(&key), &key, now),
+            KeyAdmissionEnd::Open
+        );
+        // A row of ANOTHER key does not govern it.
+        assert_eq!(
+            key_admission_end(
+                &[row(&OTHER, "rotated", now - h(9), Some(now + h(1)))],
+                Some(&key),
+                &key,
+                now
+            ),
+            KeyAdmissionEnd::Open
+        );
+        // Not admitted now: revoked, or past its window.
+        assert_eq!(
+            key_admission_end(
+                &[row(&KEY, "revoked", now - h(9), None)],
+                Some(&key),
+                &key,
+                now
+            ),
+            KeyAdmissionEnd::NotAdmitted
+        );
+        assert_eq!(
+            key_admission_end(
+                &[row(&KEY, "rotated", now - h(9), Some(now - h(1)))],
+                None,
+                &key,
+                now
+            ),
+            KeyAdmissionEnd::NotAdmitted
+        );
+        // One row: its valid_until; an active row with none: no end.
+        assert_eq!(
+            key_admission_end(
+                &[row(&KEY, "rotated", now - h(9), Some(now + h(1)))],
+                Some(&key),
+                &key,
+                now
+            ),
+            KeyAdmissionEnd::At(now + h(1))
+        );
+        assert_eq!(
+            key_admission_end(&[row(&KEY, "active", now - h(9), None)], None, &key, now),
+            KeyAdmissionEnd::Open
+        );
+        // Two overlapping rows: the later end.
+        assert_eq!(
+            key_admission_end(
+                &[
+                    row(&KEY, "rotated", now - h(9), Some(now + h(1))),
+                    row(&KEY, "active", now - h(2), Some(now + h(3))),
+                ],
+                None,
+                &key,
+                now
+            ),
+            KeyAdmissionEnd::At(now + h(3))
+        );
+        // A hand-over: the second row opens (with the skew) exactly as the
+        // first closes, so admission runs on to the second's end.
+        assert_eq!(
+            key_admission_end(
+                &[
+                    row(&KEY, "rotated", now - h(9), Some(now + h(1))),
+                    row(&KEY, "rotated", now + h(1) + skew, Some(now + h(4))),
+                ],
+                None,
+                &key,
+                now
+            ),
+            KeyAdmissionEnd::At(now + h(4))
+        );
+        // A gap: the second row opens an hour late, so admission ends at the
+        // first's end, even though a later window exists.
+        assert_eq!(
+            key_admission_end(
+                &[
+                    row(&KEY, "rotated", now - h(9), Some(now + h(1))),
+                    row(&KEY, "rotated", now + h(2) + skew, Some(now + h(4))),
+                ],
+                None,
+                &key,
+                now
+            ),
+            KeyAdmissionEnd::At(now + h(1))
         );
     }
 

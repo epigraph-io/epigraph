@@ -579,6 +579,94 @@ async fn protected_resource_metadata_points_at_this_as() {
     );
 }
 
+// ── /.well-known/jwks.json (DB-free) ─────────────────────────────────────────
+//
+// Backlog 7b834860: a federation extension must verify kernel tokens without
+// holding anything that can mint one. The kernel serves the public half of its
+// Ed25519 signing key; an extension built from that document verifies a kernel
+// token and cannot sign.
+
+fn app_with_jwt(cfg: epigraph_api::oauth::JwtConfig) -> axum::Router {
+    let _ = app(); // sets the dummy DATABASE_URL the state needs
+    let mut state = AppState::new(config()).with_providers(Arc::new(ProviderRegistry::default()));
+    state.jwt_config = Arc::new(cfg);
+    create_router(state)
+}
+
+fn kernel_token(cfg: &epigraph_api::oauth::JwtConfig) -> String {
+    cfg.issue_access_token(
+        uuid::Uuid::new_v4(),
+        vec!["claims:read".to_string()],
+        "agent",
+        None,
+        Some(uuid::Uuid::new_v4()),
+        chrono::Duration::minutes(5),
+        epigraph_auth::AccessTokenBinding::NONE,
+    )
+    .unwrap()
+    .0
+}
+
+/// The served JWK Set is the kernel's public key and nothing else: an
+/// extension built from it verifies a kernel token and refuses to mint, and
+/// the RFC 8414 document points at it. Fails on a kernel without the route
+/// (404) or one that serves a key an extension cannot verify with.
+#[tokio::test]
+async fn jwks_serves_the_public_key_an_extension_verifies_kernel_tokens_with() {
+    let kernel = epigraph_api::oauth::JwtConfig::from_ed25519_seed(&[0x42; 32]);
+    let token = kernel_token(&kernel);
+    let app = app_with_jwt(kernel);
+
+    let (status, body) = get_json(app.clone(), "/.well-known/jwks.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = body["keys"].as_array().expect("a JWK Set");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["kty"], "OKP");
+    assert_eq!(keys[0]["crv"], "Ed25519");
+    assert!(
+        keys[0].get("d").is_none(),
+        "the private key is never served"
+    );
+
+    let extension = epigraph_api::oauth::JwtConfig::verifier_from_jwks(&body.to_string())
+        .expect("the served document is a verifier");
+    assert!(extension.validate_token(&token).is_ok());
+    assert!(
+        extension
+            .issue_access_token(
+                uuid::Uuid::new_v4(),
+                vec!["claims:admin".to_string()],
+                "service",
+                None,
+                None,
+                chrono::Duration::minutes(5),
+                epigraph_auth::AccessTokenBinding::NONE,
+            )
+            .is_err(),
+        "an extension holding the served key cannot mint a kernel token"
+    );
+
+    let (_, meta) = get_json(app, "/.well-known/oauth-authorization-server").await;
+    assert_eq!(
+        meta["jwks_uri"],
+        "https://test.example/.well-known/jwks.json"
+    );
+}
+
+/// A kernel still on the shared secret publishes nothing: an empty set and
+/// no `jwks_uri`. Mutation caught: publishing the HS256 secret as an `oct` key.
+#[tokio::test]
+async fn an_hs256_kernel_publishes_no_key_and_no_jwks_uri() {
+    let app = app_with_jwt(epigraph_api::oauth::JwtConfig::from_secret(
+        b"a-test-secret-that-is-long-enough-000",
+    ));
+    let (status, body) = get_json(app.clone(), "/.well-known/jwks.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({ "keys": [] }));
+    let (_, meta) = get_json(app, "/.well-known/oauth-authorization-server").await;
+    assert!(meta.get("jwks_uri").is_none());
+}
+
 // ── /oauth/authorize entry-point (DB-free) ───────────────────────────────────
 //
 // PKCE is MANDATORY on the authorization endpoint (OAuth 2.1 / RFC 9700). The
@@ -1582,6 +1670,16 @@ async fn authorize_relaxes_only_the_loopback_port(pool: PgPool) {
 /// request carried `redirect_uri` (Google's token endpoint mocked as in
 /// `the_consent_page_cannot_be_framed_or_cached`).
 async fn consent_page_for(pool: &PgPool, redirect_uri: &str) -> (String, String) {
+    consent_page_with_origins(pool, redirect_uri, RedirectOrigins::default()).await
+}
+
+/// [`consent_page_for`] on a server configured with `origins`
+/// (`EPIGRAPH_OAUTH_REDIRECT_ORIGINS`).
+async fn consent_page_with_origins(
+    pool: &PgPool,
+    redirect_uri: &str,
+    origins: RedirectOrigins,
+) -> (String, String) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
@@ -1617,8 +1715,11 @@ async fn consent_page_for(pool: &PgPool, redirect_uri: &str) -> (String, String)
             Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
         )
         .expect("register google");
-    let app =
-        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+    let app = create_router(
+        AppState::with_db(pool.clone(), config())
+            .with_providers(Arc::new(registry))
+            .with_oauth_redirect_origins(origins),
+    );
 
     let google_state = format!("gstate_{}", Uuid::new_v4().simple());
     AuthorizeSessionRepository::create(
@@ -1673,5 +1774,87 @@ async fn consent_names_a_local_application_for_a_loopback_redirect(pool: PgPool)
     assert!(
         body.contains("Authorize Claude"),
         "a claude.ai sign-in is still presented as Claude: {body}"
+    );
+}
+
+// ── 5664ea1c: operator-configured redirect origins ───────────────────────
+
+use epigraph_api::oauth::redirect::RedirectOrigins;
+
+const PARTNER_CALLBACK: &str = "https://explorer.example.test/oauth/callback";
+
+fn partner_origins() -> RedirectOrigins {
+    RedirectOrigins::parse(Some("https://explorer.example.test")).expect("a valid origin")
+}
+
+fn dcr_body(redirect_uri: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_name": "Explorer",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
+    })
+}
+
+/// An operator adds a redirect origin by configuration: dynamic registration
+/// with a callback on that origin succeeds and locks it; a callback on an
+/// unlisted origin (or a lookalike of the listed one) is still refused on the
+/// same server; and the same callback is refused by a server without the
+/// setting, so the acceptance is the configuration's.
+///
+/// Catches: the allowlist ignoring the configured origins, and a configured
+/// origin matched by prefix or suffix instead of exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_accepts_a_configured_origin_and_refuses_an_unlisted_one(pool: PgPool) {
+    let configured = create_router(
+        AppState::with_db(pool.clone(), config()).with_oauth_redirect_origins(partner_origins()),
+    );
+    let (status, body) = post_json2(
+        configured.clone(),
+        "/oauth/register",
+        dcr_body(PARTNER_CALLBACK),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "configured origin: {body}");
+    assert_eq!(body["redirect_uris"][0], PARTNER_CALLBACK, "{body}");
+
+    for unlisted in [
+        "https://other.example.test/oauth/callback",
+        "https://explorer.example.test.evil.test/oauth/callback",
+        "https://explorer.example.test@evil.test/oauth/callback",
+        "http://explorer.example.test/oauth/callback",
+        "https://explorer.example.test:8443/oauth/callback",
+    ] {
+        let (status, body) =
+            post_json2(configured.clone(), "/oauth/register", dcr_body(unlisted)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unlisted}: {body}");
+    }
+
+    let (status, body) = post_json2(
+        create_router(AppState::with_db(pool.clone(), config())),
+        "/oauth/register",
+        dcr_body(PARTNER_CALLBACK),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "without the setting the same origin is refused: {body}"
+    );
+}
+
+/// The consent page for a configured origin names that origin, which the
+/// server validated, and does not present the sign-in as Claude's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_names_the_configured_origin(pool: PgPool) {
+    let (body, email) = consent_page_with_origins(&pool, PARTNER_CALLBACK, partner_origins()).await;
+    assert!(
+        !body.contains("Claude"),
+        "a configured origin is not presented as Claude: {body}"
+    );
+    assert!(
+        body.contains("https://explorer.example.test") && body.contains(&email),
+        "the page names the origin that receives access: {body}"
     );
 }

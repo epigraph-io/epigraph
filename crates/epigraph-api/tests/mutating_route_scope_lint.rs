@@ -163,6 +163,7 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("crate::oauth::register_endpoint", Exempt(OAUTH)),
     ("crate::oauth::revoke_endpoint", Exempt(OAUTH)),
     ("crate::oauth::token_endpoint", Exempt(OAUTH)),
+    ("countersign::countersign_authorship", Scope("claims:write")),
     ("cross_source::decide_candidate", Scope("claims:write")),
     ("crud::assign_claim_to_frame", Scope("claims:admin")),
     ("crud::assign_unthemed", Scope("claims:admin")),
@@ -235,6 +236,12 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("hypothesis::create_hypothesis", Scope("claims:write")),
     ("hypothesis::promote_hypothesis", Scope("claims:write")),
     ("ingest::ingest_paper", Scope("claims:admin")),
+    // Pure computation over the body, gated anyway: it is MCP
+    // `structure_source`'s HTTP twin and carries that tool's scope.
+    (
+        "mcp_twins::structure_source",
+        Via("claims:read", "require_claims_read"),
+    ),
     ("papers::create_paper", Scope("claims:write")),
     ("perspective::create_perspective", Scope("claims:write")),
     ("perspective::set_source_reliability", Scope("claims:write")),
@@ -272,6 +279,12 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("tasks::complete_task", Scope("tasks:write")),
     ("tasks::create_task", Scope("tasks:write")),
     ("tasks::fail_task", Scope("tasks:write")),
+    // Migration 263: the definer decides which group and which invitation;
+    // the scope says the token class may manage groups at all.
+    ("team_groups::accept_invitation", Scope("groups:write")),
+    ("team_groups::create_team_group", Scope("groups:write")),
+    ("team_groups::decline_invitation", Scope("groups:write")),
+    ("team_groups::invite_to_group", Scope("groups:write")),
     ("versioning::mark_duplicate", Scope("claims:write")),
     ("versioning::supersede_claim", Scope("claims:write")),
     ("versioning::unmark_duplicate", Scope("claims:write")),

@@ -152,3 +152,59 @@ async fn search_by_embedding_rejects_unsupported_dim(pool: PgPool) {
         result
     );
 }
+
+/// Backlog f3a3ca54: the paper filter finds a paper whose legacy key differs
+/// from a listed resolver spelling only in the prefix's letter case.
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_by_embedding_paper_filter_matches_a_case_variant_prefix(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+
+    let paper = Uuid::new_v4();
+    sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, 'Upper-case prefix')")
+        .bind(paper)
+        .bind("HTTPS://DOI.ORG/10.5555/case-filter")
+        .execute(&pool)
+        .await
+        .expect("seed paper");
+
+    let claim = Uuid::new_v4();
+    let pgvec = build_query_vec();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, properties, embedding) \
+         VALUES ($1, $2, $3, $4, 0.5, jsonb_build_object('level', 2), $5::vector)",
+    )
+    .bind(claim)
+    .bind(format!("c-{claim}"))
+    .bind(distinct_hash(40))
+    .bind(agent)
+    .bind(&pgvec)
+    .execute(&pool)
+    .await
+    .expect("insert claim");
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+    )
+    .bind(paper)
+    .bind(claim)
+    .execute(&pool)
+    .await
+    .expect("insert asserts edge");
+
+    let results = ClaimRepository::search_by_embedding(
+        &pool,
+        &viewer,
+        &pgvec,
+        1536,
+        5,
+        Some("10.5555/case-filter"),
+    )
+    .await
+    .expect("search_by_embedding with doi filter");
+    let ids: Vec<Uuid> = results.iter().map(|r| r.claim_id).collect();
+    assert!(
+        ids.contains(&claim),
+        "the bare-DOI filter must reach the paper keyed on HTTPS://DOI.ORG/...: {ids:?}"
+    );
+}

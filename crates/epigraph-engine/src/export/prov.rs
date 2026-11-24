@@ -89,11 +89,11 @@ fn prov_relation_endpoints(
     }
 }
 
-/// Bounds on one export. [`Self::default`] is unbounded, which is what the
-/// operator CLI passes, so its output is the whole lineage as before. A
-/// request path (the MCP tool) passes finite limits, because the walk has no
-/// row cap of its own and every kept claim costs about two statements plus
-/// its full content.
+/// Bounds on one export. [`Self::default`] is unbounded: a caller passes it
+/// only on an explicit opt-in (the operator CLI's `--unbounded`). The MCP tool
+/// and the CLI by default pass finite limits, because the walk has no row cap
+/// of its own and every kept claim costs about two statements plus its full
+/// content.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProvExportLimits {
     /// Most claims kept as entities, nearest-first: the root, then its
@@ -132,24 +132,44 @@ fn clip_content(content: String, max: Option<usize>) -> (String, Option<usize>) 
 ///
 /// # What the walk follows
 ///
-/// [`epigraph_db::LineageRepository::get_ancestor_ids`] walks EVERY incoming
-/// claim-to-claim edge, of any relationship, not only the `derived_from`
-/// family. A claim that `refutes` or `contradicts` an ancestor is therefore
-/// in the export as a `prov:Entity` (with its attribution), but its edge has
-/// no PROV-O predicate ([`relationship_to_prov_predicate`]) and is omitted, so
-/// such an entity carries no `prov:Relation` to the rest of the document.
+/// [`epigraph_db::LineageRepository::get_ancestor_ids_probed`] walks incoming
+/// claim-to-claim edges whose relationship is in
+/// [`epigraph_db::ANCESTOR_ID_RELATIONSHIPS`]: the `derived_from` family this
+/// module maps ([`epigraph_db::ANCESTOR_DERIVATION_RELATIONSHIPS`], matched in
+/// exactly the lower-case spelling [`relationship_to_prov_predicate`] maps, so
+/// an upper-case `DERIVED_FROM` paraphrase edge, written paraphrase -> source,
+/// is not walked), plus the lineage relationships `get_provenance` walks
+/// (`supports`, `elaborates`, `decomposes_to`, compared lower-cased as there).
+/// A claim that only `refutes` or
+/// `contradicts` an ancestor, or that `supersedes` one (a successor, not an
+/// ancestor), is not walked, so it never takes a `max_nodes` slot from a
+/// derivation ancestor (backlog 19d325d5). A `supports` / `elaborates` /
+/// `decomposes_to` ancestor is in the export as a `prov:Entity` (with its
+/// attribution), but its edge has no PROV-O predicate
+/// ([`relationship_to_prov_predicate`]) and is omitted, so such an entity
+/// carries no `prov:Relation` to the rest of the document.
+///
+/// # One relation per fact
+///
+/// One `(source, target, relationship)` fact can be stored as several edge
+/// rows (the edges table has no triple uniqueness since migrations
+/// 017/018/053). Each fact is emitted as ONE `prov:Relation`, named after the
+/// first of its rows the export meets (backlog 11402482).
 ///
 /// `supersedes` is only expanded one hop per claim (not recursively) in
 /// this first pass — deeper supersession *chains* (claims that themselves
 /// supersede a claim already reached via a supersedes edge) are a follow-up;
 /// see the module's PR description.
 ///
-/// # `truncated`
+/// # `truncated` and `depth_truncated`
 ///
-/// The document's `truncated` is true iff `limits.max_nodes` cut the claim
-/// set. It does NOT report a `max_depth` cutoff: the ancestor walk returns no
-/// signal for one, so a depth-limited export can be incomplete with
-/// `truncated: false`.
+/// The document's `truncated` is true iff the export is known to be
+/// incomplete: `limits.max_nodes` cut the claim set, OR the walk stopped at
+/// `max_depth` with a readable ancestor one layer past it. `depth_truncated`
+/// is true iff the second cause holds (backlog 4caad789). Both count only
+/// claims the viewer can READ, reached over edges it can read: the depth
+/// probe runs through the walk's own predicates, so neither flag can reveal a
+/// hidden claim. The probe layer's claims are never emitted.
 ///
 /// This is **read-only**: it issues only `SELECT`s (via
 /// `LineageRepository`, `EdgeRepository`, `ClaimRepository`,
@@ -211,8 +231,11 @@ pub async fn export_provenance_prov_o(
     // in the lineage — the direction is inverted relative to what the CTE
     // looks for. So we add supersedes targets explicitly, one hop per claim
     // already in the set.
-    let mut claim_ids =
-        LineageRepository::get_ancestor_ids(&mut *conn, viewer, root_claim_id, max_depth).await?;
+    let walk =
+        LineageRepository::get_ancestor_ids_probed(&mut *conn, viewer, root_claim_id, max_depth)
+            .await?;
+    let depth_truncated = walk.truncated_by_depth;
+    let mut claim_ids = walk.ids;
     claim_ids.reverse();
     claim_ids.retain(|id| *id != root_claim_id);
     claim_ids.insert(0, root_claim_id);
@@ -220,7 +243,7 @@ pub async fn export_provenance_prov_o(
     // The node cap, BEFORE any per-claim statement, nearest-first. Every id
     // the walk returned is readable (it filters claims and edges for the
     // viewer), so this cut counts readable claims only.
-    let mut truncated = false;
+    let mut truncated = depth_truncated;
     if let Some(n) = limits.max_nodes {
         if claim_ids.len() > n {
             claim_ids.truncate(n);
@@ -273,7 +296,9 @@ pub async fn export_provenance_prov_o(
     let mut agents_seen = HashSet::new();
     let mut agent_entities = Vec::new();
     let mut relations = Vec::new();
-    let mut edges_seen = HashSet::new();
+    // Keyed on the FACT, not the row: parallel rows of one
+    // `(source, target, relationship)` are one relation.
+    let mut facts_seen: HashSet<(uuid::Uuid, uuid::Uuid, String)> = HashSet::new();
 
     for (claim_id, claim) in readable {
         let (content, content_chars) = clip_content(claim.content, limits.max_content_chars);
@@ -314,10 +339,10 @@ pub async fn export_provenance_prov_o(
         // `target_id` (see doc comment on `prov_relation_endpoints`),
         // `supersedes` edges have this claim as the `source_id`. The outgoing
         // half was fetched in pass 1 for every ancestor; only a supersedes
-        // predecessor needs it fetched here. Dedup by edge id since a claim
-        // can appear on both sides across the loop (e.g. the root is both a
-        // target of its ancestor's edge and a source of its own supersedes
-        // edge).
+        // predecessor needs it fetched here. Dedup by fact (source, target,
+        // relationship): a claim can appear on both sides across the loop
+        // (e.g. the root is both a target of its ancestor's edge and a source
+        // of its own supersedes edge), and one fact can have several rows.
         let outgoing = match outgoing_by_claim.remove(&claim_id) {
             Some(edges) => edges,
             None => EdgeRepository::get_by_source(&mut *conn, viewer, claim_id, "claim").await?,
@@ -327,9 +352,6 @@ pub async fn export_provenance_prov_o(
         claim_edges.extend(outgoing);
 
         for edge in claim_edges {
-            if !edges_seen.insert(edge.id) {
-                continue;
-            }
             if edge.source_type != "claim"
                 || edge.target_type != "claim"
                 || !readable_ids.contains(&edge.source_id)
@@ -340,6 +362,9 @@ pub async fn export_provenance_prov_o(
             let Some(predicate) = relationship_to_prov_predicate(&edge.relationship) else {
                 continue;
             };
+            if !facts_seen.insert((edge.source_id, edge.target_id, edge.relationship.clone())) {
+                continue;
+            }
             let (generated, used) =
                 prov_relation_endpoints(&edge.relationship, edge.source_id, edge.target_id);
             relations.push(serde_json::json!({
@@ -357,6 +382,7 @@ pub async fn export_provenance_prov_o(
         "@context": "https://www.w3.org/ns/prov#",
         "root_claim": format!("claim:{root_claim_id}"),
         "truncated": truncated,
+        "depth_truncated": depth_truncated,
         "entities": entities,
         "agents": agent_entities,
         "relations": relations,
@@ -409,6 +435,41 @@ mod tests {
         assert_eq!((kept.as_str(), none), ("abc", None));
         let (kept, none) = clip_content("abcdef".to_string(), None);
         assert_eq!((kept.as_str(), none), ("abcdef", None));
+    }
+
+    /// Every claim-to-claim derivation relationship this module maps (all but
+    /// `supersedes`, which the export expands by its own outgoing hop, and the
+    /// claim-to-agent attribution names) is one the ancestor walk follows, so
+    /// a mapped derivation ancestor is never silently out of the walk.
+    #[test]
+    fn the_ancestor_walk_follows_every_mapped_derivation_relationship() {
+        for r in ["derived_from", "derives_from", "generated", "uses_evidence"] {
+            assert!(relationship_to_prov_predicate(r).is_some(), "{r} is mapped");
+            assert!(
+                epigraph_db::ANCESTOR_ID_RELATIONSHIPS.contains(&r)
+                    && epigraph_db::ANCESTOR_DERIVATION_RELATIONSHIPS.contains(&r),
+                "{r} is walked, in the exactly-matched derivation family"
+            );
+        }
+        for r in epigraph_db::ANCESTOR_DERIVATION_RELATIONSHIPS {
+            assert!(
+                relationship_to_prov_predicate(r).is_some(),
+                "{r} is matched exactly, so it must be the spelling the mapping maps"
+            );
+        }
+        for r in [
+            "refutes",
+            "contradicts",
+            "supersedes",
+            "CORROBORATES",
+            "corroborates",
+            "DERIVED_FROM",
+        ] {
+            assert!(
+                !epigraph_db::ANCESTOR_ID_RELATIONSHIPS.contains(&r),
+                "{r} is not ancestry"
+            );
+        }
     }
 
     #[test]

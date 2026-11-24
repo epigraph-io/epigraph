@@ -22,11 +22,17 @@
 //!    `MAX_CRASH_REDELIVERIES` times, then failed, see
 //!    `PostgresJobQueue::reap_stale_jobs_counting_attempts`), then run
 //!    the oldest pending job of a registered type, one at a time, until none
-//!    is left or `--max-runtime` (default 50min) has elapsed.
+//!    is left or `--max-runtime` (default 50min) has elapsed. A job that
+//!    fails retryably goes back to `pending` with a not-before time of now
+//!    plus its handler's backoff (`jobs.run_after`, migration 261), and no
+//!    run claims it before then (`retry_not_before` in the report).
 //!
 //! Exit codes: 0 drained (or locked); 1 a job failed in this run (retryable
 //! or terminal; a failure outranks every other code), or the run could not
-//! start; 4 pending jobs of a type this run has no handler for are waiting
+//! start; 5 a privatization plan is stranded in `applying` or `reverting`
+//! with no job to finish it (`stranded_privatization_plans` in the report;
+//! reported on every run until an operator aborts and reverts it; it
+//! outranks 4); 4 pending jobs of a type this run has no handler for are waiting
 //! (`pending_unregistered` in the report, per type; for example
 //! `embedding_generation` on an instance whose provider may not write
 //! `claims.embedding`; it outranks 3); 3 out of time with work still pending.
@@ -36,6 +42,10 @@
 //! `--cancel-pending <TYPE>` (repeatable): the run sets that type's pending
 //! jobs `cancelled` (`cancelled_unregistered` in the report) before draining.
 //! It refuses, exit 1 with no write, a type this run has a handler for.
+//!
+//! At start, before any refusal, the run journals its belief modes and any
+//! belief-mode flag value it did not recognise (SPEC §10.2), as the API
+//! server does.
 //!
 //! Usage: `drain_jobs [--max-runtime <DURATION>] [--cancel-pending <TYPE>]...`,
 //! where DURATION is seconds or a number with `s`, `m`/`min` or `h`. `DATABASE_URL` and
@@ -118,6 +128,20 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    // Belief modes (SPEC §10.2, backlog a7ab715d): read once, here, and
+    // journalled before anything can stop the run, as the API server does at
+    // boot, so the journal shows the modes every job of this run ran under.
+    // No job acts on a belief-mode flag yet; the first one that does would
+    // otherwise run in a mode nobody can see.
+    tracing::info!(
+        belief_modes = %epigraph_engine::belief_modes::current().summary(),
+        "belief modes read at startup"
+    );
+    // A typo runs the flag's default; named here so it shows in the journal.
+    for flag in epigraph_engine::belief_modes::unrecognised() {
+        tracing::warn!("belief-mode flag ignored: {flag}");
+    }
 
     let Args {
         max_runtime,

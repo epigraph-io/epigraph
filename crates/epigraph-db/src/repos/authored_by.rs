@@ -702,8 +702,14 @@ impl AuthoredByRepository {
     /// The prompt snapshot `agent_id` was running at `at`, as the session of
     /// `conn` may see it under `audience`: migration 199's
     /// `epigraph_agent_prompt_snapshot_at`, the ONE spelling of the snapshot
-    /// gate. `None` both when no snapshot was active and when the caller is
-    /// not in the audience.
+    /// gate for every caller that shows a snapshot to a reader. `None` both
+    /// when no snapshot was active and when the caller is not in the audience.
+    ///
+    /// The one other caller of the definer is
+    /// `AgentRepository::run_token_principal_pool`, which passes
+    /// `p_open = true` (NOT [`crate::PROMPT_SNAPSHOT_AUDIENCE`]): the
+    /// pre-authentication run-token grant reads only the attested MODEL and
+    /// never returns it. A change to the audience ruling must re-check it.
     async fn snapshot_at(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,

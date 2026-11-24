@@ -251,6 +251,16 @@ impl Links {
         self.path("/bff/atlas/resolve/")
     }
 
+    /// `/bff/atlas/sources` (the client adds `?theme_id=&after=`).
+    pub fn bff_atlas_sources(&self) -> String {
+        self.path("/bff/atlas/sources")
+    }
+
+    /// `/bff/atlas/timeline` (the client adds `?theme_id=&after=`).
+    pub fn bff_atlas_timeline(&self) -> String {
+        self.path("/bff/atlas/timeline")
+    }
+
     // ---- auth, health, static -------------------------------------------
 
     /// `/auth/login`, with `?return_to=` (a browser-visible local path).

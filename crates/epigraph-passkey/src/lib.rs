@@ -28,12 +28,12 @@
 //!   own attestation (its stored certificate chain, and for an Android key
 //!   that the leaf certifies the credential's key) is re-verified against
 //!   the roots THIS process trusts now, as is every passkey on its lineage.
-//!   What is not re-verified: that a stored `packed` / `tpm` chain was the
-//!   one that attested the stored key (its attestation signature is not
-//!   kept), so a row planted through that completion function with a
-//!   genuine, public model chain beside the planter's own key passes
-//!   ([`Passkeys::hardware_attested`] says what that allows). The stored
-//!   state only has to agree;
+//!   For a `packed` / `tpm` passkey that includes its stored attestation
+//!   STATEMENT ([`STATEMENT_KEY`], kept at registration), re-verified over
+//!   the stored key, so a row planted through that completion function with
+//!   a genuine, public model chain beside the planter's own key anchors
+//!   nothing and counts as hardware nowhere ([`Passkeys::hardware_attested`]).
+//!   The stored state only has to agree;
 //! * user verification is checked on the registered credential and on every
 //!   assertion here, whatever policy the stored state names (operator ruling
 //!   D5: a passkey with user verification);
@@ -193,7 +193,9 @@ pub struct RegisteredPasskey {
     /// The credential id (16..=1023 bytes).
     pub credential_id: Vec<u8>,
     /// The library's serialized credential, public key and counter included
-    /// (`{"cred": {...}}`).
+    /// (`{"cred": {...}}`), with the registration response the ceremony
+    /// verified stored beside it ([`STATEMENT_KEY`]; removed when the
+    /// anchored path drops an untrusted attestation).
     pub passkey: Value,
     /// The authenticator model, from a verified attestation; the nil UUID for
     /// `none` and self attestation.
@@ -600,7 +602,7 @@ impl Passkeys {
                 serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?
             }
         };
-        registered_from(passkey_json)
+        registered_from(with_statement(passkey_json, &reg)?)
     }
 
     /// Finish an attested registration of `library` (the stored library
@@ -744,8 +746,10 @@ impl Passkeys {
             .webauthn
             .finish_passkey_registration(&reg, &st)
             .map_err(|e| refused(&e))?;
-        let registered =
-            registered_from(serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?)?;
+        let registered = registered_from(with_statement(
+            serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?,
+            &reg,
+        )?)?;
         if registered.attestation_format == "none" {
             return Ok(registered);
         }
@@ -930,6 +934,8 @@ impl Passkeys {
     /// * `android-key`: chains to an Android key root, its KeyDescription
     ///   (the leaf's, and only the leaf's) places the attestation and the key
     ///   in a TEE or StrongBox with `purpose` and `origin` hardware-enforced,
+    ///   on a device whose bootloader was locked and whose boot was Verified
+    ///   (its hardware-enforced `rootOfTrust`, [`android::hardware_rules`]),
     ///   and no certificate of the chain, root included, is on the status list
     ///   (which must be no older than
     ///   [`android::ANDROID_KEY_STATUS_MAX_AGE`]);
@@ -943,26 +949,27 @@ impl Passkeys {
     ///
     /// For `android-key` the leaf certificate is issued FOR the credential's
     /// key, so the two must be the same key. For `packed` / `tpm` the
-    /// certificate is the authenticator model's, and what bound it to this
-    /// credential (the attestation signature) is not stored, so that binding
-    /// is NOT re-checked here. The API's ceremony checked it when it wrote
-    /// the row, but the row has two other writers: the maintenance DSN, and a
-    /// holder of the request DSN with a live enrollment id, who can call
-    /// 124's `epigraph_complete_passkey_enrollment` directly with a key, a
-    /// stored credential and columns of their choosing. Such a holder can
-    /// store a genuine, public `packed` / `tpm` model chain beside their own
-    /// key, and this check passes it. What that allows, beyond what the
-    /// holder can already do (plant any key on that enrollment, which then
-    /// elevates as the person): the row anchors later passkeys (on acts it
-    /// confirms, each opened by the operator's `passkey-enroll --act`),
-    /// counts as hardware on a lineage (its genuine chain also passes the
-    /// validity window), and, recorded as non-`none`, is not revoked with its
-    /// anchor by migration 200's cascade. An `android-key` row cannot be
-    /// planted this way: its leaf must certify the credential's key, which
-    /// must then assert. Re-deriving the columns in the database would not
-    /// close it (the stored credential is as freely chosen as the columns,
-    /// and this check already demands they agree); storing the attestation
-    /// statement and re-verifying its signature here would, and is not done.
+    /// certificate is the authenticator model's, and what binds it to this
+    /// credential is the attestation STATEMENT: its signature, by the leaf,
+    /// over authenticator data that carry the credential's key. The
+    /// registration stores it beside the credential ([`STATEMENT_KEY`]) and
+    /// it is re-verified here over the stored key, and must attest exactly
+    /// the stored credential id, key, chain, model, format and flag
+    /// (`statement_attests`). That is what stops a PLANTED row: the row has
+    /// writers besides the API's ceremony (the maintenance DSN, and a holder
+    /// of the request DSN with a live enrollment id, who can call 124's
+    /// `epigraph_complete_passkey_enrollment` directly with a key, a stored
+    /// credential and columns of their choosing), and a genuine, public
+    /// model chain stored beside the planter's own key would otherwise pass,
+    /// anchor later passkeys and count as hardware on a lineage. Without the
+    /// model's attestation key no statement over the planter's key can be
+    /// made, and another credential's statement attests another key. A
+    /// `packed` / `tpm` credential that stores no statement (one registered
+    /// before statements were kept) is therefore not hardware-attested here.
+    /// What a planted row still can do is what the holder could already do
+    /// (plant any key on that enrollment, which then elevates as the person),
+    /// and, recorded as non-`none`, it is not revoked with its anchor by
+    /// migration 200's cascade (the database cannot verify a statement).
     ///
     /// # Errors
     /// Why not, in words, for the log.
@@ -1088,11 +1095,132 @@ impl Passkeys {
                 if !ca.blanket_allow() && !ca.aaguids().contains_key(&aaguid) {
                     return Err(format!("its model {aaguid} is no longer on the allowlist"));
                 }
-                chain_valid_at(&attestation.data, ca, at).map(|()| None)
+                chain_valid_at(&attestation.data, ca, at)?;
+                self.statement_attests(passkey, cred).map(|()| None)
             }
             "android-key" => Ok(Some((cred.clone(), attestation))),
             other => Err(format!("a `{other}` attestation is not hardware-attested")),
         }
+    }
+
+    /// That the attestation statement stored with a `packed` / `tpm`
+    /// credential ([`STATEMENT_KEY`], the registration response the ceremony
+    /// verified, kept verbatim as the library parsed it) is the one that
+    /// attested THIS credential: re-verified with the library's own
+    /// registration procedure (the statement's signature, by its leaf
+    /// certificate, over authenticator data that carry the credential's id,
+    /// public key and flags, for this relying party's rp id and origin, with
+    /// user verification), what it attests must be exactly what the row
+    /// stores: the credential id, the public key, the certificate chain and
+    /// model, the format and the backup-eligible flag.
+    ///
+    /// The ceremony's challenge is not re-checked (the state it was issued in
+    /// is gone, so the statement's own is used): the binding that matters
+    /// here is of the chain to the key, which a statement cannot be moved off
+    /// (another credential's statement attests another key), and a statement
+    /// over a key cannot be made without the model's attestation key. The
+    /// certificates' validity is not re-checked here either (the library's
+    /// statement procedure does not read it); [`chain_valid_at`] does.
+    ///
+    /// A credential registered before statements were kept, or one written
+    /// outside the ceremony, stores none and is refused: the chain beside it
+    /// shows nothing about its key.
+    fn statement_attests(&self, passkey: &Value, cred: &Value) -> Result<(), String> {
+        let stored = passkey.get(STATEMENT_KEY).ok_or_else(|| {
+            "no attestation statement is stored with the credential, so nothing shows that its \
+             certificate chain attested its key (a passkey registered before statements were \
+             kept is re-enrolled to anchor)"
+                .to_string()
+        })?;
+        let reg: RegisterPublicKeyCredential = serde_json::from_value(stored.clone())
+            .map_err(|e| format!("the stored attestation statement does not parse: {e}"))?;
+        let client_data: Value = serde_json::from_slice(&reg.response.client_data_json)
+            .map_err(|e| format!("the stored statement's client data do not parse: {e}"))?;
+        let challenge = client_data
+            .get("challenge")
+            .and_then(Value::as_str)
+            .and_then(|c| URL_SAFE_NO_PAD.decode(c.trim_end_matches('=')).ok())
+            .ok_or_else(|| "the stored statement's client data name no challenge".to_string())?;
+        let (_, state) = self
+            .webauthn
+            .start_passkey_registration(Uuid::nil(), "statement", "statement", None)
+            .map_err(|e| format!("the statement's re-verification cannot start: {e}"))?;
+        let mut state = serde_json::to_value(&state)
+            .map_err(|e| format!("the statement's re-verification state: {e}"))?;
+        match state.pointer_mut("/rs/challenge") {
+            Some(c) => *c = Value::from(URL_SAFE_NO_PAD.encode(&challenge)),
+            None => return Err("the statement's re-verification state has no challenge".into()),
+        }
+        let state: PasskeyRegistration = serde_json::from_value(state)
+            .map_err(|e| format!("the statement's re-verification state: {e}"))?;
+        let attested = self
+            .webauthn
+            .finish_passkey_registration(&reg, &state)
+            .map_err(|e| format!("the stored attestation statement does not verify: {e}"))?;
+        let attested = serde_json::to_value(&attested)
+            .map_err(|e| format!("the re-verified credential does not encode: {e}"))?;
+        let attested = attested
+            .get("cred")
+            .ok_or_else(|| "the re-verified credential has no `cred`".to_string())?;
+        // Each compared as the type it is, so the comparison does not depend
+        // on how the database re-encoded the stored JSON.
+        let cred_id = |c: &Value| {
+            c.get("cred_id")
+                .and_then(Value::as_str)
+                .and_then(|id| URL_SAFE_NO_PAD.decode(id.trim_end_matches('=')).ok())
+        };
+        let key = |c: &Value| {
+            c.get("cred")
+                .cloned()
+                .and_then(|k| serde_json::from_value::<COSEKey>(k).ok())
+        };
+        let statement = |c: &Value| {
+            c.get("attestation")
+                .cloned()
+                .and_then(|a| serde_json::from_value::<ParsedAttestation>(a).ok())
+                .and_then(|a| {
+                    let der = match &a.data {
+                        ParsedAttestationData::Basic(chain)
+                        | ParsedAttestationData::AttCa(chain)
+                        | ParsedAttestationData::AnonCa(chain) => chain
+                            .iter()
+                            .map(|x| x.to_der().ok())
+                            .collect::<Option<Vec<_>>>()?,
+                        _ => Vec::new(),
+                    };
+                    Some((der, serde_json::to_value(&a.metadata).ok()?))
+                })
+        };
+        let flag = |c: &Value, name: &str| c.get(name).and_then(Value::as_bool);
+        let format = |c: &Value| {
+            c.get("attestation_format")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let mismatch = |what: &str| {
+            Err(format!(
+                "the stored attestation statement attests another {what} than the stored \
+                 credential's"
+            ))
+        };
+        if cred_id(attested).is_none() || cred_id(attested) != cred_id(cred) {
+            return mismatch("credential id");
+        }
+        if key(attested).is_none() || key(attested) != key(cred) {
+            return mismatch("public key");
+        }
+        if statement(attested).is_none() || statement(attested) != statement(cred) {
+            return mismatch("certificate chain or model");
+        }
+        if format(attested).is_none() || format(attested) != format(cred) {
+            return mismatch("attestation format");
+        }
+        if flag(attested, "backup_eligible").is_none()
+            || flag(attested, "backup_eligible") != flag(cred, "backup_eligible")
+        {
+            return mismatch("backup-eligible flag");
+        }
+        Ok(())
     }
 
     /// The Android half of [`Self::hardware_attested`], over a credential
@@ -1196,6 +1324,138 @@ impl Passkeys {
             }
         }
         Ok(())
+    }
+
+    /// Whether a STORED passkey's attestation is still in good standing for
+    /// an ASSERTION (an elevation, an admin act's confirmation): the check a
+    /// caller runs after [`Self::finish_authentication`] verified the
+    /// assertion, on the passkey row the database serves for the asserting
+    /// credential.
+    ///
+    /// * `android-key` (by the row's `attestation_format` OR by the stored
+    ///   credential's own; a row and credential that disagree are refused):
+    ///   its stored chain must still reach an Android key root configured
+    ///   now (its signatures; the library's time checks off), and no
+    ///   certificate of it, the root included, may be on today's status list,
+    ///   which must be fresh, as at enrollment (fail closed: a stale, missing
+    ///   or unreadable list refuses). A batch key Google revokes after the
+    ///   passkey enrolled therefore stops it elevating at the next refresh of
+    ///   the list.
+    ///
+    ///   NOT re-checked here: the certificates' validity periods (an
+    ///   attestation speaks for the moment of registration, and a remotely
+    ///   provisioned intermediate may be short-lived, so an expiry would lock
+    ///   a person out of a key nobody revoked) and the hardware rules
+    ///   ([`android::hardware_rules`]: checked at registration and at every
+    ///   anchor use; a rule added since does not retire an enrolled key's
+    ///   assertions).
+    /// * every other format: in good standing. `packed` / `tpm` have no
+    ///   status list, and a `none` passkey holds only through its anchor.
+    /// * under the software policy, every passkey: that policy trusts no
+    ///   attestation, so none has a standing to lose.
+    ///
+    /// # Errors
+    /// [`StandingRefusal::NotInGoodStanding`]: a certificate is listed, the
+    /// chain no longer reaches a configured Android root, or the row and the
+    /// credential disagree. [`StandingRefusal::Unknown`]: no Android roots or
+    /// no current status list to check it against.
+    pub fn assertion_standing(
+        &self,
+        passkey: &Value,
+        attestation_format: &str,
+    ) -> Result<(), StandingRefusal> {
+        if self.config.allows_software_attestation() {
+            return Ok(());
+        }
+        let cred = passkey.get("cred");
+        let stored_format = cred
+            .and_then(|c| c.get("attestation_format"))
+            .and_then(Value::as_str);
+        let android = |f: Option<&str>| f == Some("android-key");
+        if !android(Some(attestation_format)) && !android(stored_format) {
+            return Ok(());
+        }
+        if stored_format != Some(attestation_format) {
+            return Err(StandingRefusal::NotInGoodStanding(format!(
+                "the row's attestation format `{attestation_format}` is not the credential's \
+                 ({stored_format:?})"
+            )));
+        }
+        let cred = cred.ok_or_else(|| {
+            StandingRefusal::NotInGoodStanding("the stored credential has no `cred`".into())
+        })?;
+        let attestation: ParsedAttestation = cred
+            .get("attestation")
+            .cloned()
+            .ok_or_else(|| "the stored credential holds no attestation".to_string())
+            .and_then(|a| {
+                serde_json::from_value(a)
+                    .map_err(|e| format!("the stored attestation does not parse: {e}"))
+            })
+            .map_err(StandingRefusal::NotInGoodStanding)?;
+        let serials = self.android_key_serials(&attestation)?;
+        self.android_key_standing(&serials).map_err(|d| match d {
+            Distrust::Untrusted(why) => StandingRefusal::NotInGoodStanding(why),
+            Distrust::StatusUnknown(why) => StandingRefusal::Unknown(why),
+        })
+    }
+
+    /// The serials of a stored Android chain and of the configured root it
+    /// reaches, for [`Self::assertion_standing`]: the chain's signatures are
+    /// verified to a root configured now, its validity periods are not.
+    fn android_key_serials(
+        &self,
+        attestation: &ParsedAttestation,
+    ) -> Result<Vec<Vec<u8>>, StandingRefusal> {
+        let cas = self.android_cas.as_ref().ok_or_else(|| {
+            StandingRefusal::Unknown(format!(
+                "no Android key roots are configured ({}), so an android-key passkey's standing \
+                 cannot be checked",
+                config::ENV_ANDROID_KEY_CA_FILE
+            ))
+        })?;
+        let untrusted = StandingRefusal::NotInGoodStanding;
+        let chain = match &attestation.data {
+            ParsedAttestationData::Basic(chain) if !chain.is_empty() => chain,
+            _ => {
+                return Err(untrusted(
+                    "the stored Android key attestation holds no certificate chain".into(),
+                ))
+            }
+        };
+        let ca = verify_attestation_ca_chain(&attestation.data, cas, true)
+            .map_err(|e| {
+                untrusted(format!(
+                    "its chain does not verify to an Android key root: {e}"
+                ))
+            })?
+            .ok_or_else(|| untrusted("it carries no certificate chain".into()))?;
+        // Each certificate's serial, and nothing else: the KeyDescription is
+        // NOT parsed here, so a parser or rule added after a passkey enrolled
+        // cannot stop it asserting (registration enforced them).
+        let mut serials = chain
+            .iter()
+            .enumerate()
+            .map(|(index, c)| {
+                let der = c
+                    .to_der()
+                    .map_err(|e| untrusted(format!("a certificate does not encode: {e}")))?;
+                let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| {
+                    untrusted(format!(
+                        "attestation certificate {index} does not parse: {e}"
+                    ))
+                })?;
+                Ok(cert.raw_serial().to_vec())
+            })
+            .collect::<Result<Vec<_>, StandingRefusal>>()?;
+        let root = ca
+            .ca()
+            .to_der()
+            .map_err(|e| untrusted(format!("the root does not encode: {e}")))?;
+        let (_, root) = x509_parser::parse_x509_certificate(&root)
+            .map_err(|e| untrusted(format!("the root does not parse: {e}")))?;
+        serials.push(root.raw_serial().to_vec());
+        Ok(serials)
     }
 
     /// The rules for a registration that verified under the Android key
@@ -1452,9 +1712,9 @@ impl Verifier {
 /// can call 124's `epigraph_complete_passkey_enrollment` with values of its
 /// choosing.
 /// So [`Passkeys::check_anchor`] re-verifies the confirmation, and the
-/// anchor's and every ancestor's stored attestation against the CURRENT
-/// configuration ([`Passkeys::hardware_attested`], which says what it does
-/// not re-check).
+/// anchor's and every ancestor's stored attestation (for `packed` / `tpm`
+/// its stored statement too, over the stored key) against the CURRENT
+/// configuration ([`Passkeys::hardware_attested`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActAnchor {
     /// The act the enrollment was opened on.
@@ -1610,6 +1870,34 @@ impl AnchorRefusal {
             Self::AssertionDoesNotVerify => "assertion_does_not_verify",
             Self::CredentialMismatch => "credential_mismatch",
             Self::BackupEligibilityChanged => "backup_eligibility_changed",
+        }
+    }
+}
+
+/// Why a stored passkey may not assert now
+/// ([`Passkeys::assertion_standing`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum StandingRefusal {
+    /// Its attestation is not in good standing: a certificate of its chain
+    /// is on the attestation status list, the chain no longer reaches a
+    /// configured root, or its row and credential disagree.
+    #[error("the passkey's attestation is no longer in good standing: {0}")]
+    NotInGoodStanding(String),
+    /// Its standing cannot be checked: no Android roots configured (the
+    /// remedy is to restore them), or no current attestation status list
+    /// (stale, missing, unreadable: the remedy is to refresh it). The reason
+    /// says which.
+    #[error("the passkey's attestation standing cannot be checked: {0}")]
+    Unknown(String),
+}
+
+impl StandingRefusal {
+    /// A stable snake_case code for logs and responses.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotInGoodStanding(_) => "attestation_not_in_good_standing",
+            Self::Unknown(_) => "attestation_status_unavailable",
         }
     }
 }
@@ -1783,12 +2071,41 @@ pub fn evidence_challenge(evidence: &Value) -> Result<Vec<u8>, PasskeyError> {
         .map_err(|e| malformed("evidence challenge", e))
 }
 
+/// Where a stored credential (`{"cred": ...}`, [`RegisteredPasskey::passkey`])
+/// keeps the registration response its ceremony verified (the
+/// authenticator's attestation object and client data, as the library parsed
+/// them), so that a `packed` / `tpm` attestation can be re-verified against
+/// the stored key whenever the passkey anchors or counts as hardware
+/// ([`Passkeys::hardware_attested`]). The library ignores the member when it
+/// reads the credential back.
+pub const STATEMENT_KEY: &str = "registration_response";
+
+/// `passkey` (a library-serialized credential) with the registration
+/// response `reg` stored beside its credential ([`STATEMENT_KEY`]).
+fn with_statement(
+    mut passkey: Value,
+    reg: &RegisterPublicKeyCredential,
+) -> Result<Value, PasskeyError> {
+    let statement = serde_json::to_value(reg).map_err(|e| malformed("registration response", e))?;
+    passkey
+        .as_object_mut()
+        .ok_or_else(|| malformed("credential", "not an object"))?
+        .insert(STATEMENT_KEY.into(), statement);
+    Ok(passkey)
+}
+
 /// A library-serialized credential (`{"cred": {...}}`) with its attestation
 /// dropped: the attestation, its metadata and its format replaced by what the
-/// library records for a `none` registration. The key, credential id,
-/// counter, flags and everything else are untouched.
+/// library records for a `none` registration, and its stored registration
+/// response ([`STATEMENT_KEY`]) removed. The key, credential id, counter,
+/// flags and everything else are untouched.
 fn without_attestation(mut passkey: Value) -> Result<Value, PasskeyError> {
-    let cred = passkey
+    let stored = passkey
+        .as_object_mut()
+        .ok_or_else(|| malformed("credential", "not an object"))?;
+    // The dropped statement goes with it: a `none` row is never re-verified.
+    stored.remove(STATEMENT_KEY);
+    let cred = stored
         .get_mut("cred")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| malformed("credential", "no cred"))?;

@@ -1779,15 +1779,153 @@ async fn workflow_truth(pool: &PgPool, wf: Uuid) -> f64 {
         .expect("workflow truth")
 }
 
+/// The token facts of every `workflows.caller_write` row about `wf` written by
+/// `acting`, oldest first: `(action, transport, client_id, token_jti,
+/// delegated_by)`.
+async fn caller_write_tokens(
+    pool: &PgPool,
+    wf: Uuid,
+    acting: Uuid,
+) -> Vec<(
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    sqlx::query_as(
+        "SELECT details->>'action', details->>'transport', details->>'client_id', \
+                details->>'token_jti', details->>'delegated_by' \
+           FROM security_events \
+          WHERE event_type = 'workflows.caller_write' \
+            AND details->>'workflow_id' = $1::text AND details->>'acting_agent' = $2::text \
+          ORDER BY created_at, id",
+    )
+    .bind(wf)
+    .bind(acting)
+    .fetch_all(pool)
+    .await
+    .expect("provenance token facts")
+}
+
+/// Backlog 7d95803e: a write through a DELEGATED run token is traceable to
+/// the delegator credential and to the token. Every `workflows.caller_write`
+/// row it makes names `delegated_by` (the token's delegator), `client_id`
+/// and `token_jti`, and states `transport`, over a REST step route, REST
+/// `POST /api/v1/workflows` (`store_workflow`, whose gate used to be handed
+/// no token, so its row named no client and no token) and MCP HTTP. The
+/// stdio row names no token and no delegator.
+///
+/// `store_workflow` reaches the gate only when the goal's slug already names
+/// a lineage: here `p` started `GAP` at generation 1, and `d` stores
+/// generation 0 under it, which needs authority over the lineage head.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegated_write_names_its_delegator_and_token_in_every_caller_write_row(pool: PgPool) {
+    const GAP: &str = "acme-delegate-store-gap";
+    let w = world(&pool).await;
+    let dl = &w.p_delegator;
+    let delegator = Some(dl.delegator.to_string());
+    let client = Some(dl.delegator_client.to_string());
+
+    // A step route on every transport.
+    let vias = w.d_vias();
+    let Via::McpHttp(_, mcp_token) = &vias[1] else {
+        unreachable!("d_vias()[1] is MCP HTTP")
+    };
+    let mcp_jti_used = mcp_token.jti;
+    for via in &vias {
+        let label = via.label();
+        via.add_step(PUB, &format!("acme traced step via {label}"))
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the delegate adds a step: {e}"));
+    }
+    let rows = caller_write_tokens(&pool, w.pub_wf, w.d).await;
+    assert_eq!(rows.len(), 3, "one row per transport: {rows:?}");
+    let stdio = Some("stdio".to_string());
+    let http = Some("http".to_string());
+    assert_eq!(
+        rows[0],
+        ("add_step".to_string(), stdio, None, None, None),
+        "the stdio row names no token and no delegator"
+    );
+    assert_eq!(
+        rows[1],
+        (
+            "add_step".to_string(),
+            http.clone(),
+            client.clone(),
+            Some(mcp_jti_used.to_string()),
+            delegator.clone()
+        ),
+        "MCP HTTP: the delegator and the token are named"
+    );
+    let (action, transport, rest_client, rest_jti, rest_delegator) = &rows[2];
+    assert_eq!(
+        (action.as_str(), transport, rest_client, rest_delegator),
+        ("add_step", &http, &client, &delegator),
+        "REST step route: the delegator and the token are named"
+    );
+    assert!(
+        rest_jti
+            .as_deref()
+            .is_some_and(|j| Uuid::parse_str(j).is_ok()),
+        "REST step route: the token id is named: {rows:?}"
+    );
+
+    // REST `store_workflow` under a lineage `p` started at generation 1.
+    let p_rest = Via::Rest(
+        &w.router,
+        rest_token(&w.state, Uuid::new_v4(), w.p, None, WRITE_SCOPES),
+    );
+    p_rest
+        .ingest(&extraction_gen(GAP, 1, 1), public_in(w.t))
+        .await
+        .unwrap_or_else(|e| panic!("p starts {GAP} at generation 1: {e}"));
+    let head = workflow_gen(&pool, GAP, 1).await.expect("the lineage head");
+    let Via::Rest(router, token) = &vias[2] else {
+        unreachable!("d_vias()[2] is REST")
+    };
+    let (status, body) = post(
+        router,
+        "/api/v1/workflows",
+        token,
+        &json!({"goal": "acme delegate store gap",
+                "steps": ["acme delegate stored step"]}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the delegate stores generation 0: {body}"
+    );
+    assert!(
+        workflow_gen(&pool, GAP, 0).await.is_some(),
+        "PREMISE: the store wrote generation 0 of {GAP}: {body}"
+    );
+    let rows = caller_write_tokens(&pool, head, w.d).await;
+    assert_eq!(rows.len(), 1, "one row for the lineage head: {rows:?}");
+    let (action, transport, store_client, store_jti, store_delegator) = &rows[0];
+    assert_eq!(
+        (action.as_str(), transport, store_client, store_delegator),
+        ("workflow_ingest", &http, &client, &delegator),
+        "REST store_workflow: the delegator and the token are named"
+    );
+    assert_eq!(
+        store_jti, rest_jti,
+        "REST store_workflow: the same bearer token's id is named"
+    );
+}
+
 /// `deprecate_workflow` (MCP; REST has no hierarchical deprecation) by `p`'s
 /// delegate. Over `p`'s workflow private to `p_g` (which `d` writes through
 /// its link) it is admitted on stdio and MCP-HTTP and recorded as `delegate`
 /// naming `p`. Over `p`'s public workflow in team group `t` (which `d` does
-/// not write) the gate admits it but row security refuses the deprecation of
-/// `t`'s claims, so nothing is written or recorded (tenancy unchanged; the
-/// refusal surfaces as the tool's opaque internal error, the write path's
-/// existing answer to a row-security refusal there). Another principal's
-/// delegate is refused by the gate itself.
+/// not write) the gate admits it but the database does not: since migration
+/// 237 the `workflows` row's UPDATE matches nothing for a non-writer of `t`
+/// (and row security refuses the deprecation of `t`'s claims too, which is
+/// answered by name since backlog ab353d54), so the tool refuses the call by
+/// name before any claim is touched, and nothing is written or recorded.
+/// Another principal's delegate is refused by the gate itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
     let w = world(&pool).await;
@@ -1821,11 +1959,12 @@ async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
     let err = http
         .deprecate(in_t)
         .await
-        .expect_err("tenancy refuses the delegate's deprecation of t's claims");
-    assert_eq!(
-        err, "internal error; the detail is in the server log",
+        .expect_err("the database refuses the delegate's deprecation of t's row");
+    assert!(
+        err.contains("was not deprecated") && err.contains("owner group"),
         "admitted by the gate (not its refusal), refused below it: {err}"
     );
+    assert!(!err.contains(GATE_REFUSAL), "not the gate's refusal: {err}");
     assert_eq!(row_counts(&pool).await, before, "nothing written");
     assert_eq!(workflow_truth(&pool, in_t).await, truth_before);
     assert_eq!(truth(&pool, step).await, step_truth);

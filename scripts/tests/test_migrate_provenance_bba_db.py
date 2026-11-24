@@ -49,6 +49,8 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "scripts"))
 import migrate_provenance_bba as mpb  # noqa: E402
 
+from tests import db_roles  # noqa: E402
+
 TEST_DSN = os.environ.get("DEDUP_TEST_DATABASE_URL", "")
 
 # Same guard as tests/dedup: this fixture INSERTs and removes rows, so it must
@@ -195,16 +197,29 @@ def world(tmp_path):
     conn.close()
 
 
-def _rollback(cur, manifest: str, execute: bool) -> str:
+def _rollback(manifest: str, execute: bool) -> str:
+    """rollback() as main() runs it: on the script's own connection, as the
+    maintenance login it uses in production (tests/db_roles.py), committed only
+    with --execute. The rows belong to a group that login is not a member of, so
+    a session row security narrowed would find none ("already absent")."""
     out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        mpb.rollback(cur, argparse.Namespace(execute=execute), manifest)
+    conn = db_roles.connect_script(TEST_DSN)
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        with contextlib.redirect_stdout(out):
+            mpb.rollback(cur, argparse.Namespace(execute=execute), manifest)
+        if execute:
+            conn.commit()
+        else:
+            conn.rollback()
+    finally:
+        conn.close()
     return out.getvalue()
 
 
 def test_the_dry_run_counts_the_live_rows_names_the_retracted_one_and_deletes_nothing(world):
     cur = world["cur"]
-    out = _rollback(cur, world["manifest"], execute=False)
+    out = _rollback(world["manifest"], execute=False)
     assert "would delete 2 BBAs" in out, out
     assert "would skip 1 retracted BBAs" in out, out
     assert world["retracted"] in out, out
@@ -214,7 +229,7 @@ def test_the_dry_run_counts_the_live_rows_names_the_retracted_one_and_deletes_no
 
 def test_the_rollback_completes_deletes_the_live_rows_and_keeps_the_retracted_one(world):
     cur = world["cur"]
-    out = _rollback(cur, world["manifest"], execute=True)
+    out = _rollback(world["manifest"], execute=True)
     assert "deleted 2 BBAs" in out, out
     assert "skipped 1 retracted BBAs" in out, out
     assert world["retracted"] in out, out

@@ -203,8 +203,10 @@
 //!   (`harvester_sources`, `harvester_audit_reports`), which no generator
 //!   finds, are covered (tenancy columns and `harvester_fragments`'s row
 //!   security) and hold no registry row; the cardinality pin stays 12 and
-//!   `tenancy_coverage.rs::the_registry_is_exactly_the_twelve_measured_rows`
-//!   pins the membership. `webhook_subscriptions` is still not in it.
+//!   `tenancy_coverage.rs::the_registry_is_exactly_the_measured_rows`
+//!   pins the membership. AMENDED by migration 240 (backlog 88cf603b):
+//!   `behavioral_executions` is covered (its workflow's tenancy, FORCEd row
+//!   security) and its row goes, so the pin is 11. `webhook_subscriptions` is still not in it.
 //! * **No route moved between the `public` and `protected` chains.** The four
 //!   webhook routes were already on `protected` in both `create_router`
 //!   variants and still are; `public_router_allowlist.rs` is untouched.
@@ -1619,6 +1621,10 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "epigraph_role_derived_memberships",
         "epigraph_group_role_roster",
         "FROM group_role_bindings",
+        // Migration 236: the unbound twin of `epigraph_live_memberships`
+        // answers for ANY agent (not app-executable). The request path reads
+        // memberships only through the principal-bound read.
+        "epigraph_live_memberships_unbound",
     ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
@@ -1935,17 +1941,25 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // re-stamps the reports when the fragment's pair changes; both are named
     // inside the pattern so that a disabled one is visible here like every
     // other stamping trigger.
+    // 26 SINCE MIGRATION 240 (backlog 88cf603b), arm (c)'s set again unmoved:
+    // `behavioral_executions_inherit_tenancy` stamps a run with its WORKFLOW's
+    // tenancy at INSERT, and `workflows_behavioral_executions_inherit_tenancy`
+    // and `claims_behavioral_executions_inherit_tenancy` re-stamp the runs when
+    // their workflow row or flat workflow claim changes its pair.
     assert_eq!(
         rows.len(),
-        23,
-        "expected 23 tenancy triggers — 3 named (claims_require_tenancy, \
+        26,
+        "expected 26 tenancy triggers — 3 named (claims_require_tenancy, \
          edges_tenancy, claims_propagate_tenancy) plus one \
          *_inherit_tenancy per claim-derived tier-A table (17), plus migration \
          089's harvester_claim_provenance_fragment_inherit_tenancy, plus \
          migration 173's harvester_audit_reports_inherit_tenancy and \
-         harvester_fragments_audit_reports_inherit_tenancy. Found {}: \
+         harvester_fragments_audit_reports_inherit_tenancy, plus migration 240's \
+         behavioral_executions_inherit_tenancy, \
+         workflows_behavioral_executions_inherit_tenancy and \
+         claims_behavioral_executions_inherit_tenancy. Found {}: \
          {rows:?}. A different count means migration 070 arm (c)'s table set \
-         moved or an 089 or 173 trigger is gone, which is a D1 change and \
+         moved or an 089, 173 or 240 trigger is gone, which is a D1 change and \
          needs a decision, not a silent edit.",
         rows.len()
     );
@@ -1973,14 +1987,16 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // 074's parentless-root body on another tier-A table.
     // 27 -> 30 (Atlas W2, backlog 77f4bf09): migration 210's
     // `atlas_map_{epochs,runs,levels}_require_tenancy`, the same root body.
+    // 30 -> 31 (backlog 34864fb5): migration 246's `papers_require_tenancy`,
+    // the same root body on the paper registry.
     assert_eq!(
         pr16.len(),
-        30,
-        "expected 30: after migration 074, 24 *_require_tenancy (claims, the 17 \
+        31,
+        "expected 31: after migration 074, 24 *_require_tenancy (claims, the 17 \
          claim-derived tables, the 6 parentless roots) plus claims_block_widening; \
          migration 173 adds harvester_sources_require_tenancy, migration 183 \
-         workflows_require_tenancy and migration 210 the three atlas_map_* triggers. \
-         Found {}: {pr16:?}",
+         workflows_require_tenancy, migration 210 the three atlas_map_* triggers and \
+         migration 246 papers_require_tenancy. Found {}: {pr16:?}",
         pr16.len()
     );
     let pr16_disabled: Vec<&(String, String)> = pr16.iter().filter(|(_, e)| e != "O").collect();
@@ -2364,6 +2380,17 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     // them; their tenancy is inherited from the workflow row, so they carry no
     // tenancy columns and are reached through WORKFLOW_REPORT_TABLES below.
     "workflow_outcome_reports",
+    // Workflow runs (240, backlog 88cf603b): tier-A since that migration, which
+    // gives them their workflow's tenancy and FORCEs the table itself; reached
+    // through `tier_a` in the test below.
+    "behavioral_executions",
+    // Paper rows (246, backlog 34864fb5): tier-A since that migration, which
+    // FORCEs the table itself; reached through `tier_a` in the test below.
+    "papers",
+    // Team-group invitations (263, backlog triage T75): FORCEd by the
+    // migration that creates them; no tenancy columns, so reached through
+    // GROUP_INVITATION_TABLES below.
+    "group_invitations",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2473,6 +2500,11 @@ const ROLE_AGENT_TABLES: &[&str] = &["role_agents"];
 /// creates them; row security inherited from `workflows`.
 const WORKFLOW_REPORT_TABLES: &[&str] = &["workflow_outcome_reports"];
 
+/// The team-group invitations (263), FORCEd by the migration that creates
+/// them, none of the earlier kinds, and carrying no `visibility` /
+/// `owner_group_id` columns, so it does not join `tier_a`.
+const GROUP_INVITATION_TABLES: &[&str] = &["group_invitations"];
+
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
 /// reports.
@@ -2516,11 +2548,16 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     // columns and FORCEs it, so it joins `tier_a` here and in the catalog.
     // 28 -> 31 (Atlas W2, backlog 77f4bf09): migration 210's three
     // `atlas_map_*` tables carry both columns and are FORCEd by it.
+    // 31 -> 32 (backlog 88cf603b): migration 240 gives `behavioral_executions`
+    // both columns (its workflow's pair) and FORCEs it.
+    // 32 -> 33 (backlog 34864fb5): migration 246 gives `papers` both tenancy
+    // columns and FORCEs it.
     assert_eq!(
         tier_a.len(),
-        31,
+        33,
         "migration 062's tier_a is 25 relations, 173 adds the two harvester neighbours, \
-         183 adds workflows and 210 the three atlas_map_* tables; got {}: {tier_a:?}",
+         183 adds workflows, 210 the three atlas_map_* tables, 240 \
+         behavioral_executions and 246 papers; got {}: {tier_a:?}",
         tier_a.len()
     );
 
@@ -2539,6 +2576,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(GROUP_ROLE_TABLES.iter().map(|s| (*s).to_string()))
         .chain(ROLE_AGENT_TABLES.iter().map(|s| (*s).to_string()))
         .chain(WORKFLOW_REPORT_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(GROUP_INVITATION_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()

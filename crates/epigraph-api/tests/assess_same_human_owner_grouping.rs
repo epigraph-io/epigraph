@@ -14,10 +14,14 @@
 //!
 //! # The oracle
 //!
-//! The sibling's row carries EXACTLY the slot's masses. The cautious rule is
-//! idempotent, so the assess response's BetP must equal the single-call value;
-//! Dempster's product of two identical BBAs is strictly higher. A control
-//! pins that a stranger's identical row still reinforces.
+//! The sibling's row carries EXACTLY the slot's masses. A control claim holds
+//! the same two rows from independent owners (a stranger's identical row),
+//! which must reinforce; the siblings' fold must stay strictly below it. Since
+//! backlog 735df6d7 the response is the engine's fold, the claim's cache (it
+//! used to be a fold of its own, which reduced the two identical raw rows to
+//! the single-call value); the engine discounts the untyped slot row and the
+//! frames row differently, so the siblings' value is not the single-call one,
+//! only below the independent one.
 
 mod viewer_fixture;
 
@@ -135,18 +139,26 @@ async fn a_siblings_row_folds_cautiously_with_the_owners_assessment(pool: PgPool
     frames_row(&state, &pool, two, claim, first.frame_id, &masses).await;
     let again = assess(&state, &pool, one, claim).await;
     let folded = again.pignistic_prob.expect("BetP");
-    assert!(
-        (folded - single).abs() < 1e-9,
-        "a sibling's identical row must not add up with the owner's slot: single-call \
-         {single}, got {folded}"
-    );
     // The claim's cache is the engine's recompute (checked against the
-    // control below, which holds the same two rows from independent owners).
+    // control below, which holds the same two rows from independent owners),
+    // and the response is that cache (backlog 735df6d7).
     let cache_again = cached_betp(&pool, claim).await;
-    // The stored global scoped belief is this response's fold.
+    assert!(
+        (folded - cache_again).abs() < 1e-9,
+        "the response must be the cached value: {folded} vs {cache_again}"
+    );
+    assert!(
+        (single - cache_single).abs() < 1e-9,
+        "the single-call response must be the cached value: {single} vs {cache_single}"
+    );
+    // The stored global scoped belief is this response's fold. The latest
+    // one: the table's UNIQUE (frame, claim, scope_type, scope_id) key treats
+    // the global scope's NULL scope_id as distinct, so every write of it
+    // inserts a row and the upsert never conflicts.
     let global: Option<f64> = sqlx::query_scalar(
         "SELECT pignistic_prob FROM ds_combined_beliefs \
-          WHERE claim_id = $1 AND frame_id = $2 AND scope_type = 'global'",
+          WHERE claim_id = $1 AND frame_id = $2 AND scope_type = 'global' \
+          ORDER BY computed_at DESC LIMIT 1",
     )
     .bind(claim)
     .bind(again.frame_id)
@@ -177,6 +189,11 @@ async fn a_siblings_row_folds_cautiously_with_the_owners_assessment(pool: PgPool
     assert!(
         independent > single + 1e-3,
         "an independent owner's identical row must still reinforce: {independent} vs {single}"
+    );
+    assert!(
+        folded < independent - 1e-3,
+        "the response aggregated the sibling's row like an independent owner's: siblings \
+         {folded} vs independent {independent}"
     );
     // The cache path: the engine discounts each row by its own evidence type
     // (the untyped slot more than the frames row), so the siblings' rows are

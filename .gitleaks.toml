@@ -36,6 +36,15 @@ regexes = [
   # in claim_theme.rs's round-trip unit test: a count and a fixture UUID, an
   # opaque page position, not a credential.
   '''^t1\.41\.6f1c0b2e9d3a4c55a1b2c3d4e5f60718$''',
+  # Claim keys of the committed perspectival seed fixture
+  # (crates/epigraph-engine/tests/fixtures/perspectival_seed/claims.json):
+  # human-readable fixture names ("<frame>-<arm>-<symptom n>"), not credentials.
+  '''^eff-treatment-b-symptom-3$''',
+  '''^eff-treatment-c-symptom-2$''',
+  # A cited claim-id prefix with a trailing hex word in a doc comment of the
+  # MCP citation resolver (crates/epigraph-mcp/src/tools/claim_ids.rs): an
+  # example UUID prefix, not a credential.
+  '''^30d8b667-face$''',
 ]
 
 [[allowlists]]

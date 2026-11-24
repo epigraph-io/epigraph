@@ -216,9 +216,9 @@ async fn a_second_supersession_leaves_the_first_actors_edge_on_the_claim_it_wrot
 }
 
 /// The act's reserved marker (`supersede_act`) is what tells an act edge
-/// apart: the act writes it, and the generic edge writers that run the
-/// reserved-property refusal reject it (MCP `link_epistemic` and
-/// `link_hierarchical` do not run it yet; supersede SPEC K12a audits them). A
+/// apart: the act writes it, and the generic edge writers, HTTP and MCP, run
+/// the reserved-property refusal and reject it (the MCP link tools since
+/// backlog 3676c459). A
 /// property that merely spells a supersession `tool` (any edge writer could
 /// set one) pins nothing. Shown on a
 /// CLAIM-sourced `AUTHORED` edge spelling the tool: it is an ordinary edge of

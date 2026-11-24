@@ -411,3 +411,134 @@ async fn generations_that_share_steps_keep_their_own_order(pool: PgPool) {
         );
     }
 }
+
+/// The order of `id`'s steps as the plan-order readers return it (the
+/// hierarchical step texts and the step-head resolution must agree).
+async fn read_order(pool: &PgPool, viewer: &epigraph_db::Viewer, id: Uuid) -> Vec<String> {
+    let texts: Vec<String> = epigraph_db::WorkflowRepository::step_texts_for_hierarchical(
+        &mut pool.acquire().await.expect("acquire"),
+        viewer,
+        &[id],
+    )
+    .await
+    .expect("step texts")
+    .remove(&id)
+    .unwrap_or_default();
+    let resolved: Vec<Uuid> =
+        epigraph_db::WorkflowRepository::resolve_steps_to_heads(pool, viewer, id)
+            .await
+            .expect("resolve")
+            .iter()
+            .map(|s| s.frozen_claim_id)
+            .collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    assert_eq!(
+        resolved,
+        step_ids(pool, id, &refs).await,
+        "resolve_steps_to_heads agrees with step_texts_for_hierarchical for {id}"
+    );
+    texts
+}
+
+/// `add_step` into the HEAD generation must not reorder an OLDER generation
+/// that shares the two steps it inserts between (backlog 14335111).
+///
+/// Step claims are content-addressed per `canonical_name`, so generations
+/// that keep the same adjacent steps share one `prev -> next` edge. The
+/// mid-chain rewire deleted it unconditionally. Generation 0 here reads
+/// `x, a, b, c` only through its chain (`x` was itself added at slot 0, so it
+/// is unindexed and plan_index order lists it LAST); once `x -> a` was gone it
+/// read `a, b, c, x`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_insert_into_one_generation_keeps_a_shared_pair_for_the_other(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (caller, _group) = fixture::seed_agent_with_group(&pool, "shared-pair-caller").await;
+    let canonical = format!("shared-pair-generations-{}", Uuid::new_v4());
+    let (a, b, c) = ("alpha: fetch", "bravo: transform", "charlie: publish");
+    let (x, y) = ("xray: check the inputs", "yankee: lint the inputs");
+
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
+        &pool,
+        &viewer,
+        &extraction(&canonical, &[a, b, c]),
+    )
+    .await
+    .expect("generation 0");
+    let gen0: Uuid =
+        sqlx::query_scalar("SELECT id FROM workflows WHERE canonical_name = $1 AND generation = 0")
+            .bind(&canonical)
+            .fetch_one(&pool)
+            .await
+            .expect("generation 0 row");
+
+    let add = |text: &'static str, position: u32| {
+        let pool = pool.clone();
+        let canonical = canonical.clone();
+        async move {
+            let mut tx = pool.begin().await.expect("begin");
+            let r = epigraph_ingest_executor::workflow_steps::add_step(
+                &mut tx,
+                None,
+                caller,
+                &canonical,
+                text,
+                Some(position),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("add_step {text:?} at {position}: {e}"));
+            tx.commit().await.expect("commit");
+            r
+        }
+    };
+
+    let added = add(x, 0).await;
+    assert_eq!(added.workflow_id, gen0);
+    assert_eq!(
+        added.plan_index, None,
+        "PRECONDITION: an insert is unindexed, so only the chain puts it first"
+    );
+    assert_eq!(read_order(&pool, &viewer, gen0).await, [x, a, b, c]);
+
+    let improved = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy_via_pool(
+        &pool,
+        &viewer,
+        &canonical,
+        extraction(&canonical, &[x, a, b, c]),
+    )
+    .await
+    .expect("generation 1");
+    let gen1 = Uuid::parse_str(&improved.workflow_id).expect("uuid");
+    let ids = step_ids(&pool, gen0, &[x, a]).await;
+    assert_eq!(
+        step_ids(&pool, gen1, &[x, a]).await,
+        ids,
+        "PRECONDITION: the generations share the x and a step claims"
+    );
+
+    let added = add(y, 1).await;
+    assert_eq!(
+        added.workflow_id, gen1,
+        "add_step edits the head generation"
+    );
+
+    assert_eq!(
+        read_order(&pool, &viewer, gen1).await,
+        [x, y, a, b, c],
+        "the edited generation reads the insert at its slot"
+    );
+    assert_eq!(
+        read_order(&pool, &viewer, gen0).await,
+        [x, a, b, c],
+        "the older generation keeps its own order"
+    );
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
+    )
+    .bind(ids[0])
+    .bind(ids[1])
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(kept, 1, "the shared x -> a edge is kept");
+}

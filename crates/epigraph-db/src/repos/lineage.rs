@@ -75,8 +75,23 @@ pub struct LineageResult {
     /// discards that layer, so a complete walk that ends AT `max_depth` is not
     /// truncated), or because a caller-supplied `max_nodes` cap cut the
     /// topological order down to fewer entries than were actually reachable.
-    /// Defaults to `false`.
+    /// Defaults to `false`. Its two halves are [`Self::truncated_by_depth`]
+    /// and a non-empty [`Self::omitted_by_node_cap`].
     pub truncated: bool,
+    /// The depth half of `truncated`: a claim the viewer can read lies past
+    /// `max_depth`. Kept apart so a caller can tell which bound to raise.
+    pub truncated_by_depth: bool,
+    /// The claims the `max_nodes` cap left out, in no particular order.
+    ///
+    /// EXACT within `max_depth`: the walk statement returns every visible
+    /// claim within `max_depth` and the cap trims those rows in memory, so
+    /// this is precisely "reached, readable, within depth, and not returned".
+    /// A claim past `max_depth` is never here (the walk probes one layer past
+    /// it only to decide [`Self::truncated_by_depth`], and nothing beyond).
+    /// Ids only: the follow-up statements never read these claims, and the
+    /// ids are of claims the viewer can already read. Empty when no cap was
+    /// given or the walk fitted under it.
+    pub omitted_by_node_cap: Vec<Uuid>,
 }
 
 /// Claim data in lineage result
@@ -168,6 +183,54 @@ struct LineageEdgeRow {
 /// direction.
 pub const LINEAGE_INCOMING: &[&str] = &["supports", "elaborates", "decomposes_to"];
 
+/// Relationships [`LineageRepository::get_ancestor_ids`] walks, each behind an
+/// INCOMING edge (`ancestor -> claim`): [`LINEAGE_INCOMING`] plus
+/// [`ANCESTOR_DERIVATION_RELATIONSHIPS`].
+///
+/// Not walked (backlog 19d325d5): `refutes`, `contradicts`, cross-source
+/// `CORROBORATES` and every other relationship, which are not ancestry, and
+/// `supersedes`, which is written new -> old, so its INCOMING edge names a
+/// successor; the export reaches predecessors by its own one-hop outgoing
+/// expansion.
+///
+/// The two halves are matched differently. [`LINEAGE_INCOMING`] is compared
+/// lower-cased, exactly as [`LineageRepository::get_lineage`] compares it, so
+/// the two walks agree on what an ancestor is. The derivation family is
+/// matched EXACTLY: `DERIVED_FROM` is a different relationship from
+/// `derived_from` (`epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS`
+/// says never to fold the pair), written paraphrase -> source atom, i.e.
+/// descendant -> origin, so its incoming edge names a paraphrase, not an
+/// ancestor.
+pub const ANCESTOR_ID_RELATIONSHIPS: &[&str] = &[
+    "supports",
+    "elaborates",
+    "decomposes_to",
+    "derived_from",
+    "derives_from",
+    "generated",
+    "uses_evidence",
+];
+
+/// The derivation family of [`ANCESTOR_ID_RELATIONSHIPS`]: what the PROV-O
+/// export maps to `prov:wasDerivedFrom` / `prov:wasGeneratedBy` / `prov:used`
+/// (`derived_from`, its legacy spelling `derives_from`, `generated`,
+/// `uses_evidence`), in the exact lower-case spelling that mapping matches.
+/// Matched case-sensitively; see [`ANCESTOR_ID_RELATIONSHIPS`].
+pub const ANCESTOR_DERIVATION_RELATIONSHIPS: &[&str] =
+    &["derived_from", "derives_from", "generated", "uses_evidence"];
+
+/// The ancestor ids of a claim and whether the walk stopped at its depth
+/// bound; see [`LineageRepository::get_ancestor_ids_probed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestorIds {
+    /// The root and its ancestors within `max_depth`, ancestors first
+    /// (descending depth).
+    pub ids: Vec<Uuid>,
+    /// `true` iff a claim the viewer can read, reached over a readable edge,
+    /// lies one layer past `max_depth`.
+    pub truncated_by_depth: bool,
+}
+
 /// Row for evidence queries
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct EvidenceQueryRow {
@@ -235,6 +298,31 @@ fn drop_probe_layer(rows: Vec<LineageRow>, max_depth: i32) -> (Vec<LineageRow>, 
     let kept: Vec<LineageRow> = rows.into_iter().filter(|r| r.depth <= max_depth).collect();
     let cut = kept.len() != fetched;
     (kept, cut)
+}
+
+/// Trim a walk's rows (already within `max_depth`) to at most `max_nodes`,
+/// keeping the root and the claims NEAREST it, and return the ids it cut.
+///
+/// Both walks use this one rule. The rows are stable-sorted by DESCENDING
+/// depth over the CTE's `ORDER BY s.id` order, and the last `n` are kept: the
+/// shallowest layers whole, and inside the layer the cap cuts, the ids that
+/// sort LAST (pinned by `lineage_max_nodes_cut_inside_a_depth_layer_is_pinned`).
+/// The root is depth 0, alone in its layer, so it survives any cap of at least
+/// one. Runs BEFORE any follow-up statement, so the cap bounds what is fetched
+/// and not only what is returned.
+fn apply_node_cap(rows: Vec<LineageRow>, max_nodes: Option<usize>) -> (Vec<LineageRow>, Vec<Uuid>) {
+    let Some(n) = max_nodes else {
+        return (rows, Vec::new());
+    };
+    if rows.len() <= n {
+        return (rows, Vec::new());
+    }
+    let mut order: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
+    order.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending depth
+    let kept_ids: HashSet<Uuid> = order[order.len() - n..].iter().map(|(id, _)| *id).collect();
+    let (kept, cut): (Vec<LineageRow>, Vec<LineageRow>) =
+        rows.into_iter().partition(|r| kept_ids.contains(&r.id));
+    (kept, cut.into_iter().map(|r| r.id).collect())
 }
 
 /// The furthest shortest-depth layer [`LineageRepository::detect_cycles`] and
@@ -727,36 +815,20 @@ impl LineageRepository {
         // RETURNED claims and is computed from their `parent_ids` below.
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
 
-        // Depth-based truncation is exact: the probe layer found a visible
-        // ancestor past `max_depth` (see `drop_probe_layer`).
-        let mut truncated = truncated_by_depth;
-
         // Apply the optional node cap BEFORE any follow-up statement, so the
         // cap bounds what is fetched and not only what is returned.
         //
         // topological_order is ancestors-first / target-last, so keeping the
         // *first* n entries would keep the furthest ancestors while dropping
         // the target claim itself. Instead we keep the LAST n entries of that
-        // order: the target claim plus its (n - 1) nearest ancestors. The
-        // order is computed here with the SAME stable sort used to build
-        // `topological_order` below, over rows in the CTE's order, so the kept
-        // set is exactly the one the late trim used to keep.
+        // order: the target claim plus its (n - 1) nearest ancestors (see
+        // `apply_node_cap`).
         //
         // Every map below is then built from the kept rows only, and the edges
         // query constrains both ends to them, so `parent_ids` cannot name a
         // claim outside `claims`.
-        let mut lineage_rows = lineage_rows;
-        if let Some(n) = max_nodes {
-            if lineage_rows.len() > n {
-                let mut order: Vec<(Uuid, i32)> =
-                    lineage_rows.iter().map(|r| (r.id, r.depth)).collect();
-                order.sort_by_key(|b| std::cmp::Reverse(b.1)); // Descending depth
-                let kept_ids: HashSet<Uuid> =
-                    order[order.len() - n..].iter().map(|(id, _)| *id).collect();
-                lineage_rows.retain(|r| kept_ids.contains(&r.id));
-                truncated = true;
-            }
-        }
+        let (lineage_rows, omitted_by_node_cap) = apply_node_cap(lineage_rows, max_nodes);
+        let truncated = truncated_by_depth || !omitted_by_node_cap.is_empty();
 
         // Collect claim IDs for subsequent queries
         let claim_ids: Vec<Uuid> = lineage_rows.iter().map(|r| r.id).collect();
@@ -769,6 +841,8 @@ impl LineageRepository {
                 cycle_detected: false,
                 max_depth_reached,
                 truncated,
+                truncated_by_depth,
+                omitted_by_node_cap,
                 ..LineageResult::default()
             });
         }
@@ -944,6 +1018,8 @@ impl LineageRepository {
             cycle_detected,
             max_depth_reached,
             truncated,
+            truncated_by_depth,
+            omitted_by_node_cap,
         })
     }
 
@@ -1100,6 +1176,7 @@ impl LineageRepository {
     ///
     /// Returns just the UUIDs of all ancestor claims, useful for
     /// quick membership checks without fetching full claim data.
+    /// [`Self::get_ancestor_ids_probed`] without the depth flag.
     ///
     /// # Arguments
     /// * `pool` - Database connection pool
@@ -1111,14 +1188,54 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
     pub async fn get_ancestor_ids<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
     ) -> Result<Vec<Uuid>, DbError> {
+        Ok(
+            Self::get_ancestor_ids_probed(executor, viewer, claim_id, max_depth)
+                .await?
+                .ids,
+        )
+    }
+
+    /// The root and its ancestor claim ids within `max_depth` (default 100),
+    /// ancestors first, and whether a readable ancestor lies past the bound.
+    ///
+    /// "Ancestor" means reached over an incoming edge whose relationship is in
+    /// [`ANCESTOR_ID_RELATIONSHIPS`] ([`LINEAGE_INCOMING`] compared
+    /// lower-cased, [`ANCESTOR_DERIVATION_RELATIONSHIPS`] exactly, so a
+    /// `paraphrase -DERIVED_FROM-> claim` row is not walked). A disputing claim
+    /// (`refutes`, `contradicts`) or a successor (`supersedes`, written
+    /// new -> old) is not walked, so under a caller's node cap it can never
+    /// take a slot ahead of a derivation ancestor (backlog 19d325d5).
+    ///
+    /// The walk is breadth-first with a visited set, so each claim enters once,
+    /// at its shortest depth, and the work is bounded by the claims reached,
+    /// not the paths to them. It runs ONE layer past `max_depth` (the
+    /// [`probe_depth`] of [`Self::get_lineage_conn`]); that layer passes the
+    /// same claim and edge predicates as every other, so
+    /// [`AncestorIds::truncated_by_depth`] counts only claims the viewer can
+    /// read and cannot reveal a hidden one. The probe layer's ids are dropped
+    /// before they are returned (backlog 4caad789).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_ancestor_ids_probed<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        max_depth: Option<i32>,
+    ) -> Result<AncestorIds, DbError> {
         let max_depth = max_depth.unwrap_or(100);
+        let folded: Vec<String> = LINEAGE_INCOMING.iter().map(|r| (*r).to_string()).collect();
+        let exact: Vec<String> = ANCESTOR_DERIVATION_RELATIONSHIPS
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect();
 
         #[derive(sqlx::FromRow)]
         struct IdDepthRow {
@@ -1152,6 +1269,8 @@ impl LineageRepository {
                         SELECT c.id
                         FROM unnest(w.frontier) AS l(id)
                         JOIN edges e ON e.target_id = l.id AND e.target_type = 'claim'
+                                    AND (lower(e.relationship) = ANY($3::text[])
+                                         OR e.relationship = ANY($4::text[]))
                         JOIN claims c ON e.source_id = c.id AND e.source_type = 'claim'
                         WHERE true
                           /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
@@ -1167,21 +1286,34 @@ impl LineageRepository {
             CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
             ORDER BY u.id
             "#,
-            3,
+            5,
         );
         let mut q = sqlx::query_as::<_, IdDepthRow>(&sql)
             .bind(claim_id)
-            .bind(max_depth);
+            .bind(probe_depth(max_depth))
+            .bind(&folded)
+            .bind(&exact);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let rows: Vec<IdDepthRow> = q.fetch_all(executor).await?;
 
+        // Drop the probe layer first; its presence is the depth flag.
+        let fetched = rows.len();
+        let mut sorted: Vec<(Uuid, i32)> = rows
+            .iter()
+            .filter(|r| r.depth <= max_depth)
+            .map(|r| (r.id, r.depth))
+            .collect();
+        let truncated_by_depth = sorted.len() != fetched;
+
         // Sort by depth descending (ancestors first)
-        let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
         sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
-        Ok(sorted.into_iter().map(|(id, _)| id).collect())
+        Ok(AncestorIds {
+            ids: sorted.into_iter().map(|(id, _)| id).collect(),
+            truncated_by_depth,
+        })
     }
 
     /// Query descendant lineage for a claim using recursive CTE
@@ -1193,11 +1325,19 @@ impl LineageRepository {
     /// * `pool` - Database connection pool
     /// * `claim_id` - The claim to trace descendants from
     /// * `max_depth` - Maximum depth to traverse (None for default of 100)
+    /// * `max_nodes` - Optional cap on the number of nodes kept, as on
+    ///   [`Self::get_lineage`]: the root plus its `n - 1` nearest
+    ///   descendants (inside the layer the cap cuts, the ids that sort last).
+    ///   `topological_order` is root-first here, so the kept claims are its
+    ///   leading entries. The trim runs before the edges/evidence/traces
+    ///   statements, and the ids it cut are in
+    ///   `LineageResult::omitted_by_node_cap`. `None` disables the cap.
     ///
     /// # Returns
     /// * `LineageResult` containing all claims, evidence, and traces in the
     ///   descendant lineage. `truncated` is exact, as in [`Self::get_lineage`]:
-    ///   `true` iff a visible descendant lies past `max_depth`.
+    ///   `true` iff a visible descendant lies past `max_depth` or the
+    ///   `max_nodes` cap cut the result.
     ///
     /// # SQL Pattern
     /// The breadth-first walk of [`Self::get_lineage`] (one row per layer, a
@@ -1240,6 +1380,7 @@ impl LineageRepository {
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
+        max_nodes: Option<usize>,
     ) -> Result<LineageResult, DbError> {
         // `ConnectionFailed`, not the `From<sqlx::Error>` catch-all — see
         // [`Self::get_lineage`].
@@ -1247,15 +1388,15 @@ impl LineageRepository {
             .acquire()
             .await
             .map_err(|source| DbError::ConnectionFailed { source })?;
-        Self::get_descendants_conn(&mut conn, viewer, claim_id, max_depth).await
+        Self::get_descendants_conn(&mut conn, viewer, claim_id, max_depth, max_nodes).await
     }
 
     /// [`Self::get_descendants`] on a caller-supplied connection. THE PRIMITIVE.
     ///
     /// The descendant walk is NOT interchangeable with the ancestor one and must
     /// not be unified with it: it sorts `topological_order` by depth ASCENDING
-    /// where `get_lineage` sorts DESCENDING, and it has no `max_nodes` cap, so
-    /// its `truncated` is the depth probe's alone. Each is paired with its own
+    /// where `get_lineage` sorts DESCENDING (the `max_nodes` cap is the one
+    /// rule they share, `apply_node_cap`). Each is paired with its own
     /// primitive; only the wrapper/primitive duplication was removed.
     ///
     /// # Errors
@@ -1266,6 +1407,7 @@ impl LineageRepository {
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
+        max_nodes: Option<usize>,
     ) -> Result<LineageResult, DbError> {
         let max_depth = max_depth.unwrap_or(100);
 
@@ -1340,11 +1482,22 @@ impl LineageRepository {
 
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
 
+        // The node cap, before any follow-up statement, as in
+        // `get_lineage_conn`: the root and its nearest descendants.
+        let (lineage_rows, omitted_by_node_cap) = apply_node_cap(lineage_rows, max_nodes);
+        let truncated = truncated_by_depth || !omitted_by_node_cap.is_empty();
+
         // Collect claim IDs for subsequent queries
         let claim_ids: Vec<Uuid> = lineage_rows.iter().map(|r| r.id).collect();
 
         if claim_ids.is_empty() {
-            return Ok(LineageResult::default());
+            return Ok(LineageResult {
+                max_depth_reached,
+                truncated,
+                truncated_by_depth,
+                omitted_by_node_cap,
+                ..LineageResult::default()
+            });
         }
 
         // Query edges to build parent relationships (for descendants, parents are in reverse)
@@ -1507,7 +1660,9 @@ impl LineageRepository {
             topological_order,
             cycle_detected,
             max_depth_reached,
-            truncated: truncated_by_depth,
+            truncated,
+            truncated_by_depth,
+            omitted_by_node_cap,
         })
     }
 

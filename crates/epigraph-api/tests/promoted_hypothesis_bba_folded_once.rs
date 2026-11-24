@@ -17,11 +17,11 @@
 //! # Harness
 //!
 //! The app runs on the per-test database through `ScopedPool::connect`, as in
-//! `error_derived_bba_provenance.rs`. Its promote route writes on the
-//! unstamped `state.db_pool`, which on a non-bypassing role is refused at the
-//! copy on BOTH code versions, so this cannot be run there faithfully; the
-//! retirement is instead gated by the caller's write predicate, which the
-//! refusal arm below pins.
+//! `error_derived_bba_provenance.rs`, so row security is bypassed here; the
+//! retirement is gated by the caller's write predicate, which the refusal arm
+//! below pins. The promote route writes on a transaction stamped with the
+//! caller's viewer (backlog b9c4e809); its refusals on the application role
+//! are measured in `hypothesis_promote_standing_app_role.rs`.
 
 #![cfg(feature = "db")]
 
@@ -274,11 +274,20 @@ async fn promoted_hypothesis_bba_is_folded_once(
     );
 }
 
-/// A promoter that cannot write the source row is refused, and NOTHING is
-/// written: no copy on research_validity, the source still in place. A
-/// promotion that copied without retiring would leave the double count.
+/// A promoter that READS the hypothesis but may not write it is refused, and
+/// NOTHING is written: no copy on research_validity, the source still in
+/// place, the status unwritten.
+///
+/// Until backlog b9c4e809 this arm reached the retire and was refused there
+/// ("cannot retire that BBA"), because the route never asked whether the
+/// caller may write the hypothesis. It is now refused first, for that reason
+/// (403 `not_claim_writer`). The retire refusal stays in the route as defense
+/// in depth, but it is no longer reachable from a caller that may write the
+/// hypothesis: a BBA inherits its claim's tenancy (migration 070's
+/// propagation, which the promotion's own status write fires), so such a
+/// caller may retire the BBA too.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
+async fn a_promoter_who_cannot_write_the_hypothesis_writes_nothing(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
@@ -287,10 +296,10 @@ async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
         .await
         .expect("seeding pool");
     // A claim owned by the ANALYST's group, which the promoter reads as a
-    // `reader` member: readable by the promoter, so the gate passes, but
-    // outside its writable set. The analyst files the evidence, because the
-    // analyze route writes only onto a hypothesis its caller may write
-    // (operator ruling R-51); the promoter could not have filed it.
+    // `reader` member: readable by the promoter, so the readiness gate would
+    // pass, but outside its writable set. The analyst files the evidence,
+    // because the analyze route writes only onto a hypothesis its caller may
+    // write.
     let (analyst, analyst_group) =
         viewer_fixture::seed_agent_with_group(&pool, "846b808e-analyst").await;
     let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "846b808e-outsider").await;
@@ -313,9 +322,9 @@ async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
     let r = make_promotable(&pool, &conn_opts, analyst, claim).await;
     let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
 
-    // CALIBRATION: the premise of this arm is that the source BBA lies
-    // OUTSIDE the promoter's writable set. Without it the refusal below would
-    // have no explanation.
+    // CALIBRATION: the hypothesis and its source BBA lie OUTSIDE the
+    // promoter's writable set, and the promoter sees a promotable hypothesis,
+    // so the refusal below is about authority and not the readiness gate.
     let owner: Option<Uuid> =
         sqlx::query_scalar("SELECT owner_group_id FROM mass_functions WHERE id = $1")
             .bind(source.id)
@@ -331,21 +340,27 @@ async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
         "CALIBRATION: the source BBA is not owned by the promoter's group"
     );
     assert!(
-        owner.is_none_or(|g| !viewer.writable_groups().contains(&g)),
-        "CALIBRATION: the source BBA's owner {owner:?} is outside the promoter's writable \
-         set {:?}",
+        !viewer.writable_groups().contains(&analyst_group)
+            && owner.is_none_or(|g| !viewer.writable_groups().contains(&g)),
+        "CALIBRATION: the hypothesis's group and the source BBA's owner {owner:?} are \
+         outside the promoter's writable set {:?}",
         viewer.writable_groups()
+    );
+    let ready = status_of(r.addr, agent, r.claim).await;
+    assert_eq!(
+        ready["promotion"]["ready"], true,
+        "CALIBRATION: the promoter sees a promotable hypothesis: {ready}"
     );
 
     let (status, body) = promote(r.addr, agent, r.claim).await;
     assert_eq!(
         status,
         reqwest::StatusCode::FORBIDDEN,
-        "a promotion that cannot retire the source must be refused: {status} {body}"
+        "a promoter who may not write the hypothesis must be refused: {status} {body}"
     );
     assert!(
-        body.contains("cannot retire that BBA"),
-        "the refusal names the retire, not some other failure: {body}"
+        body.contains("not_claim_writer"),
+        "the refusal names the caller's write authority over the hypothesis: {body}"
     );
     assert!(
         rows(&pool, r.claim, r.rv_frame).await.is_empty(),
@@ -358,6 +373,13 @@ async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
             .any(|row| row.id == source.id),
         "a refused promotion leaves the source in place"
     );
+    let hyp_status: Option<String> =
+        sqlx::query_scalar("SELECT properties->>'hypothesis_status' FROM claims WHERE id = $1")
+            .bind(r.claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the status");
+    assert_eq!(hyp_status, None, "a refused promotion writes no status");
 }
 
 async fn status_of(addr: SocketAddr, agent: Uuid, claim: Uuid) -> serde_json::Value {
@@ -680,13 +702,14 @@ async fn make_promotable_by_legacy_rows(
     }
 }
 
-/// The prod-dominant shape of the refusal above: an ordinary agent promotes a
-/// PUBLIC (legacy) hypothesis whose `hypothesis_assessment` BBA is owned by
-/// the memberless world group. It cannot retire that BBA, so the promotion is
-/// refused and nothing is written: no `research_validity` copy, and the
-/// source stays in place.
+/// The prod-dominant shape: an ordinary agent promotes a PUBLIC (legacy)
+/// hypothesis, which like its `hypothesis_assessment` BBA is owned by the
+/// memberless world group. It may read the hypothesis but not write it, so
+/// the promotion is refused for that reason, 403 `not_claim_writer`
+/// (backlog b9c4e809), before the retire is reached; nothing is written: no
+/// `research_validity` copy, the source in place, the status unwritten.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_promoter_who_cannot_retire_a_world_owned_source_writes_nothing(
+async fn a_promoter_of_a_world_owned_hypothesis_writes_nothing(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
@@ -714,7 +737,8 @@ async fn a_promoter_who_cannot_retire_a_world_owned_source_writes_nothing(
 
     // CALIBRATION: the source BBA is world-owned, so it lies outside every
     // ordinary agent's writable set; and the hypothesis is promotable for the
-    // promoter, so a refusal below is the retire and not the readiness gate.
+    // promoter, so a refusal below is about authority and not the readiness
+    // gate.
     let owner: Option<Uuid> =
         sqlx::query_scalar("SELECT owner_group_id FROM mass_functions WHERE id = $1")
             .bind(source.id)
@@ -736,12 +760,19 @@ async fn a_promoter_who_cannot_retire_a_world_owned_source_writes_nothing(
     assert_eq!(
         status,
         reqwest::StatusCode::FORBIDDEN,
-        "a promotion that cannot retire a world-owned source must be refused: {status} {body}"
+        "a promotion of a world-owned hypothesis must be refused: {status} {body}"
     );
     assert!(
-        body.contains("cannot retire that BBA"),
-        "the refusal names the retire, not some other failure: {body}"
+        body.contains("not_claim_writer"),
+        "the refusal names the caller's write authority over the hypothesis: {body}"
     );
+    let hyp_status: Option<String> =
+        sqlx::query_scalar("SELECT properties->>'hypothesis_status' FROM claims WHERE id = $1")
+            .bind(r.claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the status");
+    assert_eq!(hyp_status, None, "a refused promotion writes no status");
     assert!(
         rows(&pool, r.claim, r.rv_frame).await.is_empty(),
         "a refused promotion writes no research_validity copy"
@@ -840,4 +871,117 @@ async fn a_promotion_racing_a_committed_promotion_is_refused(
             .any(|row| row.id == source.id),
         "the refused promotion leaves the source in place"
     );
+}
+
+/// The source BBA can be retracted between the route's read of it and the
+/// retire step (SPEC §11 K4a site 6, through the REST route): since backlog
+/// b9c4e809 the read runs on the promotion's own transaction after the status
+/// flip, and a concurrent retraction that commits after that read is seen by
+/// the retire's re-check. Here the retraction lands inside the promotion's
+/// transaction right after the read, deterministically: a trigger on the
+/// research_validity copy (`copy_to_frame`, which follows the read and
+/// precedes the retire). A retracted row is never retired: the promotion is
+/// refused as a caller that cannot retire its source, and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_source_retracted_between_the_read_and_the_retire_refuses_the_promotion(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "k4a-s6-promoter").await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, agent, group, "k4a s6 raced hypothesis").await;
+    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
+    let retracted = |pool: PgPool, id: Uuid| async move {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT retracted_at IS NOT NULL FROM mass_functions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the source")
+    };
+    assert!(
+        !retracted(pool.clone(), source.id).await,
+        "PREMISE: the source is live"
+    );
+
+    // The race, made deterministic: the promotion's research_validity copy
+    // (written after the source read, before the retire) retracts the source
+    // in the same transaction (all three retraction columns, as the retract
+    // definer writes them).
+    for sql in [
+        format!(
+            "CREATE FUNCTION k4a_s6_race() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
+             AS $f$ BEGIN \
+               UPDATE mass_functions SET retracted_at = now(), retracted_by = '{agent}'::uuid, \
+                      retract_reason = 'k4a s6 race' \
+                WHERE id = '{}'::uuid; \
+               RETURN NEW; END $f$",
+            source.id
+        ),
+        format!(
+            "CREATE TRIGGER k4a_s6_race AFTER INSERT ON mass_functions FOR EACH ROW \
+             WHEN (NEW.claim_id = '{}'::uuid AND NEW.frame_id = '{}'::uuid) \
+             EXECUTE FUNCTION k4a_s6_race()",
+            r.claim, r.rv_frame
+        ),
+    ] {
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "a source retracted since the read must refuse the promotion: {status} {body}"
+    );
+    assert!(
+        body.contains("cannot retire that BBA"),
+        "the refusal is the retire's clean false, not an error: {body}"
+    );
+    assert!(
+        rows(&pool, r.claim, r.rv_frame).await.is_empty(),
+        "a refused promotion writes no research_validity copy"
+    );
+    assert!(
+        rows(&pool, r.claim, r.hyp_frame)
+            .await
+            .iter()
+            .any(|row| row.id == source.id),
+        "a refused promotion leaves the source in place"
+    );
+    assert!(
+        !retracted(pool.clone(), source.id).await,
+        "the race's retraction rolled back with the refused promotion"
+    );
+    let promoted: Option<String> =
+        sqlx::query_scalar("SELECT properties->>'hypothesis_status' FROM claims WHERE id = $1")
+            .bind(r.claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the status");
+    assert_ne!(
+        promoted.as_deref(),
+        Some("promoted"),
+        "a refused promotion leaves the status unpromoted"
+    );
+
+    // CALIBRATION: without the race the same promotion lands, so the refusal
+    // above was the retracted row's.
+    for sql in [
+        "DROP TRIGGER k4a_s6_race ON mass_functions",
+        "DROP FUNCTION k4a_s6_race()",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect(sql);
+    }
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert!(status.is_success(), "promote: {status} {body}");
 }

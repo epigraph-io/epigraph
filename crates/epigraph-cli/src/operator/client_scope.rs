@@ -8,10 +8,13 @@
 //! grants read scopes, the agent arm grants nothing, and only the
 //! `epigraph-admin` service client carries the admin set. When an operator
 //! decides that a particular human should hold, say, `claims:admin`, the only
-//! ways to express that were a raw superuser `UPDATE oauth_clients` or
-//! `POST /api/v1/admin/clients/:id/approve`, which writes `granted_scopes`
-//! verbatim. Neither validates the scope, neither checks what kind of client it
-//! is, and neither leaves an audit row. This command replaces the raw path.
+//! ways to express that were a raw superuser `UPDATE oauth_clients` or a
+//! client approval through `epigraph_oauth_client_approve`, which writes
+//! `granted_scopes` verbatim and only promotes a PENDING client (today
+//! `epigraph-operator approve-client` on the maintenance DSN; the
+//! `POST /api/v1/admin/clients/:id/approve` route answers 501 since migration
+//! 188). The raw `UPDATE` validates nothing, checks no client type and leaves
+//! no audit row. This command replaces it for an active human client.
 //!
 //! A human's agents act through that human's OAuth client, so they carry at
 //! most that human's scopes. The refresh grant issues the refresh token's own
@@ -30,12 +33,13 @@
 //!   `MAINTENANCE_DATABASE_URL`) and refuses a login that is not a member of
 //!   `epigraph_maintenance`.
 //! * **Admin-only scopes only.** The scope must be in `ADMIN_ONLY_SCOPES` (the
-//!   constant itself, not a copy). Ordinary scopes are the registration and
-//!   approval paths' business; this command exists for the scopes those paths
-//!   never grant. Checked before any connection is used.
+//!   constant itself, not a copy). Ordinary scopes are the business of
+//!   registration and of approval (`epigraph-operator approve-client`); this
+//!   command exists for the scopes those paths never grant. Checked before any connection is used.
 //! * **Human clients only.** A `service` client's scopes are managed by
 //!   `bootstrap_clients` (the canonical names ARE their scope definition) and
-//!   an `agent` client's by the approval route; both are refused.
+//!   an `agent` client's when it is approved (`epigraph-operator
+//!   approve-client`, a pending client only); both are refused.
 //! * **Active clients only, for a grant.** A `revoked`, `suspended` or
 //!   `pending` human client is refused a grant: it would carry the scope the
 //!   moment it was reactivated or approved, and any party can DCR-register a
@@ -250,7 +254,8 @@ pub fn validate_scope(scope: &str) -> anyhow::Result<()> {
     }
     bail!(
         "refusing scope {scope:?}: this command grants and revokes only admin-only scopes \
-         ({}). Ordinary scopes are managed by client registration and approval.",
+         ({}). Ordinary scopes are managed by client registration and approval \
+         (epigraph-operator approve-client).",
         ADMIN_ONLY_SCOPES.join(", ")
     )
 }
@@ -303,7 +308,8 @@ pub async fn run(
         bail!(
             "refusing client {client} ({:?}): it is a {} client. This command changes only a \
              HUMAN's own client; a service client's scopes are set by bootstrap_clients and an \
-             agent client's by the approval route. Nothing was written.",
+             agent client's when it is approved (epigraph-operator approve-client, on the \
+             maintenance DSN, for a pending client). Nothing was written.",
             row.client_name,
             row.client_type
         );

@@ -97,13 +97,17 @@ async fn out_of_range_run_parameters_are_refused(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn defaults_and_boundary_run_parameters_are_admitted(pool: PgPool) {
-    let out = run(&pool, serde_json::json!({}))
+    // A request names a scope (backlog b02347c6); a fresh frame id has no
+    // factors.
+    let frame = uuid::Uuid::new_v4();
+    let out = run(&pool, serde_json::json!({ "frame_id": frame }))
         .await
         .expect("the defaults are admitted");
     assert_eq!(out["factors_count"], 0, "CALIBRATION: the graph is empty");
     run(
         &pool,
         serde_json::json!({
+            "frame_id": frame,
             "max_iterations": BP_MAX_ITERATIONS,
             "convergence_threshold": 0.0,
             "damping": 1.0,

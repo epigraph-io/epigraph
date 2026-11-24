@@ -123,8 +123,9 @@
 //!   ([`record_caller_workflow_write`]) naming the `arm`, the `acting_agent`,
 //!   the human it acted for (`operator`: the caller itself on the operator
 //!   arm, the principal its live link names on the delegate arm), the
-//!   `submitter`, the tool (`action`), the `workflow_id`, the token
-//!   (`client_id`, `token_jti`) and the tool's own facts (`write`). The row is
+//!   `submitter`, the tool (`action`), the `workflow_id`, the `transport`, the
+//!   token (`client_id`, `token_jti`, and `delegated_by`, a delegated run
+//!   token's delegator) and the tool's own facts (`write`). The row is
 //!   attributed to the session principal (077's `security_events_append`
 //!   admits no other attribution), which is now the caller itself; the actor
 //!   is `acting_agent`. A new generation records one row per anchor it
@@ -178,10 +179,19 @@
 //! Writing as the caller adds the database's own check on top of these arms
 //! for the rows a write CREATES: they land in a group the caller writes
 //! (`epigraph_ingest_executor::owner`) and row security refuses a new claim or
-//! edge in one it does not. It is not a check on the existing `workflows` row
-//! itself: migration 183's `workflows_update` policy admits an UPDATE of any
-//! public row, so an entry point must never update an existing row on a path
-//! these arms did not admit (a re-ingest stores no goal embedding).
+//! edge in one it does not. On the existing `workflows` row itself, migration
+//! 237's `workflows_update_owner` admits an UPDATE (or a row lock) only from a
+//! writer of the row's owner group, public rows included, so the database
+//! backs the owner-group writer arm. The identity arms (submitter, operator,
+//! delegate) are NOT backed there: a caller they admit that does not write
+//! the owner group writes nothing to the row (its UPDATE matches no row,
+//! without an error), so `deprecate_workflow` refuses such a call unless the
+//! row already reads deprecated, rather than retire the plan's claims and
+//! leave the row live. The admin arm writes the row through 237's audited
+//! admin definer (`WorkflowRepository::admin_deprecate_row`), which re-checks
+//! the live grant and writes the audit row itself. An entry point must still
+//! never update an existing row on a path these arms did not admit (a
+//! re-ingest stores no goal embedding).
 
 use crate::errors::{internal_error_logged, internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
@@ -239,17 +249,23 @@ impl WorkflowGrant {
 /// whether or not the caller reads it (the ruling masks answers and changes
 /// no authority).
 ///
+/// `viewer` is the view the tool resolved for this request. Only the stdio
+/// arm uses it, and only when it names `caller`, so its reads stay on `conn`
+/// (see [`stdio_workflow_authority`]).
+///
 /// # Errors
 /// A workflow-specific refusal naming the submitter (never the claim gate's
 /// "cannot retire it" wording, which named the wrong object and verb), the
 /// call site's not-found answer for a row the caller cannot read, or an
 /// internal error if the caller's view, the submitter, the operator link or
 /// the admin grant cannot be read.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn require_workflow_authority(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
     auth: Option<&epigraph_auth::AuthContext>,
     caller: WriteIdentity,
+    viewer: &epigraph_db::visibility::Viewer,
     workflow_id: uuid::Uuid,
     tool_name: &'static str,
     not_found: &(dyn Fn() -> McpError + Send + Sync),
@@ -267,7 +283,8 @@ pub(crate) async fn require_workflow_authority(
     // agent, checked against the target row on its own stamp.
     let Some(auth) = auth else {
         let arm =
-            stdio_workflow_authority(server, conn, caller, workflow_id, owner, tool_name).await?;
+            stdio_workflow_authority(server, conn, caller, viewer, workflow_id, owner, tool_name)
+                .await?;
         return Ok(grant(arm));
     };
     let caller_agent = caller.agent_id();
@@ -340,7 +357,7 @@ pub(crate) async fn require_workflow_authority(
     }
     // 2. The submitter's operator (#503; HTTP admits the operator itself, never
     //    the actor arm, exactly as `require_owner_or_admin` does).
-    if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
+    if crate::tools::claims::operator_arm_allows(&mut *conn, caller_agent, owner, false).await? {
         return Ok(grant(WorkflowArm::Operator));
     }
     // 3. A delegate (R-183): the caller's acting link names the submitter,
@@ -483,8 +500,22 @@ async fn unrecorded_row_owner_group_arm(
 
 /// The stdio arms of [`require_workflow_authority`] (backlog 222289f3; see the
 /// module doc's STDIO bullet). `caller` is the write identity, this server's
-/// own agent; the `viewer` a tool was handed is NOT consulted, so the check is
-/// on the principal that writes.
+/// own agent. The check is on the principal that writes: `viewer` (the view
+/// the tool resolved for this request) is used only when it names `caller`,
+/// which it always does on stdio; any other viewer a driver passed is
+/// ignored and the caller's own is resolved instead.
+///
+/// # One connection (backlog 26a436c6)
+///
+/// Every read here runs on `conn`, the write's own caller-stamped
+/// transaction. The row read used to check out a SECOND, separately stamped
+/// connection from the same pool while `conn` was held (twice per target in
+/// `deprecate_workflow`), and the operator read and the viewer resolution a
+/// third and fourth, so concurrent stdio writes could each hold one
+/// connection while waiting for another and exhaust the pool (hold and
+/// wait). `conn`'s stamp is the caller's own (`begin_caller_workflow_tx`
+/// stamps the write identity's viewer), so the row read answers exactly what
+/// the separate stamp answered.
 ///
 /// 1. The caller must READ the row on its OWN stamp (the stamp the write runs
 ///    on). A row it cannot read is refused without its id or submitter. That text is NOT a
@@ -509,56 +540,36 @@ async fn stdio_workflow_authority(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
     caller: WriteIdentity,
+    viewer: &epigraph_db::visibility::Viewer,
     workflow_id: uuid::Uuid,
     owner: Option<uuid::Uuid>,
     tool_name: &'static str,
 ) -> Result<WorkflowArm, McpError> {
     let caller_agent = caller.agent_id();
-    let viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, caller_agent)
-        .await
-        .map_err(|e| {
-            internal_error_logged(
-                format!("{tool_name}: could not resolve the stdio caller's viewer"),
-                e,
-            )
-        })?;
-    let tenancy = match server.scoped.as_ref() {
-        Some(scoped) => {
-            let mut read = scoped.read_as(&viewer).await.map_err(|e| {
-                internal_error_logged(
-                    format!("{tool_name}: could not read the workflow as the stdio caller"),
-                    e,
-                )
-            })?;
-            let t =
-                epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut read, &viewer, workflow_id)
-                    .await
-                    .map_err(|e| {
-                        internal_error_logged(
-                            format!("{tool_name}: could not read the workflow as the stdio caller"),
-                            e,
-                        )
-                    })?;
-            read.commit().await.map_err(|e| {
-                internal_error_logged(
-                    format!("{tool_name}: could not read the workflow as the stdio caller"),
-                    e,
-                )
-            })?;
-            t
-        }
-        // No tenancy-aware pool (a development superuser): the in-query
-        // predicate alone, on the act's own (unstamped) connection, as every
-        // reader on that configuration.
-        None => epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, &viewer, workflow_id)
+    let resolved;
+    let viewer = if viewer.principal() == Some(caller_agent) {
+        viewer
+    } else {
+        resolved = epigraph_db::visibility::Viewer::resolve(&server.pool, caller_agent)
             .await
             .map_err(|e| {
                 internal_error_logged(
-                    format!("{tool_name}: could not read the workflow as the stdio caller"),
+                    format!("{tool_name}: could not resolve the stdio caller's viewer"),
                     e,
                 )
-            })?,
+            })?;
+        &resolved
     };
+    // On `conn`, never a second connection (see the doc): its stamp is the
+    // caller's own, and the in-query predicate states the same view.
+    let tenancy = epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, viewer, workflow_id)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not read the workflow as the stdio caller"),
+                e,
+            )
+        })?;
     let Some((visibility, owner_group)) = tenancy else {
         return Err(crate::errors::invalid_params(format!(
             "{tool_name}: no workflow this caller (agent {caller_agent}) can read matches the \
@@ -601,7 +612,7 @@ async fn stdio_workflow_authority(
     if caller_agent == owner {
         return Ok(WorkflowArm::Submitter);
     }
-    if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
+    if crate::tools::claims::operator_arm_allows(&mut *conn, caller_agent, owner, false).await? {
         return Ok(WorkflowArm::Operator);
     }
     if let Some(operator) = delegate_arm(conn, caller_agent, owner, tool_name).await? {
@@ -710,6 +721,33 @@ async fn admin_arm(
     )))
 }
 
+/// The `details` of a `workflows.admin_write` audit row: the tool, the
+/// target, its recorded submitter, the token's delegator and the tool's own
+/// before / after facts. Shared by [`audit_admin_workflow_write`] and the
+/// admin deprecation of a row (`deprecate_workflow`), whose definer writes the
+/// row itself.
+///
+/// The admin arm needs a token, so its row is always an authenticated
+/// call's; it states so, as every `workflows.caller_write` row states its
+/// transport (backlog 26a436c6), and it names the token's delegator, null for
+/// an undelegated token (backlog 7d95803e).
+pub(crate) fn admin_workflow_audit_record(
+    tool_name: &'static str,
+    workflow_id: uuid::Uuid,
+    submitter: Option<uuid::Uuid>,
+    delegated_by: Option<uuid::Uuid>,
+    details: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "action": tool_name,
+        "workflow_id": workflow_id,
+        "submitter": submitter,
+        "transport": "http",
+        "delegated_by": delegated_by,
+        "write": details,
+    })
+}
+
 /// Record a cross-owner workflow write made through the audited admin arm
 /// (`workflows.admin_write`), on the SAME transaction as the write, so the two
 /// commit together or not at all. `details` carries the tool's own before /
@@ -732,12 +770,13 @@ pub(crate) async fn audit_admin_workflow_write(
             "{tool_name}: an admin workflow write with no token to audit. Nothing was written."
         )));
     };
-    let record = serde_json::json!({
-        "action": tool_name,
-        "workflow_id": workflow_id,
-        "submitter": submitter,
-        "write": details,
-    });
+    let record = admin_workflow_audit_record(
+        tool_name,
+        workflow_id,
+        submitter,
+        token.delegated_by,
+        details,
+    );
     // Migration 112's definer, not an INSERT: the audit row is written with
     // the definer's own guarantees (the token's live grant re-checked) on
     // whatever stamp the write runs on; it used to be the system agent's, where
@@ -826,9 +865,14 @@ pub(crate) async fn record_caller_workflow_write(
         WorkflowArm::OwnerGroupWriter { group } => ("owner_group_writer", None, Some(group)),
         WorkflowArm::StdioUndeclaredSigner => ("undeclared_signer", None, None),
     };
-    let (transport, client_id, token_jti) = match auth {
-        Some(token) => ("http", Some(token.client_id), Some(token.jti)),
-        None => ("stdio", None, None),
+    let (transport, client_id, token_jti, delegated_by) = match auth {
+        Some(token) => (
+            "http",
+            Some(token.client_id),
+            Some(token.jti),
+            token.delegated_by,
+        ),
+        None => ("stdio", None, None, None),
     };
     if auth.is_some() && matches!(grant.arm, WorkflowArm::StdioUndeclaredSigner) {
         return Err(internal_error_text(format!(
@@ -846,6 +890,9 @@ pub(crate) async fn record_caller_workflow_write(
         "transport": transport,
         "client_id": client_id,
         "token_jti": token_jti,
+        // A delegated run token's delegator (`dlg`), the credential whose
+        // authority a delegate exercised (backlog 7d95803e); null otherwise.
+        "delegated_by": delegated_by,
         "write": details,
     });
     epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)

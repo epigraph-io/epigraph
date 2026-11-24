@@ -364,18 +364,502 @@ async fn an_unchanged_resubmission_leaves_bayesian_posterior_where_it_was(
         "the unchanged warning says the posterior did not move: {again}"
     );
 
-    // CALIBRATION, NOT A REQUIREMENT: a replacement stores a different BBA,
-    // and today it applies its own Beta update without withdrawing the
-    // replaced BBA's earlier increment. This pins only that the fix above is
-    // scoped to `unchanged`. Whether a replacement should apply just the delta
-    // is an open follow-up; a fix there should change this assertion.
+    // A replacement stores a different BBA and moves the track by the
+    // difference (backlog 862d8404): the replaced BBA's increment is withdrawn
+    // and the new one's added, so the claim holds the new BBA's evidence only.
+    // m({h0}) = 0.7 at reliability 0.5 is 0.35, the rest (0.65) on Θ.
     let mut replaced = body;
     replaced["reliability"] = serde_json::json!(0.5);
     let replaced = post(&w, &token_a, replaced).await;
     assert_eq!(replaced["write_outcome"], "replaced", "{replaced}");
+    let (alpha, beta_) = beta(&w.pool, w.claim).await;
     assert!(
-        beta(&w.pool, w.claim).await.0 > after_first.0,
-        "CALIBRATION (current behaviour, not a requirement): a replaced BBA applies its Beta \
-         update"
+        (alpha - 1.35).abs() < 1e-12 && (beta_ - 1.65).abs() < 1e-12,
+        "a replaced BBA's Beta increment is withdrawn: Beta(1.35, 1.65), got ({alpha}, {beta_})"
+    );
+}
+
+/// POST the evidence and return the status and the raw body, whatever it is.
+async fn post_raw(w: &World, token: &str, body: Value) -> (u16, String) {
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/v1/frames/{}/evidence",
+            w.addr, w.frame
+        ))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    (status, resp.text().await.expect("body"))
+}
+
+/// Backlog 2b992740: two `masses` keys that name the same focal element
+/// (`"0,1"` and `"1,0"`, `"0"` and `" 0"`, `"0"` and `"0,0"`) are refused with
+/// a 400 naming `masses`, and nothing is stored, as MCP `submit_ds_evidence`
+/// refuses them. At origin/main the route's inline parser let the later key
+/// silently replace the earlier one, so each body below (whose raw masses sum
+/// to 1.5) collapsed to a valid BBA summing to 1 and was stored as a 201: a
+/// BBA different from the one sent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn colliding_mass_keys_are_refused_and_nothing_is_stored(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "2b992740-a").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+
+    for masses in [
+        serde_json::json!({"0": 0.5, "0,1": 0.5, "1,0": 0.5}),
+        serde_json::json!({"1": 0.5, "0": 0.5, " 0": 0.5}),
+        serde_json::json!({"1": 0.5, "0": 0.5, "0,0": 0.5}),
+    ] {
+        let (status, text) = post_raw(
+            &w,
+            &token_a,
+            serde_json::json!({"claim_id": w.claim, "reliability": 1.0, "masses": masses}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "colliding keys {masses} must be refused, got {status}: {text}"
+        );
+        assert!(
+            text.contains("masses") && text.contains("same focal element"),
+            "the refusal names the field and the collision: {text}"
+        );
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(w.claim)
+        .fetch_one(&w.pool)
+        .await
+        .expect("count BBAs");
+    assert_eq!(stored, 0, "a refused request stores no BBA");
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM claim_frames WHERE claim_id = $1")
+        .bind(w.claim)
+        .fetch_one(&w.pool)
+        .await
+        .expect("count frame links");
+    assert_eq!(linked, 0, "a refused request links no frame");
+
+    // CALIBRATION: the same focal elements given once each are accepted, so
+    // the refusals above are about the collision and nothing else.
+    let ok = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.5, "1,0": 0.5}}),
+    )
+    .await;
+    assert_eq!(ok["write_outcome"], "inserted", "{ok}");
+}
+
+/// Assign the test claim to hypothesis 0 of the test frame.
+async fn assign_hypothesis_zero(w: &World) {
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0)",
+    )
+    .bind(w.claim)
+    .bind(w.frame)
+    .execute(&w.pool)
+    .await
+    .expect("assign the claim to hypothesis 0");
+}
+
+fn assert_beta(got: (f64, f64), want: (f64, f64), what: &str) {
+    assert!(
+        (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
+        "{what}: want Beta{want:?}, got Beta{got:?}"
+    );
+}
+
+/// Backlog 862d8404: a write that REPLACES the caller's earlier BBA moves the
+/// Beta track by the difference between the two, never by the new BBA alone.
+///
+/// - Replacing a BBA with the same masses (only `evidence_type` differs, so
+///   the write is a genuine replacement, not `unchanged`) leaves the track and
+///   `bayesian_posterior` where they were.
+/// - Replacing it with different masses leaves the track a fresh claim holding
+///   only the new BBA has.
+///
+/// At origin/main the route added the new BBA's full increment on every
+/// replacement and withdrew nothing: the first arm moved Beta(1.56, 1.44) to
+/// Beta(2.12, 1.88), and each revision of one source's evidence counted as new
+/// independent evidence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replaced_bba_moves_the_beta_track_by_the_difference_only(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "862d8404-a").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    assign_hypothesis_zero(&w).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+    // Stored (reliability 0.8): m({h0}) = 0.56, m(Θ) = 0.44.
+    let body = serde_json::json!({
+        "claim_id": w.claim, "reliability": 0.8, "evidence_type": "statistical",
+        "masses": {"0": 0.7, "0,1": 0.3},
+    });
+    let first = post(&w, &token_a, body.clone()).await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    assert_beta(beta(&w.pool, w.claim).await, (1.56, 1.44), "first write");
+    let posterior = first["bayesian_posterior"].as_f64().expect("posterior");
+
+    let mut retyped = body.clone();
+    retyped["evidence_type"] = serde_json::json!("testimonial");
+    let retyped = post(&w, &token_a, retyped).await;
+    assert_eq!(retyped["write_outcome"], "replaced", "{retyped}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.56, 1.44),
+        "a BBA replaced by the same masses leaves the track where it was",
+    );
+    let after = retyped["bayesian_posterior"].as_f64().expect("posterior");
+    assert!(
+        (after - posterior).abs() < 1e-12,
+        "and bayesian_posterior with it: {posterior} -> {after}"
+    );
+
+    // Different masses: m({h0}) = 0.2 at reliability 1, the rest on Θ.
+    let other = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "evidence_type": "testimonial",
+                           "masses": {"0": 0.2, "0,1": 0.8}}),
+    )
+    .await;
+    assert_eq!(other["write_outcome"], "replaced", "{other}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.2, 1.8),
+        "a replaced track holds only the new BBA, as a fresh claim would",
+    );
+    let reported = other["bayesian_posterior"].as_f64().expect("posterior");
+    assert!(
+        (reported - 1.2 / 3.0).abs() < 1e-12,
+        "the reported posterior is the fresh-claim one: {reported}"
+    );
+}
+
+/// The guard on backlog 862d8404's withdrawal: a replaced row that the Beta
+/// track never counted withdraws nothing. `submit_claim`'s seed wire stores its
+/// BBA in the author's slot with no perspective (`combination_method =
+/// 'auto_wire'`) and keeps no Beta track, so the author's first evidence on
+/// that slot replaces it. Withdrawing the seed would take out mass that was
+/// never added; the track must end as a fresh claim holding only the new BBA.
+/// (This holds at origin/main, which withdrew nothing at all; it pins that the
+/// withdrawal is limited to the writers that count.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn replacing_an_uncounted_seed_bba_withdraws_nothing(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "862d8404-seed").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    assign_hypothesis_zero(&w).await;
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &w.pool,
+        w.claim,
+        w.frame,
+        Some(a),
+        None,
+        &serde_json::json!({"0": 0.9, "0,1": 0.1}),
+        None,
+        Some("auto_wire"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed the author's auto_wire BBA");
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+
+    let out = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.2, "0,1": 0.8}}),
+    )
+    .await;
+    assert_eq!(out["write_outcome"], "replaced", "{out}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.2, 1.8),
+        "an uncounted seed's mass is not withdrawn",
+    );
+}
+
+/// The floor under backlog 862d8404's withdrawal: a replaced row from a
+/// counting writer that the track nonetheless never counted (an MCP
+/// `submit_ds_evidence` row stored before the MCP paths kept the track) can
+/// withdraw more than the track holds. Each parameter stays at or above the
+/// prior's 1.0: here alpha would be 1 + 0.2 - 0.9 = 0.3 without the floor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_withdrawal_never_takes_the_track_below_the_prior(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "862d8404-floor").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    assign_hypothesis_zero(&w).await;
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &w.pool,
+        w.claim,
+        w.frame,
+        Some(a),
+        None,
+        &serde_json::json!({"0": 0.9, "0,1": 0.1}),
+        None,
+        Some("Dempster"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed an uncounted MCP-shaped BBA in the author's slot");
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+
+    let out = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.2, "0,1": 0.8}}),
+    )
+    .await;
+    assert_eq!(out["write_outcome"], "replaced", "{out}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.0, 1.7),
+        "alpha is held at the prior; beta moves by 0.8 - 0.1",
+    );
+}
+
+/// Backlog 1ce62137: a REST evidence write on a claim with no frame link links
+/// it at hypothesis_index 0 (what every belief read resolves a missing index
+/// to), so the write moves the claim's Beta track and the next write records a
+/// divergence row. No `claim_frames` row is seeded here.
+///
+/// At origin/main the route linked the claim with a NULL index, which
+/// `beta_increments` counts as nothing: the claim stayed at Beta(1, 1), every
+/// later update was a cold start, and no divergence row was ever written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rest_write_on_an_unlinked_claim_moves_beta_and_then_records_divergence(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "1ce62137-a").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+    let body = serde_json::json!({
+        "claim_id": w.claim, "reliability": 1.0, "masses": {"0": 0.7, "0,1": 0.3},
+    });
+
+    let first = post(&w, &token_a, body.clone()).await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.7, 1.3),
+        "the first write moves the track",
+    );
+    let index: Option<i32> = sqlx::query_scalar(
+        "SELECT hypothesis_index FROM claim_frames WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(w.claim)
+    .bind(w.frame)
+    .fetch_one(&w.pool)
+    .await
+    .expect("the write links the claim to the frame");
+    assert_eq!(index, Some(0), "a new link names hypothesis 0");
+
+    // A second, independent BBA (an Inserted write under a perspective the
+    // caller owns, its confidence calibration cleared): the track is no longer
+    // at the prior, so this write records the claim's divergence.
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id, confidence_calibration) \
+         VALUES ($1, $2, NULL) RETURNING id",
+    )
+    .bind(format!("1ce62137-p-{}", Uuid::new_v4()))
+    .bind(a)
+    .fetch_one(&w.pool)
+    .await
+    .expect("seed perspective");
+    let mut second = body;
+    second["perspective_id"] = serde_json::json!(perspective);
+    let second = post(&w, &token_a, second).await;
+    assert_eq!(second["write_outcome"], "inserted", "{second}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (2.4, 1.6),
+        "the second write adds its own increment",
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ds_bayesian_divergence WHERE claim_id = $1")
+            .bind(w.claim)
+            .fetch_one(&w.pool)
+            .await
+            .expect("count divergence rows");
+    assert_eq!(rows, 1, "the second write records one divergence row");
+}
+
+async fn divergence_count(w: &World) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM ds_bayesian_divergence WHERE claim_id = $1")
+        .bind(w.claim)
+        .fetch_one(&w.pool)
+        .await
+        .expect("count divergence rows")
+}
+
+/// Backlog 862d8404's change to the cold-start rule: a replacement whose
+/// withdrawal leaves the track holding only the new BBA has no other evidence
+/// to diverge from, so it is a cold start and records no divergence row, as a
+/// fresh claim's first write does.
+///
+/// At origin/main the replacement counted the new BBA on top of the replaced
+/// one, so the track was no longer at the prior and the replacement recorded
+/// a divergence row against evidence that was the caller's own, revised.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replacement_that_leaves_only_the_new_bba_records_no_divergence(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "862d8404-cold").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    assign_hypothesis_zero(&w).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+
+    let first = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.7, "0,1": 0.3}}),
+    )
+    .await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    let replaced = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.2, "0,1": 0.8}}),
+    )
+    .await;
+    assert_eq!(replaced["write_outcome"], "replaced", "{replaced}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.2, 1.8),
+        "the track holds only the new BBA",
+    );
+    assert_eq!(
+        divergence_count(&w).await,
+        0,
+        "a replacement leaving only its own BBA on the track is a cold start"
+    );
+}
+
+/// The converse: a replacement on a track that also holds OTHER evidence (an
+/// independent BBA under a perspective the caller owns) is not a cold start.
+/// It records a divergence row, and the track holds the other evidence plus
+/// the new BBA. (This holds at origin/main too, where every write after the
+/// first recorded a row; it pins that the withdrawal does not make every
+/// replacement cold. Mutation-proved: treating any write that withdraws as a
+/// cold start fails it.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replacement_beside_other_evidence_records_divergence(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "862d8404-warm").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    assign_hypothesis_zero(&w).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id, confidence_calibration) \
+         VALUES ($1, $2, NULL) RETURNING id",
+    )
+    .bind(format!("862d8404-warm-p-{}", Uuid::new_v4()))
+    .bind(a)
+    .fetch_one(&w.pool)
+    .await
+    .expect("seed perspective");
+
+    let other = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "perspective_id": perspective,
+                           "masses": {"0": 0.6, "0,1": 0.4}}),
+    )
+    .await;
+    assert_eq!(other["write_outcome"], "inserted", "{other}");
+    let first = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.7, "0,1": 0.3}}),
+    )
+    .await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    assert_eq!(
+        divergence_count(&w).await,
+        1,
+        "the second BBA records a row"
+    );
+
+    let replaced = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.2, "0,1": 0.8}}),
+    )
+    .await;
+    assert_eq!(replaced["write_outcome"], "replaced", "{replaced}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.8, 2.2),
+        "the other evidence plus the new BBA",
+    );
+    assert_eq!(
+        divergence_count(&w).await,
+        2,
+        "a replacement beside other evidence records its divergence"
     );
 }

@@ -3,8 +3,9 @@
 //!
 //! Every production writer of `perspectives` declares
 //! `TenancyDecl::instance_wide()` on purpose (`PerspectiveRepository::create`,
-//! `ensure_evidence_perspective`, `ensure_edge_perspective`; migration 077's
-//! registry WITH CHECK admits exactly that declaration). `verify` used to count
+//! the one writer since migration 267 moved the edge and evidence keys onto
+//! `mass_functions`; migration 077's registry WITH CHECK admits exactly that
+//! declaration). `verify` used to count
 //! such a row as residue whenever its `owner_agent_id` held a live operator
 //! link, and `run` used to move it into that operator's group, so the deploy
 //! pre-flight failed again after every perspective an operator-linked agent
@@ -88,15 +89,33 @@ async fn write_perspectives(pool: &PgPool, author: Uuid) -> [Uuid; 3] {
     .await
     .expect("create perspective")
     .id;
-    let evidence_key = Uuid::new_v4();
-    PerspectiveRepository::ensure_evidence_perspective(pool, evidence_key, Some(author))
-        .await
-        .expect("evidence perspective");
-    let edge_key = Uuid::new_v4();
-    PerspectiveRepository::ensure_edge_perspective(pool, edge_key, Some(author))
-        .await
-        .expect("edge perspective");
-    [lens, evidence_key, edge_key]
+    let untyped = PerspectiveRepository::create(
+        pool,
+        "an untyped lens",
+        None,
+        Some(author),
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("create perspective")
+    .id;
+    let empirical = PerspectiveRepository::create(
+        pool,
+        "an empirical lens",
+        None,
+        Some(author),
+        Some("empirical"),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("create perspective")
+    .id;
+    [lens, untyped, empirical]
 }
 
 #[sqlx::test(migrations = "../../migrations")]

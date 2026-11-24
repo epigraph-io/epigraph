@@ -30,6 +30,7 @@ mod support;
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
+use chrono::{DateTime, Duration, Utc};
 use epigraph_api::create_router;
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::{
@@ -783,6 +784,189 @@ async fn a_blob_that_fails_verification_is_withheld(pool: PgPool) {
     );
 }
 
+/// The listing reads no prompt content (backlog bedd59b7): with the definer
+/// owner's SELECT on `agent_prompt_blobs` revoked, the listing still answers,
+/// byte for byte as before, while the blob route, which must read content,
+/// now fails (CALIBRATION: the revoke bites a content read).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_listing_reads_no_prompt_content(pool: PgPool) {
+    let operator = human(&pool).await;
+    let f = family(&pool, operator).await;
+    let state = app_role_state(&pool).await;
+    let before = read_ok(&state, operator, f.child).await;
+    let hash = blake3_hex(&f.child_learned);
+    read_blob_ok(&state, operator, f.child, &hash).await;
+
+    sqlx::query("REVOKE SELECT ON public.agent_prompt_blobs FROM epigraph_maintenance")
+        .execute(&pool)
+        .await
+        .expect("revoke");
+    let (status, body) = get_blob(&state, operator, f.child, &hash).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "CALIBRATION: a content read now fails: {body}"
+    );
+    assert_eq!(
+        read_ok(&state, operator, f.child).await,
+        before,
+        "the listing does not touch the blob table"
+    );
+}
+
+/// A snapshot row written directly (superuser) at a chosen `first_seen`.
+async fn snapshot_at(pool: &PgPool, agent: Uuid, tag: &str, first_seen: DateTime<Utc>) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agent_prompt_snapshots \
+             (agent_id, group_folder, model, prompt_hash, in_prompt, first_seen, last_seen) \
+         VALUES ($1, $2, 'test-model-7', $3, '{}'::jsonb, $4, $4) RETURNING id",
+    )
+    .bind(agent)
+    .bind(format!("g-{tag}"))
+    .bind(blake3::hash(agent.as_bytes()).to_hex().to_string())
+    .bind(first_seen)
+    .fetch_one(pool)
+    .await
+    .expect("seed snapshot")
+}
+
+/// A page's rows as `(agent, snapshot)`, in the order the page lists them:
+/// the agent's own snapshots, then each lineage member's (a member with no
+/// snapshot on the page as `(member, None)`).
+fn page_rows(agent: Uuid, page: &Value) -> Vec<(Uuid, Option<Uuid>)> {
+    let id = |v: &Value| -> Uuid { serde_json::from_value(v.clone()).expect("a uuid") };
+    let mut out: Vec<(Uuid, Option<Uuid>)> = arr(&page["snapshots"], "snapshots")
+        .iter()
+        .map(|s| (agent, Some(id(&s["id"]))))
+        .collect();
+    for side in ["ancestors", "descendants"] {
+        for m in arr(&page["lineage"][side], side) {
+            let snaps = arr(&m["snapshots"], "snapshots");
+            if snaps.is_empty() {
+                out.push((id(&m["agent_id"]), None));
+            }
+            out.extend(
+                snaps
+                    .iter()
+                    .map(|s| (id(&m["agent_id"]), Some(id(&s["id"])))),
+            );
+        }
+    }
+    out
+}
+
+/// A lineage larger than one page is fully readable across pages (backlog
+/// 24a9f4fa). The agent has three snapshots (two sharing `first_seen`), an
+/// ancestor its operator may not read (listed by id, no snapshot) and a
+/// descendant. At every page size from 1 up, following `next_cursor` reads
+/// every row exactly once; every page but the last says `truncated` with a
+/// cursor, the last says neither; each page has at most `limit` rows and the
+/// same depth-limit flags. CONTROL: the default page holds everything. A
+/// cursor the route did not issue is a 400.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lineage_larger_than_one_page_reads_fully_across_pages(pool: PgPool) {
+    let operator = human(&pool).await;
+    let other = human(&pool).await;
+    let (parent, agent) = split_family(&pool, operator, other).await;
+    let child = register(
+        &pool,
+        &identity(
+            "g-split",
+            Some(agent),
+            [
+                PromptFile::Absent,
+                PromptFile::Absent,
+                stored("split group rules\n"),
+                stored("the grandchild's lesson\n"),
+            ],
+        ),
+    )
+    .await;
+    assert!(
+        child.link_live,
+        "CALIBRATION: the descendant inherits the link"
+    );
+    let tie = DateTime::from_timestamp_micros((Utc::now() - Duration::days(1)).timestamp_micros())
+        .expect("instant");
+    snapshot_at(&pool, agent, "tie-1", tie).await;
+    snapshot_at(&pool, agent, "tie-2", tie).await;
+    let state = app_role_state(&pool).await;
+
+    let whole = read_ok(&state, operator, agent).await;
+    assert_eq!(whole["truncated"], json!(false), "{whole}");
+    assert_eq!(whole["next_cursor"], Value::Null, "{whole}");
+    let mut all = page_rows(agent, &whole);
+    assert_eq!(
+        all.len(),
+        5,
+        "CALIBRATION: 3 own, 1 unreadable, 1 descendant: {whole}"
+    );
+    assert!(all.contains(&(parent, None)), "{whole}");
+    all.sort();
+
+    for limit in 1..=5usize {
+        let mut rows: Vec<(Uuid, Option<Uuid>)> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let uri = match &after {
+                None => format!("/api/v1/agents/{agent}/prompt-history?limit={limit}"),
+                Some(c) => {
+                    format!("/api/v1/agents/{agent}/prompt-history?limit={limit}&after={c}")
+                }
+            };
+            let (status, page) = get_json(&state, operator, &["claims:read"], &uri).await;
+            assert_eq!(status, StatusCode::OK, "limit {limit}: {page}");
+            pages += 1;
+            assert!(pages <= 10, "limit {limit}: the pages advance");
+            let got = page_rows(agent, &page);
+            assert!(
+                !got.is_empty() && got.len() <= limit,
+                "limit {limit}: {page}"
+            );
+            assert_eq!(
+                page["lineage"]["ancestors_at_limit"],
+                whole["lineage"]["ancestors_at_limit"]
+            );
+            rows.extend(got);
+            match page["next_cursor"].as_str() {
+                Some(c) => {
+                    assert_eq!(page["truncated"], json!(true), "limit {limit}: {page}");
+                    after = Some(c.to_string());
+                }
+                None => {
+                    assert_eq!(page["truncated"], json!(false), "limit {limit}: {page}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(pages, 5usize.div_ceil(limit), "limit {limit}: page count");
+        rows.sort();
+        assert_eq!(rows, all, "limit {limit}: every row once");
+    }
+
+    for bad in [
+        "not-a-cursor".to_string(),
+        // A position no row has: past the walk's depth (and `abs()` overflow
+        // in the definer), and an instant `timestamptz` cannot hold.
+        format!("-2147483648_{}", agent.simple()),
+        format!(
+            "1_{}_-220000000000000000_{}",
+            agent.simple(),
+            agent.simple()
+        ),
+    ] {
+        let (status, body) = get_json(
+            &state,
+            operator,
+            &["claims:read"],
+            &format!("/api/v1/agents/{agent}/prompt-history?after={bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+}
+
 /// Registers a chain of `n` generations in one group, each succeeding the
 /// last, the first live-linked to `operator` (so every later one inherits
 /// the link). Returns the agent ids, oldest first.
@@ -846,6 +1030,24 @@ async fn the_listing_says_when_the_lineage_walk_reached_its_depth_limit(pool: Pg
     assert_eq!(down.len(), 64, "65 descendants exist; the walk lists 64");
     assert_eq!(oldest["lineage"]["descendants_at_limit"], json!(true));
     assert_eq!(oldest["lineage"]["ancestors_at_limit"], json!(false));
+
+    // A page that lists only the agent itself still says the walk reached
+    // the limit: the flags are the whole walk's, not the page's.
+    let (status, first) = get_json(
+        &state,
+        operator,
+        &["claims:read"],
+        &format!("/api/v1/agents/{}/prompt-history?limit=1", ids[65]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["lineage"]["ancestors"], json!([]), "{first}");
+    assert_eq!(
+        first["lineage"]["ancestors_at_limit"],
+        json!(true),
+        "{first}"
+    );
+    assert_eq!(first["truncated"], json!(true), "{first}");
 }
 
 /// From any member of a three-generation chain, the lineage is nearest first
@@ -1110,7 +1312,7 @@ impl Recording {
                 "human",
                 None,
                 Some(principal),
-                chrono::Duration::minutes(30),
+                Duration::minutes(30),
                 AccessTokenBinding {
                     family_id: family,
                     elevation_id: elv,

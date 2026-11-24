@@ -20,8 +20,8 @@ use epigraph_cli::belief_cache::{
     plan_restore, read_wave, restore_wave, RestoreOptions, WaveRecord,
 };
 use epigraph_cli::edge_rewire::{
-    read_edge_row_records, restore_edge_rows, run_targeted_rewire, seed_from_waves, EdgeRowRecord,
-    TargetedRunOptions, TargetedRunReport,
+    read_edge_row_records, restore_edge_rows, restore_edge_rows_batched, run_targeted_rewire,
+    seed_from_waves, EdgeRowRecord, EdgeRowRestoreReport, TargetedRunOptions, TargetedRunReport,
 };
 use epigraph_db::visibility::Viewer;
 use rewire_fixture::*;
@@ -102,6 +102,8 @@ async fn apply(
 fn until_fixed(max_passes: usize) -> TargetedRunOptions {
     TargetedRunOptions {
         max_passes,
+        // These tests count every rewrite, unchanged rows included.
+        only_changed: false,
         ..TargetedRunOptions::default()
     }
 }
@@ -402,15 +404,17 @@ async fn targeted_rewire_restores_rows_and_caches_byte_identical(pool: PgPool) {
     assert_eq!(report.rewired(), 3, "{report:?}");
 
     // Edge 1 is rewritten organically after the rewire; edge 2 is retracted.
-    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
-        .bind(edges[1])
-        .bind(STALE_PRE_401)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE mass_functions SET masses = $2::jsonb WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edges[1])
+    .bind(STALE_PRE_401)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE mass_functions SET retracted_at = now(), retracted_by = $2, \
-                retract_reason = 'cal4 restore fixture' WHERE perspective_id = $1",
+                retract_reason = 'cal4 restore fixture' WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(edges[2])
     .bind(author)
@@ -461,6 +465,76 @@ async fn targeted_rewire_restores_rows_and_caches_byte_identical(pool: PgPool) {
     let again = restore_edge_rows(&pool, &rows, false).await.unwrap();
     assert_eq!(again.already_restored, vec![id(0)], "{again:?}");
     assert!(again.restored.is_empty());
+}
+
+/// The restore hands its outcomes over per batch, after each batch commits:
+/// when a later batch fails (here a trigger in this database refuses the
+/// second row's UPDATE), the first batch's row is restored AND its outcome
+/// was already handed over, so a restore that stops part-way leaves the
+/// outcomes of what it committed rather than none. A re-run with the
+/// trigger gone finds the first row `already_restored` and restores the
+/// second, completing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_restore_hands_over_each_batch_outcome_as_it_commits(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer, "per-batch").await;
+    let pre = (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await);
+    let (report, _, rows) = apply(&pool, &viewer, &ch.wave, &until_fixed(10)).await;
+    assert_eq!(report.rewired(), 2, "{report:?}");
+    // LIFO: the row rewritten last (bc) is restored first, in batch 1.
+    let (first, second) = (pre.1[0].0, pre.0[0].0);
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_row() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN RAISE EXCEPTION 'test: batch 2 fails'; END $f$",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_refuse_row BEFORE UPDATE ON mass_functions \
+         FOR EACH ROW WHEN (OLD.id = '{second}'::uuid) EXECUTE FUNCTION test_refuse_row()"
+    ))
+    .execute(&pool)
+    .await
+    .expect("trigger");
+
+    let mut handed: Vec<EdgeRowRestoreReport> = Vec::new();
+    let mut on_batch = |r: &EdgeRowRestoreReport| -> anyhow::Result<()> {
+        handed.push(r.clone());
+        Ok(())
+    };
+    let out = restore_edge_rows_batched(&pool, &rows, false, 1, &mut on_batch).await;
+
+    let err = out.expect_err("batch 2 fails");
+    assert!(format!("{err:#}").contains("batch 2 fails"), "{err:#}");
+    assert_eq!(
+        handed.len(),
+        1,
+        "batch 1's outcome was handed over: {handed:?}"
+    );
+    assert_eq!(handed[0].restored, vec![first]);
+    assert_eq!((handed[0].batches_done, handed[0].batches_total), (1, 2));
+    assert!(!handed[0].complete());
+    assert_eq!(edge_rows(&pool, ch.bc).await, pre.1, "batch 1 committed");
+    assert_ne!(edge_rows(&pool, ch.ab).await, pre.0, "batch 2 rolled back");
+
+    sqlx::query("DROP TRIGGER test_refuse_row ON mass_functions")
+        .execute(&pool)
+        .await
+        .expect("drop the trigger");
+    let mut handed: Vec<EdgeRowRestoreReport> = Vec::new();
+    let mut on_batch = |r: &EdgeRowRestoreReport| -> anyhow::Result<()> {
+        handed.push(r.clone());
+        Ok(())
+    };
+    let again = restore_edge_rows_batched(&pool, &rows, false, 1, &mut on_batch)
+        .await
+        .expect("re-run");
+    assert_eq!(again.already_restored, vec![first], "{again:?}");
+    assert_eq!(again.restored, vec![second], "{again:?}");
+    assert!(again.complete());
+    assert_eq!(handed.len(), 2);
+    assert_eq!(edge_rows(&pool, ch.ab).await, pre.0, "both rows back");
 }
 
 /// A settled cycle `a ⇄ b` and a wave that moved `a`. Returns the claims,
@@ -559,12 +633,14 @@ async fn targeted_restore_unwinds_a_cycle_run_to_the_pre_run_rows(pool: PgPool) 
     let ((_a2, _b2), (ab2, ba2), wave2) = settled_cycle(&pool, &viewer, "two").await;
     let ba2_pre = edge_rows(&pool, ba2).await;
     let (_, _, rows2) = apply(&pool, &viewer, &wave2, &until_fixed(80)).await;
-    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
-        .bind(ab2)
-        .bind(STALE_PRE_401)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE mass_functions SET masses = $2::jsonb WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(ab2)
+    .bind(STALE_PRE_401)
+    .execute(&pool)
+    .await
+    .unwrap();
     let ab2_now = edge_rows(&pool, ab2).await;
     let restored2 = restore_edge_rows(&pool, &rows2, false)
         .await

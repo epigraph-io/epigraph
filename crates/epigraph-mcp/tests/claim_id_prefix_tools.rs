@@ -315,3 +315,127 @@ async fn a_hidden_edge_between_readable_claims_is_not_wiring(pool: PgPool) {
     );
     assert_eq!(doc["unwired"], serde_json::json!(["b41ed9e1"]));
 }
+
+const WORD_HEAD: &str = "b43fa110-0000-4000-8000-000000000011";
+const WORD_REAL: &str = "b43fa111-face-4000-8000-000000000012";
+const WORD_SIBLING: &str = "b43fa111-0000-4000-8000-000000000013";
+const DIGIT_SIBLING: &str = "b43fa112-1111-4000-8000-000000000014";
+const WORD_LINTED: &str = "b43a0a00-0000-4000-8000-000000000010";
+
+/// Backlog `5120795e`: a hex WORD after an id (`b43fa110-face`) is parsed as
+/// a uuid group. When that longer prefix names no readable claim, the lint
+/// falls back past trailing all-letter groups to the shorter prefix and
+/// reports the citation resolved there, keeping the written form. A longer
+/// prefix that does resolve wins; a group with a digit, and a full uuid, are
+/// never dropped, so they cannot be re-pointed at a sibling claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hex_word_after_an_id_falls_back_to_the_shorter_prefix(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "t43ids").await;
+    let head = claim_with_id(&pool, WORD_HEAD, member, "the head-only citation").await;
+    let real = claim_with_id(&pool, WORD_REAL, member, "a claim whose 2nd group is face").await;
+    claim_with_id(
+        &pool,
+        WORD_SIBLING,
+        member,
+        "its sibling under the same head",
+    )
+    .await;
+    claim_with_id(&pool, DIGIT_SIBLING, member, "a sibling of a digit group").await;
+    let linted = claim_with_id(
+        &pool,
+        WORD_LINTED,
+        member,
+        "Follows b43fa110-face; again b43fa110. Builds on b43fa111-face. \
+         Not b43fa112-0ca4, nor b43fa110-aaaa-bbbb-cccc-dddddddddddd.",
+    )
+    .await;
+
+    let doc = lint(&server, &pool, member, linted).await;
+    let cites = doc["citations"].as_array().expect("citations");
+    let tokens: Vec<&str> = cites.iter().map(|c| c["token"].as_str().unwrap()).collect();
+    assert_eq!(
+        tokens,
+        vec![
+            "b43fa110",
+            "b43fa111-face",
+            "b43fa112-0ca4",
+            "b43fa110-aaaa-bbbb-cccc-dddddddddddd"
+        ],
+        "`b43fa110-face` resolves at `b43fa110` and is not cited twice: {doc}"
+    );
+    assert_eq!(status_of(&doc, "b43fa110"), "unwired", "{doc}");
+    assert_eq!(
+        cites[0]["cited_as"], "b43fa110-face",
+        "the written form kept"
+    );
+    assert_eq!(cites[0]["matches"], serde_json::json!([head.to_string()]));
+
+    // The longer prefix resolves, so it wins: one match, not the ambiguous
+    // pair under the head, and no fallback is reported.
+    assert_eq!(status_of(&doc, "b43fa111-face"), "unwired");
+    assert_eq!(cites[1]["matches"], serde_json::json!([real.to_string()]));
+    assert!(cites[1].get("cited_as").is_none(), "{doc}");
+
+    // A digit group and a full uuid never fall back, though their heads
+    // name readable claims.
+    assert_eq!(status_of(&doc, "b43fa112-0ca4"), "unresolved");
+    assert_eq!(
+        status_of(&doc, "b43fa110-aaaa-bbbb-cccc-dddddddddddd"),
+        "unresolved"
+    );
+    assert_eq!(
+        doc["unwired"],
+        serde_json::json!(["b43fa110", "b43fa111-face"])
+    );
+}
+
+const HIDDEN_WORD: &str = "b43fa121-face-4000-8000-000000000021";
+const HIDDEN_SIBLING: &str = "b43fa121-0000-4000-8000-000000000022";
+const ABSENT_SIBLING: &str = "b43fa122-0000-4000-8000-000000000023";
+const HIDDEN_LINTED: &str = "b43a0a01-0000-4000-8000-000000000024";
+const ABSENT_LINTED: &str = "b43a0a02-0000-4000-8000-000000000025";
+
+/// Backlog `5120795e`, visibility: a longer prefix that names only a claim
+/// the caller cannot read falls back exactly as if that claim were absent,
+/// so the fallback reveals nothing about hidden claims. Its member still
+/// resolves the citation at full precision.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_longer_match_falls_back_like_an_absent_one(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "t43ids-hidden").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "t43ids-hidden-stranger").await;
+    let hidden = claim_with_id(&pool, HIDDEN_WORD, member, "a private face claim").await;
+    stamp_group_private(&pool, hidden, group).await;
+    let sibling = claim_with_id(&pool, HIDDEN_SIBLING, member, "a public sibling").await;
+    claim_with_id(&pool, ABSENT_SIBLING, member, "a public sibling").await;
+    let with_hidden = claim_with_id(&pool, HIDDEN_LINTED, member, "Cites b43fa121-face.").await;
+    let with_absent = claim_with_id(&pool, ABSENT_LINTED, member, "Cites b43fa122-face.").await;
+
+    let doc = lint(&server, &pool, member, with_hidden).await;
+    assert_eq!(status_of(&doc, "b43fa121-face"), "unwired", "{doc}");
+    assert_eq!(
+        doc["citations"][0]["matches"],
+        serde_json::json!([hidden.to_string()])
+    );
+
+    let hidden_doc = lint(&server, &pool, stranger, with_hidden).await;
+    assert_eq!(
+        hidden_doc["citations"][0]["matches"],
+        serde_json::json!([sibling.to_string()]),
+        "{hidden_doc}"
+    );
+    assert!(!hidden_doc.to_string().contains(HIDDEN_WORD));
+    let absent_doc = lint(&server, &pool, stranger, with_absent).await;
+    let mask = |doc: &Value, head: &str, linted: &str, sibling: &str| {
+        doc.to_string()
+            .replace(linted, "<linted>")
+            .replace(sibling, "<sibling>")
+            .replace(head, "<head>")
+    };
+    assert_eq!(
+        mask(&hidden_doc, "b43fa121", HIDDEN_LINTED, HIDDEN_SIBLING),
+        mask(&absent_doc, "b43fa122", ABSENT_LINTED, ABSENT_SIBLING),
+        "hidden and absent must be indistinguishable"
+    );
+}

@@ -1,7 +1,7 @@
 //! What a BBA upsert does to the writer's own row (backlogs bcbe34b2, 6f82db4f).
 //!
-//! A BBA is upserted on `(claim, frame, source agent, perspective)`
-//! (`mass_functions_unique_per_perspective`), and the upsert returns only the
+//! A BBA is upserted on `(claim, frame, source agent, perspective, slot)`
+//! (`mass_functions_unique_per_key`, migrations 034 and 267), and the upsert returns only the
 //! row id, so an identical resubmission, a silent replacement and a first
 //! submission all look alike to the caller. Both evidence-submission surfaces,
 //! MCP `submit_ds_evidence` and `POST /api/v1/frames/:id/evidence`, read the
@@ -70,15 +70,19 @@ pub struct BbaWrite<'a> {
 }
 
 /// The writer's row for the upsert key among `rows` (one claim and frame):
-/// the row whose source agent and perspective are the write's.
+/// the row whose source agent and perspective are the write's and which sits
+/// on no slot (both evidence-submission surfaces write a perspective's key,
+/// never a slot's; an edge, evidence or assessment BBA of the same agent with
+/// no perspective is another key, migration 267).
 #[must_use]
 pub fn prior_for(
     rows: &[MassFunctionRow],
     agent: Option<Uuid>,
     perspective: Option<Uuid>,
 ) -> Option<&MassFunctionRow> {
-    rows.iter()
-        .find(|row| row.source_agent_id == agent && row.perspective_id == perspective)
+    rows.iter().find(|row| {
+        row.source_agent_id == agent && row.perspective_id == perspective && row.slot_id.is_none()
+    })
 }
 
 /// Whether `row` already holds exactly what `write` stores: the same focal
@@ -133,6 +137,8 @@ mod tests {
             frame_id: Uuid::nil(),
             source_agent_id: None,
             perspective_id: None,
+            slot_kind: None,
+            slot_id: None,
             masses,
             conflict_k: None,
             combination_method: Some("discount".to_string()),

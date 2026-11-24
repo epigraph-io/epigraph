@@ -588,10 +588,12 @@ pub struct ExportProvenanceProvOParams {
     pub claim_id: String,
 
     #[schemars(
-        description = "Maximum ancestor depth to walk. The walk follows every claim-to-claim \
-                       edge INTO a claim, of any relationship (not only derived_from). \
-                       Default 5, clamped to 1..=20. A depth cutoff is NOT reported in \
-                       `truncated`."
+        description = "Maximum ancestor depth to walk. The walk follows derivation edges \
+                       INTO a claim (the derived_from family plus supports, elaborates, \
+                       decomposes_to), never refutes, contradicts or a successor's \
+                       supersedes. Default 5, clamped to 1..=20. When a claim you can read \
+                       lies past it, the document reports `truncated: true` and \
+                       `depth_truncated: true`."
     )]
     #[serde(default)]
     pub max_depth: Option<i32>,
@@ -1285,6 +1287,22 @@ pub struct ImproveWorkflowHierarchyParams {
     )]
     #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListWorkflowsParams {
+    #[schemars(description = "Maximum number of entries in this page (default 50, max 200).")]
+    pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Opaque cursor from the previous page's `next_cursor`; omit it for the first page. Walk pages until `next_cursor` is null."
+    )]
+    pub cursor: Option<String>,
+
+    #[schemars(
+        description = "When true, also list deprecated workflows: a hierarchical lineage none of whose generations you can read has truth 0.3 or above (deprecate_workflow writes 0.05) and a flat workflow claim that is no longer current. A lineage whose head is deprecated but which still has a live generation is listed either way. Defaults to false."
+    )]
+    pub include_deprecated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2480,7 +2498,7 @@ pub struct IngestDocumentParams {
     pub wait: Option<bool>,
 
     #[schemars(
-        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: PRIVATE if your own default is private (set_default_group private: true), else your default team (set_default_group) while you may still write it, else your human operator's default (private, or its team on the same condition), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates; their evidence, traces and asserts edges inherit it. It scopes the new claims only: the paper's own record (title, DOI, journal), its author agents, its processed_by stamp (what check_already_ingested reports) and its asserts edges onto already-public claims it converges onto stay readable by every agent whatever you pass, so do not ingest a confidential document. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: PRIVATE if your own default is private (set_default_group private: true), else your default team (set_default_group) while you may still write it, else your human operator's default (private, or its team on the same condition), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates; their evidence, traces and asserts edges inherit it. It also scopes the paper's own record (title, DOI, journal): a team or private ingest writes a paper row only that group reads, so its processed_by stamp and its authored and asserts edges (including onto already-public claims it converges onto) are the group's too, and to anyone outside the group check_already_ingested and query_paper answer as for an unknown document. Another group's private copy of the same document is a separate paper. Still readable by every agent whatever you pass: the author agents themselves (an author's name), and an author's asserts edge onto an already-public claim the ingest converges onto (which ties that name to that claim, though not to the document), so do not ingest a document whose author list is itself confidential. Publicizing or sharing the claims later does not yet widen the paper row. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
     )]
     #[serde(default)]
     pub visibility: Option<String>,
@@ -2512,7 +2530,7 @@ pub struct IngestDocumentInlineParams {
     pub wait: Option<bool>,
 
     #[schemars(
-        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: PRIVATE if your own default is private (set_default_group private: true), else your default team (set_default_group) while you may still write it, else your human operator's default (private, or its team on the same condition), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates; their evidence, traces and asserts edges inherit it. It scopes the new claims only: the paper's own record (title, DOI, journal), its author agents, its processed_by stamp (what check_already_ingested reports) and its asserts edges onto already-public claims it converges onto stay readable by every agent whatever you pass, so do not ingest a confidential document. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: PRIVATE if your own default is private (set_default_group private: true), else your default team (set_default_group) while you may still write it, else your human operator's default (private, or its team on the same condition), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates; their evidence, traces and asserts edges inherit it. It also scopes the paper's own record (title, DOI, journal): a team or private ingest writes a paper row only that group reads, so its processed_by stamp and its authored and asserts edges (including onto already-public claims it converges onto) are the group's too, and to anyone outside the group check_already_ingested and query_paper answer as for an unknown document. Another group's private copy of the same document is a separate paper. Still readable by every agent whatever you pass: the author agents themselves (an author's name), and an author's asserts edge onto an already-public claim the ingest converges onto (which ties that name to that claim, though not to the document), so do not ingest a document whose author list is itself confidential. Publicizing or sharing the claims later does not yet widen the paper row. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
     )]
     #[serde(default)]
     pub visibility: Option<String>,
@@ -2537,7 +2555,7 @@ pub struct IngestDocumentSpineParams {
     pub extraction: epigraph_ingest::document::schema::DocumentExtraction,
 
     #[schemars(
-        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: PRIVATE if your own default is private (set_default_group private: true), else your default team (set_default_group) while you may still write it, else your human operator's default (private, or its team on the same condition), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates; their evidence, traces and asserts edges inherit it. It scopes the new claims only: the paper's own record (title, DOI, journal), its author agents, its processed_by stamp (what check_already_ingested reports) and its asserts edges onto already-public claims it converges onto stay readable by every agent whatever you pass, so do not ingest a confidential document. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: PRIVATE if your own default is private (set_default_group private: true), else your default team (set_default_group) while you may still write it, else your human operator's default (private, or its team on the same condition), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates; their evidence, traces and asserts edges inherit it. It also scopes the paper's own record (title, DOI, journal): a team or private ingest writes a paper row only that group reads, so its processed_by stamp and its authored and asserts edges (including onto already-public claims it converges onto) are the group's too, and to anyone outside the group check_already_ingested and query_paper answer as for an unknown document. Another group's private copy of the same document is a separate paper. Still readable by every agent whatever you pass: the author agents themselves (an author's name), and an author's asserts edge onto an already-public claim the ingest converges onto (which ties that name to that claim, though not to the document), so do not ingest a document whose author list is itself confidential. Publicizing or sharing the claims later does not yet widen the paper row. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
     )]
     #[serde(default)]
     pub visibility: Option<String>,
@@ -2644,18 +2662,18 @@ pub struct LinkHierarchicalParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Structural relationship type. Claim to claim: decomposes_to, section_follows, continues_argument. Workflow references: executes (workflow -> claim: the workflow runs that step claim; use it to repair a dropped executes edge), invokes (workflow -> workflow, or step claim -> workflow: a sub-workflow reference; optional at_step; cycles refused), depends_on (workflow -> workflow: a prerequisite; cycles refused). None of them moves belief."
+        description = "Structural relationship type. Claim to claim: decomposes_to, section_follows, continues_argument. Workflow references: executes (workflow -> claim: the workflow runs that step claim; use it to repair a dropped executes edge), invokes (workflow -> workflow, or step claim -> workflow: a sub-workflow reference; optional at_step; cycles refused), depends_on (workflow -> workflow: a prerequisite; cycles refused). Agent attribution: asserts (agent -> claim: the agent asserts the claim; written only by that agent or the human operating it through a live binding). None of them moves belief."
     )]
     pub relationship: String,
 
     #[schemars(
-        description = "Entity type of the source, validated against the entity_types registry. Default \"claim\". executes, invokes and depends_on take \"workflow\" here (invokes also \"claim\", for a step claim). A workflow source requires authority over that workflow, as add_step does (its submitter, the submitter's operator or delegate, or a writer of its owner group), and a step-claim source of invokes requires it over every workflow executing that step; a refusal writes nothing."
+        description = "Entity type of the source, validated against the entity_types registry. Default \"claim\". executes, invokes and depends_on take \"workflow\" here (invokes also \"claim\", for a step claim); asserts takes \"agent\". A workflow source requires authority over that workflow, as add_step does (its submitter, the submitter's operator or delegate, or a writer of its owner group), and a step-claim source of invokes requires it over every workflow executing that step; a refusal writes nothing."
     )]
     #[serde(default)]
     pub source_type: Option<String>,
 
     #[schemars(
-        description = "Entity type of the target, validated against the entity_types registry. Default \"claim\". invokes and depends_on take \"workflow\" here; executes takes \"claim\"."
+        description = "Entity type of the target, validated against the entity_types registry. Default \"claim\". invokes and depends_on take \"workflow\" here; executes and asserts take \"claim\"."
     )]
     #[serde(default)]
     pub target_type: Option<String>,
@@ -2668,7 +2686,7 @@ pub struct LinkHierarchicalParams {
 
     #[schemars(
         with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
-        description = "Optional arbitrary JSON object attached to the edge."
+        description = "Optional JSON object attached to the edge. Keys reserved for a supersession act or the document ingest (for example dedup, supersede_act, ingest_written) are refused, and nothing is written."
     )]
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
@@ -2847,7 +2865,7 @@ pub struct LinkEpistemicParams {
 
     #[schemars(
         with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
-        description = "Optional arbitrary JSON object attached to the edge."
+        description = "Optional JSON object attached to the edge. Keys reserved for a supersession act or the document ingest (for example dedup, supersede_act, ingest_written) are refused, and nothing is written."
     )]
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
@@ -3334,6 +3352,17 @@ pub struct DsEvidenceResponse {
     /// `unknown_keys`, which names evidence-type keys only. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unknown_locality_tag: Option<String>,
+    /// Set when the claim is a COMPOUND and the server runs
+    /// `EPIGRAPH_COMPOUND_WRITE_GUARD=warn` (backlog 7435772c, SPEC §4.1 W3):
+    /// the BBA was stored, but a compound's belief is derived from its atoms,
+    /// so it is never folded into the compound's cached belief (the derived
+    /// compound view reads its refutation mass, as for every compound row).
+    /// `visible_atoms` lists the atoms this caller can see (`{id, content}`, at most 50; `visible_atom_count` is
+    /// the full count): write there instead. A matching sentence is in
+    /// `warnings`. Under `refuse` the call is refused instead. Omitted for a
+    /// claim that is not a compound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecated_compound_target: Option<epigraph_engine::compound_write_guard::CompoundTarget>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3483,6 +3512,57 @@ pub struct ListMyBugReportsParams {
     #[schemars(description = "Maximum reports to return, newest first (default 50, at most 200).")]
     #[serde(default)]
     pub limit: Option<i64>,
+}
+
+/// `create_team_group` (migration 263).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateTeamGroupParams {
+    #[schemars(
+        description = "The group's name, 1 to 255 characters (surrounding space trimmed). You may hold only one active team group of a name (case-insensitive); other people's group names do not matter."
+    )]
+    pub name: String,
+    #[schemars(description = "Optional reason, recorded in the group.team_created audit event.")]
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `list_my_groups` (migration 263). Takes no arguments.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ListMyGroupsParams {}
+
+/// `invite_to_group` (migration 263).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InviteToGroupParams {
+    #[schemars(description = "UUID of the team group (you must be a live admin of it).")]
+    pub group_id: String,
+    #[schemars(
+        description = "UUID of the Person to invite: a registered human operator's own agent id, not an agent they operate."
+    )]
+    pub agent_id: String,
+    #[schemars(
+        description = "The role the membership will have if they accept: reader (the default), writer or admin."
+    )]
+    #[serde(default)]
+    pub role: Option<String>,
+    #[schemars(
+        description = "Optional note shown to the invitee and recorded in the audit event."
+    )]
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `accept_group_invitation` (migration 263).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AcceptGroupInvitationParams {
+    #[schemars(description = "UUID of an invitation addressed to you (see list_my_groups).")]
+    pub invitation_id: String,
+}
+
+/// `decline_group_invitation` (migration 263).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeclineGroupInvitationParams {
+    #[schemars(description = "UUID of an invitation addressed to you (see list_my_groups).")]
+    pub invitation_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3661,7 +3741,7 @@ pub struct ShareClaimsWithTeamParams {
     pub claim_ids: Vec<String>,
 
     #[schemars(
-        description = "UUID of the team to move the claims into. You (or your human operator) need a live writer or admin membership of it."
+        description = "UUID of the team to move the claims into. You need your own live writer or admin membership of it."
     )]
     pub group_id: String,
 
@@ -4384,15 +4464,15 @@ pub struct LabelDedupCandidateParam {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PlanLabelDedupParams {
     #[schemars(
-        description = "STDIO ONLY. Path of the dedup profile file: absolute under, or relative to, the profile root this server was started with (EPIGRAPH_MCP_PROFILE_ROOT). Refused over HTTP, when no root is set, outside the root, through a symlink, or when it is not a regular file. Exactly one of profile_path / profile_json."
+        description = "STDIO ONLY. Path of the dedup profile file: absolute under, or relative to, the profile root this server was started with (EPIGRAPH_MCP_PROFILE_ROOT). Refused over HTTP, when no root is set, outside the root, through a symlink, or when it is not a regular file. Exactly one of profile_path / profile_json / profile_claim_id."
     )]
     pub profile_path: Option<String>,
     #[schemars(
-        description = "HTTP ONLY. The dedup profile as inline JSON text (schema label-dedup-profile/v1). Refused on stdio. Exactly one of profile_path / profile_json."
+        description = "HTTP ONLY. The dedup profile as inline JSON text (schema label-dedup-profile/v2). Refused on stdio. Exactly one of profile_path / profile_json / profile_claim_id."
     )]
     pub profile_json: Option<String>,
     #[schemars(
-        description = "Reserved: reading the profile from a stored claim is not available yet; a call that sets it is refused (PROFILE_CLAIM_DEFERRED)."
+        description = "Id of a claim whose content is the dedup profile's exact bytes (a profile stored in the graph). Read as you: a claim you cannot read is PROFILE_NOT_FOUND, like a missing one. Its bytes must hash to profile_hash. Over HTTP always accepted; on stdio only when this server was started with a pin (EPIGRAPH_MCP_PROFILE_PIN), else PROFILE_CLAIM_REFUSED. The plan reports it in profile_source. Exactly one of profile_path / profile_json / profile_claim_id."
     )]
     pub profile_claim_id: Option<String>,
     #[schemars(
@@ -4422,7 +4502,7 @@ pub struct ApplyLabelDedupParams {
     pub profile_path: Option<String>,
     #[schemars(description = "As plan_label_dedup (HTTP only)")]
     pub profile_json: Option<String>,
-    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    #[schemars(description = "As plan_label_dedup")]
     pub profile_claim_id: Option<String>,
     #[schemars(description = "As plan_label_dedup")]
     pub profile_hash: String,
@@ -4447,7 +4527,7 @@ pub struct ProbeLabelDedupParams {
     pub profile_path: Option<String>,
     #[schemars(description = "As plan_label_dedup (HTTP only)")]
     pub profile_json: Option<String>,
-    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    #[schemars(description = "As plan_label_dedup")]
     pub profile_claim_id: Option<String>,
     #[schemars(description = "As plan_label_dedup")]
     pub profile_hash: String,

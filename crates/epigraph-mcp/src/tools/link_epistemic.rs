@@ -15,6 +15,10 @@
 //! matching `epigraph_engine::sheaf::restriction_kind_with_profile`.
 //!
 //! Tight contract:
+//! - `properties` may not carry a reserved key
+//!   (`epigraph_db::RESERVED_EDGE_PROPERTIES`: the dedup identity, the
+//!   supersession act's marker, the ingest's own record): refused with the HTTP
+//!   edges route's text (`epigraph_db::reserved_edge_property_refusal`),
 //! - both endpoints are existing claims (`source_type`/`target_type` are always
 //!   `"claim"`, not caller-controllable),
 //! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`] or
@@ -221,6 +225,17 @@ pub async fn do_link_epistemic(
         ));
     }
 
+    // The keys only an act or the document ingest writes (backlog 3676c459):
+    // refused with the HTTP edges route's text before anything is read or
+    // written, as `patch_edge` refuses them.
+    if let Some(reason) = params
+        .properties
+        .as_ref()
+        .and_then(epigraph_db::reserved_edge_property_refusal)
+    {
+        return Err(invalid_params(reason));
+    }
+
     // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1). The existence
     // reads, the edge, the belief wiring, the `edge.added` event and the belief
     // readback all run on it, and it commits once.
@@ -337,7 +352,7 @@ pub async fn do_link_epistemic(
     // is `false` on that call but the wake-up must still fire (backlog claim
     // 8ef5cf61-7382-43a4-85cb-565d76ba3f06). `auto_wire_edge_if_epistemic`
     // itself resolves the "already wired?" check (via
-    // `MassFunctionRepository::exists_for_perspective`) and is a no-op once a
+    // `MassFunctionRepository::exists_for_edge`) and is a no-op once a
     // BBA exists for this edge_id, so it's safe to attempt on every call.
     //
     // The BBA is attributed to the SOURCE claim's agent_id ("A's author asserts
@@ -409,7 +424,7 @@ pub async fn do_link_epistemic(
             let already_wired = if was_created {
                 Some(false)
             } else {
-                MassFunctionRepository::exists_for_perspective(&mut *probe, viewer, edge_id)
+                MassFunctionRepository::exists_for_edge(&mut *probe, viewer, edge_id)
                     .await
                     .ok()
             };

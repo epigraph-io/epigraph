@@ -1,6 +1,6 @@
 //! Agent endpoints.
 //!
-//! # Tenancy: 5 of this file's 15 raw-pool sites are converted
+//! # Tenancy: 6 of this file's 15 raw-pool sites are converted
 //!
 //! Conversion shard 6. `get_agent_reputation` (2 sites) and `agent_claims`
 //! (3 sites) each serve their whole request on one viewer-stamped connection
@@ -21,11 +21,15 @@
 //!   and a write routed through a `ScopedRead` type-checks and is then rolled
 //!   back on drop under `SessionGucMode::Transaction`. Owner is
 //!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
-//! * `get_agent`, `list_agents` — the HANDLER, not the site: neither takes a
-//!   `Viewer`, so there is nothing for `read_as` to stamp a connection with.
-//!   The residual is already on record as `F-TAILRLS-P1` in
-//!   `docs/tenancy/progress.json` and is owned by that entry, not by this shard,
-//!   which neither widens nor narrows it.
+//! * `list_agents` (4 sites) — `AgentRepository::list*` / `count*` take a
+//!   `&PgPool` and read only `agents`, which is `USING (true)`, so stamping
+//!   them would narrow nothing. Since backlog 761c2b05 both `get_agent` and
+//!   `list_agents` take a `Viewer` and null `orcid` / `ror_id` for a profile
+//!   the caller may not see, through
+//!   `AgentRepository::profile_details_visible` on a [`AppState::read_as`]
+//!   connection; `get_agent`'s one row read moved onto that connection too.
+//!   `list_agents`' `?public_key=` lookup (backlog 8946be59) reads its one row
+//!   on that connection as well and applies the same profile redaction.
 //!
 //! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES`,
 //! `AUTH_OPTIONAL_PROVENANCE_SITES` and `AUTH_OPTIONAL_WRITE_SITES` rows for
@@ -88,6 +92,30 @@ pub struct CreateAgentRequest {
     /// Arbitrary JSONB properties (methodology, affiliation metadata, etc.)
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+    /// Ask for an OAuth login for the new agent (backlog 2f87eb08). Default
+    /// `false`: registering an agent records an identity and provisions NO
+    /// client. With `true`, the new agent gets an `agent` client whose
+    /// `client_id` is its public key: ACTIVE with the agent provision scopes
+    /// when the caller holds `claims:admin`, otherwise PENDING with none
+    /// granted, as `/oauth/register`'s agent arm registers it.
+    #[serde(default)]
+    pub login: bool,
+    /// What `public_key` is: `ed25519` (the default, a real signature
+    /// verifier) or `seed-derived`, a key derived from a PUBLIC seed (an
+    /// author's name, a DOI) whose private half anyone can compute. A
+    /// `seed-derived` agent only NAMES someone: it is stored so that no
+    /// verifier accepts its key (migration 230, backlog 57943a39), and it gets
+    /// no OAuth client. Declaring it on an existing key changes nothing.
+    #[serde(default)]
+    pub key_kind: Option<String>,
+    /// Required with `key_kind: "seed-derived"`: the hex Ed25519 signature,
+    /// under `public_key`, of
+    /// `epigraph_crypto::key_kind_declaration_message("seed-derived", key)`.
+    /// The declaration is permanent, so the caller must prove it holds the
+    /// key: otherwise anyone with `agents:write` could declare another
+    /// party's not yet registered key and lock its holder out.
+    #[serde(default)]
+    pub key_kind_proof: Option<String>,
 }
 
 /// Agent response structure
@@ -136,6 +164,10 @@ pub struct AgentListParams {
     pub offset: i64,
     /// Filter agents by PROV-O label (person, organization, software_agent, instrument)
     pub label: Option<String>,
+    /// Exact Ed25519 public key (64 hex characters, either case). When set,
+    /// the response holds the one agent with that key, or none: `total` is 0
+    /// or 1. ANDed with `label` when both are given. A malformed key is a 400.
+    pub public_key: Option<String>,
 }
 
 fn default_agent_list_limit() -> i64 {
@@ -162,8 +194,9 @@ fn parse_public_key(hex_key: &str) -> Result<[u8; ED25519_PUBLIC_KEY_BYTE_LENGTH
     ValidationService::parse_public_key(hex_key)
 }
 
-/// Standard harvester-level scopes for auto-provisioned agent OAuth clients.
-/// These allow the agent to read/write claims, edges, and evidence.
+/// Standard harvester-level scopes for an agent OAuth client provisioned on an
+/// explicit login request. These allow the agent to read/write claims, edges,
+/// and evidence.
 ///
 /// Re-exported from `epigraph_core::canonical_scopes` (identical contents) so
 /// this is no longer one of three divergent private grant lists. It is
@@ -171,13 +204,51 @@ fn parse_public_key(hex_key: &str) -> Result<[u8; ED25519_PUBLIC_KEY_BYTE_LENGTH
 #[cfg(feature = "db")]
 const AGENT_DEFAULT_SCOPES: &[&str] = epigraph_core::canonical_scopes::AGENT_PROVISION_SCOPES;
 
+/// Refuse a `key_kind` declaration whose proof of possession is missing or
+/// does not verify under `public_key` (backlog 57943a39). See
+/// [`CreateAgentRequest::key_kind_proof`].
+#[cfg(feature = "db")]
+fn check_key_kind_proof(
+    public_key: &[u8; 32],
+    kind: &str,
+    proof_hex: Option<&str>,
+) -> Result<(), ApiError> {
+    let refuse = |reason: &str| ApiError::ValidationError {
+        field: "key_kind_proof".to_string(),
+        reason: format!(
+            "{reason}: declaring key_kind {kind:?} requires the hex Ed25519 signature, under \
+             public_key, of key_kind_declaration_message({kind:?}, public_key)"
+        ),
+    };
+    let Some(proof_hex) = proof_hex else {
+        return Err(refuse("missing proof of possession"));
+    };
+    let proof: [u8; 64] = hex::decode(proof_hex)
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| refuse("the proof is not a hex-encoded 64-byte signature"))?;
+    let message = epigraph_crypto::key_kind_declaration_message(kind, public_key);
+    if epigraph_crypto::SignatureVerifier::verify(public_key, &message, &proof).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(refuse("the proof does not verify under public_key"))
+    }
+}
+
 /// Create a new agent
 ///
 /// POST /agents
 ///
 /// Creates a new agent with the given public key and optional display name.
-/// When called by an authenticated user (OAuth2 bearer token), also auto-provisions
-/// an `oauth_clients` row so the new agent can authenticate via client_credentials.
+///
+/// Registering an agent is an IDENTITY act and provisions no login (backlog
+/// 2f87eb08). It used to give every new agent an ACTIVE `agent` client with
+/// `claims:write`, treating the caller's `agents:write` as the approval, so any
+/// `agents:write` holder (a bulk ingester registering one agent per author)
+/// minted a live login for every key it registered. Now a client is created
+/// only when the request sets `login: true`, and it is ACTIVE only when the
+/// caller also holds `claims:admin`; otherwise it is PENDING with no scope
+/// granted, awaiting the same approval as a `/oauth/register` agent client.
 #[cfg(feature = "db")]
 pub async fn create_agent(
     State(state): State<AppState>,
@@ -191,6 +262,7 @@ pub async fn create_agent(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+    let login = request.login;
 
     let public_key = parse_public_key(&request.public_key)?;
     // Migration 148: the legacy public-constant key of a system role names a
@@ -205,6 +277,28 @@ pub async fn create_agent(
                      derivable by anyone; it cannot be registered as an agent"
                 .to_string(),
         });
+    }
+
+    let seed_derived = match request.key_kind.as_deref() {
+        None | Some("ed25519") => false,
+        Some(k) if k == epigraph_db::KEY_KIND_SEED_DERIVED => true,
+        Some(other) => {
+            return Err(ApiError::ValidationError {
+                field: "key_kind".to_string(),
+                reason: format!(
+                    "unknown key_kind {other:?}: expected `ed25519` (the default) or \
+                     `seed-derived`"
+                ),
+            });
+        }
+    };
+
+    if seed_derived {
+        check_key_kind_proof(
+            &public_key,
+            epigraph_db::KEY_KIND_SEED_DERIVED,
+            request.key_kind_proof.as_deref(),
+        )?;
     }
 
     let mut agent = Agent::new(public_key, request.display_name);
@@ -223,65 +317,89 @@ pub async fn create_agent(
     // here for forward-compatibility but not persisted until core model is extended.
     let _ = request.properties; // acknowledged but unused until core model supports it
     let (created_agent, was_created) =
-        AgentRepository::create_or_get(&state.db_pool, &agent).await?;
+        AgentRepository::create_or_get_declaring(&state.db_pool, &agent, seed_derived).await?;
     let new_agent_id = Uuid::from(created_agent.id);
 
-    // Auto-provision an OAuth client only for a *newly created* agent (and only
-    // when the caller is authenticated). On a find-hit the client already
-    // exists from the original registration; re-creating it would hit the
-    // `oauth_clients` unique constraint on `client_id` and warn-spam the log.
-    if was_created {
-        if let Some(axum::Extension(auth)) = &auth_ctx {
-            let client_id_str = hex::encode(public_key);
-            let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
-            let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
+    // A login is provisioned only on an explicit request (backlog 2f87eb08),
+    // and only for a *newly created* agent: on a find-hit the agent already
+    // exists, and re-creating its client would hit the `oauth_clients` unique
+    // constraint on `client_id`.
+    //
+    // Never for a `seed-derived` key: its private half is public, so an
+    // active client for it is a credential anyone can use (backlog 57943a39).
+    if was_created && login && !seed_derived {
+        let client_id_str = hex::encode(public_key);
+        let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
+        let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
 
-            // This path passes a REAL agent_id at creation time, so it is not
-            // part of the "oauth_clients.agent_id is never populated" bug that
-            // `AgentRepository::ensure_for_client` fixes for the other three
-            // creation paths (`oauth/register.rs`, external provisioning,
-            // `bootstrap_clients`). `ensure_for_client` is a no-op for a client
-            // created here — it early-returns on the existing link.
-            //
-            // Do NOT "unify" the two: this one has a real Ed25519 agent whose
-            // public_key IS a signature verifier (key_kind='ed25519'), whereas
-            // ensure_for_client materialises a `derived` placeholder for a
-            // keyless OAuth principal. Collapsing them would either lose the
-            // real key or mark it derived.
-            //
-            // status="active" here, while /oauth/register's agent arm now
-            // registers "pending", is a deliberate asymmetry, not an oversight:
-            // reaching this line requires an authenticated caller holding
-            // `agents:write` (checked above) — which IS the admin approval that
-            // the anonymous registration endpoint lacks.
-            if let Err(e) = OAuthClientRepository::create(
-                &state.db_pool,
-                &client_id_str,
-                None, // no client_secret_hash for agent clients
-                client_name,
-                "agent",
-                &scopes, // allowed_scopes
-                &scopes, // granted_scopes (auto-approved for agents)
-                "active",
-                Some(new_agent_id),   // agent_id
-                Some(auth.client_id), // owner_id = the creating user/service
-                None,                 // legal_entity_name
-                None,                 // legal_contact_email
-                None, // redirect_uris: agents use Ed25519 assertion auth, no redirect
-            )
-            .await
-            {
-                // Log but don't fail agent creation — the agent row already exists
-                tracing::warn!(
-                    agent_id = %new_agent_id,
-                    error = %e,
-                    "Failed to auto-provision OAuth client for new agent"
-                );
-            }
+        // `agents:write` is NOT the approval of a login: it is held by bulk
+        // ingesters that register an agent per author, for identities that
+        // never asked to log in. Only `claims:admin` approves one here; any
+        // other caller gets a PENDING client with nothing granted, exactly
+        // what `/oauth/register`'s agent arm writes, for an admin to approve.
+        let admin = auth.has_scope(epigraph_core::canonical_scopes::CLAIMS_ADMIN);
+        let (status, granted): (&str, Vec<String>) = if admin {
+            ("active", scopes.clone())
+        } else {
+            ("pending", Vec::new())
+        };
+
+        // This path passes a REAL agent_id at creation time, so it is not
+        // part of the "oauth_clients.agent_id is never populated" bug that
+        // `AgentRepository::ensure_for_client` fixes for the other three
+        // creation paths (`oauth/register.rs`, external provisioning,
+        // `bootstrap_clients`). `ensure_for_client` is a no-op for a client
+        // created here — it early-returns on the existing link.
+        //
+        // Do NOT "unify" the two: this one has a real Ed25519 agent whose
+        // public_key IS a signature verifier (key_kind='ed25519'), whereas
+        // ensure_for_client materialises a `derived` placeholder for a
+        // keyless OAuth principal. Collapsing them would either lose the
+        // real key or mark it derived.
+        if let Err(e) = OAuthClientRepository::create(
+            &state.db_pool,
+            &client_id_str,
+            None, // no client_secret_hash for agent clients
+            client_name,
+            "agent",
+            &scopes,  // allowed_scopes: what an approval may grant
+            &granted, // granted_scopes: all of them for an admin, else none
+            status,
+            Some(new_agent_id),   // agent_id
+            Some(auth.client_id), // owner_id = the creating user/service
+            None,                 // legal_entity_name
+            None,                 // legal_contact_email
+            None,                 // redirect_uris: agents use Ed25519 assertion auth, no redirect
+        )
+        .await
+        {
+            // Log but don't fail agent creation — the agent row already exists
+            tracing::warn!(
+                agent_id = %new_agent_id,
+                error = %e,
+                "Failed to provision the requested OAuth client for new agent"
+            );
         }
     }
 
-    Ok(Json(created_agent.into()))
+    // On a find-hit the response is an EXISTING agent's row, and `orcid` /
+    // `ror_id` are its profile DETAILS (backlog 761c2b05): posting someone
+    // else's public key (which `GET /api/v1/agents` serves) must not read back
+    // a private profile's ORCID. This handler has no viewer, so it applies
+    // the strict arms of the profile rule only: the agent itself or
+    // `claims:admin` sees them; everyone else gets null, even for a public
+    // profile, whose detail `GET /api/v1/agents/:id` still serves. A newly
+    // created row echoes what this caller just supplied.
+    let mut response: AgentResponse = created_agent.into();
+    if !was_created
+        && auth.agent_id != Some(new_agent_id)
+        && !auth.has_scope(epigraph_core::canonical_scopes::CLAIMS_ADMIN)
+    {
+        response.orcid = None;
+        response.ror_id = None;
+    }
+
+    Ok(Json(response))
 }
 
 /// Create a new agent (placeholder - no database)
@@ -313,22 +431,66 @@ pub async fn create_agent(
 ///
 /// GET /agents/:id
 ///
-/// Returns agent information including their public key.
+/// Returns agent information including their public key. `orcid` and `ror_id`
+/// are profile DETAILS: null unless the caller may see the agent's profile
+/// (backlog 761c2b05; [`AgentRepository::profile_details_visible`], the rule
+/// `get_public_profile` and `find_agent` apply), so a private profile's ORCID
+/// is not disclosed to every authenticated caller.
 #[cfg(feature = "db")]
 pub async fn get_agent(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AgentResponse>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
+    let mut read = scoped_read(&state, &viewer, "get_agent").await?;
 
-    let agent = AgentRepository::get_by_id(&state.db_pool, agent_id)
+    // `agents` is `USING (true)` (migration 077 section 9): the stamp narrows
+    // no row here; it is what the profile-visibility read below needs.
+    let agent = AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
+    let visible = AgentRepository::profile_details_visible(&mut *read, &viewer, &[id]).await?;
 
-    Ok(Json(agent.into()))
+    Ok(Json(redact_profile(agent.into(), &visible)))
+}
+
+/// A viewer-stamped connection for `handler`, or the 500 every scoped read in
+/// this file answers when none can be had.
+#[cfg(feature = "db")]
+async fn scoped_read<'s>(
+    state: &'s AppState,
+    viewer: &epigraph_db::Viewer,
+    handler: &'static str,
+) -> Result<epigraph_db::ScopedRead<'s>, ApiError> {
+    state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler,
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })
+}
+
+/// Null `orcid` and `ror_id` unless the agent's profile is in `visible`
+/// (backlog 761c2b05).
+#[cfg(feature = "db")]
+fn redact_profile(
+    mut response: AgentResponse,
+    visible: &std::collections::HashSet<Uuid>,
+) -> AgentResponse {
+    if !visible.contains(&response.id) {
+        response.orcid = None;
+        response.ror_id = None;
+    }
+    response
 }
 
 /// Get an agent by ID (placeholder - no database)
@@ -354,19 +516,81 @@ pub async fn get_agent(
     Ok(Json(response))
 }
 
-/// List agents with pagination and optional label filter
+/// List agents with pagination and optional label / public-key filters
 ///
 /// GET /agents?limit=20&offset=0&label=person
+/// GET /api/v1/agents?public_key=<64 hex>
 ///
 /// Returns a paginated list of agents ordered by creation date (newest first).
 /// When `label` is provided, only agents with that PROV-O label are returned.
+/// `orcid` and `ror_id` are null for every agent whose profile the caller may
+/// not see, as in [`get_agent`].
+///
+/// When `public_key` is provided, the answer is the one agent holding that
+/// exact key (`total` 0 or 1), still filtered by `label` if that is given, so
+/// a caller resolves an agent by key in ONE request instead of paging the
+/// whole list. That lookup reads on the caller's viewer-stamped connection
+/// ([`AppState::read_as`]). `agents_identity` (migration 077 section 9) is
+/// `USING (true)`, so the stamp narrows nothing today and the row is the one
+/// the unfiltered list would page to: the filter exposes nothing the list
+/// does not, and its `orcid` / `ror_id` are nulled by the same
+/// profile-visibility rule (backlog 761c2b05).
+///
+/// The handler takes a [`ViewerExtractor`], so a token that names no
+/// principal is refused 401 on every arm, as `search_agents` and
+/// `get_agent_reputation` in this file already refuse it. The label and
+/// unfiltered arms still read through `state.db_pool`: their repository
+/// functions take a `&PgPool`, and moving them is a repository-signature
+/// change this filter does not make.
+///
+/// [`AppState::read_as`]: crate::AppState::read_as
 #[cfg(feature = "db")]
 pub async fn list_agents(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     Query(params): Query<AgentListParams>,
 ) -> Result<Json<PaginatedResponse<AgentResponse>>, ApiError> {
     let limit = params.limit.clamp(1, 100);
     let offset = params.offset.max(0);
+
+    if let Some(ref hex_key) = params.public_key {
+        let key = parse_public_key(hex_key.trim())?;
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "list_agents",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let found = AgentRepository::get_by_public_key(&mut *read, &key)
+            .await?
+            .filter(|a| match params.label.as_ref() {
+                None => true,
+                Some(label) => a.labels.contains(label),
+            });
+        let total = i64::from(found.is_some());
+        // The same profile redaction as the list arms below (backlog
+        // 761c2b05): a key lookup must not disclose an ORCID / ROR id the
+        // list would null.
+        let ids: Vec<Uuid> = found.iter().map(|a| Uuid::from(a.id)).collect();
+        let visible = AgentRepository::profile_details_visible(&mut *read, &viewer, &ids).await?;
+        // One match at most, so `offset` past it pages to nothing.
+        let items: Vec<AgentResponse> = found
+            .into_iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .map(|a| redact_profile(a.into(), &visible))
+            .collect();
+        return Ok(Json(PaginatedResponse {
+            items,
+            total,
+            limit,
+            offset,
+        }));
+    }
 
     let (agents, total) = if let Some(ref label) = params.label {
         let agents = AgentRepository::list_by_label(&state.db_pool, label, limit, offset).await?;
@@ -378,7 +602,17 @@ pub async fn list_agents(
         (agents, total)
     };
 
-    let items: Vec<AgentResponse> = agents.into_iter().map(Into::into).collect();
+    // The rows come from the raw pool (`agents` is `USING (true)`, so a stamp
+    // narrows none of them); the profile-visibility read needs the stamp, for
+    // the shared-group arm. Applied after both branches, so a label filter
+    // cannot skip it.
+    let ids: Vec<Uuid> = agents.iter().map(|a| Uuid::from(a.id)).collect();
+    let mut read = scoped_read(&state, &viewer, "list_agents").await?;
+    let visible = AgentRepository::profile_details_visible(&mut *read, &viewer, &ids).await?;
+    let items: Vec<AgentResponse> = agents
+        .into_iter()
+        .map(|a| redact_profile(a.into(), &visible))
+        .collect();
 
     Ok(Json(PaginatedResponse {
         items,

@@ -369,6 +369,14 @@ impl GraphViewRepository {
     /// in the `LEFT JOIN`'s `ON`, not in `WHERE`: a member whose every edge is
     /// hidden keeps a degree of 0 instead of being dropped.
     ///
+    /// The degree counts FACTS, not rows: one `(source, target, relationship)`
+    /// counts once however many rows store it. The default allowlist includes
+    /// `asserts`, and the document ingest keeps one marked `agent -asserts->`
+    /// / `paper -asserts->` row per ingest principal (`crate::ingest_written`),
+    /// so counting rows would rank a claim higher each time another principal
+    /// ingests its document (backlog 11402482). The `FILTER` keeps a member
+    /// with no readable edge at 0: the LEFT JOIN's all-NULL row is not a fact.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer, degree_relationships))]
@@ -382,7 +390,9 @@ impl GraphViewRepository {
     ) -> Result<Vec<GraphNodeRow>, DbError> {
         let sql = viewer.splice(
             "WITH degree AS (
-                SELECT m.claim_id, COUNT(e.*) AS deg
+                SELECT m.claim_id,
+                       COUNT(DISTINCT (e.source_id, e.target_id, e.relationship))
+                           FILTER (WHERE e.id IS NOT NULL) AS deg
                 FROM claim_cluster_membership m
                 LEFT JOIN edges e ON (e.source_id = m.claim_id OR e.target_id = m.claim_id)
                                   AND e.relationship = ANY($3)
@@ -1201,6 +1211,19 @@ impl GraphViewRepository {
     /// Both endpoints must be in the set for an edge to be returned, so an edge
     /// survives exactly when both of its endpoints did.
     ///
+    /// # One row per fact
+    ///
+    /// One `(source, target, relationship)` fact can be stored as several rows:
+    /// the document ingest keeps one marked row of an `agent -asserts-> claim`
+    /// (or `paper -asserts-> claim`, `agent -authored-> paper`) fact per ingest
+    /// principal (`crate::ingest_written`), and nothing else enforces triple
+    /// uniqueness since migrations 017/018/053. A graph view draws a fact once,
+    /// so this returns one row per fact (backlog 11402482): the oldest visible
+    /// in-force row (`valid_to` unset or in the future), else the oldest
+    /// visible row, by `created_at` then `id`. The visibility predicate sits in the
+    /// `WHERE`, before `DISTINCT ON` picks, so the representative is always a
+    /// row the viewer can read.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer, node_ids))]
@@ -1210,11 +1233,14 @@ impl GraphViewRepository {
         node_ids: &[Uuid],
     ) -> Result<Vec<SubgraphEdgeRow>, DbError> {
         let sql = viewer.splice(
-            "SELECT id, source_id, target_id, source_type, target_type, \
+            "SELECT DISTINCT ON (source_id, target_id, relationship) \
+                    id, source_id, target_id, source_type, target_type, \
                     relationship, properties \
              FROM edges \
              WHERE source_id = ANY($1) AND target_id = ANY($1) \
-               /* {EDGE_VISIBILITY:edges} */",
+               /* {EDGE_VISIBILITY:edges} */ \
+             ORDER BY source_id, target_id, relationship, \
+                      (valid_to IS NOT NULL AND valid_to <= now()), created_at, id",
             2,
         );
         let mut q = sqlx::query_as::<_, SubgraphEdgeRow>(&sql).bind(node_ids);

@@ -8,13 +8,19 @@
 # Starts the `server` binary (TEST_API_BIN, default target/debug/server) on
 # $TEST_API_PORT (default: a free port picked at runtime, so two runs on one
 # host never share a listener) against TEST_API_DATABASE_URL, whose
-# database name must end in `_test`. It inserts one agent row, mints an HS256
-# JWT for it with a per-run secret that is never written to disk, and runs the
-# command with
-#   DEDUP_TEST_API_BASE  http://127.0.0.1:$TEST_API_PORT
-#   DEDUP_TEST_TOKEN     claims:read, claims:write and claims:admin
-# exported (tests/dedup/test_fuzzy_dedup_retraction.py reads both; admin
-# because the token's agent is not the author of the claims the test seeds).
+# database name must end in `_test`. It inserts two agent rows, mints an HS256
+# JWT for each with a per-run secret that is never written to disk, and runs
+# the command with
+#   DEDUP_TEST_API_BASE        http://127.0.0.1:$TEST_API_PORT
+#   DEDUP_TEST_TOKEN           claims:read, claims:write and claims:admin
+#   DEDUP_TEST_WRITER_TOKEN    claims:read and claims:write only (no admin)
+#   DEDUP_TEST_WRITER_AGENT    the writer token's agent id
+#   DEDUP_TEST_WRITER_GROUP    that agent's personal group, which it is admin of
+# exported (tests/dedup/test_fuzzy_dedup_retraction.py reads them). The admin
+# token marks claims another agent seeded; the writer token is the common case,
+# an author marking a duplicate of its own claim in a group it writes, which the
+# dedup endpoint admits on its author arm without claims:admin (backlog
+# 32905f60).
 # The server is stopped by its recorded PID when the command exits, so it never
 # outlives the step. Exit code: the command's, or 1 when the server does not
 # come up.
@@ -89,37 +95,65 @@ if [ "$up" != 1 ]; then
   exit 1
 fi
 
-# One agent row for the token's principal (the test fixtures' shape: a real
-# 32-byte key satisfies agents_public_key_length), then the token itself,
-# with the claim set scripts/e2e/probe-http-writes.sh mints.
-TOKEN="$(SECRET="$SECRET" python3 - <<'PY'
+# One agent row per token principal (the test fixtures' shape: a real 32-byte
+# key satisfies agents_public_key_length), the writer's personal group with its
+# admin membership, then the tokens, with the claim set
+# scripts/e2e/probe-http-writes.sh mints. Printed one per line: admin token,
+# writer token, writer agent, writer group.
+MINTED="$(SECRET="$SECRET" python3 - <<'PY'
 import base64, hashlib, hmac, json, os, time, uuid
 import psycopg2
 
-agent = str(uuid.uuid4())
+admin, writer = str(uuid.uuid4()), str(uuid.uuid4())
 conn = psycopg2.connect(os.environ["TEST_API_DATABASE_URL"])
 with conn, conn.cursor() as cur:
+    for agent in (admin, writer):
+        cur.execute(
+            "INSERT INTO agents (id, public_key, role, state) "
+            "VALUES (%s::uuid, %s, 'researcher', 'active')",
+            (agent, psycopg2.Binary(os.urandom(32))),
+        )
     cur.execute(
-        "INSERT INTO agents (id, public_key, role, state) "
-        "VALUES (%s::uuid, %s, 'researcher', 'active')",
-        (agent, psycopg2.Binary(os.urandom(32))),
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) "
+        "VALUES (%s, 'did:epigraph:personal:' || %s, ''::bytea, 'personal', %s) "
+        "RETURNING id::text",
+        (f"dedup-writer:{writer}", writer, writer),
+    )
+    group = cur.fetchone()[0]
+    cur.execute(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) "
+        "VALUES (%s, %s, ''::bytea, 0, 'admin')",
+        (group, writer),
     )
 conn.close()
 
 b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 now = int(time.time()) - 2
-claims = {"sub": agent, "iss": "epigraph", "aud": "epigraph-api", "exp": now + 3600,
-          "iat": now, "nbf": now, "jti": str(uuid.uuid4()),
-          "scopes": ["claims:read", "claims:write", "claims:admin"],
-          "client_type": "service", "owner_id": agent, "agent_id": agent}
-head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-body = b64(json.dumps(claims).encode())
-sig = hmac.new(os.environ["SECRET"].encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
-print(f"{head}.{body}.{b64(sig)}")
-PY
-)" || { echo "with_test_api.sh: could not seed the agent or mint the token" >&2; exit 1; }
 
-DEDUP_TEST_API_BASE="http://127.0.0.1:$PORT" DEDUP_TEST_TOKEN="$TOKEN" "$@"
+
+def mint(agent, scopes):
+    claims = {"sub": agent, "iss": "epigraph", "aud": "epigraph-api", "exp": now + 3600,
+              "iat": now, "nbf": now, "jti": str(uuid.uuid4()), "scopes": scopes,
+              "client_type": "service", "owner_id": agent, "agent_id": agent}
+    head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    body = b64(json.dumps(claims).encode())
+    sig = hmac.new(os.environ["SECRET"].encode(), f"{head}.{body}".encode(),
+                   hashlib.sha256).digest()
+    return f"{head}.{body}.{b64(sig)}"
+
+
+print(mint(admin, ["claims:read", "claims:write", "claims:admin"]))
+print(mint(writer, ["claims:read", "claims:write"]))
+print(writer)
+print(group)
+PY
+)" || { echo "with_test_api.sh: could not seed the agents or mint the tokens" >&2; exit 1; }
+{ read -r TOKEN; read -r WRITER_TOKEN; read -r WRITER_AGENT; read -r WRITER_GROUP; } <<< "$MINTED"
+[ -n "$WRITER_GROUP" ] || { echo "with_test_api.sh: the mint printed fewer than four lines" >&2; exit 1; }
+
+DEDUP_TEST_API_BASE="http://127.0.0.1:$PORT" DEDUP_TEST_TOKEN="$TOKEN" \
+  DEDUP_TEST_WRITER_TOKEN="$WRITER_TOKEN" DEDUP_TEST_WRITER_AGENT="$WRITER_AGENT" \
+  DEDUP_TEST_WRITER_GROUP="$WRITER_GROUP" "$@"
 rc=$?
 if [ "$rc" != 0 ]; then
   echo "with_test_api.sh: command exited $rc; server log tail:" >&2

@@ -271,11 +271,82 @@ pub struct AgentPublicProfile {
 /// Ed25519 SECRET, so anyone who knows the seed holds the private key. Such a
 /// key names the agent and is NOT a signature verifier:
 /// [`AgentRepository::public_key_if_signer`] returns `None` for it, as for
-/// the OAuth placeholder `derived`. NOT YET enforced by the verifiers that
-/// read `agents.public_key` directly: `verify_claim`'s bare-key fallback, the
-/// edge-signature check and the OAuth assertion check. Insert these rows with
-/// [`AgentRepository::create_seed_derived_conn`].
+/// the OAuth placeholder `derived`, and so do the verifiers that read the
+/// bare key directly (backlog 57943a39): `verify_claim`'s bare-key fallback
+/// ([`AgentRepository::key_kind_of_public_key`]), the edge-signature check
+/// and the OAuth agent assertion check. The claim and edge verifiers also
+/// skip such an agent's `identity-legacy` row, which carries the same key
+/// (`AgentKeyRepository::attested_keys_for_claim`), so re-marking an existing
+/// row is enough. Insert these rows with
+/// [`AgentRepository::create_seed_derived_conn`] (over HTTP, `POST /agents`
+/// with `key_kind: "seed-derived"`).
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
+
+/// Step 2 of [`AgentRepository::ensure_for_client`]: refuse to adopt an
+/// `ed25519` row whose key anyone can compute (backlog 55fba366).
+///
+/// `llm` is the row's LLM-identity marker (`properties ? 'llm_model'` or
+/// `source = 'mcp-llm-agent'`). The marker is self-writable by the row, which
+/// is fine here: it can only make a row REFUSE adoption, never admit one.
+/// The author test recomputes `did_key_for_author` from the row's own name and
+/// ORCID, the rule `find_agent` reports as `name_derived_key` /
+/// `orcid_derived_key`.
+fn refuse_computable_key_adoption(
+    client_row_id: Uuid,
+    public_key: &[u8],
+    display_name: Option<&str>,
+    orcid: Option<&str>,
+    llm: bool,
+) -> Result<(), DbError> {
+    let (by_name, by_orcid) =
+        crate::repos::agent_lookup::derived_key_evidence(public_key, display_name, orcid);
+    let what = if llm {
+        "an LLM agent identity"
+    } else if by_name || by_orcid {
+        "an author node whose key is derived from its name or ORCID"
+    } else {
+        return Ok(());
+    };
+    Err(DbError::Refused {
+        kind: crate::errors::RefusalKind::Authority,
+        message: format!(
+            "oauth client {client_row_id}: the agent holding this client's key is {what}; its \
+             private key is computable from public inputs, so holding it does not prove being \
+             that agent, and it is not adopted as an OAuth principal. Nothing was linked."
+        ),
+    })
+}
+
+/// The `agents.agent_type` a self-provisioned SIGNER declares when it is
+/// created through [`AgentRepository::create_signer_conn`] (backlog 9d4673a0).
+///
+/// [`AgentRepository::create`] never names `agent_type`, so its rows take
+/// migration 001's column default `'human'`. A process's own signing identity
+/// is never a human: migrations 161/166/195 accept a lineage parent only when
+/// `agent_type IS DISTINCT FROM 'human'`, and 166's ROL02 refuses to attach a
+/// `'human'` row to a role. The type is closed to the two values the kernel
+/// uses for a non-human principal (`'llm'` is what 161's registration
+/// inserts; `'software_agent'` is what `ensure_for_client` maps an agent or
+/// service OAuth client to), so this path can never mint a `'human'`,
+/// `'role'` or `'system'` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerAgentType {
+    /// An LLM-driven identity (its key is derived from a model and prompt).
+    Llm,
+    /// Any other software signer.
+    SoftwareAgent,
+}
+
+impl SignerAgentType {
+    /// The stored `agents.agent_type` value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::SoftwareAgent => "software_agent",
+        }
+    }
+}
 
 /// Repository for Agent operations
 pub struct AgentRepository;
@@ -426,7 +497,89 @@ impl AgentRepository {
         .await
     }
 
-    /// The tail both inserts share: the `agent.registered` event on the
+    /// [`Self::create`] for a process's own SIGNER, stored with an explicit
+    /// `agent_type` instead of migration 001's `'human'` default (backlog
+    /// 9d4673a0). See [`SignerAgentType`].
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_signer(
+        pool: &PgPool,
+        agent: &Agent,
+        agent_type: SignerAgentType,
+    ) -> Result<Agent, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_signer_conn(&mut conn, agent, agent_type).await
+    }
+
+    /// [`Self::create_conn`] with `agent_type` bound (backlog 9d4673a0). Every
+    /// other column, the duplicate-key mapping and the `agent.registered`
+    /// event are exactly [`Self::create_conn`]'s; `key_kind` keeps its
+    /// `'ed25519'` default, which 077's `agents_provision` admits.
+    ///
+    /// The type is set at INSERT because it cannot be set after: migration
+    /// 118 grants the application role UPDATE on the profile columns only,
+    /// never `agent_type`. A runtime query (not `query!`), so the `.sqlx`
+    /// offline cache of [`Self::create_conn`] is untouched.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_signer_conn(
+        conn: &mut sqlx::PgConnection,
+        agent: &Agent,
+        agent_type: SignerAgentType,
+    ) -> Result<Agent, DbError> {
+        type Row = (
+            Uuid,
+            Vec<u8>,
+            Option<String>,
+            DateTime<Utc>,
+            Vec<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let id: Uuid = agent.id.into();
+        let row: Row = sqlx::query_as(
+            "INSERT INTO agents (id, public_key, display_name, created_at, updated_at, labels, \
+                                 orcid, ror_id, agent_type) \
+             VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8) \
+             RETURNING id, public_key, display_name, created_at, labels, orcid, ror_id",
+        )
+        .bind(id)
+        .bind(agent.public_key.as_slice())
+        .bind(agent.display_name.as_deref())
+        .bind(agent.created_at)
+        .bind(&agent.labels)
+        .bind(agent.orcid.as_deref())
+        .bind(agent.ror_id.as_deref())
+        .bind(agent_type.as_str())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            if let sqlx::Error::Database(ref db_err) = err {
+                if db_err.is_unique_violation() {
+                    return DbError::DuplicateKey {
+                        entity: "Agent".to_string(),
+                    };
+                }
+            }
+            DbError::from(err)
+        })?;
+        let (id, public_key, display_name, created_at, labels, orcid, ror_id) = row;
+        Self::registered(
+            conn,
+            id,
+            public_key,
+            display_name,
+            created_at,
+            labels,
+            orcid,
+            ror_id,
+        )
+        .await
+    }
+
+    /// The tail the inserts share: the `agent.registered` event on the
     /// caller's connection, and the returned [`Agent`].
     #[allow(clippy::too_many_arguments)]
     async fn registered(
@@ -504,6 +657,59 @@ impl AgentRepository {
         }
     }
 
+    /// [`Self::create_or_get`], except that a NEW row is stored with
+    /// `key_kind =` [`KEY_KIND_SEED_DERIVED`] when `seed_derived`
+    /// ([`Self::create_seed_derived_conn`]): the caller declares that the key
+    /// is derived from a public seed and so is NOT a signature verifier
+    /// (backlog 57943a39). `false` is exactly [`Self::create_or_get`].
+    ///
+    /// A find-hit returns the existing row UNCHANGED, whatever its kind: the
+    /// application role may not update `key_kind` (migration 118), and a
+    /// caller's declaration must not demote, or promote, a row someone else
+    /// registered. Re-marking an existing row is an operator task; a
+    /// declaration that finds a row of another kind logs a warning naming it.
+    ///
+    /// # Errors
+    /// As [`Self::create_or_get`].
+    pub async fn create_or_get_declaring(
+        pool: &PgPool,
+        agent: &Agent,
+        seed_derived: bool,
+    ) -> Result<(Agent, bool), DbError> {
+        if !seed_derived {
+            return Self::create_or_get(pool, agent).await;
+        }
+        if let Some(existing) = Self::get_by_public_key(pool, &agent.public_key).await? {
+            // Ignored, but never silently: an author registered before
+            // `seed-derived` existed is still a live signer, and only the
+            // operator repair (re-mark, revoke its client) closes it.
+            let kind = Self::key_kind_of_public_key(pool, &agent.public_key).await?;
+            if kind.as_deref() != Some(KEY_KIND_SEED_DERIVED) {
+                tracing::warn!(
+                    agent_id = %existing.id.as_uuid(),
+                    stored_key_kind = kind.as_deref().unwrap_or("?"),
+                    "seed-derived declaration NOT applied: the key is already registered under \
+                     another key_kind; re-marking it is an operator task (backlog 57943a39)"
+                );
+            }
+            return Ok((existing, false));
+        }
+        let mut conn = pool.acquire().await?;
+        match Self::create_seed_derived_conn(&mut conn, agent).await {
+            Ok(created) => Ok((created, true)),
+            Err(DbError::DuplicateKey { .. }) => {
+                // Lost a concurrent registration race: re-find.
+                match Self::get_by_public_key(&mut *conn, &agent.public_key).await? {
+                    Some(existing) => Ok((existing, false)),
+                    None => Err(DbError::InvalidData {
+                        reason: "agent disappeared after DuplicateKey".to_string(),
+                    }),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get an agent by ID
     ///
     /// # Tenancy: takes an executor, and deliberately takes no `Viewer`
@@ -537,8 +743,11 @@ impl AgentRepository {
     /// it." That migration names THIS function explicitly among the ones which
     /// "take no `Viewer` and return the full row". The compensating projection —
     /// `profile_visibility` gating `properties`, `orcid` and `ror_id` — lives in
-    /// exactly one function, [`Self::get_public_profile`], and the residual is
-    /// already on record as `D-PR17-agent-projection-enforced-at-one-call-site`.
+    /// [`Self::get_public_profile`], and the residual is already on record as
+    /// `D-PR17-agent-projection-enforced-at-one-call-site`. The agent-lookup
+    /// card and matcher (`agent_lookup.rs`) spell the same rule in their own
+    /// statements; `visibility_lint.rs::the_agent_profile_rule_is_one_text_at_every_site`
+    /// keeps the three one text.
     /// Stamping the session GUCs on this read changes no row either way; the
     /// value of the widening is entirely in the SIBLING statement it lets share
     /// the connection.
@@ -1411,6 +1620,20 @@ impl AgentRepository {
     ///    viewer identity, an agent's own claims would be invisible to its own
     ///    token. So: if `client_id` decodes to 32 bytes and an `ed25519` agent
     ///    holds that key, link to THAT row.
+    ///
+    ///    **Unless that row's key is computable from public inputs**
+    ///    (backlog 55fba366). The client proves only that it holds the
+    ///    private half of `client_id`, and for two shapes of legacy row that
+    ///    is no proof of being the agent: an LLM identity (`llm_model` in
+    ///    `properties`, or `source = 'mcp-llm-agent'`: the old epigraph-mcp
+    ///    create path keyed it as `BLAKE3("llm-agent:{model}:{prompt hash}")`)
+    ///    and a document-ingest author node whose key is `did_key_for_author`
+    ///    of its own name or ORCID. Both predate migration 230's
+    ///    `seed-derived` kind, which is set at insert only, so they are still
+    ///    `ed25519`. Such a row is REFUSED ([`DbError::Refused`], authority),
+    ///    not skipped: a derived placeholder in its place would answer a
+    ///    client that believes it speaks as that agent with a different
+    ///    principal. Nothing is linked, so an operator can still decide.
     /// 3. Otherwise derive a 32-byte PLACEHOLDER public key from the client's
     ///    row id. `agents.public_key` is `bytea NOT NULL CHECK (octet_length =
     ///    32)` with a UNIQUE constraint, so a keyless principal cannot exist
@@ -1442,7 +1665,9 @@ impl AgentRepository {
     /// Returns `DbError::QueryFailed` if any statement fails,
     /// `DbError::InvalidData` if `client_row_id` names no `oauth_clients` row,
     /// `DbError::DuplicateKey` if the derived key is squatted by a row that
-    /// is not a `derived` OAuth principal, and `DbError::MembershipRevoked` if
+    /// is not a `derived` OAuth principal, `DbError::Refused` (authority) if
+    /// an agent client's key belongs to an LLM identity or a name- or
+    /// ORCID-derived author row (step 2), and `DbError::MembershipRevoked` if
     /// the adopted agent holds only a revoked personal-group membership (step
     /// 6 no longer restores it; the RAISE aborts the caller's transaction, so
     /// the client stays unlinked).
@@ -1488,13 +1713,29 @@ impl AgentRepository {
         let real_signer: Option<Uuid> = if client_type == "agent" {
             match hex::decode(&client_id) {
                 Ok(bytes) if bytes.len() == 32 => {
-                    let row: Option<(Uuid,)> = sqlx::query_as(
-                        "SELECT id FROM agents WHERE public_key = $1 AND key_kind = 'ed25519'",
+                    let row: Option<(Uuid, Option<String>, Option<String>, bool)> = sqlx::query_as(
+                        "SELECT id, display_name, orcid, \
+                                    COALESCE(properties ? 'llm_model' \
+                                             OR properties ->> 'source' = 'mcp-llm-agent', \
+                                             false) \
+                               FROM agents WHERE public_key = $1 AND key_kind = 'ed25519'",
                     )
                     .bind(bytes.as_slice())
                     .fetch_optional(&mut *conn)
                     .await?;
-                    row.map(|r| r.0)
+                    match row {
+                        None => None,
+                        Some((id, name, orcid, llm)) => {
+                            refuse_computable_key_adoption(
+                                client_row_id,
+                                &bytes,
+                                name.as_deref(),
+                                orcid.as_deref(),
+                                llm,
+                            )?;
+                            Some(id)
+                        }
+                    }
                 }
                 _ => None,
             }
@@ -1767,6 +2008,12 @@ impl AgentRepository {
     /// unattached agent always may; an attached one only while its linked
     /// human holds every role it is attached to.
     ///
+    /// Asked on ONE connection, inside a transaction that stamps `agent_id` as
+    /// `epigraph.principal_id` (transaction-local, so the stamp ends with the
+    /// read): since migration 248 an application session is answered only
+    /// about its own stamped principal (the attestor and a maintenance session
+    /// about any agent). The caller asks about the agent it is about to serve.
+    ///
     /// # Errors
     /// `DbError::QueryFailed` if the function is absent (a database that has
     /// not applied migration 166) or the read fails. Deliberately NOT mapped to
@@ -1776,13 +2023,20 @@ impl AgentRepository {
         pool: &PgPool,
         agent_id: Uuid,
     ) -> Result<RoleAgentRunGate, DbError> {
-        Ok(sqlx::query_as::<_, RoleAgentRunGate>(
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, true)")
+            .bind(agent_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let gate = sqlx::query_as::<_, RoleAgentRunGate>(
             "SELECT may_run, role, holder, reason \
                FROM public.epigraph_role_agent_may_run($1)",
         )
         .bind(agent_id)
-        .fetch_one(pool)
-        .await?)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(gate)
     }
 
     /// [`Self::operator_actor`] for a caller holding a pool.
@@ -1796,6 +2050,65 @@ impl AgentRepository {
     ) -> Result<Option<OperatorLink>, DbError> {
         let mut conn = pool.acquire().await?;
         Self::operator_actor(&mut conn, agent_id).await
+    }
+
+    /// [`Self::operator_actor`] for an ACT that grants authority on the
+    /// answer: read on the act's own transaction, after taking 107's link
+    /// advisory lock (`epigraph.operator_links`) in SHARED mode, held until
+    /// that transaction ends.
+    ///
+    /// Every link writer and 191's retire verb (`epigraph_retire_operator_link`)
+    /// take that lock EXCLUSIVELY before they touch a link. So:
+    ///
+    /// * a retire in flight when the act asks makes the act wait; the read
+    ///   then runs after the retire commits and answers "not acting";
+    /// * a retire that starts after the read waits for the act to commit, so
+    ///   the act lands before the retire, never after it.
+    ///
+    /// Either way an act admitted on a link cannot land after that link's
+    /// retire committed. Shared mode does not serialise acts against each
+    /// other. Two acts holding it never wait on each other.
+    ///
+    /// # What the caller must guarantee
+    ///
+    /// * `conn` is the transaction the act COMMITS on. A lock taken on another
+    ///   connection, or one dropped before the write, is released before the
+    ///   write lands and guards nothing.
+    /// * That transaction is READ COMMITTED (a plain `BEGIN`, as `begin_as`
+    ///   sends). The lock and the read are two statements on purpose: a read
+    ///   statement's snapshot is taken when the statement starts. One
+    ///   statement that both waited on the lock and read would still see the
+    ///   pre-retire row, and so would any read under REPEATABLE READ.
+    /// * Take it before the act's first write. A retire locks the operator
+    ///   group's row `FOR UPDATE` after it takes the advisory lock. An act
+    ///   that already holds a key-share lock on that row (for example from an
+    ///   insert into that group) and then waits on the advisory lock would
+    ///   deadlock with it.
+    ///
+    /// The team-group roster verbs (164, 235) take the same lock exclusively
+    /// before they add, remove or re-role a member, so a writer-membership
+    /// revoke made through them is serialised like a retire. Such a revoke
+    /// also ends the acting link (`epigraph_operator_actor` joins the live
+    /// writer row). It does NOT serialise a revoke that UPDATEs
+    /// `group_memberships` directly, without a verb (for example
+    /// `GroupMembershipRepository::remove_member` or
+    /// `revoke_member_unless_last_admin`), nor a direct maintenance `UPDATE`
+    /// of `operator_links.retired`, which 191 leaves unserialised.
+    ///
+    /// # Errors
+    /// As [`Self::operator_actor`]; the lock statement's failure is
+    /// `DbError::QueryFailed`.
+    pub async fn operator_actor_for_act(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<OperatorLink>, DbError> {
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock_shared(\
+                 pg_catalog.hashtext('epigraph.operator_links'))",
+        )
+        .execute(&mut *conn)
+        .await?;
+        Self::operator_actor(conn, agent_id).await
     }
 
     /// "May a token that `delegator_agent` asked for act as `principal`?" —
@@ -1843,12 +2156,20 @@ impl AgentRepository {
         if run_tokens != RunTokens::On {
             return Ok(None);
         }
+        // Migration 236: the live-membership read answers only for the session
+        // principal, and this asks about the DELEGATOR's own memberships, so
+        // the statement stamps the delegator as its principal for itself
+        // (transaction-local; the statement is its own transaction on a pool
+        // connection). The read's argument is the stamped value, so the stamp
+        // precedes the call. Nothing else here reads the principal.
         let row: Option<(Uuid, Uuid)> = sqlx::query_as(
             "SELECT a.operator_id, a.operator_group_id \
-               FROM public.epigraph_operator_actor($2) a \
+               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
+                            AS delegator) s \
+              CROSS JOIN LATERAL public.epigraph_operator_actor($2) a \
               WHERE public.epigraph_author_binding($1) = $3 \
                 AND public.epigraph_human_of($1, true) = a.operator_id \
-                AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships($1) m \
+                AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships(s.delegator) m \
                              WHERE m.group_id = a.operator_group_id \
                                AND m.role IN ('writer', 'admin'))",
         )
@@ -1863,24 +2184,45 @@ impl AgentRepository {
         }))
     }
 
-    /// The agent whose identity public key is `public_key`, with its recorded
-    /// LLM model (`properties ->> 'llm_model'`), for the run-token grant: the
-    /// principal a delegator names. `None` when no agent has the key; this
-    /// never creates one.
+    /// The agent whose identity public key is `public_key`, with its ATTESTED
+    /// LLM model, for the run-token grant: the principal a delegator names.
+    /// `None` when no agent has the key; this never creates one. The model is
+    /// `None` when the agent has no attested registration.
     ///
-    /// The model is DISPLAY state (the application role may rewrite the
-    /// agent's own `properties`); the grant uses it only to narrow which
-    /// identities it serves, never as authority, which is
-    /// [`Self::delegated_principal_pool`]'s.
+    /// The model is the one migration 161's registration recorded in
+    /// `agent_prompt_snapshots`, a table only the attestor's definer (or a
+    /// maintenance session) writes, never the application role
+    /// (and whose rows never change model: the registration refuses an
+    /// identity re-registered under another one). It is read through
+    /// migration 199's `epigraph_agent_prompt_snapshot_at`, the one definer
+    /// the application role may call on that table, at `infinity` (the
+    /// latest recorded start). It is NEVER `properties ->> 'llm_model'`: that
+    /// is display state the application role may rewrite on the agent's own
+    /// row (077's `agents_self_update`, 118's column grant), so an identity
+    /// outside the served fleet could list itself.
+    ///
+    /// `p_open = true` skips 199's prompt-history gate: the run-token grant is
+    /// pre-authentication (no principal is stamped), and the model never
+    /// leaves the server (the grant's refusal does not name it), so no caller
+    /// of the request server learns more than the gated audience would.
+    ///
+    /// The grant uses the model only to narrow which identities it serves,
+    /// never as authority, which is [`Self::delegated_principal_pool`]'s.
     ///
     /// # Errors
-    /// `DbError::QueryFailed` if the read fails.
+    /// `DbError::QueryFailed` if the read fails (including a database without
+    /// migration 199, or a role that may not EXECUTE it).
     pub async fn run_token_principal_pool(
         pool: &PgPool,
         public_key: &[u8; 32],
     ) -> Result<Option<(Uuid, Option<String>)>, DbError> {
         Ok(sqlx::query_as(
-            "SELECT id, properties ->> 'llm_model' FROM public.agents WHERE public_key = $1",
+            "SELECT a.id, \
+                    (SELECT s.model \
+                       FROM public.epigraph_agent_prompt_snapshot_at( \
+                                a.id, 'infinity'::timestamptz, true) s) \
+               FROM public.agents a \
+              WHERE a.public_key = $1",
         )
         .bind(public_key.as_slice())
         .fetch_optional(pool)
@@ -2271,6 +2613,15 @@ impl AgentRepository {
     ///
     /// A bypass viewer sees everything, as everywhere else.
     ///
+    /// The same rule is spelled in two more statements, the agent-lookup card
+    /// and matcher (`agent_lookup.rs::cards_inner` / `match_ranked`), because
+    /// `visibility_lint.rs` requires each viewer-taking statement to carry its
+    /// predicate text. Change all three together:
+    /// `visibility_lint.rs::the_agent_profile_rule_is_one_text_at_every_site`
+    /// fails while their text or bind order differs, and
+    /// `agent_lookup.rs::the_three_copies_of_the_profile_rule_decide_alike`
+    /// (epigraph-db tests) while their decisions do.
+    ///
     /// The decision is made in SQL, in the same round trip as the row, so there
     /// is no window in which the caller holds the PII and has not yet decided
     /// whether it may show it.
@@ -2352,6 +2703,52 @@ impl AgentRepository {
         ))
     }
 
+    /// The ids among `ids` whose profile DETAILS (`orcid`, `ror_id`,
+    /// `properties`) `viewer` may see, by [`Self::get_public_profile`]'s rule:
+    /// a bypass viewer, a `public` profile, the viewer itself, or a live group
+    /// membership the viewer shares. Ids that name no agent are absent.
+    ///
+    /// For the routes that read whole `Agent` rows (`GET /api/v1/agents` and
+    /// `/api/v1/agents/:id`) and must null the detail fields themselves
+    /// (backlog 761c2b05): one round trip for a whole page. Run it on a
+    /// connection stamped from `viewer` (`AppState::read_as`): the shared-group
+    /// arm reads `group_memberships`, which row security hides on an unstamped
+    /// connection, so a raw-pool call answers "not visible" for a shared group.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn profile_details_visible<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT a.id
+            FROM agents a
+            WHERE a.id = ANY($1::uuid[])
+              AND (   $4::bool
+                   OR a.profile_visibility = 'public'
+                   OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
+                   OR EXISTS (SELECT 1 FROM group_memberships gm
+                               WHERE gm.agent_id = a.id
+                                 AND gm.revoked_at IS NULL
+                                 AND gm.group_id = ANY($3::uuid[])))
+            "#,
+        )
+        .bind(ids)
+        .bind(viewer.principal())
+        .bind(viewer.group_bind().unwrap_or(&[]))
+        .bind(viewer.bypass_bind())
+        .fetch_all(executor)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// The agent's public key, but **only** when it is a real Ed25519 verifier.
     ///
     /// Returns `None` both for an unknown agent and for one whose `public_key`
@@ -2375,6 +2772,31 @@ impl AgentRepository {
             sqlx::query_as("SELECT public_key FROM agents WHERE id = $1 AND key_kind = 'ed25519'")
                 .bind(id)
                 .fetch_optional(&mut *conn)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// The `key_kind` of the agent whose `public_key` is `public_key`, or
+    /// `None` when no agent holds those bytes (`agents_public_key_unique`
+    /// makes the holder unique).
+    ///
+    /// For a verifier that holds KEY BYTES rather than an agent id (the
+    /// signer key `verify_claim` resolves through `claims.signer_id`, the
+    /// `client_id` of an agent OAuth client): only `Some("ed25519")` is a
+    /// signature verifier. `derived` and [`KEY_KIND_SEED_DERIVED`] are not,
+    /// exactly as [`Self::public_key_if_signer`] decides for an id.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(executor, public_key))]
+    pub async fn key_kind_of_public_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        public_key: &[u8],
+    ) -> Result<Option<String>, DbError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT key_kind::text FROM agents WHERE public_key = $1")
+                .bind(public_key)
+                .fetch_optional(executor)
                 .await?;
         Ok(row.map(|r| r.0))
     }

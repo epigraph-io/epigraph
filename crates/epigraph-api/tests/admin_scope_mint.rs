@@ -12,10 +12,11 @@
 //! one failure. UNARMED, every token keeps it and the database records one
 //! `oauth.admin_scope_would_strip` event per client, naming the grant.
 //!
-//! The paths that HAND OUT scopes follow the same switch: client approval
-//! (`POST /api/v1/admin/clients/:id/approve`) refuses an admin-only scope
-//! while armed and approves it while unarmed, and never grants
-//! `platform:admin`; registration (`POST /oauth/register`) refuses a request
+//! The paths that HAND OUT scopes follow the same switch: the client-approval
+//! route (`POST /api/v1/admin/clients/:id/approve`) refuses an admin-only
+//! scope while armed and `platform:admin` always, and otherwise answers 501
+//! (approval is `epigraph-operator approve-client` since migration 188);
+//! registration (`POST /oauth/register`) refuses a request
 //! that names one while armed (it never grants one either way).
 //!
 //! Every request is served on a pool whose connections run as the deployed

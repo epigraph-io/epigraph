@@ -340,6 +340,23 @@ pub struct AppState {
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
     #[cfg(feature = "db")]
     pub bp_apply: BpApply,
+    /// The permits that bound concurrent `POST /api/v1/bp/propagate` runs
+    /// (backlog b02347c6). A run is CPU-bound on tokio's blocking pool, whose
+    /// ceiling (512 threads by default) every other blocking user in the
+    /// process shares; a run that finds no permit is refused (503) rather
+    /// than queued. [`BP_MAX_CONCURRENT_DEFAULT`] in every constructor;
+    /// `bin/server.rs` sets it from [`BP_MAX_CONCURRENT_ENV`] at boot.
+    #[cfg(feature = "db")]
+    pub bp_runs: Arc<tokio::sync::Semaphore>,
+    /// What a textless BBA write aimed at a compound does
+    /// (`EPIGRAPH_COMPOUND_WRITE_GUARD`, `epigraph_engine::compound_write_guard`;
+    /// read by `POST /api/v1/frames/:id/evidence` and
+    /// `POST /api/v1/claims/:id/assess`). Every constructor takes the mode this
+    /// process read at startup (`belief_modes::current`), the value `/health`
+    /// reports, so no boot step can forget to set it;
+    /// [`Self::with_compound_write_guard`] overrides it (tests).
+    #[cfg(feature = "db")]
+    pub compound_write_guard: epigraph_engine::belief_modes::CompoundWriteGuard,
     /// Whether the anonymous guest reads under `/api/v1/guest/` answer
     /// (`routes/guest.rs`). OFF in every constructor, where each guest route
     /// answers a bare 404 as if it were not routed; `bin/server.rs` sets it
@@ -390,6 +407,13 @@ pub struct AppState {
     /// Optional: When None, rate limiting is disabled.
     /// Uses per-agent and global rate limits based on token bucket algorithm.
     pub rate_limiter: Option<AgentRateLimiter>,
+    /// The per-address limiter (backlog 20210eaa), layered OUTSIDE the bearer
+    /// layers and routing (`middleware::rate_limit::address_rate_limit_middleware`),
+    /// so a 401 and an unknown-path 404 are counted, and a refused request
+    /// costs no token verification or database read. `None` in every
+    /// constructor; `bin/server.rs` sets it from
+    /// `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` (`RateLimitSettings::build_address`).
+    pub address_rate_limiter: Option<AgentRateLimiter>,
     /// Security audit log for tracking security-relevant events
     ///
     /// This log captures authentication attempts, signature verifications,
@@ -475,6 +499,12 @@ pub struct AppState {
     /// but external `grant_type=*` requests return 400 unsupported_grant_type.
     pub providers: Arc<ProviderRegistry>,
 
+    /// The operator's extra OAuth redirect origins
+    /// (`crate::oauth::redirect::REDIRECT_ORIGINS_ENV`), which
+    /// `/oauth/register` accepts beside the built-in hosted and loopback
+    /// classes. EMPTY in every constructor; `bin/server.rs` sets it at boot.
+    pub oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins,
+
     /// entity_types registry cache: `type_name` -> resolved [`EntityTypeEntry`].
     ///
     /// The single source of truth (in-process) for BOTH edge entity-type
@@ -533,6 +563,39 @@ pub use epigraph_engine::belief_modes::BpApply;
 /// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
 pub const BP_APPLY_ENV: &str = BpApply::ENV;
 
+/// How many `POST /api/v1/bp/propagate` runs may be in flight at once when
+/// [`BP_MAX_CONCURRENT_ENV`] is unset ([`AppState::bp_runs`]).
+#[cfg(feature = "db")]
+pub const BP_MAX_CONCURRENT_DEFAULT: usize = 2;
+
+/// The environment variable `bin/server.rs` reads the BP concurrency limit
+/// from: a non-negative integer, read once at boot.
+#[cfg(feature = "db")]
+pub const BP_MAX_CONCURRENT_ENV: &str = "EPIGRAPH_BP_MAX_CONCURRENT";
+
+/// Parse a [`BP_MAX_CONCURRENT_ENV`] value: `Some(limit)` for a
+/// non-negative integer the runtime's semaphore can hold, `None` for
+/// anything else. A value above `tokio::sync::Semaphore::MAX_PERMITS`
+/// parses as a `usize` but would panic `Semaphore::new` at boot, so it is
+/// refused here like any other bad value and the caller uses the default.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn parse_bp_max_concurrent(raw: &str) -> Option<usize> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit <= tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+/// The semaphore behind [`AppState::bp_runs`] for `limit` concurrent runs,
+/// clamped to `tokio::sync::Semaphore::MAX_PERMITS` so no limit panics.
+#[cfg(feature = "db")]
+fn bp_runs_semaphore(limit: usize) -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(
+        limit.min(tokio::sync::Semaphore::MAX_PERMITS),
+    ))
+}
+
 /// The environment variable that switches the guest reads on:
 /// `EPIGRAPH_GUEST_READS`.
 pub const GUEST_READS_ENV: &str = "EPIGRAPH_GUEST_READS";
@@ -577,6 +640,42 @@ impl GuestReads {
         raw.map(str::trim).is_some_and(|v| {
             !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
         })
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod bp_max_concurrent_tests {
+    use super::{bp_runs_semaphore, parse_bp_max_concurrent};
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn a_limit_the_semaphore_can_hold_parses() {
+        assert_eq!(parse_bp_max_concurrent("0"), Some(0));
+        assert_eq!(parse_bp_max_concurrent(" 2 "), Some(2));
+        let max = Semaphore::MAX_PERMITS.to_string();
+        assert_eq!(parse_bp_max_concurrent(&max), Some(Semaphore::MAX_PERMITS));
+    }
+
+    /// A value above the semaphore's limit is a valid `usize`, so a bare
+    /// `parse::<usize>()` accepted it and `Semaphore::new` panicked at boot
+    /// instead of the documented "warn and use the default".
+    #[test]
+    fn a_limit_above_the_semaphore_maximum_is_refused_not_a_boot_panic() {
+        let over = (Semaphore::MAX_PERMITS + 1).to_string();
+        assert_eq!(parse_bp_max_concurrent(&over), None, "{over}");
+        assert_eq!(parse_bp_max_concurrent(&usize::MAX.to_string()), None);
+        for bad in ["", "-1", "two", "2.0"] {
+            assert_eq!(parse_bp_max_concurrent(bad), None, "{bad:?}");
+        }
+    }
+
+    /// `with_bp_max_concurrent` is public: a caller that skips the parser
+    /// gets the semaphore's maximum, not a panic.
+    #[test]
+    fn the_semaphore_clamps_an_oversized_limit() {
+        let sem = bp_runs_semaphore(usize::MAX);
+        assert_eq!(sem.available_permits(), Semaphore::MAX_PERMITS);
+        assert_eq!(bp_runs_semaphore(2).available_permits(), 2);
     }
 }
 
@@ -785,6 +884,18 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // migration that creates them, on the same precedent; their policies
     // inherit the workflow row's tenancy.
     "workflow_outcome_reports",
+    // A workflow's recorded runs (240, backlog 88cf603b): given their
+    // workflow's tenancy columns and FORCEd by that migration, on the same
+    // precedent. Apply 240 before or with a binary carrying this name.
+    "behavioral_executions",
+    // Team-group invitations (263, backlog triage T75), FORCEd by the
+    // migration that creates them, on the same precedent; privileged
+    // policies only, read through `epigraph_my_group_invitations`.
+    "group_invitations",
+    // Paper rows (246, backlog 34864fb5): given tenancy columns and FORCEd by
+    // that migration, on the same precedent. Apply 246 before or with a binary
+    // carrying this name.
+    "papers",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
@@ -1263,6 +1374,38 @@ const MIGRATION_210_MARKERS: &[&str] = &[
     "epigraph_atlas_map_stale_row",
 ];
 
+/// The tenancy triggers **migration 240** (backlog 88cf603b) adds, as
+/// `(relation, trigger)`: the stamp that gives a `behavioral_executions` run
+/// its workflow's pair at INSERT, and the two triggers that re-stamp the runs
+/// when their `workflows` row or flat workflow claim changes its pair. A
+/// dropped follow trigger is the silent case: the runs of a narrowed workflow
+/// stay readable to its old readers, and nothing errors.
+///
+/// Required **only when one of [`MIGRATION_240_MARKERS`] exists**, for the
+/// reasons [`TENANCY_TRIGGERS_089`] gives.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_240: &[(&str, &str)] = &[
+    (
+        "behavioral_executions",
+        "behavioral_executions_inherit_tenancy",
+    ),
+    (
+        "workflows",
+        "workflows_behavioral_executions_inherit_tenancy",
+    ),
+    ("claims", "claims_behavioral_executions_inherit_tenancy"),
+];
+
+/// The markers that migration 240 has run: the three functions its triggers
+/// use. Any one present means 240 ran; its documented undo
+/// (`docs/runbooks/240-undo.sql`) drops all three.
+#[cfg(feature = "db")]
+const MIGRATION_240_MARKERS: &[&str] = &[
+    "epigraph_behavioral_execution_inherit_tenancy",
+    "epigraph_workflow_behavioral_executions_follow",
+    "epigraph_claim_behavioral_executions_follow",
+];
+
 impl AppState {
     /// Create new application state with the given configuration (no database)
     #[cfg(not(feature = "db"))]
@@ -1276,6 +1419,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1289,6 +1433,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
         }
     }
 
@@ -1325,6 +1470,8 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard(),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1333,6 +1480,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1346,6 +1494,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -1366,6 +1515,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1379,6 +1529,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
         }
     }
 
@@ -1441,6 +1592,27 @@ impl AppState {
     #[must_use]
     pub fn with_bp_apply(mut self, bp_apply: BpApply) -> Self {
         self.bp_apply = bp_apply;
+        self
+    }
+
+    /// Set how many `POST /api/v1/bp/propagate` runs may be in flight at
+    /// once; see [`Self::bp_runs`]. `0` refuses every run.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_bp_max_concurrent(mut self, limit: usize) -> Self {
+        self.bp_runs = bp_runs_semaphore(limit);
+        self
+    }
+
+    /// Set what a textless BBA write aimed at a compound does; see
+    /// [`Self::compound_write_guard`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_compound_write_guard(
+        mut self,
+        guard: epigraph_engine::belief_modes::CompoundWriteGuard,
+    ) -> Self {
+        self.compound_write_guard = guard;
         self
     }
 
@@ -1916,6 +2088,8 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard(),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1924,6 +2098,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1937,6 +2112,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -1959,6 +2135,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::new(propagation_config),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1972,6 +2149,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
         }
     }
 
@@ -1997,6 +2175,8 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard(),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -2005,6 +2185,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::new(propagation_config),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -2018,6 +2199,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -2025,16 +2207,24 @@ impl AppState {
         }
     }
 
-    /// Default JWT config from env var or dev fallback.
+    /// Default JWT config from the environment
+    /// ([`epigraph_auth::JwtConfig::from_kernel_env`]): EdDSA when
+    /// `EPIGRAPH_JWT_SIGNING_KEY` is set (with `EPIGRAPH_JWT_SECRET`, if set,
+    /// as the accept-only HS256 window), else HS256 from the secret or the
+    /// dev fallback.
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
-        // NOTE: intentionally NOT fail-closed. This is called by test/builder
-        // constructors; the production gate lives in bin/server.rs::main behind
-        // EPIGRAPH_ALLOW_INSECURE_SECRET. See epigraph_auth::assert_production_secret.
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET").unwrap_or_else(|_| {
-            String::from_utf8(epigraph_auth::DEV_JWT_SECRET.to_vec())
-                .expect("DEV_JWT_SECRET is valid UTF-8")
-        });
-        Arc::new(crate::oauth::JwtConfig::from_secret(secret.as_bytes()))
+        // NOTE: the dev fallback is intentionally NOT fail-closed. This is
+        // called by test/builder constructors; the production gate lives in
+        // bin/server.rs::main (`epigraph_auth::check_kernel_jwt_keys`), which
+        // refuses a malformed signing key before any state is built, so the
+        // panic below is unreachable from the server binary. A malformed key
+        // must never fall back to shared-secret signing.
+        let signing_key = std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR).ok();
+        let secret = std::env::var("EPIGRAPH_JWT_SECRET").ok();
+        let config =
+            crate::oauth::JwtConfig::from_kernel_env(signing_key.as_deref(), secret.as_deref())
+                .unwrap_or_else(|reason| panic!("FATAL: {reason}"));
+        Arc::new(config)
     }
 
     /// The admin-scope switch for one request (elevation plan EL-10): read on
@@ -2156,6 +2346,9 @@ impl AppState {
     ///     same reasoning.
     ///   * [`TENANCY_TRIGGERS_210`] is required only once any of
     ///     [`MIGRATION_210_MARKERS`] — 210's staleness functions — is present.
+    ///   * [`TENANCY_TRIGGERS_240`] is required only once any of
+    ///     [`MIGRATION_240_MARKERS`] — 240's stamp and follow functions — is
+    ///     present.
     ///
     /// A trigger whose *table* does not exist is not required — 070 and 074
     /// both guard their `CREATE TRIGGER` with `IF EXISTS (… relkind = 'r')`, so
@@ -2207,6 +2400,7 @@ impl AppState {
                 .chain(TENANCY_TRIGGERS_089.iter())
                 .chain(TENANCY_TRIGGERS_173.iter())
                 .chain(TENANCY_TRIGGERS_210.iter())
+                .chain(TENANCY_TRIGGERS_240.iter())
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
@@ -2221,7 +2415,7 @@ impl AppState {
         // can never fire. `pg_proc`, not `_sqlx_migrations`: the catalog is what
         // the trigger actually lives in, and a hand-edited migrations table
         // would otherwise decide a safety check.
-        // One read for every marker-gated tier (089's, 173's and 210's), so the boot
+        // One read for every marker-gated tier (089's, 173's, 210's and 240's), so the boot
         // check keeps a single catalog probe.
         let markers: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT p.proname::text FROM pg_proc p \
@@ -2232,6 +2426,7 @@ impl AppState {
             std::iter::once(MIGRATION_089_MARKER)
                 .chain(MIGRATION_173_MARKERS.iter().copied())
                 .chain(MIGRATION_210_MARKERS.iter().copied())
+                .chain(MIGRATION_240_MARKERS.iter().copied())
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
         )
@@ -2244,6 +2439,9 @@ impl AppState {
         let migration_210_applied = markers
             .iter()
             .any(|m| MIGRATION_210_MARKERS.contains(&m.as_str()));
+        let migration_240_applied = markers
+            .iter()
+            .any(|m| MIGRATION_240_MARKERS.contains(&m.as_str()));
 
         // 074 ran iff `claims_block_widening` is installed. It is created in
         // section 4, ahead of section 5's `DROP DEFAULT`, so this marker cannot
@@ -2262,6 +2460,9 @@ impl AppState {
         }
         if migration_210_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_210);
+        }
+        if migration_240_applied {
+            required.extend_from_slice(TENANCY_TRIGGERS_240);
         }
 
         let mut missing: Vec<String> = Vec::new();
@@ -2319,6 +2520,7 @@ impl AppState {
             migration_089_applied,
             migration_173_applied,
             migration_210_applied,
+            migration_240_applied,
             "tenancy triggers armed"
         );
         Ok(())
@@ -2603,6 +2805,13 @@ impl AppState {
         self
     }
 
+    /// Set the per-address limiter; see [`Self::address_rate_limiter`].
+    #[must_use]
+    pub fn with_address_rate_limiter(mut self, limiter: AgentRateLimiter) -> Self {
+        self.address_rate_limiter = Some(limiter);
+        self
+    }
+
     /// Set the embedding service for this state (builder pattern)
     ///
     /// When an embedding service is configured, semantic search will use it
@@ -2649,7 +2858,9 @@ impl AppState {
     }
 
     /// Whether this process's embedding provider may write the stored vector
-    /// columns (`claims.embedding`, `evidence.embedding`): the rule
+    /// columns (`claims.embedding`, `evidence.embedding`,
+    /// `workflows.goal_embedding`, `behavioral_executions.goal_embedding`,
+    /// `methods.embedding`; backlog 21b7319a): the rule
     /// [`EmbeddingProviderKind::may_restore_claim_embeddings`] states for the
     /// job handler, applied to the request-serving write paths too (backlog
     /// 211bd623). `true` when no provider was declared.
@@ -2662,9 +2873,9 @@ impl AppState {
         )
     }
 
-    /// The embedding service for a vector that will be STORED on a claim or
-    /// evidence row, or `None` when there is no service or its provider does
-    /// not own those columns.
+    /// The embedding service for a vector that will be STORED (on a claim,
+    /// evidence, workflow, behavioral-execution or method row), or `None` when
+    /// there is no service or its provider does not own those columns.
     ///
     /// `embedding_service_from_env` falls through OpenAI, Jina and a mock, and
     /// only the job handler was told which one it got. An API process started
@@ -2701,6 +2912,17 @@ impl AppState {
     #[must_use]
     pub fn with_policy_gate(mut self, gate: SharedPolicyGate) -> Self {
         self.policy_gate = gate;
+        self
+    }
+
+    /// Set the extra OAuth redirect origins; see
+    /// [`Self::oauth_redirect_origins`].
+    #[must_use]
+    pub fn with_oauth_redirect_origins(
+        mut self,
+        origins: crate::oauth::redirect::RedirectOrigins,
+    ) -> Self {
+        self.oauth_redirect_origins = origins;
         self
     }
 

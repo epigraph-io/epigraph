@@ -455,6 +455,13 @@ async fn atlas_page_signed_in_is_a_shell_without_inline_script_or_style() {
     assert!(body.contains(r#"data-layout-url="/explorer/bff/atlas/layout""#));
     assert!(body.contains(r#"data-resolve-prefix="/explorer/bff/atlas/resolve/""#));
     assert!(body.contains(r#"data-themes-url="/explorer/bff/themes""#));
+    assert!(body.contains(r#"data-sources-url="/explorer/bff/atlas/sources""#));
+    assert!(body.contains(r#"data-timeline-url="/explorer/bff/atlas/timeline""#));
+    // The view rules load before atlas.js reads them, content-hashed.
+    let views = body
+        .find("src=\"/explorer/static/atlas_views.js?v=")
+        .expect("atlas_views.js is loaded and hashed");
+    assert!(views < body.find("src=\"/explorer/static/atlas.js").unwrap());
     // With no map list the page lays out as before: the nested leaf legend
     // takes no row (hidden, not just invisible) and the controls are hidden.
     assert!(!body.contains("data-atlas-maps"));
@@ -540,6 +547,22 @@ async fn every_atlas_route_is_built_at_both_mounts() {
                   "items": [link_item(E1, "supports", C1, C2)], "next": null})),
     )
     .await;
+    mount_get(
+        &app,
+        "/api/v1/sources/overview",
+        ok(
+            json!({"sources": [{"kind": "agent", "id": AGENT, "display_name": "A",
+                               "claim_count": 1}], "next_cursor": null}),
+        ),
+    )
+    .await;
+    mount_get(
+        &app,
+        "/api/v1/claims",
+        ok(json!({"claims": [], "total": 0, "limit": 100, "offset": 0,
+                  "next_cursor": null, "links": [], "links_truncated": false})),
+    )
+    .await;
     let sid = app.sign_in("tok");
 
     for base in ["/explorer", ""] {
@@ -559,6 +582,8 @@ async fn every_atlas_route_is_built_at_both_mounts() {
             format!("/bff/atlas/links?from={T}&to={T2}"),
             "/bff/atlas/search?q=water".to_string(),
             format!("/bff/atlas/resolve/c-{}", simple(C1)),
+            format!("/bff/atlas/sources?theme_id={T}"),
+            format!("/bff/atlas/timeline?theme_id={T}"),
         ] {
             let uri = format!("{base}{route}");
             let res = app.get_as(&uri, &sid).await;
@@ -592,6 +617,8 @@ async fn atlas_bff_routes_require_sign_in() {
         format!("/explorer/bff/atlas/links?from={T}&to={T2}"),
         "/explorer/bff/atlas/search?q=x".to_string(),
         format!("/explorer/bff/atlas/resolve/c-{}", simple(C1)),
+        format!("/explorer/bff/atlas/sources?theme_id={T}"),
+        format!("/explorer/bff/atlas/timeline?theme_id={T}"),
     ] {
         let res = app.get(&uri).await;
         assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{uri}");
@@ -2662,6 +2689,123 @@ fn atlas_js_nested_claim_links_never_invent_a_node() {
     assert!(nested.contains("NESTED.findClaimLeaf("));
     assert!(!nested.contains("makeNode("), "no stand-in node");
     assert!(!nested.contains("cfg.themeClaims"), "no claim-list read");
+}
+
+/// A cold claim link (a `#c-` hash or a search pick, both through
+/// `goToResolved`) into a nested theme asks the claim-to-leaf route when no
+/// fetched leaf draws the claim, then fetches that leaf: the page reads
+/// `data-atlas-claim-leaf-url` as a prefix and `goToNestedClaim` hands it to
+/// `NESTED.lookupClaimLeaf` (tested with a stubbed getter in
+/// js-tests/atlas_nested.test.cjs) only after the fetched-leaf answer.
+#[test]
+fn atlas_js_cold_claim_link_asks_the_claim_leaf_route() {
+    let js = include_str!("../static/atlas.js");
+    assert!(
+        js.contains(
+            "cfg.claimLeaf = NESTED ? NESTED.localPrefix(root.getAttribute('data-atlas-claim-leaf-url')) : null;"
+        ),
+        "the page reads the lookup prefix from the shell"
+    );
+    let start = js
+        .find("async function goToNestedClaim(")
+        .expect("goToNestedClaim");
+    let nested = &js[start..start + js[start..].find("\n  }\n").expect("its end")];
+    let fetched = nested
+        .find("NESTED.findClaimLeaf(")
+        .expect("the fetched leaves answer first");
+    let lookup = nested
+        .find("NESTED.lookupClaimLeaf(")
+        .expect("then the claim-to-leaf route");
+    assert!(fetched < lookup, "the free answer comes first");
+    assert!(nested[lookup..].contains("cfg.claimLeaf, NS.map, NS.hierarchy, claimId"));
+    let no_url = nested
+        .find("if (!doc && !cfg.claimLeaf) {")
+        .expect("a page without the lookup does not claim the claim is off the map");
+    assert!(fetched < no_url && no_url < lookup);
+    // The theme to attach under is the tested NESTED.coldClaimHome decision
+    // (js-tests/atlas_nested.test.cjs): the picked map's place, not resolve.
+    let landing = nested
+        .find("NESTED.coldClaimHome(theme, place, ")
+        .expect("the route's answer picks the home theme");
+    assert!(nested[landing..].contains("home = landing.home;"));
+    let leaf = nested
+        .find("fetchLevel(place.level_id, 'leaf', NS.hierarchy)")
+        .expect("the named leaf is fetched as a leaf");
+    let chain = nested
+        .rfind("attachChain(home, doc)")
+        .expect("and attached with its breadcrumb chain");
+    assert!(lookup < landing && landing < leaf && leaf < chain);
+    // Both entry points reach it: a #c- hash and a search pick resolve, then
+    // hand a nested theme's claim to goToNestedClaim.
+    let pick = &js[js.find("function pick(").expect("pick")..];
+    assert!(pick[..pick.find("\n  }\n").unwrap()].contains("followClaim(r.claim_id)"));
+    for f in ["async function followClaim(", "async function followHash("] {
+        let body = &js[js.find(f).expect(f)..];
+        assert!(body[..body.find("\n  }\n").unwrap()].contains("await goToResolved(res)"));
+    }
+}
+
+/// A theme's panel offers Sources and Timeline (P3b, P3c) from the page's
+/// `data-sources-url` and `data-timeline-url`, through the tested rules in
+/// static/atlas_views.js, and the timeline lane is SVG built element by
+/// element (the parse-free rule of `atlas_js_never_parses_strings_as_code_or_html`
+/// still holds for the whole file).
+#[test]
+fn atlas_js_theme_panel_offers_sources_and_timeline() {
+    let js = include_str!("../static/atlas.js");
+    for needed in [
+        "['sources', 'data-sources-url'],",
+        "['timeline', 'data-timeline-url'],",
+        "const VIEWS = window.AtlasViews || null;",
+    ] {
+        assert!(js.contains(needed), "atlas.js reads {needed}");
+    }
+    let body = |name: &str| -> &str {
+        let start = js.find(name).unwrap_or_else(|| panic!("{name}"));
+        &js[start..start + js[start..].find("\n  }\n").expect("its end")]
+    };
+    let panel = body("function showNodePanel(");
+    let offer = panel
+        .find("if (node.kind === 'theme') themeViewButtons(node);")
+        .expect("a theme panel offers the views");
+    let off_map = panel.find("if (node.offMap)").expect("off-map gate");
+    assert!(off_map < offer, "a theme not on the map offers nothing");
+    let buttons = body("function themeViewButtons(");
+    let gate = buttons
+        .find("if (NS.on) return;")
+        .expect("no viewer-own claim reads under a map list");
+    assert!(gate < buttons.find("showSourcesPanel(theme)").unwrap());
+    assert!(gate < buttons.find("showTimelinePanel(theme)").unwrap());
+    // The two panels are the only readers of their routes.
+    assert_eq!(js.matches("VIEWS.sourcesUrl(").count(), 1);
+    assert_eq!(js.matches("VIEWS.timelineUrl(").count(), 1);
+    assert_eq!(
+        js.matches("showSourcesPanel(theme)").count(),
+        3,
+        "its definition, the button and the retry"
+    );
+    assert_eq!(
+        js.matches("showTimelinePanel(theme)").count(),
+        3,
+        "its definition, the button and the retry"
+    );
+    let sources = body("function showSourcesPanel(");
+    assert!(sources.contains("VIEWS.sourcesUrl(cfg.sources, theme.id, after)"));
+    assert!(sources.contains("VIEWS.sourceGroups(all)"));
+    assert!(
+        sources.contains("doiHref(it.href)"),
+        "a paper links out only through doiHref"
+    );
+    let timeline = body("function showTimelinePanel(");
+    assert!(timeline.contains("VIEWS.timelineUrl(cfg.timeline, theme.id, after)"));
+    assert!(timeline.contains("VIEWS.mergePages(page, body)"));
+    let draw = body("function drawTimeline(");
+    assert!(draw.contains("VIEWS.timelineLayout("));
+    assert!(
+        draw.contains("followClaim(d.id)"),
+        "a dot opens its claim on the map"
+    );
+    assert!(body("function svgEl(").contains("document.createElementNS(SVG_NS, tag)"));
 }
 
 /// The leaf legend is un-hidden only once the page has a map list, and in

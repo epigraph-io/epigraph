@@ -413,6 +413,118 @@ async fn evolve_step_revises_refuses_when_the_lineage_back_fill_changes_no_row(p
     );
 }
 
+/// The `supersedes` twin of the test above (PR #738 test-lens follow-up (h)).
+/// A `supersedes` step RETIRES its parent before the lineage back-fill runs,
+/// so a refused back-fill must leave that retire uncommitted: the parent
+/// stays current, keeps no lineage, and no successor or edge is written. The
+/// stand-in skips only the lineage change, so the retire itself lands and
+/// the refusal is the back-fill's (its `action`), not the retire's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_refuses_and_keeps_the_parent_current_when_the_lineage_back_fill_changes_no_row(
+    pool: PgPool,
+) {
+    let agent = seed_agent(&pool).await;
+    let parent = seed_claim(
+        &pool,
+        agent,
+        "superseded parent whose lineage cannot be back-filled",
+        0.7,
+    )
+    .await;
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION aaa_test_skip_lineage_backfill() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NULL; END $$; \
+         CREATE TRIGGER aaa_test_skip_lineage_backfill BEFORE UPDATE ON claims FOR EACH ROW \
+         WHEN (OLD.id = '{parent}'::uuid \
+               AND NEW.step_lineage_id IS DISTINCT FROM OLD.step_lineage_id) \
+         EXECUTE FUNCTION aaa_test_skip_lineage_backfill();"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the back-fill stand-in");
+
+    // The pool form, which rolls its transaction back on an error as every
+    // request caller of `evolve_step_conn` does (they return before commit).
+    // The retire has already run on that transaction when the back-fill is
+    // refused, so only the rollback keeps the parent current; a caller that
+    // committed after the error would keep the retire.
+    let content = "successor of a parent whose lineage cannot be back-filled";
+    let r = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(parent),
+        content,
+        "supersedes",
+        Some("unbackfillable"),
+        2,
+        agent,
+    )
+    .await;
+
+    let err =
+        r.expect_err("a successor whose parent's lineage back-fill changed no row must not evolve");
+    assert!(
+        matches!(
+            &err,
+            epigraph_db::DbError::WriteRefused { id, action, .. }
+                if *id == parent && action == "evolve_step lineage back-fill"
+        ),
+        "the zero-row back-fill is refused as such, naming the parent; got: {err:?}"
+    );
+    let successors: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(successors, 0, "no successor was written");
+    let edges: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE target_id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(edges, 0, "no supersedes edge was inserted");
+    let (still_current, lineage): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, step_lineage_id FROM claims WHERE id = $1")
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        still_current,
+        "the retire that ran before the refused back-fill was undone with it"
+    );
+    assert_eq!(lineage, None, "the parent still has no lineage");
+
+    // Control: without the stand-in the same supersede lands, retiring the
+    // parent and back-filling its lineage onto it and its successor.
+    sqlx::raw_sql("DROP TRIGGER aaa_test_skip_lineage_backfill ON claims")
+        .execute(&pool)
+        .await
+        .expect("drop the stand-in");
+    let ok = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(parent),
+        content,
+        "supersedes",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("the same supersede evolves once the back-fill can land");
+    let (is_current, lineage): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, step_lineage_id FROM claims WHERE id = $1")
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!is_current, "the control retires the parent");
+    assert_eq!(
+        lineage,
+        Some(ok.step_lineage_id),
+        "parent and successor share one lineage"
+    );
+}
+
 // ── evolve_step(supersedes) and the supersede edge cascade (backlog 8d3b4527) ──
 //
 // evolve_step(supersedes) retires a step and writes its successor, but the

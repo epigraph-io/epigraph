@@ -156,8 +156,13 @@ fn refuse_outside_ceiling(
 /// any viewer exists, whether the verified token yields a principal at all,
 /// and every function it composes is an app-executable `SECURITY DEFINER`
 /// read that does not depend on the session's stamp.
+///
+/// `POST /oauth/introspect` asks the same question through this function
+/// (backlog 8d6c886f), so an RFC 7662 consumer and the API itself cannot
+/// disagree about a delegated token: a refusal here is `active: false` there,
+/// and a 503 here is a 503 there.
 #[cfg(feature = "db")]
-async fn admit_delegated(
+pub(crate) async fn admit_delegated(
     state: &AppState,
     auth: &AuthContext,
     extensions: &mut axum::http::Extensions,
@@ -225,7 +230,7 @@ async fn admit_delegated(
 /// refuses every delegated run token (fails closed) and admits every other
 /// token unchanged.
 #[cfg(not(feature = "db"))]
-async fn admit_delegated(
+pub(crate) async fn admit_delegated(
     _state: &AppState,
     auth: &AuthContext,
     _extensions: &mut axum::http::Extensions,
@@ -406,9 +411,14 @@ require_scope_extractor!(RequireScopeAdmin, "claims:admin");
 require_scope_extractor!(RequireScopeWrite, "claims:write");
 require_scope_extractor!(RequireScopeWebhooksWrite, "webhooks:write");
 // Group management. `groups:write` creates a group (the creator becomes its sole
-// admin); `groups:admin` manages an EXISTING group's membership and is checked
-// alongside a live `role='admin'` membership in that group
-// (`middleware::group_authz::require_group_admin_conn`) — scope AND membership.
+// admin); `groups:admin` manages an EXISTING keyed or community group's
+// membership and is checked alongside a live `role='admin'` membership in that
+// group (`middleware::group_authz::require_group_admin_conn`) — scope AND
+// membership. One exception: the consented invitations of a Person-made
+// keyless team group (`routes::team_groups`, migration 263) take
+// `groups:write` for invite, accept and decline, because an invitation places
+// no one (the invitee's own accept does) and the definer re-checks the
+// inviter's live admin row itself.
 // Using the extractor rather than `check_scopes` inside the handler matters
 // here: these routes take a `Json` body, and an extractor rejection runs before
 // body parsing, so a scope failure is 403 rather than 422 (issue #128).

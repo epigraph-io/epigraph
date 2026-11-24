@@ -1,17 +1,16 @@
 //! T2 — real DB compute-on-read validation for the perspectival-demo.
 //!
-//! Records the discriminating treatment-c-cluster BBAs into a dev epigraph DB,
+//! Records the discriminating treatment-c-cluster BBAs into a fresh database,
 //! sets per-perspective `source_reliability`, then calls the REAL
 //! `belief_query::get_perspective_belief` (full compute-on-read path:
 //! effective_source_strength_with_perspective -> combine_multiple -> pignistic)
-//! and asserts it reproduces the demo's scripts/verify_beliefs.py.
+//! and asserts it reproduces the demo's Python model (`verify_beliefs.py`).
+//! `epigraph-ds/tests/perspectival_seed_validation.rs` pins the same numbers on
+//! the DS math alone; this copy pins them through the database read path.
 //!
-//! Run:
-//!   DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_demo_dev \
-//!   SQLX_OFFLINE=true cargo test -p epigraph-engine --test perspectival_demo_t2 -- --nocapture
-//!
-//! Leaves its rows in the dev DB for inspection (frames/claims/perspectives
-//! suffixed with a per-run id so re-runs don't collide).
+//! A `#[sqlx::test]`: it seeds everything it reads into its own database, so it
+//! runs in every gate. (It used to be `#[ignore]`d as needing a seed directory
+//! and a dedicated dev database; it never read a seed directory.)
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -21,13 +20,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
 use epigraph_ds::{FocalElement, FrameOfDiscernment, MassFunction};
 use uuid::Uuid;
-
-async fn get_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPool::connect(&url).await.ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-    Some(pool)
-}
 
 async fn insert_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
@@ -126,13 +118,8 @@ async fn betp(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
         .pignistic_prob
 }
 
-#[tokio::test]
-#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
-async fn t2_real_engine_reproduces_python_model() {
-    let Some(pool) = get_pool().await else {
-        eprintln!("SKIP: DATABASE_URL not set");
-        return;
-    };
+#[sqlx::test(migrations = "../../migrations")]
+async fn t2_real_engine_reproduces_python_model(pool: PgPool) {
     let run = Uuid::new_v4().simple().to_string();
     let sfx = &run[..8];
 

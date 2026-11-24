@@ -77,14 +77,19 @@ pub async fn register_endpoint(
     // DB access, so an abusive registration is rejected DB-free (and so the negative
     // test needs no database). This closes the open-redirect / open-registration gap
     // flagged in recon: a redirect_uri that is neither a hosted MCP client's callback
-    // (claude.ai/claude.com) nor an RFC 8252 loopback listener (native clients such as
-    // OpenAI Codex) is refused regardless of client_type. See `oauth::redirect`.
+    // (claude.ai/claude.com), nor on an origin the operator configured
+    // (EPIGRAPH_OAUTH_REDIRECT_ORIGINS), nor an RFC 8252 loopback listener (native
+    // clients such as OpenAI Codex) is refused regardless of client_type. See
+    // `oauth::redirect`.
     if let Some(uris) = req.redirect_uris.as_deref() {
         for u in uris {
-            if crate::oauth::redirect::classify(u).is_none() {
+            if crate::oauth::redirect::classify(u, &state.oauth_redirect_origins).is_none() {
+                // The configured origins are not listed in this anonymous
+                // answer: the allowlist is the operator's, not the caller's.
                 return Err(ApiError::BadRequest {
-                    message: "redirect_uri must be https://claude.ai/, https://claude.com/, or a \
-                              loopback http://127.0.0.1 or http://[::1] callback"
+                    message: "redirect_uri must be https://claude.ai/, https://claude.com/, an \
+                              https origin this server is configured to accept, or a loopback \
+                              http://127.0.0.1 or http://[::1] callback"
                         .to_string(),
                 });
             }
@@ -246,10 +251,10 @@ pub async fn register_endpoint(
                 // `OAuthClientRepository::get_by_client_id` filters
                 // status='active'.
                 //
-                // NOTE the asymmetry with routes/agents.rs, which DOES
-                // auto-activate: that path requires an authenticated caller
-                // holding `agents:write`, which is the admin approval this one
-                // lacks.
+                // routes/agents.rs (POST /api/v1/agents) provisions a client
+                // only on an explicit `login: true`, and ACTIVE only for a
+                // `claims:admin` caller; otherwise it writes this same pending
+                // shape (backlog 2f87eb08: `agents:write` is not an approval).
                 (
                     "pending",
                     epigraph_core::canonical_scopes::AGENT_PROVISION_SCOPES

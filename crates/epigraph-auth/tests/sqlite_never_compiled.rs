@@ -38,9 +38,12 @@
 //!
 //! Blind spot: a third-party crate that enables `sqlx/sqlite` through its OWN
 //! manifest is invisible to both scans (the lockfile records no features).
-//! When a dependency that itself depends on sqlx is added or bumped, re-run
-//! `cargo tree -i libsqlite3-sys -e normal --all-features --target all
-//! --workspace`, which must print nothing.
+//! The `lint` CI job covers it: its step "SQLite is never compiled (resolved
+//! dependency graph)" runs `.github/scripts/sqlite-never-compiled.sh`, which
+//! lists the feature-resolved graph with `cargo tree --workspace
+//! --all-features --target all` (network available there) and fails on
+//! libsqlite3-sys, sqlx-sqlite or rusqlite. Run that script locally after
+//! adding or bumping a dependency that itself depends on sqlx.
 
 use std::path::{Path, PathBuf};
 

@@ -284,6 +284,13 @@ pub const RATE_LIMIT_GLOBAL_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_GLOBAL_RPM";
 /// The reverse proxies whose `X-Forwarded-For` is believed ([`TrustedProxies`]).
 /// Read only to key an installed limiter; it never turns one on.
 pub const TRUSTED_PROXIES_ENV: &str = "EPIGRAPH_TRUSTED_PROXIES";
+/// Requests per minute per client address, counted OUTSIDE authentication
+/// and routing (backlog 20210eaa): every request from one address, a 401, an
+/// unknown-path 404 and an authenticated request alike, is charged to the
+/// address before the bearer layer reads anything. Unset: no per-address
+/// limiter. It is independent of [`RATE_LIMIT_RPM_ENV`] (setting one does not
+/// turn the other on), and [`RATE_LIMIT_ENV`]`=off` turns it off too.
+pub const RATE_LIMIT_ADDRESS_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_ADDRESS_RPM";
 /// [`RATE_LIMIT_RPM_ENV`]'s value when rate limiting is on but no per-bucket
 /// limit was given (`EPIGRAPH_RATE_LIMIT=on`, or only a global limit): 10
 /// requests a second sustained, with a burst of a full minute's worth.
@@ -318,6 +325,10 @@ pub struct RateLimitSettings {
     /// Whose `X-Forwarded-For` is believed. Unset means loopback only (a
     /// reverse proxy on this host); `none` trusts no proxy.
     pub trusted_proxies: TrustedProxies,
+    /// Requests per minute per client address for the per-address limiter
+    /// ([`RATE_LIMIT_ADDRESS_RPM_ENV`]), if configured. [`Self::parse`]
+    /// leaves it `None`; [`Self::with_address_rpm`] sets it.
+    pub per_address_rpm: Option<u32>,
 }
 
 impl RateLimitSettings {
@@ -379,7 +390,21 @@ impl RateLimitSettings {
             per_key_rpm,
             global_rpm,
             trusted_proxies,
+            per_address_rpm: None,
         })
+    }
+
+    /// Add the per-address limit, [`RATE_LIMIT_ADDRESS_RPM_ENV`]'s raw value
+    /// (`None` or blank = unset). A value that is not a positive whole number
+    /// is an error, for the same reason as [`Self::parse`]'s.
+    pub fn with_address_rpm(mut self, raw: Option<&str>) -> Result<Self, String> {
+        self.per_address_rpm = match blank_is_unset(raw) {
+            None => None,
+            Some(v) => Some(v.parse::<u32>().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                format!("{RATE_LIMIT_ADDRESS_RPM_ENV}={v:?} is not a positive whole number")
+            })?),
+        };
+        Ok(self)
     }
 
     /// Read and parse the variables from the process environment.
@@ -390,6 +415,29 @@ impl RateLimitSettings {
             var(RATE_LIMIT_RPM_ENV).as_deref(),
             var(RATE_LIMIT_GLOBAL_RPM_ENV).as_deref(),
             var(TRUSTED_PROXIES_ENV).as_deref(),
+        )?
+        .with_address_rpm(var(RATE_LIMIT_ADDRESS_RPM_ENV).as_deref())
+    }
+
+    /// The per-address limiter (backlog 20210eaa), or `None` when
+    /// [`Self::per_address_rpm`] is unset or [`RATE_LIMIT_ENV`] is `off`.
+    ///
+    /// One bucket per client address ([`TrustedProxies`] decides which
+    /// `X-Forwarded-For` hop that is, as for the principal limiter), no
+    /// global bucket. It is a backstop under the principal limiter, not a
+    /// replacement: every principal behind one address shares this bucket,
+    /// so size it for the busiest address, not for one client.
+    #[must_use]
+    pub fn build_address(&self) -> Option<AgentRateLimiter> {
+        let rpm = self.per_address_rpm.filter(|_| !self.switched_off)?;
+        Some(
+            AgentRateLimiter::new(RateLimitConfig {
+                default_rpm: rpm,
+                global_rpm: u32::MAX,
+                replenish_interval_secs: 1,
+                enable_global_limit: false,
+            })
+            .with_trusted_proxies(self.trusted_proxies.clone()),
         )
     }
 
@@ -432,6 +480,7 @@ impl RateLimitSettings {
             per_key_rpm: DEFAULT_RATE_LIMIT_RPM,
             global_rpm: None,
             trusted_proxies: self.trusted_proxies.clone(),
+            per_address_rpm: None,
         })
     }
 }
@@ -478,6 +527,15 @@ impl BucketMap {
             bucket.tokens < bucket.max_tokens
         });
     }
+}
+
+/// The limit and balance of one rate-limit bucket ([`AgentRateLimiter::quota`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quota {
+    /// Requests a minute the bucket allows (its capacity).
+    pub limit: u32,
+    /// Requests the bucket allows now.
+    pub remaining: u32,
 }
 
 /// Per-agent rate limiter with global limits
@@ -720,9 +778,28 @@ impl AgentRateLimiter {
     /// Get the remaining quota for an agent
     ///
     /// Returns the approximate number of requests the agent can make
-    /// before hitting their limit.
+    /// before hitting their limit. [`Self::quota`]'s `remaining`.
     #[must_use]
     pub fn remaining_quota(&self, agent_id: &AgentId) -> u32 {
+        self.quota(agent_id).remaining
+    }
+
+    /// The limit and the balance of the bucket `agent_id` is charged to, read
+    /// together under one lock, so the two always describe the same bucket.
+    ///
+    /// The bucket is the key's own when it is tracked (its capacity is the
+    /// custom limit [`Self::set_agent_limit`] gave it, else `default_rpm`);
+    /// the shared overflow bucket when it is untracked at the cap (capacity
+    /// `default_rpm`, whatever custom limit the key has, because that is the
+    /// bucket [`Self::check`] charged); and, for a key not tracked yet with
+    /// room to be, the full bucket its first request would get.
+    ///
+    /// The middleware reports this as `X-RateLimit-Limit` and
+    /// `X-RateLimit-Remaining`. Before backlog a65cc870 the limit header was
+    /// always `default_rpm`, so a key with a custom limit was told a limit
+    /// that was not the one throttling it.
+    #[must_use]
+    pub fn quota(&self, agent_id: &AgentId) -> Quota {
         // Limit first, bucket lock second: the order `check_agent` uses. Taking
         // the limits lock while holding the bucket lock inverts
         // `set_agent_limit`'s order and can deadlock against it.
@@ -733,22 +810,31 @@ impl AgentRateLimiter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let buckets = &mut *guard;
 
-        if let Some(bucket) = buckets.map.get_mut(agent_id) {
+        let of = |bucket: &mut TokenBucket| {
             bucket.refill();
-            bucket.tokens as u32
+            Quota {
+                limit: bucket.max_tokens as u32,
+                remaining: bucket.tokens as u32,
+            }
+        };
+        if let Some(bucket) = buckets.map.get_mut(agent_id) {
+            of(bucket)
         } else if buckets.map.len() >= self.max_tracked_keys {
             // An untracked key at the cap is charged to the shared overflow
-            // bucket (`check_agent`), so that bucket's tokens are its quota.
+            // bucket (`check_agent`), so that bucket is its quota.
             match buckets.overflow.as_mut() {
-                Some(bucket) => {
-                    bucket.refill();
-                    bucket.tokens as u32
-                }
-                None => self.config.default_rpm,
+                Some(bucket) => of(bucket),
+                None => Quota {
+                    limit: self.config.default_rpm,
+                    remaining: self.config.default_rpm,
+                },
             }
         } else {
             // Not tracked and room to be: its first request gets a full bucket.
-            limit
+            Quota {
+                limit,
+                remaining: limit,
+            }
         }
     }
 
@@ -958,6 +1044,59 @@ mod tests {
             0,
             "an overflow-charged key whose shared bucket is spent has no quota left"
         );
+    }
+
+    /// a65cc870: the quota reports the limit of the bucket the key was
+    /// charged to, not `default_rpm`. A tracked key with a custom limit has
+    /// that limit; the same custom-limit key, untracked at the cap, is charged
+    /// to the overflow bucket and has ITS limit (`default_rpm`), not the
+    /// custom one.
+    #[test]
+    fn the_quota_is_the_charged_buckets_limit_and_balance() {
+        let limiter = per_key(5);
+        limiter.set_agent_limit(key(1), 2);
+        assert_eq!(
+            limiter.quota(&key(1)),
+            Quota {
+                limit: 2,
+                remaining: 2
+            },
+            "untracked with room: the full bucket its custom limit gives"
+        );
+        limiter.check(&key(1)).unwrap();
+        assert_eq!(
+            limiter.quota(&key(1)),
+            Quota {
+                limit: 2,
+                remaining: 1
+            }
+        );
+        limiter.check(&key(2)).unwrap();
+        assert_eq!(
+            limiter.quota(&key(2)),
+            Quota {
+                limit: 5,
+                remaining: 4
+            },
+            "a key with no custom limit has default_rpm"
+        );
+
+        // At the cap: a custom-limit key that is not tracked is charged to
+        // the overflow bucket, whose capacity is default_rpm.
+        let capped = per_key(5).with_max_tracked_keys(1);
+        capped.check(&key(0)).unwrap();
+        capped.set_agent_limit(key(9), 2);
+        capped.check(&key(9)).unwrap();
+        assert_eq!(capped.tracked_keys(), 1, "CALIBRATION: key 9 overflowed");
+        assert_eq!(
+            capped.quota(&key(9)),
+            Quota {
+                limit: 5,
+                remaining: 4
+            },
+            "an overflow-charged key reports the overflow bucket, not its custom limit"
+        );
+        assert_eq!(capped.remaining_quota(&key(9)), 4);
     }
 
     /// `set_agent_limit` takes the limits lock, then the bucket lock.
@@ -1193,6 +1332,67 @@ mod tests {
                 RateLimitSettings::parse(None, rpm, global, proxies).is_err(),
                 "{rpm:?} {global:?} {proxies:?} must refuse"
             );
+        }
+    }
+
+    /// 20210eaa: the per-address limiter is opt-in through its own variable,
+    /// does not turn the principal limiter on (nor the reverse), is turned off
+    /// by an explicit `EPIGRAPH_RATE_LIMIT=off`, and keys through the same
+    /// trusted proxies.
+    #[test]
+    fn the_address_limit_is_its_own_opt_in() {
+        let unset = RateLimitSettings::parse(None, None, None, None)
+            .unwrap()
+            .with_address_rpm(None)
+            .unwrap();
+        assert!(unset.build_address().is_none(), "unset: no address limiter");
+        let blank = unset.clone().with_address_rpm(Some(" ")).unwrap();
+        assert!(blank.build_address().is_none(), "blank is unset");
+
+        let only = RateLimitSettings::parse(None, None, None, Some("192.0.2.0/24"))
+            .unwrap()
+            .with_address_rpm(Some("900"))
+            .unwrap();
+        assert!(
+            only.build().is_none(),
+            "the address limit does not turn the principal limiter on"
+        );
+        let limiter = only.build_address().expect("address limiter");
+        assert_eq!(limiter.config().default_rpm, 900);
+        assert!(!limiter.config().enable_global_limit);
+        assert!(limiter
+            .trusted_proxies()
+            .contains("192.0.2.9".parse().unwrap()));
+        assert!(
+            only.guest_default().is_some(),
+            "the address limit does not count as a configured limiter for the guest default"
+        );
+
+        let principal = RateLimitSettings::parse(None, Some("30"), None, None)
+            .unwrap()
+            .with_address_rpm(None)
+            .unwrap();
+        assert!(principal.build().is_some());
+        assert!(
+            principal.build_address().is_none(),
+            "the principal limit does not turn the address limiter on"
+        );
+
+        let off = RateLimitSettings::parse(Some("off"), None, None, None)
+            .unwrap()
+            .with_address_rpm(Some("900"))
+            .unwrap();
+        assert!(
+            off.build_address().is_none(),
+            "EPIGRAPH_RATE_LIMIT=off wins"
+        );
+
+        for bad in ["0", "-1", "ten", "1.5"] {
+            let err = RateLimitSettings::parse(None, None, None, None)
+                .unwrap()
+                .with_address_rpm(Some(bad))
+                .expect_err("a malformed address limit refuses");
+            assert!(err.contains(RATE_LIMIT_ADDRESS_RPM_ENV), "{err}");
         }
     }
 

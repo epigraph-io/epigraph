@@ -18,6 +18,9 @@
 //!   finds no compound there (the session really hides the decomposition), a
 //!   standalone twin holding the same BBA HAS an owner (the session reads the
 //!   BBA rows), and a compound with a public child has none;
+//! * on the same session the vacate gates' fold-cache test
+//!   (`DerivationScopeRepository::claim_has_fold_cache`) reads that compound
+//!   as a compound too: its cache is no fold cache (backlog bbece56a);
 //! * the definer's catalog shape: SECURITY DEFINER, owned by
 //!   `epigraph_maintenance`, path `pg_catalog, pg_temp`, no PUBLIC EXECUTE,
 //!   EXECUTE for the application role;
@@ -447,5 +450,89 @@ async fn on_an_unstamped_app_session_a_compound_with_a_private_decomposition_has
         owner, None,
         "0dc20fad: on an unstamped app session a compound whose decomposition is hidden must \
          have no cache owner (it had {owner:?})"
+    );
+}
+
+/// Seed a cached belief on `id` (a superuser write, as a fold left it).
+async fn set_cache(pool: &PgPool, id: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET belief = 0.6, plausibility = 0.8, pignistic_prob = 0.7 WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("seed cache");
+}
+
+/// The red test of bbece56a. The vacate gates of a recompute
+/// (`DerivationScopeRepository::claim_has_fold_cache`, read by
+/// `derivation_scope::must_vacate_cache` and the widening-act gate) treat a
+/// cache as a fold of the claim's own BBAs only on a NON-compound. A
+/// compound's cache is a query over its leaves, so it is never vacated as a
+/// fold. On the caller's stamped application session the compound `hidden`,
+/// whose only child (and the edge to it) is private to another group, must
+/// still read as a compound: it has no fold cache. Calibrated in the same
+/// session: the inline predicate finds no compound there, a standalone twin
+/// with the same cache HAS a fold cache, and a visible compound has none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_an_app_session_a_compound_with_a_private_decomposition_has_no_fold_cache(pool: PgPool) {
+    use epigraph_db::repos::derivation_scope::DerivationScopeRepository;
+
+    let (caller, mine) = fixture::seed_agent_with_group(&pool, "bbece56a-caller").await;
+    let (other, theirs) = fixture::seed_agent_with_group(&pool, "bbece56a-other").await;
+    let hidden = claim(&pool, caller, mine, "public", "compound, private child").await;
+    let child = claim(&pool, other, theirs, "group", "private only child").await;
+    decomposes_to(&pool, hidden, child, "group", theirs).await;
+    let standalone = claim(&pool, caller, mine, "public", "standalone twin").await;
+    let open = claim(&pool, caller, mine, "public", "compound, public child").await;
+    let open_child = claim(&pool, caller, mine, "public", "public child").await;
+    decomposes_to(&pool, open, open_child, "public", mine).await;
+    for c in [hidden, standalone, open] {
+        set_cache(&pool, c).await;
+    }
+
+    let viewer = Viewer::resolve(&pool, caller)
+        .await
+        .expect("resolve caller");
+    let url = fixture::database_url_for(&pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let mut tx = scoped.begin_as(&viewer).await.expect("stamped transaction");
+    let who: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("session_user");
+    assert_eq!(
+        who, "epigraph_app",
+        "the session must be the application role"
+    );
+    assert!(
+        !inline_is_compound(&mut tx, hidden).await,
+        "calibration: the caller's session cannot see the private decomposition"
+    );
+    let mut fold_cache = Vec::new();
+    for id in [hidden, standalone, open] {
+        fold_cache.push(
+            DerivationScopeRepository::claim_has_fold_cache(&mut *tx, &viewer, id)
+                .await
+                .expect("claim_has_fold_cache on an app session"),
+        );
+    }
+    tx.rollback().await.expect("rollback");
+    let [hidden_fold, standalone_fold, open_fold] = fold_cache[..] else {
+        unreachable!("three ids")
+    };
+    assert!(
+        standalone_fold,
+        "calibration: the session reads the cache columns, so a standalone claim's cache \
+         is a fold cache"
+    );
+    assert!(!open_fold, "a visible compound has no fold cache");
+    assert!(
+        !hidden_fold,
+        "bbece56a: a compound whose decomposition the caller's row security hides must \
+         still have no fold cache"
     );
 }

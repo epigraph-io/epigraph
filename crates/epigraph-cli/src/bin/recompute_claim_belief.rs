@@ -26,11 +26,12 @@
 //!
 //! Reads claim_ids from a file (one UUID per line) or `--stdin`.
 //!
-//! Usage:
-//!     epigraph-recompute-belief --input /tmp/claim_ids.txt
-//!     epigraph-recompute-belief --stdin < /tmp/claim_ids.txt
+//! Usage (a writing run names its disk gate; see "Disk gate" below):
 //!     epigraph-recompute-belief --input /tmp/claim_ids.txt --dry-run
 //!     epigraph-recompute-belief --input /tmp/claim_ids.txt \
+//!         --disk-path <db data volume> (--disk-check-cmd <cmd> | --no-backup-check)
+//!     epigraph-recompute-belief --stdin <GATE FLAGS> < /tmp/claim_ids.txt
+//!     epigraph-recompute-belief --input /tmp/claim_ids.txt <GATE FLAGS> \
 //!         --snapshot /path/wave-1.jsonl [--wave <name>]
 //!
 //! Rollback (`--snapshot <wave file>`): each claim is recomputed in ONE
@@ -49,6 +50,35 @@
 //! be written rolls its claim back and stops the run (exit 3), so no write
 //! lands unrecorded. Unchanged claims are not recorded; `claims.updated_at` is
 //! not part of the record. See `epigraph_cli::recompute_claim_belief`.
+//! Before the first write the run also writes `<wave file>.run.json`: this
+//! process's belief modes, whether `--allow-mode-skew` overrode the mode
+//! check, and the disk gate (including a `--no-backup-check` opt-out), so the
+//! wave file carries how it was made.
+//!
+//! Mode check (backlog a7ab715d, 1ea4f6bf): before a WRITING run, and before
+//! it opens the database, the run reads the API's `/health` → `belief_modes`
+//! (`EPIGRAPH_API`, else `EPIGRAPH_API_URL`) and refuses (exit 3) when any mode
+//! differs from this process's, or when they cannot be read
+//! (`epigraph_cli::belief_mode_check`, as `recompute_betp` and
+//! `backfill_factors` do). It also refuses (exit 3) a writing run under any
+//! `EPIGRAPH_ATOM_FOLD` other than `legacy`, whatever the server says: the
+//! owner-frame recompute this binary calls implements only the legacy fold.
+//! `--dry-run` writes nothing and is exempt. Exit 3 is also the wave-file STOP
+//! below; the two are told apart by stderr (a mode refusal names
+//! `belief_modes` or `atom_fold` and writes nothing).
+//!
+//! Disk gate (backlog 1ea4f6bf, `recompute_betp::DiskGate`): a writing run
+//! needs `--disk-path <path on the database's data volume>` and
+//! `--disk-check-cmd <backup and archive health check>` (or an explicit
+//! `--no-backup-check`). The claim list is worked in batches of `--batch-size`
+//! (default 1000), and before EACH batch the free space on that volume, less
+//! the batch's projected write volume (`--projected-bytes-per-claim`, WAL and
+//! archive, plus the wave file's records when it is on that volume), must stay
+//! at or above `--min-free-gb` (default 20), and the check command must exit
+//! 0. A failure stops the run before that batch writes (exit 4); every
+//! committed write before it is recorded, so the wave file still restores
+//! the run. The wave file's own volume is not gated separately: a record that
+//! does not fit already rolls its claim back and stops the run (exit 3).
 //!
 //! Concurrency is `--concurrency` (default 8). Each task is one DB round-trip
 //! to fetch BBAs + one round-trip to write the recomputed belief. On a local
@@ -63,6 +93,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
+use epigraph_cli::recompute_betp::DiskGate;
 use epigraph_cli::recompute_claim_belief::{recompute_claim_recorded, ClaimRecomputeError};
 
 #[derive(Parser, Debug)]
@@ -98,14 +130,51 @@ struct Cli {
     /// The wave name every record carries. Default `recompute_claim_belief`.
     #[arg(long, requires = "snapshot")]
     wave: Option<String>,
+    /// A path on the database's data volume, for the disk gate checked before
+    /// every batch (mandatory for a writing run).
+    #[arg(long, required_unless_present = "dry_run")]
+    disk_path: Option<PathBuf>,
+    /// Free space (GB) that must remain on `--disk-path`'s volume after each
+    /// batch's projected writes.
+    #[arg(long, default_value_t = 20.0)]
+    min_free_gb: f64,
+    /// Projected write volume per claim, in bytes: WAL and archive, plus the
+    /// wave file's records when it is on the measured volume.
+    #[arg(long, default_value_t = 65_536)]
+    projected_bytes_per_claim: u64,
+    /// The backup and archive health check the disk gate runs before each
+    /// batch (exit 0 = pass). A writing run needs this or `--no-backup-check`.
+    #[arg(
+        long,
+        conflicts_with = "no_backup_check",
+        required_unless_present_any = ["dry_run", "no_backup_check"]
+    )]
+    disk_check_cmd: Option<String>,
+    /// Run the disk gate on free space alone, with no backup check. A
+    /// deliberate opt-out, printed at the start of the run.
+    #[arg(long)]
+    no_backup_check: bool,
+    /// Claims per batch (the disk gate runs before each).
+    #[arg(long, default_value_t = 1000)]
+    batch_size: usize,
+    /// Proceed with a writing run although this process's belief modes differ
+    /// from the API's `/health` report (or cannot be read). For tests and a
+    /// deliberate, recorded override only.
+    #[arg(long, hide = true)]
+    allow_mode_skew: bool,
 }
 
 /// The wave name a `--snapshot` run records when `--wave` is not given.
 const DEFAULT_WAVE: &str = "recompute_claim_belief";
 
 /// Exit code of a run stopped because a wave-file record could not be
-/// written (claims after it were not attempted).
+/// written (claims after it were not attempted). The same number as
+/// `belief_mode_check::MODE_CHECK_REFUSED_EXIT`; stderr tells them apart.
 const EXIT_SNAPSHOT_FAILED: i32 = 3;
+
+/// Exit code of a run the disk gate stopped before a batch (claims from that
+/// batch on were not attempted).
+const EXIT_DISK_GATE: i32 = 4;
 
 #[tokio::main]
 async fn main() {
@@ -115,6 +184,18 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    // Before the database: a writing run must show its belief modes match the
+    // API's (SPEC §10.2), and, since the owner-frame recompute folds only the
+    // legacy way, must run under the legacy atom fold. A dry run writes
+    // nothing and is exempt.
+    let intent = if cli.dry_run {
+        RunIntent::WritesNothing
+    } else {
+        RunIntent::Writes
+    };
+    enforce_or_exit("recompute_claim_belief", intent, cli.allow_mode_skew).await;
+    enforce_build_fold_or_exit("recompute_claim_belief", intent);
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
@@ -160,6 +241,31 @@ async fn run(
         return Ok(());
     }
 
+    // The disk gate (backlog 1ea4f6bf), checked before every batch. clap
+    // requires `--disk-path` and a backup check (or `--no-backup-check`) for a
+    // writing run, which is all that reaches here.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let gate = DiskGate {
+        path: cli
+            .disk_path
+            .clone()
+            .ok_or("a writing run needs --disk-path")?,
+        min_free_bytes: (cli.min_free_gb.max(0.0) * 1e9) as u64,
+        projected_bytes_per_claim: cli.projected_bytes_per_claim,
+        check_cmd: cli.disk_check_cmd.clone(),
+    };
+    println!(
+        "disk gate: {} keeps {} bytes free after {} projected bytes per claim, before every \
+         batch of {}; backup check: {}",
+        gate.path.display(),
+        gate.min_free_bytes,
+        gate.projected_bytes_per_claim,
+        cli.batch_size.max(1),
+        gate.check_cmd
+            .as_deref()
+            .unwrap_or("NONE (--no-backup-check)"),
+    );
+
     // The wave file is opened BEFORE the first write, and `wave_at` is taken
     // from the database clock in its own statement before it
     // (`belief_cache::WaveRecord::at`). A file that cannot be opened, or that
@@ -171,10 +277,38 @@ async fn run(
             let wave = cli.wave.as_deref().unwrap_or(DEFAULT_WAVE);
             let log = epigraph_cli::recompute_betp::WaveLog::open(path, wave, at)
                 .map_err(|e| format!("--snapshot: {e}"))?;
+            // The run's own record beside its wave file, before the first
+            // write: this process's belief modes, whether the mode check was
+            // overridden, and the disk gate, including a backup-check
+            // opt-out, so the wave file shows how it was made (as
+            // `recompute_betp` records its runs).
+            let backup_check = match &gate.check_cmd {
+                Some(cmd) => serde_json::json!({ "command": cmd }),
+                None => serde_json::json!({ "command": null, "no_backup_check": true }),
+            };
+            epigraph_cli::recompute_betp::write_run_record(
+                path,
+                &serde_json::json!({
+                    "bin": "recompute_claim_belief",
+                    "wave": wave,
+                    "wave_at": at,
+                    "belief_modes": epigraph_engine::belief_modes::current(),
+                    "allow_mode_skew": cli.allow_mode_skew,
+                    "disk_gate": {
+                        "path": gate.path,
+                        "min_free_bytes": gate.min_free_bytes,
+                        "projected_bytes_per_claim": gate.projected_bytes_per_claim,
+                        "batch_size": cli.batch_size.max(1),
+                        "backup_check": backup_check,
+                    },
+                }),
+            )
+            .map_err(|e| format!("--snapshot: run record: {e}"))?;
             println!(
-                "wave file: {} (wave {wave}, wave_at {})",
+                "wave file: {} (wave {wave}, wave_at {}); run record: {}.run.json",
                 path.display(),
-                at.to_rfc3339()
+                at.to_rfc3339(),
+                path.display()
             );
             Some(log)
         }
@@ -223,62 +357,78 @@ async fn run(
     // so the remedy is a re-run. Written out for an operator in
     // `docs/deploy.md`.
     let progress_every = cli.progress_every;
-    futures::stream::iter(claim_ids)
-        .map(|claim_id| {
-            let pool = pool.clone();
-            let done = done.clone();
-            let claims_with_work = claims_with_work.clone();
-            let claims_empty = claims_empty.clone();
-            let frame_writes = frame_writes.clone();
-            let errors = errors.clone();
-            let recorded = recorded.clone();
-            let not_attempted = not_attempted.clone();
-            let stopped = stopped.clone();
-            async move {
-                if stopped.load(Ordering::SeqCst) {
-                    not_attempted.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                // Backlog 696d3a1c: the cache is ONE shared value, written from
-                // the claim's single owner frame, independent of frame names.
-                // An operator one-shot on the DSN the operator supplies (in
-                // practice a superuser, where a tenancy stamp is inert); each
-                // claim is one transaction on one connection.
-                match recompute_claim_recorded(&pool, viewer, claim_id, log).await {
-                    Ok(outcome) => {
-                        if outcome.recomputed {
-                            claims_with_work.fetch_add(1, Ordering::Relaxed);
-                            frame_writes.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            claims_empty.fetch_add(1, Ordering::Relaxed);
+    let batch_size = cli.batch_size.max(1);
+    let batches = claim_ids.len().div_ceil(batch_size);
+    let mut gate_stop: Option<String> = None;
+    for (i, batch) in claim_ids.chunks(batch_size).enumerate() {
+        // A wave-file STOP or a gate failure leaves every later batch
+        // unattempted, and counted as such.
+        if gate_stop.is_some() || stopped.load(Ordering::SeqCst) {
+            not_attempted.fetch_add(batch.len(), Ordering::Relaxed);
+            continue;
+        }
+        if let Err(why) = gate.check(batch.len()) {
+            gate_stop = Some(format!("before batch {} of {batches}: {why}", i + 1));
+            not_attempted.fetch_add(batch.len(), Ordering::Relaxed);
+            continue;
+        }
+        futures::stream::iter(batch.iter().copied())
+            .map(|claim_id| {
+                let pool = pool.clone();
+                let done = done.clone();
+                let claims_with_work = claims_with_work.clone();
+                let claims_empty = claims_empty.clone();
+                let frame_writes = frame_writes.clone();
+                let errors = errors.clone();
+                let recorded = recorded.clone();
+                let not_attempted = not_attempted.clone();
+                let stopped = stopped.clone();
+                async move {
+                    if stopped.load(Ordering::SeqCst) {
+                        not_attempted.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Backlog 696d3a1c: the cache is ONE shared value, written from
+                    // the claim's single owner frame, independent of frame names.
+                    // An operator one-shot on the DSN the operator supplies (in
+                    // practice a superuser, where a tenancy stamp is inert); each
+                    // claim is one transaction on one connection.
+                    match recompute_claim_recorded(&pool, viewer, claim_id, log).await {
+                        Ok(outcome) => {
+                            if outcome.recomputed {
+                                claims_with_work.fetch_add(1, Ordering::Relaxed);
+                                frame_writes.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                claims_empty.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if outcome.changed && log.is_some() {
+                                recorded.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                        if outcome.changed && log.is_some() {
-                            recorded.fetch_add(1, Ordering::Relaxed);
+                        Err(e) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            if matches!(e, ClaimRecomputeError::Record(_)) {
+                                stopped.store(true, Ordering::SeqCst);
+                            }
+                            eprintln!("  {claim_id}: {e}");
                         }
                     }
-                    Err(e) => {
-                        errors.fetch_add(1, Ordering::Relaxed);
-                        if matches!(e, ClaimRecomputeError::Record(_)) {
-                            stopped.store(true, Ordering::SeqCst);
-                        }
-                        eprintln!("  {claim_id}: {e}");
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if progress_every > 0 && n.is_multiple_of(progress_every) {
+                        println!(
+                            "  [{n}/{total}] claims_recomputed={} frame_writes={} empty={} errors={}",
+                            claims_with_work.load(Ordering::Relaxed),
+                            frame_writes.load(Ordering::Relaxed),
+                            claims_empty.load(Ordering::Relaxed),
+                            errors.load(Ordering::Relaxed),
+                        );
                     }
                 }
-                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if progress_every > 0 && n.is_multiple_of(progress_every) {
-                    println!(
-                        "  [{n}/{total}] claims_recomputed={} frame_writes={} empty={} errors={}",
-                        claims_with_work.load(Ordering::Relaxed),
-                        frame_writes.load(Ordering::Relaxed),
-                        claims_empty.load(Ordering::Relaxed),
-                        errors.load(Ordering::Relaxed),
-                    );
-                }
-            }
-        })
-        .buffer_unordered(cli.concurrency.max(1))
-        .for_each(|()| async {})
-        .await;
+            })
+            .buffer_unordered(cli.concurrency.max(1))
+            .for_each(|()| async {})
+            .await;
+    }
 
     println!(
         "done: {} claims recomputed across {} (claim, frame) writes, {} had no recomputable input \
@@ -290,6 +440,19 @@ async fn run(
     );
     if log.is_some() {
         println!("recorded: {}", recorded.load(Ordering::Relaxed));
+    }
+    if let Some(why) = gate_stop {
+        let rest = if log.is_some() {
+            "Every committed write is recorded; restore with `restore_belief_cache --from \
+             <wave file>`, or free space and re-run the rest against a NEW wave file."
+        } else {
+            "Free space and re-run the rest; the run is idempotent."
+        };
+        eprintln!(
+            "STOPPED by the disk gate {why}. {} claims were not attempted. {rest}",
+            not_attempted.load(Ordering::Relaxed),
+        );
+        std::process::exit(EXIT_DISK_GATE);
     }
     if stopped.load(Ordering::SeqCst) {
         eprintln!(

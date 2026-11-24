@@ -1117,7 +1117,12 @@ async fn unpinned_full_page_has_no_cursor_unless_one_was_supplied(pool: PgPool) 
     let first = search(&pool, state.clone(), agent, plain(Some("o:0".into())))
         .await
         .expect("paged");
-    assert_eq!(first.next_cursor.as_deref(), Some("o:5"));
+    // An unpinned walk pages by key (backlog 4f1c2aec): position 5, limit 5.
+    let next = first
+        .next_cursor
+        .as_deref()
+        .expect("a full first page has a cursor");
+    assert!(next.starts_with("k:5.5."), "unpinned next_cursor: {next}");
     let second = search(&pool, state, agent, plain(first.next_cursor.clone()))
         .await
         .expect("second page");
@@ -1276,10 +1281,20 @@ async fn unpinned_cursor_walk_is_not_short_changed_by_another_groups_nearer_clai
     let pages = walk(&pool, &state, stranger, page).await;
     let seen: Vec<Uuid> = pages.iter().flat_map(hit_ids).collect();
     assert_eq!(seen, public, "every public claim, nearest first, once each");
-    let cursors: Vec<String> = pages.iter().filter_map(|r| r.next_cursor.clone()).collect();
+    // Key cursors (backlog 4f1c2aec) carry the walk position first. The read
+    // looks one row past each page, so the walk ends ON the last visible row
+    // instead of after an empty page: two cursors for three rows.
+    let positions: Vec<String> = pages
+        .iter()
+        .filter_map(|r| r.next_cursor.clone())
+        .map(|c| {
+            assert!(c.starts_with("k:"), "an unpinned walk pages by key: {c}");
+            c.split('.').next().expect("position").to_string()
+        })
+        .collect();
     assert_eq!(
-        cursors,
-        vec!["o:1".to_string(), "o:2".to_string(), "o:3".to_string()],
+        positions,
+        vec!["k:1".to_string(), "k:2".to_string()],
         "the cursor advances one visible row at a time"
     );
     for r in &pages {
@@ -1423,4 +1438,315 @@ async fn paged_request_is_503_when_the_configured_embedder_fails(pool: PgPool) {
         .await
         .expect("theme_core makes no embedding call");
     assert_eq!(out.results.len(), 2);
+}
+
+// ── Unpinned key walks (backlog 4f1c2aec) ──
+
+/// An unpinned request for `q` with `limit` and `cursor`.
+fn unpinned(q: &str, limit: u32, cursor: Option<String>) -> SemanticSearchRequest {
+    SemanticSearchRequest {
+        query: q.to_string(),
+        limit: Some(limit),
+        cursor,
+        ..Default::default()
+    }
+}
+
+/// A public claim at `deg` degrees from the probe `p`.
+async fn public_unpinned_at(
+    pool: &PgPool,
+    agent: Uuid,
+    content: &str,
+    p: &[f32],
+    deg: f64,
+) -> Uuid {
+    let id = seed_public_claim(pool, agent, content).await;
+    set_embedding(pool, id, &tilt(p, deg)).await;
+    id
+}
+
+/// A cursor walk over the UNPINNED ranking with rows written between pages:
+/// one nearer the query than every row already served (before the page
+/// boundary) and one past it. Offset pages over the moving ranking repeat a
+/// served row (the insert before the boundary pushes the last served row past
+/// it); key pages continue from the last row served and cannot.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unpinned_walk_neither_repeats_nor_skips_when_rows_arrive_between_pages(pool: PgPool) {
+    let embedder = mock_embedder();
+    let q = "unpinned key walk";
+    let p = probe_vec(&embedder, q).await;
+    let (agent, _g) = seed_agent_with_group(&pool, "tf-key-walk").await;
+    let mut before = Vec::new();
+    for i in 0..10 {
+        // 2, 4, ... 20 degrees: distinct distances, nearest first.
+        before.push(
+            public_unpinned_at(
+                &pool,
+                agent,
+                &format!("tf-kw {i}"),
+                &p,
+                2.0 * (i + 1) as f64,
+            )
+            .await,
+        );
+    }
+    let state = split_state_with_embedder(&pool, embedder).await;
+
+    let first = search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 3, Some("o:0".into())),
+    )
+    .await
+    .expect("first page");
+    assert_eq!(
+        hit_ids(&first),
+        before[..3].to_vec(),
+        "calibration: the 3 nearest rows"
+    );
+    let mut cursor = first
+        .next_cursor
+        .clone()
+        .expect("a full first page has a cursor");
+
+    // Written between pages: one nearer than everything served, one later.
+    let early = public_unpinned_at(&pool, agent, "tf-kw early", &p, 1.0).await;
+    let late = public_unpinned_at(&pool, agent, "tf-kw late", &p, 9.0).await;
+
+    let mut seen = hit_ids(&first);
+    loop {
+        let page = search(
+            &pool,
+            state.clone(),
+            agent,
+            unpinned(q, 3, Some(cursor.clone())),
+        )
+        .await
+        .expect("later page");
+        seen.extend(hit_ids(&page));
+        match page.next_cursor.clone() {
+            Some(c) => cursor = c,
+            None => break,
+        }
+        assert!(seen.len() < 100, "the walk failed to terminate");
+    }
+
+    let unique: HashSet<Uuid> = seen.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "a row was served twice across the walk: {seen:?}"
+    );
+    for id in &before {
+        assert!(
+            unique.contains(id),
+            "a row present for the whole walk was skipped: {id}"
+        );
+    }
+    assert!(
+        !unique.contains(&early),
+        "a row ranked before the boundary that arrived mid-walk is behind the walk"
+    );
+    assert!(
+        unique.contains(&late),
+        "a row ranked after the boundary that arrived mid-walk is still ahead of it"
+    );
+    let order: Vec<Uuid> = seen.iter().copied().filter(|id| *id != late).collect();
+    assert_eq!(order, before, "the walk keeps the ranking's order");
+}
+
+/// The key cursor is bound to its walk: a page with another `limit`, or for
+/// another query, is refused; and an unpinned search cannot be paged by
+/// position past `o:0`. Each would page a different scan or ranking from an
+/// unrelated boundary.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unpinned_cursor_is_refused_for_another_limit_query_or_a_position(pool: PgPool) {
+    let embedder = mock_embedder();
+    let q = "unpinned bound cursor";
+    let p = probe_vec(&embedder, q).await;
+    let (agent, _g) = seed_agent_with_group(&pool, "tf-key-bound").await;
+    for i in 0..8 {
+        public_unpinned_at(
+            &pool,
+            agent,
+            &format!("tf-kb {i}"),
+            &p,
+            2.0 * (i + 1) as f64,
+        )
+        .await;
+    }
+    let state = split_state_with_embedder(&pool, embedder).await;
+
+    let first = search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 3, Some("o:0".into())),
+    )
+    .await
+    .expect("first page");
+    let cursor = first.next_cursor.clone().expect("cursor");
+
+    // Same walk: accepted.
+    search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 3, Some(cursor.clone())),
+    )
+    .await
+    .expect("the same limit and query continue the walk");
+
+    let e = search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 4, Some(cursor.clone())),
+    )
+    .await
+    .expect_err("a different limit mid-walk must be refused");
+    assert_eq!(validation_field(e), "cursor", "limit changed mid-walk");
+
+    let e = search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned("a different query entirely", 3, Some(cursor.clone())),
+    )
+    .await
+    .expect_err("another query's cursor must be refused");
+    assert_eq!(validation_field(e), "cursor", "query changed mid-walk");
+
+    let e = search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 3, Some("o:3".into())),
+    )
+    .await
+    .expect_err("a position cursor past o:0 on an unpinned search must be refused");
+    assert_eq!(validation_field(e), "cursor", "o:3 unpinned");
+
+    let t = bare_theme(&pool, "tf-key-bound T").await;
+    let e = search(&pool, state, agent, pinned(q, t, 3, Some(cursor)))
+        .await
+        .expect_err("a key cursor on a pinned search must be refused");
+    assert_eq!(validation_field(e), "cursor", "k: on a pinned search");
+}
+
+/// Review finding on 4f1c2aec: the key cursor is authenticated. A caller who
+/// rewrites a served key (the position back to 0, which would walk past the
+/// 1,000-row window without end, or the distance to the far end of the
+/// cosine range, which empties the iterative pass and forces the exact
+/// retry) is refused with a 400 on `cursor`, the served key's MAC kept. The
+/// test edits whatever the server emitted, so it does not depend on the
+/// key's exact layout beyond its dot-separated fields.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unpinned_key_cursor_is_refused_when_tampered(pool: PgPool) {
+    let embedder = mock_embedder();
+    let q = "unpinned tampered cursor";
+    let p = probe_vec(&embedder, q).await;
+    let (agent, _g) = seed_agent_with_group(&pool, "tf-key-tamper").await;
+    for i in 0..8 {
+        public_unpinned_at(
+            &pool,
+            agent,
+            &format!("tf-kx {i}"),
+            &p,
+            2.0 * (i + 1) as f64,
+        )
+        .await;
+    }
+    let state = split_state_with_embedder(&pool, embedder).await;
+
+    let first = search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 3, Some("o:0".into())),
+    )
+    .await
+    .expect("first page");
+    let cursor = first.next_cursor.clone().expect("cursor");
+    let fields: Vec<&str> = cursor.split('.').collect();
+    assert!(
+        fields[0] == "k:3" && fields.len() >= 5,
+        "calibration: an unpinned walk continues with a k: key at position 3: {cursor}"
+    );
+    search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 3, Some(cursor.clone())),
+    )
+    .await
+    .expect("calibration: the served key continues the walk");
+
+    let with = |i: usize, v: &str| {
+        let mut f = fields.clone();
+        f[i] = v;
+        f.join(".")
+    };
+    for (what, forged) in [
+        ("position reset to 0", with(0, "k:0")),
+        ("distance set to 2.0", with(3, "4000000000000000")),
+        ("distance set to 0.0", with(3, "0000000000000000")),
+        ("claim id replaced", with(4, &Uuid::new_v4().to_string())),
+    ] {
+        assert_ne!(forged, cursor);
+        let e = search(
+            &pool,
+            state.clone(),
+            agent,
+            unpinned(q, 3, Some(forged.clone())),
+        )
+        .await
+        .expect_err(&format!("a forged key ({what}) must be refused: {forged}"));
+        assert_eq!(validation_field(e), "cursor", "{what}");
+    }
+}
+
+/// Identical embeddings (a tie group) straddling a page boundary. The HNSW
+/// scan orders by distance alone, so its LIMIT cuts a tie group arbitrarily;
+/// a key boundary inside the cut would skip the tied rows with smaller ids.
+/// The page holds the tie group back instead, and the walk serves every row
+/// exactly once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unpinned_walk_serves_a_tie_group_across_a_page_boundary_once(pool: PgPool) {
+    let embedder = mock_embedder();
+    let q = "unpinned tie walk";
+    let p = probe_vec(&embedder, q).await;
+    let (agent, _g) = seed_agent_with_group(&pool, "tf-key-ties").await;
+    let mut all = Vec::new();
+    all.push(public_unpinned_at(&pool, agent, "tf-kt a", &p, 2.0).await);
+    all.push(public_unpinned_at(&pool, agent, "tf-kt b", &p, 4.0).await);
+    // Three identical vectors at 6 degrees: rows 3..5 of the ranking, so a
+    // page of 4 ends inside the group.
+    for i in 0..3 {
+        all.push(public_unpinned_at(&pool, agent, &format!("tf-kt tie {i}"), &p, 6.0).await);
+    }
+    for (i, deg) in [8.0, 10.0, 12.0].into_iter().enumerate() {
+        all.push(public_unpinned_at(&pool, agent, &format!("tf-kt after {i}"), &p, deg).await);
+    }
+    let state = split_state_with_embedder(&pool, embedder).await;
+
+    let pages = walk(&pool, &state, agent, |cur| {
+        unpinned(q, 4, Some(cur.unwrap_or_else(|| "o:0".to_string())))
+    })
+    .await;
+    let seen: Vec<Uuid> = pages.iter().flat_map(hit_ids).collect();
+    let unique: HashSet<Uuid> = seen.iter().copied().collect();
+    assert_eq!(unique.len(), seen.len(), "a row was served twice: {seen:?}");
+    assert_eq!(
+        unique,
+        all.iter().copied().collect::<HashSet<_>>(),
+        "every row exactly once, the tie group included"
+    );
+    assert!(
+        pages[0].results.len() < 4 && pages[0].next_cursor.is_some(),
+        "calibration: the first page ends inside the tie group, so it is held back \
+         ({} rows)",
+        pages[0].results.len()
+    );
 }

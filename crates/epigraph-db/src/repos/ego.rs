@@ -64,10 +64,11 @@
 //!
 //! The three `edges` statements therefore dispatch on the far endpoint's type:
 //!
-//! * `claim` / `evidence` / `trace` — the three tenanted tables
-//!   [`EgoRepository::hydrate`] actually reads — must pass a viewer-filtered
-//!   `EXISTS` on their own table, so the edge is counted and listed only when
-//!   the row at its other end is one the viewer may read;
+//! * `claim` / `evidence` / `trace` / `paper` — the tenanted tables
+//!   [`EgoRepository::hydrate`] actually reads (`papers` since migration 246)
+//!   — must pass a viewer-filtered `EXISTS` on their own table, so the edge is
+//!   counted and listed only when the row at its other end is one the viewer
+//!   may read;
 //! * any other type must be positively known to carry NO tenancy of its own,
 //!   i.e. be a member of [`EgoRepository::untenanted_entity_types`]. That
 //!   excludes the remaining `tenancy_tier = 'columns'` types (`perspective`,
@@ -250,6 +251,8 @@ impl EgoRepository {
                                 WHERE fev.id = far.id /* {VISIBILITY:fev} */)
                       WHEN 'trace' THEN EXISTS (SELECT 1 FROM reasoning_traces frt
                                 WHERE frt.id = far.id /* {VISIBILITY:frt} */)
+                      WHEN 'paper' THEN EXISTS (SELECT 1 FROM papers fpa
+                                WHERE fpa.id = far.id /* {VISIBILITY:fpa} */)
                       ELSE far.entity_type = ANY($3::text[])
                     END )
               /* {EDGE_VISIBILITY:e} */
@@ -287,6 +290,8 @@ impl EgoRepository {
                                 WHERE fev.id = e.target_id /* {VISIBILITY:fev} */)
                       WHEN 'trace' THEN EXISTS (SELECT 1 FROM reasoning_traces frt
                                 WHERE frt.id = e.target_id /* {VISIBILITY:frt} */)
+                      WHEN 'paper' THEN EXISTS (SELECT 1 FROM papers fpa
+                                WHERE fpa.id = e.target_id /* {VISIBILITY:fpa} */)
                       ELSE e.target_type = ANY($4::text[])
                     END )
               /* {EDGE_VISIBILITY:e} */
@@ -322,6 +327,8 @@ impl EgoRepository {
                                 WHERE fev.id = e.source_id /* {VISIBILITY:fev} */)
                       WHEN 'trace' THEN EXISTS (SELECT 1 FROM reasoning_traces frt
                                 WHERE frt.id = e.source_id /* {VISIBILITY:frt} */)
+                      WHEN 'paper' THEN EXISTS (SELECT 1 FROM papers fpa
+                                WHERE fpa.id = e.source_id /* {VISIBILITY:fpa} */)
                       ELSE e.source_type = ANY($4::text[])
                     END )
               /* {EDGE_VISIBILITY:e} */
@@ -566,13 +573,19 @@ impl EgoRepository {
             });
         }
 
-        // `papers` is not in migration 062's `tier_a` array either, for the
-        // same reason as `agents`: bibliographic metadata, no owner_group_id.
-        let papers: Vec<(Uuid, Option<String>, String)> =
-            sqlx::query_as("SELECT id, title, doi FROM papers WHERE id = ANY($1)")
-                .bind(ids)
-                .fetch_all(&mut *conn)
-                .await?;
+        // `papers` carries the tenancy of the ingest that wrote it since
+        // migration 246, so a paper is hydrated only when the viewer may read
+        // it, exactly as the edge statements above admit its edge.
+        let papers_sql = viewer.splice(
+            "SELECT p.id, p.title, p.doi FROM papers p WHERE p.id = ANY($1) /* {VISIBILITY:p} */",
+            2,
+        );
+        let mut papers_q =
+            sqlx::query_as::<_, (Uuid, Option<String>, String)>(&papers_sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            papers_q = papers_q.bind(g);
+        }
+        let papers: Vec<(Uuid, Option<String>, String)> = papers_q.fetch_all(&mut *conn).await?;
         for (id, title, doi) in papers {
             let label = title.filter(|t| !t.is_empty()).unwrap_or(doi);
             out.push(EgoEntity {

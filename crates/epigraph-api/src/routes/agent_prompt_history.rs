@@ -29,14 +29,41 @@
 //!
 //! # Shape
 //!
-//! The definer returns one row per (lineage member, snapshot). The listing
-//! groups them: the agent's own snapshots, then `lineage.ancestors` (up the
-//! succession, `distance` 1 = a parent) and `lineage.descendants` (down it),
-//! one entry per agent carrying all of its snapshots. A lineage member the
-//! caller may not read is listed by id with `readable: false` and no
-//! snapshots. The walk goes [`LINEAGE_DEPTH_LIMIT`] generations each way;
-//! `ancestors_at_limit` / `descendants_at_limit` say it reached that limit, so
-//! farther generations, if any, are not listed.
+//! The listing reads migration 268's `epigraph_agent_prompt_history_meta`,
+//! which has 161's gate and walk but returns hashes and metadata only: no
+//! prompt text is built in the database for a listing. It returns one row per
+//! (lineage member, snapshot). The listing groups them: the agent's own
+//! snapshots, then `lineage.ancestors` (up the succession, `distance` 1 = a
+//! parent) and `lineage.descendants` (down it), one entry per agent carrying
+//! its snapshots. A lineage member the caller may not read is listed by id
+//! with `readable: false` and no snapshots. The walk goes
+//! [`LINEAGE_DEPTH_LIMIT`] generations each way; `ancestors_at_limit` /
+//! `descendants_at_limit` say it reached that limit, so farther generations,
+//! if any, are not listed. Both flags describe the WHOLE walk on every page
+//! that has rows; they are taken from the rows served, so an empty page (only
+//! after a cursor this route did not issue, or after the lineage changed
+//! between pages) reports both as `false`.
+//!
+//! # Pages
+//!
+//! The rows come nearest first (the agent itself, then distance 1, ancestors
+//! before descendants, then distance 2, ...), each agent's snapshots
+//! contiguous and oldest first, at most `limit` rows a page
+//! ([`DEFAULT_PAGE_ROWS`], at most [`MAX_PAGE_ROWS`]) and at most
+//! [`PAGE_BYTE_BUDGET`] bytes of snapshot metadata (a single row larger than
+//! that is still served alone, so every page advances). A page that stops
+//! before the end says so: `truncated: true` and a `next_cursor`, which the
+//! caller passes back as `?after=` (with the same `limit`, or another) for
+//! the next page; the last page has `truncated: false` and no cursor. A
+//! member whose snapshots straddle a page boundary appears on both pages, so
+//! a client reading every page merges members by `agent_id`. The cursor is a
+//! position only: every page re-runs the gate and the walk, so a forged one
+//! reads nothing the first page would not. Reading every page yields each row
+//! once only while the lineage does not change between pages (keyset paging):
+//! a snapshot registered for a member the cursor has passed is not on a later
+//! page, and a new succession edge that brings a member nearer can move it
+//! before the cursor, so it is skipped; re-read from the first page to see
+//! such changes.
 //!
 //! The listing carries NO file content: each file is named by the BLAKE3 of
 //! its raw bytes (`{"blob_hash": ..}`), so the listing grows with the number of
@@ -52,9 +79,9 @@
 //! key, as `{blob_hash, raw_size, text, lossy}`. A hash no readable snapshot
 //! names, an unreadable lineage member's included, is a 404; a stored blob that
 //! fails verification is WITHHELD, a 500 naming the failure, and its bytes are
-//! never served. The server holds at most one file's content per request. (The
-//! definer still builds its whole result, content included, inside the
-//! database; a content-free definer variant would bound that too.)
+//! never served. The server holds at most one file's content per request. The
+//! file read still goes through 161's definer, which builds the whole
+//! lineage's content inside the database to return that one file.
 //!
 //! # No registration route
 //!
@@ -65,7 +92,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
@@ -73,9 +100,9 @@ use epigraph_core::AgentId;
 use epigraph_db::agent_identity::PROMPT_HISTORY_REFUSED;
 use epigraph_db::{
     AgentIdentityRepository, AgentRepository, DbError, PromptBlob, PromptBlobRead,
-    PromptHistoryIndexEntry, PromptSnapshotIndex,
+    PromptHistoryCursor, PromptHistoryIndexEntry, PromptSnapshotIndex,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -93,15 +120,43 @@ pub const REQUIRED_SCOPE: &str = "claims:read";
 /// the two drift apart.
 pub const LINEAGE_DEPTH_LIMIT: u32 = 64;
 
+/// Rows a page holds when the caller names no `limit`.
+pub const DEFAULT_PAGE_ROWS: u32 = 200;
+/// The largest `limit` honoured; a larger one is clamped to it.
+pub const MAX_PAGE_ROWS: u32 = 500;
+/// The most snapshot metadata a page carries, in serialised bytes (estimated
+/// per row by [`row_bytes`]); the page stops before the row that would pass
+/// it, unless that row is the page's first.
+pub const PAGE_BYTE_BUDGET: usize = 512 * 1024;
+
+const BAD_CURSOR: &str =
+    "malformed `after` cursor; pass back the `next_cursor` of the previous page unchanged";
+
+/// `GET /api/v1/agents/:id/prompt-history` query.
+#[derive(Debug, Default, Deserialize)]
+pub struct PromptHistoryQuery {
+    /// The `next_cursor` of the previous page.
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Rows per page, clamped to `[1, MAX_PAGE_ROWS]`.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 /// `GET /api/v1/agents/:id/prompt-history` response.
 #[derive(Debug, Serialize)]
 pub struct PromptHistoryResponse {
     /// The agent asked about.
     pub agent_id: Uuid,
-    /// Its snapshots, oldest first (empty for an agent never registered).
+    /// Its snapshots on this page, oldest first (empty for an agent never
+    /// registered).
     pub snapshots: Vec<SnapshotView>,
-    /// Its succession lineage.
+    /// Its succession lineage, as far as this page reaches.
     pub lineage: LineageView,
+    /// True when more rows follow this page: pass `next_cursor` back.
+    pub truncated: bool,
+    /// The `?after=` of the next page; `None` on the last page.
+    pub next_cursor: Option<String>,
 }
 
 /// The agents an agent succeeded, and the agents that succeeded it.
@@ -224,11 +279,55 @@ impl From<PromptSnapshotIndex> for SnapshotView {
     }
 }
 
-/// Group the definer's rows (one per lineage member and snapshot, ordered by
-/// depth, then first seen) into the response: one entry per agent, each
-/// carrying all of its snapshots in the order the definer gave them.
+/// What one row costs a page, in serialised bytes: its snapshot's metadata
+/// as the response writes it, plus a fixed allowance for the member entry and
+/// separators. A row with no snapshot costs the allowance alone.
 #[must_use]
-pub fn group_history(agent_id: Uuid, rows: Vec<PromptHistoryIndexEntry>) -> PromptHistoryResponse {
+pub fn row_bytes(row: &PromptHistoryIndexEntry) -> usize {
+    const MEMBER_ALLOWANCE: usize = 128;
+    MEMBER_ALLOWANCE
+        + row.snapshot.as_ref().map_or(0, |s| {
+            serde_json::to_vec(&SnapshotView::from(s.clone())).map_or(0, |b| b.len())
+        })
+}
+
+/// Cut a fetched page: keep rows while fewer than `limit` are kept and the
+/// kept bytes (`size` per row) stay within `budget`, always keeping the first
+/// row so a page advances. True as the second value when rows were left out,
+/// so the caller emits a cursor from the LAST KEPT row.
+pub fn cut_page<T>(
+    mut rows: Vec<T>,
+    limit: usize,
+    budget: usize,
+    size: impl Fn(&T) -> usize,
+) -> (Vec<T>, bool) {
+    let mut kept = 0usize;
+    let mut bytes = 0usize;
+    for row in &rows {
+        let cost = size(row);
+        if kept >= limit || (kept > 0 && bytes.saturating_add(cost) > budget) {
+            break;
+        }
+        bytes = bytes.saturating_add(cost);
+        kept += 1;
+    }
+    let truncated = kept < rows.len();
+    rows.truncate(kept);
+    (rows, truncated)
+}
+
+/// Group a page of the definer's rows (one per lineage member and snapshot,
+/// nearest first, each agent's snapshots contiguous) into the response: one
+/// entry per agent, each carrying its snapshots on this page in the order the
+/// definer gave them. The depth-limit flags come from the WHOLE walk's
+/// extent (its farthest ancestor and descendant depths), not from the page.
+#[must_use]
+pub fn group_history(
+    agent_id: Uuid,
+    rows: Vec<PromptHistoryIndexEntry>,
+    extent: (Option<i32>, Option<i32>),
+    next_cursor: Option<String>,
+) -> PromptHistoryResponse {
     let mut own = Vec::new();
     let mut members: Vec<(i32, LineageMember)> = Vec::new();
     let mut index: HashMap<Uuid, usize> = HashMap::new();
@@ -262,25 +361,23 @@ pub fn group_history(agent_id: Uuid, rows: Vec<PromptHistoryIndexEntry>) -> Prom
             descendants.push(member);
         }
     }
-    // Nearest first; the definer orders by signed depth, which puts the
-    // FARTHEST ancestor first.
+    // Nearest first. The definer's order already is; the stable sort keeps
+    // it whatever order the rows arrive in.
     ancestors.sort_by_key(|m| m.distance);
     descendants.sort_by_key(|m| m.distance);
-    let at_limit = |members: &[LineageMember]| {
-        members
-            .last()
-            .is_some_and(|m| m.distance >= LINEAGE_DEPTH_LIMIT)
-    };
+    let at_limit = |d: Option<i32>| d.is_some_and(|d| d.unsigned_abs() >= LINEAGE_DEPTH_LIMIT);
     PromptHistoryResponse {
         agent_id,
         snapshots: own,
         lineage: LineageView {
-            ancestors_at_limit: at_limit(&ancestors),
-            descendants_at_limit: at_limit(&descendants),
+            ancestors_at_limit: at_limit(extent.0),
+            descendants_at_limit: at_limit(extent.1),
             ancestors,
             descendants,
             depth_limit: LINEAGE_DEPTH_LIMIT,
         },
+        truncated: next_cursor.is_some(),
+        next_cursor,
     }
 }
 
@@ -309,19 +406,20 @@ fn internal(what: &str, e: &dyn std::fmt::Display) -> ApiError {
     }
 }
 
-/// `GET /api/v1/agents/:id/prompt-history`: the agent's prompt snapshots and
-/// lineage, for its operator and admins (`claims:read`).
+/// `GET /api/v1/agents/:id/prompt-history`: one page of the agent's prompt
+/// snapshots and lineage, for its operator and admins (`claims:read`).
 ///
 /// # Errors
 /// 401 without a principal; 403 without `claims:read` (checked before any
-/// lookup, so it does not depend on the id); 404 for a caller who is neither
-/// the operator nor an admin, and for an agent that does not exist, with the
-/// same body.
+/// lookup, so it does not depend on the id); 400 for an `after` this route
+/// did not issue; 404 for a caller who is neither the operator nor an admin,
+/// and for an agent that does not exist, with the same body.
 pub async fn get_prompt_history(
     State(state): State<AppState>,
     auth_ctx: Option<Extension<AuthContext>>,
     ViewerExtractor(viewer): ViewerExtractor,
     Path(id): Path<Uuid>,
+    Query(q): Query<PromptHistoryQuery>,
 ) -> Result<Json<PromptHistoryResponse>, ApiError> {
     let Some(Extension(auth)) = auth_ctx else {
         return Err(ApiError::Unauthorized {
@@ -329,13 +427,32 @@ pub async fn get_prompt_history(
         });
     };
     crate::middleware::scopes::check_scopes(&auth, &[REQUIRED_SCOPE])?;
+    let after = q
+        .after
+        .as_deref()
+        .map(|raw| {
+            PromptHistoryCursor::decode(raw).ok_or_else(|| ApiError::BadRequest {
+                message: BAD_CURSOR.into(),
+            })
+        })
+        .transpose()?;
+    let limit = q.limit.unwrap_or(DEFAULT_PAGE_ROWS).clamp(1, MAX_PAGE_ROWS);
 
     let mut read = state
         .read_as(&viewer)
         .await
         .map_err(|e| internal("acquire a viewer-stamped connection", &e))?;
-    let rows = match AgentIdentityRepository::prompt_history_index(&mut read, id).await {
-        Ok(rows) => rows,
+    // One row past the page: whether it comes back says whether a next page
+    // exists.
+    let page = match AgentIdentityRepository::prompt_history_page(
+        &mut read,
+        id,
+        after.as_ref(),
+        limit + 1,
+    )
+    .await
+    {
+        Ok(page) => page,
         Err(e) if is_refused(&e) => {
             tracing::info!(
                 target: "agent.prompt_history",
@@ -359,7 +476,14 @@ pub async fn get_prompt_history(
     read.commit()
         .await
         .map_err(|e| internal("finish the read", &e))?;
-    Ok(Json(group_history(id, rows)))
+    let extent = (page.lineage_min_depth, page.lineage_max_depth);
+    let (rows, truncated) = cut_page(page.rows, limit as usize, PAGE_BYTE_BUDGET, row_bytes);
+    let next_cursor = if truncated {
+        rows.last().map(|r| r.cursor().encode())
+    } else {
+        None
+    };
+    Ok(Json(group_history(id, rows, extent, next_cursor)))
 }
 
 /// `GET /api/v1/agents/:id/prompt-history/blobs/:hash`: one file named by a
@@ -453,13 +577,10 @@ mod tests {
     }
 
     /// Whatever order the rows arrive in, each direction comes out nearest
-    /// first with its unsigned distance, and a direction whose farthest
-    /// member sits at the depth limit says so.
+    /// first with its unsigned distance.
     #[test]
     fn grouping_orders_each_direction_nearest_first_whatever_the_row_order() {
         let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
-        // The definer's order is by signed depth (farthest ancestor first);
-        // the descendants here arrive farthest first as well.
         let rows = vec![
             member(ids[0], -3),
             member(ids[1], -1),
@@ -468,7 +589,7 @@ mod tests {
             member(ids[4], 1),
             member(ids[5], 2),
         ];
-        let out = group_history(Uuid::new_v4(), rows);
+        let out = group_history(Uuid::new_v4(), rows, (Some(-3), Some(3)), None);
         assert_eq!(
             ids_and_distances(&out.lineage.ancestors),
             [(ids[1], 1), (ids[2], 2), (ids[0], 3)]
@@ -478,16 +599,89 @@ mod tests {
             [(ids[4], 1), (ids[5], 2), (ids[3], 3)]
         );
         assert!(!out.lineage.ancestors_at_limit && !out.lineage.descendants_at_limit);
+        assert!(!out.truncated && out.next_cursor.is_none());
+    }
 
+    /// The depth-limit flags are the WHOLE walk's, not the page's: a page that
+    /// lists only the nearest generation still says the walk reached the
+    /// limit when the extent does, and one short of the limit is not it.
+    #[test]
+    fn the_depth_limit_flags_come_from_the_walks_extent_not_the_page() {
         let limit = i32::try_from(LINEAGE_DEPTH_LIMIT).expect("small");
+        let near = vec![member(Uuid::new_v4(), -1), member(Uuid::new_v4(), 1)];
         let out = group_history(
             Uuid::new_v4(),
-            vec![member(ids[0], -limit), member(ids[1], limit - 1)],
+            near.clone(),
+            (Some(-limit), Some(limit - 1)),
+            Some("c".into()),
         );
         assert!(out.lineage.ancestors_at_limit, "an ancestor at the limit");
         assert!(
             !out.lineage.descendants_at_limit,
             "a descendant one short of it"
         );
+        assert!(out.truncated, "a cursor means more rows follow");
+        let out = group_history(Uuid::new_v4(), near, (None, None), None);
+        assert!(!out.lineage.ancestors_at_limit && !out.lineage.descendants_at_limit);
+    }
+
+    /// The cut keeps at most `limit` rows and stops before the row that would
+    /// pass the byte budget, says when it left rows out, and always keeps the
+    /// first row, even one larger than the whole budget, so a page advances.
+    #[test]
+    fn a_page_is_cut_by_rows_and_by_bytes_and_always_advances() {
+        let sizes = |v: &[usize]| v.to_vec();
+        let id = |n: &usize| *n;
+        assert_eq!(
+            cut_page(sizes(&[10, 10, 10]), 3, 1000, id),
+            (vec![10, 10, 10], false),
+            "everything fits"
+        );
+        assert_eq!(
+            cut_page(sizes(&[10, 10, 10, 10]), 3, 1000, id),
+            (vec![10, 10, 10], true),
+            "the row cap"
+        );
+        assert_eq!(
+            cut_page(sizes(&[40, 40, 30, 5]), 10, 100, id),
+            (vec![40, 40], true),
+            "the byte cap stops before the row that passes it, even if a later one fits"
+        );
+        assert_eq!(
+            cut_page(sizes(&[50, 50]), 10, 100, id),
+            (vec![50, 50], false),
+            "exactly the budget fits"
+        );
+        assert_eq!(
+            cut_page(sizes(&[5000, 1]), 10, 100, id),
+            (vec![5000], true),
+            "an oversized first row is served alone"
+        );
+        assert_eq!(cut_page(Vec::<usize>::new(), 10, 100, id), (vec![], false));
+    }
+
+    /// A snapshot's metadata is what a row costs: a row with a large
+    /// `in_prompt` costs more than an empty member row by at least its size.
+    #[test]
+    fn a_rows_cost_grows_with_its_snapshot_metadata() {
+        let bare = member(Uuid::new_v4(), 1);
+        let mut big = member(Uuid::new_v4(), 1);
+        big.snapshot = Some(PromptSnapshotIndex {
+            id: Uuid::new_v4(),
+            group_folder: "g".into(),
+            model: "m".into(),
+            prompt_hash: "0".repeat(64),
+            identity_md: None,
+            global_claude_md: None,
+            group_claude_md: None,
+            learned_md: Some([7; 32]),
+            in_prompt: serde_json::json!({"note": "x".repeat(10_000)}),
+            blob_refused: Vec::new(),
+            runner_version: None,
+            host_sha: None,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+        });
+        assert!(row_bytes(&big) >= row_bytes(&bare) + 10_000);
     }
 }

@@ -83,7 +83,7 @@ Single transaction:
    — see Decisions).
 5. **Edge migration** — recreate all relationships of the merged nodes on
    the merged claim. Same two guard classes as `mark_duplicate`
-   (claim.rs:2844, `docs/architecture/audit-edge-collision-mark-duplicate.md`),
+   (claim.rs:2844, `docs/audits/audit-edge-collision-mark-duplicate.md`),
    plus one new class:
    - *Self-loops*: edges among `{sources ∪ merged}` would collapse to
      `merged→merged`; filter them out (they are interior to the merge).

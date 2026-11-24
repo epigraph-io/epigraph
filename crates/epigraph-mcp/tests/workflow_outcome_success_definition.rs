@@ -44,12 +44,24 @@ fn success_is_defined_as_goal_achieved_not_procedure_completed() {
         }
     }
 
-    let desc = tool(&tools, "report_workflow_outcome")["description"]
-        .as_str()
-        .expect("report_workflow_outcome has a description")
-        .to_string();
-    assert!(
-        desc.contains("success=true means the workflow's goal was achieved"),
-        "report_workflow_outcome's description must define success; got: {desc}"
-    );
+    // Both tool descriptions too, not only the parameter: backlog a4914433
+    // (1) found `report_hierarchical_outcome`'s description, which a caller
+    // using the hierarchical tool directly reads, still without the definition.
+    for name in ["report_workflow_outcome", "report_hierarchical_outcome"] {
+        let desc = tool(&tools, name)["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{name}` has a description"))
+            .to_string();
+        for needle in [
+            "success=true means the workflow's goal was achieved",
+            "every gate and check passed",
+            "not merely that every step ran",
+            "a run whose gates or checks failed is success=false",
+        ] {
+            assert!(
+                desc.contains(needle),
+                "`{name}`'s description must say {needle:?}; got: {desc}"
+            );
+        }
+    }
 }

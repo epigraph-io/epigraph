@@ -436,8 +436,10 @@ fn uuids_in(s: &str) -> Vec<Uuid> {
 }
 
 /// Filter a belief report to what `caller` may read: claim ids outside its
-/// view are dropped, and an error that names anything but a claim or an edge
-/// it can read is replaced by a generic line. A bypass caller (a replay, a
+/// view are dropped, an error keeps only its context (the step and the ids it
+/// ran on, never the error's own text; backlog f9acb220), and an error whose
+/// context names anything but a claim or an edge it can read is replaced by a
+/// generic line ([`caller_error_line`]). A bypass caller (a replay, a
 /// maintenance job) gets the report unchanged. If the filter itself cannot
 /// run, the caller gets no ids at all.
 ///
@@ -458,10 +460,15 @@ pub async fn report_for_caller(
         .iter()
         .chain(&report.recomputed)
         .chain(&report.unbacked)
+        .chain(&report.unchanged)
         .copied()
         .collect();
+    // Only the context's ids decide an entry (`caller_error_line`); ids inside
+    // the error text never reach the caller.
     for e in &report.errors {
-        ids.extend(uuids_in(e));
+        ids.extend(uuids_in(
+            e.split_once(": ").map_or("", |(context, _)| context),
+        ));
     }
     ids.sort_unstable();
     ids.dedup();
@@ -496,20 +503,37 @@ pub async fn report_for_caller(
         invalidated_bbas: report.invalidated_bbas,
         recomputed: keep(&report.recomputed),
         unbacked: keep(&report.unbacked),
+        unchanged: keep(&report.unchanged),
         errors: report
             .errors
             .iter()
-            .map(|e| {
-                if uuids_in(e).iter().all(|id| visible.contains(id)) {
-                    e.clone()
-                } else {
-                    "a cascade step failed on a row outside the caller's view; the details are \
-                     in the audit row"
-                        .to_string()
-                }
-            })
+            .map(|e| caller_error_line(e, |id| visible.contains(id)))
             .collect(),
         retracted_key_kept: report.retracted_key_kept,
+    }
+}
+
+/// What a non-bypass caller is told about one [`CascadeReport::errors`] entry.
+///
+/// An entry is `"{context}: {error}"` (`CascadeReport::note_error`). The
+/// context is the engine's own text: the step and the claim or edge ids it ran
+/// on. The error is whatever the step returned, usually a driver error, which
+/// can spell SQL, a constraint, a statement timeout or another writer's row.
+/// The caller gets the context and a fixed tail; the full entry stays in the
+/// server log and in the agent-less belief-ids audit row (`record_belief`).
+/// Splitting at the first `": "` never shows error text: everything before
+/// that separator was written by the context, which holds none.
+///
+/// An entry whose context names an id `visible` refuses, or that has no
+/// context at all, becomes the generic line, with no ids in it.
+fn caller_error_line(entry: &str, visible: impl Fn(&Uuid) -> bool) -> String {
+    match entry.split_once(": ") {
+        Some((context, _error)) if uuids_in(context).iter().all(visible) => {
+            format!("{context}: failed; the details are in the audit row")
+        }
+        _ => "a cascade step failed on a row outside the caller's view; the details are in \
+              the audit row"
+            .to_string(),
     }
 }
 
@@ -701,6 +725,7 @@ async fn record_belief(
         "targets": report.targets,
         "recomputed": report.recomputed,
         "unbacked": report.unbacked,
+        "unchanged": report.unchanged,
         "errors": report.errors,
     });
     let written: Result<Uuid, String> = async {
@@ -755,6 +780,7 @@ fn belief_counts(report: &CascadeReport) -> serde_json::Value {
         "targets": report.targets.len(),
         "recomputed": report.recomputed.len(),
         "unbacked": report.unbacked.len(),
+        "unchanged": report.unchanged.len(),
         "errors": report.errors.len(),
     })
 }
@@ -784,9 +810,11 @@ fn applied(
 }
 
 /// The supersede cascade: migrate the retired claim's edges onto the
-/// replacement and mint the moved edges' BP factors (with its audit row,
-/// atomically), then invalidate and re-derive the BBAs frozen from its
-/// interval ([`cascade_after_supersede`]).
+/// replacement (the current head of its supersedes chain, should the
+/// replacement have been superseded since:
+/// [`ClaimRepository::migrate_superseded_edges_to_head_conn`]) and mint the
+/// moved edges' BP factors (with its audit row, atomically), then invalidate
+/// and re-derive the BBAs frozen from its interval ([`cascade_after_supersede`]).
 ///
 /// `admin` must be the maintenance connection and `admin_viewer` its bypass
 /// viewer (`MaintenanceSession::split`): the cascade walks downstream claims of
@@ -805,24 +833,44 @@ pub async fn apply_after_supersede(
     // commit together with the applied row: the retirement deleted the
     // predecessor's factors, and the INSERT-only factor trigger never sees the
     // migration's re-points.
+    //
+    // The edges go to the CURRENT head of `new_id`'s supersedes chain (backlog
+    // 6a670eab): a replayed deferral's successor may have been superseded since
+    // it was recorded. The factors and the belief cascade key on that head.
+    // When the chain was followed, the claims after `new_id` are listed under
+    // `superseded_onto` (the applied row carries their count, its ids row the
+    // claims, the head last): they are other writers' claims.
     let repaired = repair_with_audit!(
         admin,
         trigger,
         |tx| async {
-            let m = ClaimRepository::migrate_superseded_edges_conn(&mut tx, old_id, new_id).await?;
+            let (m, chain) = ClaimRepository::migrate_superseded_edges_to_head_conn(
+                &mut tx,
+                admin_viewer,
+                old_id,
+                new_id,
+            )
+            .await?;
+            let head = chain.last().copied().unwrap_or(new_id);
             let moved: Vec<Uuid> = m.retargeted.iter().chain(&m.resourced).copied().collect();
             let slots =
-                ClaimRepository::regenerate_superseded_edge_factors_conn(&mut tx, new_id, &moved)
+                ClaimRepository::regenerate_superseded_edge_factors_conn(&mut tx, head, &moved)
                     .await?;
-            Ok::<_, DbError>((m, slots))
+            Ok::<_, DbError>((m, slots, chain))
         },
-        |m| serde_json::json!({
-            "edges_retargeted": m.0.retargeted,
-            "edges_resourced": m.0.resourced,
-            "factors_minted": m.1,
-        })
+        |m| {
+            let mut touched = serde_json::json!({
+                "edges_retargeted": m.0.retargeted,
+                "edges_resourced": m.0.resourced,
+                "factors_minted": m.1,
+            });
+            if m.2.len() > 1 {
+                touched["superseded_onto"] = serde_json::json!(&m.2[1..]);
+            }
+            touched
+        }
     );
-    let (_, applied_id, touched) = match repaired {
+    let ((_, _, chain), applied_id, touched) = match repaired {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -831,7 +879,8 @@ pub async fn apply_after_supersede(
             )
         }
     };
-    let report = cascade_after_supersede(&mut *admin, admin_viewer, old_id, new_id).await;
+    let head = chain.last().copied().unwrap_or(new_id);
+    let report = cascade_after_supersede(&mut *admin, admin_viewer, old_id, head).await;
     let belief = record_belief(admin, trigger, applied_id, &report).await;
     let status = applied(applied_id, &touched, Some((&report, belief)));
     (status, report_for_caller(admin, caller, &report).await)
@@ -903,8 +952,17 @@ pub struct UnmarkOutcome {
 /// Why an un-mark changed nothing (its transaction rolled back).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnmarkRefusal {
-    /// The act refused: not a dedup-marked duplicate, or not writable.
-    Act(String),
+    /// The act refused, by design: the claim is not a dedup-marked duplicate,
+    /// its mark is not the one the caller was checked against, or the chain
+    /// moved since. `kind` decides the transport's answer, as for any
+    /// [`epigraph_db::DbError::Refused`] (input 400, authority 403, state 409),
+    /// and `message` is text written for the caller. Only a designed refusal
+    /// is an `Act`: any other error of the act is [`Self::Failed`], so driver
+    /// text never reaches a caller as a refusal's reason (backlog dca9ed56).
+    Act {
+        kind: epigraph_db::RefusalKind,
+        message: String,
+    },
     /// No applied repair record and no open cascade for this mark, and it is
     /// not a legacy mark the operator backfill gave its identity edge: there is
     /// nothing to reverse it from.
@@ -916,7 +974,7 @@ pub enum UnmarkRefusal {
 impl std::fmt::Display for UnmarkRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Act(e) => write!(f, "{e}"),
+            Self::Act { message, .. } => f.write_str(message),
             Self::NoRecord => f.write_str(
                 "there is no record of this dedup's repair (it was repaired before revert \
                  records existed, or not through the administrative cascade), so it cannot \
@@ -924,6 +982,26 @@ impl std::fmt::Display for UnmarkRefusal {
             ),
             Self::Failed(e) => write!(f, "the un-mark failed and nothing was changed: {e}"),
         }
+    }
+}
+
+/// The un-mark's answer to an error of its act
+/// ([`ClaimRepository::unmark_duplicate_act_authorized_conn`]): a designed
+/// refusal keeps its kind and its text ([`UnmarkRefusal::Act`]); a claim that
+/// vanished since the caller read it is a state refusal; anything else (the
+/// database failing: a lock timeout, a lost connection) is
+/// [`UnmarkRefusal::Failed`], whose text the transports keep in the server log.
+fn act_refusal(e: epigraph_db::DbError) -> UnmarkRefusal {
+    match e {
+        epigraph_db::DbError::Refused { kind, message } => UnmarkRefusal::Act { kind, message },
+        // The duplicate was deleted after the caller read it: its state moved,
+        // and the text is the fixed not-found template naming an id the caller
+        // supplied.
+        e @ epigraph_db::DbError::NotFound { .. } => UnmarkRefusal::Act {
+            kind: epigraph_db::RefusalKind::State,
+            message: e.to_string(),
+        },
+        other => UnmarkRefusal::Failed(other.to_string()),
     }
 }
 
@@ -995,10 +1073,73 @@ pub async fn apply_unmark_authorized(
     expected_canonical: Uuid,
     authorized_chain: Option<&[Uuid]>,
 ) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
+    apply_unmark_checked(
+        admin,
+        admin_viewer,
+        caller,
+        trigger,
+        dup_id,
+        expected_canonical,
+        authorized_chain,
+        None,
+    )
+    .await
+}
+
+/// A check of the caller's authority that must hold on the un-mark's OWN
+/// transaction, not only on the request's earlier, rolled-back one: run by
+/// [`apply_unmark_checked`] first, before the act, on the transaction the
+/// un-mark commits on. A refusal (`Err` with its text) rolls back with nothing
+/// changed and is answered as an authority [`UnmarkRefusal::Act`] (403).
+///
+/// What it is for (backlog 9a5bc055): a request path that admitted the caller
+/// through an operator link re-decides that admission here, under the link
+/// lock, so a retire of the link cannot commit between the request's gate and
+/// this commit.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
+#[async_trait::async_trait]
+pub trait UnmarkPrecondition: Send + Sync {
+    /// Decide on `tx`, the un-mark's own transaction.
+    async fn check(&self, tx: &mut sqlx::PgConnection) -> Result<(), String>;
+}
+
+/// [`apply_unmark_authorized`] with `precondition` run first on the un-mark's
+/// own transaction (see [`UnmarkPrecondition`]). `None` is
+/// [`apply_unmark_authorized`].
+///
+/// # Errors
+/// As [`apply_unmark`], and an authority [`UnmarkRefusal::Act`]
+/// ([`epigraph_db::RefusalKind::Authority`]) with the precondition's text
+/// when it refuses.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_unmark_checked(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    caller: &Viewer,
+    trigger: &CascadeTrigger,
+    dup_id: Uuid,
+    expected_canonical: Uuid,
+    authorized_chain: Option<&[Uuid]>,
+    precondition: Option<&dyn UnmarkPrecondition>,
+) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
     use epigraph_core::ClaimId;
     let mut tx = sqlx::Acquire::begin(&mut *admin)
         .await
         .map_err(|e| UnmarkRefusal::Failed(e.to_string()))?;
+    // Before the act takes any row lock, so a precondition that waits on a
+    // lock (the link lock) holds none a link writer could be waiting on.
+    if let Some(precondition) = precondition {
+        precondition
+            .check(&mut tx)
+            .await
+            // The one precondition (the link grant's re-check, #999) is an
+            // authority decision: its refusal is a 403, as the act's own
+            // authority refusals are.
+            .map_err(|message| UnmarkRefusal::Act {
+                kind: epigraph_db::RefusalKind::Authority,
+                message,
+            })?;
+    }
     // The act re-reads the canonical's chain and refuses one other than
     // `authorized_chain` (the canonical was replaced again since the caller
     // was checked) without naming what it read under the admin viewer.
@@ -1009,16 +1150,20 @@ pub async fn apply_unmark_authorized(
         authorized_chain,
     )
     .await
-    .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
+    .map_err(act_refusal)?;
     let canonical_id = unmarked.canonical;
     // The act locked the duplicate's row; the mark it found must be the one
     // the caller was authorized against (read earlier, on its own transaction).
     if canonical_id != expected_canonical {
-        return Err(UnmarkRefusal::Act(format!(
-            "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
-             {expected_canonical}, which the caller's authority was checked against; \
-             nothing was changed"
-        )));
+        // State: the mark moved since the caller was checked.
+        return Err(UnmarkRefusal::Act {
+            kind: epigraph_db::RefusalKind::State,
+            message: format!(
+                "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
+                 {expected_canonical}, which the caller's authority was checked against; \
+                 nothing was changed"
+            ),
+        });
     }
     let current_canonical_id = unmarked.current_canonical();
     let failed = |e: String| UnmarkRefusal::Failed(e);
@@ -1139,6 +1284,40 @@ pub async fn apply_unmark_authorized(
     ))
 }
 
+/// Whether [`apply_unmark`] would refuse `dup_id` as
+/// [`UnmarkRefusal::NoRecord`], read-only: `Some(NoRecord)` when its mark
+/// (identity edge `identity_edge`, `legacy_backfill` when the legacy backfill
+/// wrote it, as [`ClaimRepository::unmark_identity_edge_conn`] reads them) has
+/// no revert record, no open dedup cascade, and is not a backfilled legacy
+/// mark; `None` when the un-mark has something to reverse it from. The same
+/// three reads and the same rule as [`apply_unmark_authorized`], so a
+/// preflight (the `unmark_duplicate` CLI's dry run) predicts the act's
+/// refusal instead of reporting the mark admissible and refusing at apply,
+/// after earlier marks of the same run have committed.
+///
+/// Maintenance connection only (the audit reads are unfiltered).
+///
+/// # Errors
+/// `DbError::QueryFailed` on a failed read; `DbError::InvalidData` for a
+/// revert record without an applied row id ([`audit::dedup_revert_record`]),
+/// which the act fails on too.
+pub async fn predict_no_record(
+    conn: &mut sqlx::PgConnection,
+    dup_id: Uuid,
+    identity_edge: Uuid,
+    legacy_backfill: bool,
+) -> Result<Option<UnmarkRefusal>, DbError> {
+    // Both reads first, in the act's order, so a read the act fails on (a
+    // revert record with no applied row id) fails the preflight too, even for
+    // a mark the legacy rule would admit.
+    let record = audit::dedup_revert_record(&mut *conn, dup_id, identity_edge).await?;
+    let open = audit::open_dedup_cascades(&mut *conn, dup_id).await?;
+    if record.is_some() || legacy_backfill || !open.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(UnmarkRefusal::NoRecord))
+}
+
 /// The consolidation cascade: migrate the retired sources' live edges onto
 /// the merged claim and retract the redundant copies
 /// ([`ClaimRepository::migrate_consolidated_edges_conn`], with its audit row,
@@ -1256,7 +1435,7 @@ pub async fn apply_match_retire(
 /// The `edge_retract` cascade (migration 120), on the maintenance connection:
 /// remove every BBA keyed on the withdrawn edge
 /// ([`epigraph_db::EdgeRepository::remove_withdrawn_edge_bbas_conn`], keyed on
-/// `perspective_type = 'edge'`) with its audit row, atomically, then re-derive
+/// the edge's slot, `slot_kind = 'edge'`) with its audit row, atomically, then re-derive
 /// the beliefs of the claims those BBAs lived on AND the `sources` of every
 /// OPEN `edge_retract` deferral of the edge (not only the trigger's: two acts
 /// before one replay record two deferrals, and this run's applied row closes
@@ -1354,7 +1533,7 @@ pub struct WithdrawnEdgeSweepItem {
 
 /// The one-shot legacy sweep (`replay_deferred_cascades
 /// --sweep-withdrawn-edge-bbas`), on the maintenance connection: every edge
-/// whose edge-keyed BBAs outlived it (an edge-factor perspective with BBAs whose
+/// whose edge-keyed BBAs outlived it (an edge slot with BBAs whose
 /// edge is absent or out of force, retracted before migration 120 recorded
 /// deferrals) goes through [`apply_after_edge_retract`], audited as cause
 /// `edge_retract` naming `acting_agent` (the operator running it, D1) with
@@ -1576,6 +1755,43 @@ pub async fn replay_deferred(
 mod tests {
     use super::*;
 
+    /// The act's errors split three ways (backlog dca9ed56): a designed
+    /// refusal keeps its kind; a duplicate deleted after the caller read it
+    /// is a state refusal (409 / INVALID_PARAMS), with the fixed not-found
+    /// text naming the id the caller supplied; anything else is a failure,
+    /// redacted by both transports. No request path can delete the duplicate
+    /// between the caller's read and the act on demand, so the `NotFound` arm
+    /// is pinned here.
+    #[test]
+    fn an_act_error_is_a_refusal_only_when_it_is_designed() {
+        use epigraph_db::{DbError, RefusalKind};
+        let refused = act_refusal(DbError::Refused {
+            kind: RefusalKind::Authority,
+            message: "unmark_duplicate: refused".into(),
+        });
+        assert_eq!(
+            refused,
+            UnmarkRefusal::Act {
+                kind: RefusalKind::Authority,
+                message: "unmark_duplicate: refused".into(),
+            }
+        );
+        let id = Uuid::new_v4();
+        let deleted = act_refusal(DbError::NotFound {
+            entity: "Claim".into(),
+            id,
+        });
+        let UnmarkRefusal::Act { kind, message } = &deleted else {
+            panic!("a deleted duplicate must be a state refusal: {deleted:?}");
+        };
+        assert_eq!(*kind, RefusalKind::State);
+        assert_eq!(message, &format!("Claim with ID {id} not found"));
+        let failed = act_refusal(DbError::QueryFailed {
+            source: sqlx::Error::PoolTimedOut,
+        });
+        assert!(matches!(failed, UnmarkRefusal::Failed(_)), "{failed:?}");
+    }
+
     #[test]
     fn counts_only_replaces_every_array_by_its_length() {
         let v = serde_json::json!({
@@ -1600,6 +1816,36 @@ mod tests {
         let found = uuids_in(&format!("target {a}: failed (edge {b}); code 42501"));
         assert_eq!(found, vec![a, b]);
         assert!(uuids_in("no ids here, just 42501").is_empty());
+    }
+
+    #[test]
+    fn a_caller_error_line_keeps_the_context_and_withholds_the_error_text() {
+        let (seen, hidden) = (Uuid::new_v4(), Uuid::new_v4());
+        let visible = |id: &Uuid| *id == seen;
+        // The error text names a row the caller cannot read; only the context
+        // decides, and none of the error's text survives.
+        let entry = format!(
+            "recompute claim {seen}: error returned from database: canary-f9ac relation \
+             secret_shadow row {hidden}"
+        );
+        let line = caller_error_line(&entry, visible);
+        assert_eq!(
+            line,
+            format!("recompute claim {seen}: failed; the details are in the audit row")
+        );
+        // A context naming a row the caller cannot read, and an entry with no
+        // context, both become the generic line, with no id in it.
+        for entry in [
+            format!("repair claim {seen} after invalidating edge {hidden}: canary-f9ac"),
+            "canary-f9ac with no context".to_string(),
+        ] {
+            let line = caller_error_line(&entry, visible);
+            assert!(
+                line.contains("outside the caller's view") && uuids_in(&line).is_empty(),
+                "{entry:?} -> {line:?}"
+            );
+            assert!(!line.contains("canary-f9ac"), "{line:?}");
+        }
     }
 
     #[test]

@@ -21,7 +21,10 @@
 //!   transaction's start.
 //! * `epigraph_role_agent_may_run(agent)` answers the host and epigraph-mcp
 //!   without exposing the roster. Both the application role and the identity
-//!   attestor can EXECUTE it.
+//!   attestor can EXECUTE it; since 248 the application role is answered only
+//!   about its own stamped principal.
+//! * Since 248 the attach verb refuses (`ROL03`) an identity the host has not
+//!   registered yet, whose first registration the attachment would abort.
 //! * A succession registered by the attestor copies the parent's live
 //!   attachments to the child, once, over every gap the child's own rows
 //!   leave; a SHARED successor (one that runs in more than one group) is
@@ -262,14 +265,32 @@ struct MayRun {
     reason: String,
 }
 
+/// `epigraph_role_agent_may_run(agent)` on a `role` session stamped with
+/// `agent` as its principal: the way an application session asks about
+/// ITSELF (248 answers it about nobody else; the attestor is not bound).
 async fn may_run_as(pool: &PgPool, role: &str, agent: Uuid) -> Result<MayRun, sqlx::Error> {
+    may_run_stamped(pool, role, Some(agent), agent).await
+}
+
+/// `epigraph_role_agent_may_run(agent)` on a `role` session stamped with
+/// `principal` (`None`: unstamped).
+async fn may_run_stamped(
+    pool: &PgPool,
+    role: &str,
+    principal: Option<Uuid>,
+    agent: Uuid,
+) -> Result<MayRun, sqlx::Error> {
     fixture::as_role(pool, role, |mut conn| async move {
+        if let Some(p) = principal {
+            stamp(&mut conn, p, &[]).await;
+        }
         let r = sqlx::query_as::<_, MayRun>(
             "SELECT may_run, role, holder, reason FROM public.epigraph_role_agent_may_run($1)",
         )
         .bind(agent)
         .fetch_one(&mut *conn)
         .await;
+        unstamp(&mut conn).await;
         (conn, r)
     })
     .await
@@ -739,6 +760,60 @@ async fn may_run_answers_the_app_role_and_the_attestor(pool: PgPool) {
                 reason: "not_holder".into()
             },
             "{caller}: an agent of the previous holder"
+        );
+    }
+}
+
+/// Backlog 1afdc93d (migration 248). `agents` is world-readable, so under
+/// 166 an application session could ask `epigraph_role_agent_may_run` about
+/// every agent id and rebuild the role roster (which agents are attached to
+/// which role, and whether each role has a holder). 248 answers an
+/// application session only about its OWN stamped principal: about any other
+/// agent, or unstamped, it is refused `42501` and returns no row. The identity
+/// attestor (the host, which asks before starting any container) and a
+/// maintenance session still get the full answer about any agent.
+///
+/// Verified to fail: on 166's body (248 reverted) the unstamped and the
+/// other-principal app sessions both get the full answer, role included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn may_run_answers_an_app_session_only_about_its_own_principal(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let other = agent_of(&pool, h, "other").await;
+    attach(&pool, ROLE, attached).await;
+    let gap = MayRun {
+        may_run: false,
+        role: Some(ROLE.into()),
+        holder: None,
+        reason: "no_holder".into(),
+    };
+
+    for (what, principal) in [
+        ("unstamped", None),
+        ("stamped as another agent", Some(other)),
+    ] {
+        let r = may_run_stamped(&pool, "epigraph_app", principal, attached).await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "an app session {what} asks about another agent: {r:?}"
+        );
+    }
+    assert_eq!(
+        may_run_stamped(&pool, "epigraph_app", Some(attached), attached)
+            .await
+            .expect("an app session asks about its own principal"),
+        gap,
+        "its own answer, in full"
+    );
+    for privileged in [ATTESTOR, "epigraph_maintenance"] {
+        assert_eq!(
+            may_run_stamped(&pool, privileged, None, attached)
+                .await
+                .unwrap_or_else(|e| panic!("{privileged} asks about any agent: {e}")),
+            gap,
+            "{privileged}: the full answer, unstamped"
         );
     }
 }
@@ -2757,53 +2832,164 @@ async fn every_table_the_app_role_writes_carries_the_role_holder_write_check(poo
     );
 }
 
-/// 161's registration adopts a never-registered identity only while it is
-/// FRESH, and an attachment is a reference into `agents`, so attaching an
-/// identity BEFORE the host first registers it makes that registration abort
-/// `AID09`, naming `role_agents` (fail closed: the identity stays refused).
-/// The handover order is register first, then attach. CONTROL: the same
-/// shape without the attachment is adopted.
+/// Attach `agent` to `role` through the maintenance definer, returning the
+/// result instead of expecting success.
+async fn try_attach(pool: &PgPool, role: &str, agent: Uuid) -> Result<Uuid, sqlx::Error> {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// The host's first registration of an EXISTING agent row (adoption by its
+/// own public key), on the attestor's session.
+async fn try_adopt(pool: &PgPool, agent: Uuid) -> Result<Uuid, sqlx::Error> {
+    let key: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("key");
+    let hash = blake3::hash(&key).to_hex().to_string();
+    fixture::as_role(pool, ATTESTOR, |mut conn| async move {
+        let r = sqlx::query_scalar(
+            "SELECT agent_id FROM public.epigraph_register_agent_identity( \
+                 $1, NULL, 'test-model-166', $2, 'g-166-early', NULL, $3)",
+        )
+        .bind(&key)
+        .bind(&hash)
+        .bind(json!({"in_prompt": {}}))
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// Backlog 30ec8d72 (migration 248). 161's registration adopts a
+/// never-registered identity only while it is FRESH, and an attachment is a
+/// reference into `agents`. Under 166 alone, attaching such an identity
+/// before the host first registered it made that registration abort `AID09`
+/// for good. 248's attach refuses it instead, `ROL03`, naming the
+/// register-first order, and writes nothing; the identity is then still
+/// fresh, the host's registration adopts it, and the same attach lands.
+///
+/// CONTROLS (no over-refusal): an identity the registration would refuse
+/// anyway is attached as before, because the attachment is not what refuses
+/// it: one already bound by an operator link (`AID09` on the link), and one
+/// that authored claims without ever registering (`AID05`).
+///
+/// Verified to fail: on 166's attach (248 reverted) the early attach lands
+/// (no `ROL03`) and the registration then aborts `AID09`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_attachment_before_the_first_registration_aborts_it(pool: PgPool) {
+async fn attaching_an_identity_the_host_has_not_registered_is_refused(pool: PgPool) {
     seed_role(&pool, ROLE).await;
     let (early, _) = fixture::seed_agent_with_group(&pool, "attached-early").await;
-    let (fresh, _) = fixture::seed_agent_with_group(&pool, "fresh").await;
-    attach(&pool, ROLE, early).await;
 
-    let try_register = |agent: Uuid| {
-        let pool = pool.clone();
-        async move {
-            let key: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
-                .bind(agent)
-                .fetch_one(&pool)
-                .await
-                .expect("key");
-            let hash = blake3::hash(&key).to_hex().to_string();
-            fixture::as_role(&pool, ATTESTOR, |mut conn| async move {
-                let r: Result<Uuid, _> = sqlx::query_scalar(
-                    "SELECT agent_id FROM public.epigraph_register_agent_identity( \
-                         $1, NULL, 'test-model-166', $2, 'g-166-early', NULL, $3)",
-                )
-                .bind(&key)
-                .bind(&hash)
-                .bind(json!({"in_prompt": {}}))
-                .fetch_one(&mut *conn)
-                .await;
-                (conn, r)
-            })
-            .await
-        }
-    };
-    let refused = try_register(early).await;
-    assert_eq!(code_of(&refused).as_deref(), Some("AID09"), "{refused:?}");
+    let refused = try_attach(&pool, ROLE, early).await;
+    assert_eq!(code_of(&refused).as_deref(), Some("ROL03"), "{refused:?}");
     let text = refused.expect_err("refused").to_string();
-    assert!(text.contains("role_agents"), "names the binding: {text}");
-    assert_eq!(
-        try_register(fresh)
-            .await
-            .expect("CONTROL: a fresh identity is adopted"),
-        fresh
+    assert!(
+        text.contains("register it first") && text.contains("AID09"),
+        "the refusal names the register-first order and the trap it avoids: {text}"
     );
+    assert!(
+        live_attachments(&pool, early).await.is_empty(),
+        "a refused attach writes nothing"
+    );
+
+    assert_eq!(
+        try_adopt(&pool, early)
+            .await
+            .expect("the identity is still fresh: the host's registration adopts it"),
+        early
+    );
+    try_attach(&pool, ROLE, early)
+        .await
+        .expect("once registered, the same attach lands");
+    assert_eq!(
+        live_attachments(&pool, early).await,
+        vec![(ROLE.to_string(), None)]
+    );
+
+    // CONTROL: bound by an operator link, never registered.
+    let (h, _) = human(&pool, "holder").await;
+    let linked = agent_of(&pool, h, "linked").await;
+    try_attach(&pool, ROLE, linked)
+        .await
+        .expect("CONTROL: an identity an operator link already binds is attached as before");
+
+    // CONTROL: an author that never registered (161's AID05 shape).
+    let (author, a_group) = fixture::seed_agent_with_group(&pool, "author").await;
+    insert_claim(&pool, author, a_group)
+        .await
+        .expect("seed the author's claim");
+    try_attach(&pool, ROLE, author)
+        .await
+        .expect("CONTROL: an identity that authored claims unregistered is attached as before");
+}
+
+/// `docs/runbooks/248-undo.sql` puts back exactly 166's two bodies (the md5s
+/// 248's precondition names), owner and grants kept, and with them 166's
+/// behaviour: the early attach lands again and an unstamped application
+/// session is answered again. CONTROL first: at head both are refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_248_undo_restores_166s_bodies(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (early, _) = fixture::seed_agent_with_group(&pool, "undo-early").await;
+    assert_eq!(
+        code_of(&try_attach(&pool, ROLE, early).await).as_deref(),
+        Some("ROL03"),
+        "CONTROL: 248 is applied"
+    );
+    let undo = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/runbooks/248-undo.sql"
+    ))
+    .expect("read the undo");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("apply the undo");
+    for (signature, md5) in [
+        (
+            "public.epigraph_attach_agent_to_role(text, uuid, timestamptz, timestamptz, text)",
+            "434b06ab5e01ac9d13953ed1c4a4b647",
+        ),
+        (
+            "public.epigraph_role_agent_may_run(uuid)",
+            "eac9e167f74f426e664fd2c5e7f1f428",
+        ),
+    ] {
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT md5(prosrc) FROM pg_catalog.pg_proc WHERE oid = to_regprocedure($1)",
+        )
+        .bind(signature)
+        .fetch_one(&pool)
+        .await
+        .expect("read the body");
+        assert_eq!(
+            found.as_deref(),
+            Some(md5),
+            "{signature} is 166's body again"
+        );
+    }
+    try_attach(&pool, ROLE, early)
+        .await
+        .expect("166's attach admits the unregistered identity again");
+    let (h, _) = human(&pool, "undo-holder").await;
+    let other = agent_of(&pool, h, "undo-other").await;
+    may_run_stamped(&pool, "epigraph_app", None, other)
+        .await
+        .expect("166's may_run answers an unstamped application session again");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -9,22 +9,26 @@
 //! This module is the one place the flags are parsed, so every process
 //! derives the same [`BeliefModes`] from the same environment, and every
 //! reader in a process acts on the same value its `/health` report shows.
-//! Code acts on a flag by reading its field of [`current`]
-//! (`belief_modes::current().<key>`, or the engine's
-//! `atom_items::modes().<key>`, which is [`current`] plus a once-only typo
-//! warning); it never parses the variable again. The
+//! Code acts on a flag by calling its accessor on [`current`]
+//! (`belief_modes::current().<key>()`, or on the engine's
+//! `atom_items::modes()`, which is [`current`] plus a once-only typo
+//! warning); it never parses the variable again. The fields are private to
+//! this module, so the accessor is the only way to the value. The
 //! `belief_mode_readers` ratchet in this crate's tests fails on a second
-//! parser, and on a flag read in code while the table below says "no".
+//! parser, on a file that calls a flag's accessor without being listed for
+//! that flag (or is listed and no longer calls it), and on a table row below
+//! that says "no" for a flag some file acts on (or the reverse).
 //!
 //! The modes are reported by:
 //!
+//! - the job runner (`drain_jobs`), which journals it at boot;
 //! - the API server and the HTTP and stdio MCP servers, which journal it at
 //!   boot and report [`current`] on `/health` → `belief_modes` and
 //!   `system_stats` → `belief_modes`; the pre-flip mode check (SPEC §10.4)
 //!   compares those reports across live processes;
 //! - the CLI wave bins `recompute_betp`, `backfill_factors`,
-//!   `sweep_retired_source_bbas`, `refresh_truth_mirrors` and
-//!   `decompose_claims --retarget`, which compare their own [`current`] with
+//!   `recompute_claim_belief`, `sweep_retired_source_bbas`,
+//!   `refresh_truth_mirrors` and `decompose_claims --retarget`, which compare their own [`current`] with
 //!   the API's report before a writing run ([`BeliefModes::skew`]).
 //!
 //! # Defaults, and what this build acts on
@@ -37,7 +41,7 @@
 //! |---|---|---|---|
 //! | `EPIGRAPH_ATOM_FOLD` | `legacy`, `aef_standalone`, `aef` | `legacy` | yes: the single atom-cache writer (`edge_factor::recompute_atom_cache`) folds with the AEF the atoms the mode covers; the CLI wave bins whose writers fold only legacy refuse a writing run under any other fold |
 //! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` | `shadow` only: MCP `get_belief` adds the atom-level `shadow` view beside the served values. `progressive` and `strict` are not wired and serve `legacy` (logged once; `/health` still reports the configured mode) |
-//! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | no: a textless BBA write on a compound is neither kept inert nor logged yet |
+//! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | yes, on the textless BBA writers MCP `submit_ds_evidence`, REST `POST /api/v1/frames/:id/evidence` and REST `POST /api/v1/claims/:id/assess` (`compound_write_guard::decide`, role by migration 193's definer, a claim the caller cannot read left to the writer's not-found): on a compound, `warn` stores the BBA inert (a compound has no cache-owner frame, so no cache fold reads it; the per-frame side rows each writer keeps, such as its Beta track, are still written), returns `deprecated_compound_target` with the caller's visible atoms and logs the caller; `refuse` refuses it (MCP `invalid_params`, REST 422, `error: compound_target`) before anything is written. `update_with_evidence` carries evidence text and is not guarded |
 //! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` | yes: the atom display fold (`atom_items`), the atom-cache writer, BBA retraction's cache vacate and the shadow report keep or drop edge-factor rows whose source is a compound |
 //! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` | no |
 //! | `EPIGRAPH_INFERENCE` | `off`, `shadow`, `on` | `off` | no |
@@ -45,8 +49,8 @@
 //!
 //! The value docs below say what each mode means. For a flag (or value) the
 //! table marks as not acted on, a reported mode is configuration, not
-//! behaviour: `compound_write_guard: refuse` on `/health` does not mean such
-//! a write is refused. Each flag is wired into its code path by the change
+//! behaviour: `inference: on` on `/health` does not mean an inference layer
+//! is served. Each flag is wired into its code path by the change
 //! that introduces the behaviour, which reads [`current`] rather than parsing
 //! the environment again, and updates the table.
 //!
@@ -146,9 +150,9 @@ belief_mode! {
 }
 
 belief_mode! {
-    /// What a textless BBA write aimed at a compound does. Reported only in
-    /// this build (see the module doc's table); the variants describe the
-    /// enforced meaning.
+    /// What a textless BBA write aimed at a compound does
+    /// ([`crate::compound_write_guard`]; the module doc's table names the
+    /// writers that act on it).
     CompoundWriteGuard, env = "EPIGRAPH_COMPOUND_WRITE_GUARD", default = Warn, {
         /// Accepted, kept inert, the caller warned and logged.
         Warn => "warn",
@@ -211,14 +215,20 @@ belief_mode! {
 /// not as agreement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+///
+/// The fields are private to this module (backlog 9a8f3bff): outside it, the
+/// one way to act on a flag is its accessor ([`Self::atom_fold`] and the six
+/// beside it), so the `belief_mode_readers` ratchet can list every file that
+/// acts on each flag by its accessor calls, however the struct reached that
+/// file. A value with chosen modes is built by [`Self::from_lookup`].
 pub struct BeliefModes {
-    pub atom_fold: AtomFold,
-    pub compound_belief: CompoundBelief,
-    pub compound_write_guard: CompoundWriteGuard,
-    pub compound_source_edges: CompoundSourceEdges,
-    pub atom_cache_mode: AtomCacheMode,
-    pub inference: Inference,
-    pub bp_apply: BpApply,
+    atom_fold: AtomFold,
+    compound_belief: CompoundBelief,
+    compound_write_guard: CompoundWriteGuard,
+    compound_source_edges: CompoundSourceEdges,
+    atom_cache_mode: AtomCacheMode,
+    inference: Inference,
+    bp_apply: BpApply,
 }
 
 /// One flag's place in a [`BeliefModes`]: its report key, its environment
@@ -362,6 +372,52 @@ impl BeliefModes {
             modes,
             unrecognised,
         }
+    }
+
+    /// `EPIGRAPH_ATOM_FOLD`: which fold writes an atom's cache. Calling an
+    /// accessor is acting on its flag: the `belief_mode_readers` ratchet
+    /// lists every production file that calls each one.
+    #[must_use]
+    pub const fn atom_fold(&self) -> AtomFold {
+        self.atom_fold
+    }
+
+    /// `EPIGRAPH_COMPOUND_BELIEF`: how a compound's belief is served.
+    #[must_use]
+    pub const fn compound_belief(&self) -> CompoundBelief {
+        self.compound_belief
+    }
+
+    /// `EPIGRAPH_COMPOUND_WRITE_GUARD`: what a textless BBA write on a
+    /// compound does.
+    #[must_use]
+    pub const fn compound_write_guard(&self) -> CompoundWriteGuard {
+        self.compound_write_guard
+    }
+
+    /// `EPIGRAPH_COMPOUND_SOURCE_EDGES`: whether edge-factor rows whose source
+    /// is a compound are kept or dropped.
+    #[must_use]
+    pub const fn compound_source_edges(&self) -> CompoundSourceEdges {
+        self.compound_source_edges
+    }
+
+    /// `EPIGRAPH_ATOM_CACHE_MODE`: what an atom's cache holds.
+    #[must_use]
+    pub const fn atom_cache_mode(&self) -> AtomCacheMode {
+        self.atom_cache_mode
+    }
+
+    /// `EPIGRAPH_INFERENCE`: whether inference runs.
+    #[must_use]
+    pub const fn inference(&self) -> Inference {
+        self.inference
+    }
+
+    /// `EPIGRAPH_BP_APPLY`: whether BP results may be written.
+    #[must_use]
+    pub const fn bp_apply(&self) -> BpApply {
+        self.bp_apply
     }
 
     /// The modes the process environment describes, read now. Processes use

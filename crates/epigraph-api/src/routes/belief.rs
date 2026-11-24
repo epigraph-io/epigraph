@@ -308,6 +308,9 @@ struct ScopedBeliefWrite {
 /// not folded: `mass_on_empty` is its own conflict mass, `conflict_k` and
 /// `strategy` are NULL, as before. `strategy` is `Dempster`, or
 /// `cautious+Dempster` when a same-human sibling group was reduced.
+///
+/// The fold is `epigraph_engine::scoped_belief::fold_scope_rows`, which the
+/// widening acts' recompute of a moved claim's scoped rows also uses.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn scoped_belief_write(
@@ -320,58 +323,27 @@ async fn scoped_belief_write(
     scope_type: &'static str,
     scope_id: Uuid,
 ) -> Option<ScopedBeliefWrite> {
-    let mut rows = epigraph_engine::derivation_scope::retain_for_cache(conn, rows)
-        .await
-        .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope rows: {e}"))
-        .ok()?;
-    rows.sort_by_key(|r| r.id);
-    let rows: Vec<(epigraph_db::MassFunctionRow, epigraph_ds::MassFunction)> = rows
-        .into_iter()
-        .filter_map(|row| {
-            epigraph_ds::MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                .ok()
-                .map(|m| (row, m))
-        })
-        .collect();
-    if rows.is_empty() {
-        return None;
-    }
-    let stored: Vec<epigraph_db::MassFunctionRow> = rows.iter().map(|(r, _)| r.clone()).collect();
-    let sources = epigraph_engine::source_dependence::bba_sources_for_rows(conn, viewer, &stored)
-        .await
-        .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope sources: {e}"))
-        .ok()?;
-    let folded = rows.len() >= 2;
-    let cautious = epigraph_engine::source_dependence::has_same_owner_siblings(&sources);
-    let items = sources
-        .into_iter()
-        .zip(rows.into_iter().map(|(_, m)| m))
-        .collect();
-    let (combined, k) = epigraph_engine::source_dependence::combine_with_owner_dependence(
-        items,
+    let fold = epigraph_engine::scoped_belief::fold_scope_rows(
+        conn,
+        viewer,
+        ds_frame,
+        h_idx,
+        rows,
         conflict_threshold,
     )
-    .ok()?;
-    let (belief, plausibility, pignistic_prob, mass_on_missing) =
-        compute_hypothesis_belief(&combined, ds_frame, h_idx);
+    .await
+    .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope: {e}"))
+    .ok()??;
     Some(ScopedBeliefWrite {
         scope_type,
         scope_id,
-        belief,
-        plausibility,
-        mass_on_empty: k,
-        mass_on_missing,
-        conflict_k: folded.then_some(k),
-        // The rule that produced the stored fold, in the spelling `/assess`
-        // already stores for a cautious-then-Dempster fold.
-        strategy: folded.then(|| {
-            if cautious {
-                "cautious+Dempster".to_string()
-            } else {
-                "Dempster".to_string()
-            }
-        }),
-        pignistic_prob,
+        belief: fold.belief,
+        plausibility: fold.plausibility,
+        mass_on_empty: fold.mass_on_empty,
+        mass_on_missing: fold.mass_on_missing,
+        conflict_k: fold.conflict_k,
+        strategy: fold.strategy,
+        pignistic_prob: fold.pignistic_prob,
     })
 }
 
@@ -405,7 +377,7 @@ fn default_reliability() -> f64 {
 }
 
 fn default_conflict_threshold() -> f64 {
-    0.3
+    epigraph_engine::scoped_belief::DEFAULT_CONFLICT_THRESHOLD
 }
 
 /// Response from evidence submission
@@ -439,6 +411,17 @@ pub struct EvidenceSubmissionResponse {
     /// `replaced`. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Set when the claim is a COMPOUND and the server runs
+    /// `EPIGRAPH_COMPOUND_WRITE_GUARD=warn` (backlog 7435772c, SPEC §4.1 W3):
+    /// the BBA was stored, but a compound's belief is derived from its atoms,
+    /// so it is never folded into the compound's cached belief (the derived
+    /// compound view reads its refutation mass, as for every compound row).
+    /// `visible_atoms` lists the atoms the caller can see (`{id, content}`, at most 50; `visible_atom_count` is
+    /// the full count): submit there instead. A matching sentence is in
+    /// `warnings`. Under `refuse` the request is refused with 422
+    /// (`compound_target`). Omitted for a claim that is not a compound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecated_compound_target: Option<epigraph_engine::compound_write_guard::CompoundTarget>,
 }
 
 /// Simplified combination report for API response
@@ -685,22 +668,9 @@ pub(crate) fn compute_hypothesis_belief(
     ds_frame: &epigraph_ds::FrameOfDiscernment,
     hypothesis_index: Option<i32>,
 ) -> (f64, f64, f64, f64) {
-    use epigraph_ds::{measures, FocalElement};
-
     // The shared rule (backlog 45cbaef4): a negative or out-of-range stored
-    // index reads as 0, exactly as the cache writer resolves it. This used to
-    // be `i as usize`, which wrapped a negative index to `usize::MAX`.
-    let h_idx = epigraph_engine::edge_factor::resolve_hypothesis_index(
-        hypothesis_index,
-        ds_frame.hypothesis_count(),
-    );
-    let supported = FocalElement::positive(std::collections::BTreeSet::from([h_idx]));
-    let bel = measures::belief(combined, &supported);
-    let pl = measures::plausibility(combined, &supported);
-    let betp = measures::pignistic_probability(combined, h_idx);
-    let m_missing = combined.mass_of_missing();
-
-    (bel, pl, betp, m_missing)
+    // index reads as 0, exactly as the cache writer resolves it.
+    epigraph_engine::scoped_belief::hypothesis_belief(combined, ds_frame, hypothesis_index)
 }
 
 // =============================================================================
@@ -947,7 +917,7 @@ pub async fn conflict_batch(
     Path(frame_id): Path<Uuid>,
     Json(request): Json<ConflictBatchRequest>,
 ) -> Result<Json<ConflictBatchResponse>, ApiError> {
-    use epigraph_ds::{combination::conflict_coefficient, FrameOfDiscernment, MassFunction};
+    use epigraph_ds::{FrameOfDiscernment, MassFunction};
     use std::collections::{HashMap, HashSet};
 
     if request.pairs.len() > 100 {
@@ -1024,47 +994,63 @@ pub async fn conflict_batch(
         .pairs
         .iter()
         .map(|pair| {
-            let mf_a = mass_fns.get(&pair.claim_a);
-            let mf_b = mass_fns.get(&pair.claim_b);
-
-            match (mf_a, mf_b) {
-                (Some(a), Some(b)) => match conflict_coefficient(a, b) {
-                    Ok(k) => ConflictBatchResult {
-                        claim_a: pair.claim_a,
-                        claim_b: pair.claim_b,
-                        conflict_k: Some(k),
-                        error: None,
-                    },
-                    Err(e) => ConflictBatchResult {
-                        claim_a: pair.claim_a,
-                        claim_b: pair.claim_b,
-                        conflict_k: None,
-                        error: Some(e.to_string()),
-                    },
-                },
-                _ => {
-                    let missing = if mf_a.is_none() && mf_b.is_none() {
-                        format!(
-                            "No mass functions for claims {} and {}",
-                            pair.claim_a, pair.claim_b
-                        )
-                    } else if mf_a.is_none() {
-                        format!("No mass function for claim {}", pair.claim_a)
-                    } else {
-                        format!("No mass function for claim {}", pair.claim_b)
-                    };
-                    ConflictBatchResult {
-                        claim_a: pair.claim_a,
-                        claim_b: pair.claim_b,
-                        conflict_k: None,
-                        error: Some(missing),
-                    }
-                }
-            }
+            pair_conflict(
+                pair,
+                mass_fns.get(&pair.claim_a),
+                mass_fns.get(&pair.claim_b),
+            )
         })
         .collect();
 
     Ok(Json(ConflictBatchResponse { results }))
+}
+
+/// The fixed per-pair reason for a conflict the engine could not compute.
+#[cfg(feature = "db")]
+const CONFLICT_NOT_COMPUTED: &str = "conflict could not be computed for this pair; the detail \
+                                     is in the server log";
+
+/// One pair's slot in a `conflict_batch` answer.
+///
+/// The answer is a 200, so a slot's `error` never carries an error's
+/// `to_string()` (backlog f9acb220): an engine failure is logged and the slot
+/// says [`CONFLICT_NOT_COMPUTED`]. The missing-BBA texts name only the pair's
+/// own claim ids, which the caller sent.
+#[cfg(feature = "db")]
+fn pair_conflict(
+    pair: &ConflictPair,
+    mf_a: Option<&epigraph_ds::MassFunction>,
+    mf_b: Option<&epigraph_ds::MassFunction>,
+) -> ConflictBatchResult {
+    let (claim_a, claim_b) = (pair.claim_a, pair.claim_b);
+    let (conflict_k, error) = match (mf_a, mf_b) {
+        (Some(a), Some(b)) => match epigraph_ds::combination::conflict_coefficient(a, b) {
+            Ok(k) => (Some(k), None),
+            Err(e) => {
+                tracing::warn!(
+                    %claim_a,
+                    %claim_b,
+                    error = %e,
+                    "conflict_batch: conflict coefficient not computed"
+                );
+                (None, Some(CONFLICT_NOT_COMPUTED.to_string()))
+            }
+        },
+        (None, None) => (
+            None,
+            Some(format!(
+                "No mass functions for claims {claim_a} and {claim_b}"
+            )),
+        ),
+        (None, Some(_)) => (None, Some(format!("No mass function for claim {claim_a}"))),
+        (Some(_), None) => (None, Some(format!("No mass function for claim {claim_b}"))),
+    };
+    ConflictBatchResult {
+        claim_a,
+        claim_b,
+        conflict_k,
+        error,
+    }
 }
 
 /// Stub for non-db builds
@@ -1217,6 +1203,38 @@ pub async fn submit_evidence(
     };
     let frame_id = redirected.as_ref().map_or(frame_id, |f| f.id);
 
+    // 0c. EPIGRAPH_COMPOUND_WRITE_GUARD (backlog 7435772c, SPEC §4.1 W3):
+    //     these masses carry no evidence text, so on a COMPOUND they could
+    //     never be attributed to its atoms. The role is decided by structure
+    //     (migration 193's definer), as the caller, before anything is
+    //     written or announced. `refuse` answers 422 with the atoms the
+    //     caller can see; `warn` goes ahead (the row is inert: a compound has
+    //     no cache-owner frame, so neither step 13 nor any later owner-rule
+    //     recompute folds it), tells the caller and logs it once committed.
+    let deprecated_compound_target = {
+        use epigraph_engine::compound_write_guard::{decide, GuardDecision};
+        let mut read = state.read_as(&viewer).await?;
+        match decide(
+            &mut read,
+            &viewer,
+            request.claim_id,
+            state.compound_write_guard,
+            "frames_evidence",
+            Some(caller),
+        )
+        .await?
+        {
+            GuardDecision::NotCompound => None,
+            GuardDecision::Accept(target) => Some(target),
+            GuardDecision::Refuse(target) => {
+                return Err(ApiError::CompoundTarget {
+                    message: target.refusal(),
+                    data: target.refusal_data(),
+                });
+            }
+        }
+    };
+
     // 1. Load and validate frame
     let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
@@ -1289,7 +1307,20 @@ pub async fn submit_evidence(
         } else {
             epigraph_ds::FocalElement::positive(subset)
         };
-        masses.insert(fe, value);
+        // Two keys naming one focal element ("0,1" and "1,0", "0" and " 0")
+        // are refused, as MCP `submit_ds_evidence` refuses them: the later
+        // one silently replaced the earlier, so a body whose masses did not
+        // sum to 1 could pass `MassFunction::new` and store a BBA other than
+        // the one sent (backlog 2b992740).
+        if masses.insert(fe, value).is_some() {
+            return Err(ApiError::ValidationError {
+                field: "masses".to_string(),
+                reason: format!(
+                    "key '{key}' names the same focal element as an earlier key; give each \
+                     focal element once"
+                ),
+            });
+        }
     }
 
     let raw_mass =
@@ -1593,8 +1624,13 @@ pub async fn submit_evidence(
     //      id, so read the row first, on this transaction, and compare it with
     //      exactly what 5b stores. The caller's row has an agent, so the
     //      cached-combination exclusion never hides it.
-    let write_outcome = {
-        use epigraph_db::bba_write_outcome::{classify, prior_for, BbaWrite};
+    //
+    //      A replacement also yields what the replaced row was counted with on
+    //      the Beta track, for 13b to withdraw (backlog 862d8404), at the
+    //      claim's index on the frame as it stood when that row was counted:
+    //      read here, before step 6 can create the link.
+    let (write_outcome, withdrawn) = {
+        use epigraph_db::bba_write_outcome::{classify, prior_for, BbaWrite, BbaWriteOutcome};
         let rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
             &mut *tx,
             &viewer,
@@ -1602,8 +1638,9 @@ pub async fn submit_evidence(
             frame_id,
         )
         .await?;
-        classify(
-            prior_for(&rows, request.agent_id, request.perspective_id),
+        let prior = prior_for(&rows, request.agent_id, request.perspective_id);
+        let outcome = classify(
+            prior,
             &BbaWrite {
                 masses: &masses_json,
                 combination_method: "discount",
@@ -1613,7 +1650,22 @@ pub async fn submit_evidence(
                 conflict_k: None,
                 evidence_id: None,
             },
-        )
+        );
+        let withdrawn = match (outcome, prior) {
+            (BbaWriteOutcome::Replaced, Some(row)) => {
+                let prior_index = epigraph_db::FrameRepository::get_claim_assignment(
+                    &mut *tx,
+                    &viewer,
+                    request.claim_id,
+                    frame_id,
+                )
+                .await?
+                .and_then(|ca| ca.hypothesis_index);
+                epigraph_engine::ds_divergence::replaced_increments(row, &ds_frame, prior_index)
+            }
+            _ => None,
+        };
+        (outcome, withdrawn)
     };
 
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
@@ -1637,13 +1689,23 @@ pub async fn submit_evidence(
     //    and the COMMIT would silently roll the BBA back).
     //    ON CONFLICT DO NOTHING preserves an existing hypothesis_index;
     //    `FrameRepository::assign_claim` would overwrite it with NULL.
+    //    A NEW link names hypothesis 0, the index every belief read resolves a
+    //    missing one to (`edge_factor::resolve_hypothesis_index`). Linked with
+    //    a NULL index, the claim's Beta update below counted nothing
+    //    (`ds_divergence::beta_increments` has no singleton to read), so a
+    //    claim written only through this route never left Beta(1, 1) and,
+    //    every update being a cold start, never recorded a divergence row
+    //    (backlog 1ce62137). An existing NULL link is left as it is: the BBAs
+    //    already stored on it were counted as nothing, and a replacement
+    //    withdraws what its row was counted with (see 13b).
     {
         use sqlx::Acquire as _;
         let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to open a savepoint: {e}"),
         })?;
         let assigned = sqlx::query(
-            "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(request.claim_id)
         .bind(frame_id)
@@ -1746,6 +1808,9 @@ pub async fn submit_evidence(
             })?
             .flatten();
     let mut warnings = deprecated_parameter_warnings(&request);
+    if let Some(target) = &deprecated_compound_target {
+        warnings.push(target.warning());
+    }
     if redirected.is_some() {
         warnings.push(epigraph_engine::promotion::redirected_evidence_warning(
             request.claim_id,
@@ -1764,8 +1829,9 @@ pub async fn submit_evidence(
         ),
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Replaced => warnings.push(
             "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
-             perspective_id (same mass_function_id); it was not added beside it. To add \
-             independent evidence, submit it under a distinct perspective_id."
+             perspective_id (same mass_function_id); it was not added beside it, and \
+             bayesian_posterior counts it in place of the replaced BBA. To add independent \
+             evidence, submit it under a distinct perspective_id."
                 .to_string(),
         ),
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Inserted => {}
@@ -1812,7 +1878,9 @@ pub async fn submit_evidence(
         // An identical resubmission stored nothing new (backlog 33ce3f5d):
         // its Beta update was applied when the BBA was first stored, and
         // applying it again would count the same evidence twice. The
-        // posterior is reported from the parameters as they stand.
+        // posterior is reported from the parameters as they stand. A
+        // replacement withdraws the replaced BBA's increment (`withdrawn`,
+        // step 5a') as it adds its own (backlog 862d8404).
         let counted = write_outcome != epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged;
         // The submitted evidence's singleton mass is the evidence strength
         // (shared with the MCP DS tools: `epigraph_engine::ds_divergence`).
@@ -1823,6 +1891,7 @@ pub async fn submit_evidence(
             &viewer,
             request.claim_id,
             increments,
+            withdrawn,
             "submit_evidence",
         )
         .await
@@ -2002,6 +2071,11 @@ pub async fn submit_evidence(
     }
 
     tx.commit().await?;
+    // The compound write has landed: only now does it count in the guard's
+    // journal (a request refused above added no line).
+    if let Some(target) = &deprecated_compound_target {
+        target.log_accepted("frames_evidence", Some(caller));
+    }
 
     // 13c. CDST residual mass analysis
     {
@@ -2442,6 +2516,7 @@ pub async fn submit_evidence(
             write_outcome: write_outcome.as_str().to_string(),
             deduplicated: write_outcome.deduplicated(),
             warnings,
+            deprecated_compound_target,
         }),
     ))
 }
@@ -3378,6 +3453,7 @@ mod tests {
             write_outcome: "inserted".to_string(),
             deduplicated: false,
             warnings: vec![],
+            deprecated_compound_target: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pignistic_prob"));
@@ -3555,6 +3631,7 @@ mod tests {
             write_outcome: "inserted".to_string(),
             deduplicated: false,
             warnings: vec![],
+            deprecated_compound_target: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(
@@ -3877,6 +3954,46 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert!(json["conflict_k"].is_null());
         assert!(json["error"].as_str().unwrap().contains("No mass function"));
+    }
+
+    /// Backlog f9acb220: a pair whose conflict the engine refuses (here two
+    /// BBAs on different frames) gets the fixed reason in its 200 slot, never
+    /// the engine error's text, which names both frames.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_pair_the_engine_refuses_carries_the_fixed_reason_not_the_error_text() {
+        let frame = |name: &str| {
+            epigraph_ds::FrameOfDiscernment::new(
+                name.to_string(),
+                vec!["yes".to_string(), "no".to_string()],
+            )
+            .unwrap()
+        };
+        let mf = |name: &str| {
+            epigraph_ds::MassFunction::from_json_masses(
+                frame(name),
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+            )
+            .unwrap()
+        };
+        let (a, b) = (mf("frame_canary_left"), mf("frame_canary_right"));
+        assert!(
+            epigraph_ds::combination::conflict_coefficient(&a, &b).is_err(),
+            "calibration: the engine refuses BBAs on different frames"
+        );
+        let pair = ConflictPair {
+            claim_a: Uuid::new_v4(),
+            claim_b: Uuid::new_v4(),
+        };
+        let slot = serde_json::to_value(pair_conflict(&pair, Some(&a), Some(&b))).unwrap();
+        assert!(slot["conflict_k"].is_null(), "{slot}");
+        assert_eq!(slot["error"], CONFLICT_NOT_COMPUTED, "{slot}");
+        assert!(!slot.to_string().contains("frame_canary"), "{slot}");
+
+        let same = mf("frame_canary_left");
+        let ok = serde_json::to_value(pair_conflict(&pair, Some(&a), Some(&same))).unwrap();
+        assert!(ok["conflict_k"].is_number(), "calibration: {ok}");
+        assert!(ok.get("error").is_none(), "calibration: {ok}");
     }
 
     #[test]

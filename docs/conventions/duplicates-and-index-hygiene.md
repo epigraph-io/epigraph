@@ -15,7 +15,7 @@ or hides it. Use this page to decide.
 |---|---|---|
 | A claim that restates another claim, and only one should stay current | `mark_duplicate(claim_id, canonical_id, reason)` | The duplicate becomes non-current, `supersedes` the canonical, and loses its embeddings (it leaves semantic recall). A `same_as` identity edge records the tool, the rule, who marked it, and your `reason` when you give one. The dedup cascade then re-points the duplicate's edges (see [What a mark moves](#what-a-mark-moves)). |
 | Many identical restatements across the corpus | `sweep_semantic_duplicates`, an operator job (the CLI on the maintenance connection; a request-serving MCP server refuses it) | Dry-run by default. It collapses only claims with identical content (the same hash), across tenants, onto the survivor it picks (highest truth value, then earliest), through the same act as `mark_duplicate`, with rule `exact_restatement`. Near-duplicates come back as merge candidates for `consolidate_claims`. |
-| 2 to 20 claims that restate ONE of them | `consolidate_claims(mode='identity', survivor_claim_id)` | No claim is written. Every other source is marked a duplicate of the survivor through `mark_duplicate`'s act: it gets the identity edge, its belief inputs pool onto the survivor, its edges move, and it can be un-marked. Every source and your authority over every pair are checked before any is marked. |
+| 2 to 20 claims that restate ONE of them | `consolidate_claims(mode='identity', survivor_claim_id)` | No claim is written. Every other source is marked a duplicate of the survivor through `mark_duplicate`'s act: it gets the identity edge, its belief inputs pool onto the survivor, its edges move, and it can be un-marked. Every source and your authority over every pair are checked before any is marked, and the marks are one transaction: all the sources are marked or none is (a source another writer changes mid-call refuses the whole call). The sources must all be marked under one write identity, so a `claims:admin` call mixing sources whose owning group you write with sources you do not is refused; split it by owning group. |
 | 2 to 20 complementary claims that should become ONE new, merged claim | `consolidate_claims(mode='merge')` (`rewrite` is accepted as `merge`) | A new claim is written, and the sources supersede into it. Their edges move to it, but their belief inputs do not (no belief cascade follows). There is no identity edge and no un-mark: the sources are not duplicates of each other. Sources spanning two owner groups are refused. |
 | 2 to 20 claims that a new, more general claim should sum up while they stay current | `consolidate_claims(mode='abstract')` | A new claim is written and linked to each source by a `generalizes` edge marked `"moves_belief": false`, so the factor backfill and the sheaf skip it and the abstraction's confidence, which comes from the sources, is not fed back into them. Nothing is retired and no edge moves. |
 | A claim whose content is wrong or out of date | `supersede_claim` | A new version replaces it. |
@@ -40,8 +40,16 @@ sweep runs:
 - `--applied-marks <file>` takes an `apply_label_dedup` response and un-marks
   each of its marks newest first, with the canonical and identity edge the
   apply recorded. Every mark is checked before any is un-marked; one refusal
-  writes nothing. Revert the apply's label writes with `revert_label_dedup`
-  and `applied_units` only, which needs no maintenance connection.
+  writes nothing. The check refuses what the act would: a mark with no
+  in-force identity edge, and a mark with nothing to reverse it from (no
+  revert record, no open cascade, not a backfilled legacy mark). A record
+  the check cannot read (one that names no applied row) fails the whole run
+  before anything is written: exit 1, no plan. A failure only the act can
+  see (for example a revert record whose body does not parse) still stops
+  that mark after earlier ones committed: the report's `status` is then
+  `partial` and the failed step says why. Revert the apply's label
+  writes with `revert_label_dedup` and `applied_units` only, which needs no
+  maintenance connection.
 - `--apply` un-marks. Each un-mark is audited as cause `undedup` naming
   `--acting-agent`, and the restored claim is re-embedded when the CLI has an
   `OPENAI_API_KEY` (otherwise `embed_backfill` fills it). It does not run
@@ -75,8 +83,14 @@ deferred, and the replay timer applies it.
 
 - **Edges.** The duplicate's edges, incoming and outgoing, are re-pointed onto
   the canonical. An edge whose triple the canonical already has is retracted
-  instead. The identity edge itself is never moved. A non-public duplicate
-  keeps its `executes` edges.
+  instead. Edges that record the duplicate itself stay on it, neither moved
+  nor retracted:
+  - an agent's authorship of it (`AUTHORED` or `asserts` from an agent);
+  - a supersede act edge (one carrying the `supersede_act` marker);
+  - retracted edges, and lineage edges (`supersedes`, in either spelling);
+  - the identity edge;
+  - the document ingest's own edges;
+  - a non-public duplicate's `executes` edges.
 - **Belief inputs (mass functions).** They follow the edges and pool onto the
   canonical, except:
   - copies of a source the canonical already holds;

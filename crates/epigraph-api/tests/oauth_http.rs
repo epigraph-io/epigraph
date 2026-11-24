@@ -217,3 +217,68 @@ async fn redirect_flow_on_assertion_provider_returns_400() {
         "expected does-not-support-redirect message, got body: {body}"
     );
 }
+
+// ── /oauth/revoke tests (backlog cd96cd49) ───────────────────────────────
+
+async fn post_raw(
+    app: axum::Router,
+    uri: &str,
+    content_type: &str,
+    body: &'static str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// A revocation request with no `token`, or a body that does not parse, is
+/// refused with RFC 7009 section 2.2.1 / RFC 6749 section 5.2's
+/// `{"error":"invalid_request"}` (400), in JSON and in the RFC's own
+/// form-encoded body, never the generic `{"error":"BadRequest"}` shape. A
+/// standards-following client keys its handling on that code. The request is
+/// refused while parsing, before any token is looked up, so this needs no
+/// database.
+///
+/// Catches: `parse_revoke_request` mapping a parse failure (including a
+/// missing `token`) to `ApiError::BadRequest`.
+#[tokio::test]
+async fn a_revoke_without_a_token_is_rfc_invalid_request() {
+    for (what, content_type, body) in [
+        ("JSON body, no token", "application/json", "{}"),
+        (
+            "JSON body, only a hint",
+            "application/json",
+            r#"{"token_type_hint":"refresh_token"}"#,
+        ),
+        ("malformed JSON", "application/json", "{not json"),
+        (
+            "form body, no token",
+            "application/x-www-form-urlencoded",
+            "token_type_hint=access_token",
+        ),
+        ("empty form body", "application/x-www-form-urlencoded", ""),
+    ] {
+        let app = app(registry_with(false, false));
+        let (status, body) = post_raw(app, "/oauth/revoke", content_type, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("invalid_request"),
+            "{what}: RFC 7009 error code expected, got {body}"
+        );
+        assert!(
+            body.get("error_description")
+                .and_then(Value::as_str)
+                .is_some_and(|d| !d.is_empty()),
+            "{what}: an error_description is carried: {body}"
+        );
+    }
+}

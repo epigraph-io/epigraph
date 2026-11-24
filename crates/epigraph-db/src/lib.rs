@@ -86,6 +86,9 @@ pub use refusal_codes::{
     caller_refusal_code, supersede_refusal_code, CALLER_REFUSAL_CODES, SUPERSEDE_REFUSAL_CODES,
 };
 pub use repos::bug_report::{BugReportInput, BugReportReceipt, BugReportRepository, BugReportRow};
+pub use repos::person_team_group::{
+    AcceptedInvitation, MyGroup, MyInvitation, PersonTeamGroupRepository, INVITATION_ROLES,
+};
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
 pub use repos::PolicyRepository;
@@ -93,8 +96,8 @@ pub use repos::SpeaksFor;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
     agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
-    PromptBlobRead, PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot,
-    PromptSnapshotIndex,
+    PromptBlobRead, PromptFile, PromptHistoryCursor, PromptHistoryEntry, PromptHistoryIndexEntry,
+    PromptHistoryPage, PromptSnapshot, PromptSnapshotIndex, PROMPT_HISTORY_PAGE_MAX,
 };
 pub use repos::{
     agent_lookup, authored_by, AgentAuthorship, AgentCard, AgentKind, AgentLookupRepository,
@@ -124,29 +127,30 @@ pub use repos::{
     EvidenceEdgeRow, EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceListFilter,
     EvidenceListRow, EvidenceRepository, EvidenceSearchResult, EvolveStepResult,
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
-    FactorRepository, FlatRanking, FlatWorkflowClaim, FrameClaimBeliefHit, FrameRepository,
-    GapAnalysisResult, GapChallengeRow, GapRecord, GapRepository, GraphExpansionHit,
-    GraphViewRepository, GroundedNeighbor, GroupKeyEpochRepository, GroupMembershipRepository,
-    GroupRepository, GroupRow, HierarchicalOutcomeCounters, HierarchicalOutcomeRecord,
-    HierarchicalOutcomeResult, HierarchicalWorkflowRow, HybridHit, IndexCounts,
-    InstanceAdminRepository, InstanceAdminRow, KeyEpochRow, LabelFamilyRow, LabelQuery,
-    LearningEventRepository, LearningEventRow, LevelAndSourceType, LineageHead, LineageRepository,
-    MarkedDuplicateRow, MarkedDuplicates, MassFunctionRepository, MatchCandidateRepo,
-    MatchCandidateRow, MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength,
-    MethodFailureModes, MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult,
-    MethodSourcePaper, MethodUsageExample, MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage,
-    NewHierarchicalOutcomeReport, NewRecallEvent, NonceConsumption, OAuthClientRepository,
-    OAuthClientRow, OperatorLink, OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff,
-    PatchClaimInput, PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository,
-    ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
+    FactorRepository, FlatPage, FlatRanking, FlatWorkflowClaim, FrameClaimBeliefHit,
+    FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord, GapRepository,
+    GraphExpansionHit, GraphViewRepository, GroundedNeighbor, GroupKeyEpochRepository,
+    GroupMembershipRepository, GroupRepository, GroupRow, HierarchicalOutcomeCounters,
+    HierarchicalOutcomeRecord, HierarchicalOutcomeResult, HierarchicalWorkflowRow, HybridHit,
+    IndexCounts, InstanceAdminRepository, InstanceAdminRow, KeyEpochRow, LabelFamilyRow,
+    LabelQuery, LearningEventRepository, LearningEventRow, LevelAndSourceType, LineageHead,
+    LineageRepository, MarkedDuplicateRow, MarkedDuplicates, MassFunctionRepository,
+    MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow, MethodCapability,
+    MethodEvidenceStrength, MethodFailureModes, MethodForCapability, MethodRecord,
+    MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample, MovedBba,
+    NearestClaimHit, NeighbourhoodThemeCoverage, NewHierarchicalOutcomeReport, NewRecallEvent,
+    NonceConsumption, OAuthClientRepository, OAuthClientRow, OperatorLink, OperatorLinkOutcome,
+    PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
+    PatternTemplateRow, PerspectiveRepository, PromotionStanding, ProvenanceChain,
+    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
     ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
     RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
     RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
     RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
-    SecurityEventRepository, SecurityEventRow, SemanticSelectedClaim, SheafRepository,
-    SortDirection, StructuralRepository, SupersedeActor, SupersedeEdgeMigration, SupersedeTool,
-    SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
-    TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
+    SecurityEventRepository, SecurityEventRow, SemanticFlatPage, SemanticSelectedClaim,
+    SheafRepository, SortDirection, StructuralRepository, SupersedeActor, SupersedeEdgeMigration,
+    SupersedeTool, SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow,
+    ThemeSummaryRow, TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
     WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
     WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
@@ -181,7 +185,9 @@ pub use repos::{
 };
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{CountersignDecision, CountersignRepository, CountersignedRow};
-pub use repos::{DelegationLive, RunTokens, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV};
+pub use repos::{
+    DelegationLive, RunTokens, SignerAgentType, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV,
+};
 pub use repos::{
     IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing, PaperIngestPrincipal,
     AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
@@ -246,7 +252,7 @@ pub use repos::graph_view::{
     SubgraphTraceRow,
 };
 pub use repos::mass_function::{
-    cached_combination_slot_holds_input, delete_edge_bbas, CachedBelief, EdgeBbaCascade,
+    cached_combination_slot_holds_input, delete_edge_bbas, BbaSlot, CachedBelief, EdgeBbaCascade,
     MassFunctionRow, CACHED_COMBINATION_UNFOLDED,
 };
 // `repos::ownership` is intentionally absent: 40969da5 retired the legacy
@@ -263,6 +269,6 @@ pub use repos::political::{
 
 // Re-export Lineage types for users of LineageRepository
 pub use repos::lineage::{
-    LcaResult, LineageClaim, LineageEvidence, LineageNode, LineageResult, LineageTrace,
-    LINEAGE_INCOMING,
+    AncestorIds, LcaResult, LineageClaim, LineageEvidence, LineageNode, LineageResult,
+    LineageTrace, ANCESTOR_DERIVATION_RELATIONSHIPS, ANCESTOR_ID_RELATIONSHIPS, LINEAGE_INCOMING,
 };

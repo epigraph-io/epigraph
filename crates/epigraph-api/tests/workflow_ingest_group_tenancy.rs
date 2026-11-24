@@ -3648,7 +3648,7 @@ async fn a_caller_that_does_not_write_the_inherited_group_cannot_add_a_generatio
 
     // REST: a variant (another canonical name) linked to the group parent.
     // Generation 1, so it links `(name, 0)` (`resolve_ingest_parent` looks
-    // one generation down; a generation-0 variant links nothing).
+    // one generation down; a generation-0 variant is refused).
     let variant = "acme-inherit-variant";
     let mut child = extraction(variant, 1, &[&["acme inherit variant op"]]);
     child["source"]["parent_canonical_name"] = json!(name);

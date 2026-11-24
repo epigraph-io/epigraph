@@ -1051,3 +1051,409 @@ async fn a_both_hierarchies_apply_waits_for_the_publish_lock(pool: PgPool) {
     .unwrap();
     assert_eq!(latest, run);
 }
+
+// ── reverse (backlog b3e39c55) ──────────────────────────────────────────────
+
+/// A run written straight through the repository, as another builder (the
+/// nightly, the naming pass, another map's apply) would leave one: `algo`,
+/// `params`, one level per hierarchy in `hierarchies`, finished unless
+/// `finish` is false.
+async fn seed_run(
+    pool: &PgPool,
+    map: AtlasMap,
+    algo: &str,
+    params: serde_json::Value,
+    theme: Uuid,
+    hierarchies: &[AtlasHierarchy],
+    finish: bool,
+) -> Uuid {
+    use epigraph_db::repos::atlas_map::{LevelDoc, MapEpochs, NewMapRun};
+    let mut tx = pool.begin().await.unwrap();
+    let run = AtlasMapRepository::write_run(
+        &mut tx,
+        &NewMapRun {
+            map,
+            algo: algo.to_string(),
+            params,
+            epochs: MapEpochs::default(),
+        },
+    )
+    .await
+    .expect("open the run");
+    for &h in hierarchies {
+        AtlasMapRepository::put_level(
+            &mut tx,
+            run,
+            &LevelDoc {
+                hierarchy: h,
+                group_id: Uuid::new_v4(),
+                parent_group_id: None,
+                theme_id: theme,
+                level: 0,
+                schema_version: 1,
+                payload: serde_json::json!({"seeded": true}),
+            },
+        )
+        .await
+        .expect("store a level");
+    }
+    if finish {
+        AtlasMapRepository::finish_run(&mut tx, run)
+            .await
+            .expect("finish");
+    }
+    tx.commit().await.unwrap();
+    run
+}
+
+/// Every stored run and level, as bytes to compare before and after.
+async fn every_row(pool: &PgPool) -> Vec<(Uuid, String)> {
+    sqlx::query_as(
+        "SELECT r.id, to_jsonb(r)::text || '|' || COALESCE( \
+                    (SELECT string_agg(to_jsonb(l)::text, '|' ORDER BY l.hierarchy, l.group_id) \
+                       FROM atlas_map_levels l WHERE l.run_id = r.id), '') \
+           FROM atlas_map_runs r ORDER BY r.id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read every run")
+}
+
+async fn reversed_audit_rows(pool: &PgPool) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = $1 ORDER BY created_at, id",
+    )
+    .bind(epigraph_cli::atlas_undo::REVERSE_EVENT)
+    .fetch_all(pool)
+    .await
+    .expect("read the audit rows")
+}
+
+async fn reverse(
+    pool: &PgPool,
+    viewer: &Viewer,
+    map: AtlasMap,
+    run: Uuid,
+    kind: epigraph_cli::atlas_undo::ApplyKind,
+    write: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let mut conn = pool.acquire().await.unwrap();
+    epigraph_cli::atlas_undo::reverse_run(&mut conn, viewer, map, run, kind, write).await
+}
+
+/// DONE for b3e39c55: an applied run is undone with the CLI, dry run then
+/// apply. The dry run reports the cascade and writes nothing (no audit row
+/// either); the apply deletes exactly that run and its levels, leaves the
+/// earlier run of the map, the meaning-only run and another team's run
+/// byte-identical, the earlier run is served again, and one audit row names
+/// the run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_undoes_one_apply_run_after_a_dry_run_and_nothing_else(pool: PgPool) {
+    use epigraph_cli::atlas_undo::ApplyKind;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = c.map();
+    let mut conn = pool.acquire().await.unwrap();
+    let meaning_run = run_id(
+        &epigraph_cli::atlas_meaning::build::apply_result(
+            &mut conn,
+            &viewer,
+            map,
+            &meaning_result(&c),
+            CAP,
+            true,
+        )
+        .await
+        .expect("meaning-only apply"),
+    );
+    drop(conn);
+    let r = links_result(&c);
+    let first = run_id(&apply(&pool, &viewer, &c, &r).await.expect("first"));
+    let second = run_id(&apply(&pool, &viewer, &c, &r).await.expect("second"));
+    let unrelated = seed_run(
+        &pool,
+        AtlasMap::Team(c.other),
+        epigraph_cli::atlas_links::build::HIERARCHIES_ALGO,
+        serde_json::json!({"hierarchies": ["meaning", "links"]}),
+        c.theme,
+        &[M, L],
+        true,
+    )
+    .await;
+    let second_levels =
+        stored(&pool, second, "meaning").await.len() + stored(&pool, second, "links").await.len();
+    assert!(second_levels > 0);
+    let before = every_row(&pool).await;
+
+    let dry = reverse(&pool, &viewer, map, second, ApplyKind::Links, false)
+        .await
+        .expect("dry run");
+    assert_eq!(dry["applied"], false, "{dry}");
+    assert_eq!(dry["served_now"], true, "{dry}");
+    assert_eq!(dry["served_after"], serde_json::json!(first), "{dry}");
+    assert_eq!(dry["deletes"]["levels"], serde_json::json!(second_levels));
+    assert_eq!(every_row(&pool).await, before, "the dry run wrote nothing");
+    assert!(reversed_audit_rows(&pool).await.is_empty(), "no audit row");
+
+    let done = reverse(&pool, &viewer, map, second, ApplyKind::Links, true)
+        .await
+        .expect("apply");
+    assert_eq!(done["applied"], true, "{done}");
+    let after = every_row(&pool).await;
+    let expected: Vec<(Uuid, String)> = before
+        .iter()
+        .filter(|(id, _)| *id != second)
+        .cloned()
+        .collect();
+    assert_eq!(after, expected, "only the reversed run and its levels went");
+    for id in [first, meaning_run, unrelated] {
+        assert!(after.iter().any(|(r, _)| *r == id), "{id} is kept");
+    }
+    let orphans: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM atlas_map_levels WHERE run_id = $1")
+            .bind(second)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(orphans, 0, "the levels went with the run");
+    let served: Uuid = sqlx::query_scalar(
+        "SELECT id FROM atlas_map_runs WHERE owner_group_id = $1 AND finished_at IS NOT NULL \
+          ORDER BY finished_at DESC, id DESC LIMIT 1",
+    )
+    .bind(c.team)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(served, first, "the earlier run is served again");
+
+    let audit = reversed_audit_rows(&pool).await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0]["run"]["run_id"], serde_json::json!(second));
+    assert_eq!(audit[0]["map"], serde_json::json!(map_key(map)));
+    assert_eq!(audit[0]["tool"], "atlas_links");
+    assert_eq!(audit[0]["served_after"], serde_json::json!(first));
+    assert!(done["audit_event_id"].is_string(), "{done}");
+
+    // Gone now: a second reverse refuses.
+    reverse(&pool, &viewer, map, second, ApplyKind::Links, true)
+        .await
+        .expect_err("already reversed");
+}
+
+/// The refusals, each writing nothing: another map's run (named under this
+/// map), a run of the other binary's apply (both ways), a run a later nightly
+/// or naming pass was built from, that derived run itself, and an unfinished
+/// run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_refuses_runs_it_must_not_delete(pool: PgPool) {
+    use epigraph_cli::atlas_undo::ApplyKind;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = c.map();
+    let mut conn = pool.acquire().await.unwrap();
+    let meaning_run = run_id(
+        &epigraph_cli::atlas_meaning::build::apply_result(
+            &mut conn,
+            &viewer,
+            map,
+            &meaning_result(&c),
+            CAP,
+            true,
+        )
+        .await
+        .expect("meaning-only apply"),
+    );
+    drop(conn);
+    let links_run = run_id(
+        &apply(&pool, &viewer, &c, &links_result(&c))
+            .await
+            .expect("apply"),
+    );
+    let theirs = seed_run(
+        &pool,
+        AtlasMap::Team(c.other),
+        epigraph_cli::atlas_links::build::HIERARCHIES_ALGO,
+        serde_json::json!({"hierarchies": ["meaning", "links"]}),
+        c.theme,
+        &[M, L],
+        true,
+    )
+    .await;
+    let before = every_row(&pool).await;
+
+    for write in [false, true] {
+        let wrong_map = reverse(&pool, &viewer, map, theirs, ApplyKind::Links, write)
+            .await
+            .expect_err("another team's run");
+        assert!(
+            format!("{wrong_map:#}").contains("has no run"),
+            "{wrong_map:#}"
+        );
+        let e = reverse(&pool, &viewer, map, links_run, ApplyKind::Meaning, write)
+            .await
+            .expect_err("a links run is not atlas_meaning's");
+        assert!(format!("{e:#}").contains("atlas_meaning apply"), "{e:#}");
+        let e = reverse(&pool, &viewer, map, meaning_run, ApplyKind::Links, write)
+            .await
+            .expect_err("a meaning run is not atlas_links'");
+        assert!(format!("{e:#}").contains("atlas_links apply"), "{e:#}");
+    }
+    assert_eq!(every_row(&pool).await, before);
+
+    // A nightly built from the links run, and a naming pass from the meaning
+    // run (the naming pass keeps its source's algo and params).
+    let nightly = seed_run(
+        &pool,
+        map,
+        epigraph_cli::atlas_nightly::build::NIGHTLY_ALGO,
+        serde_json::json!({"hierarchies": ["meaning", "links"], "nightly_from_run": links_run}),
+        c.theme,
+        &[M, L],
+        true,
+    )
+    .await;
+    let named = seed_run(
+        &pool,
+        map,
+        epigraph_cli::atlas_meaning::build::MEANING_ALGO,
+        serde_json::json!({"hierarchy": "meaning", "named_from_run": meaning_run}),
+        c.theme,
+        &[M],
+        true,
+    )
+    .await;
+    let unfinished = seed_run(
+        &pool,
+        map,
+        epigraph_cli::atlas_links::build::HIERARCHIES_ALGO,
+        serde_json::json!({"hierarchies": ["meaning", "links"]}),
+        c.theme,
+        &[M, L],
+        false,
+    )
+    .await;
+    let before = every_row(&pool).await;
+    for write in [false, true] {
+        for (run, kind) in [
+            (links_run, ApplyKind::Links),
+            (meaning_run, ApplyKind::Meaning),
+        ] {
+            let e = reverse(&pool, &viewer, map, run, kind, write)
+                .await
+                .expect_err("a later run was built from it");
+            assert!(format!("{e:#}").contains("built from"), "{e:#}");
+        }
+        let e = reverse(&pool, &viewer, map, nightly, ApplyKind::Links, write)
+            .await
+            .expect_err("a nightly run is not an apply");
+        assert!(format!("{e:#}").contains("atlas_links apply"), "{e:#}");
+        let e = reverse(&pool, &viewer, map, named, ApplyKind::Meaning, write)
+            .await
+            .expect_err("a naming run is not an apply");
+        assert!(format!("{e:#}").contains("named_from_run"), "{e:#}");
+        let e = reverse(&pool, &viewer, map, unfinished, ApplyKind::Links, write)
+            .await
+            .expect_err("an unfinished run");
+        assert!(format!("{e:#}").contains("unfinished"), "{e:#}");
+    }
+    assert_eq!(
+        every_row(&pool).await,
+        before,
+        "no refusal deleted anything"
+    );
+    assert!(reversed_audit_rows(&pool).await.is_empty());
+}
+
+/// The reverse verb end to end through the binaries an operator runs: each
+/// binary reverses only its own apply's run (the wiring of `ApplyKind` and
+/// `--run-id`), the default is a dry run that leaves the run in place, and
+/// `--apply` removes it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binaries_reverse_their_own_runs_dry_run_first(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = c.map();
+    let mut conn = pool.acquire().await.unwrap();
+    let meaning_run = run_id(
+        &epigraph_cli::atlas_meaning::build::apply_result(
+            &mut conn,
+            &viewer,
+            map,
+            &meaning_result(&c),
+            CAP,
+            true,
+        )
+        .await
+        .expect("meaning-only apply"),
+    );
+    drop(conn);
+    let links_run = run_id(
+        &apply(&pool, &viewer, &c, &links_result(&c))
+            .await
+            .expect("apply"),
+    );
+    let url = fixture::database_url_for(&pool).await;
+    let run = |bin: &str, run: Uuid, write: bool| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("DATABASE_URL", &url)
+            .env("MAINTENANCE_DATABASE_URL", &url)
+            .env("RUST_LOG", "warn")
+            .args(["reverse", "--map", &map_key(map), "--run-id"])
+            .arg(run.to_string());
+        if write {
+            cmd.arg("--apply");
+        }
+        cmd.output().expect("run the binary")
+    };
+    let exists = |run: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM atlas_map_runs WHERE id = $1)",
+            )
+            .bind(run)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (meaning_bin, links_bin) = (
+        env!("CARGO_BIN_EXE_atlas_meaning"),
+        env!("CARGO_BIN_EXE_atlas_links"),
+    );
+
+    for (bin, other_run, want) in [
+        (meaning_bin, links_run, "atlas_meaning apply"),
+        (links_bin, meaning_run, "atlas_links apply"),
+    ] {
+        let out = run(bin, other_run, true);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{bin} reversed the other binary's run"
+        );
+        assert!(stderr.contains(want), "{bin}: {stderr}");
+    }
+    for (bin, own) in [(links_bin, links_run), (meaning_bin, meaning_run)] {
+        let dry = run(bin, own, false);
+        assert!(
+            dry.status.success(),
+            "{bin} dry run: {}",
+            String::from_utf8_lossy(&dry.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&dry.stdout).expect("report");
+        assert_eq!(report["applied"], false, "{report}");
+        assert!(exists(own).await, "the dry run kept {own}");
+        let done = run(bin, own, true);
+        assert!(
+            done.status.success(),
+            "{bin} --apply: {}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&done.stdout).expect("report");
+        assert_eq!(report["applied"], true, "{report}");
+        assert!(!exists(own).await, "{bin} --apply deleted {own}");
+    }
+}

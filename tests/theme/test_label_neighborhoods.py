@@ -14,7 +14,7 @@ import uuid
 import pytest
 
 from scripts import label_themes_llm as L
-from tests.theme.conftest import TEST_DSN
+from tests.theme.conftest import script_dsn
 from tests.theme.test_label_excludes_intake import PUBLIC_TEXT, _claim, _group
 
 PRIVATE_TEXT = "neighbourhood-label private member heron-garnet"
@@ -71,7 +71,7 @@ def _run_labeller(monkeypatch, *extra):
     monkeypatch.setattr(L, "call_claude_cli", fake_cli)
     monkeypatch.delenv("MAINTENANCE_DATABASE_URL", raising=False)
     monkeypatch.setattr(
-        sys, "argv", ["label_themes_llm.py", "--database-url", TEST_DSN, "--neighborhoods", *extra]
+        sys, "argv", ["label_themes_llm.py", "--database-url", script_dsn(), "--neighborhoods", *extra]
     )
     L.main()
     return prompts
@@ -158,3 +158,43 @@ def test_neighbourhood_placeholders_are_relabelled(label):
 ])
 def test_neighbourhood_names_are_kept(label):
     assert not L.is_neighborhood_placeholder_label(label)
+
+
+def test_a_newer_bridge_run_is_not_the_run_labelled(db):
+    """latest_cluster_run picks the run expand serves: the newest LOUVAIN run.
+
+    POST /api/v1/clusters/build-from-bridges writes algo = 'louvain_bridge'
+    rows into the same graph_cluster_runs table; such a run has no
+    neighbourhoods and ClusterRunRepository::latest skips it (backlog
+    523dcb4f). Both runs are dated in the future so no run another test left
+    behind can outrank them, and the bridge run is the newer of the two, so a
+    lookup ordered by completed_at alone picks it and fails here.
+    """
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded, completed_at) "
+            "VALUES (gen_random_uuid(), 0, false, now() + interval '1 day') "
+            "RETURNING run_id::text, algo"
+        )
+        louvain, algo = cur.fetchone()
+        cur.execute(
+            "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded, algo, completed_at) "
+            "VALUES (gen_random_uuid(), 0, false, 'louvain_bridge', now() + interval '2 days') "
+            "RETURNING run_id::text"
+        )
+        bridge = cur.fetchone()[0]
+    db.commit()
+    try:
+        # The runner inserts without naming algo; migration 028's default is
+        # the literal the lookup filters on.
+        assert algo == "louvain"
+        assert L.latest_cluster_run(db) == louvain, (
+            f"the louvain_bridge run {bridge} must not be the run --neighborhoods labels"
+        )
+    finally:
+        db.rollback()
+        with db.cursor() as cur:
+            cur.execute(
+                "DELETE FROM graph_cluster_runs WHERE run_id::text = ANY(%s)", ([louvain, bridge],)
+            )
+        db.commit()

@@ -224,10 +224,11 @@ impl BehavioralExecutionRepository {
     ///
     /// # Tenancy
     ///
-    /// `behavioral_executions` carries no visibility columns and no row
-    /// security, and `epigraph_app` keeps `SELECT` on it (migration 118), so
-    /// the table alone discloses every workflow's runs (`goal_text`,
-    /// `step_beliefs`) to every caller. A row is returned only when its
+    /// Since migration 240 a `behavioral_executions` row carries its
+    /// workflow's `(owner_group_id, visibility)` under FORCEd row security, so
+    /// the table no longer discloses a group workflow's runs (`goal_text`,
+    /// `step_beliefs`) to a non-member. The in-query filter stays as defense
+    /// in depth: a row is returned only when its
     /// workflow is one `viewer` reads: the polymorphic `workflow_id`
     /// (migration 022) names either a `workflows` row (hierarchical; tenancy
     /// since migration 183) or a flat workflow claim, and the parent filter
@@ -583,8 +584,8 @@ impl BehavioralExecutionRepository {
     /// per-row count would let one long report clear `min_executions` alone.
     ///
     /// Deprecated workflows (`truth_value <= 0.1`) are excluded.
-    /// `behavioral_executions` carries no visibility columns and no row
-    /// security; the joined `workflows` row carries its plan's tenancy under
+    /// `behavioral_executions` rows carry their workflow's tenancy under row
+    /// security (migration 240); the joined `workflows` row carries its plan's tenancy under
     /// row security since migration 183 (ruling R-74), so run this on the
     /// caller's STAMPED connection: the join then keeps exactly the workflows
     /// the caller reads.

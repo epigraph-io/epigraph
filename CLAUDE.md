@@ -36,6 +36,13 @@ closed set by design.
   forwarding the bearer gives it no authority it does not already have. The
   rule that follows: **mount only an extension you operate and would trust
   with the kernel's signing secret**, and never mount a third-party one.
+  Backlog `7b834860` adds the asymmetric path: with
+  `EPIGRAPH_JWT_SIGNING_KEY` the kernel signs EdDSA and serves
+  `/.well-known/jwks.json`, and an extension built on
+  `JwtConfig::verifier_from_jwks` verifies without being able to mint. The
+  caveat holds until a deployment has set the key and removed
+  `EPIGRAPH_JWT_SECRET` from every extension (`docs/deploy.md`, "Token
+  signing keys").
   The fix (backlog `c9b82fae`; design
   `docs/superpowers/specs/2026-09-26-episcience-operator-authority-design.md`
   section 2 and section 6 item 6) is an RFC 8693 token-exchange grant at
@@ -270,7 +277,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
 - **MCP `improve_workflow_hierarchy`** — embeds executor output (claims) AND calls `set_goal_embedding` for the new `workflows` row; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
-- **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
+- **MCP `add_step`** and **HTTP `POST /api/v1/workflows/steps`** — embed when `AddStepResult::inserted_content` is `Some` (a new step, or a reused one revived from a workflow deprecation)
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
 - **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
@@ -281,12 +288,15 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `supersede_claim`** and **HTTP `POST /api/v1/claims/:id/supersede`** — the act inserts a current replacement with new text and copies no vector, so the replacement is embedded post-commit: MCP on the stamp of the principal whose transaction inserted it (`actor`), not the inherited author, who may not write the claim's group (`tools/supersede.rs::supersede_claim`, `embed_claim_author_stamped`), HTTP on the caller's stamp (`routes/versioning.rs::supersede_claim`, `AppState::embed_claim_as`)
 - **MCP `evolve_step`** and **HTTP `POST /api/v1/workflows/steps/:id/evolve`** — the new step, `supersedes` or `revises`, embedded post-commit through the caller that authored it (`tools/evolve_step.rs`, `embed_created_workflow_claims`; `routes/workflows.rs::evolve_step`, `embed_inserted_workflow_claims`)
 - **CLI `unmark_duplicate`** — the operator's un-mark on the maintenance DSN (request servers refuse one under D9); re-embeds each restored claim post-commit through `store_embedding_if_unsealed`, best-effort (`crates/epigraph-cli/src/bin/unmark_duplicate.rs::embed_restored`)
+- **CLI `epigraph-operator custodial-supersede`** — the custodian's revision of a platform-owned claim inserts a current successor with new text; after the act commits (`--apply`) it embeds the successor on the same maintenance session through `store_embedding_if_unsealed`, best-effort, and prints `embedded=` (`crates/epigraph-cli/src/operator/custodian.rs::embed_successor`)
 - **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format the vector with `epigraph_db::pgvector_literal` (the one helper; `embedding_stack_ratchet` refuses a hand-written `[v,v,...]`), bind as `$N::vector`)
 - **CLI `method_search`** — `crates/epigraph-cli/src/bin/method_search.rs` (embedding included directly in INSERT, matches `hypothesis` pattern)
 
 `epigraph-ingest-executor` is pure-DB and does **not** embed itself; it returns
-`inserted: Vec<(Uuid, String)>` / `AddStepResult::inserted_content` so each
-caller embeds with its own configured embedder.
+`WorkflowIngestExecutionResult::claims_to_embed()` (the claims it `inserted`
+plus the ones it `revived` from a workflow deprecation) /
+`AddStepResult::inserted_content` so each caller embeds with its own configured
+embedder.
 
 ### Cleanup paths (must null on `is_current = false`)
 
@@ -306,6 +316,7 @@ The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 - **`ClaimRepository::supersede_act_conn`** — `"UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL"`
 - **`ClaimRepository::evolve_step_conn`** — same statement, under `if edge_type == "supersedes"`
 - **`ClaimRepository::deprecate_claim`** — `SET truth_value = 0.05, is_current = false, embedding = NULL,`
+- **`ClaimRepository::retire_for_workflow_deprecation`** — the same `SET` list plus a `workflow_deprecation_retired` marker in `properties` (the hierarchical `deprecate_workflow`); `revive_workflow_deprecation_retired` undoes a marked retirement when a later generation or `add_step` reuses the claim, and the caller re-embeds it
 - **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL` (mode `merge` only: `abstract` retires nothing, and `identity` goes through `mark_duplicate_act` below)
 - **`mark_duplicate_act`** (free fn behind `ClaimRepository::mark_duplicate_act_conn` / `mark_duplicate_with_repair_conn`) — `SET supersedes = $1, is_current = false, embedding = NULL,`
 

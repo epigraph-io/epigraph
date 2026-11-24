@@ -22,6 +22,10 @@ Nothing in the repository installs it. Every step below is an operator step.
      the nearest centroid) and "by links" tree (W5b mirrors, new links join
      their neighbours' leaf), a leaf over the 100-node cap or the contract's
      1,024 edges split on the box by W3's fallback split (`resplit_leaves`);
+     a leaf of ONE claim whose own agents and evidence carry more than 1,024
+     edges among them cannot be split, so it keeps its heaviest 1,024 (each
+     agent and evidence node keeps an edge to the claim) and the cut is
+     reported under `leaf_edge_cap`;
    - builds real leaves (claims with their stored `truth_value` as the
      colour value, agents, evidence, W7 flow weights);
    - once every theme is final, builds the map's cross-group links: group
@@ -52,14 +56,21 @@ newer run was published while the night ran; nothing was written) or
   cut: `dropped_targets`, `dropped_bundles`, `dropped_outgoing`,
   `dropped_links`; also stored in the run's `params`). A cut keeps the
   heaviest and never fails the night;
+- `leaf_edge_cap` (`capped_leaves`, `dropped_edges`: the one-claim leaves
+  over the contract's 1,024 edges and the edges they left out; also per
+  theme in `themes.built[].stats` and in the run's `params`). Like the link
+  caps it keeps the heaviest and never fails the night: the claim and every
+  one of its agents and evidence rows are still drawn, only the weakest
+  edges among them are not;
 - `layout.relaid` (the levels laid out again) and `naming.renamed` (the
   levels whose naming input changed), `naming.report.calls`.
 
-A theme whose update FAILS does not fail the night. The one known cause is
-a single claim whose OWN agents and evidence carry more than the contract's
-1,024 edges among them: no split can bring one claim under the limit. (A
-leaf of several claims over 1,024 edges is split, not failed.) The theme
-is:
+A theme whose update FAILS does not fail the night. A leaf over the edge
+limit no longer fails one (above: several claims are split, one claim is
+capped). The known remaining cause is a stored edge whose relationship name
+the contract refuses (it allows letters, digits and `_`, at most 32
+characters, starting with a letter; `edges` takes any non-empty name and the
+leaf serves the stored one lower-cased). The theme is:
 - **carried**: the previous run's levels of that theme are kept, both
   hierarchies, when every node and edge of every carried leaf is still in
   that leaf assembled from what the map may draw now (claims that arrived
@@ -67,11 +78,10 @@ is:
 - **dropped** from the run otherwise (a claim, agent, evidence row or edge
   of it left the map's audience: carrying it would leak it).
 
-Both list the error. For the single-claim case an operator build does NOT
-clear it (the build would store the same claim's leaf again): find the claim
-in the error, and reduce the edges among its attachments (retract duplicate
-or stale edges), after which the next night builds the theme. Any other
-error: rebuild the map (below) and file the error.
+Both list the error. For a refused relationship name an operator build does
+NOT clear it (the build would store the same leaf again): file the error
+(it names the level and the edge). Any other error: rebuild the map (below) and
+file the error.
 
 Exit codes: 0 when every map was written, unchanged, skipped or a dry run;
 1 when a map failed or the night refused to start (the timer's alert fires);
@@ -152,6 +162,12 @@ with it (`ON DELETE CASCADE`) and the previous finished run is served again:
 ```sql
 DELETE FROM atlas_map_runs WHERE id = '<run_id>';
 ```
+
+An operator build's run (`atlas_meaning apply --apply`, `atlas_links apply
+--apply`) is undone with the binary's own `reverse` instead of a DELETE:
+`atlas_meaning reverse --map M --run-id R` reports what it would delete and
+which run is served after, and `--apply` deletes it and writes an audit row.
+It refuses a nightly run, and an operator run a later night was built from.
 
 The pruned older runs are gone, so the rollback reaches back `--keep-runs - 1`
 nights. The theme assignment of step 1 is not rolled back by this; it only

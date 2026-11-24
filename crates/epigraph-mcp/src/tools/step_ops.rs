@@ -79,11 +79,19 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
                 data: None,
             }
         }
-        // Migration 105's personal-group refusal (the step claim's owner
-        // declaration): a denial, as on every other write tool.
-        E::Repo(db) if db.is_write_authority_refusal() => crate::errors::db_caller_error(db),
         E::Executor(x) => crate::errors::executor_caller_error("executor error", x),
-        E::Db(_) | E::Repo(_) => internal_error(e.to_string()),
+        // The TYPED error, never its `to_string()` (backlog 0bc4636e): a
+        // designed refusal (`DbError::Refused`, a coded database message) is
+        // recognised by its type and sent as written; anything else is
+        // redacted and logged. Stringified, a refusal was redacted too.
+        E::Db(e) => internal_error(e),
+        // A repository error is classified as on every other write tool
+        // (`db_caller_error`): migration 105's personal-group refusals, a
+        // row-security `WriteRefused`, an operator-link or elevation denial
+        // and a supersede refusal are INVALID_REQUEST, `InvalidData` is
+        // INVALID_PARAMS, and everything else goes to `internal_error` (a
+        // `DbError::Refused` sent as written, driver text redacted).
+        E::Repo(e) => crate::errors::db_caller_error(e),
     }
 }
 
@@ -96,6 +104,7 @@ async fn require_authority_over(
     conn: &mut sqlx::PgConnection,
     auth: Option<&epigraph_auth::AuthContext>,
     caller: crate::write_identity::WriteIdentity,
+    viewer: &epigraph_db::visibility::Viewer,
     canonical_name: &str,
     tool_name: &'static str,
 ) -> Result<Option<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)>, McpError> {
@@ -118,7 +127,7 @@ async fn require_authority_over(
         ))
     };
     let grant = crate::tools::workflow_authority::require_workflow_authority(
-        server, conn, auth, caller, head, tool_name, &not_found,
+        server, conn, auth, caller, viewer, head, tool_name, &not_found,
     )
     .await?;
     Ok(Some((head, grant)))
@@ -160,6 +169,7 @@ pub async fn add_step(
         &mut tx,
         auth,
         caller,
+        viewer,
         &params.canonical_name,
         "add_step",
     )
@@ -264,6 +274,7 @@ pub async fn delete_step(
         &mut tx,
         auth,
         caller,
+        viewer,
         &params.canonical_name,
         "delete_step",
     )
@@ -300,4 +311,74 @@ pub async fn delete_step(
         step_lineage_id: r.step_lineage_id,
         truth_value: r.truth_value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_step_err;
+    use crate::errors::INTERNAL_ERROR_MESSAGE;
+    use epigraph_ingest_executor::StepOpError as E;
+
+    /// A refusal the repo layer authored reaches the `add_step` /
+    /// `delete_step` caller as written (backlog 0bc4636e). The mapper used to
+    /// stringify the error first (`internal_error(e.to_string())`), which
+    /// erased the `DbError` type `designed_refusal` recognises it by, so the
+    /// caller got the redacted internal error instead of the reason.
+    #[test]
+    fn a_repo_refusal_reaches_the_caller_as_written() {
+        const MESSAGE: &str = "workflow step 5c1e is not current; refusing";
+        let mapped = map_step_err(E::Repo(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
+            message: MESSAGE.to_string(),
+        }));
+        assert_eq!(mapped.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            mapped.message, MESSAGE,
+            "the refusal was not sent as written"
+        );
+    }
+
+    /// A repository denial reaches the caller classified as on every other
+    /// write tool (`db_caller_error`), not as the redacted internal error: a
+    /// row-security `WriteRefused` is INVALID_REQUEST with its text and an
+    /// `InvalidData` rejection is INVALID_PARAMS with its reason. The old
+    /// mapper sent both to `internal_error`, which redacts them.
+    #[test]
+    fn a_repo_denial_is_classified_as_on_every_write_tool() {
+        let denied = map_step_err(E::Repo(epigraph_db::DbError::WriteRefused {
+            entity: "claim".to_string(),
+            id: uuid::Uuid::nil(),
+            action: "update".to_string(),
+        }));
+        assert_eq!(denied.code, rmcp::model::ErrorCode::INVALID_REQUEST);
+        assert!(
+            denied.message.contains("may read it but not update it"),
+            "{}",
+            denied.message
+        );
+
+        const REASON: &str = "step text carries unexpanded shell syntax";
+        let invalid = map_step_err(E::Repo(epigraph_db::DbError::InvalidData {
+            reason: REASON.to_string(),
+        }));
+        assert_eq!(invalid.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(invalid.message.contains(REASON), "{}", invalid.message);
+    }
+
+    /// The other half: a driver or protocol error, bare or converted into a
+    /// `DbError`, stays redacted. Passing the typed error must not open a
+    /// path for server text.
+    #[test]
+    fn a_driver_error_stays_redacted() {
+        const SECRET: &str = "connection to db-host-7f3a:5432 reset";
+        for mapped in [
+            map_step_err(E::Db(sqlx::Error::Protocol(SECRET.to_string()))),
+            map_step_err(E::Repo(epigraph_db::DbError::from(sqlx::Error::Protocol(
+                SECRET.to_string(),
+            )))),
+        ] {
+            assert_eq!(mapped.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            assert_eq!(mapped.message, INTERNAL_ERROR_MESSAGE, "{}", mapped.message);
+        }
+    }
 }

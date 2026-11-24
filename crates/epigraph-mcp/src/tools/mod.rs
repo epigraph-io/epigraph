@@ -40,6 +40,7 @@ pub mod recall_events;
 pub mod sheaf;
 pub mod step_ops;
 pub mod supersede;
+pub mod team_groups;
 pub mod themes;
 pub mod viewer;
 pub mod visibility;

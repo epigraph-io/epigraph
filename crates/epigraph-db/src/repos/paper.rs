@@ -1,10 +1,10 @@
 //! Paper entity repository.
 //!
 //! Papers are first-class graph nodes (entity_type = "paper") used by
-//! hierarchical document ingestion. The `papers` table has a UNIQUE
-//! constraint on `doi`, so re-ingestion of the same DOI returns the
-//! existing paper id (get-or-create semantics) rather than creating a
-//! second row. Re-ingestion is gated separately via the `processed_by`
+//! hierarchical document ingestion. Since migration 246 a row carries the
+//! tenancy of the ingest that wrote it and `papers` is unique on (document
+//! key, scope): every public ingest of a DOI returns the one public row
+//! (get-or-create semantics), and a group's private ingest returns its own. Re-ingestion is gated separately via the `processed_by`
 //! edge with a `pipeline` property.
 
 use sqlx::PgPool;
@@ -21,54 +21,94 @@ pub struct PaperRow {
     pub journal: Option<String>,
 }
 
+/// A `papers` row as `POST /api/v1/papers` answers it
+/// ([`PaperRepository::registered_row`]).
+#[derive(Debug, Clone)]
+pub struct RegisteredPaper {
+    pub id: Uuid,
+    pub doi: String,
+    pub title: Option<String>,
+    pub journal: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// `(visibility, owner_group_id)` of a declared paper write. A paper has no
+/// parent to inherit from, so an `Inherited` declaration is refused here
+/// rather than by the database's 23502.
+fn declared(decl: epigraph_core::TenancyDecl) -> Result<(&'static str, Uuid), DbError> {
+    match (decl.visibility_bind(), decl.owner_group_bind()) {
+        (Some(v), Some(g)) => Ok((v, g)),
+        _ => Err(DbError::InvalidData {
+            reason: "a papers row must be written with a declared tenancy (visibility and \
+                     owner group); a paper has no parent to inherit one from"
+                .to_string(),
+        }),
+    }
+}
+
 pub struct PaperRepository;
 
 impl PaperRepository {
-    /// Insert a paper, or return the existing id if the document key already
-    /// exists under any of its spellings.
+    /// Insert a paper in the scope `decl` names, or return the existing row of
+    /// that scope if the document key already exists there under any of its
+    /// spellings.
     ///
-    /// The key is matched through [`document_key_spellings`], canonical
+    /// # One row per document per scope (migration 246)
+    ///
+    /// `papers` carries the tenancy of the ingest that wrote it. A PUBLIC row
+    /// is shared: every public writer of a document converges on its one public
+    /// row, whoever owns it (that is how two sources corroborate, and why a
+    /// public ingest behaves as it did before 246). A GROUP row belongs to its
+    /// owner group: a team's private ingest of a document another team holds
+    /// privately creates its own row and learns nothing about the other's.
+    /// The lookup therefore matches the declared SCOPE, not merely what the
+    /// session can see: a member sees both its group's row and the public one,
+    /// and must reuse the one its declaration names.
+    ///
+    /// Run it on the writer's STAMPED connection (`decl` is the ingest's
+    /// resolved declaration). Row security admits the INSERT only for an owner
+    /// group the session writes; the conflicting row of a scope is always one
+    /// the writer can read (public, or its own group's), so the upsert never
+    /// lands on a hidden row.
+    ///
+    /// The key is matched through [`document_key_spellings`] and
+    /// [`document_key_first_in_sql`] within the declared scope, canonical
     /// first, so a row an older writer stored under a resolver URL
-    /// (`https://doi.org/10.x/y`) is reused rather than twinned by a bare-key
-    /// ingest (backlog 90756d26). A new row is stored under the
-    /// [`canonical_document_key`]. Idempotent for repeat ingestion.
+    /// (`https://doi.org/10.x/y`, or a case variant of its prefix such as
+    /// `HTTPS://DOI.ORG/10.x/y`) is reused rather than twinned (backlogs
+    /// 90756d26, f3a3ca54). A new row is stored under the
+    /// [`canonical_document_key`].
     ///
-    /// **A hit fills only NULL fields** (backlog 62ce37ca). `papers` is one
-    /// global row per document with no row security, and this runs on the
-    /// plain pool before any per-caller authority over the paper is checked,
-    /// so the row found keeps its `title` and `journal`; a provided value is
-    /// written only where the stored one is NULL. Overwriting on hit let any
-    /// ingester naming an existing DOI rewrite that paper's bibliographic
-    /// fields for every reader. Both arms below hold this: the `updated` CTE
-    /// (an existing row) and `ON CONFLICT` (a concurrent writer inserted the
-    /// same new key first).
-    ///
-    /// One statement: when no spelling exists yet, the insert falls through
-    /// to `ON CONFLICT (doi)` on the canonical key, so a concurrent writer
-    /// that inserted the same document under another spelling makes this
-    /// call wait and then return that writer's row, not a unique violation.
+    /// **A hit fills only NULL fields** (backlog 62ce37ca): the row found keeps
+    /// its `title` and `journal`; a provided value is written only where the
+    /// stored one is NULL. Both arms hold this: the `updated` CTE (an existing
+    /// row) and `ON CONFLICT` (a concurrent writer inserted the same new key in
+    /// the same scope first, which makes this call wait and then return that
+    /// writer's row, not a unique violation).
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_or_create(
-        pool: &PgPool,
+    /// `DbError::InvalidData` for an undeclared (`Inherited`) `decl`: a paper
+    /// has no parent to inherit from. `DbError::QueryFailed` if the statement
+    /// fails, including a row-security refusal (42501) for an owner group the
+    /// session does not write.
+    #[instrument(skip(executor))]
+    pub async fn get_or_create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         doi: &str,
         title: Option<&str>,
         journal: Option<&str>,
+        decl: epigraph_core::TenancyDecl,
     ) -> Result<Uuid, DbError> {
+        let (visibility, owner) = declared(decl)?;
         let canonical = canonical_document_key(doi);
         let spellings = document_key_spellings(doi);
         // Runtime-checked, not `query!`: CI's migration runner is built
         // `SQLX_OFFLINE`, so a new compile-time query cannot be cached
         // before the schema it is checked against exists.
-        let id: Uuid = sqlx::query_scalar(
+        let id: Uuid = sqlx::query_scalar(&format!(
             r#"
             WITH found AS (
-                SELECT id FROM papers
-                WHERE doi = ANY($1::text[])
-                ORDER BY array_position($1::text[], doi)
-                LIMIT 1
+                {first}
             ),
             updated AS (
                 UPDATE papers p SET
@@ -79,10 +119,13 @@ impl PaperRepository {
                 RETURNING p.id
             ),
             inserted AS (
-                INSERT INTO papers (doi, title, journal)
-                SELECT $2::text, $3::text, $4::text
+                INSERT INTO papers (doi, title, journal, visibility, owner_group_id)
+                SELECT $2::text, $3::text, $4::text, $5::text, $6::uuid
                 WHERE NOT EXISTS (SELECT 1 FROM found)
-                ON CONFLICT (doi) DO UPDATE SET
+                ON CONFLICT (doi, (CASE WHEN visibility = 'public'
+                                        THEN '00000000-0000-0000-0000-000000000000'::uuid
+                                        ELSE owner_group_id END))
+                DO UPDATE SET
                     title = COALESCE(papers.title, EXCLUDED.title),
                     journal = COALESCE(papers.journal, EXCLUDED.journal)
                 RETURNING id
@@ -91,17 +134,168 @@ impl PaperRepository {
             UNION ALL
             SELECT id FROM inserted
             "#,
-        )
+            first = document_key_first_in_sql(
+                "id",
+                1,
+                "visibility = $5::text AND ($5::text = 'public' OR owner_group_id = $6::uuid)",
+            ),
+        ))
         .bind(&spellings)
         .bind(&canonical)
         .bind(title)
         .bind(journal)
-        .fetch_one(pool)
+        .bind(visibility)
+        .bind(owner)
+        .fetch_one(executor)
         .await?;
         Ok(id)
     }
 
-    /// Find a paper by DOI. Returns `None` if no paper has this DOI.
+    /// The id of the row of `doi` in the scope `decl` names (see
+    /// [`Self::get_or_create`]), under any spelling, canonical first, else a
+    /// legacy row of that scope keyed on a case variant of a resolver prefix
+    /// (backlog f3a3ca54); `None` when that scope has none. The row a write declared with `decl` would
+    /// reuse, read on the writer's stamped connection.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for an undeclared `decl`; `DbError::QueryFailed`
+    /// if the query fails.
+    pub async fn find_in_scope<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        doi: &str,
+        decl: epigraph_core::TenancyDecl,
+    ) -> Result<Option<Uuid>, DbError> {
+        let (visibility, owner) = declared(decl)?;
+        Ok(sqlx::query_scalar(&document_key_first_in_sql(
+            "id",
+            1,
+            "visibility = $2::text AND ($2::text = 'public' OR owner_group_id = $3::uuid)",
+        ))
+        .bind(document_key_spellings(doi))
+        .bind(visibility)
+        .bind(owner)
+        .fetch_optional(executor)
+        .await?)
+    }
+
+    /// Every `papers` row of the document `raw` names that `viewer` may read,
+    /// under any of its [`document_key_spellings`] ([`document_key_rows_sql`]:
+    /// a legacy row keyed on a case variant of a resolver prefix only when no
+    /// readable row has an exact spelling, backlog f3a3ca54): spelling order
+    /// first (canonical, then as given, then legacy resolver spellings, then a
+    /// case-variant row), then the
+    /// viewer's own GROUP rows before the public one (the copy a team's ingest
+    /// wrote is the one its member asked about), then oldest first.
+    ///
+    /// Migration 246 gives `papers` row security, so on `viewer`'s stamped
+    /// connection a row of another group's private ingest is simply absent: no
+    /// existence oracle. Run it on that connection so the predicate spliced
+    /// here and the row security agree: the exact-spelling gate of the
+    /// case-variant fallback is filtered by that row security alone, so a
+    /// hidden row never suppresses the fallback for a readable one.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the query fails.
+    pub async fn visible_by_document_key(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        raw: &str,
+    ) -> Result<Vec<PaperRow>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT p.id, p.doi, p.title, p.journal FROM ({rows}) AS p \
+                  WHERE TRUE /* {{VISIBILITY:p}} */ \
+                  ORDER BY array_position($1::text[], p.doi), (p.visibility = 'group') DESC, \
+                           p.created_at, p.id",
+                rows = document_key_rows_sql("*", 1),
+            ),
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>)>(&sql)
+            .bind(document_key_spellings(raw));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(|(id, doi, title, journal)| PaperRow {
+                id,
+                doi,
+                title,
+                journal,
+            })
+            .collect())
+    }
+
+    /// The row [`Self::get_or_create`] just returned, read back on the SAME
+    /// connection (the writer's stamped transaction) for a response:
+    /// `POST /api/v1/papers`. The id came from that write, so row security on
+    /// that connection already admits it; there is no viewer to spend.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the query fails or no row has this id.
+    pub async fn registered_row<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<RegisteredPaper, DbError> {
+        let (id, doi, title, journal, created_at) = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Option<String>,
+                Option<String>,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT id, doi, title, journal, COALESCE(created_at, now()) FROM papers WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(executor)
+        .await?;
+        Ok(RegisteredPaper {
+            id,
+            doi,
+            title,
+            journal,
+            created_at,
+        })
+    }
+
+    /// Find the paper a caller-supplied document key names, under any stored
+    /// spelling of it ([`document_key_spellings`] through
+    /// [`document_key_first_sql`]): the canonical key first, then the key as
+    /// given, then each legacy resolver-prefix spelling, and only when none of
+    /// those is stored, a legacy row whose prefix differs from them only in
+    /// letter case. `None` if no row matches.
+    ///
+    /// Runtime-checked, not `query!`, for the reason given in
+    /// [`Self::get_or_create`].
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn find_by_document_key(
+        pool: &PgPool,
+        raw: &str,
+    ) -> Result<Option<PaperRow>, DbError> {
+        use sqlx::Row;
+        let row = sqlx::query(&document_key_first_sql("id, doi, title, journal", 1))
+            .bind(document_key_spellings(raw))
+            .fetch_optional(pool)
+            .await?;
+        Ok(row.map(|r| PaperRow {
+            id: r.get("id"),
+            doi: r.get("doi"),
+            title: r.get("title"),
+            journal: r.get("journal"),
+        }))
+    }
+
+    /// Find a paper by DOI, matching the stored key EXACTLY (no spelling
+    /// expansion; see [`Self::find_by_document_key`]). Returns `None` if no
+    /// paper has this DOI.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -131,7 +325,12 @@ impl PaperRepository {
     /// when none is recorded or no paper has this id. `None` means "unknown",
     /// which every caller must treat as all rights reserved. Ingest only READS
     /// this; it is set by an operator, never from an extraction, so a caller
-    /// cannot declare its own source open-licensed (backlog 8709d128).
+    /// cannot declare its own source open-licensed (backlog 8709d128). The
+    /// database enforces that since migration 255 (backlog 9ee6799d): the
+    /// application role holds no INSERT or UPDATE on `licence`, and no UPDATE
+    /// on `doi` or `id`, so it can neither write a licence nor move a licensed
+    /// row onto another DOI (this is read by id after a lookup by DOI). The
+    /// operator writes it through the audited `epigraph_set_paper_licence`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -1323,20 +1522,29 @@ pub struct IngestAssertedClaimRow {
 // =============================================================================
 //
 // `papers.doi` is the document identity key. Every writer and every reader of
-// it, on every transport, goes through the two functions below: the MCP
+// it, on every transport, goes through the functions below (the key, its
+// spellings, and the lookup predicate over them): the MCP
 // ingestion and paper-query tools (`epigraph-mcp` `tools/ingestion.rs`) and the
 // REST paper routes (`epigraph-api` `routes/papers.rs`). Before they were
 // shared, the REST routes stored and matched the caller's spelling verbatim, so
 // `https://doi.org/10.x/y`, `doi:10.x/y` and `10.x/y` were three keys there and
 // one key over MCP.
 //
-// Pure functions, no SQL: they live here because this module owns the column
-// they key, and both transports already depend on this crate.
+// Pure functions (the SQL ones only build a statement fragment; none touches
+// the database): they live here because this module owns the column they key,
+// and both transports already depend on this crate.
 //
-// Deliberately NOT the belief engine's `normalize_doi`
-// (`epigraph-engine` `source_dependence.rs`): that one lowercases, which is
-// right for a belief source key and wrong for this one (see
-// [`canonical_document_key`]).
+// Two forms of one key, built on one prefix list ([`DOI_KEY_PREFIXES`]) and one
+// bare-DOI test ([`is_bare_doi`]):
+//
+// - [`canonical_document_key`], the STORED spelling. It keeps the caller's
+//   case: existing `papers.doi` rows and their `doi:<key>` labels carry it, and
+//   folding it would re-key them.
+// - [`document_identity_key`], the case-folded IDENTITY, for deciding whether
+//   two spellings name one document: the belief engine's same-source key
+//   (`epigraph-engine` `source_dependence.rs`) and its edge-factor paper join
+//   (`edge_factor::edge_source_is_intra`) compare with it (backlog e34fd66e).
+//   Nothing stores it, so no row or label is re-keyed by it.
 
 /// Resolver prefixes a caller may put in front of a DOI. Matched
 /// case-insensitively; `doi:` also tolerates whitespace before the DOI.
@@ -1401,9 +1609,13 @@ pub fn canonical_document_key(raw: &str) -> String {
 /// order.
 ///
 /// The legacy spellings are what make a row written under a resolver URL
-/// before keys were canonicalized findable by the bare DOI. They are
-/// exact-match: a row keyed on a case variant of a prefix
-/// (`HTTPS://DOI.ORG/...`) is found only as given.
+/// before keys were canonicalized findable by the bare DOI. On their own
+/// they are exact-match; a lookup reaches a row keyed on a case variant of a
+/// prefix (`HTTPS://DOI.ORG/...`) only through [`document_key_rows_sql`]
+/// (lookups) or [`document_key_match_sql`] (a per-row filter).
+///
+/// A key that is not a bare DOI yields exactly one spelling, itself; a bare
+/// DOI yields more than one. [`document_key_rows_sql`] relies on that.
 #[must_use]
 pub fn document_key_spellings(raw: &str) -> Vec<String> {
     let canonical = canonical_document_key(raw);
@@ -1424,11 +1636,222 @@ pub fn document_key_spellings(raw: &str) -> Vec<String> {
     out
 }
 
+/// Strip one [`DOI_KEY_PREFIXES`] entry (case-insensitively), if `t` starts
+/// with one.
+fn strip_document_key_prefix(t: &str) -> Option<&str> {
+    DOI_KEY_PREFIXES.iter().find_map(|p| {
+        t.get(..p.len())
+            .filter(|head| head.eq_ignore_ascii_case(p))
+            .map(|_| &t[p.len()..])
+    })
+}
+
+/// A DOI resolver root with nothing behind it (`https://doi.org`,
+/// `dx.doi.org/`, ...).
+fn is_doi_resolver_root(t: &str) -> bool {
+    let t = t.trim().trim_end_matches('/');
+    DOI_KEY_PREFIXES
+        .iter()
+        .filter(|p| p.ends_with('/'))
+        .any(|p| t.eq_ignore_ascii_case(p.trim_end_matches('/')))
+}
+
+/// What is behind the DOI prefixes of `t` ([`DOI_KEY_PREFIXES`]), all of them
+/// peeled (`doi:https://doi.org/10.x` names `10.x`), trimmed; `""` for a
+/// resolver root with nothing behind it. `None` when `t` carries no DOI
+/// prefix. Unlike [`canonical_document_key`], this peels whatever follows the
+/// prefix, not only a bare DOI: `doi:<uri>` (the label ingest builds for a
+/// document identified by its URI) names that URI.
+#[must_use]
+pub fn peel_document_key_prefixes(t: &str) -> Option<&str> {
+    let mut rest = match strip_document_key_prefix(t.trim()) {
+        Some(r) => r,
+        None if is_doi_resolver_root(t) => "",
+        None => return None,
+    };
+    loop {
+        rest = rest.trim();
+        if is_doi_resolver_root(rest) {
+            return Some("");
+        }
+        match strip_document_key_prefix(rest) {
+            Some(r) => rest = r,
+            None => return Some(rest),
+        }
+    }
+}
+
+/// The case-folded identity of a document key, for deciding whether two
+/// spellings name ONE document (see the section comment): every
+/// [`DOI_KEY_PREFIXES`] spelling peeled ([`peel_document_key_prefixes`]),
+/// trimmed, trailing `/` removed, ASCII-lowercased (DOIs are
+/// case-insensitive). `None` for a blank result, a placeholder
+/// (`epigraph_core::domain::evidence::is_placeholder_id`: "unknown", "n/a",
+/// ...; an identity built on one would merge every DOI-less document) or
+/// anything that is still a URL once the prefixes are gone (a web page is not
+/// a DOI). Percent-encoded DOIs are not decoded, so one DOI written both ways
+/// stays two identities.
+///
+/// Every spelling [`canonical_document_key`] folds together has one identity
+/// here, so two values the stored key treats as one document are never two
+/// sources to the belief engine.
+#[must_use]
+pub fn document_identity_key(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let t = peel_document_key_prefixes(t)
+        .unwrap_or(t)
+        .trim()
+        .trim_end_matches('/');
+    if t.is_empty() || t.contains("://") || epigraph_core::domain::evidence::is_placeholder_id(t) {
+        None
+    } else {
+        Some(t.to_ascii_lowercase())
+    }
+}
+
+/// The case-variant arm shared by [`document_key_match_sql`] and
+/// [`document_key_rows_sql`]: `column` equals one of the spellings bound at
+/// `$bind` ignoring letter case AND ends in the canonical key (`$bind[1]`)
+/// exactly, so only the resolver PREFIX is folded.
+fn case_variant_arm_sql(column: &str, bind: usize) -> String {
+    format!(
+        "(lower({column}) = ANY(SELECT lower(s) FROM unnest(${bind}::text[]) AS s) \
+         AND right({column}, char_length((${bind}::text[])[1])) = (${bind}::text[])[1])"
+    )
+}
+
+/// The per-row SQL predicate for a `papers.doi` match: true when `column`
+/// holds a stored spelling of the document key whose
+/// [`document_key_spellings`] are bound at `$bind` (as `text[]`).
+///
+/// A row matches when its key is one of the spellings exactly, OR when it
+/// equals one of them ignoring letter case AND ends in the canonical key
+/// (`$bind[1]`) exactly. The second arm is what finds a legacy row keyed on a
+/// case variant of a resolver prefix (`HTTPS://DOI.ORG/10.x/y`, `Doi:10.x/y`;
+/// backlog f3a3ca54), which [`canonical_document_key`] already folds onto the
+/// bare DOI but a byte-for-byte match missed, so a re-ingest twinned it. Only
+/// the PREFIX is compared case-insensitively: the suffix is the canonical key
+/// itself, so its case is kept (keys are not lowercased; see
+/// [`canonical_document_key`]). For a key that is not a bare DOI the spellings
+/// are just the key, and the second arm then admits nothing but that key.
+///
+/// **Only for a filter applied to rows already reached another way** (the
+/// recall paper filter joins `papers` by primary key). No index serves the
+/// second arm, so as the WHERE of a lookup over `papers` it makes even an
+/// exact hit scan the whole table; a lookup uses [`document_key_rows_sql`].
+///
+/// `column` must be a trusted identifier (a static literal such as `doi` or
+/// `p.doi`), never caller input.
+#[must_use]
+pub fn document_key_match_sql(column: &str, bind: usize) -> String {
+    format!(
+        "({column} = ANY(${bind}::text[]) OR {variant})",
+        variant = case_variant_arm_sql(column, bind),
+    )
+}
+
+/// A `SELECT {columns} FROM papers` returning the rows a lookup for the
+/// document key whose [`document_key_spellings`] are bound at `$bind` (as
+/// `text[]`) finds: every row stored under one of the spellings EXACTLY; or,
+/// only when there is none, every legacy row keyed on a case variant of a
+/// resolver prefix (the arm [`document_key_match_sql`] describes; backlog
+/// f3a3ca54).
+///
+/// The fallback is what keeps the lookup on the unique index. The exact set
+/// is an index probe. The case-variant set, which no index serves, is gated
+/// by an uncorrelated `NOT EXISTS` over the exact spellings (planned once, as
+/// a one-time filter), so on a hit its scan of `papers` never runs; it also
+/// never runs for a key that is not a bare DOI, whose spellings are the key
+/// alone (`cardinality = 1`) and which therefore has no prefix to fold. Only
+/// a miss on a bare DOI (a new paper's first ingest) scans `papers`; an
+/// expression index on `lower(doi)` would serve that too.
+///
+/// Wrap it as a derived table and rank by
+/// `array_position($bind::text[], doi)` (canonical first; a case-variant row
+/// ranks NULL, last), with `doi` as the tiebreak: see
+/// [`document_key_first_sql`]. `columns` must be plain `papers` column names
+/// written by the caller, never caller input, and must include `doi` to rank.
+#[must_use]
+pub fn document_key_rows_sql(columns: &str, bind: usize) -> String {
+    document_key_rows_in_sql(columns, bind, "TRUE")
+}
+
+/// [`document_key_rows_sql`] restricted to the rows `scope` admits (migration
+/// 246: a `papers` row carries the tenancy of the ingest that wrote it).
+/// `scope` is applied to BOTH arms and to the exact-spelling gate, so a row
+/// outside the scope neither matches nor suppresses the case-variant fallback
+/// for a row inside it.
+///
+/// `scope` must be a trusted SQL predicate (a static literal, binds as
+/// `$n` placeholders, never caller input) over UNQUALIFIED `papers` columns:
+/// inside the gate's `papers k` an unqualified name resolves to `k`, in the
+/// arms to their own `papers`.
+#[must_use]
+pub fn document_key_rows_in_sql(columns: &str, bind: usize, scope: &str) -> String {
+    format!(
+        "SELECT {columns} FROM papers WHERE doi = ANY(${bind}::text[]) AND ({scope}) \
+         UNION ALL \
+         SELECT {columns} FROM papers \
+         WHERE cardinality(${bind}::text[]) > 1 \
+           AND NOT EXISTS (SELECT 1 FROM papers k \
+                            WHERE k.doi = ANY(${bind}::text[]) AND ({scope})) \
+           AND {variant} AND ({scope})",
+        variant = case_variant_arm_sql("doi", bind),
+    )
+}
+
+/// The single best row of [`document_key_rows_sql`]: `SELECT {columns}`
+/// (plain `papers` column names written by the caller, never caller input)
+/// of the exact spelling earliest in the list, canonical first, else of a
+/// case-variant row, ties broken by `doi`. Used by every `papers` lookup that
+/// resolves a key to one paper.
+#[must_use]
+pub fn document_key_first_sql(columns: &str, bind: usize) -> String {
+    document_key_first_in_sql(columns, bind, "TRUE")
+}
+
+/// [`document_key_first_sql`] over [`document_key_rows_in_sql`]: the single
+/// best row of the document key among the rows `scope` admits (the same
+/// trusted-literal rule for `scope`).
+#[must_use]
+pub fn document_key_first_in_sql(columns: &str, bind: usize, scope: &str) -> String {
+    format!(
+        "SELECT {columns} FROM ({rows}) AS m \
+         ORDER BY array_position(${bind}::text[], m.doi), m.doi LIMIT 1",
+        rows = document_key_rows_in_sql("*", bind, scope),
+    )
+}
+
 #[cfg(test)]
 mod document_key_tests {
     use super::*;
 
     const BARE: &str = "10.1021/acsnano.9b05650";
+
+    /// `document_key_rows_sql` skips its case-variant scan when the
+    /// spellings array has one element, on the strength of this: a key that
+    /// is not a bare DOI has no resolver prefix to fold and yields one
+    /// spelling, and a bare DOI, however it is spelled, yields more.
+    #[test]
+    fn only_a_bare_doi_has_more_than_one_spelling() {
+        for raw in [
+            BARE,
+            "  10.1021/acsnano.9b05650 ",
+            "HTTPS://DOI.ORG/10.1021/acsnano.9b05650",
+            "doi: 10.1021/acsnano.9b05650",
+        ] {
+            assert!(document_key_spellings(raw).len() > 1, "{raw:?}");
+        }
+        for raw in [
+            "urn:epigraph:doc:abc",
+            "  URN:EPIGRAPH:DOC:abc  ",
+            "https://doi.org/not-a-doi",
+            "DOI:not-a-doi",
+            "arxiv:2401.00001",
+        ] {
+            assert_eq!(document_key_spellings(raw).len(), 1, "{raw:?}");
+        }
+    }
 
     #[test]
     fn every_resolver_spelling_canonicalizes_to_the_bare_doi() {
@@ -1488,6 +1911,56 @@ mod document_key_tests {
         let s = document_key_spellings(raw);
         assert_eq!(s[0], BARE);
         assert_eq!(s[1], raw);
+    }
+
+    /// Backlog e34fd66e: one document, one identity, for every spelling the
+    /// stored key folds together (the scheme-less resolver spellings
+    /// included) and for case variants, which the stored key keeps apart.
+    #[test]
+    fn every_spelling_of_one_document_has_one_identity() {
+        let spellings = [
+            "10.1021/acsnano.9b05650",
+            "10.1021/ACSNANO.9B05650",
+            "https://doi.org/10.1021/acsnano.9b05650",
+            "HTTPS://WWW.DOI.ORG/10.1021/acsnano.9b05650/",
+            "http://dx.doi.org/10.1021/acsnano.9b05650",
+            "doi:10.1021/acsnano.9b05650",
+            " DOI: 10.1021/acsnano.9b05650 ",
+            "doi.org/10.1021/acsnano.9b05650",
+            "dx.doi.org/10.1021/acsnano.9b05650",
+            "WWW.DOI.ORG/10.1021/acsnano.9b05650",
+            "doi:https://doi.org/10.1021/acsnano.9b05650",
+        ];
+        for raw in spellings {
+            assert_eq!(document_identity_key(raw).as_deref(), Some(BARE), "{raw:?}");
+            // The identity is the stored key, case-folded.
+            assert_eq!(
+                document_identity_key(&canonical_document_key(raw)).as_deref(),
+                Some(BARE),
+                "{raw:?}"
+            );
+        }
+        // A document identified by its URI: the `doi:<uri>` label names it.
+        assert_eq!(
+            document_identity_key("doi:urn:epigraph:doc:Some-Title"),
+            document_identity_key("urn:epigraph:doc:some-title")
+        );
+        assert_ne!(
+            document_identity_key("10.5555/a"),
+            document_identity_key("10.5555/b")
+        );
+        for none in [
+            "",
+            "  ",
+            "doi:",
+            "https://doi.org",
+            "doi.org/",
+            "unknown",
+            "doi:n/a",
+            "https://example.org/articles/10.5555/x",
+        ] {
+            assert_eq!(document_identity_key(none), None, "{none:?}");
+        }
     }
 
     #[test]

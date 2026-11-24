@@ -33,9 +33,12 @@
 //!   `edges_tenancy`, after 072) lets a session read an edge co-owned by two
 //!   teams only when it is in BOTH, so a member of T alone cannot read it and
 //!   a co-owned edge is never baked into a single-team map, neither the
-//!   owner's nor the co-owner's. A view for a viewer in both teams is future
-//!   work. Migration 210 already treats "the edge gained a co-owner" as the
-//!   edge leaving the owner's map;
+//!   owner's nor the co-owner's. A viewer in both teams gets such an edge at
+//!   request time instead, on their own answer only, when the leaf draws both
+//!   its ends ([`crate::AtlasServeRepository::co_owned_leaf_edges`]; a
+//!   co-owned edge between a claim of each team is still drawn nowhere). Migration 210
+//!   already treats "the edge gained a co-owner" as the edge leaving the
+//!   owner's map;
 //! * the public map binds T as NULL, so only public rows pass.
 //!
 //! The edge predicate is the MAP rule, not
@@ -121,7 +124,9 @@
 //! [`fallback_split`] cuts on edges as well as nodes. A leaf of ONE claim
 //! whose own attachments carry more edges cannot be split: it is returned as
 //! [`LeafOutcome::Fits`] with [`LeafCounts::edges`] over the limit, and the
-//! contract refuses the document it makes (the caller reports it).
+//! builder of the served document caps it (the nightly keeps the heaviest
+//! edges and reports the cut: `epigraph_cli::atlas_nightly::leaves::cap_leaf_edges`,
+//! backlog 8d09e6bc).
 //!
 //! # Determinism
 //!

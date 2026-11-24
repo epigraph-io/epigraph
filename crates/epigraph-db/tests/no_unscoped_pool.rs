@@ -555,7 +555,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        20,
+        21,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
@@ -578,7 +578,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          pre-authentication reason. The twentieth is migration 213's single-use check of an \
          agent's assertion (`AssertionNonceRepository::consume`), an app-callable definer keyed \
          by the verified public key and the assertion's signed nonce, run after the signature and freshness \
-         verify and before anything is minted: the same pre-authentication reason.",
+         verify and before anything is minted: the same pre-authentication reason. The \
+         twenty-first is `refuse_non_verifier_agent_key` (backlog 57943a39): between that \
+         verify and the nonce record, one read of `agents.key_kind` (universally readable by \
+         policy, untenanted) for the verified key, refusing a key held by an agent that is not \
+         a signature verifier (any kind but `ed25519`), before anything is minted: the same \
+         pre-authentication reason.",
     ),
     (
         "oauth/token_exchange.rs",
@@ -814,7 +819,48 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// four registry statements on the caller's stamped connection, the one its
 /// claim-derived listing already used (`routes/papers.rs` 8 -> 4). No file
 /// reached zero.
-const HIGH_WATER: usize = 187;
+/// 187 -> 184 (backlog 73d4f7ff): `create_evidence` runs its author-key read,
+/// the evidence row and its `DERIVED_FROM` edge on the caller's
+/// `AppState::write_as` transaction (`routes/crud.rs` 26 -> 23). Its
+/// provenance append stays on the pool. `learn_convention`'s evidence moved
+/// onto a stamped transaction too, but its `pool` alias still serves the
+/// system-authored claim, so `routes/conventions.rs` keeps its count.
+/// 184 -> 182 (backlog 1dea9589): `create_span` writes the span and its
+/// `attributed_to` edge on the caller's `AppState::write_as` transaction
+/// (`routes/spans.rs` 6 -> 4; `close_span` and `list_spans` keep theirs).
+/// 182 -> 181 (backlog 761c2b05; 187 -> 186 on its own branch, staged after
+/// 1dea9589): `get_agent` holds a `Viewer` and reads its row and the
+/// profile-visibility check on the caller's stamped connection
+/// (`routes/agents.rs` 10 -> 9). No file reached zero.
+/// 181 -> 176 (backlog 54018ca1, migration 239; 187 -> 182 on its own
+/// branch): the key rotate and revoke routes run their reads and the key definers on the caller's stamped
+/// transaction (`routes/agent_keys.rs` 6 -> 1, the list read left). No file
+/// reached zero.
+/// 176 -> 173 (backlog 34864fb5, migration 246; 187 -> 184 on its own
+/// branch): `create_paper` writes and reads back on the caller's stamped
+/// transaction (`routes/papers.rs` 4 -> 1). No file reached zero.
+/// 173 -> 172 (backlog 88cf603b, migration 240; 187 -> 186 on its own
+/// branch): `record_behavioral_execution`'s insert moved onto the caller's
+/// stamped transaction, because `behavioral_executions` now carries its
+/// workflow's tenancy under FORCEd row security (`routes/workflows.rs`
+/// 3 -> 2). No file reached zero.
+/// 172 -> 170 (backlog 073d24a3; 187 -> 185 on its own branch):
+/// `propagate_beliefs` reads its scalar priors and alternative-set classes on
+/// the caller's stamped read (`routes/computation.rs` 5 -> 3). No file
+/// reached zero.
+/// backlog 6492de67 (migration 252; 187 -> 182 on its own branch) moved the
+/// same `routes/agent_keys.rs` sites onto the caller's stamped transaction
+/// as 54018ca1 above and adds the admin audit row on it: no further change.
+/// 170 -> 169 (backlog 74feb76b; 187 -> 186 on its own branch): `assess_claim`
+/// runs every read and write on the caller's `AppState::write_as`
+/// transaction; `routes/assess.rs` 1 -> 0, key DELETED (`HIGH_WATER_FILES`
+/// falls by one with it).
+/// 169 -> 165 (backlog b9c4e809; 187 -> 183 on its own branch):
+/// `promote_hypothesis` runs its two frame reads, its source-BBA read and
+/// every write on ONE transaction from the caller's `AppState::write_as`
+/// instead of `state.db_pool.begin()` (`routes/hypothesis.rs` 6 -> 2). No
+/// file reached zero.
+const HIGH_WATER: usize = 165;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -887,7 +933,8 @@ const HIGH_WATER: usize = 187;
 /// 36 -> 35 when `routes/rag.rs` reached zero (backlog 9bef22f3, merged on
 /// staging after the line above).
 /// 35 -> 34 when `routes/embeddings.rs` reached zero (backlog batch B37).
-const HIGH_WATER_FILES: usize = 34;
+/// 34 -> 33 when `routes/assess.rs` reached zero (backlog 74feb76b).
+const HIGH_WATER_FILES: usize = 33;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -896,9 +943,10 @@ const HIGH_WATER_FILES: usize = 34;
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
     ("routes/admin.rs", 4),
-    ("routes/agent_keys.rs", 6),
-    ("routes/agents.rs", 10),
-    ("routes/assess.rs", 1),
+    ("routes/agent_keys.rs", 1),
+    ("routes/agents.rs", 9),
+    // `routes/assess.rs` was 1 and is GONE (backlog 74feb76b): `assess_claim`
+    // reads and writes on one `AppState::write_as` transaction.
     // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
     // `query_security_events` reads on `AppState::read_as` with the caller's
     // viewer.
@@ -968,9 +1016,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 6 -> 5 (HTTP public-only reads, 2026-11-05): `bp_seed_rows`' BBA load
     // moved onto the stamped read its source reads already used. On the
     // production pool (`scoped.inner()`, `epigraph_app`) the unstamped load saw
-    // public `mass_functions` rows only. What remains: `propagate_beliefs` (2,
-    // it writes) and `compose_subgraphs` (3, no `Viewer`).
-    ("routes/computation.rs", 5),
+    // public `mass_functions` rows only.
+    // 5 -> 3 (backlog 073d24a3, finding F-SHARD4-A2): `propagate_beliefs`'
+    // scalar-prior and alternative-set reads (both reads; its writes were on
+    // `AppState::write_as` already) moved onto the stamped read its factor
+    // load uses, each through a repo fn that splices the caller's viewer. What
+    // remains: `compose_subgraphs` (3, no `Viewer`).
+    ("routes/computation.rs", 3),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 8),
@@ -1034,7 +1086,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 27 -> 26 (backlog dae795f8): `promote_staged_edges`'s two arms (one
     // `&state.db_pool` each) became one transaction begun on it. Still the raw
     // pool, so not a conversion.
-    ("routes/crud.rs", 26),
+    // 26 -> 23 (backlog 73d4f7ff): `create_evidence` writes its author-key
+    // read, the evidence and its `DERIVED_FROM` edge on one
+    // `AppState::write_as` transaction; its provenance append stays on the pool.
+    ("routes/crud.rs", 23),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
@@ -1112,8 +1167,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 11 before the operator-binding delta review, which moved
     // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`;
     // 6 since its VOI cache moved onto that same stamped transaction (round 4
-    // COR-R4-3).
-    ("routes/hypothesis.rs", 6),
+    // COR-R4-3); 2 since `promote_hypothesis` runs on the caller's
+    // `AppState::write_as` transaction (backlog b9c4e809).
+    ("routes/hypothesis.rs", 2),
     // `routes/isomorphism.rs` was 3 and is GONE, not converted: the file was
     // DELETED with the `episcience` cargo feature that gated it (backlog
     // 54db73b5). It imported a crate that is not a dependency, so it was never
@@ -1132,9 +1188,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // Backlog fe75ef36 / b7354adc then gave `GET /api/v1/papers` per-viewer
     // fields (authors, claim count, ingests), so `list_papers` took a
     // `ViewerExtractor`, and its four registry reads moved onto the same
-    // `AppState::read_as` connection. The four that remain are
-    // `create_paper`'s, two of them writes.
-    ("routes/papers.rs", 4),
+    // `AppState::read_as` connection. The four that remained were
+    // `create_paper`'s, two of them writes; migration 246 (backlog 34864fb5)
+    // gave `papers` row security, so `create_paper` now writes and reads back
+    // on the caller's stamped transaction (`begin_claim_write`). The one that
+    // remains is its `default_decl_for_author_pool(&state.db_pool, ..)`, the
+    // home-group resolution every claim-writing handler makes on the pool.
+    ("routes/papers.rs", 1),
     // 5 before conversion shard 5, which moved `list_perspectives`,
     // `get_perspective` and `agent_perspectives` onto `AppState::read_as`, and
     // 2 before `set_source_reliability` (an `UPDATE`) moved onto
@@ -1171,7 +1231,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // rather than repo calls; both kept their SQL where it was and changed only
     // the executor, so `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`
     // still records `("search.rs", 1)` and must not be lowered.
-    ("routes/spans.rs", 6),
+    // 6 -> 4 (backlog 1dea9589): `create_span`'s span INSERT and its
+    // `attributed_to` edge run on the caller's `AppState::write_as`
+    // transaction. `close_span` (3) and `list_spans` (1) remain.
+    ("routes/spans.rs", 4),
     // `routes/structural.rs` was 1 and is GONE, not zeroed: conversion shard 5
     // moved `get_structural_features`'s single alias -- which fanned into NINE
     // sequential `StructuralRepository` round-trips -- onto `AppState::read_as`.
@@ -1285,9 +1348,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // the caller's stamped read, and both post-commit goal embeds to the
     // system-agent stamp (`store_workflow_goal_embedding`).
     // 4 -> 3 (backlog 08061583): `record_behavioral_execution`'s workflow
-    // existence check moved to the caller's stamped read. Its insert stays on
-    // the pool: `behavioral_executions` has no row security.
-    ("routes/workflows.rs", 3),
+    // existence check moved to the caller's stamped read.
+    // 3 -> 2 (backlog 88cf603b, migration 240): its insert followed, onto the
+    // caller's stamped transaction: `behavioral_executions` now has row
+    // security keyed on its workflow's tenancy.
+    ("routes/workflows.rs", 2),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

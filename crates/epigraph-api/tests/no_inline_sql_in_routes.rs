@@ -98,7 +98,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("belief.rs", 7),
     ("claims.rs", 3),
     ("clusters.rs", 8),
-    ("computation.rs", 9),
+    ("computation.rs", 6),
     ("conventions.rs", 3),
     ("cross_source.rs", 1),
     ("crud.rs", 3),
@@ -108,7 +108,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("graph_neighborhood.rs", 1),
     ("graph_query_utils.rs", 1),
     ("hypothesis.rs", 11),
-    ("papers.rs", 8),
+    ("papers.rs", 4),
     ("policies.rs", 4),
     ("revoke_signature.rs", 6),
     ("search.rs", 3),
@@ -137,7 +137,16 @@ const REGISTER: &[(&str, usize)] = &[
 /// Lowered to 94 on staging batch 4 by backlog batch B37 (#895): its route
 /// reads moved into the repo layer (`search.rs` 4 -> 3; `conflicts.rs`,
 /// `embeddings.rs`, `political.rs` and `workflows.rs` reached zero).
-const HIGH_WATER: usize = 91;
+/// Lowered to 87 by migration 246 (backlog 34864fb5): `create_paper`'s
+/// lookup, fill-only update, insert and re-fetch became
+/// `PaperRepository::get_or_create` and `registered_row` (`papers.rs` 8 -> 4).
+/// Lowered to 86 by backlog triage T52 (backlog b02347c6; 91 -> 90 on its own
+/// branch): `/bp/propagate`'s factor load moved into
+/// `FactorRepository::load_bp_scope` (`computation.rs` 9 -> 8), and to 84
+/// when its priors and alternative-set reads moved into
+/// `FactorRepository::bp_priors` / `bp_alternative_sets`, both spending the
+/// caller's viewer (finding F-SHARD4-A2, `computation.rs` 8 -> 6).
+const HIGH_WATER: usize = 84;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

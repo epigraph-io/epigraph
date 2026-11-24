@@ -270,6 +270,7 @@ pub async fn callback_endpoint(
         &user.client_name,
         &grantable,
         &session.redirect_uri,
+        &state.oauth_redirect_origins,
     ))
     .into_response())
 }
@@ -279,18 +280,35 @@ pub async fn callback_endpoint(
 /// Who is asking is named from the class of the session's `redirect_uri` (validated
 /// against the client's registration at /authorize), never from the self-declared
 /// DCR `client_name`, which anyone registering a client chooses.
-fn render_consent_page(ticket: &str, email: &str, scopes: &[String], redirect_uri: &str) -> String {
+fn render_consent_page(
+    ticket: &str,
+    email: &str,
+    scopes: &[String],
+    redirect_uri: &str,
+    extra_origins: &crate::oauth::redirect::RedirectOrigins,
+) -> String {
     use crate::oauth::redirect::{classify, RedirectClass};
     let scope_items: String = scopes
         .iter()
         .map(|s| format!("<li><code>{}</code></li>", html_escape(s)))
         .collect();
-    let (title, lead) = match classify(redirect_uri) {
+    let (title, lead) = match classify(redirect_uri, extra_origins) {
         Some(RedirectClass::Hosted) => (
             "Authorize Claude".to_string(),
             format!(
                 "Claude wants to access EpiGraph as <strong>{}</strong> with:",
                 html_escape(email)
+            ),
+        ),
+        // An operator-listed origin: named by its origin, which the server
+        // validated, never by the self-declared client_name.
+        Some(RedirectClass::Configured) => (
+            "Authorize an application".to_string(),
+            format!(
+                "The application at <code>{}</code> wants to access EpiGraph as \
+                 <strong>{}</strong>. Access goes to that site. It asks for:",
+                html_escape(&redirect_origin(redirect_uri)),
+                html_escape(email),
             ),
         ),
         Some(RedirectClass::Loopback) => (
@@ -300,7 +318,7 @@ fn render_consent_page(ticket: &str, email: &str, scopes: &[String], redirect_ur
                  access EpiGraph as <strong>{}</strong>. Access goes to <code>{}</code>. Allow \
                  only if you just started this sign-in yourself. It asks for:",
                 html_escape(email),
-                html_escape(&loopback_origin(redirect_uri)),
+                html_escape(&redirect_origin(redirect_uri)),
             ),
         ),
         None => (
@@ -329,8 +347,9 @@ fn render_consent_page(ticket: &str, email: &str, scopes: &[String], redirect_ur
     )
 }
 
-/// `scheme://host:port` of a loopback redirect, for the consent page.
-fn loopback_origin(redirect_uri: &str) -> String {
+/// `scheme://host:port` of a loopback or configured redirect, for the consent
+/// page.
+fn redirect_origin(redirect_uri: &str) -> String {
     url::Url::parse(redirect_uri)
         .map(|u| u.origin().ascii_serialization())
         .unwrap_or_default()

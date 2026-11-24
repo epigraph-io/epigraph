@@ -70,12 +70,17 @@ fn row(
     perspective: Option<Uuid>,
     evidence: Option<Uuid>,
 ) -> MassFunctionRow {
+    // An edge-factor row is stored on its edge's slot, never a perspective
+    // (migration 267): `perspective` names the edge for such a row.
+    let edge_slot = method == Some(EDGE_FACTOR_METHOD);
     MassFunctionRow {
         id: Uuid::new_v4(),
         claim_id: Uuid::new_v4(),
         frame_id: Uuid::new_v4(),
         source_agent_id: agent,
-        perspective_id: perspective,
+        perspective_id: if edge_slot { None } else { perspective },
+        slot_kind: (edge_slot && perspective.is_some()).then(|| "edge".to_string()),
+        slot_id: if edge_slot { perspective } else { None },
         masses: serde_json::json!({}),
         conflict_k: None,
         combination_method: method.map(str::to_owned),
@@ -102,13 +107,18 @@ fn uuid_of(n: u128) -> Uuid {
 /// The ways one DOI reaches the store: ingest's bare `properties.doi`, its
 /// `https://doi.org/<doi>` source_url, a `doi:` label, a dx link, case and
 /// slash variants.
-const SPELLINGS: [&str; 6] = [
+const SPELLINGS: [&str; 9] = [
     "10.5555/Paper.One",
     "https://doi.org/10.5555/paper.one",
     "http://dx.doi.org/10.5555/PAPER.ONE/",
     "doi:10.5555/paper.one",
     " DOI:10.5555/Paper.One ",
     "https://www.doi.org/10.5555/paper.one",
+    // The scheme-less resolver spellings the stored document key folds
+    // (`epigraph_db::repos::paper::DOI_KEY_PREFIXES`, backlog e34fd66e).
+    "doi.org/10.5555/paper.one",
+    "DX.DOI.ORG/10.5555/Paper.One",
+    "www.doi.org/10.5555/paper.one",
 ];
 
 /// Methods a row can carry that give it no structural key of its own.

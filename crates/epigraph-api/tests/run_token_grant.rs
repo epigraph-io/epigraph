@@ -44,8 +44,13 @@ use uuid::Uuid;
 
 const GRANT: &str = "urn:epigraph:grant:run-token";
 
-/// The model every test principal records (`agents.properties`).
+/// The model every test principal is registered under (an attested
+/// `agent_prompt_snapshots` row, mirrored into `agents.properties`).
 const MODEL: &str = "test-run-token-model";
+
+/// A model no test server lists: an identity outside the served fleet (an
+/// operator's own local tooling identity, say).
+const EXCLUDED_MODEL: &str = "test-operator-local-tooling-model";
 
 /// The delegator's client secret (32 bytes; hex on the wire).
 const SECRET: [u8; 32] = [0x5a; 32];
@@ -129,8 +134,10 @@ async fn arm_client(pool: &PgPool, client: Uuid, scopes: &[&str]) -> String {
     .expect("arm the delegator client")
 }
 
-/// Record `model` as `agent`'s LLM model; its identity public key, hex.
-async fn identify(pool: &PgPool, agent: Uuid, model: &str) -> String {
+/// Write `model` into `agent`'s DISPLAY state only (`properties ->>
+/// 'llm_model'`), with no attested registration behind it; its identity public
+/// key, hex.
+async fn display_model(pool: &PgPool, agent: Uuid, model: &str) -> String {
     let pk: Vec<u8> = sqlx::query_scalar(
         "UPDATE agents SET properties = COALESCE(properties, '{}'::jsonb) \
                                         || jsonb_build_object('llm_model', $2::text) \
@@ -140,8 +147,81 @@ async fn identify(pool: &PgPool, agent: Uuid, model: &str) -> String {
     .bind(model)
     .fetch_one(pool)
     .await
-    .expect("record the principal's model");
+    .expect("record the principal's display model");
     hex::encode(pk)
+}
+
+/// Record an ATTESTED registration of `agent` under `model`: the
+/// `agent_prompt_snapshots` row migration 161's registration writes (only the
+/// attestor's definer may; seeded here on the superuser connection).
+async fn attest(pool: &PgPool, agent: Uuid, model: &str) {
+    sqlx::query(
+        "INSERT INTO agent_prompt_snapshots \
+             (agent_id, group_folder, model, prompt_hash, in_prompt) \
+         VALUES ($1, 'run-token-test', $2, $3, '{}'::jsonb) \
+         ON CONFLICT ON CONSTRAINT agent_prompt_snapshots_one_per_state DO NOTHING",
+    )
+    .bind(agent)
+    .bind(model)
+    .bind(blake3::hash(agent.as_bytes()).to_hex().to_string())
+    .execute(pool)
+    .await
+    .expect("record the principal's attested registration");
+}
+
+/// Register `agent` under `model` (attested, and mirrored into its display
+/// properties as the registration does); its identity public key, hex.
+async fn identify(pool: &PgPool, agent: Uuid, model: &str) -> String {
+    attest(pool, agent, model).await;
+    display_model(pool, agent, model).await
+}
+
+/// `agent` rewrites its OWN `properties.llm_model` to `model` on an
+/// APPLICATION-role session stamped as itself (077's `agents_self_update`,
+/// 118's column grant): what any holder of the application DSN can do. Read
+/// back on the superuser pool, so a rewrite that did not land fails here
+/// rather than making the caller's assertion vacuous.
+async fn rewrite_own_model_as_app(pool: &PgPool, agent: Uuid, model: &str) {
+    let model_owned = model.to_string();
+    let updated = fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(agent.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp the agent as the session principal");
+        let n = sqlx::query(
+            "UPDATE agents SET properties = COALESCE(properties, '{}'::jsonb) \
+                                            || jsonb_build_object('llm_model', $2::text) \
+              WHERE id = $1",
+        )
+        .bind(agent)
+        .bind(&model_owned)
+        .execute(&mut *conn)
+        .await
+        .expect("the application role rewrites its own properties")
+        .rows_affected();
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("clear the session principal");
+        (conn, n)
+    })
+    .await;
+    assert_eq!(
+        updated, 1,
+        "PREMISE: the application role may rewrite its own row"
+    );
+    let now: Option<String> =
+        sqlx::query_scalar("SELECT properties ->> 'llm_model' FROM agents WHERE id = $1")
+            .bind(agent)
+            .fetch_one(pool)
+            .await
+            .expect("read back the rewritten model");
+    assert_eq!(
+        now.as_deref(),
+        Some(model),
+        "PREMISE: the application-role rewrite landed"
+    );
 }
 
 /// A live delegation whose delegator is armed with [`DELEGATOR_GRANTED`] and
@@ -685,6 +765,145 @@ async fn a_model_outside_the_allowlist_is_refused(pool: PgPool) {
         &mint(&none, &request(&client_id, &key, json!({}))).await,
         "invalid_grant",
     );
+}
+
+/// The model list is checked against the ATTESTED registration (migration
+/// 161's `agent_prompt_snapshots`, written only by the attestor's definer or
+/// a maintenance session),
+/// never against `agents.properties`, which the application role may rewrite
+/// on the agent's own row. An identity registered under a model outside the
+/// list stays refused after it rewrites its display model to a listed one, and
+/// an identity with no attested registration is refused whatever its
+/// properties say.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_app_role_rewrite_of_llm_model_does_not_make_an_excluded_identity_mintable(
+    pool: PgPool,
+) {
+    let st = app_state(&pool, RunTokens::On, &[MODEL]).await;
+
+    // Registered under a model the server does not serve.
+    let d = delegation::live_delegation(&pool, "run-token-excluded").await;
+    let client_id = arm_client(&pool, d.delegator_client, DELEGATOR_GRANTED).await;
+    let key = identify(&pool, d.principal, EXCLUDED_MODEL).await;
+    refused_because(
+        &pool,
+        1,
+        "CALIBRATION: an excluded registration is refused",
+        &mint(&st, &request(&client_id, &key, json!({}))).await,
+        "invalid_grant",
+        "model_not_allowed",
+        Some(d.principal),
+    )
+    .await;
+
+    rewrite_own_model_as_app(&pool, d.principal, MODEL).await;
+    refused_because(
+        &pool,
+        2,
+        "an excluded identity that rewrote its display model to a listed one",
+        &mint(&st, &request(&client_id, &key, json!({}))).await,
+        "invalid_grant",
+        "model_not_allowed",
+        Some(d.principal),
+    )
+    .await;
+
+    // No attested registration at all: the display model alone is a listed
+    // one (written by the application role), and the mint is refused.
+    let u = delegation::live_delegation(&pool, "run-token-unattested").await;
+    let u_client = arm_client(&pool, u.delegator_client, DELEGATOR_GRANTED).await;
+    let u_key = display_model(&pool, u.principal, EXCLUDED_MODEL).await;
+    rewrite_own_model_as_app(&pool, u.principal, MODEL).await;
+    refused_because(
+        &pool,
+        3,
+        "an identity with no attested registration",
+        &mint(&st, &request(&u_client, &u_key, json!({}))).await,
+        "invalid_grant",
+        "no_attested_model",
+        Some(u.principal),
+    )
+    .await;
+    assert!(
+        events(&pool, "oauth_run_token_minted").await.is_empty(),
+        "no run token was minted"
+    );
+}
+
+/// The converse: an identity registered under a listed model still mints
+/// after its display model is rewritten to an unlisted one, so the decision
+/// reads the attested model and not merely "refuse whatever changed".
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_attested_model_decides_a_mint_not_the_display_property(pool: PgPool) {
+    let (d, client_id, key) = world(&pool, "run-token-attested").await;
+    let st = app_state(&pool, RunTokens::On, &[MODEL]).await;
+    rewrite_own_model_as_app(&pool, d.principal, EXCLUDED_MODEL).await;
+    token_of(
+        "a listed registration whose display model was rewritten",
+        &mint(&st, &request(&client_id, &key, json!({}))).await,
+    );
+}
+
+/// A delegator with NO live delegation over an identity learns nothing of
+/// that identity's registration: whether it was attested, and whether its
+/// attested model is listed, never changes the answer. The model checks run
+/// only after the delegation check, so an unattested identity, one attested
+/// under an excluded model and one attested under a listed model are all
+/// refused `delegation_not_live`, with byte-identical response bodies.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_caller_without_a_delegation_learns_nothing_of_an_identitys_registration(pool: PgPool) {
+    let (_d, client_id, key) = world(&pool, "run-token-oracle").await;
+    let st = app_state(&pool, RunTokens::On, &[MODEL]).await;
+    token_of(
+        "CALIBRATION: the delegator mints for its own principal",
+        &mint(&st, &request(&client_id, &key, json!({}))).await,
+    );
+
+    // Three identities the delegator holds no delegation over.
+    let (unattested, _) = delegation::agent_with_group(&pool, "run-token-oracle-unattested").await;
+    let unattested_key = display_model(&pool, unattested, MODEL).await;
+    let (excluded, _) = delegation::agent_with_group(&pool, "run-token-oracle-excluded").await;
+    let excluded_key = identify(&pool, excluded, EXCLUDED_MODEL).await;
+    let (listed, _) = delegation::agent_with_group(&pool, "run-token-oracle-listed").await;
+    let listed_key = identify(&pool, listed, MODEL).await;
+
+    let mut bodies = Vec::new();
+    for (n, (what, agent, k)) in [
+        ("an unattested identity", unattested, &unattested_key),
+        (
+            "an identity attested under an excluded model",
+            excluded,
+            &excluded_key,
+        ),
+        (
+            "an identity attested under a listed model",
+            listed,
+            &listed_key,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let answer = mint(&st, &request(&client_id, k, json!({}))).await;
+        refused_because(
+            &pool,
+            n + 1,
+            what,
+            &answer,
+            "invalid_grant",
+            "delegation_not_live",
+            Some(agent),
+        )
+        .await;
+        bodies.push((what, answer.1));
+    }
+    for (what, body) in &bodies[1..] {
+        assert_eq!(
+            body, &bodies[0].1,
+            "{what} must be answered exactly as {}",
+            bodies[0].0
+        );
+    }
 }
 
 /// A malformed request is `invalid_request`: a run label over 64 characters,

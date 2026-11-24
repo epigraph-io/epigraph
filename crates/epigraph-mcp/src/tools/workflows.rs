@@ -33,9 +33,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// proposing a variant; an invalid `workflow_id` errors rather than returning
 /// an empty set (which would read as "no runs" and mislead the proposer).
 ///
-/// Read as the CALLER (`server.read_as`). `behavioral_executions` has no row
-/// security of its own, so the repo admits a run only when its workflow (a
-/// `workflows` row or a flat workflow claim) is one `viewer` reads: a workflow
+/// Read as the CALLER (`server.read_as`). A run carries its workflow's tenancy
+/// under row security (migration 240), and the repo also admits a run only
+/// when its workflow (a `workflows` row or a flat workflow claim) is one
+/// `viewer` reads, so the two agree: a workflow
 /// private to a group the caller is not in answers exactly like an unknown id,
 /// with no rows, and its `goal_text` / `step_beliefs` never leave the database.
 pub async fn get_workflow_executions(
@@ -201,17 +202,19 @@ async fn assess_workflow_promotion(
     // a lineage root ("nothing to promote over"), and refresh skipped its
     // write, all without an error.
     //
-    // The run counts come from `behavioral_executions`, which has no row
-    // security of its own (and `epigraph_app` keeps SELECT on it), so
-    // `success_stats` counts only the runs of a workflow `viewer` reads: a
+    // The run counts come from `behavioral_executions`, whose rows carry
+    // their workflow's tenancy (migration 240), and `success_stats` also
+    // counts only the runs of a workflow `viewer` reads: a
     // public `variant_of` edge to a private parent no longer discloses that
     // parent's success record. All three reads share this one stamped read,
     // released before refresh's write, so the tool never holds two pooled
     // connections.
     let mut read = server.read_as(viewer, "assess_workflow_promotion").await?;
+    // The typed error (backlog 0bc4636e): a coded database refusal keeps the
+    // type `internal_error` recognises it by; its `to_string()` did not.
     let parent_id = WorkflowRepository::immediate_variant_parent(&mut *read, viewer, variant_id)
         .await
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(internal_error)?;
 
     let variant =
         BehavioralExecutionRepository::success_stats(&mut *read, viewer, variant_id, window)
@@ -397,21 +400,7 @@ pub async fn store_workflow(
             {
                 return success_json(&StoreWorkflowResponse {
                     workflow_id: hit.id.to_string(),
-                    hint: Some(format!(
-                        "A workflow in the tenancy this store would use (visibility '{}', \
-                         owner group {}) already has a near-identical goal ({:.3} similar): \
-                         '{}' (canonical_name '{}', generation {}, the lineage head). Nothing \
-                         was stored. To change its steps, call improve_workflow_hierarchy \
-                         with parent_canonical_name='{}'; to mint a separate lineage anyway, \
-                         call store_workflow again with force_new=true.",
-                        hit.visibility,
-                        hit.owner_group_id,
-                        hit.similarity,
-                        hit.goal,
-                        hit.canonical_name,
-                        hit.generation,
-                        hit.canonical_name
-                    )),
+                    hint: Some(hit.hint("store_workflow")),
                     canonical_name: hit.canonical_name,
                     goal: hit.goal,
                     generation: hit.generation,
@@ -517,61 +506,18 @@ pub async fn store_workflow(
     })
 }
 
-/// Cosine similarity at or above which `store_workflow` treats a new goal as a
-/// rewording of an existing hierarchical workflow's goal (backlog 5e54282f).
-/// Well above `find_workflow_hierarchical`'s 0.5 search floor: that one finds
-/// candidates, this one refuses to mint a lineage.
-pub const STORE_WORKFLOW_MATCH_THRESHOLD: f64 = 0.90;
+/// The match threshold, shared with the REST twin (backlog 51d599a9).
+pub use epigraph_ingest_executor::STORE_WORKFLOW_MATCH_THRESHOLD;
 
-/// A lineage head [`matching_workflow`] found for a reworded goal.
-struct WorkflowMatch {
-    id: uuid::Uuid,
-    canonical_name: String,
-    generation: i32,
-    goal: String,
-    similarity: f64,
-    visibility: String,
-    owner_group_id: uuid::Uuid,
-}
-
-/// The live (`truth_value >= 0.3`) hierarchical workflow LINEAGE HEAD whose
-/// goal (or the goal of an earlier generation of its lineage) is the most
-/// similar to `qvec`, when that clears [`STORE_WORKFLOW_MATCH_THRESHOLD`]
-/// under a canonical_name other than `canonical_name`, AND the head has
-/// exactly the tenancy this store would give a new lineage.
-///
-/// # The tenancy rule
-///
-/// A match redirects every later outcome report (goal text, per-step
-/// deviation reasons, `outcome_details`) onto the matched plan. Matching
-/// anything the caller merely READS would let a store meant to stay private
-/// (the undeclared default, or a declared group) land on another team's
-/// public plan, or on a plan of another group the caller is also in. So the
-/// target tenancy is decided first, exactly as the ingest would: the declared
-/// one, else `epigraph_ingest_executor::owner::resolve_caller_owner` for a new
-/// lineage (the caller's one team, else its own default), on a transaction
-/// stamped from the CALLER (the write identity, which on stdio is this
-/// server's own agent whatever viewer a driver passed). Only a head with the
-/// same `(visibility, owner_group_id)` is a match. When the target cannot be
-/// resolved (an unbound author), nothing is matched and the ingest reports
-/// its own refusal.
-///
-/// # Heads, not generations
-///
-/// The search covers every generation, and each hit is resolved to the head
-/// of its `canonical_name`, so a match never names a superseded generation.
-/// A lineage with rows the caller cannot read is skipped: its readable
-/// "head" may not be the real one.
-///
-/// # An identical goal is not a match
-///
-/// `None` whenever a row named `canonical_name` itself exists, readable or
-/// not, embedded or not, live or deprecated: an identical goal stays the
-/// ingest's own business (its idempotent `already_ingested` no-op, or its
-/// refusal of a name with rows the caller cannot read), never a match to
-/// another lineage. That check does not go through the goal embedding, which
-/// rows stored before goals were embedded (and `embed: false` ingests) do not
-/// have.
+/// [`epigraph_ingest_executor::matching_workflow_conn`] for this store's
+/// caller: the rule (tenancy, heads, an identical goal is no match) lives
+/// there, shared with REST `POST /api/v1/workflows` (backlog 51d599a9). Here
+/// the caller is the write identity (on stdio this server's own agent,
+/// whatever viewer a driver passed), read on a transaction stamped from it
+/// and rolled back. A failed match READ is logged and matches nothing, so the
+/// store goes on as it would without matching, as REST does: one input, one
+/// answer on either transport (review of 51d599a9). Resolving the caller and
+/// opening its transaction still fail the call, as the store itself would.
 async fn matching_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -579,7 +525,7 @@ async fn matching_workflow(
     declared: Option<epigraph_core::TenancyDecl>,
     canonical_name: &str,
     qvec: &[f32],
-) -> Result<Option<WorkflowMatch>, McpError> {
+) -> Result<Option<epigraph_ingest_executor::WorkflowGoalMatch>, McpError> {
     let caller = server.write_identity(auth, viewer).await?;
     let resolved = crate::tools::workflow_ingest::caller_viewer(
         server,
@@ -591,110 +537,26 @@ async fn matching_workflow(
     let caller_viewer = resolved.as_ref().unwrap_or(viewer);
     let mut tx =
         crate::claim_helper::begin_caller_workflow_tx(server, caller, "store_workflow").await?;
-    let target = match declared {
-        Some(d) => d,
-        None => {
-            match epigraph_ingest_executor::owner::resolve_caller_owner(
-                &mut tx,
-                caller.agent_id(),
-                None,
-            )
-            .await
-            {
-                Ok(owner) => owner.decl,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "store_workflow: no target tenancy for matching; not matching"
-                    );
-                    tx.rollback().await.map_err(internal_error)?;
-                    return Ok(None);
-                }
-            }
-        }
-    };
-    let (Some(target_visibility), Some(target_owner)) =
-        (target.visibility_bind(), target.owner_group_bind())
-    else {
-        tx.rollback().await.map_err(internal_error)?;
-        return Ok(None);
-    };
-
-    let name_taken = WorkflowRepository::head_by_canonical(&mut *tx, canonical_name)
-        .await
-        .map_err(internal_error)?
-        .is_some()
-        || WorkflowRepository::name_has_hidden_rows_conn(&mut tx, canonical_name)
-            .await
-            .map_err(internal_error)?;
-    if name_taken {
-        tx.rollback().await.map_err(internal_error)?;
-        return Ok(None);
-    }
-    let hits = WorkflowRepository::search_hierarchical_by_embedding_scored(
-        &mut *tx,
+    let found = epigraph_ingest_executor::matching_workflow_conn(
+        &mut tx,
         caller_viewer,
-        &epigraph_db::pgvector_literal(qvec),
-        0.3,
-        10,
+        caller.agent_id(),
+        declared,
+        canonical_name,
+        qvec,
     )
-    .await
-    .map_err(internal_error)?;
-
-    let mut seen: Vec<String> = Vec::new();
-    let mut found = None;
-    for hit in hits
-        .into_iter()
-        .filter(|h| h.similarity >= STORE_WORKFLOW_MATCH_THRESHOLD)
-    {
-        if seen.contains(&hit.canonical_name) {
-            continue;
-        }
-        seen.push(hit.canonical_name.clone());
-        if WorkflowRepository::name_has_hidden_rows_conn(&mut tx, &hit.canonical_name)
-            .await
-            .map_err(internal_error)?
-        {
-            continue;
-        }
-        let Some(head_id) = WorkflowRepository::head_by_canonical(&mut *tx, &hit.canonical_name)
-            .await
-            .map_err(internal_error)?
-        else {
-            continue;
-        };
-        let Some(head) = WorkflowRepository::row_as_viewer(&mut tx, caller_viewer, head_id)
-            .await
-            .map_err(internal_error)?
-        else {
-            continue;
-        };
-        if head.truth_value < 0.3 {
-            continue;
-        }
-        let Some((visibility, owner_group_id)) =
-            WorkflowRepository::tenancy_as_viewer(&mut tx, caller_viewer, head_id)
-                .await
-                .map_err(internal_error)?
-        else {
-            continue;
-        };
-        if visibility != target_visibility || owner_group_id != target_owner {
-            continue;
-        }
-        found = Some(WorkflowMatch {
-            id: head.id,
-            canonical_name: head.canonical_name,
-            generation: head.generation,
-            goal: head.goal,
-            similarity: hit.similarity,
-            visibility,
-            owner_group_id,
-        });
-        break;
+    .await;
+    // Read-only: roll back whatever the read left, before branching on it.
+    if let Err(e) = tx.rollback().await {
+        tracing::warn!(error = %e, "store_workflow: could not end the match read");
     }
-    tx.rollback().await.map_err(internal_error)?;
-    Ok(found)
+    match found {
+        Ok(found) => Ok(found),
+        Err(e) => {
+            tracing::warn!(error = %e, "store_workflow: goal match failed; not matching");
+            Ok(None)
+        }
+    }
 }
 
 pub async fn find_workflow(
@@ -1518,15 +1380,38 @@ pub async fn report_workflow_outcome(
     .await
     .map_err(internal_error)?;
 
+    // The workflow claim's Beta-Bernoulli track and its DS-vs-Bayesian
+    // divergence row (backlog d3648d3c), kept exactly as
+    // `update_with_evidence` keeps them after the same `ds_auto` update: the
+    // outcome BBA (stored under this call's own evidence perspective, so it is
+    // always a new row and always counted) moves the track on hypothesis 0,
+    // and the row records this call's BetP against the posterior on the
+    // cache's frame. A failed outcome's BBA sits on FALSE, so all its
+    // non-conflict mass goes to beta. Best-effort, under savepoints; a cold
+    // start records no row (`epigraph_engine::ds_divergence`).
+    epigraph_engine::ds_divergence::track_counted_bba(
+        &mut tx,
+        viewer,
+        epigraph_engine::ds_divergence::CountedBba {
+            claim_id: workflow_id,
+            frame_id: ds.frame_id,
+            bba: &ds.evidence_bba,
+            hypothesis_index: Some(0),
+            pignistic_prob: Some(ds.pignistic_prob),
+        },
+        "report_workflow_outcome",
+    )
+    .await
+    .map_err(internal_error)?;
+
     // Derive truth_value from CDST pignistic probability. `UPDATE claims`, and it
     // commits in the SAME stamped transaction as the evidence INSERT and the DS
     // wiring above — there is no longer an unstamped write before it, and no
     // self-committing unit of its own. It is the tool's last HARD write: what
     // follows the commit is `BehavioralExecutionRepository::create`, which is
-    // warn-only and targets `behavioral_executions`: `relrowsecurity = f` with
-    // zero policies, so it is refused on neither configuration. That site is
-    // registered as a residual in
-    // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` with that reason.
+    // warn-only and runs on a fresh transaction on the same author stamp
+    // (`behavioral_executions` is under FORCEd row security since migration
+    // 240, keyed on its workflow's tenancy).
     // After the DS wiring necessarily, because the value comes from it.
     //
     // MIGRATION 114: skipped for a public workflow claim this caller does not
@@ -1614,13 +1499,29 @@ pub async fn report_workflow_outcome(
         run_label: None,
     };
 
-    if let Err(e) = BehavioralExecutionRepository::create(
-        &server.pool,
-        behavioral_row,
-        goal_embedding_pgvec.as_deref(),
-    )
-    .await
-    {
+    // On the author's stamp (migration 240): the row takes the workflow
+    // claim's tenancy under FORCEd row security, and its INSERT policy admits
+    // it only for a session that reads the claim. On the raw pool (an
+    // unstamped session, which reads public rows only) a member's run of its
+    // own group-private workflow was refused and only logged. A fresh
+    // transaction after the commit above, so the embedder call stays out of
+    // that one; still best-effort.
+    let recorded = async {
+        let mut run_tx =
+            crate::claim_helper::begin_author_stamped_tx(server, author, "report_workflow_outcome")
+                .await
+                .map_err(|e| e.message.to_string())?;
+        BehavioralExecutionRepository::create(
+            &mut *run_tx,
+            behavioral_row,
+            goal_embedding_pgvec.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        run_tx.commit().await.map_err(|e| e.to_string())
+    }
+    .await;
+    if let Err(e) = recorded {
         tracing::warn!(workflow_id = %workflow_id, "behavioral execution write failed: {e}");
     }
 
@@ -1757,8 +1658,16 @@ pub async fn deprecate_workflow(
         if !is_row {
             return Err(deprecate_target_not_found(workflow_id));
         }
-        return deprecate_hierarchical_workflow(server, auth, caller, workflow_id, cascade, params)
-            .await;
+        return deprecate_hierarchical_workflow(
+            server,
+            viewer,
+            auth,
+            caller,
+            workflow_id,
+            cascade,
+            params,
+        )
+        .await;
     }
 
     // Deprecate the target workflow (A4: also set is_current = false).
@@ -1772,17 +1681,25 @@ pub async fn deprecate_workflow(
         epigraph_core::ClaimId::from_uuid(workflow_id),
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(deprecate_write_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
-    // `workflows` is NOT RLS-protected (measured: no policy, not in 062's
-    // tier-A), so this half was never refused — it is in the transaction so the
-    // two halves of one deprecation cannot land apart.
+    // `workflows` has row security since migration 183, and since 237 its
+    // UPDATE reaches only a row whose owner group this stamp WRITES; any other
+    // row matches nothing here, without an error. It is in the transaction so
+    // the two halves of one deprecation cannot land apart: a row this caller
+    // READS that matched nothing and is not already deprecated refuses the
+    // whole call (`refuse_a_live_row_left_behind`) instead of committing the
+    // claim's half alone. A row it cannot read was never written on this
+    // stamp, before 237 either, and reads here as a flat-only id.
     let row_rows =
         epigraph_db::WorkflowRepository::set_truth_value_if_changed(&mut *tx, workflow_id, 0.05)
             .await
-            .map_err(internal_error)?;
+            .map_err(deprecate_write_error)?;
+    if row_rows == 0 {
+        refuse_a_live_row_left_behind(&mut tx, workflow_id, None).await?;
+    }
     // REPORT ONLY WHAT CHANGED (U017). The id used to be listed whether or not
     // anything was written.
     if root_rows > 0 || row_rows > 0 {
@@ -1870,11 +1787,11 @@ pub async fn deprecate_workflow(
                     epigraph_core::ClaimId::from_uuid(child_id),
                 )
                 .await
-                .map_err(internal_error)?;
+                .map_err(deprecate_write_error)?;
                 // Mirror onto the hierarchical row, if any.
                 epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, child_id, 0.05)
                     .await
-                    .map_err(internal_error)?;
+                    .map_err(deprecate_write_error)?;
                 // REPORT ONLY WHAT ACTUALLY FLIPPED. `deprecate_claim` returns
                 // `rows_affected`, and a cascade child can legitimately yield 0:
                 // `claims_tenancy`'s USING side filters the UPDATE's target, so a
@@ -1903,6 +1820,48 @@ pub async fn deprecate_workflow(
     })
 }
 
+/// `deprecate_workflow`'s answer when row security refuses one of its writes
+/// (backlog ab353d54): an UNCODED `42501` from a deprecation UPDATE (the
+/// claims tenancy policy's WITH CHECK, `new row violates row-level security
+/// policy`), the transaction aborted and nothing written. Since the delegate
+/// arm was added, the workflow gate admits callers that need not write the
+/// workflow's owner group (a delegate acting for the submitter, say), and a
+/// public plan's rows pass row security's read side, so the refusal comes
+/// from the write. It is a
+/// denial the caller can act on, `INVALID_REQUEST` naming the missing group
+/// write authority, as `evolve_step` answers its own `42501`; it used to be
+/// the opaque INTERNAL_ERROR, which reads as a server fault and invites a
+/// retry. A CODED refusal (`XX00: ...`) and every other error keep
+/// [`internal_error`]'s handling.
+fn deprecate_write_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
+    let any: &dyn std::any::Any = &e;
+    let source = match any.downcast_ref::<epigraph_db::DbError>() {
+        Some(epigraph_db::DbError::QueryFailed { source }) => Some(source),
+        _ => any.downcast_ref::<sqlx::Error>(),
+    };
+    if let Some(sqlx::Error::Database(d)) = source {
+        if d.code().as_deref() == Some("42501") && !crate::errors::coded(d.message()) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                tool = "deprecate_workflow",
+                error = %e,
+                "row security refused the deprecation write"
+            );
+            return McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::from(
+                    "deprecate_workflow: refused: the caller does not write the group that owns \
+                     this workflow or a claim it executes, so row security refused the \
+                     deprecation. It needs write authority over that owner group as well as \
+                     authority over the workflow. Nothing was written.",
+                ),
+                data: None,
+            };
+        }
+    }
+    internal_error(e)
+}
+
 /// `deprecate_workflow`'s answer for an id that names nothing the caller can
 /// read. The hierarchical path's authority gate gives the same answer for a
 /// target (or, with `cascade`, a descendant) the caller cannot read, so a
@@ -1912,6 +1871,46 @@ fn deprecate_target_not_found(workflow_id: uuid::Uuid) -> McpError {
         "no claim you can read and no hierarchical workflows row has id {workflow_id}; \
          nothing was deprecated"
     ))
+}
+
+/// After a `truth_value` write on the caller's stamp that changed nothing,
+/// refuse the deprecation (nothing is committed: the error drops the
+/// transaction) unless `workflow_id`'s row already reads deprecated.
+///
+/// Since migration 237 a `workflows` UPDATE reaches only a row whose owner
+/// group the session WRITES, and a filtered row raises nothing. The workflow
+/// authority gate admits callers that write no such group (the submitter, its
+/// operator, a delegate), so their write can match no row while the claims of
+/// the same deprecation are retired: the claim / row split the transaction
+/// exists to prevent. A row the caller cannot read gets `not_found` when one is
+/// given (the hierarchical path, where the row is known to exist and the
+/// answer must not tell a hidden row from a missing one) and passes otherwise
+/// (the flat path, where no row is the normal answer).
+async fn refuse_a_live_row_left_behind(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: uuid::Uuid,
+    not_found: Option<&(dyn Fn() -> McpError + Send + Sync)>,
+) -> Result<(), McpError> {
+    let truth = epigraph_db::WorkflowRepository::truth_value_of(&mut *conn, workflow_id)
+        .await
+        .map_err(internal_error)?;
+    match truth {
+        Some(t) if (t - epigraph_db::WorkflowRepository::DEPRECATED_TRUTH).abs() < f64::EPSILON => {
+            Ok(())
+        }
+        None => match not_found {
+            Some(answer) => Err(answer()),
+            None => Ok(()),
+        },
+        Some(_) => Err(invalid_params(format!(
+            "deprecate_workflow: hierarchical workflow {workflow_id} was not deprecated: the \
+             database admits a change to a workflows row only from a writer of the row's owner \
+             group, and this caller does not write it (it was admitted as the workflow's \
+             submitter, the submitter's operator or an agent acting for one of them). Ask a \
+             writer of the workflow's owner group, or use the audited claims:admin path. Nothing \
+             was written."
+        ))),
+    }
 }
 
 /// `deprecate_workflow` for a HIERARCHICAL workflow id (a `workflows` row):
@@ -1946,17 +1945,18 @@ fn deprecate_target_not_found(workflow_id: uuid::Uuid) -> McpError {
 ///   transaction.
 /// * Only what changed is reported.
 ///
-/// KNOWN LIMITATION (follow-up, not fixed here): a retired level 0-2 claim is
-/// not revived when a later generation (`improve_workflow_hierarchy`) or
-/// `add_step` reuses its exact text. The claim id depends only on the text and
-/// the `canonical_name`, the executor's dedup-by-id skips an existing row, and
-/// `add_step` inserts with `ON CONFLICT (id) DO NOTHING`. So the new live
-/// workflow executes a claim that has `is_current = false` and no embeddings.
-/// A correct revival has to tell this deprecation's retirements apart from an
-/// `evolve_step` supersede, which also sets `is_current = false` on purpose,
-/// so it needs a retirement marker and touches the shared executor.
+/// A retired claim is MARKED (`ClaimRepository::retire_for_workflow_deprecation`
+/// records the truth value it had), because the claim id depends only on the
+/// text and the `canonical_name`: a later generation
+/// (`improve_workflow_hierarchy`) or `add_step` that reuses the exact text
+/// reuses this row. The shared executor and `add_step` revive a marked claim
+/// they reuse (current again, its truth value back, re-embedded by the
+/// caller), so the new live workflow does not execute a retired, unembedded
+/// step (backlog 1767f2ae). An `evolve_step` supersede leaves no marker and
+/// is never revived.
 async fn deprecate_hierarchical_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     caller: crate::write_identity::WriteIdentity,
     workflow_id: uuid::Uuid,
@@ -1988,9 +1988,10 @@ async fn deprecate_hierarchical_workflow(
     //    the lineage until its refusal rolled back, a repeatable contention
     //    lever on anyone's workflow.
     let not_found = || deprecate_target_not_found(workflow_id);
+    let not_found_answer: &(dyn Fn() -> McpError + Send + Sync) = &not_found;
     for &row in &targets {
         crate::tools::workflow_authority::require_workflow_authority(
-            server, &mut tx, auth, caller, row, TOOL, &not_found,
+            server, &mut tx, auth, caller, viewer, row, TOOL, &not_found,
         )
         .await?;
     }
@@ -2027,21 +2028,23 @@ async fn deprecate_hierarchical_workflow(
     // 2. Serialize against any other deprecation that could share a claim with
     //    this target set, BEFORE the sharing rule reads other workflows' truth
     //    (write skew; see `lock_lineages_for_deprecation`).
-    WorkflowRepository::lock_lineages_for_deprecation(&mut *tx, &targets)
+    WorkflowRepository::lock_lineages_for_deprecation(&mut tx, &targets)
         .await
         .map_err(internal_error)?;
 
     // 3. RE-CHECK under the lock (TOCTOU): the call may have waited on the lock
     //    while another transaction changed what step 1 read (a row's recorded
     //    submitter, the caller's admin grant). Only the grant decided here,
-    //    with every target row now locked against another writer and the
-    //    admin grant re-read after the wait, admits the write and drives the
-    //    per-target audit; step 1's grants are discarded.
+    //    with every lineage row the caller READS now locked against another
+    //    deprecation (through 237's lock definer, so a row of an owner group
+    //    the caller does not write is locked too) and the admin grant re-read
+    //    after the wait, admits the write and drives the per-target audit;
+    //    step 1's grants are discarded.
     let mut grants = Vec::with_capacity(targets.len());
     for &row in &targets {
         grants.push(
             crate::tools::workflow_authority::require_workflow_authority(
-                server, &mut tx, auth, caller, row, TOOL, &not_found,
+                server, &mut tx, auth, caller, viewer, row, TOOL, &not_found,
             )
             .await?,
         );
@@ -2051,9 +2054,22 @@ async fn deprecate_hierarchical_workflow(
     let mut retired_claim_ids = Vec::new();
     let mut kept_shared_claim_ids: Vec<String> = Vec::new();
     for (&row, grant) in targets.iter().zip(&grants) {
-        let row_changed = WorkflowRepository::set_truth_value_if_changed(&mut *tx, row, 0.05)
-            .await
-            .map_err(internal_error)?;
+        // THE ROW. Since migration 237 a `workflows` UPDATE on the stamp reaches
+        // only a row whose owner group the caller WRITES. The admin arm admits
+        // a caller that writes none, so its write goes through 237's audited
+        // admin definer, after the claims below so that the one audit row the
+        // definer writes carries them. Any other arm writes here, and a write
+        // that matched nothing refuses the call unless the row already reads
+        // deprecated (`refuse_a_live_row_left_behind`).
+        let mut row_changed = 0;
+        if !grant.is_admin() {
+            row_changed = WorkflowRepository::set_truth_value_if_changed(&mut *tx, row, 0.05)
+                .await
+                .map_err(deprecate_write_error)?;
+            if row_changed == 0 {
+                refuse_a_live_row_left_behind(&mut tx, row, Some(not_found_answer)).await?;
+            }
+        }
         let claims = WorkflowRepository::executed_structural_claims(&mut *tx, row, &targets)
             .await
             .map_err(internal_error)?;
@@ -2064,35 +2080,63 @@ async fn deprecate_hierarchical_workflow(
                 row_kept.push(c.id.to_string());
                 continue;
             }
-            let n = ClaimRepository::deprecate_claim_if_current(
+            let n = ClaimRepository::retire_for_workflow_deprecation(
                 &mut *tx,
                 epigraph_core::ClaimId::from_uuid(c.id),
             )
             .await
-            .map_err(internal_error)?;
+            .map_err(deprecate_write_error)?;
             if n > 0 {
                 row_retired.push(c.id.to_string());
             }
         }
-        // From the post-lock grant only (step 3): the admin arm's audit row,
-        // or the provenance row of any other authenticated arm.
-        crate::tools::workflow_authority::record_workflow_write(
-            &mut tx,
-            auth,
-            caller,
-            TOOL,
-            row,
-            *grant,
-            serde_json::json!({
-                "truth_value_after": 0.05,
-                "workflow_row_changed": row_changed > 0,
-                "retired_claim_ids": row_retired,
-                "kept_shared_claim_ids": row_kept,
-                "cascade": cascade,
-                "reason": params.reason,
-            }),
-        )
-        .await?;
+        // From the post-lock grant only (step 3): the admin arm's row write and
+        // its audit row (one definer call), or the provenance row of any other
+        // authenticated arm.
+        let mut details = serde_json::json!({
+            "truth_value_after": 0.05,
+            "retired_claim_ids": row_retired,
+            "kept_shared_claim_ids": row_kept,
+            "cascade": cascade,
+            "reason": params.reason,
+        });
+        if grant.is_admin() {
+            let Some(token) = auth else {
+                return Err(crate::errors::internal_error_text(format!(
+                    "{TOOL}: an admin workflow write with no token to audit. Nothing was written."
+                )));
+            };
+            let record = crate::tools::workflow_authority::admin_workflow_audit_record(
+                TOOL,
+                row,
+                grant.owner,
+                token.delegated_by,
+                details,
+            );
+            row_changed = WorkflowRepository::admin_deprecate_row(
+                &mut tx,
+                token.client_id,
+                token.jti,
+                row,
+                &record,
+            )
+            .await
+            .map_err(|e| {
+                crate::errors::internal_error_logged(
+                    format!(
+                        "{TOOL}: the audited admin deprecation of workflow {row} was refused. \
+                         Nothing was written."
+                    ),
+                    e,
+                )
+            })?;
+        } else {
+            details["workflow_row_changed"] = serde_json::json!(row_changed > 0);
+            crate::tools::workflow_authority::record_workflow_write(
+                &mut tx, auth, caller, TOOL, row, *grant, details,
+            )
+            .await?;
+        }
         if row_changed > 0 {
             deprecated_ids.push(row.to_string());
         }

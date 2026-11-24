@@ -301,12 +301,46 @@ pub enum ApiError {
     /// `400` with an RFC 6749 §5.2 token-endpoint error body,
     /// `{"error": <code>, "error_description": <text>}`, for a client that
     /// must act on the code: the elevate grant's device-flow-style polling
-    /// (`authorization_pending`, then `invalid_grant`). The other grants keep
-    /// their historical `BadRequest` shape.
+    /// (`authorization_pending`, then `invalid_grant`), the run-token and
+    /// token-exchange grants, the refresh grant's `invalid_scope`, and
+    /// `POST /oauth/revoke`'s `invalid_request` (RFC 7009 §2.2.1). Other
+    /// token-endpoint refusals keep their historical `BadRequest` shape.
     #[error("{error}: {description}")]
     OAuthGrantError {
         error: &'static str,
         description: String,
+    },
+
+    /// RFC 6749 §5.2 `invalid_client` from the token endpoint: a confidential
+    /// client failed to authenticate (unknown or missing `client_id`, a
+    /// missing, malformed or wrong secret or assertion, a replayed assertion).
+    /// Body `{"error":"invalid_client","error_description":<text>}`, with a
+    /// generic description that does not say which check failed.
+    ///
+    /// `400` when the client authenticated in the request body
+    /// (`client_secret_post`, the one method this server accepts), which owes
+    /// no challenge. `401` with `WWW-Authenticate: Basic` when the request
+    /// carried `Authorization: Basic`, as §5.2 requires for a client that
+    /// tried the header.
+    #[error("invalid_client: {description}")]
+    OAuthInvalidClient {
+        description: String,
+        basic_attempted: bool,
+    },
+
+    /// `422`, `compound_target` (`EPIGRAPH_COMPOUND_WRITE_GUARD=refuse`,
+    /// backlog 7435772c, SPEC §4.1 W3): a textless BBA write
+    /// (`POST /api/v1/frames/:id/evidence`, `POST /api/v1/claims/:id/assess`)
+    /// named a COMPOUND, whose belief is derived from its atoms. Nothing was
+    /// written. `data` is the machine-keyed body MCP `submit_ds_evidence`
+    /// carries in its refusal's `data`
+    /// (`epigraph_engine::compound_write_guard::CompoundTarget::refusal_data`):
+    /// `error`, `claim_id`, `visible_atoms` (the atoms the caller can see,
+    /// `{id, content}`), `visible_atom_count`, `flag`, `retryable: false`.
+    #[error("{message}")]
+    CompoundTarget {
+        message: String,
+        data: serde_json::Value,
     },
 }
 
@@ -374,6 +408,28 @@ struct ErrorResponse {
     details: Option<serde_json::Value>,
 }
 
+impl ApiError {
+    /// The text a CALLER may read for this error: exactly the top-level
+    /// `message` of its rendered response body.
+    ///
+    /// `Display` (`to_string()`) renders the carried message, which for
+    /// [`ApiError::InternalError`] and [`ApiError::DatabaseError`] is the
+    /// server-side detail, often with a driver error interpolated. A route that
+    /// puts an error's text into a SUCCESS body (a per-item result in a batch
+    /// answered 200) must take it from here, never from `to_string()`, or the
+    /// detail the 500 body withholds reaches the caller through the 200
+    /// (backlog f9acb220). The redacted variants answer their fixed literals;
+    /// every other variant's text is designed for the caller and is unchanged.
+    #[must_use]
+    pub fn caller_message(&self) -> String {
+        match self {
+            ApiError::InternalError { .. } => format!("Internal error: {INTERNAL_ERROR_BODY}"),
+            ApiError::DatabaseError { .. } => format!("Database error: {DATABASE_ERROR_BODY}"),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // The MOVED contract (operator decision D9) has its own body, keyed for
@@ -417,6 +473,32 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
         // RFC 6749 §5.2: the token endpoint's own error body.
+        if let ApiError::OAuthInvalidClient {
+            description,
+            basic_attempted,
+        } = &self
+        {
+            let status = if *basic_attempted {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            let mut response = (
+                status,
+                Json(serde_json::json!({
+                    "error": "invalid_client",
+                    "error_description": description,
+                })),
+            )
+                .into_response();
+            if *basic_attempted {
+                response.headers_mut().insert(
+                    WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Basic realm=\"oauth\", charset=\"UTF-8\""),
+                );
+            }
+            return response;
+        }
         if let ApiError::OAuthGrantError { error, description } = &self {
             return (
                 StatusCode::BAD_REQUEST,
@@ -441,6 +523,15 @@ impl IntoResponse for ApiError {
                 })),
             )
                 .into_response();
+        }
+        // The compound write guard's refusal (backlog 7435772c): the shared
+        // machine-keyed body, with the message beside it.
+        if let ApiError::CompoundTarget { message, data } = &self {
+            let mut body = data.clone();
+            if let Some(map) = body.as_object_mut() {
+                map.insert("message".to_string(), serde_json::json!(message));
+            }
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
         }
         let (status, error_type, details) = match &self {
             ApiError::BadRequest { message } => (
@@ -554,6 +645,20 @@ impl IntoResponse for ApiError {
             // Answered above with its own body; kept here so the match stays
             // exhaustive.
             ApiError::OAuthGrantError { error, .. } => (StatusCode::BAD_REQUEST, *error, None),
+            ApiError::OAuthInvalidClient {
+                basic_attempted, ..
+            } => (
+                if *basic_attempted {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "invalid_client",
+                None,
+            ),
+            ApiError::CompoundTarget { .. } => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "compound_target", None)
+            }
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a
@@ -575,13 +680,7 @@ impl IntoResponse for ApiError {
                 | ApiError::SignatureError { .. }
         );
 
-        // `Display` renders the carried message, so the redacted variants'
-        // top-level `message` is built from the literal, not from `self`.
-        let message = match &self {
-            ApiError::InternalError { .. } => format!("Internal error: {INTERNAL_ERROR_BODY}"),
-            ApiError::DatabaseError { .. } => format!("Database error: {DATABASE_ERROR_BODY}"),
-            other => other.to_string(),
-        };
+        let message = self.caller_message();
         let body = ErrorResponse {
             error: error_type.to_string(),
             message,
@@ -1174,6 +1273,48 @@ mod tests {
                 v["message"].as_str().is_some_and(|m| !m.is_empty()),
                 "{kind}: the body still says something: {body}"
             );
+        }
+    }
+
+    /// `caller_message` is the text a per-item result in a 200 may carry
+    /// (backlog f9acb220), so it must be what the rendered body's top-level
+    /// `message` says, for a redacted variant and a designed one alike, and
+    /// never the server-side detail a redacted variant was built with.
+    #[tokio::test]
+    async fn caller_message_is_the_rendered_message_and_withholds_the_detail() {
+        let canary = "relation canary_7f3a_internal does not exist";
+        for error in [
+            ApiError::InternalError {
+                message: format!("query failed: {canary}"),
+            },
+            ApiError::DatabaseError {
+                message: format!("Failed to commit transaction: {canary}"),
+            },
+            ApiError::BadRequest {
+                message: "content must not be empty".to_string(),
+            },
+            ApiError::Forbidden {
+                reason: "no write authority".to_string(),
+            },
+        ] {
+            let said = error.caller_message();
+            let redacted = matches!(
+                error,
+                ApiError::InternalError { .. } | ApiError::DatabaseError { .. }
+            );
+            let (_status, body) = rendered(error).await;
+            let v: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+            assert_eq!(
+                v["message"].as_str(),
+                Some(said.as_str()),
+                "caller_message drifted from the rendered message: {body}"
+            );
+            if redacted {
+                assert!(
+                    !said.contains("canary_7f3a"),
+                    "caller_message carries the server-side detail: {said}"
+                );
+            }
         }
     }
 

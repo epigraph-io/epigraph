@@ -10,10 +10,12 @@
 //! otherwise read as a restore that "worked"). Restored values are compared
 //! with what the database held before the run, never with a value this file
 //! computes. The sentinel sits on a frame with no BBA, so the recompute also
-//! moves `belief_frame_id` and the restore has to put it back;
-//! `classification` does not move in these fixtures (the recompute leaves
-//! the seeded value), so its restore is not exercised here; the other six
-//! cache columns move and are put back.
+//! moves `belief_frame_id` and the restore has to put it back. The recompute
+//! writes `classification` only when the owner frame is `binary_truth`, so
+//! the fresh-frame fixtures leave it as seeded; one test
+//! (`a_classification_the_recompute_moves_is_recorded_and_restored`, backlog
+//! 1ea4f6bf) owns its claim's cache from `binary_truth`, so all seven cache
+//! columns move and are put back.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -60,14 +62,47 @@ impl Run {
     }
 }
 
-/// Run `bin` with only `DATABASE_URL` (plus `PATH`), from `cwd`.
+/// The operator flags every `recompute_claim_belief` invocation here carries
+/// beyond the ones a test is about. These tests are about the wave file, not
+/// the pre-run mode check (`belief_mode_check_bins.rs` covers that for this
+/// bin), so the check is overridden, against an API address that refuses at
+/// once (see [`OPERATOR_ENV`]).
+const OPERATOR_FLAGS: &[&str] = &["--allow-mode-skew"];
+
+/// The disk gate a writing run must name, for the tests that are not about
+/// it: the run's working directory, no headroom, no backup check. A test
+/// about the gate passes its own `--disk-path`, and then gets none of these.
+const DEFAULT_GATE: &[&str] = &[
+    "--disk-path",
+    ".",
+    "--min-free-gb",
+    "0",
+    "--no-backup-check",
+];
+
+/// The environment beside `DATABASE_URL`: an API base nothing listens on, so
+/// the overridden mode check never reaches a real server on the test host.
+const OPERATOR_ENV: &[(&str, &str)] = &[("EPIGRAPH_API_URL", "http://127.0.0.1:1")];
+
+/// Run `bin` with only `DATABASE_URL` (plus `PATH` and [`OPERATOR_ENV`]),
+/// from `cwd`. When the command runs `recompute_claim_belief` (directly, or
+/// as the last program a wrapper `exec`s), [`OPERATOR_FLAGS`] are appended,
+/// and [`DEFAULT_GATE`] unless `args` names its own `--disk-path`.
 fn run(bin: &str, cwd: &Path, db: &str, args: &[&str]) -> Run {
+    let mut argv: Vec<&str> = args.to_vec();
+    if bin == RECOMPUTE || args.contains(&RECOMPUTE) {
+        argv.extend_from_slice(OPERATOR_FLAGS);
+        if !args.contains(&"--disk-path") {
+            argv.extend_from_slice(DEFAULT_GATE);
+        }
+    }
     let out = Command::new(bin)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("RUST_LOG", "warn")
         .env("DATABASE_URL", db)
-        .args(args)
+        .envs(OPERATOR_ENV.iter().copied())
+        .args(&argv)
         .current_dir(cwd)
         .output()
         .expect("run the binary");
@@ -710,7 +745,10 @@ async fn a_writer_mid_transaction_when_the_run_reaches_the_claim_is_the_recorded
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("RUST_LOG", "warn")
         .env("DATABASE_URL", &db)
+        .envs(OPERATOR_ENV.iter().copied())
         .args(["--input", s(&list), "--snapshot", s(&wave)])
+        .args(OPERATOR_FLAGS)
+        .args(DEFAULT_GATE)
         .current_dir(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -812,6 +850,364 @@ async fn a_run_without_snapshot_still_writes_and_records_nothing(pool: PgPool) {
         files,
         vec![std::ffi::OsString::from("ids.txt")],
         "a file was written"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── classification (backlog 1ea4f6bf) ────────────────────────────────────────
+
+/// The canonical `binary_truth` frame, created as the engine creates it when
+/// the migrated database does not already hold it.
+async fn binary_frame(pool: &PgPool) -> Uuid {
+    if let Some(id) = sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
+        .fetch_optional(pool)
+        .await
+        .expect("look up binary_truth")
+    {
+        return id;
+    }
+    sqlx::query_scalar(
+        "INSERT INTO frames (name, description, hypotheses) \
+         VALUES ('binary_truth', 'Canonical binary frame: {TRUE, FALSE}', \
+                 ARRAY['TRUE', 'FALSE']) RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("create binary_truth")
+}
+
+/// `classification` is the one cache column the fresh-frame fixtures never
+/// move: the recompute writes it only on `binary_truth`. Here the claim's
+/// only input is on `binary_truth`, so the recompute replaces the sentinel
+/// label with the classifier's verdict, the record carries both labels, and
+/// the restore puts the sentinel label back (with the other six columns).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_classification_the_recompute_moves_is_recorded_and_restored(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let owner = agent(&pool).await;
+    let binary = binary_frame(&pool).await;
+    let sentinel_frame = frame(&pool).await;
+    let id = claim(&pool, owner).await;
+    bba(&pool, id, binary, owner, 0.9).await;
+    let sentinel = set_sentinel(&pool, id, sentinel_frame, 0.0).await;
+    assert_eq!(sentinel.classification.as_deref(), Some("sentinel"));
+
+    let wave = dir.join("wave.jsonl");
+    let list = write_ids(&dir, &[id]);
+    run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &["--input", s(&list), "--snapshot", s(&wave)],
+    )
+    .ok("recompute --snapshot on binary_truth");
+
+    let written = cache(&pool, id).await;
+    assert_eq!(
+        written.belief_frame_id,
+        Some(binary),
+        "the cache is not owned from binary_truth, so the classification test proves nothing"
+    );
+    let label = written
+        .classification
+        .clone()
+        .expect("a binary_truth recompute writes a classification");
+    assert_ne!(
+        label, "sentinel",
+        "the recompute did not move the classification"
+    );
+    let records = wave_records(&wave);
+    assert_eq!(records.len(), 1, "one record: {records:?}");
+    assert_eq!(
+        records[0].before.classification.as_deref(),
+        Some("sentinel"),
+        "the record's `before` lost the prior classification"
+    );
+    assert_eq!(
+        records[0].written.classification.as_deref(),
+        Some(label.as_str()),
+        "the record's `written` is not the classification the run left"
+    );
+
+    let r = run(RESTORE, &dir, &db, &["--from", s(&wave)]);
+    r.ok("restore --from");
+    assert_eq!(r.count("restored"), 1);
+    let restored = cache(&pool, id).await;
+    assert_eq!(
+        restored.classification.as_deref(),
+        Some("sentinel"),
+        "the restore did not put back the moved classification"
+    );
+    assert_eq!(
+        restored, sentinel,
+        "the restore did not put back the exact prior cache"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── the disk gate (backlog 1ea4f6bf) ───────────────────────────────────────
+
+/// A writing run that names no disk gate is refused before it writes: the
+/// operator no longer checks free space by hand.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writing_run_without_a_disk_gate_is_refused_before_any_write(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let (ids, _) = seeded(&pool, 1).await;
+    let list = write_ids(&dir, &ids);
+    let state = cache_state(&pool).await;
+
+    for (missing, extra) in [
+        ("--disk-path", &["--no-backup-check"][..]),
+        ("--disk-check-cmd", &["--disk-path", "."][..]),
+    ] {
+        let out = Command::new(RECOMPUTE)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("RUST_LOG", "warn")
+            .env("DATABASE_URL", &db)
+            .envs(OPERATOR_ENV.iter().copied())
+            .args(["--input", s(&list)])
+            .args(OPERATOR_FLAGS)
+            .args(extra)
+            .current_dir(&dir)
+            .output()
+            .expect("run the recompute");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "a writing run without {missing} must be refused (exit 2)\nstdout: {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&out.stdout),
+        );
+        assert!(
+            stderr.contains(missing),
+            "refused for the wrong reason: {stderr}"
+        );
+        assert_eq!(
+            cache_state(&pool).await,
+            state,
+            "the refused run wrote a cache"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gate runs before EVERY batch, not once: a backup check that passes
+/// for batch 1 and fails for batch 2 lets batch 1 write (and record) and
+/// stops the run before batch 2 writes anything (exit 4). The wave file still
+/// restores what was written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_disk_gate_runs_before_every_batch_and_stops_before_the_failing_one(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let (ids, sentinels) = seeded(&pool, 3).await;
+    let list = write_ids(&dir, &ids);
+    let wave = dir.join("wave.jsonl");
+    // Passes once: the first call leaves the marker, every later call sees it.
+    let marker = dir.join("gate-ran-once");
+    let check = format!("test ! -e '{0}' && touch '{0}'", s(&marker));
+
+    let r = run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &[
+            "--input",
+            s(&list),
+            "--snapshot",
+            s(&wave),
+            "--batch-size",
+            "1",
+            "--concurrency",
+            "1",
+            "--disk-path",
+            s(&dir),
+            "--min-free-gb",
+            "0",
+            "--disk-check-cmd",
+            &check,
+        ],
+    );
+    assert_eq!(
+        r.code,
+        Some(4),
+        "a gate failure must stop the run (exit 4)\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stderr
+            .contains("STOPPED by the disk gate before batch 2 of 3")
+            && r.stderr.contains("failed")
+            && r.stderr.contains("2 claims were not attempted"),
+        "the run did not stop at batch 2's gate: {}",
+        r.stderr
+    );
+    assert!(marker.exists(), "the backup check never ran");
+    let written = cache(&pool, ids[0]).await;
+    assert_ne!(written, sentinels[0], "batch 1 was not written");
+    for i in 1..3 {
+        assert_eq!(
+            cache(&pool, ids[i]).await,
+            sentinels[i],
+            "claim {} was written after the gate failed",
+            i + 1
+        );
+    }
+    assert_eq!(r.count("recorded"), 1);
+    let records = wave_records(&wave);
+    assert_eq!(records.len(), 1, "one record, batch 1's: {records:?}");
+    assert_eq!(records[0].claim_id, ids[0]);
+
+    let r = run(RESTORE, &dir, &db, &["--from", s(&wave)]);
+    r.ok("restore --from after a gate stop");
+    assert_eq!(r.count("restored"), 1);
+    assert_eq!(
+        cache(&pool, ids[0]).await,
+        sentinels[0],
+        "the restore did not put back batch 1's prior cache"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The free-space half: a headroom no volume has refuses the first batch,
+/// so nothing is written or recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_headroom_the_volume_lacks_stops_the_run_before_its_first_write(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let (ids, _) = seeded(&pool, 2).await;
+    let list = write_ids(&dir, &ids);
+    let wave = dir.join("wave.jsonl");
+    let state = cache_state(&pool).await;
+
+    let r = run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &[
+            "--input",
+            s(&list),
+            "--snapshot",
+            s(&wave),
+            "--disk-path",
+            s(&dir),
+            // 10^21 bytes.
+            "--min-free-gb",
+            "1000000000000",
+            "--no-backup-check",
+        ],
+    );
+    assert_eq!(
+        r.code,
+        Some(4),
+        "a headroom the volume lacks must stop the run (exit 4)\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("before batch 1 of 1")
+            && r.stderr.contains("disk check failed on")
+            && r.stderr.contains("2 claims were not attempted"),
+        "stopped for the wrong reason: {}",
+        r.stderr
+    );
+    assert_eq!(
+        cache_state(&pool).await,
+        state,
+        "the stopped run wrote a cache"
+    );
+    assert!(
+        wave_records(&wave).is_empty(),
+        "the stopped run recorded a write"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── the run record (review of backlog 1ea4f6bf / a7ab715d) ───────────────────
+
+/// `<wave file>.run.json`, the run's own record of how it was made.
+fn run_record(wave_file: &Path) -> serde_json::Value {
+    let mut p = wave_file.as_os_str().to_owned();
+    p.push(".run.json");
+    let text = std::fs::read_to_string(PathBuf::from(p)).expect("the run record exists");
+    serde_json::from_str(&text).expect("the run record is JSON")
+}
+
+/// A `--snapshot` run records its operator opt-outs beside the wave file: a
+/// run made with `--no-backup-check` and `--allow-mode-skew` leaves a run
+/// record that says so (and names its modes and gate), and a run with a
+/// backup check records the command and no opt-out. Without it, the only
+/// trace of either override is terminal output.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_snapshot_run_records_its_operator_opt_outs_beside_the_wave_file(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let (ids, _) = seeded(&pool, 2).await;
+    let list = write_ids(&dir, &ids);
+
+    // The harness's defaults: `--no-backup-check` and `--allow-mode-skew`.
+    let opted_out = dir.join("opted-out.jsonl");
+    run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &["--input", s(&list), "--snapshot", s(&opted_out)],
+    )
+    .ok("recompute with both opt-outs");
+    let rec = run_record(&opted_out);
+    assert_eq!(rec["bin"], "recompute_claim_belief", "{rec}");
+    assert_eq!(rec["wave"], "recompute_claim_belief", "{rec}");
+    assert_eq!(
+        rec["allow_mode_skew"], true,
+        "mode override not recorded: {rec}"
+    );
+    assert_eq!(
+        rec["disk_gate"]["backup_check"]["no_backup_check"], true,
+        "backup-check opt-out not recorded: {rec}"
+    );
+    assert!(
+        rec["disk_gate"]["backup_check"]["command"].is_null(),
+        "{rec}"
+    );
+    assert_eq!(rec["disk_gate"]["path"], ".", "{rec}");
+    assert_eq!(rec["disk_gate"]["min_free_bytes"], 0, "{rec}");
+    assert!(
+        rec["belief_modes"]["atom_fold"].is_string(),
+        "the run's own modes are not recorded: {rec}"
+    );
+    assert!(rec["wave_at"].is_string(), "{rec}");
+
+    // A run with a backup check records the command and no opt-out. Its own
+    // gate, so none of the harness's gate flags are added.
+    let checked = dir.join("checked.jsonl");
+    run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &[
+            "--input",
+            s(&list),
+            "--snapshot",
+            s(&checked),
+            "--disk-path",
+            ".",
+            "--min-free-gb",
+            "0",
+            "--disk-check-cmd",
+            "true",
+        ],
+    )
+    .ok("recompute with a backup check");
+    let rec = run_record(&checked);
+    assert_eq!(rec["disk_gate"]["backup_check"]["command"], "true", "{rec}");
+    assert!(
+        rec["disk_gate"]["backup_check"]
+            .get("no_backup_check")
+            .is_none(),
+        "a run with a backup check recorded the opt-out: {rec}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

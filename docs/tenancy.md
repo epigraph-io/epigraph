@@ -389,9 +389,11 @@ locked are stepped over. Run one.
 4. `settle_remaining`, then `verify`.
 
 **`perspectives` is not re-owned, and `verify` does not count it.** Every
-writer of `perspectives` (`PerspectiveRepository::create`,
-`ensure_evidence_perspective`, `ensure_edge_perspective`) declares
-`TenancyDecl::instance_wide()`, `('public', world)`, on purpose. 077's registry
+writer of `perspectives` (`PerspectiveRepository::create`; before migration
+267 also `ensure_evidence_perspective` and `ensure_edge_perspective`, whose
+per-evidence and per-edge keys 267 moved onto `mass_functions.slot_kind` /
+`slot_id`) declares `TenancyDecl::instance_wide()`, `('public', world)`, on
+purpose. 077's registry
 WITH CHECK admits exactly that declaration, as it does for `frames` and
 `contexts`. The backfill used to walk `perspectives` on `owner_agent_id` like
 `recall_events`. Since the DS auto-wire records an `owner_agent_id` on its
@@ -834,11 +836,19 @@ human (`OPL02`).
   registered human that is not itself linked. Suspending or revoking the
   client, revoking the human, or creating a second client for the agent
   unbinds it at once.
-* **What it does not do.** It is not an operator link: nothing on the token
-  or webhook path reads it, so the client keeps minting tokens and keeps its
-  viewer, and an operated agent is still refused whether or not it is
-  allowlisted. The bearer layers read it only to check a DELEGATED run
-  token's delegator (below); an ordinary token never reaches that read. It is
+* **What it does not do.** It is not an operator link: the mint's
+  operated-agent refusal does not consult it, so the client keeps minting
+  tokens and keeps its viewer, and an operated agent is still refused whether
+  or not it is allowlisted. The registry is still read on the request path,
+  for other questions: the bearer layers read it to check a DELEGATED run
+  token's delegator, and the run-token grant before it mints one (below); and
+  viewer resolution (`epigraph_live_memberships`, so webhook delivery too)
+  reaches it through `epigraph_human_of` and role derivation and, for
+  personal-group rows, reads it directly (migration 235); and the agent card
+  (MCP `find_agent` / `get_agent`, the REST agent search) reads it on the
+  caller's own connection to show an allowlisted agent's operator. The 149
+  entry of `migrations/README.md` lists the readers found on 2026-11-23;
+  grep `author_binding_clients` for the current set. It is
   not an ownership relation (the human does not own the agent's claims). And
   it does not reach the membership door (`epigraph_require_operator_scope`
   reads links only).
@@ -984,13 +994,21 @@ It is refused (`invalid_request`, `invalid_client`, `invalid_grant` or
 * the delegator client authenticates and has an agent (never created here);
 * an agent has the identity key (never created here: the host registers an
   identity and links it before it runs it);
-* the agent's recorded model (`agents.properties ->> 'llm_model'`) is listed
-  in `EPIGRAPH_RUN_TOKEN_MODELS` (comma or whitespace separated; EMPTY
-  refuses every mint). The property is display state the application role
-  may rewrite on the agent's own row, so this narrows which identities the
-  grant serves; it is not authority;
+* `EPIGRAPH_RUN_TOKEN_MODELS` lists at least one model (comma or whitespace
+  separated; EMPTY refuses every mint, `no_model_allowed`);
 * `AgentRepository::delegated_principal_pool` answers `Some`, the same
-  question every request then repeats.
+  question every request then repeats;
+* the agent has an ATTESTED registration (migration 161's
+  `agent_prompt_snapshots`, written only by the host attestor's definer or a
+  maintenance session, never by the application role; else
+  `no_attested_model`), and the model it was registered under is listed in
+  `EPIGRAPH_RUN_TOKEN_MODELS` (else `model_not_allowed`). The model is read
+  through migration 199's `epigraph_agent_prompt_snapshot_at`, never from
+  `agents.properties ->> 'llm_model'`, which is display state the
+  application role may rewrite on the agent's own row. This narrows which
+  identities the grant serves; it is not authority. It is checked after the
+  delegation, so a caller with no live delegation over an identity is
+  answered `delegation_not_live` and learns nothing of its registration.
 
 Every mint writes one `security_events` row `oauth_run_token_minted` (the
 principal as `agent_id`; details: delegator, delegator client, operator,
@@ -1011,7 +1029,8 @@ personal group (never a link): `epigraph-operator group-member add --group
 "<why>" [--apply]` (migration 235; it requires the allowance of step 3, so the
 order matters). (5) Set `EPIGRAPH_RUN_TOKENS=on` on BOTH `epigraph-api` (the
 grant and the REST check) and the MCP HTTP listener (the MCP check), and
-`EPIGRAPH_RUN_TOKEN_MODELS` on `epigraph-api`. (6) Verify with one mint and
+`EPIGRAPH_RUN_TOKEN_MODELS` on `epigraph-api` (an identity the host has not
+registered through the attestor is refused, whatever its properties say). (6) Verify with one mint and
 its `oauth_run_token_minted` row. Disarming is the reverse; suspending the
 delegator client stops every token on its next request.
 
@@ -1335,10 +1354,16 @@ scopes; arming is an operator step (`docs/deploy.md`).
   calling token's refresh family; whether a connector shares one family
   across chats is not measured, so connector mode stays OFF and the CLI path
   is the served one.
-* **MCP reads are not widened.** The MCP read tools read on the server's own
-  unstamped pool, so an elevated MCP request reads no more than before; its
-  calls are still recorded (attributed when the answer names a row). The REST
-  surface is widened.
+* **MCP reads are widened, the federated tools are refused.** The MCP read
+  tools read on a connection stamped from the request's viewer
+  (`EpiGraphMcpFull::read_as`), so an elevated MCP read is widened by 126's
+  arms exactly as a REST read is, and recorded like one (attributed when the
+  answer names a row). A federated tool is never served to an elevated
+  request: `call_tool` refuses it at dispatch with `ELEVATED READ-ONLY`
+  (`refuse_elevated_federated`), so no extension receives an elevated call
+  and none has an elevated read to record. Pinned on the application role by
+  `epigraph-api`'s
+  `elevation_acceptance::p_after_sudo_reads_bs_canaries_and_b_reads_every_access`.
 * **Lockdown, group-held assignments, a two-person rule and signed audit
   events are out of scope** for this stack.
 
@@ -1505,7 +1530,8 @@ member while:
 A detach DOES revoke the lineage's grant: a succession copy counts only while
 every row it was copied through, the operator's own attachment included, is
 un-detached and inside its window. So detaching the identity you attached
-(`epigraph_detach_agent_from_role`) takes the group from every successor
+(`epigraph-operator role-detach`, over `epigraph_detach_agent_from_role`)
+takes the group from every successor
 copied from it at once, and detaching a middle identity takes it from the
 copies below that one. That holds however the copies were made: when you
 attach an identity, its registered successors are attached with it, and
@@ -1600,17 +1626,66 @@ whose copy chains through the detached identity's old copy (the documented
 restore, above). Read each candidate's copy chain before relying on the
 list. The identity that runs now is among them only if every revert on the
 way was registered and every edit was registered with the identity that ran
-before it as its parent (see "What the cut-off cannot see" below). The walk
-ignores when a succession was recorded and when a detach was made, so the
-answer for a past instant also changes after a later revert or detach (the
-same "at any time" reading as the sticky detach itself).
+before it as its parent (see "What the cut-off cannot see" below). Since
+migration 249 the walk reads when each record was made: asked about a past
+instant T, it counts only the attachments written, the detaches made and the
+successions attested by T, so a later revert or detach does not change the
+answer for T (the roster's `--at` reads that answer). From the moment a
+detach is made it is sticky, as above. An instant at or after the asking
+transaction's start is the present: every record the transaction can see
+counts, so a live check never misses a detach already committed. Four
+inputs are still read as they stand now, not at T, so they can still change
+a past answer: the folder test (every snapshot, at any time), the operator
+link, the client allowance, and the group's status (suspending or
+deprovisioning a group later empties the answer, and the roster's `--at`,
+for every earlier instant).
 
 To give the group back after a detach, attach the identity that runs NOW,
 by name. Re-attaching the old root alone does not bring back a successor
 whose old copy still covers the window (166's lineage follow copies only
-into gaps): detach the running identity's old copy first, then attach it by
-name. The copies its later identities inherit from that attachment count
-again.
+into gaps, and that copy chains to the root's detached row). Since
+migration 264 one audited verb does the whole restore:
+
+    epigraph-operator restore-role-successor --role role:K --root <root> \
+        --successor <running identity> --reason TEXT [--apply]
+
+(`epigraph_restore_role_successor` on a maintenance session). It attaches
+the root by name (or keeps its live row made by name), detaches the
+successor's covering copies and attaches the successor by name, in one
+transaction, with one `platform.role_successor_restored` audit row; without
+`--apply` it rolls back and prints what it would do. It refuses (`ROL04`,
+nothing written) a `--root` that never held a row made by name for the role
+(a middle identity that only held copies: re-attaching it would undo its
+own detach, or step around the detach of the root above it), and refuses
+unless a copy written fresh from the root's row would admit the successor:
+it must run in exactly one group folder, one the root runs in; it must hold
+no detached row of its own; every copy below the root's row on its chain
+must be live; and no other identity it descends from (195's walk) may hold
+a detached row. A successor whose copies already chain through live rows,
+and that the walk finds admitted, is left as it is (`successor_unchanged`;
+when the verb attached the root, the audit row records that outcome). A registered descendant still out after
+the restore is reported, not changed: restore it with the restored identity
+as `--root`. The restored successor holds a row made BY NAME, so, like any
+such row, a later detach of the root alone no longer cuts it off: detach the
+successor too. Two more consequences of that row: with a finite
+`--valid-to` the successor's row ends with the root's, and past it the
+successor is unattached exactly as the root is (its old copy, detached
+whole, would have kept it under the role's restriction); and 179's folder
+rule is judged once, at the restore, so a successor later reused in another
+group folder keeps the grant a copy would lose (detach it if it is reused).
+The manual pair (detach the running identity's old copy, then
+attach it by name) still works and has the same effect, without those checks.
+The copies its later identities inherit from that attachment count again.
+With the operator verbs, dry run each step of the manual pair first and
+check its `MEMBERSHIP` lines, then repeat it with `--apply`:
+
+```bash
+epigraph-operator role-detach --role <role> --agent <running identity> --reason "<why>"
+epigraph-operator role-attach --role <role> --agent <running identity> --reason "<why>"
+```
+
+The attach's dry run runs against the database as it is, so it previews the
+attach only after the detach has been applied.
 
 The lineage walk reads only recorded successions. A copy written by hand
 for an identity with no recorded parent is judged by its copy chain alone
@@ -1657,14 +1732,18 @@ identity the host may run for the group (any model, any kind of run; every
 identity with a prompt snapshot in the group's folder is one) and the
 identity at the root of every un-detached copy they hold (a copy counts
 only when its root's agent runs in the copy holder's folder, so these are
-in the same set; read each chain to check). Call
-`epigraph_detach_agent_from_role` on each of them that holds an
-UN-DETACHED attachment made by name, in ANY window: one dated to open
-later is not live yet, but it opens with no act of yours. The verb
-detaches every un-detached row the identity holds for the role. Make the
-list on a maintenance session: `role_agents` is FORCE RLS, so an app or
-read-only session reads no row of it, and an empty answer anywhere else
-means nothing. Then
+in the same set; read each chain to check). Run
+`epigraph-operator role-detach --role <role> --agent <id> --reason "<why>"`
+on each of them that holds an UN-DETACHED attachment made by name, in ANY
+window: one dated to open later is not live yet, but it opens with no act of
+yours. The verb (over `epigraph_detach_agent_from_role`) detaches every
+un-detached row the identity holds for the role. Without `--apply` it is a
+dry run: it prints each row it would end (`WOULD BE DETACHED`) and the
+role-derived memberships of the identity, its registered successors and its
+copies' holders before vs after (`MEMBERSHIP ... LOST`), and rolls back;
+re-run it with `--apply`. Make the list on a maintenance session:
+`role_agents` is FORCE RLS, so an app or read-only session reads no row of
+it, and an empty answer anywhere else means nothing. Then
 no copy any of them holds has a live root, and nothing registered from
 them later inherits one: the job stays out until you attach one of its
 identities by name again. A binding in `registered_agents` mode is out of
@@ -1684,8 +1763,12 @@ group: the detach takes it out there too. Limits: an
 attachment made by name is not tied to a folder, so an identity attached by
 name in another group's folder whose model and prompt files are identical
 to ones this job can put back keeps the group when the job runs it, and is
-not found from this folder until it registers here; a copy written by hand
-stays the limit stated above.
+not found from this folder until it registers here (pinned by
+`group_role_membership.rs::an_identity_attached_by_name_elsewhere_is_found_from_the_folder_only_once_it_registers_there`;
+the "root of every copy" half of the list adds no identity whose copies
+count, since a copy counts only when its root runs in the holder's folder:
+`a_copy_counts_only_when_its_root_runs_in_the_holders_folder`); a copy
+written by hand stays the limit stated above.
 
 #### Recipe: a role-private group for a scheduled job
 
@@ -1729,14 +1812,25 @@ new, non-elevating role that the same human holds, here
 4. Register the job's identity, through the host's identity attestor, in the
    group folder the job runs in, and link it to that human. Do this BEFORE
    step 5: an identity that already has an attachment when the host first
-   registers it is refused (`AID09`).
+   registers it is refused (`AID09`), so since migration 248 step 5 refuses
+   (`ROL03`) an identity the host has not registered yet. `role-attach` also
+   prints `UNREGISTERED` for an identity the host has never registered that
+   248 still lets through (one that already authored a claim); do not apply
+   it then.
 
-5. Attach the identity to the role (166; no CLI verb yet):
+5. Attach the identity to the role (166). A dry run first:
 
-   ```sql
-   SELECT public.epigraph_attach_agent_to_role(
-       'role:platform-operations', '<identity agent id>', NULL, NULL, '<why>');
+   ```bash
+   epigraph-operator role-attach --role role:platform-operations \
+       --agent <identity agent id> --reason "<why>"
    ```
+
+   It runs `epigraph_attach_agent_to_role` and rolls back, printing the
+   attachment, a `COPY` line for every registered successor the attach
+   follows onto (the whole chain), and the role-derived memberships it
+   changes (`MEMBERSHIP GAINED ... group=<group id> role=writer` for the
+   identity). Check them, then repeat with `--apply`. `--valid-from` /
+   `--valid-to` (RFC 3339) set a window; the default is from now, open-ended.
 
 6. Check: `epigraph-operator group-roster --group <group id>` lists the holder
    and the identity at `writer`, and no other agent of that human.
@@ -2288,3 +2382,41 @@ things that does not amount to:
 All three are functional gaps and none is a confidentiality one — the seal nulled
 the vectors, which is the safe direction. An operator who wants full recall back
 after an unseal runs `epigraph-cli reembed`.
+
+### A plan stranded in `applying` or `reverting`
+
+The apply and revert jobs are one-attempt jobs. When the drain's reaper finds one
+still `running` after `MAX_CRASH_REDELIVERIES` (3) crash re-deliveries, it fails
+the job with `REAPED_REDELIVERIES_SPENT_MESSAGE`; a handler that fails on a
+database fault (a deadlock or a lock timeout, say) also ends its job `failed`.
+Neither writes the plan: it stays in `applying` or `reverting`, with whatever
+prefix of its batches committed. A refusal is different: the handler sets the
+plan `failed` itself.
+
+**How it is detected.** At the end of every run `drain_jobs` lists each plan in
+`applying` or `reverting` that no `pending` or `running` apply or revert job
+names, under `stranded_privatization_plans` in its JSON report (plan id, state,
+and the last job's id, state and error), logs it at ERROR, and exits **5**
+while one exists (a job failure still exits 1). It does so on every run until
+the plan is recovered, so the timer's failure alert keeps firing. The dispatch
+writes the state flip and the job in one transaction, so a dispatch in
+progress is never reported.
+
+**How to recover.** The applied prefix stays applied until reverted, and the
+order of the two steps is the one §6.5.5 gives for any stop:
+
+1. `POST /api/v1/admin/privatization/plans/:id/abort`: sets the plan `failed`
+   and writes a `plan.abort` audit row. The next drain run no longer reports it.
+2. `POST /api/v1/admin/privatization/plans/:id/revert`: un-applies exactly the
+   items marked `applied` (a revert accepts a `failed` plan). A `seal` plan with
+   a sealed item is refused until those items are unsealed.
+
+Both are privatization lifecycle routes, so they answer only on a deployment
+that attaches a maintenance pool to the API; the stock server attaches none
+(see "Maintenance work lives in timers and operator CLIs" above), and there
+they answer 501. On such a deployment no route recovers a stranded plan
+yet, and the drain keeps reporting it (exit 5). Before deploying a
+`drain_jobs` with this check, list the plans it will report (`SELECT id,
+state FROM privatization_plans WHERE state IN ('applying', 'reverting')` on
+the maintenance login, then look for a live job naming each one): every one
+of them makes every run exit 5 until it is recovered.

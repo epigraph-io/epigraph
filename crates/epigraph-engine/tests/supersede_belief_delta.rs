@@ -3,7 +3,7 @@
 //! * The ORACLE is the real cascade on the same throwaway database: the
 //!   delta runs first, then the fixes' own write paths run over the rows it
 //!   measured (the K10(2) arm through `cascade_after_supersede`, the edge-BBA
-//!   removal and repair through `delete_for_perspective` +
+//!   removal and repair through `delete_for_edge` +
 //!   `cascade_after_edge_withdrawal` for the `supersedes` rows, and the K3
 //!   mint `regenerate_superseded_edge_factors_conn` for the R-131 set), and
 //!   every value the delta predicted must be the value the cascade wrote.
@@ -25,7 +25,7 @@
 mod fixture;
 
 use epigraph_db::visibility::{SystemReason, Viewer};
-use epigraph_db::{ClaimRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
+use epigraph_db::{ClaimRepository, MassFunctionRepository, PgPool};
 use epigraph_engine::edge_factor::{auto_wire_ds_for_edge, ensure_binary_frame, EdgeFactorOutcome};
 use epigraph_engine::supersede_delta::r173::R173Options;
 use epigraph_engine::supersede_delta::{
@@ -155,15 +155,12 @@ async fn owned_claim(pool: &PgPool, owner: Uuid, group: Uuid, tag: &str) -> Uuid
 /// nothing wires one any more) and return its id.
 async fn store_on_edge(pool: &PgPool, holder: Uuid, frame: Uuid, agent: Uuid, edge: Uuid) -> Uuid {
     let mut conn = pool.acquire().await.expect("acquire");
-    PerspectiveRepository::ensure_edge_perspective(&mut *conn, edge, Some(agent))
-        .await
-        .expect("edge perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_in_slot(
         &mut *conn,
         holder,
         frame,
         Some(agent),
-        Some(edge),
+        epigraph_db::BbaSlot::Edge(edge),
         &serde_json::json!({"1": 0.7, "0,1": 0.3}),
         None,
         Some("edge_factor"),
@@ -174,12 +171,14 @@ async fn store_on_edge(pool: &PgPool, holder: Uuid, frame: Uuid, agent: Uuid, ed
     )
     .await
     .expect("the pre-K12(b) supersedes BBA");
-    sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1 AND claim_id = $2")
-        .bind(edge)
-        .bind(holder)
-        .fetch_one(&mut *conn)
-        .await
-        .expect("the stored row")
+    sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2",
+    )
+    .bind(edge)
+    .bind(holder)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("the stored row")
 }
 
 /// Retract `row` as `owner` through the real repository path.
@@ -249,12 +248,13 @@ async fn world_with(pool: &PgPool, private: bool) -> World {
     } else {
         None
     };
-    let kept_row: Uuid =
-        sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1")
-            .bind(kept_edge)
-            .fetch_one(pool)
-            .await
-            .expect("the row to retract");
+    let kept_row: Uuid = sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(kept_edge)
+    .fetch_one(pool)
+    .await
+    .expect("the row to retract");
     retract_as(pool, owner, kept_row).await;
     // The retirement the K10(2) arm never saw.
     retire(pool, retired).await;
@@ -529,7 +529,7 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
     // both removals, which is the `combined` value).
     {
         let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
-        let n = MassFunctionRepository::delete_for_perspective(&mut *tx, w.overlap_lineage_edge)
+        let n = MassFunctionRepository::delete_for_edge(&mut *tx, w.overlap_lineage_edge)
             .await
             .expect("remove the overlap's supersedes BBA");
         assert_eq!(n, 1);
@@ -581,7 +581,7 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
 
     let mut n = 0;
     for e in [w.lineage_edge, w.overlap_lineage_edge] {
-        let one = MassFunctionRepository::delete_for_perspective(&mut *conn, e)
+        let one = MassFunctionRepository::delete_for_edge(&mut *conn, e)
             .await
             .expect("remove the supersedes BBA");
         assert_eq!(one, 1);
@@ -618,6 +618,31 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
     assert_eq!(
         minted, r131.slots_minted,
         "the mint fills the slots the delta counted"
+    );
+
+    // Post-mint re-run (backlog 7c1bdeec (4)): the symmetric pair shares one
+    // slot, so the mint filled it from one edge and left the other edge with
+    // no factor of its own. The re-run selects only that edge, on a HELD slot,
+    // and counts no slot to mint.
+    let again = run_read_only(
+        &mut conn,
+        &w.viewer,
+        &DeltaOptions {
+            items: DeltaItems {
+                r131: true,
+                ..DeltaItems::default()
+            },
+            ..ALL
+        },
+    )
+    .await
+    .expect("the post-mint delta runs");
+    let held = again.r131.as_ref().expect("r131 block");
+    assert_eq!(
+        (held.edges, held.slots_minted, held.edges_on_held_slots),
+        (1, 0, 1),
+        "after the mint only one edge of the symmetric pair is factorless, and its slot is \
+         held: {held:?}"
     );
 
     assert_eq!(
@@ -724,8 +749,12 @@ fn the_delta_calls_no_write_path() {
         "update_claim_belief",
         "clear_claim_belief",
         "delete_for_perspective",
+        // Migration 267's slot-keyed renames and additions of the write paths.
+        "delete_for_edge",
         "auto_wire",
         "store_with_perspective",
+        "store_in_slot",
+        "store_for_evidence",
         "apply_after",
         "cascade_after",
         "replay_deferred",
@@ -837,5 +866,148 @@ async fn the_delta_reads_every_row_on_the_maintenance_login(pool: PgPool) {
         serde_json::to_value(&as_maintenance).expect("json"),
         serde_json::to_value(&as_superuser).expect("json"),
         "the maintenance login measures exactly what the superuser measures"
+    );
+}
+
+/// Store a BBA on `claim` citing `evidence` (keyed on its evidence slot,
+/// migration 267), as the evidence write path does.
+async fn store_cited(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Uuid) {
+    MassFunctionRepository::store_for_evidence(
+        pool,
+        claim,
+        frame,
+        Some(agent),
+        Some(evidence),
+        &serde_json::json!({"0": 0.8, "0,1": 0.2}),
+        None,
+        Some("auto_wire"),
+        Some(1.0),
+        None,
+        "unknown",
+        Some(evidence),
+    )
+    .await
+    .expect("store a cited BBA");
+}
+
+/// The two K0 outcomes the oracle world does not reach (backlog 7c1bdeec
+/// (4)), each from a refuter retired by a plain flip:
+///
+/// * `KeptOtherFrame`: the holder's only binary BBA is the retired refuter's,
+///   and it keeps one on `claim_validity`. Predicted unchanged; the real K10
+///   sweep then leaves the cache exactly as predicted, and its report lists
+///   the holder under `unchanged` (the refold wrote nothing).
+/// * `VacatePossible`: the holder keeps a binary BBA, but one citing evidence
+///   narrowed to a group, which the derivation scope rule does not admit.
+///   Reported, not predicted (`new` is `None`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_delta_reports_kept_other_frame_and_vacate_possible(pool: PgPool) {
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let public = fixture::public_viewer(&pool).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "k0-outcomes-author").await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "k0-outcomes-member").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let binary = ensure_binary_frame(&mut conn, &public)
+        .await
+        .expect("binary frame");
+    let validity = epigraph_engine::edge_factor::resolve_claim_validity_frame(&mut conn, &public)
+        .await
+        .expect("claim_validity frame");
+
+    let retired = believed(&pool, agent, "k0 outcomes refuter", 0.9, 0.95).await;
+    // KeptOtherFrame: another frame's BBA first, then the refuter's edge
+    // (whose wiring writes the binary cache).
+    let elsewhere = fixture::seed_public_claim(&pool, agent, "k0 backed elsewhere").await;
+    MassFunctionRepository::store_with_perspective(
+        &pool,
+        elsewhere,
+        validity,
+        Some(agent),
+        None,
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        None,
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("a claim_validity BBA");
+    wire(&pool, &public, agent, retired, elsewhere, "refutes").await;
+    // VacatePossible: a cited binary BBA while its evidence is public, the
+    // refuter's edge, then the evidence narrowed to a group.
+    let hidden = fixture::seed_public_claim(&pool, agent, "k0 hidden support").await;
+    let ev = fixture::seed_evidence(&pool, hidden, "observation").await;
+    store_cited(&pool, hidden, binary, agent, ev).await;
+    wire(&pool, &public, agent, retired, hidden, "contradicts").await;
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'k0 fixture: hidden')",
+    )
+    .bind(ev)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("pin the hidden evidence");
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(ev)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("narrow the evidence to the group");
+    retire(&pool, retired).await;
+    let kept_before = cache(&pool, elsewhere).await;
+    assert!(kept_before.0.is_some(), "PREMISE: a binary cache to keep");
+
+    let report = run_read_only(
+        &mut conn,
+        &bypass,
+        &DeltaOptions {
+            items: DeltaItems {
+                k10_retro: true,
+                ..DeltaItems::default()
+            },
+            ..ALL
+        },
+    )
+    .await
+    .expect("the delta runs");
+    let k10 = report.k10_retro.as_ref().expect("k10-retro block");
+    assert_eq!(
+        sorted(ids(&k10.delta.claims)),
+        sorted(vec![elsewhere, hidden]),
+        "{k10:?}"
+    );
+    let kept = find(&k10.delta.claims, elsewhere);
+    assert_eq!(kept.outcome, DeltaOutcome::KeptOtherFrame, "{kept:?}");
+    assert_eq!(kept.new, Some(kept.old), "kept unchanged: {kept:?}");
+    let vacate = find(&k10.delta.claims, hidden);
+    assert_eq!(vacate.outcome, DeltaOutcome::VacatePossible, "{vacate:?}");
+    assert_eq!(vacate.new, None, "not predicted: {vacate:?}");
+    assert_eq!(
+        (
+            k10.delta.totals.kept_other_frame,
+            k10.delta.totals.vacate_possible
+        ),
+        (1, 1),
+        "{:?}",
+        k10.delta.totals
+    );
+
+    // The oracle for the kept holder: the real K10(3) sweep over the
+    // measured selection.
+    let rows = epigraph_engine::supersede_delta::retired_source_edge_bbas(&mut conn, None)
+        .await
+        .expect("the selection");
+    let sweep =
+        epigraph_engine::retraction_cascade::sweep_retired_source_bbas(&mut conn, &bypass, &rows)
+            .await;
+    assert!(sweep.report.errors.is_empty(), "{sweep:?}");
+    assert_written_as_predicted(&pool, std::slice::from_ref(kept)).await;
+    assert!(
+        sweep.report.unchanged.contains(&elsewhere),
+        "the real sweep reports the kept holder as unchanged: {:?}",
+        sweep.report
     );
 }

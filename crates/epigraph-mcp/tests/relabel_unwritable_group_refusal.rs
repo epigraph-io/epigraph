@@ -21,6 +21,8 @@
 //! * stdio `patch_claim` with `add_labels`: the same refusal, nothing written;
 //! * HTTP `update_labels` by the claim's AUTHOR (who passes the ownership gate)
 //!   on a claim owned by a group it cannot write: the same refusal;
+//! * HTTP `patch_claim` by the claim's AUTHOR on such a claim: the same
+//!   refusal (calibration: its own group's claim patches);
 //! * stdio `patch_claim` with `properties` only (no labels): the same
 //!   `UPDATE claims`, so the same refusal, with no label-specific remedy;
 //! * a coded `42501`, or a row-security refusal on ANOTHER table a trigger
@@ -207,6 +209,61 @@ async fn http_author_relabelling_its_claim_in_an_unwritable_group_is_a_named_ref
         .expect_err("the claim's group refuses the author's stamp");
     assert_named_refusal(&e, claim, group, "http update_labels by the author");
     assert_eq!(labels_of(&pool, claim).await, before, "nothing written");
+}
+
+/// `patch_claim` over HTTP (backlog 8672f843): the author passes the
+/// ownership gate, and a claim of its own owned by a group its stamp cannot
+/// write is the same named refusal, with nothing written. Calibration: the
+/// same patch by the same caller on its own group's claim lands, so the
+/// refusal is the claim's group and not the transport.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_author_patching_its_claim_in_an_unwritable_group_is_a_named_refusal(pool: PgPool) {
+    let (server, _agent, _viewer) = app_role_server(&pool).await;
+    let (_owner, group) = fixture::seed_agent_with_group(&pool, "patch-group-admin").await;
+    let (caller, token, caller_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let claim = public_claim_in(
+        &pool,
+        caller,
+        group,
+        "caller-authored, group-owned, patched",
+    )
+    .await;
+    let before = (
+        labels_of(&pool, claim).await,
+        properties_of(&pool, claim).await,
+    );
+    let patch = |claim: Uuid| PatchClaimParams {
+        claim_id: claim.to_string(),
+        trace_id: None,
+        properties: Some(serde_json::json!({ "patched_over": "http" })),
+        add_labels: vec!["relabel-probe".to_string()],
+        remove_labels: vec![],
+    };
+
+    let e = patch_claim(&server, &caller_viewer, patch(claim), Some(&token))
+        .await
+        .expect_err("the claim's group refuses the author's stamp");
+    assert_named_refusal(&e, claim, group, "http patch_claim by the author");
+    assert_eq!(
+        (
+            labels_of(&pool, claim).await,
+            properties_of(&pool, claim).await
+        ),
+        before,
+        "nothing written"
+    );
+
+    let own_group = personal_group_of(&pool, caller).await;
+    let mine = public_claim_in(&pool, caller, own_group, "caller's own group, patched").await;
+    patch_claim(&server, &caller_viewer, patch(mine), Some(&token))
+        .await
+        .expect("CALIBRATION: the author patches its own group's claim over HTTP");
+    assert!(
+        labels_of(&pool, mine)
+            .await
+            .contains(&"relabel-probe".to_string()),
+        "calibration: the label landed"
+    );
 }
 
 /// Only the row-security refusal is renamed. A CODED `42501` a trigger raises

@@ -279,8 +279,20 @@ pub struct CreateEvidenceResponse {
 /// Create a new evidence record
 ///
 /// POST /api/v1/evidence
+///
+/// The claim read, the evidence row, its `evidence -> claim` `supports` edge
+/// and the `claim -> evidence` `DERIVED_FROM` edge run on ONE transaction
+/// stamped with the caller's viewer (backlog 73d4f7ff). On the raw pool
+/// nothing stamped the caller, so on a public claim the evidence and both
+/// edges took no caller ownership (the edges landed world-owned, and the
+/// writer could not later retract or patch them). Stamped, migration 114's
+/// attach rule owns the evidence by the caller's group and migration 120 owns
+/// the edges by it. A claim the caller cannot read answers exactly as a
+/// missing one (404); one it reads but may not attach to is refused by the
+/// database (42501 -> 403) with nothing written.
 #[cfg(feature = "db")]
 pub async fn create_evidence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateEvidenceRequest>,
@@ -367,16 +379,34 @@ pub async fn create_evidence(
         *hash.as_bytes()
     };
 
-    // Resolve public key for the agent
-    let public_key = epigraph_db::AgentRepository::get_by_id(
-        &state.db_pool,
+    let mut tx = state.write_as(&viewer, "create_evidence").await?;
+
+    // The claim, read as the caller. Unreadable and nonexistent answer alike.
+    let readable =
+        epigraph_db::ClaimRepository::visible_claim_ids(&mut *tx, &viewer, &[request.claim_id])
+            .await?;
+    if !readable.contains(&request.claim_id) {
+        return Err(ApiError::NotFound {
+            entity: "claim".to_string(),
+            id: request.claim_id.to_string(),
+        });
+    }
+
+    // Resolve public key for the agent. An unknown agent, or a stored key
+    // of the wrong length (a Rust-side error that leaves the transaction
+    // intact), degrades to the zero key as before. A failed QUERY aborts the
+    // transaction, so it is returned here rather than resurfacing as a
+    // confusing "current transaction is aborted" at the evidence INSERT.
+    let public_key = match epigraph_db::AgentRepository::get_by_id(
+        &mut *tx,
         AgentId::from_uuid(request.agent_id),
     )
     .await
-    .ok()
-    .flatten()
-    .map(|a| a.public_key)
-    .unwrap_or([0u8; 32]);
+    {
+        Ok(agent) => agent.map_or([0u8; 32], |a| a.public_key),
+        Err(epigraph_db::DbError::InvalidData { .. }) => [0u8; 32],
+        Err(e) => return Err(ApiError::from(e)),
+    };
 
     let evidence = Evidence::new(
         AgentId::from_uuid(request.agent_id),
@@ -390,16 +420,30 @@ pub async fn create_evidence(
     // With its `evidence -> claim` edge, in the evidence's own transaction
     // (backlog 2d60f619). The request names no direction: `supports`.
     let created = EvidenceRepository::create(
-        &state.db_pool,
+        &mut *tx,
         &evidence,
         epigraph_db::EvidenceEdge::supports(state.edge_signing_key()),
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "create_evidence",
+                error = %e,
+                "the database refused the evidence"
+            );
+            crate::errors::write_refused("claim")
+        } else {
+            ApiError::from(e)
+        }
+    })?;
     let evidence_id: Uuid = created.id.into();
 
-    // Materialize claim --DERIVED_FROM--> evidence edge
-    let _ = epigraph_db::EdgeRepository::create_signed(
-        &state.db_pool,
+    // Materialize claim --DERIVED_FROM--> evidence edge (best-effort, as
+    // before, under a savepoint so a refusal cannot abort the evidence).
+    crate::routes::belief::create_edge_under_savepoint(
+        &mut tx,
         state.edge_signing_key(),
         request.claim_id,
         "claim",
@@ -407,10 +451,12 @@ pub async fn create_evidence(
         "evidence",
         "DERIVED_FROM",
         None,
-        None,
-        None,
     )
-    .await;
+    .await?;
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the evidence: {e}"),
+    })?;
 
     // Record provenance when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
@@ -1870,6 +1916,11 @@ pub struct SplitCandidatesQuery {
 /// Find themes with high intra-cluster variance.
 ///
 /// GET /api/v1/themes/split-candidates
+///
+/// Per viewer: `claim_count` and the `min_claims` floor count the current,
+/// embedded members the caller can read, never the stored corpus-wide
+/// `claim_themes.claim_count`, and a theme with no such member is not listed
+/// (backlog 06f5c5b2; see `ClaimThemeRepository::find_split_candidates`).
 #[cfg(feature = "db")]
 pub async fn get_split_candidates(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,

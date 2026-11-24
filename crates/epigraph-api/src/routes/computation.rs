@@ -9,7 +9,7 @@
 //! - `POST /api/v1/graph/compose`         - Compose two subgraphs via decorated cospans
 //! - `GET  /api/v1/claims/:id/belief-at`  - Reconstruct belief at a past timestamp
 //!
-//! # Tenancy: 5 of this file's 15 raw-pool sites are converted, and 10 are not
+//! # Tenancy: 12 of this file's 15 raw-pool sites are converted, and 3 are not
 //!
 //! Conversion shard 4 against `D-PR17-request-path-never-stamps-session-gucs`
 //! (`epigraph-db/tests/no_unscoped_pool.rs`). Unlike `routes/belief.rs`, the
@@ -23,28 +23,18 @@
 //! statement on it. `sheaf_reconcile` is a POST and is still a read — it returns
 //! computed proposals and persists nothing.
 //!
+//! `propagate_beliefs` is converted whole (tenancy finding `F-SHARD4-A2`,
+//! closed by backlog 073d24a3). Its reads (the factor load, the scalar priors
+//! and the alternative-set classes) run on ONE [`AppState::read_as`]
+//! connection, each through a repo fn that splices the caller's viewer: a
+//! factor is loaded only when every claim it names is one the caller can
+//! read, so no id, prior or BP value of another group's claim reaches the run
+//! or the response. Its CDST seeds are read by `bp_seed_rows` on its own
+//! stamped read, and its apply writes on an [`AppState::write_as`]
+//! transaction (`apply_bp_updates`).
+//!
 //! Not converted, and NOT merely deferred:
 //!
-//! * `propagate_beliefs` (4 sites, all reads; its apply writes on a
-//!   `write_as` transaction since the batch H-a review). Converting only
-//!   its reads is the shape no shard in this series has reviewed — every prior
-//!   shard converted whole handlers — and a half-converted handler here would
-//!   change its own output silently and with a 200, so it is whole-handler work
-//!   or none. ONE statement is the deliberate exception: the factor load runs
-//!   on [`AppState::read_as`] because atom-level belief's `decomposes_to`
-//!   exclusion (SPEC §6.2) decides its legacy arm by reading `edges`, and that
-//!   read must see the caller's own private edges. `factors` has no row
-//!   security and the load splices no viewer, so the stamp changes nothing
-//!   else it returns. Converting the writes too is worse — `read_as` is
-//!   documented read-only, `ScopedRead::commit` is not called by `Drop`, and
-//!   under `SessionGucMode::Transaction` a write routed through it is rolled
-//!   back while still type-checking, because `ScopedRead` is
-//!   `DerefMut<Target = PgConnection>`. Its write side belongs to
-//!   `ScopedPool::begin_as` plus 16b's `Viewer::splice_write`, as a whole-handler
-//!   change with its own evidence. A separate question raised while classifying
-//!   this handler is registered as `F-SHARD4-A2`; analysis held outside this
-//!   repository, and its owner is NOT the conversion-shard series — see the
-//!   entry's `assigned` field.
 //! * `compose_subgraphs` (3 sites) is registered as `F-SHARD4-A1`; analysis
 //!   held outside this repository. Owner: the conversion-shard series. Two of
 //!   its three sites reach the database through [`extract_neighborhood`], which
@@ -101,7 +91,17 @@ pub struct ReconcileRequest {
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
 pub struct PropagateRequest {
+    /// Only factors on this frame. With no `claim_ids`, the whole frame is
+    /// the scope.
     pub frame_id: Option<Uuid>,
+    /// The claims whose factor-graph neighbourhood is run (backlog
+    /// b02347c6): the factors that name one of them, then those that name a
+    /// variable of those, out to `max_hops`. At most [`BP_MAX_SCOPE_CLAIMS`].
+    /// A request names this, `frame_id`, or both.
+    pub claim_ids: Option<Vec<Uuid>>,
+    /// Factor hops from `claim_ids`, 1 to [`BP_MAX_HOPS`]; default
+    /// [`BP_DEFAULT_HOPS`]. Only with `claim_ids`.
+    pub max_hops: Option<usize>,
     pub max_iterations: Option<usize>,
     pub convergence_threshold: Option<f64>,
     pub damping: Option<f64>,
@@ -593,16 +593,22 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// written. A claim the caller can see but not WRITE is still refused (403),
 /// and the whole apply is rolled back.
 ///
+/// Since backlog 073d24a3 the loader (`FactorRepository::load_bp_scope`) no
+/// longer loads a factor naming such an id at all, for read-only runs and
+/// applies alike, so this check is a backstop: `skipped_not_visible` counts
+/// only a claim the caller stopped being able to see between the load and
+/// this transaction, and is otherwise 0.
+///
 /// # A COMPOUND is never written (SPEC §1.3 D4)
 ///
-/// Under atom-level belief a compound (a claim with an in-force
-/// `decomposes_to` out-edge, `compound_ids_among_sql`) is a query over its
-/// atoms and has no cache of its own; BP may still compute a value for one
-/// (read-only diagnostics keep the `evidential_support` / `mutual_exclusion`
-/// factors that name compounds), but apply skips it and counts it in
-/// `skipped_compounds`. The role is read on the same stamped transaction, so
-/// it is decided over the edges the caller can see, not structurally; see
-/// `compound_ids_among_sql` for the residual that leaves.
+/// Under atom-level belief a compound (`claim_role::IS_COMPOUND_SQL`; in
+/// short a claim with an in-force `decomposes_to` out-edge) is a query over
+/// its atoms and has no cache of its own; BP may still compute a value for
+/// one (read-only diagnostics keep the `evidential_support` /
+/// `mutual_exclusion` factors that name compounds), but apply skips it and
+/// counts it in `skipped_compounds`. The role is decided structurally, by
+/// migration 193's definer (`compound_ids_among_sql`), so a compound whose
+/// decomposition the caller cannot see is still skipped (backlog 77b605ce).
 ///
 /// # A claim BP could have informed from a LESS READABLE one is SKIPPED
 ///
@@ -610,7 +616,8 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// is derived only from sources at least as widely readable as the claim.
 /// BP messages travel along factors, so a claim's result can carry the belief
 /// of any claim in its connected component of the run's factor graph
-/// (`factor_variables`). A claim whose component holds a claim less readable
+/// (`factor_variables`: one variable list per factor and, on a CDST run, one
+/// per alternative-set class, which groups its members' messages). A claim whose component holds a claim less readable
 /// than itself (for a public claim, any non-public one; for a group claim,
 /// another group's; and any id that is no claim the caller can read) is
 /// skipped and counted in `skipped_less_readable_inputs`.
@@ -927,20 +934,120 @@ fn bp_config_from_request(
     })
 }
 
+/// The most claims a `POST /api/v1/bp/propagate` scope may name.
+#[cfg(feature = "db")]
+pub const BP_MAX_SCOPE_CLAIMS: usize = 1_000;
+
+/// The factor hops a claim scope is expanded by when `max_hops` is absent.
+#[cfg(feature = "db")]
+pub const BP_DEFAULT_HOPS: usize = 2;
+
+/// The most factor hops a claim scope may ask for.
+#[cfg(feature = "db")]
+pub const BP_MAX_HOPS: usize = 4;
+
+/// The most factors one BP run loads. A scope that reaches more is refused
+/// (400) rather than run on a truncated graph: narrow the claim set, lower
+/// `max_hops`, or add a `frame_id`.
+#[cfg(feature = "db")]
+pub const BP_MAX_FACTORS: usize = 10_000;
+
+/// The factor-graph scope a [`PropagateRequest`] names (backlog b02347c6).
+///
+/// A run used to load every BP-readable factor when `frame_id` was absent,
+/// so its cost grew with the corpus, not with the request. A request must
+/// now name `claim_ids` (expanded `max_hops` factor hops, default
+/// [`BP_DEFAULT_HOPS`]) or a `frame_id`, or both.
+///
+/// # Errors
+/// `ApiError::ValidationError` (400) on `claim_ids` when neither is named,
+/// when `claim_ids` is empty or longer than [`BP_MAX_SCOPE_CLAIMS`]; on
+/// `max_hops` when it is 0, above [`BP_MAX_HOPS`], or given without
+/// `claim_ids`.
+#[cfg(feature = "db")]
+fn bp_scope_from_request(
+    request: &PropagateRequest,
+) -> Result<epigraph_db::repos::factor::BpFactorScope<'_>, ApiError> {
+    let refuse = |field: &str, reason: String| ApiError::ValidationError {
+        field: field.to_string(),
+        reason,
+    };
+    let claim_ids = request.claim_ids.as_deref();
+    match claim_ids {
+        None if request.frame_id.is_none() => {
+            return Err(refuse(
+                "claim_ids",
+                "Name the claims to run BP around (claim_ids) or a frame (frame_id); \
+                 a run over the whole factor graph is not served"
+                    .to_string(),
+            ))
+        }
+        Some([]) => {
+            return Err(refuse(
+                "claim_ids",
+                "Must name at least one claim".to_string(),
+            ))
+        }
+        Some(ids) if ids.len() > BP_MAX_SCOPE_CLAIMS => {
+            return Err(refuse(
+                "claim_ids",
+                format!(
+                    "Must name at most {BP_MAX_SCOPE_CLAIMS} claims (got {})",
+                    ids.len()
+                ),
+            ))
+        }
+        _ => {}
+    }
+    let max_hops = match (request.max_hops, claim_ids) {
+        (Some(_), None) => {
+            return Err(refuse(
+                "max_hops",
+                "Bounds a claim_ids scope; this request names none".to_string(),
+            ))
+        }
+        (Some(h), Some(_)) if h == 0 || h > BP_MAX_HOPS => {
+            return Err(refuse(
+                "max_hops",
+                format!("Must be in [1, {BP_MAX_HOPS}] (got {h})"),
+            ))
+        }
+        (Some(h), Some(_)) => h,
+        (None, _) => BP_DEFAULT_HOPS,
+    };
+    Ok(epigraph_db::repos::factor::BpFactorScope {
+        frame_id: request.frame_id,
+        claim_ids,
+        max_hops,
+    })
+}
+
 /// Run a BP engine on the blocking pool, off the async runtime's workers
 /// (backlog 69f52e3f): a run is CPU-bound for up to [`BP_MAX_ITERATIONS`]
 /// sweeps of the factor graph.
+///
+/// `permit` is the run's share of [`AppState::bp_runs`] (backlog b02347c6).
+/// The blocking task holds a clone until it finishes, so a request whose
+/// future is dropped mid-run (a client that disconnects) still counts
+/// against the limit while its thread computes.
 #[cfg(feature = "db")]
-async fn run_bp_blocking<T, F>(run: F) -> Result<T, ApiError>
+async fn run_bp_blocking<T, F>(
+    permit: &std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    run: F,
+) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(run)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("belief propagation did not complete: {e}"),
-        })
+    let permit = std::sync::Arc::clone(permit);
+    tokio::task::spawn_blocking(move || {
+        let _held = permit;
+        run()
+    })
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("belief propagation did not complete: {e}"),
+    })
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
@@ -949,16 +1056,24 @@ where
 /// `convergence_threshold` / `damping` must lie in `[0, 1]`; anything else is
 /// a 400 before any factor is loaded.
 ///
+/// The run's factor graph is the scope the request names (backlog
+/// b02347c6): `claim_ids` expanded `max_hops` factor hops, a `frame_id`, or
+/// both ([`bp_scope_from_request`]). A request that names neither is a 400,
+/// as is a scope that reaches more than [`BP_MAX_FACTORS`] factors. An apply
+/// writes from that neighbourhood's run only.
+///
 /// BP apply is retired: `apply_updates: true` answers 409 and writes nothing
 /// unless the server runs with `EPIGRAPH_BP_APPLY=on` ([`crate::state::BpApply`]).
 /// When it is on, the results are written all-or-nothing on a
 /// transaction stamped with the caller's viewer (`apply_bp_updates`): a claim
 /// the caller can see but not write fails the request (403) and nothing is
-/// written. A BP variable that is not a claim the caller can see (a stale
-/// factor id, or another group's private claim) is skipped. `applied_count` is
-/// the number of claims written, `skipped_not_visible` the number skipped as
-/// not visible and `skipped_compounds` the number skipped as compounds (D4);
-/// `updated_beliefs` lists what BP computed, which is not the same list.
+/// written. A factor naming an id that is not a claim the caller can read (a
+/// stale factor id, or another group's private claim), or minted from an edge
+/// the caller cannot read, is not loaded at all (backlog 073d24a3).
+/// `applied_count` is the number of claims written, `skipped_not_visible` the
+/// number skipped as no longer visible at write time (otherwise 0) and
+/// `skipped_compounds` the number skipped as compounds (D4); `updated_beliefs`
+/// lists what BP computed, which is not the same list.
 ///
 /// A read-only run needs no scope beyond the bearer. `apply_updates: true`
 /// writes beliefs, so it needs `claims:write` (403 otherwise, before the
@@ -972,6 +1087,7 @@ pub async fn propagate_beliefs(
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let config = bp_config_from_request(&request)?;
+    let scope = bp_scope_from_request(&request)?;
     let apply = request.apply_updates.unwrap_or(false);
     if apply {
         crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
@@ -991,16 +1107,32 @@ pub async fn propagate_beliefs(
         });
     }
 
-    // Load factors from DB. This is the one loader that feeds the BP engines
-    // (`run_cdst_bp`, `run_bp`; interval mode runs the scalar track here), so
-    // the `decomposes_to` exclusion (SPEC §6.2, D3) is applied here, once.
+    // At most `state.bp_runs` runs at once (backlog b02347c6), refused rather
+    // than queued: a queued request would hold its connection and its caller
+    // for as long as the runs ahead of it. Taken after every 4xx check, held
+    // through the BP run (the blocking task keeps a clone) and the apply.
+    let permit = std::sync::Arc::new(state.bp_runs.clone().try_acquire_owned().map_err(|_| {
+        tracing::warn!(
+            handler = "propagate_beliefs",
+            "BP run refused: every BP run permit is in use"
+        );
+        ApiError::ServiceUnavailable {
+            service: "belief propagation (the concurrent-run limit is reached; retry later)"
+                .to_string(),
+        }
+    })?);
+
+    // Load the factors in the request's scope (backlog b02347c6). This is the
+    // one loader that feeds the BP engines (`run_cdst_bp`, `run_bp`; interval
+    // mode runs the scalar track here), so the `decomposes_to` exclusion
+    // (SPEC §6.2, D3) is applied here, once, at every hop of the expansion.
     //
     // On the caller's viewer-stamped connection, not the raw pool: the
     // exclusion's legacy arm matches a factor to its `decomposes_to` edge by
     // reading `edges`, which row security filters. Unstamped, that read sees
     // only public edges, so a legacy factor on a decomposition private to the
-    // caller's own group would be loaded. `factors` itself has no row security.
-    // The rest of this handler's reads stay where they were.
+    // caller's own group would be loaded. `factors` itself has no row
+    // security, so the loader also splices the caller's viewer (below).
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_read",
@@ -1012,20 +1144,74 @@ pub async fn propagate_beliefs(
             message: "Failed to acquire a scoped connection".to_string(),
         }
     })?;
-    let factors: Vec<FactorRow> = sqlx::query_as(&format!(
-        "SELECT f.id, f.factor_type, f.variable_ids, f.potential, f.description \
-         FROM factors f \
-         WHERE ($1::uuid IS NULL OR f.frame_id = $1) \
-           AND {} \
-         ORDER BY f.created_at",
-        epigraph_db::repos::factor::bp_readable_factor_sql()
-    ))
-    .bind(request.frame_id)
-    .fetch_all(&mut *read)
+    // Every read below runs on this one stamped connection and spends the
+    // caller's viewer (tenancy finding F-SHARD4-A2): a factor is loaded only
+    // when every variable it names is a claim the caller can read, so no id,
+    // prior or BP value of a claim the caller cannot read reaches the run or
+    // the response.
+    let mode = request.mode.as_deref().unwrap_or("auto");
+    let factors_r = epigraph_db::repos::factor::FactorRepository::load_bp_scope(
+        &mut read,
+        &viewer,
+        &scope,
+        BP_MAX_FACTORS,
+    )
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to load factors: {e}"),
     })?;
+    let factors = match factors_r {
+        epigraph_db::repos::factor::BpScopeLoad::Loaded(rows) => rows,
+        epigraph_db::repos::factor::BpScopeLoad::OverCap { cap } => {
+            crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
+            return Err(ApiError::ValidationError {
+                field: if scope.claim_ids.is_some() {
+                    "claim_ids".to_string()
+                } else {
+                    "frame_id".to_string()
+                },
+                reason: format!(
+                    "The scope reaches more than {cap} factors; narrow claim_ids, lower \
+                     max_hops or add a frame_id"
+                ),
+            });
+        }
+    };
+
+    // Collect all variable IDs and load their current beliefs
+    let all_var_ids: Vec<Uuid> = factors
+        .iter()
+        .flat_map(|f| f.variable_ids.iter().copied())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // The scalar engine's priors. Through the raw pool this read saw only
+    // public claims (the application role, unstamped), so a member's own
+    // group's claims ran from the engine default instead of their BetP.
+    let belief_rows =
+        epigraph_db::repos::factor::FactorRepository::bp_priors(&mut read, &viewer, &all_var_ids)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to load beliefs: {e}"),
+            })?;
+    // The CDST engine's alternative-set classes, seeded from the run's
+    // variables. Not read for an explicit scalar or interval run. A failed
+    // read is an error: it used to read as "no classes" and silently changed
+    // how the run combined its messages.
+    let alt_set_rows = if matches!(mode, "scalar" | "interval") {
+        Vec::new()
+    } else {
+        epigraph_db::repos::factor::FactorRepository::bp_alternative_sets(
+            &mut read,
+            &viewer,
+            &all_var_ids,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to load alternative sets: {e}"),
+        })?
+    };
     crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
 
     if factors.is_empty() {
@@ -1040,23 +1226,6 @@ pub async fn propagate_beliefs(
             "updated_beliefs": [],
         })));
     }
-
-    // Collect all variable IDs and load their current beliefs
-    let all_var_ids: Vec<Uuid> = factors
-        .iter()
-        .flat_map(|f| f.variable_ids.iter().copied())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    let belief_rows: Vec<(Uuid, Option<f64>)> =
-        sqlx::query_as("SELECT id, pignistic_prob FROM claims WHERE id = ANY($1)")
-            .bind(&all_var_ids)
-            .fetch_all(&state.db_pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to load beliefs: {e}"),
-            })?;
 
     let initial_beliefs: HashMap<Uuid, f64> = belief_rows
         .into_iter()
@@ -1078,7 +1247,6 @@ pub async fn propagate_beliefs(
         factors.iter().map(|f| f.variable_ids.as_slice()).collect();
 
     // -- CDST branch: decide mode, load mass functions if needed ---------------
-    let mode = request.mode.as_deref().unwrap_or("auto");
 
     // Only load mass functions when CDST might be used (skip for explicit
     // scalar/interval). The seed rows are the ones `bp_seed_rows` admits
@@ -1173,16 +1341,18 @@ pub async fn propagate_beliefs(
             })
             .collect();
 
-        // Load the alternative-set equivalence class for every claim from the
-        // `alternative_set` view (migration 042). Empty on a fresh graph —
-        // BP must not fail in that case, so we tolerate query failures and
-        // proceed with an empty map (== legacy pure-Dempster behavior).
-        let alt_set_rows: Vec<(Uuid, Vec<Uuid>)> =
-            sqlx::query_as("SELECT claim_id, alt_members FROM alternative_set")
-                .fetch_all(&state.db_pool)
-                .await
-                .unwrap_or_default();
-
+        // The alternative-set classes couple their members in this run as a
+        // factor does (a message's source is grouped by its class), so apply's
+        // R-22 guard reads each class as one more coupling: a claim whose
+        // class reaches a less readable claim is not written from it.
+        let alt_couplings: Vec<Vec<Uuid>> = alt_set_rows
+            .iter()
+            .map(|(claim_id, members)| {
+                std::iter::once(*claim_id)
+                    .chain(members.iter().copied())
+                    .collect()
+            })
+            .collect();
         let mut alt_set_membership: epigraph_engine::cdst_bp::AltSetMembership = HashMap::new();
         for (claim_id, members) in alt_set_rows {
             alt_set_membership.insert(claim_id, members);
@@ -1197,7 +1367,7 @@ pub async fn propagate_beliefs(
         };
 
         let factors_count = engine_factors.len();
-        let result = run_bp_blocking(move || {
+        let result = run_bp_blocking(&permit, move || {
             epigraph_engine::cdst_bp::run_cdst_bp(
                 &engine_factors,
                 &initial,
@@ -1229,8 +1399,13 @@ pub async fn propagate_beliefs(
                     (*claim_id, *betp, Some((bel, pl)))
                 })
                 .collect();
+            let couplings: Vec<&[Uuid]> = factor_variables
+                .iter()
+                .copied()
+                .chain(alt_couplings.iter().map(Vec::as_slice))
+                .collect();
             (written, skipped, skipped_compounds, skipped_less_readable) =
-                apply_bp_updates(&state, &viewer, &updates, &factor_variables).await?;
+                apply_bp_updates(&state, &viewer, &updates, &couplings).await?;
         }
 
         return Ok(Json(serde_json::json!({
@@ -1256,7 +1431,7 @@ pub async fn propagate_beliefs(
 
     // -- Scalar BP fallback ---------------------------------------------------
     let factors_count = engine_factors.len();
-    let result = run_bp_blocking(move || {
+    let result = run_bp_blocking(&permit, move || {
         epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config)
     })
     .await?;
@@ -1478,18 +1653,6 @@ pub async fn belief_at_time(
 
 // ── Internal types ──
 
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct FactorRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    factor_type: String,
-    variable_ids: Vec<Uuid>,
-    potential: serde_json::Value,
-    #[allow(dead_code)]
-    description: Option<String>,
-}
-
 // `EvidenceAtRow` was deleted with the inline evidence read in
 // `belief_at_time`; its replacement is `epigraph_db::EvidenceAtTimeRow`, whose
 // query carries `/* {VISIBILITY:e} */` and `/* {VISIBILITY:ed} */`.
@@ -1643,5 +1806,63 @@ mod less_readable_tests {
             out.contains(&group_claim) && out.contains(&other_group_claim),
             "{out:?}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod bp_run_permit_tests {
+    use super::run_bp_blocking;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    /// Backlog b02347c6: a run's permit is held by the blocking task, not
+    /// only by the request. When the request future is dropped mid-run (a
+    /// client that disconnects), the thread keeps computing, so the permit
+    /// must stay taken until the thread ends; otherwise every disconnect
+    /// lets one more run onto the blocking pool than the limit allows.
+    #[tokio::test]
+    async fn a_dropped_request_keeps_its_permit_until_the_blocking_run_ends() {
+        let runs = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(runs.clone().try_acquire_owned().expect("one permit"));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // Poll the run until it is on the blocking pool, then drop the
+        // request future, as axum does when the client goes away.
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_bp_blocking(&permit, move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            }),
+        )
+        .await;
+        assert!(dropped.is_err(), "the run must still be in flight");
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("join")
+            .expect("the blocking run started");
+        // The handler's own share goes with its dropped future.
+        drop(permit);
+
+        assert_eq!(
+            runs.available_permits(),
+            0,
+            "the blocking run is still computing, so its permit must still be taken"
+        );
+        assert!(
+            runs.clone().try_acquire_owned().is_err(),
+            "a new run must be refused while the disconnected one computes"
+        );
+
+        release_tx.send(()).expect("release the run");
+        let freed = tokio::time::timeout(Duration::from_secs(10), async {
+            while runs.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(freed.is_ok(), "the permit must come back once the run ends");
     }
 }

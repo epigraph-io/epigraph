@@ -673,13 +673,29 @@ impl GroupMembershipRepository {
     /// `epigraph_maintenance`, `REVOKE`d from `PUBLIC` and granted only to
     /// `epigraph_app`. Inside its frame `current_user` is the owner, so
     /// `epigraph_definer_bypass()` is true and the policy's definer disjunct
-    /// admits the scan. Its exposure is identical to this function's own: it was
-    /// already callable with an arbitrary `agent_id` and already returned
-    /// exactly `(group_id, role)`.
+    /// admits the scan. Since migration 236 it answers only for the session
+    /// principal (see below).
     ///
     /// The index note above still holds — the function body carries the same
     /// predicate and projection, so `idx_group_memberships_agent_live` serves it
     /// index-only exactly as before.
+    ///
+    /// # The statement stamps `agent_id` as its own principal (migration 236)
+    ///
+    /// Since migration 236 the definer answers only for the session principal
+    /// (or a maintenance session): an application session no longer lists
+    /// another agent's memberships by naming its id (backlog fad5a6c4). This
+    /// read runs before any stamp exists, so the statement stamps `agent_id`
+    /// as `epigraph.principal_id` itself, transaction-locally
+    /// (`set_config(..., true)`), and passes the stamped value to the definer.
+    /// The definer's argument IS the `set_config` result, so the stamp is in
+    /// place before the call; and the statement is its own implicit
+    /// transaction on a pool connection, so the stamp ends with it. Against a
+    /// database below 236 the stamp changes nothing.
+    ///
+    /// The stamp is not an authority (any holder of the application DSN can
+    /// set it); what 236 removes is the ambient answer for an agent the
+    /// caller did not stamp. Callers pass the principal they are resolving.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -688,11 +704,15 @@ impl GroupMembershipRepository {
         pool: &PgPool,
         agent_id: Uuid,
     ) -> Result<Vec<(Uuid, String)>, DbError> {
-        let rows: Vec<(Uuid, String)> =
-            sqlx::query_as("SELECT group_id, role FROM public.epigraph_live_memberships($1)")
-                .bind(agent_id)
-                .fetch_all(pool)
-                .await?;
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT m.group_id, m.role \
+               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
+                            AS principal) s \
+              CROSS JOIN LATERAL public.epigraph_live_memberships(s.principal) m",
+        )
+        .bind(agent_id)
+        .fetch_all(pool)
+        .await?;
 
         Ok(rows)
     }
@@ -735,12 +755,17 @@ impl GroupMembershipRepository {
     }
 
     /// Whether `agent_id` holds a live `writer` or `admin` membership of
-    /// `group_id`, on `conn` (any stamp): the same live-membership definer
+    /// `group_id`, on `conn`: the same live-membership definer
     /// [`Self::list_live_for_agent`] (and so `Viewer::resolve`) reads, asked
     /// for one group: the CALLER's own write authority over the group a row
     /// lands in, checked live on the write's transaction (a step added to a
     /// group plan, an owner group chosen for a workflow write, the lineage
     /// gate's owner-group writer arm).
+    ///
+    /// `conn` must be stamped with `agent_id` as its principal (a transaction
+    /// stamped from `agent_id`'s own viewer, as every caller's is): since
+    /// migration 236 the definer answers only for the session principal, so
+    /// asked about any other agent this answers `false` (fail-closed).
     ///
     /// # Errors
     /// Returns `DbError` if the query fails.
@@ -775,6 +800,10 @@ impl GroupMembershipRepository {
     /// from `agent_id`'s viewer a group is counted only while it is both live
     /// now (the definer) and in the stamp (row security on `groups`): a
     /// membership revoked since the stamp, or granted after it, is not.
+    ///
+    /// As for [`Self::agent_writes_group_conn`], `conn` must be stamped with
+    /// `agent_id` as its principal (migration 236); for any other agent the
+    /// answer is empty.
     ///
     /// # Errors
     /// Returns `DbError` if the query fails.

@@ -110,8 +110,7 @@ async fn seed_evidence(pool: &PgPool, claim: Uuid, tag: &str) -> Uuid {
     .expect("seed evidence")
 }
 
-/// A `supports` edge plus the `perspectives` row its edge-keyed BBA names,
-/// as `ensure_edge_perspective` leaves them.
+/// A `supports` edge (its edge-keyed BBA sits on the edge's slot).
 async fn seed_supports_edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -124,12 +123,6 @@ async fn seed_supports_edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     .execute(pool)
     .await
     .expect("seed edge");
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
-        .bind(id)
-        .bind(format!("edge {id}"))
-        .execute(pool)
-        .await
-        .expect("seed edge perspective");
     id
 }
 
@@ -145,21 +138,42 @@ async fn store_bba(
     method: &str,
     evidence: Option<Uuid>,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        agent,
-        perspective,
-        &masses,
-        None,
-        Some(method),
-        None,
-        None,
-        "unknown",
-        evidence,
-    )
-    .await
+    match perspective {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                agent,
+                epigraph_db::BbaSlot::Edge(edge),
+                &masses,
+                None,
+                Some(method),
+                None,
+                None,
+                "unknown",
+                evidence,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                agent,
+                None,
+                &masses,
+                None,
+                Some(method),
+                None,
+                None,
+                "unknown",
+                evidence,
+            )
+            .await
+        }
+    }
     .expect("store bba")
 }
 
@@ -871,6 +885,227 @@ async fn the_act_allows_a_false_bound_duplicate_with_nothing_to_pool(pool: PgPoo
     })
     .await;
     act.expect("nothing to pool or move: FA07 does not apply");
+}
+
+/// A FALSE-bound duplicate owned by `w`'s group `g`, with `visibility`, no
+/// BBA and no edge: the shape FA07's allowed arm admits.
+async fn false_bound_duplicate(
+    pool: &PgPool,
+    w: Uuid,
+    g: Uuid,
+    visibility: &str,
+    frame: Uuid,
+) -> Uuid {
+    let dup = Uuid::new_v4();
+    let hash: Vec<u8> = dup.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, $5, $6)",
+    )
+    .bind(dup)
+    .bind(format!("a FALSE-bound duplicate {dup}"))
+    .bind(&hash)
+    .bind(w)
+    .bind(visibility)
+    .bind(g)
+    .execute(pool)
+    .await
+    .expect("seed the writer's duplicate");
+    FrameRepository::assign_claim(pool, dup, frame, Some(1))
+        .await
+        .expect("bind FALSE");
+    dup
+}
+
+/// An edge into `dup` written on the harness.
+async fn edge_into(
+    pool: &PgPool,
+    (source, source_type): (Uuid, &str),
+    dup: Uuid,
+    relationship: &str,
+    properties: serde_json::Value,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, $2, $3, 'claim', $4, $5) RETURNING id",
+    )
+    .bind(source)
+    .bind(source_type)
+    .bind(dup)
+    .bind(relationship)
+    .bind(properties)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("seed {relationship} edge: {e}"))
+}
+
+/// `w`'s dedup act of `dup` onto `canonical`, on its stamped application
+/// role session.
+async fn writer_act(
+    pool: &PgPool,
+    w: Uuid,
+    dup: Uuid,
+    canonical: Uuid,
+) -> Result<(), epigraph_db::DbError> {
+    let p = pool.clone();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, w).await;
+        let r = ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            ClaimId::from_uuid(dup),
+            ClaimId::from_uuid(canonical),
+        )
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// One FA07 class: `(label, visibility, source, relationship, properties)`.
+type StayCase = (
+    &'static str,
+    &'static str,
+    (Uuid, &'static str),
+    &'static str,
+    serde_json::Value,
+);
+
+/// FA07's edge arm predicts the repair's INCOMING re-point, so an edge that
+/// re-point leaves on the duplicate carries nothing to the canonical and must
+/// not refuse the act (backlog 89a1d071 part 2). Before the fix the arm was
+/// exact-case and counted every in-force incoming edge, so each of these alone
+/// refused FA07: an agent's `AUTHORED` / `asserts` and an act-marked edge
+/// (K1), a legacy upper-case `SUPERSEDES` (K2), the document ingest's
+/// assertion (`ingest_written`), a dedup identity edge from an earlier mark,
+/// and a non-public duplicate's frozen `executes`.
+///
+/// Each class runs alone on a fresh FALSE-bound duplicate with no BBA (checked,
+/// so the pooling arm cannot decide), onto a world canonical the writer cannot
+/// write. The control, a plain claim-sourced `supports` the re-point moves,
+/// still refuses.
+#[sqlx::test(migrations = "../../migrations")]
+async fn fa07_ignores_incoming_edges_the_repair_leaves_on_the_duplicate(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, g) = fixture::seed_agent_with_group(&pool, "dedup-writer").await;
+    let (other, _) = fixture::seed_agent_with_group(&pool, "another-agent").await;
+    let frame = seed_frame(&pool).await;
+    let z = fixture::seed_public_claim(&pool, author, "a third claim").await;
+    let act = serde_json::json!({
+        "tool": "supersede_claim",
+        epigraph_db::SUPERSEDE_ACT_PROPERTY: "supersede_claim",
+    });
+
+    let stays: Vec<StayCase> = vec![
+        (
+            "agent AUTHORED",
+            "public",
+            (other, "agent"),
+            "AUTHORED",
+            serde_json::json!({}),
+        ),
+        (
+            "agent asserts",
+            "public",
+            (other, "agent"),
+            "asserts",
+            serde_json::json!({}),
+        ),
+        (
+            "act-marked supports",
+            "public",
+            (z, "claim"),
+            "supports",
+            act.clone(),
+        ),
+        (
+            "upper-case SUPERSEDES",
+            "public",
+            (z, "claim"),
+            "SUPERSEDES",
+            serde_json::json!({}),
+        ),
+        (
+            "dedup identity edge",
+            "public",
+            (z, "claim"),
+            "same_as",
+            serde_json::json!({"dedup": {"tool": "mark_duplicate"}}),
+        ),
+        (
+            "non-public executes",
+            "group",
+            // Claim-sourced: the edges table accepts it, and the re-point's
+            // frozen test is on the relationship alone.
+            (z, "claim"),
+            "executes",
+            serde_json::json!({}),
+        ),
+    ];
+    for (label, visibility, source, relationship, properties) in stays {
+        let canonical = fixture::seed_public_claim(&pool, author, "world canonical").await;
+        let dup = false_bound_duplicate(&pool, w, g, visibility, frame).await;
+        edge_into(&pool, source, dup, relationship, properties).await;
+        assert_eq!(
+            bba_count(&pool, dup).await,
+            0,
+            "{label}: CALIBRATION, no BBA, so only the edge arm can decide"
+        );
+        writer_act(&pool, w, dup, canonical)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{label}: the repair leaves it, so FA07 must not refuse: {e:?}")
+            });
+    }
+
+    // The document ingest's own assertion, through its writer.
+    let canonical = fixture::seed_public_claim(&pool, author, "world canonical").await;
+    let dup = false_bound_duplicate(&pool, w, g, "public", frame).await;
+    let paper: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, $1) RETURNING id")
+            .bind(format!("10.9999/fa07-{}", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await
+            .expect("paper");
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        author,
+        paper,
+        "paper",
+        dup,
+        "claim",
+        "asserts",
+        None,
+    )
+    .await
+    .expect("the paper's ingest-written assertion");
+    drop(conn);
+    assert_eq!(bba_count(&pool, dup).await, 0, "ingest: CALIBRATION");
+    writer_act(&pool, w, dup, canonical)
+        .await
+        .unwrap_or_else(|e| panic!("ingest-written asserts: FA07 must not refuse: {e:?}"));
+
+    // The control: an edge the re-point moves still refuses.
+    let canonical = fixture::seed_public_claim(&pool, author, "world canonical").await;
+    let dup = false_bound_duplicate(&pool, w, g, "public", frame).await;
+    edge_into(&pool, (z, "claim"), dup, "supports", serde_json::json!({})).await;
+    assert_eq!(bba_count(&pool, dup).await, 0, "control: CALIBRATION");
+    let err = writer_act(&pool, w, dup, canonical)
+        .await
+        .expect_err("a moving edge would carry the binding: FA07 refuses");
+    assert!(format!("{err:?}").contains("FA07"), "{err:?}");
+}
+
+async fn bba_count(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("count")
 }
 
 /// The compound rule's calibration: a RETRACTED `decomposes_to` out-edge does

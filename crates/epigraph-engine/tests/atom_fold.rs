@@ -31,7 +31,7 @@ mod fixture;
 use std::collections::{BTreeSet, HashMap};
 
 use epigraph_db::repos::claim_role::leaf_closure_batch;
-use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, Viewer};
+use epigraph_db::{FrameRepository, MassFunctionRepository, Viewer};
 use epigraph_engine::atom_items::{
     atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode, AxiomRow, CompoundSourceEdges,
 };
@@ -126,6 +126,8 @@ async fn research_validity(pool: &PgPool) -> Uuid {
 struct Row {
     agent: Option<Uuid>,
     perspective: Option<Uuid>,
+    /// The slot the row is keyed on instead of a perspective (migration 267).
+    slot: Option<epigraph_db::BbaSlot>,
     method: Option<&'static str>,
     strength: Option<f64>,
     evidence_type: Option<&'static str>,
@@ -137,6 +139,7 @@ impl Row {
         Self {
             agent: Some(agent),
             perspective: None,
+            slot: None,
             method: None,
             strength: Some(1.0),
             evidence_type: None,
@@ -152,21 +155,42 @@ async fn store(
     row: Row,
     masses: serde_json::Value,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        row.agent,
-        row.perspective,
-        &masses,
-        None,
-        row.method,
-        row.strength,
-        row.evidence_type,
-        "unknown",
-        row.evidence,
-    )
-    .await
+    match row.slot {
+        Some(slot) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                row.agent,
+                slot,
+                &masses,
+                None,
+                row.method,
+                row.strength,
+                row.evidence_type,
+                "unknown",
+                row.evidence,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                row.agent,
+                row.perspective,
+                &masses,
+                None,
+                row.method,
+                row.strength,
+                row.evidence_type,
+                "unknown",
+                row.evidence,
+            )
+            .await
+        }
+    }
     .expect("store BBA")
 }
 
@@ -199,7 +223,7 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> 
     .expect("edge")
 }
 
-/// An edge-factor row on `target` for edge `edge_id`: perspective = edge id.
+/// An edge-factor row on `target` for edge `edge_id`: keyed on the edge's slot.
 async fn store_edge_factor(
     pool: &PgPool,
     edge_id: Uuid,
@@ -207,18 +231,13 @@ async fn store_edge_factor(
     writer: Uuid,
     masses: serde_json::Value,
 ) -> Uuid {
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge') ON CONFLICT DO NOTHING")
-        .bind(edge_id)
-        .execute(pool)
-        .await
-        .expect("edge perspective");
     let b = binary(pool).await;
     store(
         pool,
         target,
         b,
         Row {
-            perspective: Some(edge_id),
+            slot: Some(epigraph_db::BbaSlot::Edge(edge_id)),
             method: Some("edge_factor"),
             ..Row::plain(writer)
         },
@@ -232,8 +251,8 @@ async fn decompose(pool: &PgPool, parent: Uuid, child: Uuid) -> Uuid {
     edge(pool, parent, child, "decomposes_to").await
 }
 
-/// An evidence row on `holder` carrying `properties.doi`, plus the evidence
-/// perspective a citation of it uses.
+/// An evidence row on `holder` carrying `properties.doi`, plus the
+/// perspective an `attributed_v1` citation of it is keyed on.
 async fn doi_evidence(pool: &PgPool, holder: Uuid, doi: &str, cite_agent: Uuid) -> Uuid {
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO evidence (claim_id, evidence_type, content_hash, properties) \
@@ -245,9 +264,16 @@ async fn doi_evidence(pool: &PgPool, holder: Uuid, doi: &str, cite_agent: Uuid) 
     .fetch_one(pool)
     .await
     .expect("evidence");
-    PerspectiveRepository::ensure_evidence_perspective(pool, id, Some(cite_agent))
+    // The perspective an `attributed_v1` row citing it is keyed on (that row
+    // shape keeps `perspective_id` = the cited evidence; migration 267 moved
+    // only the edge, evidence and assessment slots). Untyped: a typed
+    // `evidence` row is refused (`perspectives_not_bba_slot`).
+    let _ = cite_agent;
+    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'attribution_source')")
+        .bind(id)
+        .execute(pool)
         .await
-        .expect("evidence perspective");
+        .expect("attribution perspective");
     id
 }
 
@@ -1651,9 +1677,9 @@ async fn an_unreadable_row_is_skipped_and_never_fails_the_batch(pool: PgPool) {
     );
 }
 
-// ── review: a row citing evidence through its perspective only ─────────────
+// ── review: a row citing evidence through its evidence slot only ───────────
 
-/// A row that cites its evidence only through an evidence perspective
+/// A row that cites its evidence only through its evidence slot
 /// (`evidence_id` NULL) keys on that evidence row even when the viewer cannot
 /// read it, as a row citing a hidden `evidence_id` does: two agents citing one
 /// evidence row are one item (.8) for every viewer, never one item per row
@@ -1680,7 +1706,7 @@ async fn two_rows_citing_one_evidence_perspective_are_one_item_for_every_viewer(
             atom,
             b,
             Row {
-                perspective: Some(ev),
+                slot: Some(epigraph_db::BbaSlot::Evidence(ev)),
                 ..Row::plain(a)
             },
             serde_json::json!({"0": 0.8, "0,1": 0.2}),

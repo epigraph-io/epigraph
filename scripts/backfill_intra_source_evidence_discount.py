@@ -44,9 +44,14 @@ Usage:
     python3 scripts/backfill_intra_source_evidence_discount.py --execute
 
     # Refresh the cached BetP on the affected claims (the
-    # `claims.{belief, plausibility, pignistic_prob, ...}` scalars):
-    DATABASE_URL=... epigraph-recompute-belief \\
-        --input /tmp/locality-backfill-affected-claims.txt
+    # `claims.{belief, plausibility, pignistic_prob, ...}` scalars). A writing
+    # run names its disk gate and checks its belief modes against the API's
+    # /health (EPIGRAPH_API_URL); see docs/deploy.md:
+    DATABASE_URL=... EPIGRAPH_API_URL=... epigraph-recompute-belief \\
+        --input /tmp/locality-backfill-affected-claims.txt \\
+        --disk-path <database data volume> \\
+        (--disk-check-cmd <backup check> | --no-backup-check) \\
+        [--snapshot <wave file>]
 
 By default `--scope 0.85` targets the largest tier (≈74 711 BBAs in prod
 as of 2026-05-27). Pass `--scope 1.0`, `--scope 0.75`, `--scope 0.5`,
@@ -411,7 +416,8 @@ def main() -> int:
         help=(
             "Where to write the list of affected claim_ids on --execute. "
             "Feed this file to `epigraph-recompute-belief --input <path>` "
-            "to refresh the cached BetP on the affected claims."
+            "(plus its disk-gate flags) to refresh the cached BetP on the "
+            "affected claims."
         ),
     )
     args = parser.parse_args()
@@ -452,7 +458,9 @@ def main() -> int:
     print()
     print("Next: refresh the cached BetP on the affected claims —")
     print(
-        f"    DATABASE_URL=... epigraph-recompute-belief --input {args.affected_claims_out}"
+        "    DATABASE_URL=... EPIGRAPH_API_URL=... epigraph-recompute-belief "
+        f"--input {args.affected_claims_out} --disk-path <database data volume> "
+        "(--disk-check-cmd <backup check> | --no-backup-check) [--snapshot <wave file>]"
     )
     print(
         "Until you run that, `claims.{belief, plausibility, pignistic_prob}` for "

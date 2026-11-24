@@ -9,6 +9,8 @@ import uuid
 import psycopg2
 import pytest
 
+from tests import db_roles
+
 TEST_DSN = os.environ.get(
     "THEME_TEST_DATABASE_URL",
     "postgres://epigraph:epigraph@localhost/epigraph_db_repo_test",
@@ -43,14 +45,34 @@ def db():
         if cur.fetchone()[0] < len(REQUIRED):
             conn.close()
             _unavailable("required tables missing — run `cargo sqlx migrate run` on the test DB")
-    # Clean slate for the clustering tables.
+    # Clean slate for the clustering tables. A bounded lock wait: the script
+    # runs on its own connection (script_db), and a lock it still holds must
+    # fail the test, not hang the job.
     with conn.cursor() as cur:
+        cur.execute("SET lock_timeout = '60s'")
         cur.execute("UPDATE claims SET theme_id = NULL WHERE theme_id IS NOT NULL")
         cur.execute("DELETE FROM claim_clusters")
         cur.execute("DELETE FROM cluster_centroids")
         cur.execute("DELETE FROM cluster_labels")
         cur.execute("DELETE FROM claim_themes")
     conn.commit()
+    yield conn
+    conn.rollback()
+    conn.close()
+
+
+def script_dsn():
+    """The DSN a theme script under test connects on: the maintenance login in
+    CI, never the fixture superuser there (tests/db_roles.py)."""
+    return db_roles.script_dsn(TEST_DSN)
+
+
+@pytest.fixture
+def script_db(db):
+    """The theme script's OWN connection, as the maintenance login (CI) it runs
+    as in production. Fixture rows must be committed for it to see them.
+    Depends on `db` so it is opened after and closed before the fixture's."""
+    conn = db_roles.connect_script(TEST_DSN)
     yield conn
     conn.rollback()
     conn.close()

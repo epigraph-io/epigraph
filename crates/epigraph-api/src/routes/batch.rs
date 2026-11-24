@@ -216,7 +216,12 @@ pub async fn batch_create_claims(
             }
             Err(e) => {
                 failed += 1;
-                let message = e.to_string();
+                // The CALLER's text, never `to_string()`: this slot is in a
+                // 200 body, so the server-side detail an `InternalError` /
+                // `DatabaseError` carries (a driver error, interpolated by
+                // `create_claim_core`) would bypass the 500-body redaction
+                // (backlog f9acb220). `into_response` logs that detail.
+                let message = e.caller_message();
                 let status = e.into_response().status().as_u16();
                 results.push(BatchClaimResult {
                     index,

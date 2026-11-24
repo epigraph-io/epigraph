@@ -62,7 +62,9 @@ struct Cli {
     #[arg(long, env = "EPIGRAPH_MCP_AGENT_KEY", hide_env_values = true)]
     agent_key: Option<String>,
 
-    /// OpenAI API key for embedding generation. If omitted, uses mock embeddings.
+    /// OpenAI API key for embedding generation. If omitted, embedding is
+    /// disabled: claims are stored without vectors, and semantic recall over
+    /// them is unavailable (no mock vectors are generated).
     #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true)]
     openai_api_key: Option<String>,
 
@@ -84,6 +86,17 @@ struct Cli {
     /// both processes with the new value.
     #[arg(long, env = "EPIGRAPH_JWT_SECRET", hide_env_values = true)]
     jwt_secret: Option<String>,
+
+    /// The kernel's token-verification keys as a JWK Set (the HTTP API's
+    /// `/.well-known/jwks.json`), for an API that signs EdDSA
+    /// (`EPIGRAPH_JWT_SIGNING_KEY`).
+    ///
+    /// Verify-only: this process can check an EdDSA token but holds nothing
+    /// that mints one. With `--jwt-secret` as well, HS256 tokens from the
+    /// shared secret are also accepted (the migration window); drop the
+    /// secret to close it. Either this or `--jwt-secret` enables Bearer auth.
+    #[arg(long, env = "EPIGRAPH_JWT_JWKS", hide_env_values = true)]
+    jwt_jwks: Option<String>,
 
     /// Acknowledge that HTTP transport exposes all MCP tools without authentication.
     ///
@@ -192,10 +205,12 @@ struct Cli {
     /// `EPIGRAPH_AGENT_SIGNING_KEY`, and excludes `--agent-key`. Stdio only:
     /// refused with `--listen`.
     ///
-    /// The SIGNING private key (64 hex chars) is read from
-    /// `EPIGRAPH_AGENT_SIGNING_KEY` in the environment ONLY, never from the
-    /// command line, where `ps` and `/proc/<pid>/cmdline` would show it (see
-    /// [`signing_key_from_env`]). Every signature this process makes is by it;
+    /// The SIGNING private key (64 hex chars) is read from the 0600 file
+    /// `EPIGRAPH_AGENT_SIGNING_KEY_FILE` names (preferred: the key stays out
+    /// of `/proc/<pid>/environ`), or from `EPIGRAPH_AGENT_SIGNING_KEY` in the
+    /// environment, never both and never from the command line, where `ps`
+    /// and `/proc/<pid>/cmdline` would show it (see [`signing_key_source`]).
+    /// Every signature this process makes is by it;
     /// its public half must be an ACTIVE `signing` key of the identity's agent
     /// in `agent_keys`, registered by the host before the container starts.
     #[arg(long, env = "EPIGRAPH_AGENT_IDENTITY_PUBKEY", hide_env_values = true)]
@@ -286,8 +301,9 @@ fn select_signer(
         (Some(identity), Some(signing)) => {
             if agent_key.is_some() {
                 return Err(
-                    "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY name the agent \
-                     and its signing key; they cannot be combined with --agent-key \
+                    "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY (or \
+                     EPIGRAPH_AGENT_SIGNING_KEY_FILE) name the agent and its signing key; they \
+                     cannot be combined with --agent-key \
                      (EPIGRAPH_MCP_AGENT_KEY). Set one identity source."
                         .to_string(),
                 );
@@ -298,11 +314,11 @@ fn select_signer(
             let signer =
                 AgentSigner::from_bytes(&signing).map_err(|e| format!("agent-signing-key: {e}"))?;
             if signer.public_key() == identity {
-                return Err(
-                    "EPIGRAPH_AGENT_SIGNING_KEY is the identity key's own private half; the \
-                     signing key must be a separate random key (the identity key signs nothing)"
-                        .to_string(),
-                );
+                return Err("the signing key (EPIGRAPH_AGENT_SIGNING_KEY or the file \
+                     EPIGRAPH_AGENT_SIGNING_KEY_FILE names) is the identity key's own private \
+                     half; the signing key must be a separate random key (the identity key signs \
+                     nothing)"
+                    .to_string());
             }
             return Ok(SelectedSigner {
                 signer,
@@ -313,8 +329,10 @@ fn select_signer(
         _ => {
             return Err(
                 "EPIGRAPH_AGENT_IDENTITY_PUBKEY and EPIGRAPH_AGENT_SIGNING_KEY must be set \
-                 together (the separate-signing-key mode); refusing to start with only one \
-                 rather than fall back to another identity"
+                 together (the separate-signing-key mode; the signing key comes from \
+                 EPIGRAPH_AGENT_SIGNING_KEY or from the file EPIGRAPH_AGENT_SIGNING_KEY_FILE \
+                 names, exactly one of them); refusing to start with only one half rather than \
+                 fall back to another identity"
                     .to_string(),
             );
         }
@@ -343,15 +361,17 @@ fn select_signer(
 const SIGNING_KEY_ENV: &str = "EPIGRAPH_AGENT_SIGNING_KEY";
 
 /// Read the separate-signing-key mode's signing PRIVATE key from
-/// [`SIGNING_KEY_ENV`], and only from there: it is deliberately not a clap
-/// argument, so it cannot be passed on the command line (visible in `ps` and
+/// [`SIGNING_KEY_ENV`] (the other source is [`SIGNING_KEY_FILE_ENV`], see
+/// [`signing_key_source`]). It is deliberately not a clap argument, so it
+/// cannot be passed on the command line (visible in `ps` and
 /// `/proc/<pid>/cmdline` to every process in the container). An empty value
 /// counts as unset, as clap treats the other env-backed arguments. The value
 /// is held in a [`Zeroizing`] string, wiped when dropped.
 ///
 /// The variable itself is left in place: removing it would not clear
 /// `/proc/<pid>/environ` (that shows the environment the process was started
-/// with) and would race the runtime's worker threads.
+/// with) and would race the runtime's worker threads. A deployment that must
+/// keep the key out of the environment uses the file instead.
 ///
 /// # Errors
 /// The variable is set but is not valid UTF-8 (refused rather than read as
@@ -371,6 +391,135 @@ fn signing_key_from_env(
     }
 }
 
+/// The environment variable naming a FILE that holds the signing PRIVATE key
+/// (backlog 8bd859e5, 8331811d): the alternative to [`SIGNING_KEY_ENV`] that
+/// keeps the key out of this process's environment. `/proc/<pid>/environ`
+/// shows the environment a process was started with for its whole life, to
+/// its own uid and to root; a path there shows only where the key is, and the
+/// file is readable by its owner alone.
+///
+/// The file holds the key as 64 hex characters (surrounding whitespace, such
+/// as a trailing newline, is ignored), the format `EPIGRAPH_API_SIGNING_KEY_FILE`
+/// uses for the API's key. It is read once at boot (see
+/// [`read_signing_key_file`]). Setting both this and [`SIGNING_KEY_ENV`] is
+/// refused: two sources of one key leave it unclear which one signs.
+const SIGNING_KEY_FILE_ENV: &str = "EPIGRAPH_AGENT_SIGNING_KEY_FILE";
+
+/// Read cap for the key file: 64 hex characters and a line ending, with room
+/// for surrounding whitespace. A larger file is refused, not truncated.
+const SIGNING_KEY_FILE_MAX_BYTES: usize = 1024;
+
+/// The separate-signing-key mode's signing PRIVATE key, from
+/// [`SIGNING_KEY_ENV`] (`env_value`) or from the file [`SIGNING_KEY_FILE_ENV`]
+/// names (`file`), never both. An empty file variable counts as unset, as an
+/// empty key variable does. `expected_uid` is the uid the file must belong to
+/// (this process's effective uid in `main`; a parameter so the owner check is
+/// testable without a second user).
+///
+/// # Errors
+/// Both sources are set; the key variable is not valid UTF-8; or the file is
+/// refused by [`read_signing_key_file`]. No message includes the key.
+fn signing_key_source(
+    env_value: Result<String, std::env::VarError>,
+    file: Option<&std::ffi::OsStr>,
+    expected_uid: u32,
+) -> Result<Option<Zeroizing<String>>, String> {
+    let from_env = signing_key_from_env(env_value)?;
+    match (from_env, file.filter(|path| !path.is_empty())) {
+        (Some(_), Some(_)) => Err(format!(
+            "{SIGNING_KEY_ENV} and {SIGNING_KEY_FILE_ENV} are both set; set exactly one source \
+             of the signing key (the file keeps it out of this process's environment)"
+        )),
+        (from_env, None) => Ok(from_env),
+        (None, Some(path)) => {
+            read_signing_key_file(std::path::Path::new(path), expected_uid).map(Some)
+        }
+    }
+}
+
+/// Read the signing key file once, into memory wiped on drop.
+///
+/// The file is opened without following a symlink (`O_NOFOLLOW`) and without
+/// blocking on a FIFO (`O_NONBLOCK`), and the checks run on the OPEN
+/// descriptor (`fstat`), so the file checked is the file read. Refused:
+///
+/// - anything but a regular file, or a path whose last component is a symlink;
+/// - a file owned by another uid than `expected_uid`;
+/// - any group or other permission bit (`mode & 0o077`; want 0600 or 0400);
+/// - more than [`SIGNING_KEY_FILE_MAX_BYTES`] bytes, or bytes that are not UTF-8.
+///
+/// The bytes are read straight into a fixed [`Zeroizing`] buffer (no growing
+/// buffer that would leave copies behind), and the returned string is
+/// allocated once at its final length. Its content is parsed by the caller
+/// (`select_signer`, via `parse_hex32`).
+///
+/// # Errors
+/// Each refusal above, and an open or read failure. Messages name the path,
+/// the owner and the mode, never the content.
+fn read_signing_key_file(
+    path: &std::path::Path,
+    expected_uid: u32,
+) -> Result<Zeroizing<String>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let shown = path.display();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                format!("{SIGNING_KEY_FILE_ENV} {shown} is a symlink; it is never followed")
+            } else {
+                format!("{SIGNING_KEY_FILE_ENV} {shown} cannot be opened: {e}")
+            }
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("{SIGNING_KEY_FILE_ENV} {shown} cannot be inspected: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "{SIGNING_KEY_FILE_ENV} {shown} is not a regular file"
+        ));
+    }
+    if meta.uid() != expected_uid {
+        return Err(format!(
+            "{SIGNING_KEY_FILE_ENV} {shown} is owned by uid {}, not by this process's uid \
+             {expected_uid}",
+            meta.uid()
+        ));
+    }
+    let perms = meta.mode() & 0o7777;
+    if perms & 0o077 != 0 {
+        return Err(format!(
+            "{SIGNING_KEY_FILE_ENV} {shown} has mode {perms:04o}; group and others must have no \
+             access (want 0600 or 0400)"
+        ));
+    }
+
+    let mut buf = Zeroizing::new([0u8; SIGNING_KEY_FILE_MAX_BYTES + 1]);
+    let mut len = 0;
+    loop {
+        let n = file
+            .read(&mut buf[len..])
+            .map_err(|e| format!("{SIGNING_KEY_FILE_ENV} {shown} cannot be read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+        if len > SIGNING_KEY_FILE_MAX_BYTES {
+            return Err(format!(
+                "{SIGNING_KEY_FILE_ENV} {shown} is larger than {SIGNING_KEY_FILE_MAX_BYTES} \
+                 bytes; it must hold only the 64 hex characters of the key"
+            ));
+        }
+    }
+    let text = std::str::from_utf8(&buf[..len])
+        .map_err(|_| format!("{SIGNING_KEY_FILE_ENV} {shown} is not valid UTF-8"))?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
 /// The separate-signing-key mode (rung 0) is stdio-only.
 ///
 /// An HTTP listener signs for EVERY caller. In this mode its key is an
@@ -383,7 +532,8 @@ fn signing_key_from_env(
 fn check_separate_key_transport(listen: Option<&str>, separate: bool) -> Result<(), String> {
     if separate && listen.is_some() {
         return Err(
-            "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY: the separate-signing-key \
+            "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY(_FILE): the \
+             separate-signing-key \
              mode is stdio-only, and is refused on an HTTP listener (--listen): a listener signs \
              for every caller, and its signatures would bind to this agent. Run the listener \
              with its own --agent-key identity."
@@ -417,7 +567,7 @@ fn parse_hex32(raw: &str, name: &str) -> Result<[u8; 32], String> {
             "invalid {name}: it contains a non-hex character; {EXPECTED}"
         ));
     }
-    if key_hex.len() % 2 != 0 {
+    if !key_hex.len().is_multiple_of(2) {
         return Err(format!(
             "invalid {name}: odd number of hex chars ({}); {EXPECTED}",
             key_hex.len()
@@ -456,12 +606,13 @@ fn parse_hex32(raw: &str, name: &str) -> Result<[u8; 32], String> {
 fn check_listen_auth_mode(
     listen: &str,
     jwt_secret: Option<&str>,
+    jwt_jwks: Option<&str>,
     allow_unauthenticated_http: bool,
 ) -> Result<(), String> {
-    match (jwt_secret, allow_unauthenticated_http) {
-        (Some(secret), false) => epigraph_auth::assert_production_secret(secret.as_bytes())
-            .map_err(|reason| format!("--jwt-secret rejected: {reason}")),
-        (None, true) => {
+    let bearer = jwt_secret.is_some() || jwt_jwks.is_some();
+    match (bearer, allow_unauthenticated_http) {
+        (true, false) => bearer_jwt_config(jwt_secret, jwt_jwks).map(|_| ()),
+        (false, true) => {
             if epigraph_mcp::is_unix_listener(listen) {
                 Ok(())
             } else {
@@ -475,15 +626,48 @@ fn check_listen_auth_mode(
                 ))
             }
         }
-        (Some(_), true) => {
-            Err("--jwt-secret and --allow-unauthenticated-http are mutually exclusive.".to_string())
-        }
-        (None, false) => Err(
-            "--listen requires either --jwt-secret <SECRET> (Bearer auth) or\n\
+        (true, true) => Err(
+            "--jwt-secret / --jwt-jwks and --allow-unauthenticated-http are mutually exclusive."
+                .to_string(),
+        ),
+        (false, false) => Err(
+            "--listen requires either --jwt-secret <SECRET> or --jwt-jwks <JWKS> (Bearer auth) or\n\
              --allow-unauthenticated-http (unix-socket listeners only, behind filesystem\n\
              permissions). See https://github.com/epigraph-io/epigraph/issues/122."
                 .to_string(),
         ),
+    }
+}
+
+/// The Bearer verifier for the HTTP transport. This process only VERIFIES
+/// kernel tokens (the HTTP API mints them):
+///
+/// * `--jwt-jwks`: verify-only by the API's Ed25519 public keys
+///   (`epigraph_auth::JwtConfig::verifier_from_jwks`), plus the HS256 accept
+///   window when `--jwt-secret` is also set;
+/// * `--jwt-secret` alone: HS256 with the shared secret, as before.
+///
+/// A set secret is held to the production bar either way.
+fn bearer_jwt_config(
+    jwt_secret: Option<&str>,
+    jwt_jwks: Option<&str>,
+) -> Result<epigraph_auth::JwtConfig, String> {
+    use epigraph_auth::JwtConfig;
+    if let Some(secret) = jwt_secret {
+        epigraph_auth::assert_production_secret(secret.as_bytes())
+            .map_err(|reason| format!("--jwt-secret rejected: {reason}"))?;
+    }
+    match (jwt_jwks, jwt_secret) {
+        (Some(jwks), secret) => {
+            let config = JwtConfig::verifier_from_jwks(jwks)
+                .map_err(|reason| format!("--jwt-jwks rejected: {reason}"))?;
+            Ok(match secret {
+                Some(secret) => config.with_hs256_accept(secret.as_bytes()),
+                None => config,
+            })
+        }
+        (None, Some(secret)) => Ok(JwtConfig::from_secret(secret.as_bytes())),
+        (None, None) => Err("no Bearer verifier: set --jwt-secret or --jwt-jwks".to_string()),
     }
 }
 
@@ -549,6 +733,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for problem in epigraph_engine::calibration::CalibrationConfig::startup_problems() {
         tracing::error!("calibration: {problem}");
     }
+    for warning in epigraph_engine::calibration::CalibrationConfig::startup_warnings() {
+        tracing::warn!("calibration: {warning}");
+    }
 
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN, and this binary is one on every transport (`--listen`
@@ -573,6 +760,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(reason) = check_listen_auth_mode(
             listen,
             cli.jwt_secret.as_deref(),
+            cli.jwt_jwks.as_deref(),
             cli.allow_unauthenticated_http,
         ) {
             eprintln!("ERROR: {reason}");
@@ -595,7 +783,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it runs here, before the DB connect, and only its side effects (printing a
     // generated key) stay below; that lets the gate read the rung off
     // `select_signer`'s own answer instead of re-deriving it.
-    let agent_signing_key = match signing_key_from_env(std::env::var(SIGNING_KEY_ENV)) {
+    let agent_signing_key = match signing_key_source(
+        std::env::var(SIGNING_KEY_ENV),
+        std::env::var_os(SIGNING_KEY_FILE_ENV).as_deref(),
+        rustix::process::geteuid().as_raw(),
+    ) {
         Ok(key) => key,
         Err(reason) => {
             eprintln!("ERROR: {reason}");
@@ -1097,14 +1289,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // See `epigraph_mcp::session_status`.
         let router = epigraph_mcp::session_status::nest_mcp_service(service);
 
-        let router = if let Some(secret) = cli.jwt_secret.as_deref() {
-            use epigraph_auth::JwtConfig;
+        let router = if cli.jwt_secret.is_some() || cli.jwt_jwks.is_some() {
             use epigraph_mcp::auth::{
                 bearer_auth_middleware, DbAccessTokenRevocation, McpAuthState,
             };
 
+            // Checked by `check_listen_auth_mode` before the DB connect; a
+            // refusal here is unreachable but must not fall through to an
+            // unauthenticated router.
+            let jwt_config =
+                match bearer_jwt_config(cli.jwt_secret.as_deref(), cli.jwt_jwks.as_deref()) {
+                    Ok(config) => config,
+                    Err(reason) => {
+                        eprintln!("ERROR: {reason}");
+                        std::process::exit(1);
+                    }
+                };
             let state = McpAuthState {
-                jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
+                jwt_config: Arc::new(jwt_config),
                 resource_metadata_url: cli.resource_metadata_url.clone(),
                 // The denylist `/oauth/revoke` writes on the HTTP API, read on
                 // this process's pool (migration 141).
@@ -1250,6 +1452,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
+mod cli_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// `--openai-api-key` / `OPENAI_API_KEY` help matches what the embedder
+    /// does without a key: embedding is DISABLED (`embed.rs::key_disabled`),
+    /// with no mock-vector fallback (backlog a13bef05).
+    #[test]
+    fn the_openai_key_help_says_omitting_it_disables_embedding() {
+        let cmd = Cli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "openai_api_key")
+            .expect("the --openai-api-key argument");
+        let help = format!(
+            "{} {}",
+            arg.get_help().map(ToString::to_string).unwrap_or_default(),
+            arg.get_long_help()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        );
+        assert!(!help.to_lowercase().contains("uses mock"), "{help}");
+        assert!(help.contains("embedding is disabled"), "{help}");
+    }
+}
+
+#[cfg(test)]
 mod listen_auth_gate_tests {
     use super::check_listen_auth_mode;
 
@@ -1266,7 +1495,7 @@ mod listen_auth_gate_tests {
     #[test]
     fn tcp_listener_with_no_credential_is_refused() {
         for listen in [TCP, "0.0.0.0:3100", "[::1]:3100", "localhost:3100"] {
-            let err = check_listen_auth_mode(listen, None, true)
+            let err = check_listen_auth_mode(listen, None, None, true)
                 .expect_err("unauthenticated TCP listener must be refused");
             assert!(
                 err.contains("unix-socket"),
@@ -1281,7 +1510,7 @@ mod listen_auth_gate_tests {
     /// socket deployment would break.
     #[test]
     fn unix_listener_with_no_credential_is_still_accepted() {
-        assert!(check_listen_auth_mode(UNIX, None, true).is_ok());
+        assert!(check_listen_auth_mode(UNIX, None, None, true).is_ok());
     }
 
     /// A TCP listener WITH a real Bearer secret is the supported production
@@ -1289,7 +1518,7 @@ mod listen_auth_gate_tests {
     /// credential, not on the transport being TCP.
     #[test]
     fn tcp_listener_with_a_real_jwt_secret_is_accepted() {
-        assert!(check_listen_auth_mode(TCP, Some(GOOD_SECRET), false).is_ok());
+        assert!(check_listen_auth_mode(TCP, Some(GOOD_SECRET), None, false).is_ok());
     }
 
     /// Pre-existing guards must survive the extraction: the committed dev
@@ -1301,21 +1530,22 @@ mod listen_auth_gate_tests {
         let dev = check_listen_auth_mode(
             TCP,
             Some("epigraph-dev-secret-change-in-production!!"),
+            None,
             false,
         )
         .expect_err("dev literal must be refused");
         assert!(dev.contains("--jwt-secret rejected"), "got: {dev}");
 
-        let short = check_listen_auth_mode(TCP, Some("too-short"), false)
+        let short = check_listen_auth_mode(TCP, Some("too-short"), None, false)
             .expect_err("a sub-32-byte secret must be refused");
         assert!(short.contains("--jwt-secret rejected"), "got: {short}");
 
-        let both = check_listen_auth_mode(TCP, Some(GOOD_SECRET), true)
+        let both = check_listen_auth_mode(TCP, Some(GOOD_SECRET), None, true)
             .expect_err("both modes at once must be refused");
         assert!(both.contains("mutually exclusive"), "got: {both}");
 
         // ...including on a unix listener, where the unauth path is otherwise legal.
-        assert!(check_listen_auth_mode(UNIX, Some(GOOD_SECRET), true).is_err());
+        assert!(check_listen_auth_mode(UNIX, Some(GOOD_SECRET), None, true).is_err());
     }
 
     /// `--listen` with neither mode selected is still refused on both transports
@@ -1323,10 +1553,75 @@ mod listen_auth_gate_tests {
     #[test]
     fn listen_with_no_mode_selected_is_refused() {
         for listen in [TCP, UNIX] {
-            let err = check_listen_auth_mode(listen, None, false)
+            let err = check_listen_auth_mode(listen, None, None, false)
                 .expect_err("--listen with no auth mode must be refused");
             assert!(err.contains("--jwt-secret"), "got: {err}");
         }
+    }
+
+    /// Backlog 7b834860: with the API signing EdDSA, this process verifies by
+    /// the API's PUBLIC keys and holds nothing that mints. A TCP listener with
+    /// only `--jwt-jwks` is accepted; its verifier admits the kernel's EdDSA
+    /// token, refuses an HS256 token until `--jwt-secret` opens the window,
+    /// and signs nothing either way. Mutations caught: the gate ignoring
+    /// `--jwt-jwks` (refused as "no mode"), and the window opened without a
+    /// secret.
+    #[test]
+    fn a_jwks_listener_verifies_by_public_key_and_mints_nothing() {
+        use super::bearer_jwt_config;
+        use epigraph_auth::{AccessTokenBinding, JwtConfig};
+        let mint = |cfg: &JwtConfig| {
+            cfg.issue_access_token(
+                uuid::Uuid::new_v4(),
+                vec!["claims:read".to_string()],
+                "agent",
+                None,
+                Some(uuid::Uuid::new_v4()),
+                chrono::Duration::minutes(5),
+                AccessTokenBinding::NONE,
+            )
+            .unwrap()
+            .0
+        };
+        let kernel = JwtConfig::from_ed25519_seed(&[0x2a; 32]);
+        let jwks = serde_json::to_string(&kernel.jwks()).unwrap();
+        let eddsa = mint(&kernel);
+        let hs256 = mint(&JwtConfig::from_secret(GOOD_SECRET.as_bytes()));
+
+        assert!(check_listen_auth_mode(TCP, None, Some(&jwks), false).is_ok());
+        let verifier = bearer_jwt_config(None, Some(&jwks)).unwrap();
+        assert_eq!(verifier.signing_algorithm(), None);
+        assert!(verifier.validate_token(&eddsa).is_ok());
+        assert!(verifier.validate_token(&hs256).is_err());
+
+        let window = bearer_jwt_config(Some(GOOD_SECRET), Some(&jwks)).unwrap();
+        assert_eq!(window.signing_algorithm(), None);
+        assert!(window.validate_token(&eddsa).is_ok());
+        assert!(window.validate_token(&hs256).is_ok());
+    }
+
+    /// A JWK Set that is not all Ed25519, a weak secret beside a good set, and
+    /// `--jwt-jwks` with the unauthenticated opt-out are all refused at boot.
+    #[test]
+    fn a_bad_jwks_or_a_weak_window_secret_is_refused() {
+        for bad in [
+            "",
+            "{}",
+            r#"{"keys":[]}"#,
+            r#"{"keys":[{"kty":"oct","k":"c2VjcmV0"}]}"#,
+        ] {
+            let err = check_listen_auth_mode(TCP, None, Some(bad), false)
+                .expect_err("a bad JWKS must be refused");
+            assert!(err.contains("--jwt-jwks rejected"), "{bad}: {err}");
+        }
+        let kernel = epigraph_auth::JwtConfig::from_ed25519_seed(&[0x2b; 32]);
+        let jwks = serde_json::to_string(&kernel.jwks()).unwrap();
+        let weak = check_listen_auth_mode(TCP, Some("too-short"), Some(&jwks), false)
+            .expect_err("a weak window secret must be refused");
+        assert!(weak.contains("--jwt-secret rejected"), "got: {weak}");
+        let both = check_listen_auth_mode(UNIX, None, Some(&jwks), true)
+            .expect_err("--jwt-jwks with the opt-out must be refused");
+        assert!(both.contains("mutually exclusive"), "got: {both}");
     }
 }
 
@@ -1373,8 +1668,8 @@ mod unauthenticated_writes_gate_tests {
 #[cfg(test)]
 mod signer_selection_tests {
     use super::{
-        check_separate_key_transport, select_signer, signing_key_from_env, SelectedSigner,
-        SeparateSigningKey,
+        check_separate_key_transport, read_signing_key_file, select_signer, signing_key_from_env,
+        signing_key_source, SelectedSigner, SeparateSigningKey,
     };
 
     const KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -1746,6 +2041,256 @@ mod signer_selection_tests {
                 .expect_err("a non-UTF-8 key is refused");
             assert!(err.contains("not valid UTF-8"), "{err}");
         }
+    }
+
+    /// A per-test private directory under the system temp dir, removed on drop.
+    struct KeyDir(std::path::PathBuf);
+
+    impl KeyDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "epigraph-mcp-signing-key-file-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir(&dir).expect("create the test dir");
+            Self(dir)
+        }
+
+        /// Write `content` to `name` and set its mode.
+        fn file(&self, name: &str, content: &[u8], mode: u32) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join(name);
+            std::fs::write(&path, content).expect("write the key file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod the key file");
+            path
+        }
+    }
+
+    impl Drop for KeyDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn my_uid() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
+    const FILE_SECRET: [u8; 32] = [0x5c; 32];
+
+    /// Backlog 8bd859e5 / 8331811d: the key file is a SOURCE of the signing
+    /// key, so a process can start with no key in its environment. A 0600 or
+    /// 0400 file owned by this uid, with a trailing newline, selects exactly
+    /// the signer the same key in the environment would.
+    #[test]
+    fn a_private_key_file_selects_the_signer() {
+        use epigraph_crypto::AgentSigner;
+        use std::env::VarError;
+
+        let dir = KeyDir::new("ok");
+        let identity = AgentSigner::from_bytes(&[0x5b; 32]).unwrap().public_key();
+        let identity_hex = hex::encode(identity);
+        let want = AgentSigner::from_bytes(&FILE_SECRET).unwrap().public_key();
+        for (name, mode) in [("rw", 0o600), ("ro", 0o400)] {
+            let content = format!("{}\n", hex::encode(FILE_SECRET));
+            let path = dir.file(name, content.as_bytes(), mode);
+            let key =
+                signing_key_source(Err(VarError::NotPresent), Some(path.as_os_str()), my_uid())
+                    .unwrap_or_else(|e| panic!("mode {mode:o}: {e}"))
+                    .expect("the file is a source");
+            let selected = select_signer(
+                None,
+                None,
+                None,
+                None,
+                SeparateSigningKey {
+                    identity_pubkey: Some(&identity_hex),
+                    signing_key: Some(key.as_str()),
+                },
+            )
+            .unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+            assert_eq!(selected.signer.public_key(), want, "mode {mode:o}");
+            assert_eq!(selected.identity_public_key, Some(identity));
+        }
+    }
+
+    /// Any group or other permission bit refuses the file, by mode, without
+    /// echoing the key.
+    #[test]
+    fn a_key_file_open_to_group_or_others_is_refused() {
+        let dir = KeyDir::new("mode");
+        let key_hex = hex::encode(FILE_SECRET);
+        for mode in [0o640, 0o620, 0o610, 0o604, 0o602, 0o601, 0o644, 0o660] {
+            let path = dir.file(&format!("m{mode:o}"), key_hex.as_bytes(), mode);
+            let err = read_signing_key_file(&path, my_uid())
+                .expect_err("a group/other bit must be refused");
+            assert!(
+                err.contains(&format!("mode {mode:04o}")) && err.contains("group and others"),
+                "mode {mode:o}: {err}"
+            );
+            assert!(
+                !err.contains(&key_hex[..16]),
+                "the key is never echoed: {err}"
+            );
+        }
+    }
+
+    /// A file owned by another uid is refused (the uid is a parameter so this
+    /// runs without a second user).
+    #[test]
+    fn a_key_file_owned_by_another_uid_is_refused() {
+        let dir = KeyDir::new("owner");
+        let path = dir.file("k", hex::encode(FILE_SECRET).as_bytes(), 0o600);
+        let other = my_uid().wrapping_add(1);
+        let err = read_signing_key_file(&path, other).expect_err("foreign owner");
+        assert!(
+            err.contains(&format!("not by this process's uid {other}")),
+            "{err}"
+        );
+        assert!(read_signing_key_file(&path, my_uid()).is_ok());
+    }
+
+    /// A symlink is never followed (even to a valid key file), and a
+    /// directory or a FIFO is not a key file. The FIFO has no writer: without
+    /// `O_NONBLOCK` the open would block forever instead of being refused.
+    #[test]
+    fn a_symlink_or_non_regular_key_file_is_refused() {
+        let dir = KeyDir::new("kind");
+        let target = dir.file("target", hex::encode(FILE_SECRET).as_bytes(), 0o600);
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = read_signing_key_file(&link, my_uid()).expect_err("symlink");
+        assert!(err.contains("symlink"), "{err}");
+
+        let sub = dir.0.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        let err = read_signing_key_file(&sub, my_uid()).expect_err("directory");
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let fifo = dir.0.join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        // On a worker thread with a deadline, so a lost `O_NONBLOCK` fails
+        // this test instead of hanging the run (the blocked thread is
+        // abandoned; the test binary still exits).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let uid = my_uid();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_signing_key_file(&fifo, uid));
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a writerless FIFO blocked: the key file must be opened O_NONBLOCK")
+            .expect_err("fifo");
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    /// A half pair names BOTH sources of the signing key: an operator who uses
+    /// the file and forgot the identity pubkey must not be told to set the key
+    /// variable (which would then be refused as a second source).
+    #[test]
+    fn a_half_pair_refusal_names_the_key_file_source() {
+        let identity_hex = "0c".repeat(32);
+        let signing_hex = "0d".repeat(32);
+        for pair in [
+            separate(Some(&identity_hex), None),
+            separate(None, Some(&signing_hex)),
+        ] {
+            let Err(err) = select_signer(None, None, None, None, pair) else {
+                panic!("a half pair must be refused");
+            };
+            assert!(
+                err.contains("EPIGRAPH_AGENT_IDENTITY_PUBKEY and EPIGRAPH_AGENT_SIGNING_KEY must be set together"),
+                "{err}"
+            );
+            assert!(err.contains("EPIGRAPH_AGENT_SIGNING_KEY_FILE"), "{err}");
+            assert!(!err.contains(&signing_hex[..16]), "{err}");
+        }
+    }
+
+    /// Too large, not UTF-8, or missing: each is a refusal, never "no key"
+    /// (which would fall through to another identity).
+    #[test]
+    fn an_oversized_non_utf8_or_missing_key_file_is_refused() {
+        use std::env::VarError;
+        let dir = KeyDir::new("content");
+        let key_hex = hex::encode(FILE_SECRET);
+
+        // At the cap: read whole.
+        let at_cap = format!("{key_hex}{}", " ".repeat(1024 - key_hex.len()));
+        let path = dir.file("at-cap", at_cap.as_bytes(), 0o600);
+        assert_eq!(
+            read_signing_key_file(&path, my_uid()).unwrap().trim(),
+            key_hex
+        );
+
+        let over = format!("{at_cap} ");
+        let path = dir.file("over", over.as_bytes(), 0o600);
+        let err = read_signing_key_file(&path, my_uid()).expect_err("oversized");
+        assert!(err.contains("larger than 1024 bytes"), "{err}");
+
+        let path = dir.file("binary", &[0x30, 0xff, 0x31], 0o600);
+        let err = read_signing_key_file(&path, my_uid()).expect_err("non-UTF-8");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+
+        let missing = dir.0.join("missing");
+        let err = signing_key_source(
+            Err(VarError::NotPresent),
+            Some(missing.as_os_str()),
+            my_uid(),
+        )
+        .expect_err("a missing file is an error, not an unset source");
+        assert!(err.contains("cannot be opened"), "{err}");
+    }
+
+    /// The two sources are exclusive: both set is refused (naming both, not
+    /// the key); an EMPTY variable on either side counts as unset.
+    #[test]
+    fn the_key_variable_and_the_key_file_are_exclusive() {
+        let dir = KeyDir::new("both");
+        let key_hex = hex::encode(FILE_SECRET);
+        let env_hex = "0d".repeat(32);
+        let path = dir.file("k", key_hex.as_bytes(), 0o600);
+
+        let err = signing_key_source(Ok(env_hex.clone()), Some(path.as_os_str()), my_uid())
+            .expect_err("both sources");
+        assert!(
+            err.contains(
+                "EPIGRAPH_AGENT_SIGNING_KEY and EPIGRAPH_AGENT_SIGNING_KEY_FILE are both set"
+            ),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&env_hex[..16]) && !err.contains(&key_hex[..16]),
+            "{err}"
+        );
+
+        let from_file = signing_key_source(Ok(String::new()), Some(path.as_os_str()), my_uid())
+            .unwrap()
+            .expect("an empty key variable leaves the file as the source");
+        assert_eq!(from_file.as_str(), key_hex);
+
+        let from_env = signing_key_source(
+            Ok(env_hex.clone()),
+            Some(std::ffi::OsStr::new("")),
+            my_uid(),
+        )
+        .unwrap()
+        .expect("an empty file variable leaves the env as the source");
+        assert_eq!(from_env.as_str(), env_hex);
+
+        assert!(
+            signing_key_source(Err(std::env::VarError::NotPresent), None, my_uid())
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The separate-signing-key mode is refused on every listener kind and

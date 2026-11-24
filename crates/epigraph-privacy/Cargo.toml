@@ -3,6 +3,7 @@ name = "epigraph-privacy"
 description = "Client-side content sealing for EpiGraph: entity-bound AAD, group roles, cross-group re-wrap"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

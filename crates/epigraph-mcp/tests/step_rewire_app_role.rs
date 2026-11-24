@@ -331,12 +331,6 @@ async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPoo
     .fetch_one(&pool)
     .await
     .expect("a -> b");
-    sqlx::query("INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, $2, 'edge')")
-        .bind(ab)
-        .bind(format!("w12b step edge {ab}"))
-        .execute(&pool)
-        .await
-        .expect("edge-factor perspective");
     let frame = epigraph_db::FrameRepository::create(
         &pool,
         "binary_truth",
@@ -347,12 +341,12 @@ async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPoo
     .expect("frame")
     .id;
     let mut conn = pool.acquire().await.expect("conn");
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_in_slot(
         &mut *conn,
         b,
         frame,
         None,
-        Some(ab),
+        epigraph_db::BbaSlot::Edge(ab),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("test"),

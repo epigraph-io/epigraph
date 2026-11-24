@@ -54,17 +54,30 @@ async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
     EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
-/// Record a licence on the paper row before ingest, the way an operator would.
+/// Record a licence on the paper row before ingest, the way an operator does:
+/// through the audited maintenance definer (migration 255), on a session that
+/// is the maintenance role. The application role cannot write the column.
 async fn set_licence(pool: &PgPool, doi: &str, title: &str, licence: &str) {
-    let paper_id = PaperRepository::get_or_create(pool, doi, Some(title), None)
-        .await
-        .expect("paper row");
-    sqlx::query("UPDATE papers SET licence = $2 WHERE id = $1")
-        .bind(paper_id)
-        .bind(licence)
-        .execute(pool)
-        .await
-        .expect("set licence");
+    let paper_id = PaperRepository::get_or_create(
+        pool,
+        doi,
+        Some(title),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("paper row");
+    let licence = licence.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT epigraph_set_paper_licence($1, $2, 'test fixture')")
+            .bind(paper_id)
+            .bind(&licence)
+            .execute(&mut *conn)
+            .await
+            .expect("set licence through the operator definer");
+        (conn, ())
+    })
+    .await;
 }
 
 /// Every evidence body this paper's ingest wrote, with its stored digest.
@@ -86,7 +99,10 @@ fn paragraph_hash() -> String {
 }
 
 /// The shape every body shares: digest = BLAKE3(body), and paragraph-backed
-/// rows (the paragraph and its atom) carry the locator and passage hash.
+/// rows (the paragraph and its atom) carry the locator and passage hash. The
+/// fixture is a Tier-2 extraction (no `source_text`), so the paragraph's
+/// extractor-supplied span was never checked against the source and the
+/// locator says so instead of printing `bytes 40..118` (backlog c083c1c9).
 fn assert_citation_locator_hash(rows: &[(String, Vec<u8>)], expect_rows_with_passage: usize) {
     for (body, hash) in rows {
         assert_eq!(
@@ -100,8 +116,9 @@ fn assert_citation_locator_hash(rows: &[(String, Vec<u8>)], expect_rows_with_pas
         .iter()
         .map(|(b, _)| b)
         .filter(|b| {
-            b.contains(r#"Locator: sections[0].paragraphs[0] ("Results"), bytes 40..118."#)
-                && b.contains(&format!("Passage BLAKE3: {}.", paragraph_hash()))
+            b.contains(
+                r#"Locator: sections[0].paragraphs[0] ("Results"), source_verifiable: false."#,
+            ) && b.contains(&format!("Passage BLAKE3: {}.", paragraph_hash()))
         })
         .collect();
     assert_eq!(
@@ -140,6 +157,18 @@ async fn document_ingest_drops_passage_when_licence_unknown(pool: PgPool) {
         );
     }
     assert_citation_locator_hash(&rows, 2);
+    // Backlog c083c1c9: the fixture carries no `source_text`, so no row's hash
+    // is checkable against the source. Every row says so, including the
+    // paragraph and atom whose extractor span nothing verified.
+    let flagged = rows
+        .iter()
+        .filter(|(b, _)| b.contains(", source_verifiable: false. Passage BLAKE3: "))
+        .count();
+    assert_eq!(flagged, 4, "every Tier-2 row is flagged: {rows:#?}");
+    assert!(
+        rows.iter().all(|(b, _)| !b.contains(", bytes ")),
+        "no unverified byte span is published: {rows:#?}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -254,9 +283,15 @@ async fn spine_ingest_retains_passage_under_open_licence(pool: PgPool) {
 /// Migration 226's CHECK refuses a licence that names nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn blank_licence_is_refused(pool: PgPool) {
-    let paper_id = PaperRepository::get_or_create(&pool, "10.9999/b60-blank", Some("Blank"), None)
-        .await
-        .expect("paper row");
+    let paper_id = PaperRepository::get_or_create(
+        &pool,
+        "10.9999/b60-blank",
+        Some("Blank"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("paper row");
     for bad in ["", " CC-BY-4.0"] {
         let err = sqlx::query("UPDATE papers SET licence = $2 WHERE id = $1")
             .bind(paper_id)

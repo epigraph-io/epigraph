@@ -341,7 +341,10 @@ pub async fn add_method(
         request.name.clone()
     };
 
-    let embedding = if let Some(embedder) = state.embedding_service() {
+    // Stored in `methods.embedding`, which method search ranks on: only the
+    // provider that owns the stored vector columns may fill it (backlog
+    // 21b7319a). Query embedding (`find_methods`) keeps `embedding_service`.
+    let embedding = if let Some(embedder) = state.storing_embedding_service() {
         embedder.generate(&embed_text).await.ok()
     } else {
         None
@@ -480,6 +483,20 @@ pub async fn method_gap_analysis(
             ),
         });
     }
+
+    // Both answers below name the hypothesis, so it is read through the
+    // caller's viewer first, as `design_experiment` reads it (backlog
+    // b6273fb9): a hypothesis the caller cannot read is the same 404 as a
+    // missing one. Read access only: an analysis writes nothing. After the
+    // input bound, which must precede every connection acquire.
+    crate::routes::experiment_loop::require_hypothesis(
+        &state,
+        &viewer,
+        params.hypothesis_id,
+        crate::routes::experiment_loop::HypothesisAccess::Read,
+        "analyse method gaps for this hypothesis",
+    )
+    .await?;
 
     if capabilities.is_empty() {
         return Ok(Json(serde_json::json!({

@@ -5,7 +5,8 @@
 //!
 //! - `identity`: the sources restate one of them, the caller-named survivor.
 //!   Each other source goes through the dedup act onto it, exactly as
-//!   `mark_duplicate` would, so it can be un-marked. No new claim.
+//!   `mark_duplicate` would, so it can be un-marked, and every act is in one
+//!   transaction: all the sources are marked or none is. No new claim.
 //! - `merge` (alias `rewrite`): a new merged claim; the sources are retired
 //!   into it and their edges move to it.
 //! - `abstract`: a new generalisation linked to each source by a
@@ -296,11 +297,12 @@ pub async fn consolidate_claims(
 /// survivor, and each can be un-marked (`unmark_duplicate`). No claim is
 /// written.
 ///
-/// All-or-nothing up to the first act: every source's state and the caller's
-/// authority over every pair are checked before any source is marked. A
-/// source that changes between that check and its own act (a concurrent
-/// writer) is refused by the act, and the sources marked before it stay
-/// marked; each can be un-marked.
+/// All or nothing (backlog 635dbfae): every source's state and the caller's
+/// authority over every pair are checked before any source is marked, and
+/// then every mark is one transaction
+/// ([`crate::tools::supersede::mark_duplicates_onto`]) that locks the sources
+/// and re-checks them. A source another writer changes after the checks
+/// refuses the whole call, and no source is left marked.
 async fn consolidate_identity(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -386,48 +388,17 @@ async fn consolidate_identity(
             }
         }
     }
-    for dup in &duplicates {
-        crate::tools::supersede::mark_duplicate_preflight(
-            server, viewer, auth, *dup, survivor, TOOL,
-        )
-        .await?;
-    }
-
-    let mut marked = Vec::with_capacity(duplicates.len());
-    let mut marked_ids: Vec<String> = Vec::with_capacity(duplicates.len());
-    for dup in duplicates {
-        let one = crate::tools::supersede::mark_duplicate_pair(
-            server,
-            viewer,
-            auth,
-            dup,
-            survivor,
-            Some(params.reason.as_str()),
-            TOOL,
-        )
-        .await;
-        match one {
-            Ok(v) => {
-                marked.push(v);
-                marked_ids.push(dup.to_string());
-            }
-            // A source changed after the checks above (a concurrent writer).
-            // The sources marked before it stay marked: say which, so the
-            // caller can un-mark them or finish the rest, rather than retry a
-            // call whose first sources now read as not current.
-            Err(mut e) if !marked_ids.is_empty() => {
-                e.message = format!(
-                    "{} (consolidate identity: these sources were already marked duplicates \
-                     of {survivor} before this one was refused, and stay marked: {})",
-                    e.message,
-                    marked_ids.join(", ")
-                )
-                .into();
-                return Err(e);
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    // Every pair's authority, then every mark in one transaction.
+    let marked = crate::tools::supersede::mark_duplicates_onto(
+        server,
+        viewer,
+        auth,
+        &duplicates,
+        survivor,
+        Some(params.reason.as_str()),
+        TOOL,
+    )
+    .await?;
 
     let response = IdentityResponse {
         mode: ConsolidateMode::Identity.as_str(),

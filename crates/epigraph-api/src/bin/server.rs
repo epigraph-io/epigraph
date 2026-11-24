@@ -121,6 +121,9 @@ async fn main() {
     for problem in epigraph_engine::calibration::CalibrationConfig::startup_problems() {
         tracing::error!("calibration: {problem}");
     }
+    for warning in epigraph_engine::calibration::CalibrationConfig::startup_warnings() {
+        tracing::warn!("calibration: {warning}");
+    }
 
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN. Checked before any other gate and before any connection,
@@ -136,22 +139,31 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Fail-closed JWT secret gate. Prod refuses to boot with an unset/dev
-    // secret; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. The dev
+    // Fail-closed JWT key gate (`epigraph_auth::check_kernel_jwt_keys`).
+    // Prod refuses to boot with neither EPIGRAPH_JWT_SIGNING_KEY (Ed25519,
+    // EdDSA tokens) nor a real EPIGRAPH_JWT_SECRET (HS256, or the accept-only
+    // window beside a signing key), and with an unset/dev secret when it is
+    // the only key; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. A
+    // malformed signing key refuses boot even under the opt-out. The dev
     // fallback in AppState::default_jwt_config is unchanged so the suite still
     // compiles and runs.
     let allow_insecure = std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
-    if !allow_insecure {
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET").unwrap_or_default();
-        if let Err(reason) = epigraph_auth::assert_production_secret(secret.as_bytes()) {
-            eprintln!(
-                "FATAL: {reason}. Set a real EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), \
-                 or set EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI."
-            );
-            std::process::exit(1);
-        }
+    if let Err(reason) = epigraph_auth::check_kernel_jwt_keys(
+        std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR)
+            .ok()
+            .as_deref(),
+        std::env::var("EPIGRAPH_JWT_SECRET").ok().as_deref(),
+        allow_insecure,
+    ) {
+        eprintln!(
+            "FATAL: {reason}. Set {} (64 hex characters, an Ed25519 seed) or a real \
+             EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), or set \
+             EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI.",
+            epigraph_auth::JWT_SIGNING_KEY_VAR
+        );
+        std::process::exit(1);
     }
 
     // Rate limiting (backlog 966164c8), read once. Until this block the
@@ -179,6 +191,26 @@ async fn main() {
         );
     }
     let rate_limiter = rate_limit.build();
+    // The per-address limiter (backlog 20210eaa), outside authentication and
+    // routing; opt-in through EPIGRAPH_RATE_LIMIT_ADDRESS_RPM, independent of
+    // the principal limiter, off under EPIGRAPH_RATE_LIMIT=off.
+    let address_rate_limiter = rate_limit.build_address();
+    match (&address_rate_limiter, rate_limit.per_address_rpm) {
+        (Some(_), Some(rpm)) => tracing::info!(
+            per_address_rpm = rpm,
+            trusted_proxies = %rate_limit.trusted_proxies,
+            "per-address rate limiter ON: every request but /health, 401s and \
+             unknown paths included, is charged to its client address before authentication"
+        ),
+        (None, Some(_)) => tracing::warn!(
+            "EPIGRAPH_RATE_LIMIT_ADDRESS_RPM is set but EPIGRAPH_RATE_LIMIT=off: the \
+             per-address rate limiter is OFF"
+        ),
+        _ => tracing::info!(
+            "per-address rate limiter OFF (EPIGRAPH_RATE_LIMIT_ADDRESS_RPM unset): 401s and \
+             unknown-path 404s are not rate limited by this process"
+        ),
+    }
 
     // Guest reads (backlog `1deb9dbf`), read here, next to the rate limit,
     // because they decide whether the guest routes get a limiter of their own
@@ -210,6 +242,21 @@ async fn main() {
         shutdown_grace_secs = serve.shutdown_grace.as_secs(),
         max_request_bytes = serve.max_request_bytes,
         "serving settings"
+    );
+    // The request pool's size and statement timeout (backlog b4c4337f), read
+    // here for the same reason: a malformed value refuses before any
+    // connection.
+    let request_pool = match epigraph_api::serving::RequestPoolSettings::from_env() {
+        Ok(settings) => settings,
+        Err(reason) => {
+            eprintln!("FATAL: the request pool is misconfigured: {reason}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        db_max_connections = request_pool.max_connections,
+        db_statement_timeout_ms = ?request_pool.statement_timeout.map(|t| t.as_millis()),
+        "request pool settings"
     );
     if serve.request_timeout.is_none() {
         tracing::warn!(
@@ -446,11 +493,13 @@ async fn main() {
         // `connect_recording_elevated_access`: this binary RECORDS every
         // elevated access (the router's per-access recorder layer, elevation
         // plan EL-8), so its pool declares the recorder, migration 125's second
-        // key. Sizing is `connect`'s (`ScopedPoolOptions::default()`).
+        // key. Sizing and statement timeout are EPIGRAPH_DB_MAX_CONNECTIONS
+        // and EPIGRAPH_DB_STATEMENT_TIMEOUT_MS (read at the top of `main`;
+        // unset, `ScopedPoolOptions::default()`'s ten and none).
         let scoped = epigraph_db::ScopedPool::connect_recording_elevated_access(
             &database_url,
             guc_mode,
-            epigraph_db::ScopedPoolOptions::default(),
+            request_pool.pool_options(),
         )
         .await
         .expect("Failed to connect to PostgreSQL");
@@ -635,8 +684,16 @@ async fn main() {
             epigraph_api::passkey_boot::running_stop(allows_software),
         );
         // The API's own edge signing key (ruling R-50): unset = unsigned edges,
-        // logged once; set but unusable = refuse to start.
+        // logged once; set but unusable = refuse to start. And while it
+        // serves: a key the verifier stops admitting (revoked, rotated out,
+        // window closed) stops the process, as it would refuse the boot.
         let edge_signer = epigraph_api::edge_signer::boot(scoped.inner()).await;
+        if let Some(signer) = &edge_signer {
+            epigraph_api::edge_signer::spawn_admission_watch(
+                scoped.inner().clone(),
+                std::sync::Arc::clone(signer),
+            );
+        }
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_embedding_provider(provider_kind)
@@ -644,7 +701,9 @@ async fn main() {
             .with_run_tokens(run_tokens_from_env())
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
             .with_token_exchange_audiences(token_exchange_audiences_from_env())
+            .with_oauth_redirect_origins(oauth_redirect_origins_from_env())
             .with_bp_apply(bp_apply_from_env())
+            .with_bp_max_concurrent(bp_max_concurrent_from_env())
             .with_guest_reads(guest_reads)
             .with_passkeys(passkeys)
             .with_edge_signer(edge_signer);
@@ -733,6 +792,11 @@ async fn main() {
     // And the guest reads' default limiter, when it applies (see above).
     let state = match guest_rate_limiter {
         Some(limiter) => state.with_guest_rate_limiter(limiter),
+        None => state,
+    };
+    // And the per-address limiter, when configured (see above).
+    let state = match address_rate_limiter {
+        Some(limiter) => state.with_address_rate_limiter(limiter),
         None => state,
     };
 
@@ -959,6 +1023,17 @@ async fn main() {
         // SIGTERM or SIGINT stops accepting and drains in-flight requests
         // for at most the shutdown grace, as on the plain listener below.
         let handle = axum_server::Handle::new();
+        // The bound address, logged with the plain listener's line: with
+        // EPIGRAPH_PORT=0 the kernel picks the port, and this line is how a
+        // caller (the TLS boot test, an operator) learns it.
+        {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                if let Some(bound) = handle.listening().await {
+                    tracing::info!("Server listening on {}", bound);
+                }
+            });
+        }
         {
             let handle = handle.clone();
             let grace = serve.shutdown_grace;
@@ -1016,7 +1091,7 @@ async fn main() {
 #[cfg(feature = "db")]
 fn bp_apply_from_env() -> epigraph_api::state::BpApply {
     use epigraph_api::state::BpApply;
-    let switch = epigraph_engine::belief_modes::current().bp_apply;
+    let switch = epigraph_engine::belief_modes::current().bp_apply();
     if switch == BpApply::On {
         tracing::warn!(
             "EPIGRAPH_BP_APPLY=on: POST /api/v1/bp/propagate may write BP results to atom \
@@ -1024,6 +1099,38 @@ fn bp_apply_from_env() -> epigraph_api::state::BpApply {
         );
     }
     switch
+}
+
+/// `EPIGRAPH_BP_MAX_CONCURRENT`, read once at boot: how many
+/// `POST /api/v1/bp/propagate` runs may be in flight at once
+/// (`AppState::bp_runs`, backlog b02347c6). Unset is the default; a value
+/// that is not a non-negative integer, or is above the runtime semaphore's
+/// maximum, is warned about and the default is used. `0` refuses every run.
+#[cfg(feature = "db")]
+fn bp_max_concurrent_from_env() -> usize {
+    use epigraph_api::state::{
+        parse_bp_max_concurrent, BP_MAX_CONCURRENT_DEFAULT, BP_MAX_CONCURRENT_ENV,
+    };
+    match std::env::var(BP_MAX_CONCURRENT_ENV) {
+        Err(_) => BP_MAX_CONCURRENT_DEFAULT,
+        Ok(raw) => match parse_bp_max_concurrent(&raw) {
+            Some(limit) => {
+                tracing::info!(
+                    limit,
+                    "EPIGRAPH_BP_MAX_CONCURRENT: concurrent BP runs capped"
+                );
+                limit
+            }
+            None => {
+                tracing::warn!(
+                    value = %raw,
+                    default = BP_MAX_CONCURRENT_DEFAULT,
+                    "EPIGRAPH_BP_MAX_CONCURRENT is not a non-negative integer the semaphore can hold; using the default"
+                );
+                BP_MAX_CONCURRENT_DEFAULT
+            }
+        },
+    }
 }
 
 /// `EPIGRAPH_GUEST_READS`, read once at boot: whether the anonymous guest
@@ -1072,6 +1179,24 @@ fn token_exchange_audiences_from_env() -> epigraph_api::oauth::token_exchange::T
         );
     }
     audiences
+}
+
+/// `EPIGRAPH_OAUTH_REDIRECT_ORIGINS`, read once at boot: the extra HTTPS
+/// origins `/oauth/register` accepts redirect URIs on. An entry that is not
+/// exactly an https origin REFUSES the boot, so a typo never silently changes
+/// the allowlist. Logged when set.
+#[cfg(feature = "db")]
+fn oauth_redirect_origins_from_env() -> epigraph_api::oauth::redirect::RedirectOrigins {
+    let origins = epigraph_api::oauth::redirect::RedirectOrigins::from_env()
+        .unwrap_or_else(|e| panic!("refusing to start: {e}"));
+    if !origins.to_strings().is_empty() {
+        tracing::warn!(
+            origins = ?origins.to_strings(),
+            "extra OAuth redirect origins configured: dynamic client registration accepts \
+             redirect URIs on these origins"
+        );
+    }
+    origins
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a

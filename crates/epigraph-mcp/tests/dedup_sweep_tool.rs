@@ -482,16 +482,15 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
     // MemTX I2 on the bulk path: no phantom and no invisible supporter.
     let orphaned: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions mf \
-         JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge' \
-         WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)",
+         WHERE mf.slot_kind = 'edge' \
+           AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.slot_id)",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
     let stranded: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions mf \
-         JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge' \
-         JOIN edges e ON e.id = mf.perspective_id \
+         JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
          WHERE e.target_type = 'claim' AND e.target_id <> mf.claim_id",
     )
     .fetch_one(&pool)

@@ -781,3 +781,69 @@ async fn coverage_counts_signed_and_unsigned_edges(pool: PgPool) {
     .unwrap();
     assert_eq!(row.0, digest.to_vec());
 }
+
+/// Backlog 57943a39: the signer's bare `agents.public_key` is admitted only
+/// when it is a signature verifier. A `seed-derived` key (migration 230) is
+/// the Ed25519 key of `BLAKE3(<public seed>)`, here an ingested author's name
+/// key, so anyone who knows the name can sign an edge under it; the verifier
+/// read `agents.public_key` with no `key_kind` filter and reported such an
+/// edge `signature_valid: true`, kind `unattested`.
+///
+/// The refused edge is still a real v1 attestation by a key of its signer
+/// (`pre_attestation: false`) and its digest is still compared. Paired: the
+/// same writer and edge shape with the key stored as `ed25519` verifies, so
+/// the refusal is a function of `key_kind`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_derived_signer_key_attests_no_edge(pool: PgPool) {
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let forged = epigraph_crypto::did_key::keypair_from_name("Ada Example");
+    let real = AgentSigner::from_bytes(&[0x7E; 32]).expect("signer");
+
+    let mut checks = Vec::new();
+    for (label, key, kind) in [
+        ("edge-seed-derived", &forged, "seed-derived"),
+        ("edge-ed25519", &real, "ed25519"),
+    ] {
+        let w = seed_signing_writer(&pool, label, key).await;
+        sqlx::query("UPDATE agents SET key_kind = $2 WHERE id = $1")
+            .bind(w)
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .expect("set key_kind");
+        let a = fixture::seed_public_claim(&pool, w, &format!("{label} A")).await;
+        let b = fixture::seed_public_claim(&pool, w, &format!("{label} B")).await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        let id = EdgeRepository::create(
+            &mut *conn, a, "claim", b, "claim", "supports", None, None, None,
+        )
+        .await
+        .expect("edge");
+        let out = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &bypass, id, key, w)
+            .await
+            .expect("sign");
+        assert!(matches!(out, EdgeSignOutcome::Signed { .. }), "{out:?}");
+        drop(conn);
+        checks.push((kind, verify(&pool, id).await));
+    }
+
+    let (_, seed) = &checks[0];
+    assert!(seed.signed, "{seed:?}");
+    assert_eq!(
+        (seed.signature_valid, seed.key_kind, seed.signature_scheme),
+        (false, None, None),
+        "a seed-derived signer key attested an edge: {seed:?}"
+    );
+    assert_eq!(
+        (seed.pre_attestation, seed.content_matches),
+        (false, Some(true)),
+        "a v1 signature by the signer's own (unadmitted) key is not pre-attestation: {seed:?}"
+    );
+
+    let (_, control) = &checks[1];
+    assert_eq!(
+        (control.signature_valid, control.key_kind),
+        (true, Some("unattested")),
+        "the ed25519 control must still verify through the bare key: {control:?}"
+    );
+}

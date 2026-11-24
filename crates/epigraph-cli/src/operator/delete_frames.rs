@@ -101,6 +101,35 @@ pub const CASCADE_TABLES: &[&str] = &[
     "ds_bayesian_divergence",
 ];
 
+/// The longest `--reason` migration 194's purge definer
+/// (`epigraph_purge_mass_functions`) accepts, in characters after `btrim`.
+pub const REASON_MAX_CHARS: usize = 2000;
+
+/// Refuse a `--reason` outside migration 194's purge bound before any
+/// database work: 1 to [`REASON_MAX_CHARS`] characters once leading and
+/// trailing SPACES are trimmed (the definer's `btrim(reason)`, which strips
+/// spaces only, and `length()`, which counts characters, not bytes).
+///
+/// Without this an over-long reason passes the dry run and fails only at the
+/// apply, when the purge definer refuses it (22023) and the transaction rolls
+/// back; and a blank reason is accepted whenever no retracted row is purged.
+///
+/// # Errors
+/// The trimmed reason is empty or longer than [`REASON_MAX_CHARS`] characters.
+pub fn validate_reason(reason: &str) -> anyhow::Result<()> {
+    let n = reason.trim_matches(' ').chars().count();
+    if n == 0 {
+        bail!("--reason must say why (it is recorded in the audit row); nothing was done");
+    }
+    if n > REASON_MAX_CHARS {
+        bail!(
+            "--reason is {n} characters; the purge definer (migration 194) accepts at most \
+             {REASON_MAX_CHARS}; nothing was done"
+        );
+    }
+    Ok(())
+}
+
 /// Everything `delete-frames` was told.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -339,7 +368,8 @@ fn print_plan(p: &Plan, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
 /// Plan, print, and under `--apply` delete.
 ///
 /// # Errors
-/// A statement fails; `--apply` without the exact `--confirm-delete`; or the
+/// A `--reason` outside [`validate_reason`]'s bound (before any statement); a
+/// statement fails; `--apply` without the exact `--confirm-delete`; or the
 /// plan changed under the write's locks, a delete removed a row count other
 /// than the plan's, or the census found a change outside the plan (each rolls
 /// the transaction back).
@@ -348,6 +378,7 @@ pub async fn run(
     opts: &Options,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<Report> {
+    validate_reason(&opts.reason)?;
     let p = plan(conn, &opts.frames, &opts.companions).await?;
     print_plan(&p, out)?;
     let mut report = Report {
@@ -455,10 +486,19 @@ async fn apply(conn: &mut PgConnection, opts: &Options, dry: &Plan) -> anyhow::R
     }
     // Migration 194 (H10): a retracted row is deleted only by the purge
     // definer, so the frames' cascade would be refused SR09 on one. Purge them
-    // first, with the run's reason; the definer writes one audit row and
-    // leaves no grant row. Their count is already in the planned
-    // `mass_functions` deletes.
+    // first, with the run's reason; the definer writes one audit row. Their
+    // count is already in the planned `mass_functions` deletes. Its grant
+    // rows: before 251 it inserts and deletes one per row; since 251 (the
+    // grant ledger, backlog 6bdac68f) it inserts one per row and the delete
+    // guard consumes it (an update), and the row stays.
     if !dry.purge.is_empty() {
+        let ledger: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure('public.epigraph_mf_guard_consume(text, uuid, jsonb)') \
+             IS NOT NULL",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .context("reading whether the retracted-BBA grant ledger exists")?;
         let purged: i32 = sqlx::query_scalar("SELECT public.epigraph_purge_mass_functions($1, $2)")
             .bind(&dry.purge)
             .bind(&opts.reason)
@@ -472,7 +512,12 @@ async fn apply(conn: &mut PgConnection, opts: &Options, dry: &Plan) -> anyhow::R
                  nothing was written"
             );
         }
-        expected.insert(PURGE_GRANT_TABLE.to_string(), (want, 0, want));
+        let grant_writes = if ledger {
+            (want, want, 0)
+        } else {
+            (want, 0, want)
+        };
+        expected.insert(PURGE_GRANT_TABLE.to_string(), grant_writes);
         expected.insert(PURGE_EVENT_TABLE.to_string(), (1, 0, 0));
     }
     let got = sqlx::query("DELETE FROM frames WHERE id = ANY($1)")
@@ -530,4 +575,26 @@ async fn apply(conn: &mut PgConnection, opts: &Options, dry: &Plan) -> anyhow::R
     .context("writing the audit row")?;
     tx.commit().await.context("committing")?;
     Ok(ids.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reason_bound_matches_the_purge_definers() {
+        // The definer: btrim (spaces only), then length() in characters.
+        assert!(validate_reason("x").is_ok());
+        assert!(validate_reason(&"a".repeat(REASON_MAX_CHARS)).is_ok());
+        // Characters, not bytes: 2000 two-byte characters are 4000 bytes.
+        assert!(validate_reason(&"\u{e9}".repeat(REASON_MAX_CHARS)).is_ok());
+        // Leading and trailing spaces do not count.
+        assert!(validate_reason(&format!("  {}  ", "a".repeat(REASON_MAX_CHARS))).is_ok());
+        assert!(validate_reason(&"a".repeat(REASON_MAX_CHARS + 1)).is_err());
+        assert!(validate_reason("").is_err());
+        assert!(validate_reason("   ").is_err());
+        // btrim strips spaces only: a tab survives it, so the definer accepts
+        // a reason of one tab, and so does this check.
+        assert!(validate_reason("\t").is_ok());
+    }
 }

@@ -102,3 +102,40 @@ fn keyed_derivation_changes_with_model_or_prompt_hash() {
     assert_ne!(base.public_key(), other_model.public_key());
     assert_ne!(base.public_key(), other_files.public_key());
 }
+
+/// Backlog 8bd859e5 (part 2, epigraph-crypto only): `keypair_from_llm_agent_keyed`
+/// holds the keyed hash (the identity private key) in a `Zeroizing` wrapper
+/// and wipes the keyed hasher (whose state carries the secret's key words).
+/// Both need blake3's `zeroize` feature on this crate: without it
+/// `blake3::Hash` and `blake3::Hasher` have no `Zeroize`, and this target does
+/// not compile.
+///
+/// What this test proves, and what it does not: it proves the feature is
+/// enabled and that blake3's `Zeroize` really clears the bytes (not a no-op
+/// impl). It does NOT observe the derivation's own memory; no safe test can,
+/// and `keypair_from_llm_agent_keyed`'s wipe is best-effort (blake3's
+/// internal temporaries and compiler stack copies are out of reach). The
+/// derivation's output is pinned unchanged by the literal-vector tests above.
+#[test]
+fn blake3_zeroize_is_enabled_and_clears_the_hash_and_hasher() {
+    use zeroize::Zeroize;
+
+    let mut hash = blake3::keyed_hash(&SECRET_A, b"llm-agent:test-model-7:x");
+    assert_ne!(hash.as_bytes(), &[0u8; 32]);
+    hash.zeroize();
+    assert_eq!(
+        hash.as_bytes(),
+        &[0u8; 32],
+        "a zeroized Hash holds no secret bytes"
+    );
+
+    let mut hasher = blake3::Hasher::new_keyed(&SECRET_A);
+    hasher.update(b"llm-agent:test-model-7:x");
+    let before = hasher.finalize();
+    hasher.zeroize();
+    assert_ne!(
+        hasher.finalize(),
+        before,
+        "a zeroized keyed Hasher no longer carries the secret's key words"
+    );
+}
