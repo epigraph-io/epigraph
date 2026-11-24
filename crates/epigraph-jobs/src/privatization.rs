@@ -1151,6 +1151,212 @@ fn processing_failed<E: std::fmt::Display>(e: E) -> JobError {
 }
 
 // =============================================================================
+// THE LIFECYCLE WRITES AN ABORT AND A DISPATCH MAKE (shared, backlog bb682f72)
+// =============================================================================
+//
+// `routes/privatization.rs` (`POST …/abort`, `…/apply`, `…/revert`) and
+// `epigraph-operator privatization abort|revert` make the same database writes
+// for the same transition, so they live here, next to [`check`], whose sixth
+// condition reads what [`dispatch_conn`] writes. Each runs on the CALLER's
+// maintenance transaction and commits nothing: the route adds its
+// `platform.custodial_act` row and commits; the operator verb adds its own and
+// commits only under `--apply`. Authorization is the caller's (§6.6 in the
+// route; a live custodian assignment, checked by the act recorder, in the
+// verb). Under operator decision D9 no request-serving process holds a
+// maintenance pool, so on a stock deployment the operator verb is the only
+// surface that reaches these.
+
+/// Which job a dispatch enqueues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchKind {
+    /// [`APPLY_JOB_TYPE`].
+    Apply,
+    /// [`REVERT_JOB_TYPE`].
+    Revert,
+}
+
+/// A fault in [`dispatch_conn`].
+#[derive(Debug, thiserror::Error)]
+pub enum LifecycleError {
+    /// A statement failed; the caller's transaction must be rolled back.
+    #[error(transparent)]
+    Db(#[from] epigraph_db::DbError),
+    /// The job payload did not serialize.
+    #[error("encode the privatization job: {0}")]
+    Encode(#[from] serde_json::Error),
+}
+
+/// What [`dispatch_conn`] committed to the caller's transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dispatched {
+    /// The `jobs` row the drain will run.
+    pub job_id: Uuid,
+    /// The token the `security_events` row, the audit row and the job share.
+    pub correlation_id: String,
+}
+
+/// A fresh correlation id: 32 hex characters, inside `varchar(64)`, legal in
+/// `security_events`, `privatization_audit` and a JSON string alike.
+#[must_use]
+pub fn new_correlation_id() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+/// Stop a running plan: the CONDITIONAL flip to `failed` from `applying`,
+/// `reverting` or `failed`, and its `plan.abort` audit row, on the caller's
+/// transaction. Returns `false` (and writes nothing) when the plan was in
+/// none of those states when the flip ran: the job handler's terminal write
+/// committed first, and an unconditional `failed` would stamp itself over an
+/// `applied` every item agrees with. `failed` is a source state so a double
+/// abort stays idempotent rather than becoming a conflict.
+///
+/// §6.5.5: the applied prefix stays applied; the undo is a separate revert.
+/// The running handler re-reads the plan at every batch boundary behind the
+/// global advisory lock, so a run in flight stops at its next batch.
+///
+/// # Errors
+/// [`epigraph_db::DbError`] for a statement fault.
+pub async fn abort_plan_conn(
+    tx: &mut sqlx::PgConnection,
+    plan: &PlanRow,
+    actor: Uuid,
+) -> Result<bool, epigraph_db::DbError> {
+    let moved = PrivatizationRepository::transition_plan_conn(
+        tx,
+        plan.id,
+        PlanTransition::Finish {
+            state: "failed",
+            from_states: &[
+                "applying".to_string(),
+                "reverting".to_string(),
+                "failed".to_string(),
+            ],
+        },
+    )
+    .await?;
+    if moved == 0 {
+        return Ok(false);
+    }
+    PrivatizationRepository::record_plan_audit_conn(
+        tx,
+        PlanAuditEntry {
+            plan_id: plan.id,
+            actor_agent_id: actor,
+            action: "plan.abort",
+            kind: None,
+            entity_id: None,
+            plan_digest: plan.plan_digest.as_deref(),
+            correlation_id: None,
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Dispatch a plan: the `security_events` row condition 6 of [`check`] looks
+/// for ([`DISPATCH_EVENT_TYPE`], attributed to `actor`, the plan id under
+/// [`DISPATCH_SUBJECT_KEY`]), the CONDITIONAL flip to `to_state` from one of
+/// `from_states`, the `plan.dispatch` audit row and the one-attempt `jobs`
+/// row, in that order, on the caller's transaction. Returns `None` when the
+/// flip moved nothing (the plan moved underneath the caller); the caller must
+/// then roll back, or the event row commits without a dispatch.
+///
+/// The event row's `details` carry the plan id and target state, never item
+/// ids or content: `security_events` is read by a principal-keyed policy, not
+/// a group-admin one.
+///
+/// # Errors
+/// [`LifecycleError`]; the caller's transaction must be rolled back.
+pub async fn dispatch_conn(
+    tx: &mut sqlx::PgConnection,
+    plan: &PlanRow,
+    actor: Uuid,
+    kind: DispatchKind,
+    to_state: &str,
+    from_states: &[String],
+) -> Result<Option<Dispatched>, LifecycleError> {
+    use epigraph_db::repos::security_event::SecurityEventRow;
+
+    let correlation_id = new_correlation_id();
+    let job = match kind {
+        DispatchKind::Apply => EpiGraphJob::PrivatizationApply {
+            plan_id: plan.id,
+            dispatched_by: actor,
+            correlation_id: correlation_id.clone(),
+        },
+        DispatchKind::Revert => EpiGraphJob::PrivatizationRevert {
+            plan_id: plan.id,
+            dispatched_by: actor,
+            correlation_id: correlation_id.clone(),
+        },
+    };
+    let job_type = job.job_type().to_string();
+    let payload = serde_json::to_value(&job)?;
+
+    SecurityEventRepository::log_conn(
+        tx,
+        &SecurityEventRow {
+            id: Uuid::new_v4(),
+            event_type: DISPATCH_EVENT_TYPE.to_string(),
+            agent_id: Some(actor),
+            success: Some(true),
+            details: serde_json::json!({
+                DISPATCH_SUBJECT_KEY: plan.id,
+                "target_group_id": plan.target_group_id,
+                "to_state": to_state,
+                "item_count": plan.item_count,
+            }),
+            ip_address: None,
+            user_agent: None,
+            correlation_id: Some(correlation_id.clone()),
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await?;
+
+    let moved = PrivatizationRepository::transition_plan_conn(
+        tx,
+        plan.id,
+        PlanTransition::Dispatch {
+            dispatched_by: actor,
+            to_state,
+            from_states,
+        },
+    )
+    .await?;
+    if moved == 0 {
+        return Ok(None);
+    }
+
+    PrivatizationRepository::record_plan_audit_conn(
+        tx,
+        PlanAuditEntry {
+            plan_id: plan.id,
+            actor_agent_id: actor,
+            action: "plan.dispatch",
+            kind: None,
+            entity_id: None,
+            plan_digest: plan.plan_digest.as_deref(),
+            correlation_id: Some(&correlation_id),
+        },
+    )
+    .await?;
+
+    let job_id = PrivatizationRepository::enqueue_job_conn(
+        tx,
+        &job_type,
+        &payload,
+        epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
+    )
+    .await?;
+
+    Ok(Some(Dispatched {
+        job_id,
+        correlation_id,
+    }))
+}
+
+// =============================================================================
 // RESEAL (§6.7 point 3)
 // =============================================================================
 
