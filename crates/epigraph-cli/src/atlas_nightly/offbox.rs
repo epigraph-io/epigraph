@@ -23,7 +23,10 @@
 //!   group is killed;
 //! * the export directory is created owner-only inside the configured work
 //!   directory (which must itself be owner-only) and DELETED once the command
-//!   returns, whatever it returned;
+//!   returns, whatever it returned (for a theme split, also when the script
+//!   itself is killed at its backstop); an export a killed NIGHT left behind
+//!   (systemd's timeout, the OOM killer) is deleted at the next call. The
+//!   run directories and their manifests are kept: `reverse` needs them;
 //! * nothing is exported or run without `--apply`.
 //!
 //! Every result is checked on the box as an operator's result is: W4's
@@ -109,9 +112,48 @@ pub fn check_work_dir(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A new owner-only directory for one call under `work_dir`.
+/// Delete `path` (an export) if it is there, never following a symlink.
+fn remove_export(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => Err(e),
+    }
+    .with_context(|| format!("delete the export {}", path.display()))
+}
+
+/// Delete the `export` of every earlier call's directory under `work_dir`
+/// (`theme-cap-*` and `atlas-meaning-*` only, never through a symlink): a
+/// night killed mid-call leaves its embeddings there. Everything else (the
+/// results and the manifests `reverse` needs) stays. One night runs at a
+/// time (the nightly lock), so no other call's export is live.
+fn sweep_stale_exports(work_dir: &Path) -> anyhow::Result<()> {
+    let prefixes = [
+        format!("{KIND_THEME_CAP}-"),
+        format!("{KIND_ATLAS_MEANING}-"),
+    ];
+    for entry in std::fs::read_dir(work_dir)
+        .with_context(|| format!("list the off-box work directory {}", work_dir.display()))?
+    {
+        let entry = entry?;
+        let ours = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| prefixes.iter().any(|p| n.starts_with(p.as_str())));
+        // `file_type` does not follow a symlink.
+        if ours && entry.file_type()?.is_dir() {
+            remove_export(&entry.path().join("export"))?;
+        }
+    }
+    Ok(())
+}
+
+/// A new owner-only directory for one call under `work_dir`, after deleting
+/// any export an earlier, killed call left there.
 fn run_dir(work_dir: &Path, kind: &str) -> anyhow::Result<PathBuf> {
     check_work_dir(work_dir)?;
+    sweep_stale_exports(work_dir)?;
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let dir = work_dir.join(format!("{kind}-{stamp}-{}", Uuid::new_v4().simple()));
     std::fs::DirBuilder::new()
@@ -238,10 +280,7 @@ impl OffBox {
         }
         .await;
         // The embeddings never outlive the call, whatever it returned.
-        if export.exists() {
-            std::fs::remove_dir_all(&export)
-                .with_context(|| format!("delete the export {}", export.display()))?;
-        }
+        remove_export(&export)?;
         called?;
         let doc = read_result(&result)?;
         ensure!(
@@ -306,8 +345,11 @@ impl OffBox {
             self.timeout.saturating_mul(2),
             true,
         )
-        .await?;
-        serde_json::from_slice(&out).context("the theme split's report is not JSON")
+        .await;
+        // The script deletes its export itself, unless it was killed at the
+        // backstop above (its `finally` never ran): then it is deleted here.
+        remove_export(&dir.join("export"))?;
+        serde_json::from_slice(&out?).context("the theme split's report is not JSON")
     }
 }
 
@@ -336,6 +378,101 @@ mod tests {
         let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         std::fs::remove_file(&link).ok();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// An export a killed call left behind (embeddings) is deleted at the
+    /// next call; the earlier calls' results and manifests, and anything
+    /// not a call's directory, are kept, and a symlinked export is removed
+    /// without following it.
+    #[test]
+    fn the_next_call_deletes_the_exports_a_killed_call_left() {
+        use std::os::unix::fs::symlink;
+        let d = scratch();
+        std::fs::DirBuilder::new().mode(0o700).create(&d).unwrap();
+        let outside = scratch();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+        for kind in [KIND_THEME_CAP, KIND_ATLAS_MEANING] {
+            let old = d.join(format!("{kind}-20260101T000000Z-old"));
+            std::fs::create_dir_all(old.join("export")).unwrap();
+            std::fs::write(old.join("export").join("t.f32"), b"emb").unwrap();
+            std::fs::write(old.join("manifest.json"), b"{}").unwrap();
+        }
+        let linked = d.join(format!("{KIND_THEME_CAP}-20260101T000000Z-link"));
+        std::fs::create_dir(&linked).unwrap();
+        symlink(&outside, linked.join("export")).unwrap();
+        let other = d.join("operator-notes");
+        std::fs::create_dir_all(other.join("export")).unwrap();
+
+        run_dir(&d, KIND_ATLAS_MEANING).unwrap();
+
+        for kind in [KIND_THEME_CAP, KIND_ATLAS_MEANING] {
+            let old = d.join(format!("{kind}-20260101T000000Z-old"));
+            assert!(
+                !old.join("export").exists(),
+                "{kind}: the stale export survived"
+            );
+            assert!(
+                old.join("manifest.json").exists(),
+                "{kind}: a manifest was deleted"
+            );
+        }
+        assert!(std::fs::symlink_metadata(linked.join("export")).is_err());
+        assert!(
+            outside.join("keep").exists(),
+            "the sweep followed a symlink"
+        );
+        assert!(
+            other.join("export").exists(),
+            "the sweep touched a directory not a call's"
+        );
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// The theme split's script killed at the backstop (its own cleanup never
+    /// runs) leaves no export behind.
+    #[tokio::test]
+    async fn a_split_killed_at_the_backstop_leaves_no_export() {
+        let d = scratch();
+        std::fs::DirBuilder::new().mode(0o700).create(&d).unwrap();
+        // argv: SCRIPT offbox --command C --work-dir DIR ...: $6 is DIR.
+        let python = d.join("python.sh");
+        std::fs::write(
+            &python,
+            "#!/bin/sh
+mkdir \"$6/export\" && echo emb > \"$6/export/t.npz\"
+exec sleep 30
+",
+        )
+        .unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let off = OffBox {
+            command: PathBuf::from("/bin/true"),
+            work_dir: d.clone(),
+            timeout: Duration::from_millis(400),
+            theme_cap_split: Some(ThemeCapSplit {
+                python,
+                script: PathBuf::from("theme_cap_split.py"),
+            }),
+        };
+        let err = off
+            .split_themes(&[Uuid::new_v4()], 10)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not finish"), "{err}");
+        let runs: Vec<PathBuf> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            !runs[0].join("export").exists(),
+            "the export outlived the killed split"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 

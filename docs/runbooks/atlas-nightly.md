@@ -81,7 +81,9 @@ What the box keeps:
   attachment integers; no text, no agent or evidence id, no tenancy) is
   written owner-only under `--offbox-dir`, which must exist and be
   owner-only (`chmod 700`), and is DELETED as soon as the command returns,
-  whatever it returned.
+  whatever it returned. An export a killed night left behind (the service's
+  timeout, the OOM killer) is deleted at the next call; the call
+  directories, results and manifests stay.
 - The command runs in its own process group with no stdin and its stdout
   discarded; its stderr goes to the journal. At `--offbox-timeout-secs` the
   group is killed and the call counts as failed.
