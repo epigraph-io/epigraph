@@ -2431,3 +2431,141 @@ async fn a_seal_clears_the_centroid_of_a_theme_it_leaves_with_no_embedded_member
         "a centroid that was the sealed vector must not survive the seal"
     );
 }
+
+// =========================================================================
+// The theme channel at 3072 dimensions (backlog 288801f8)
+// =========================================================================
+
+/// Gives `claim` a phase-`phase` `embedding_3072`.
+async fn give_3072(pool: &PgPool, claim: Uuid, phase: usize) {
+    sqlx::query("UPDATE claims SET embedding_3072 = $2::vector WHERE id = $1")
+        .bind(claim)
+        .bind(alternating_literal(3072, phase))
+        .execute(pool)
+        .await
+        .expect("give the claim a 3072-d embedding");
+}
+
+/// Seeds `centroid_3072` the way `scripts/seed_themes_from_textbooks.py` does:
+/// the mean of the members' `embedding_3072`.
+async fn seed_centroid_3072_from_members(pool: &PgPool, theme: Uuid) {
+    sqlx::query(
+        "UPDATE claim_themes t SET centroid_3072 = \
+           (SELECT avg(c.embedding_3072)::vector(3072) FROM claims c \
+             WHERE c.theme_id = t.id AND c.embedding_3072 IS NOT NULL) \
+         WHERE t.id = $1",
+    )
+    .bind(theme)
+    .execute(pool)
+    .await
+    .expect("seed centroid_3072");
+}
+
+/// `(centroid_3072 IS NULL, cosine distance to the phase-`phase` 3072 vector)`.
+async fn theme_state_3072(pool: &PgPool, theme: Uuid, phase: usize) -> (bool, Option<f64>) {
+    sqlx::query_as(
+        "SELECT centroid_3072 IS NULL, (centroid_3072 <=> $2::vector)::float8 \
+           FROM claim_themes WHERE id = $1",
+    )
+    .bind(theme)
+    .bind(alternating_literal(3072, phase))
+    .fetch_one(pool)
+    .await
+    .expect("read theme 3072")
+}
+
+/// A seeded `centroid_3072` CAN derive from a claim that is later sealed: the
+/// textbook seed averages members' `embedding_3072`. A one-member theme's
+/// `centroid_3072` is then the sealed vector, so the seal must clear it, as it
+/// clears the 1536-d centroid.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seal_clears_a_centroid_3072_that_was_the_sealed_vector(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let sealed = seed_sealable_claim(&pool, &world, "the only seeded member").await;
+    let theme = seed_theme(&pool, "seal-singleton-3072").await;
+    place_in_theme(&pool, sealed, theme, 0).await;
+    give_3072(&pool, sealed, 0).await;
+    recompute(&pool, theme).await;
+    seed_centroid_3072_from_members(&pool, theme).await;
+
+    // CALIBRATION: the seeded centroid_3072 is exactly the member's vector.
+    let (null, distance) = theme_state_3072(&pool, theme, 0).await;
+    assert!(!null, "fixture: the theme has a centroid_3072");
+    assert!(
+        distance.expect("a centroid_3072") < 1e-6,
+        "fixture: a one-member centroid_3072 is that member's vector"
+    );
+
+    let payload = seal_payload(&pool, sealed).await;
+    assert_eq!(commit_seal(&pool, &world, &[payload]).await, vec![sealed]);
+
+    let (null, _) = theme_state_3072(&pool, theme, 0).await;
+    assert!(
+        null,
+        "a centroid_3072 that was the sealed vector must not survive the seal"
+    );
+}
+
+/// With a member left, `centroid_3072` is recomputed over it alone; a theme
+/// whose `centroid_3072` was never set keeps it NULL (the seal does not start
+/// populating the column the search route counts).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seal_recomputes_a_set_centroid_3072_and_leaves_an_unset_one_null(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let sealed = seed_sealable_claim(&pool, &world, "the sealed 3072 member").await;
+    let kept = seed_sealable_claim(&pool, &world, "the 3072 member that stays").await;
+    let theme = seed_theme(&pool, "seal-mixed-3072").await;
+    place_in_theme(&pool, sealed, theme, 0).await;
+    place_in_theme(&pool, kept, theme, 1).await;
+    give_3072(&pool, sealed, 0).await;
+    give_3072(&pool, kept, 1).await;
+    recompute(&pool, theme).await;
+    seed_centroid_3072_from_members(&pool, theme).await;
+
+    let sealed_too = seed_sealable_claim(&pool, &world, "the unseeded theme member").await;
+    let kept_too = seed_sealable_claim(&pool, &world, "the unseeded member that stays").await;
+    let unseeded = seed_theme(&pool, "seal-unseeded-3072").await;
+    place_in_theme(&pool, sealed_too, unseeded, 0).await;
+    place_in_theme(&pool, kept_too, unseeded, 1).await;
+    give_3072(&pool, sealed_too, 0).await;
+    give_3072(&pool, kept_too, 1).await;
+    recompute(&pool, unseeded).await;
+
+    // CALIBRATION: the two-member centroid_3072 is far from the kept vector.
+    let (null, distance) = theme_state_3072(&pool, theme, 1).await;
+    assert!(!null, "fixture: the theme has a centroid_3072");
+    let distance = distance.expect("a centroid_3072");
+    assert!(
+        distance > 0.2,
+        "fixture: the two-member centroid_3072 is not the kept vector (distance {distance})"
+    );
+    assert!(
+        theme_state_3072(&pool, unseeded, 1).await.0,
+        "fixture: the second theme has no centroid_3072"
+    );
+
+    let payloads = vec![
+        seal_payload(&pool, sealed).await,
+        seal_payload(&pool, sealed_too).await,
+    ];
+    let mut done = commit_seal(&pool, &world, &payloads).await;
+    done.sort();
+    let mut expected = vec![sealed, sealed_too];
+    expected.sort();
+    assert_eq!(done, expected);
+
+    let (null, distance) = theme_state_3072(&pool, theme, 1).await;
+    assert!(
+        !null,
+        "the theme keeps a centroid_3072 over its remaining member"
+    );
+    let distance = distance.expect("a centroid_3072");
+    assert!(
+        distance < 1e-6,
+        "the centroid_3072 is the remaining member's vector alone (distance {distance})"
+    );
+    assert!(
+        theme_state_3072(&pool, unseeded, 1).await.0,
+        "an unset centroid_3072 stays NULL"
+    );
+}
