@@ -9,9 +9,18 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
+/// This authorization server's issuer identifier: `public_base_url` without a
+/// trailing slash. The ONE source for both the metadata document's `issuer` and
+/// the RFC 9207 `iss` on every authorization response, which a client compares
+/// byte for byte (RFC 9207 section 2.4).
+#[must_use]
+pub fn issuer(state: &AppState) -> &str {
+    state.config.public_base_url.trim_end_matches('/')
+}
+
 /// RFC 8414 — GET /.well-known/oauth-authorization-server
 pub async fn authorization_server_metadata(State(state): State<AppState>) -> Json<Value> {
-    let base = state.config.public_base_url.trim_end_matches('/');
+    let base = issuer(&state);
     let mut doc = json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
@@ -22,6 +31,12 @@ pub async fn authorization_server_metadata(State(state): State<AppState>) -> Jso
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
+        // RFC 9207: every authorization response (`/oauth/authorize/consent`'s
+        // redirect, code or error) carries `iss`, so a client talking to more
+        // than one authorization server can refuse a mix-up. ChatGPT registers
+        // its exact `connector_platform_oauth_redirect` callback only against a
+        // server that says so (`oauth::redirect`).
+        "authorization_response_iss_parameter_supported": true,
         "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
         // RFC 8414 `scopes_supported` is a statement about what an APPROVED
         // client may hold, not about what registration hands out. Since PR-02

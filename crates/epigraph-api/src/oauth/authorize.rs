@@ -56,12 +56,24 @@ const AUTH_CODE_TTL: chrono::Duration = chrono::Duration::seconds(60);
 /// (e.g. a decoded `%0A`) can never reach `Redirect::to`'s `HeaderValue::try_from`
 /// and panic the handler, and it merges correctly with a `redirect_uri` that already
 /// carries a query component (no naive double-`?`).
+///
+/// It is the only builder of an authorization response, so it appends the RFC
+/// 9207 `iss` (this server's issuer, [`crate::oauth::metadata::issuer`]) after
+/// `params` on every one, success and error alike; the metadata document
+/// advertises `authorization_response_iss_parameter_supported`, and a client
+/// that reads that refuses a response without `iss`.
 #[cfg(feature = "db")]
-fn build_redirect_url(redirect_uri: &str, params: &[(&str, &str)]) -> Result<String, ApiError> {
+fn build_redirect_url(
+    redirect_uri: &str,
+    issuer: &str,
+    params: &[(&str, &str)],
+) -> Result<String, ApiError> {
     let mut url = url::Url::parse(redirect_uri).map_err(|e| ApiError::InternalError {
         message: format!("validated redirect_uri did not parse: {e}"),
     })?;
-    url.query_pairs_mut().extend_pairs(params.iter().copied());
+    url.query_pairs_mut()
+        .extend_pairs(params.iter().copied())
+        .append_pair("iss", issuer);
     Ok(url.into())
 }
 
@@ -376,7 +388,8 @@ pub struct ConsentForm {
 /// mints a single-use 60s authorization code bound to client+user+PKCE+redirect+scopes —
 /// the user and scopes come from the server-side session row, NEVER from the form — then
 /// 302s back to the client's `redirect_uri` with `code` + the client's original `state`.
-/// On Deny (or any non-Allow decision) it 302s with `error=access_denied`.
+/// On Deny (or any non-Allow decision) it 302s with `error=access_denied`. Both carry
+/// the RFC 9207 `iss` (`build_redirect_url`).
 #[cfg(feature = "db")]
 pub async fn consent_endpoint(
     State(state): State<AppState>,
@@ -403,6 +416,7 @@ pub async fn consent_endpoint(
         // that already has a query component.
         let url = build_redirect_url(
             &session.redirect_uri,
+            crate::oauth::metadata::issuer(&state),
             &[("error", "access_denied"), ("state", &claude_state)],
         )?;
         return Ok(Redirect::to(&url).into_response());
@@ -447,6 +461,7 @@ pub async fn consent_endpoint(
     // byte, and to merge with a redirect_uri that already carries a query.
     let url = build_redirect_url(
         &session.redirect_uri,
+        crate::oauth::metadata::issuer(&state),
         &[("code", &code), ("state", &claude_state)],
     )?;
     Ok(Redirect::to(&url).into_response())
