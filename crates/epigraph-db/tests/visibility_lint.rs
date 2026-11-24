@@ -5224,11 +5224,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: `claim_themes` labels for the themes `visible_themes` admitted.
     ("atlas_layout.rs", "unplaced_themes", &["Self::theme_rows"]),
-    // untenanted: `agents` display names; the evidence labels are spliced.
+    // untenanted: `agents` display names, decided for the MAP's audience by migration
+    // 272's explicit-audience core (a definer that applies its own audience; the builder's
+    // privileged session is deliberately not the audience); the evidence labels are spliced.
     (
         "atlas_leaf.rs",
         "node_labels",
-        &["sqlx::query_as(SELECT).fetch_all"],
+        &["AgentDisclosureRepository::names_for_audience"],
     ),
     // untenanted: which of the agent ids the spliced claim and edge reads produced exist in
     // `agents`.

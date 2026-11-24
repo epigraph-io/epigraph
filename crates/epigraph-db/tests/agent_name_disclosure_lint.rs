@@ -185,8 +185,10 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Surfaces still to convert (part B of the change). Must shrink to empty.
-const PENDING: &[(&str, &str)] = &[("epigraph-db/src/repos/atlas_leaf.rs", "node_labels")];
+/// Surfaces still to convert. Empty since part B converted the last one; a read that needs converting
+/// later is listed here with the change that will convert it, never left
+/// unregistered.
+const PENDING: &[(&str, &str)] = &[];
 
 const IDENTITY_COLUMNS: &[&str] = &["display_name", "orcid", "ror_id", "properties"];
 const BARE_COLUMNS: &[&str] = &["display_name", "orcid", "ror_id"];

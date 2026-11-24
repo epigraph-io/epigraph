@@ -1299,3 +1299,52 @@ async fn claim_truth_values_read_only_the_claims_the_map_may_draw(pool: PgPool) 
     .expect("claim_truth_values");
     assert_eq!(on_public.into_iter().collect::<Vec<_>>(), vec![(pc, 0.42)]);
 }
+
+/// Spec 2026-11-24 human identity, row H3: a stored leaf document is read by
+/// the MAP's audience, so an unnamed human is labelled for that audience,
+/// never for the privileged session that builds it: no name on the public
+/// map; its name on the map of a team it belongs to (CALIBRATION, the team
+/// arm for a member of that team).
+#[sqlx::test(migrations = "../../migrations")]
+async fn node_labels_name_a_human_only_for_a_map_audience_that_may_see_it(pool: PgPool) {
+    let t = team(&pool, "team-of-the-human").await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let h = agent(&pool).await;
+    fixture::make_human_operator(&pool, h).await;
+    sqlx::query(
+        "UPDATE agents SET display_name = 'Wilhelmina Mapped', profile_visibility = 'group' \
+          WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(t)
+    .bind(h)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let (public, _) =
+        AtlasLeafRepository::node_labels(&mut conn, &system, AtlasMap::Public, &[h], &[])
+            .await
+            .expect("node_labels");
+    assert_eq!(
+        public.get(&h),
+        None,
+        "the public map's audience gets no name"
+    );
+    let (team_map, _) =
+        AtlasLeafRepository::node_labels(&mut conn, &system, AtlasMap::Team(t), &[h], &[])
+            .await
+            .expect("node_labels");
+    assert_eq!(
+        team_map.get(&h).map(String::as_str),
+        Some("Wilhelmina Mapped"),
+        "CALIBRATION: the team's members see their teammate"
+    );
+}
