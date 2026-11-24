@@ -105,11 +105,13 @@ After an apply, and after a reverse, the derived rows of the touched themes
 are stale until rebuilt (backlog 30633061): the newest clustering run still
 files the moved claims under their old theme's graph neighbourhoods and has
 none for the new parts, and the newest Atlas layout run has no position for
-the parts (it reads `stale`). Both commands print, and the manifest records,
-`touched_theme_ids` (every parent and every new part), and print the REQUIRED
-follow-up steps (`REBUILD_STEPS`; docs/runbooks/atlas-nightly.md, "After a
-theme-cap split"). `reverse` deletes the new parts' rows, and rows that
-reference them cascade.
+the parts (it reads `stale`). Both are built per run, so the rebuild is a new
+run of each: a `ClusterGraph` job (enqueued, then drained), which writes
+neighbourhoods for every theme, then a new layout run. Both commands print,
+and the manifest records, `touched_theme_ids` (every parent and every new
+part, to check the new run against), and print the REQUIRED follow-up steps
+(`REBUILD_STEPS`; docs/runbooks/atlas-nightly.md, "After a theme-cap split").
+`reverse` deletes the new parts' rows, and rows that reference them cascade.
 
 Usage:
     MAINTENANCE_DATABASE_URL=... python3 scripts/theme_cap_split.py plan --out plan.json
@@ -350,7 +352,8 @@ def _commit(conn):
 # What an apply or a reverse leaves stale, and the steps that rebuild it
 # (docs/runbooks/atlas-nightly.md, "After a theme-cap split").
 REBUILD_STEPS = [
-    "rebuild_theme_neighborhoods --manifest <manifest> --apply",
+    """enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique""",
+    "drain_jobs",
     "python3 scripts/label_themes_llm.py --neighborhoods",
     "atlas_layout --apply",
 ]

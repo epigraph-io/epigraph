@@ -236,8 +236,8 @@ def test_apply_and_reverse_name_every_theme_whose_derived_rows_are_stale(db, see
     """Backlog 30633061: after an apply (and after its reverse) the graph
     neighbourhoods and Atlas layout rows of every split parent and every new
     part are stale. Both commands name exactly those themes, the manifest
-    records them (rebuild_theme_neighborhoods --manifest reads it), and the
-    output carries the rebuild steps."""
+    records them, and the output carries the rebuild steps: a new ClusterGraph
+    run (enqueued, then drained), then a new layout run."""
     big, _, _ = _theme(db, seed_agent, (30, 25, 20))
     pair, _, _ = _theme(db, seed_agent, (25, 25), label="Second Theme", seed0=10)
     small, _, _ = _theme(db, seed_agent, (12,), label="Small Theme", seed0=20)
@@ -256,8 +256,9 @@ def test_apply_and_reverse_name_every_theme_whose_derived_rows_are_stale(db, see
     assert small not in applied["touched_theme_ids"]
     assert json.loads(manifest.read_text())["touched_theme_ids"] == stale
     assert applied["rebuild_next"] == S.REBUILD_STEPS
-    assert any(step.startswith("rebuild_theme_neighborhoods") for step in S.REBUILD_STEPS)
-    assert any(step.startswith("atlas_layout") for step in S.REBUILD_STEPS)
+    steps = [step.split()[0] for step in S.REBUILD_STEPS]
+    assert steps.index("enqueue_job") < steps.index("drain_jobs") < steps.index("atlas_layout")
+    assert '"ClusterGraph"' in S.REBUILD_STEPS[steps.index("enqueue_job")]
 
     out, _ = _run(["reverse", "--database-url", script_dsn(), "--manifest", str(manifest)])
 
