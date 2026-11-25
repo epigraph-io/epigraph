@@ -183,8 +183,8 @@ async fn every_gated_route_refuses_a_token_without_its_scope(pool: PgPool) {
             .await;
         w.assert_admitted(method, &uri, READ_WRITE, &empty).await;
     }
-    // `POST /api/v1/ingest/paper` creates a directory at a caller-chosen path,
-    // reads a caller-named local PDF and runs a host script: `claims:admin`.
+    // `POST /api/v1/ingest/paper` downloads a paper into the server's work
+    // directory and runs host scripts, LLM extraction included: `claims:admin`.
     for uri in ["/api/v1/ingest/paper", "/api/v1/ingest/paper-url"] {
         w.assert_refused(Method::POST, uri, READ_ONLY, "claims:admin", &empty)
             .await;
