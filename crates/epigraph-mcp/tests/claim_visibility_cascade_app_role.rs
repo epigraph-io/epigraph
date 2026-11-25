@@ -55,6 +55,12 @@
 //!   same holds for a flat workflow claim whose copy `report_workflow_outcome`
 //!   wrote, and for a vacated cache (`truth_value` 0.5). A current claim at
 //!   the deprecation marker (a step's soft delete) keeps 0.05.
+//! * backlog 6e4ff46e: the claim's Beta track (`beta_alpha` / `beta_beta`),
+//!   which `update_with_evidence` moved with a BBA on evidence that stays
+//!   behind (pinned), is rebuilt from the evidence the new audience may read:
+//!   it is served exactly the track of a control claim that only ever had the
+//!   readable evidence, and a claim with nothing readable left is back at the
+//!   `Beta(1, 1)` prior.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -1876,5 +1882,192 @@ async fn publicize_writes_the_moved_claims_scoped_rows_afresh_for_the_public(poo
     assert_eq!(
         n_hidden, 0,
         "the pinned perspective has nothing admissible: no row"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6e4ff46e: the Beta track follows the act
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `agent` adds evidence to `claim` through MCP `update_with_evidence`, which
+/// stores a BBA citing a new evidence row and counts it on the claim's Beta
+/// track. The new evidence row's id.
+async fn evidence_through_mcp(
+    pool: &PgPool,
+    s: &AppRole,
+    agent: Uuid,
+    claim: Uuid,
+    supports: bool,
+    strength: f64,
+) -> Uuid {
+    let ids = |pool: &PgPool| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM evidence WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_all(&pool)
+                .await
+                .expect("the claim's evidence rows")
+        }
+    };
+    let before = ids(pool).await;
+    update_with_evidence(
+        &s.server,
+        &viewer(pool, agent).await,
+        UpdateWithEvidenceParams {
+            claim_id: claim.to_string(),
+            canonical_name: None,
+            step_index: None,
+            evidence_data: format!("evidence on {claim}: supports={supports} at {strength}"),
+            evidence_type: "empirical".to_string(),
+            supports,
+            strength,
+            source_url: None,
+            labels: vec![],
+        },
+        Some(&token(agent)),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("update_with_evidence on {claim}: {e:?}"));
+    ids(pool)
+        .await
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("the update's evidence row")
+}
+
+/// `(beta_alpha, beta_beta)`, a NULL read as the `Beta(1, 1)` prior.
+type Track = (f64, f64);
+
+const PRIOR: Track = (1.0, 1.0);
+
+async fn track(pool: &PgPool, claim: Uuid) -> Track {
+    sqlx::query_as(
+        "SELECT COALESCE(beta_alpha, 1.0), COALESCE(beta_beta, 1.0) FROM claims WHERE id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("track")
+}
+
+/// The Beta track as `agent` is served it, on its stamped app-role
+/// connection.
+async fn served_track(pool: &PgPool, s: &AppRole, agent: Uuid, claim: Uuid) -> Track {
+    let v = viewer(pool, agent).await;
+    let mut conn = s.scoped.acquire_as(&v).await.expect("stamped connection");
+    sqlx::query_as(
+        "SELECT COALESCE(beta_alpha, 1.0), COALESCE(beta_beta, 1.0) FROM claims WHERE id = $1",
+    )
+    .bind(claim)
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or_else(|e| panic!("{agent} reads the claim's Beta track: {e}"))
+}
+
+fn same_track(a: Track, b: Track) -> bool {
+    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
+}
+
+/// Share: the private claim's Beta track counted a refutation citing evidence
+/// pinned at home, beside a support that moves with the claim. After the act
+/// the teammate is served the track of a control team claim that only ever
+/// had the support, not the home track (whose posterior, and the divergence
+/// rows the next evidence write records from it, carry the hidden refutation).
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_rebuilds_the_beta_track_without_the_evidence_left_at_home(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "beta-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "beta-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(
+        &pool,
+        &s,
+        alice,
+        "a private finding, tracked",
+        "private",
+        None,
+    )
+    .await;
+    let control = write(&pool, &s, alice, "the same finding, team", "team", Some(t)).await;
+    evidence_through_mcp(&pool, &s, alice, c, true, 0.8).await;
+    evidence_through_mcp(&pool, &s, alice, control, true, 0.8).await;
+    let hidden = evidence_through_mcp(&pool, &s, alice, c, false, 0.95).await;
+    pin(&pool, hidden, alice).await;
+    let stale = track(&pool, c).await;
+    let expected = track(&pool, control).await;
+    assert!(
+        !same_track(expected, PRIOR) && !same_track(stale, expected),
+        "PREMISE: the control's track counted the support ({expected:?}) and the home track \
+         also counted the hidden refutation ({stale:?})"
+    );
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(
+        tenancy(&pool, "evidence", hidden).await,
+        group(home),
+        "pinned"
+    );
+    let served = served_track(&pool, &s, bob, c).await;
+    assert!(
+        same_track(served, expected),
+        "the teammate is served Beta track {served:?}, which must be the team-readable \
+         track {expected:?} (the control's), not the home track {stale:?}"
+    );
+}
+
+/// Publicize: one team claim's track counted a refutation citing evidence
+/// pinned in the team beside a support that goes public; another's counted
+/// only pinned evidence. After the act a stranger is served, for the first,
+/// the track of a public control claim that only ever had the support, and
+/// for the second the `Beta(1, 1)` prior.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_rebuilds_the_beta_track_without_the_evidence_left_behind(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "beta-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "beta-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "a team finding, tracked", "team", Some(t)).await;
+    let only_hidden = write(&pool, &s, eve, "a team hunch, tracked", "team", Some(t)).await;
+    let control = write(&pool, &s, eve, "the same finding, public", "public", None).await;
+    evidence_through_mcp(&pool, &s, eve, c, true, 0.8).await;
+    evidence_through_mcp(&pool, &s, eve, control, true, 0.8).await;
+    let hidden = evidence_through_mcp(&pool, &s, eve, c, false, 0.95).await;
+    pin(&pool, hidden, eve).await;
+    let hidden_only = evidence_through_mcp(&pool, &s, eve, only_hidden, false, 0.95).await;
+    pin(&pool, hidden_only, eve).await;
+    let stale = track(&pool, c).await;
+    let expected = track(&pool, control).await;
+    assert!(
+        !same_track(expected, PRIOR) && !same_track(stale, expected),
+        "PREMISE: the control's track counted the support ({expected:?}) and the team track \
+         also counted the hidden refutation ({stale:?})"
+    );
+    let stale_only = track(&pool, only_hidden).await;
+    assert!(
+        !same_track(stale_only, PRIOR),
+        "PREMISE: the second claim's track counted its hidden refutation ({stale_only:?})"
+    );
+
+    publicize(&pool, &s, eve, &[c, only_hidden])
+        .await
+        .expect("publicized");
+
+    assert_eq!(tenancy(&pool, "evidence", hidden).await, group(t), "pinned");
+    let served = served_track(&pool, &s, carol, c).await;
+    assert!(
+        same_track(served, expected),
+        "a stranger is served Beta track {served:?}, which must be the public track \
+         {expected:?} (the control's), not the team's {stale:?}"
+    );
+    let served_only = served_track(&pool, &s, carol, only_hidden).await;
+    assert!(
+        same_track(served_only, PRIOR),
+        "a claim with no publicly readable evidence must be back at the Beta(1, 1) prior; a \
+         stranger was served {served_only:?} (the team's track was {stale_only:?})"
     );
 }

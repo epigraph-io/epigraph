@@ -63,6 +63,22 @@
 //! route writes them), so a scoped read right after the act finds a value
 //! (backlog 4d8df0cf). A key with nothing admissible left gets no row.
 //!
+//! # The Beta track
+//!
+//! The claim's Beta-Bernoulli track (`claims.beta_alpha` / `beta_beta`) is
+//! read by everyone who can read the claim, and its posterior is what the
+//! claim's next live evidence write returns to its writer and records in a
+//! `ds_bayesian_divergence` row. It was accumulated from every BBA the OLD
+//! audience could read, so it can count a BBA citing evidence that stays
+//! behind (backlog 6e4ff46e). The act therefore rebuilds it for every moved
+//! claim, in the same transaction: back to the `Beta(1, 1)` prior, then every
+//! BBA a live writer counts that may enter the claim's cache under its new
+//! tenancy, oldest first
+//! ([`crate::ds_divergence::rebuild_beta_track`], which states where the
+//! rebuilt track differs from the live count). A moved claim with nothing
+//! admissible to count is back at the prior, so its next live write is a cold
+//! start and records no divergence row.
+//!
 //! # An operated agent is refused in the definer (migration 242)
 //!
 //! Neither act runs on an operated agent's own authority (share-with-team
@@ -113,13 +129,10 @@
 //! * A `community` scoped row is not written afresh: its fold reads the
 //!   community's members and mass override on the raw pool. It stays absent
 //!   until the next computation that stores it.
-//! * `ds_bayesian_divergence` rows are not written afresh. Their posterior is
-//!   the claim's Beta track (`claims.beta_alpha` / `beta_beta`), which moves
-//!   with the claim unchanged and was accumulated from every BBA the old
-//!   audience could read. That track is itself an open leak this act does not
-//!   close: the claim's next live evidence write returns its posterior to the
-//!   writer and records a divergence row from it, both served to the new
-//!   audience. Recomputing the row here would only serve it sooner.
+//! * `ds_bayesian_divergence` rows are not written afresh. A row records one
+//!   evidence write (the BetP after it against the posterior after it), and
+//!   the act is not one; the claim's next live evidence write records its row
+//!   against the rebuilt track (see "The Beta track").
 
 use std::collections::HashMap;
 
@@ -138,8 +151,8 @@ pub enum VisibilityActError {
     /// visibility refusal.
     #[error(transparent)]
     Db(#[from] DbError),
-    /// The refold of a moved claim's cached belief failed. The act must not
-    /// commit.
+    /// The refold of a moved claim's cached belief, or the rebuild of its
+    /// Beta track, failed. The act must not commit.
     #[error("cached belief recompute after the act: {0}")]
     Cache(String),
 }
@@ -265,6 +278,13 @@ async fn refold_moved(
             edge_factor::recompute_widened_claim_cached_belief(&mut *conn, viewer, claim_id)
                 .await
                 .map_err(VisibilityActError::Cache)?;
+        // The Beta track, rebuilt from the evidence the new audience may read
+        // (see the module doc, "The Beta track"). For every moved claim, with
+        // or without a cache-owner frame: the track is served either way.
+        let track = crate::ds_divergence::rebuild_beta_track(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| VisibilityActError::Cache(format!("Beta track: {e}")))?;
+        tracing::debug!(%claim_id, ?track, "{act}: Beta track rebuilt");
         // `truth_value` may be a copy of the cache as folded for the OLD
         // audience (see the module doc, "truth_value"): replace it with the
         // refolded value, which is admissible by construction.
