@@ -11,6 +11,17 @@
 //!
 //! This route is feature-gated behind `genai`. With the feature off the handler
 //! returns 501.
+//!
+//! # `claims:admin`, before the body is parsed (backlog f2973ec9)
+//!
+//! Every call spends the server's LLM credential on a prompt the caller
+//! writes. The handler took `State` and `Json` and nothing else, so any valid
+//! bearer, a read-only or a public OAuth client's included, could drive paid
+//! provider calls. Both definitions (the `genai` handler and the stub) now take
+//! [`RequireScopeAdmin`](crate::middleware::bearer::RequireScopeAdmin), the
+//! gate `POST /api/v1/ingest/paper` uses for the same reason (it runs LLM
+//! extraction on the host). The `analysis:*` scopes were not used: they are
+//! READ scopes, held by every read-only role and by every public client.
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
@@ -72,6 +83,8 @@ Return ONLY the JSON array, no other text. Include 5-20 claims covering the most
 /// Requires the `genai` feature; returns 501 otherwise.
 #[cfg(feature = "genai")]
 pub async fn unconstrained_analysis(
+    // `claims:admin`, checked before the body is parsed (backlog f2973ec9).
+    _scope: crate::middleware::bearer::RequireScopeAdmin,
     State(_state): State<AppState>,
     Json(request): Json<UnconstrainedAnalysisRequest>,
 ) -> Result<(StatusCode, Json<UnconstrainedAnalysisResponse>), ApiError> {
@@ -123,6 +136,9 @@ pub async fn unconstrained_analysis(
 /// Stub when the `genai` feature is disabled.
 #[cfg(not(feature = "genai"))]
 pub async fn unconstrained_analysis(
+    // Gated like the `genai` handler, so a build's feature set does not
+    // change who is refused.
+    _scope: crate::middleware::bearer::RequireScopeAdmin,
     State(_state): State<AppState>,
     Json(_request): Json<UnconstrainedAnalysisRequest>,
 ) -> Result<(StatusCode, Json<UnconstrainedAnalysisResponse>), ApiError> {

@@ -519,7 +519,8 @@ impl FactorRepository {
 
     /// The stored BetP of each of `ids` that `viewer` can read, as BP's
     /// scalar priors: `(id, pignistic_prob)`. An id the viewer cannot read is
-    /// absent, not an error.
+    /// absent, not an error. `POST /api/v1/graph/compose` reads its node
+    /// beliefs here too (backlog 52b96600).
     ///
     /// Role-blind, as the scalar engine always was: a compound's cached
     /// value seeds it like any claim's (BP apply never writes a compound).
