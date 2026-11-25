@@ -1627,7 +1627,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "workflows.rs",
         "workflow_authority",
         &[
-            "AgentRepository::operator_actor",
+            "AgentRepository::operator_actor_for_act",
             "AgentRepository::operator_of_author",
             "WorkflowRepository::submitter_of",
             "api_admin_arm",

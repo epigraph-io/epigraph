@@ -2952,6 +2952,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          181's definer, which admits only a live admin of that group (keyed on the stamped \
          principal). The route has checked the caller's admin role on the same connection.",
     ),
+    (
+        "group_membership.rs",
+        "lock_operator_links",
+        "Not a read: migration 107's link advisory lock (`pg_advisory_xact_lock` on \
+         `hashtext('epigraph.operator_links')`), taken exclusively by the membership revokes so a \
+         writer revoke, which ends an acting operator link, is serialised against an act that \
+         read the link under the shared lock (backlog f1438bfb). No table is touched.",
+    ),
     // ── Backlog 850dcc61: the entity-mention and triple batch WRITES moved off
     // the raw pool onto the route's stamped transaction.
     (

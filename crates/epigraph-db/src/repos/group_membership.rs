@@ -117,6 +117,15 @@ impl GroupMembershipRepository {
     /// literally would have marked nothing on any real removal. The correction
     /// is recorded in `docs/tenancy/progress.json`.
     ///
+    /// # Serialised against acts on an operator link (backlog f1438bfb)
+    ///
+    /// A writer revoke ends acting authority (`epigraph_operator_actor` joins
+    /// the live writer row), so the revoke runs in its own transaction under
+    /// migration 107's link advisory lock, taken EXCLUSIVELY first
+    /// ([`Self::lock_operator_links`]): an act that read the link under the
+    /// shared lock (`AgentRepository::operator_actor_for_act`) commits before
+    /// the revoke, or reads the revoke.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
@@ -125,6 +134,8 @@ impl GroupMembershipRepository {
         group_id: Uuid,
         agent_id: Uuid,
     ) -> Result<u64, DbError> {
+        let mut tx = pool.begin().await?;
+        Self::lock_operator_links(&mut tx).await?;
         let result = sqlx::query(
             r#"
             UPDATE group_memberships
@@ -134,10 +145,39 @@ impl GroupMembershipRepository {
         )
         .bind(group_id)
         .bind(agent_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(result.rows_affected())
+    }
+
+    /// Migration 107's operator-link advisory lock (`epigraph.operator_links`),
+    /// EXCLUSIVE and transaction-scoped, for a membership revoke (backlog
+    /// f1438bfb).
+    ///
+    /// Revoking a `writer`/`admin` row ends the acting link of an agent whose
+    /// link names that group (`epigraph_operator_actor` requires the live
+    /// writer row), exactly as a link retire does. Every link writer and 191's
+    /// retire verb take this lock exclusively, and an act that grants on the
+    /// link reads it under the SHARED lock on its own transaction
+    /// (`AgentRepository::operator_actor_for_act`). Taking it here makes the
+    /// revoke wait for an act that already read the link, and makes an act
+    /// that asks later wait for the revoke and read it. Taken FIRST, before
+    /// any row lock, the order 191's retire uses (lock, then membership rows,
+    /// then the group row), so a revoke and a retire never wait on each other
+    /// in opposite orders.
+    ///
+    /// `conn` must be a transaction: on an autocommit connection the lock is
+    /// released when the statement ends.
+    async fn lock_operator_links(conn: &mut sqlx::PgConnection) -> Result<(), DbError> {
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(\
+                 pg_catalog.hashtext('epigraph.operator_links'))",
+        )
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
     }
 
     /// Revoke a member, refusing to revoke the group's LAST live admin.
@@ -284,6 +324,17 @@ impl GroupMembershipRepository {
     /// pre-existing check-then-act in `add_member` that `rotate_conn` names.
     /// This function does not close it and does not claim to.
     ///
+    /// # The operator-link lock comes first (backlog f1438bfb)
+    ///
+    /// Before any of the row locks above, the transaction takes migration
+    /// 107's link advisory lock EXCLUSIVELY (`lock_operator_links`): revoking a
+    /// writer row ends the acting link of an agent whose link names this
+    /// group, so the revoke must not land between an act's read of that link
+    /// (`AgentRepository::operator_actor_for_act`, under the shared lock) and
+    /// the act's commit. The full order is therefore: the link lock, the
+    /// roster, `groups`, `group_key_epochs`; 191's retire takes the lock first
+    /// as well.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any statement fails.
     #[instrument(skip(pool))]
@@ -354,6 +405,17 @@ impl GroupMembershipRepository {
         sqlx::query("RELEASE SAVEPOINT revoke_member_requires_tx")
             .execute(&mut *tx)
             .await?;
+
+        // THE OPERATOR-LINK LOCK, EXCLUSIVE, BEFORE ANY ROW LOCK (backlog
+        // f1438bfb). Revoking a writer row ends the acting link of an agent
+        // whose link names this group, so the revoke is serialised against an
+        // act that read that link under the shared lock
+        // (`AgentRepository::operator_actor_for_act`): it waits for that act's
+        // commit, and an act that asks later waits for this one and reads the
+        // revoke. First, as 191's retire takes it, so the order across the
+        // two is lock, roster, `groups` row. After the transaction probe, so an
+        // autocommit connection is still refused with nothing locked.
+        Self::lock_operator_links(&mut *tx).await?;
 
         // THE ROWS THE GUARD READS AND WRITES, LOCKED BEFORE IT READS THEM.
         // The `UPDATE` below locks only the row it writes; this locks the whole

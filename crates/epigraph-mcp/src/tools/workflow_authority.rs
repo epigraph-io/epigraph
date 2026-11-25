@@ -59,7 +59,9 @@
 //! * THE DELEGATE ARM (operator ruling R-183: agents acting for a principal
 //!   inherit its authority, wherever the principal itself is admitted by
 //!   identity). The caller's ACTING operator link names a principal `P`
-//!   (`AgentRepository::operator_actor`, on the write's own transaction: a
+//!   (`AgentRepository::operator_actor_for_act`, on the write's own
+//!   transaction under the operator-link lock, so a concurrent retire or
+//!   writer revoke cannot land between this read and the write's commit: a
 //!   not-retired link record AND a live writer membership of `P`'s own
 //!   personal group), and `P` is the submitter itself, or the submitter's
 //!   operator (`P` admitted by the upward arm, retired links of the
@@ -448,13 +450,22 @@ async fn owner_group_arm(
 /// arm admits `P` on, retired links included (an operator owns its retired
 /// identities' work). A chain is not followed: an agent operated by an agent
 /// operated by `P` names that agent, not `P`.
+///
+/// The caller-side read GRANTS on the link, so it is made under 107's link
+/// lock, shared, held to `conn`'s commit
+/// (`AgentRepository::operator_actor_for_act`, backlog f1438bfb): a link
+/// retire, or a revoke of the writer row the link needs, that is in flight
+/// makes the act wait and read it; one that starts later waits for the act's
+/// commit. Every caller passes the transaction it commits on, before that
+/// transaction's first write. The target-side read needs no lock: it counts
+/// retired links too, and a link record is never deleted.
 async fn delegate_arm(
     conn: &mut sqlx::PgConnection,
     caller_agent: uuid::Uuid,
     submitter: uuid::Uuid,
     tool_name: &'static str,
 ) -> Result<Option<uuid::Uuid>, McpError> {
-    let link = epigraph_db::AgentRepository::operator_actor(&mut *conn, caller_agent)
+    let link = epigraph_db::AgentRepository::operator_actor_for_act(&mut *conn, caller_agent)
         .await
         .map_err(|e| {
             internal_error_logged(

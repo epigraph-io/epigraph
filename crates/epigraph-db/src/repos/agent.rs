@@ -2089,11 +2089,13 @@ impl AgentRepository {
     /// before they add, remove or re-role a member, so a writer-membership
     /// revoke made through them is serialised like a retire. Such a revoke
     /// also ends the acting link (`epigraph_operator_actor` joins the live
-    /// writer row). It does NOT serialise a revoke that UPDATEs
-    /// `group_memberships` directly, without a verb (for example
-    /// `GroupMembershipRepository::remove_member` or
-    /// `revoke_member_unless_last_admin`), nor a direct maintenance `UPDATE`
-    /// of `operator_links.retired`, which 191 leaves unserialised.
+    /// writer row). So do the repository's own revokes,
+    /// `GroupMembershipRepository::remove_member` and
+    /// `revoke_member_unless_last_admin(_conn)` (backlog f1438bfb), which
+    /// take it exclusively before their first row lock. It does NOT
+    /// serialise any other statement that UPDATEs `group_memberships`
+    /// directly, nor a direct maintenance `UPDATE` of
+    /// `operator_links.retired`, which 191 leaves unserialised.
     ///
     /// # Errors
     /// As [`Self::operator_actor`]; the lock statement's failure is

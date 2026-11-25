@@ -3207,7 +3207,8 @@ impl ApiWorkflowGrant {
 /// The delegate arm (operator ruling R-183: agents acting for a principal
 /// inherit its authority, wherever the principal itself is admitted by
 /// identity): the caller's ACTING operator link names a principal `P`
-/// (`AgentRepository::operator_actor` on `conn`: a not-retired link record
+/// (`AgentRepository::operator_actor_for_act` on `conn`, under the
+/// operator-link lock held to the write's commit: a not-retired link record
 /// AND a live writer membership of `P`'s own personal group), and `P` is the
 /// submitter, or the submitter's operator (the upward arm's own read,
 /// retired links of the submitter included, as for `P` itself). One hop on
@@ -3318,7 +3319,13 @@ async fn workflow_authority(
         // the viewer alone (no token) reached it through the viewer
         // extractor, which admits an operated caller only through a live
         // delegation.
-        let actor = epigraph_db::AgentRepository::operator_actor(&mut *conn, caller)
+        //
+        // The read GRANTS on the link, so it is made under 107's link lock,
+        // shared, held to the commit of `conn` (the write's own transaction,
+        // before its first write): a retire, or a revoke of the writer row the
+        // link needs, cannot land between this read and the write (backlog
+        // f1438bfb), as for the claim ownership gate.
+        let actor = epigraph_db::AgentRepository::operator_actor_for_act(&mut *conn, caller)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("could not read the caller's operator link: {e}"),
