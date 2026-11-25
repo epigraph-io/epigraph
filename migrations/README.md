@@ -4570,6 +4570,20 @@ restart.
   binaries: a binary built with 273 calls it from `GET /api/v1/groups/:id`, `GET
   /api/v1/agents`, `GET /api/v1/agents/:id`, `GET /api/v1/agents/search` and MCP `find_agent` /
   `get_agent`, and answers 42883 there without it.
+- **308**: `ds_combined_beliefs_global_unique` (backlog 3adc219b). 001's
+  `ds_combined_beliefs_frame_id_claim_id_scope_type_scope_id_key` was NULLS DISTINCT, so a
+  `global` row (`scope_id IS NULL`) never conflicted and every global write
+  (`ScopedBeliefRepository::upsert`) inserted another row. The file counts the duplicates
+  (NOTICE), deletes all but the newest row of each (frame, claim, scope_type, scope_id) key
+  (latest `computed_at`, then larger `id`: the row `ScopedBeliefRepository::get` already served),
+  and re-adds the constraint under the same name as `UNIQUE NULLS NOT DISTINCT`, 034's fix. The
+  upsert's ON CONFLICT target is unchanged. No policy, grant, trigger or binary changes; migrate
+  before or after any deploy. ADD CONSTRAINT builds the index under ACCESS EXCLUSIVE with
+  `lock_timeout` 3 s. Pinned by `epigraph-db/tests/ds_combined_beliefs_global_unique_308.rs` (the
+  dedup on a database seeded at the head below 308, the key, the undo) and
+  `epigraph-api/tests/frames_evidence_app_role.rs` (two global writes on the application role
+  leave one row). Undo: `docs/runbooks/308-undo.sql` (the deleted duplicates are not restored).
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
