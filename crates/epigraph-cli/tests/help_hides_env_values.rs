@@ -137,6 +137,11 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         "src/bin/prune_recall_events.rs",
     ),
     (
+        "rebuild_moved_beta_tracks",
+        Some(env!("CARGO_BIN_EXE_rebuild_moved_beta_tracks")),
+        "src/bin/rebuild_moved_beta_tracks.rs",
+    ),
+    (
         "replay_beta_track",
         Some(env!("CARGO_BIN_EXE_replay_beta_track")),
         "src/bin/replay_beta_track.rs",

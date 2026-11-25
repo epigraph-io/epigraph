@@ -2071,3 +2071,133 @@ async fn publicize_rebuilds_the_beta_track_without_the_evidence_left_behind(pool
          stranger was served {served_only:?} (the team's track was {stale_only:?})"
     );
 }
+
+/// `ds_bayesian_divergence` rows of `claim`.
+async fn divergence_rows(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM ds_bayesian_divergence WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("count divergence rows")
+}
+
+/// A claim shared BEFORE the act rebuilt the Beta track (simulated: the stale
+/// home track put back after the share, and a divergence row a later evidence
+/// write recorded from it) is fixed by the one-off
+/// `rebuild_moved_beta_tracks` on a maintenance connection: a dry run writes
+/// nothing and reports the rebuilt track; an applying run serves the
+/// teammate the team-readable track and deletes the divergence row; and a
+/// `moved_before` earlier than the act names no claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_one_off_rebuild_fixes_a_claim_shared_before_the_act_rebuilt_its_track(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, _) = fixture::seed_agent_with_group(&pool, "backfill-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "backfill-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(
+        &pool,
+        &s,
+        alice,
+        "a private finding, moved early",
+        "private",
+        None,
+    )
+    .await;
+    let control = write(&pool, &s, alice, "the same finding, team", "team", Some(t)).await;
+    evidence_through_mcp(&pool, &s, alice, c, true, 0.8).await;
+    evidence_through_mcp(&pool, &s, alice, control, true, 0.8).await;
+    let hidden = evidence_through_mcp(&pool, &s, alice, c, false, 0.95).await;
+    pin(&pool, hidden, alice).await;
+    let stale = track(&pool, c).await;
+    let expected = track(&pool, control).await;
+    assert!(
+        !same_track(stale, expected),
+        "PREMISE: the home track ({stale:?}) counted the hidden refutation"
+    );
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    // What a claim moved before this deploy looks like: the stale track, and
+    // a divergence row recorded from it by a later evidence write.
+    sqlx::query("UPDATE claims SET beta_alpha = $2, beta_beta = $3 WHERE id = $1")
+        .bind(c)
+        .bind(stale.0)
+        .bind(stale.1)
+        .execute(&pool)
+        .await
+        .expect("put the stale track back");
+    let frame: Uuid =
+        sqlx::query_scalar("SELECT frame_id FROM mass_functions WHERE claim_id = $1 LIMIT 1")
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .expect("a frame of the claim");
+    sqlx::query(
+        "INSERT INTO ds_bayesian_divergence (claim_id, frame_id, pignistic_prob, \
+                                             bayesian_posterior, kl_divergence) \
+         VALUES ($1, $2, 0.6, 0.45, 0.1)",
+    )
+    .bind(c)
+    .bind(frame)
+    .execute(&pool)
+    .await
+    .expect("seed a divergence row from the stale track");
+    assert!(
+        same_track(served_track(&pool, &s, bob, c).await, stale),
+        "PREMISE: the teammate is served the stale home track"
+    );
+
+    let (scoped, bypass) = fixture::bypass(&pool).await;
+    let (mut conn, _lease) = scoped
+        .unscoped_for_maintenance(epigraph_db::visibility::SystemReason::SchemaContractTest)
+        .await
+        .expect("maintenance connection");
+    let rebuild = epigraph_engine::visibility_act::rebuild_moved_beta_tracks;
+
+    let early = rebuild(
+        &mut conn,
+        &bypass,
+        Some(chrono::Utc::now() - chrono::Duration::days(3650)),
+        true,
+    )
+    .await
+    .expect("a run limited to acts ten years ago");
+    assert_eq!(early.moved_claims, 0, "moved_before excludes later acts");
+
+    let dry = rebuild(&mut conn, &bypass, None, false)
+        .await
+        .expect("dry run");
+    let row = dry
+        .rebuilt
+        .iter()
+        .find(|r| r.claim_id == c)
+        .unwrap_or_else(|| panic!("the dry run names the shared claim: {dry:?}"));
+    assert!(
+        same_track(row.before, stale) && same_track(row.after, expected),
+        "the dry run reports {:?} -> {:?}, wanted {stale:?} -> {expected:?}",
+        row.before,
+        row.after
+    );
+    assert_eq!(row.divergence_rows_cleared, 1, "the dry run counts the row");
+    assert!(
+        same_track(track(&pool, c).await, stale) && divergence_rows(&pool, c).await == 1,
+        "a dry run writes nothing"
+    );
+
+    let applied = rebuild(&mut conn, &bypass, None, true)
+        .await
+        .expect("applying run");
+    assert!(applied.failed.is_empty(), "no claim failed: {applied:?}");
+    let served = served_track(&pool, &s, bob, c).await;
+    assert!(
+        same_track(served, expected),
+        "after the rebuild the teammate is served {served:?}, which must be the team-readable \
+         track {expected:?}, not the home track {stale:?}"
+    );
+    assert_eq!(
+        divergence_rows(&pool, c).await,
+        0,
+        "the divergence row recorded from the stale track is deleted"
+    );
+}
