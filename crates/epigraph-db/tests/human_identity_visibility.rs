@@ -823,6 +823,33 @@ async fn an_assertion_after_the_binding_names_the_human_after_the_binding_ends(p
     );
 }
 
+/// C5 is sticky across a SECOND binding of the same agent (review2
+/// correctness#4). An agent's public claim made while allowed (149) for H
+/// names H after the allowance is revoked; the documented next step (149's
+/// HINT "Revoke the allowance first") is to link the same agent to H, which
+/// writes a later binding start. The window is the EARLIEST start of the
+/// agent's bindings to H (`pg_catalog.min(b.since)` in the core), so the
+/// later link never un-names H. With `max` this test fails at the last
+/// assertion (mutation probe P1, which survived the suite before it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_later_binding_of_the_same_agent_never_un_names_the_human(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (outsider, _) = named(&pool, "Gil Gazer").await;
+    let (h, _) = human(&pool, "Hana Twice-Bound").await;
+    let (svc, client) = allowance_bound(&pool, h, "hana-service").await;
+    fixture::seed_public_claim(&pool, svc, "hana-service while allowed").await;
+    revoke_allowance(&pool, client).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h).await,
+        "CALIBRATION: sticky after the revoke"
+    );
+    link(&pool, svc, h).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h).await,
+        "a later link of the same agent must not un-name H (C5 sticky)"
+    );
+}
+
 // ─── C6: public assertions of every kind (operator ruling) ──────────────
 
 /// The kinds of public row besides a claim that operator ruling C6 considers,
