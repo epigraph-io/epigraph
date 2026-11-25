@@ -1001,6 +1001,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "elevation_ceremony.rs",
+        "record_standing_refusal",
+        "WRITE through 285's app-callable definer `epigraph_record_passkey_standing_refusal`: \
+         one `platform.passkey_standing_refused` audit row for a live ticket or act, by id, \
+         naming a live passkey of ITS person (the definer derives the person and refuses any \
+         other passkey). An audit row about a principal, not a corpus row; the ceremony page \
+         has no principal a Viewer could carry.",
+    ),
+    (
+        "elevation_ceremony.rs",
         "redeem",
         "WRITE through 125's app-callable definer `epigraph_redeem_elevation_ticket`, for the \
          token endpoint's elevate grant (pre-authentication: the redeem secret's SHA-256 is the \

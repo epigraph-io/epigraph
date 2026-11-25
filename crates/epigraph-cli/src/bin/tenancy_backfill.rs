@@ -2859,6 +2859,21 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // no allowance, so a lapsed allowlisted row may count again: the owner is
     // load-bearing.
     ("epigraph_group_live_roster", 273),
+    // 285, an anchored passkey's recorded anchor (the BEFORE INSERT trigger
+    // that writes it from the enrollment's act, and the BEFORE UPDATE one
+    // that refuses changing it). Its reads of the FORCEd
+    // `passkey_enrollments` and `pending_admin_acts` are admitted by
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner it
+    // reads no act and records NO anchor: every anchored passkey enrolled
+    // then is refused at its first assertion (no live anchor), fail CLOSED.
+    ("epigraph_person_authenticators_anchor", 285),
+    // 285, the audit of an assertion refused on its passkey's standing. Its
+    // reads of the FORCEd `elevation_tickets`, `pending_admin_acts` and
+    // `person_authenticators`, and its `platform.` INSERT into
+    // `security_events`, are admitted only from a maintenance-owned definer
+    // frame. Under a non-member owner it reads no live ticket or act (ELV06 /
+    // ELV08, loud: the API answers 500 and the refusal still stands).
+    ("epigraph_record_passkey_standing_refusal", 285),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4055,6 +4070,15 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_disclosed_role_attachments",
         "public.epigraph_disclosed_role_attachments(uuid[])",
+        true,
+    ),
+    // 285: the ceremony pages' assertion handlers call it on the request DSN
+    // (unstamped, keyed by the ticket or act id) for every standing refusal;
+    // without the grant every such refusal answers 500 instead of its 403 /
+    // 503, still refused.
+    (
+        "epigraph_record_passkey_standing_refusal",
+        "public.epigraph_record_passkey_standing_refusal(text, uuid, uuid, text, text)",
         true,
     ),
     // 273: group info, the agent routes and `find_agent` / `get_agent` call it
@@ -5832,6 +5856,8 @@ mod definer_register_tests {
         "epigraph_events_assessment_guard",
         // 260: the edge declaration recorder.
         "epigraph_edges_record_declaration",
+        // 285: an anchored passkey's anchor, recorded and kept.
+        "epigraph_person_authenticators_anchor",
     ];
 
     /// The function names [`OPERATOR_FUNCTION_GRANTS`] checks, read from each

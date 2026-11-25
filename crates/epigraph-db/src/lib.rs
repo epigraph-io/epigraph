@@ -168,14 +168,14 @@ pub use repos::{
     INGEST_WRITTEN_BY_FIELD, INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY,
     INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
 };
+pub use repos::{
+    record_standing_refusal, AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony,
+    EndReason, LiveElevation, Redemption, StandingCeremony, TicketMode, TicketPasskey,
+};
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
     AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
     AdminScopeSwitch,
-};
-pub use repos::{
-    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
-    Redemption, TicketMode, TicketPasskey,
 };
 pub use repos::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
