@@ -708,15 +708,71 @@ fn no_name_decision_falls_back_to_null() {
         )),
         0
     );
+    // Review 2 (leaks#6): every other spelling of a non-placeholder fallback.
+    // A `CASE` whose WHEN reads a disclosure decision (`named`) and whose
+    // branches mention `display_name` must carry the placeholder in a branch:
+    // `ELSE NULL END`, `ELSE '' END`, a missing ELSE and a COALESCE / NULLIF
+    // fallback around a placeholder-less CASE are all caught.
+    for (planted, want) in [
+        (
+            r#"{ sqlx::query("SELECT CASE WHEN d.named THEN a.display_name ELSE NULL END FROM agents a") }"#,
+            1,
+        ),
+        (
+            r#"{ sqlx::query("SELECT CASE WHEN d.named THEN a.display_name ELSE '' END FROM agents a") }"#,
+            1,
+        ),
+        (
+            r#"{ sqlx::query("SELECT COALESCE(CASE WHEN x.named THEN a.display_name END, 'unknown') FROM agents a") }"#,
+            1,
+        ),
+        (
+            r#"{ sqlx::query("SELECT CASE WHEN public.epigraph_human_named_to_viewer(a.id) THEN a.display_name END FROM agents a") }"#,
+            1,
+        ),
+        (
+            r#"{ sqlx::query("SELECT CASE WHEN NOT d.named THEN public.epigraph_unnamed_agent_name(a.id) \
+                ELSE a.display_name END FROM agents a") }"#,
+            0,
+        ),
+        (
+            r#"{ sqlx::query("SELECT CASE WHEN d.named THEN CASE WHEN a.x THEN a.display_name END \
+                ELSE public.epigraph_unnamed_agent_name(a.id) END FROM agents a") }"#,
+            0,
+        ),
+        (
+            r#"{ sqlx::query("SELECT CASE WHEN a.kind = 'x' THEN a.display_name END FROM agents a") }"#,
+            0,
+        ),
+    ] {
+        assert_eq!(
+            case_offenders(&sql_of(planted)),
+            want,
+            "planted shape: {planted}"
+        );
+    }
+    // And the Rust-side spelling: a `!<d>.named` branch that writes a null
+    // name (what `redact_agent` did before 285 gave it `unnamed_as`).
+    assert_eq!(
+        rust_offenders("fn f() { if !d.named { agent.display_name = None; } }"),
+        1
+    );
+    assert_eq!(
+        rust_offenders("fn f() { if !d.named { agent.display_name = d.unnamed_as; } }"),
+        0
+    );
+
     let mut found = Vec::new();
     let mut scanned = 0usize;
+    let mut cases = 0usize;
     for (file, src) in sources() {
         for (name, body) in fns(&src) {
             let sql = sql_of(&body);
             if sql.contains("display_name") {
                 scanned += 1;
             }
-            if offenders(&sql) > 0 {
+            cases += named_cases(&sql);
+            if offenders(&sql) > 0 || case_offenders(&sql) > 0 || rust_offenders(&body) > 0 {
                 found.push(format!("{file}::{name}"));
             }
         }
@@ -726,7 +782,104 @@ fn no_name_decision_falls_back_to_null() {
         "CALIBRATION: the scan saw only {scanned} functions naming display_name"
     );
     assert!(
-        found.is_empty(),
-        "these name decisions fall back to NULL instead of the placeholder (C7): {found:?}"
+        cases >= 8,
+        "CALIBRATION: the scan saw only {cases} name decisions (CASE on `named`)"
     );
+    assert!(
+        found.is_empty(),
+        "these name decisions fall back to something other than the placeholder (C7): {found:?}"
+    );
+}
+
+/// The `CASE ... END` expressions in `sql` (lowercased, whitespace-folded),
+/// matched by `case` / `end` word depth, each with its text.
+fn case_exprs(sql: &str) -> Vec<&str> {
+    let words: Vec<(usize, &str)> = {
+        let b = sql.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i].is_ascii_alphanumeric() || b[i] == b'_' {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if start == 0 || b[start - 1] != b'.' {
+                    out.push((start, &sql[start..i]));
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    };
+    let mut exprs = Vec::new();
+    for (k, &(start, w)) in words.iter().enumerate() {
+        if w != "case" {
+            continue;
+        }
+        let mut depth = 0i32;
+        for &(at, x) in &words[k..] {
+            match x {
+                "case" => depth += 1,
+                "end" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        exprs.push(&sql[start..at + 3]);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    exprs
+}
+
+/// Is this CASE a name decision: its first WHEN reads a disclosure decision
+/// and some branch is a `display_name`?
+fn is_name_decision(expr: &str) -> bool {
+    let cond_end = expr.find(" then ").unwrap_or(expr.len());
+    let cond = &expr[..cond_end];
+    (cond.contains(".named") || cond.contains("epigraph_human_named_to_viewer("))
+        && expr.contains("display_name")
+}
+
+fn named_cases(sql: &str) -> usize {
+    case_exprs(sql)
+        .into_iter()
+        .filter(|e| is_name_decision(e))
+        .count()
+}
+
+/// Name decisions with no placeholder branch.
+fn case_offenders(sql: &str) -> usize {
+    case_exprs(sql)
+        .into_iter()
+        .filter(|e| is_name_decision(e) && !e.contains("epigraph_unnamed_agent_name("))
+        .count()
+}
+
+/// Rust code (not SQL) that writes a null name in a `!<x>.named` branch.
+fn rust_offenders(body: &str) -> usize {
+    let mut n = 0;
+    let mut from = 0;
+    while let Some(rel) = body[from..].find(".named") {
+        let at = from + rel;
+        from = at + 1;
+        let before = &body[..at];
+        let ident_start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        if !before[..ident_start].ends_with('!') {
+            continue;
+        }
+        let rest = &body[at..];
+        let block = rest.find('}').map_or(rest, |e| &rest[..e]);
+        let folded: String = block.split_whitespace().collect::<Vec<_>>().join(" ");
+        if folded.contains("display_name = None") {
+            n += 1;
+        }
+    }
+    n
 }
