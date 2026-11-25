@@ -310,5 +310,10 @@ name = "scratch_store"
 path = "tests/scratch_store.rs"
 required-features = ["scratch"]
 
+[[test]]
+name = "scratch_snapshot"
+path = "tests/scratch_snapshot.rs"
+required-features = ["scratch"]
+
 [lints]
 workspace = true

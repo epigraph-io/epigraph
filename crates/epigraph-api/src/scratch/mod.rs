@@ -7,4 +7,5 @@
 //! code, reads the environment or opens a connection.
 
 pub mod bm25;
+pub mod snapshot;
 pub mod store;
