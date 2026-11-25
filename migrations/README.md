@@ -4603,8 +4603,8 @@ restart.
   `docs/runbooks/285-undo.sql` (restores 125's and 130's readers verbatim, drops the column and
   every recorded anchor; audit rows stay). **Deploy order:** migrate BEFORE the API binary of this
   change (it selects the readers' new column, 42703, and calls the definer, 42883); an older API
-  runs on 285 unchanged. **Before deploying, measure** live `none` passkeys with NO recorded anchor
-  after the backfill (`SELECT count(*) FROM person_authenticators WHERE revoked_at IS NULL AND
+  runs on 285 unchanged. **After applying 285 and before deploying the API binary, measure** live
+  `none` passkeys with NO recorded anchor after the backfill (`SELECT count(*) FROM person_authenticators WHERE revoked_at IS NULL AND
   attestation_format = 'none' AND anchor_authenticator_id IS NULL`): under the attested policy each
   is refused at its next assertion (they hold through nothing; e.g. a passkey registered while the
   software policy served). If any is a person's only passkey, enroll an attested passkey for that

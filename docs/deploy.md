@@ -3377,9 +3377,11 @@ The policy:
   `503`, and with its anchor revoked it is refused (and 200's cascade has
   revoked it anyway). A live `none` passkey with no recorded anchor (one
   registered while the software policy served) is refused under the
-  attested policy: count them before switching policy or deploying 285
+  attested policy: count them after applying 285 and before deploying the
+  API binary that reads its column (the older binary ignores the column, so
+  nobody is refused in between), or before switching policy
   (`attestation_format = 'none' AND anchor_authenticator_id IS NULL AND
-  revoked_at IS NULL`), and enroll an attested passkey through a
+  revoked_at IS NULL`; the column exists only from 285), and enroll an attested passkey through a
   maintenance enrollment (`passkey-enroll`) for any person whose only
   passkey that is. Only the anchor's own certificate is re-checked, not the
   lineage above it. A standing refusal is audited only while its ticket or
