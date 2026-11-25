@@ -1138,6 +1138,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "vector_scan.rs",
+        "begin_iterative_ivfflat",
+        "NO ROW READ. A crate-private helper that opens a savepoint and sets one \
+         transaction-local pgvector knob (`ivfflat.iterative_scan`) for the viewer-spliced kNN \
+         read its caller runs next (backlog b00aa40e); it reads and writes no table, so there is \
+         nothing to filter.",
+    ),
+    (
+        "vector_scan.rs",
         "begin_exact_vector_scan",
         "NO ROW READ. A crate-private helper that opens a savepoint and sets transaction-local \
          planner knobs (`enable_indexscan` off; seqscan, bitmapscan, sort on) and a capped \
@@ -5266,6 +5274,18 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "migrate_superseded_edges_to_head_conn",
         &["migrate_superseded_edges", "require_privileged_session"],
     ),
+    // session: as `search_by_embedding_scoped` (below): the novelty gate's kNN (backlog
+    // b00aa40e).
+    (
+        "claim.rs",
+        "nearest_by_embedding",
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_hnsw",
+        ],
+    ),
     // session: `begin_iterative_hnsw` / `begin_exact_vector_scan` open the transaction and set
     // the vector scan (`repos/vector_scan.rs`); the two `?.fetch_all` are `build!()` runs of the
     // viewer-spliced `sql`, which binds `viewer.group_bind()` inside the macro (the scanner does
@@ -5522,6 +5542,32 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         &[
             "Self::find_root_by_canonical",
             "Self::max_generation_by_canonical",
+        ],
+    ),
+    // session: as `claim.rs::search_by_embedding_scoped`, on the IVFFlat goal index:
+    // `begin_iterative_ivfflat` / `begin_exact_vector_scan` open the transaction and set the
+    // vector scan; the two `?.fetch_all` are `build!()` runs of the viewer-spliced `sql`
+    // (backlog b00aa40e).
+    (
+        "workflow.rs",
+        "search_by_goal_embedding_since",
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_ivfflat",
+        ],
+    ),
+    // session: as `search_by_goal_embedding_since` (above): MCP `find_workflow`'s hierarchical
+    // leg and the store-time workflow match (backlog b00aa40e).
+    (
+        "workflow.rs",
+        "search_hierarchical_by_embedding_scored",
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_ivfflat",
         ],
     ),
 ];

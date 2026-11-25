@@ -770,6 +770,21 @@ pub struct NearestClaimHit {
     pub distance: f64,
 }
 
+/// One BBA a live Beta-track writer counts, as
+/// [`ClaimRepository::beta_track_inputs`] returns it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BetaTrackInput {
+    /// The `mass_functions` row.
+    pub id: Uuid,
+    /// The stored masses.
+    pub masses: serde_json::Value,
+    /// The frame the BBA is on.
+    pub frame_name: String,
+    pub hypotheses: Vec<String>,
+    /// The claim's current `claim_frames.hypothesis_index` on that frame.
+    pub hypothesis_index: Option<i32>,
+}
+
 /// One fused hit from [`ClaimRepository::search_hybrid_scoped`] /
 /// [`ClaimRepository::search_lexical_scoped`].
 ///
@@ -4871,11 +4886,27 @@ impl ClaimRepository {
     /// `is_current = false` rows (superseded/retired claims must never
     /// suppress a new near-paraphrase insert).
     ///
+    /// # Iterative HNSW scan, then exact (backlog b00aa40e)
+    ///
+    /// Run as [`Self::search_by_embedding_scoped`] runs: an iterative HNSW
+    /// scan ([`begin_iterative_hnsw`]), retried as an exact scan when it comes
+    /// back short ([`exact_retry_or_first_pass`]; `vector_scan` module doc),
+    /// each in a transaction rolled back so the settings never reach the
+    /// caller's later reads. A plain scan yields at most `hnsw.ef_search` rows
+    /// before the visibility splice runs, so rows the caller cannot read,
+    /// nearer the query than its own, emptied its neighbours: the gate missed
+    /// the caller's own near-duplicate (and inserted a second copy), and
+    /// whether it fired told the caller whether foreign rows sit near its
+    /// text.
+    ///
+    /// Takes a connection rather than an executor because the settings need
+    /// a transaction (a savepoint on a caller's own transaction).
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
-    pub async fn nearest_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    #[instrument(skip(conn, viewer, query_embedding_pgvector))]
+    pub async fn nearest_by_embedding(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
@@ -4893,13 +4924,29 @@ impl ClaimRepository {
             "#,
             3,
         );
-        let mut q = sqlx::query_as::<_, NearestClaimHit>(&sql)
-            .bind(query_embedding_pgvector)
-            .bind(limit);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+        // A macro, not a closure: see `search_by_embedding_scoped`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query_as::<_, NearestClaimHit>(&sql)
+                    .bind(query_embedding_pgvector)
+                    .bind(limit);
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q
+            }};
         }
-        let rows = q.fetch_all(executor).await?;
+
+        let mut tx = begin_iterative_hnsw(&mut *conn, limit).await?;
+        let fetched = build!().fetch_all(&mut *tx).await;
+        tx.rollback().await?;
+        let rows = fetched?;
+        if (rows.len() as i64) < limit {
+            let mut tx = begin_exact_vector_scan(&mut *conn).await?;
+            let retried = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            return exact_retry_or_first_pass(retried, rows, "nearest_by_embedding");
+        }
 
         Ok(rows)
     }
@@ -9442,6 +9489,103 @@ impl ClaimRepository {
             q = q.bind(w);
         }
         Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
+    /// The BBAs of `claim_id` that a live Beta-track writer counts, oldest
+    /// first, with the claim's hypothesis index on each one's frame: the
+    /// input of a Beta-track rebuild (backlog 6e4ff46e,
+    /// `epigraph_engine::ds_divergence::rebuild_beta_track`).
+    ///
+    /// A row is returned when it is a fold input (not retracted, not a cached
+    /// combination: the predicates every combine-input reader uses) and its
+    /// writer counts it on the track when it stores it:
+    ///
+    /// * its `combination_method` is one of `counted_methods` (the engine's
+    ///   list of the counting writers' methods: `POST /frames/:id/evidence`
+    ///   and MCP `submit_ds_evidence`); or
+    /// * it is an `auto_wire` row keyed on a perspective or a slot: an evidence
+    ///   row of `update_with_evidence` or `report_workflow_outcome`. An
+    ///   `auto_wire` row with neither is a creation BBA (`submit_claim`,
+    ///   `memorize`, batch ingest), the claim's prior, which no live writer
+    ///   counts.
+    ///
+    /// The hypothesis index is the claim's CURRENT `claim_frames` index on the
+    /// row's frame (`None` when it has none; such a row counts nothing).
+    /// Viewer-scoped on the BBA row; the caller decides which rows are
+    /// admissible for the audience the rebuilt track is served to.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, counted_methods))]
+    pub async fn beta_track_inputs(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        counted_methods: &[&str],
+    ) -> Result<Vec<BetaTrackInput>, DbError> {
+        let not_retracted = crate::repos::mass_function::not_retracted_predicate("mf.");
+        let cached = crate::repos::mass_function::cached_combination_predicate("mf.");
+        let sql = viewer.splice(
+            &format!(
+                "SELECT mf.id, mf.masses, f.name AS frame_name, f.hypotheses, \
+                        cf.hypothesis_index \
+                   FROM mass_functions mf \
+                   JOIN frames f ON f.id = mf.frame_id \
+                   LEFT JOIN claim_frames cf \
+                          ON cf.claim_id = mf.claim_id AND cf.frame_id = mf.frame_id \
+                  WHERE mf.claim_id = $1 \
+                    AND {not_retracted} AND NOT {cached} \
+                    AND (mf.combination_method = ANY($2::text[]) \
+                         OR (mf.combination_method = 'auto_wire' \
+                             AND (mf.perspective_id IS NOT NULL OR mf.slot_id IS NOT NULL))) \
+                    /* {{VISIBILITY:mf}} */ \
+                  ORDER BY mf.created_at, mf.id"
+            ),
+            3,
+        );
+        let methods: Vec<String> = counted_methods.iter().map(|m| (*m).to_string()).collect();
+        let mut q = sqlx::query_as::<_, BetaTrackInput>(&sql)
+            .bind(claim_id)
+            .bind(methods);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
+    /// Set the claim's Beta-Bernoulli parameters to `(alpha, beta)`, replacing
+    /// whatever the track held: the write of a Beta-track rebuild (backlog
+    /// 6e4ff46e). Each parameter is held at or above the prior's `1.0`, as
+    /// [`Self::add_beta_increments`] holds it.
+    ///
+    /// Gated on the claim's group (`{WRITABLE:c}`), as the live update is.
+    /// Returns whether a row was written: `false` for a claim that does not
+    /// exist or that the viewer may not write.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn set_beta_params(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+        alpha: f64,
+        beta: f64,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "UPDATE claims AS c \
+                SET beta_alpha = GREATEST($2::float8, 1.0), \
+                    beta_beta = GREATEST($3::float8, 1.0), \
+                    updated_at = NOW() \
+              WHERE c.id = $1 /* {WRITABLE:c} */",
+            4,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(alpha).bind(beta);
+        // Conditional: a `Bypass` viewer renders `" "` and has no `$4`.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.execute(&mut *conn).await?.rows_affected() > 0)
     }
 
     /// The claim's stored Beta-Bernoulli parameters `(beta_alpha, beta_beta)`,

@@ -480,9 +480,14 @@ async fn the_reporter_cannot_read_its_report_back(pool: PgPool) {
         assert_eq!(got.is_some(), expect == 1, "{who}: get_by_id");
         tx.rollback().await.expect("rollback");
 
-        let near = ClaimRepository::nearest_by_embedding(&pool, &viewer, &unit_vector(7), 50)
-            .await
-            .expect("nearest");
+        let near = ClaimRepository::nearest_by_embedding(
+            &mut pool.acquire().await.expect("acquire"),
+            &viewer,
+            &unit_vector(7),
+            50,
+        )
+        .await
+        .expect("nearest");
         assert_eq!(
             near.iter().any(|h| h.claim_id == r.claim_id),
             expect == 1,
