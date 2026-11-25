@@ -7,8 +7,10 @@
 //!
 //! 1. assigns unthemed embedded claims to their nearest theme (the existing
 //!    `ClaimThemeRepository::assign_unthemed_batch`) and REPORTS the themes
-//!    over W1's member cap (the theme split stays W1's operator-run,
-//!    off-box tool; no UMAP runs on the box);
+//!    over W1's member cap; with the off-box hook configured ([`offbox`])
+//!    and `--apply`, it splits them through W1's `theme_cap_split.py
+//!    offbox` (export, the off-box command, apply), so no UMAP runs on the
+//!    box;
 //! 2. per map with a finished run, in one REPEATABLE READ snapshot: rebuilds
 //!    the previous run's trees ([`previous`]), updates them incrementally
 //!    ([`incremental`]: new claims by nearest centroid and by linked
@@ -26,6 +28,12 @@
 //!    snapshot's epochs, unless every level is unchanged and the epochs too;
 //!    then prunes the map's old runs.
 //!
+//! A theme new to a map that does not fit one leaf has no previous tree to
+//! update: without the hook it is reported `unbuilt`; with it (and
+//! `--apply`), its meaning tree is computed off the box through the same
+//! command (W4's export and compute) and checked with W4's `check_tree`
+//! before the map is built again, so it is built the same night.
+//!
 //! A theme whose update fails is carried from the previous run (both
 //! hierarchies, only if every node and edge of every carried leaf is still
 //! in that leaf assembled from what the map may draw now: a subset check, so
@@ -42,4 +50,5 @@ pub mod build;
 pub mod incremental;
 pub mod leaves;
 pub mod links;
+pub mod offbox;
 pub mod previous;
