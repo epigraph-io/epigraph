@@ -507,7 +507,7 @@ pub async fn store_workflow(
         &decision,
     )
     .await?;
-    let caller_reads_row = caller_reads_ingested_row(&mut tx, &viewer, &result).await?;
+    refuse_unreadable_reingest(&mut tx, &viewer, &extraction, &result).await?;
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
@@ -558,14 +558,14 @@ pub async fn store_workflow(
     }
 
     // Emit event
-    let mut event = serde_json::json!({
+    let event = serde_json::json!({
         "workflow_id": result.workflow_id,
         "canonical_name": result.canonical_name,
         "goal": request.goal,
         "step_count": request.steps.len(),
         "already_ingested": result.already_ingested,
     });
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
         "workflow_id": result.workflow_id,
         "canonical_name": result.canonical_name,
         "goal": request.goal,
@@ -575,10 +575,6 @@ pub async fn store_workflow(
         "already_ingested": result.already_ingested,
         "matched_existing": false,
     });
-    if !caller_reads_row {
-        omit_workflow_id(&mut event);
-        omit_workflow_id(&mut body);
-    }
     // `events` has no row security: every reader of the event stream sees a
     // row's payload. So the event announces only a workflow this call CREATED
     // as PUBLIC; a group-private plan's goal and id stay with its group.
@@ -595,36 +591,43 @@ pub async fn store_workflow(
     Ok(Json(body))
 }
 
-/// Whether the caller reads the row an ingest reports (backlog c831df4a). A
-/// fresh ingest created it for the caller. A re-ingest reports the EXISTING
-/// row, which the ingest's stamp found and the caller's viewer may not read;
-/// then the answer leaves its id out,
-/// as the MCP twin does (`tools/workflow_ingest.rs`). Read with the caller's
-/// viewer on the ingest's own transaction, before it commits.
+/// Refuse a re-ingest that reports a row the caller cannot read (backlog
+/// ea93e471). A fresh ingest created its row for the caller. A re-ingest
+/// reports the EXISTING row, which the ingest's stamp found (a session whose
+/// row security does not hide it) and the caller's viewer may not read: the
+/// ingest is then REFUSED, before its commit, with the refusal the executor
+/// gives a lineage with generations the caller cannot read (migration 202's
+/// `LineageOutsideView`, 409), which is what the caller gets for this name
+/// wherever row security hides the row. The answer used to leave only the id
+/// out (backlog c831df4a) and still say `already_ingested` with a re-ingest's
+/// counts, which a fresh name never does: an existence oracle for a hidden
+/// workflow. As the MCP twin does (`tools/workflow_ingest.rs`). Read with
+/// the caller's viewer on the ingest's own transaction.
 #[cfg(feature = "db")]
-async fn caller_reads_ingested_row(
+async fn refuse_unreadable_reingest(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::Viewer,
+    extraction: &epigraph_ingest::workflow::WorkflowExtraction,
     result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
-) -> Result<bool, ApiError> {
+) -> Result<(), ApiError> {
     if !result.already_ingested {
-        return Ok(true);
+        return Ok(());
     }
-    epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, viewer, result.workflow_id)
-        .await
-        .map(|t| t.is_some())
-        .map_err(|e| ApiError::InternalError {
-            message: format!("workflow ingest: could not read the workflow as the caller: {e}"),
-        })
-}
-
-/// Drop `workflow_id` from an ingest answer about a row the caller cannot
-/// read ([`caller_reads_ingested_row`]).
-#[cfg(feature = "db")]
-fn omit_workflow_id(body: &mut serde_json::Value) {
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("workflow_id");
+    let readable =
+        epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, viewer, result.workflow_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("workflow ingest: could not read the workflow as the caller: {e}"),
+            })?
+            .is_some();
+    if readable {
+        return Ok(());
     }
+    Err(workflow_ingest_error(
+        epigraph_ingest_executor::IngestExecutorError::LineageOutsideView {
+            canonical_name: extraction.source.canonical_name.clone(),
+        },
+    ))
 }
 
 /// Extract behavioral metadata from a WorkflowRecallResult's properties JSONB.
@@ -2634,7 +2637,7 @@ pub async fn ingest_workflow(
         &decision,
     )
     .await?;
-    let caller_reads_row = caller_reads_ingested_row(&mut tx, &viewer, &result).await?;
+    refuse_unreadable_reingest(&mut tx, &viewer, &extraction, &result).await?;
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
@@ -2696,9 +2699,6 @@ pub async fn ingest_workflow(
         "relationships_created": result.relationship_edges_created,
         "already_ingested": result.already_ingested,
     });
-    if !caller_reads_row {
-        omit_workflow_id(&mut body);
-    }
     if declared.is_some() {
         body["reused_items"] = result
             .reused_items
