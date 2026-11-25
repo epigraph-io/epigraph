@@ -1228,6 +1228,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             template.with_generated_signer_identity()
         };
+        // Taken before the factory owns the template: every session is a
+        // clone of it and spawns its detached work (a queued walk,
+        // post-commit embedding) into this one set, which a stopping listener
+        // waits for.
+        let background = template.background_tasks();
         let sessions = epigraph_mcp::SessionFactory::new(template);
 
         // The principal the `--allow-unauthenticated-http` middleware injects.
@@ -1297,6 +1302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let epigraph_mcp::http_listener::McpHttpListener {
             service,
             tcp_allowlist,
+            end_sessions,
             ..
         } = epigraph_mcp::http_listener::mcp_http_listener(addr, &cli.allowed_host, move || {
             Ok(sessions.session())
@@ -1383,7 +1389,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
-        epigraph_mcp::serve_with_listener(addr, router).await?;
+        // Until SIGTERM / SIGINT, then a graceful stop that waits for the
+        // detached work, as the stdio path does below (backlog 526f7508): a
+        // restart used to drop the runtime under a queued walk or an
+        // embedding loop. A signing key that loses admission does not come
+        // through here: its watch exits at once (`signing_identity`).
+        epigraph_mcp::serve_with_listener_until(
+            addr,
+            router,
+            epigraph_mcp::shutdown_signal(),
+            epigraph_mcp::GracefulShutdown::new(
+                background,
+                epigraph_mcp::background::exit_drain_timeout(),
+            )
+            .ending_sessions_with(move || end_sessions.end()),
+        )
+        .await?;
     } else {
         // ── Stdio transport (default) ───────────────────────────────────
         // Inject the same federation registry so stdio's `list_tools` surfaces
