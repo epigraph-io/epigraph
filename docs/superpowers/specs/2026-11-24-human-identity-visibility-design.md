@@ -1894,6 +1894,17 @@ Each item states the behaviour implemented until the operator rules.
   version (`below(N)`, refusal tests). The standing rule forbids editing 272-282 on this branch,
   so the rename needs an explicit ruling. The md5 preconditions hash `prosrc`, not file names,
   and survive the rename. Main's 272/273 re-body none of the functions this branch pins.
+- **C17. (Open, 2026-11-25: merge order, for the orchestrator / operator.) Open pull
+  requests already claim versions in 274-309.** The C15 renumber satisfies its ruling (above
+  origin/main's head, 273), but five open triage pull requests (#1079, #1083, #1086, #1090,
+  #1095, staged together in #1089 and #1096) add migrations numbered 274, 275, 276, 284 and
+  285. The file names differ, so git reports no conflict: whichever side reaches `main`
+  second leaves two files for one version. Guard (not a fix): `migration_version_unique.rs`
+  fails a tree in which two migration files, or the embedded migrator, hold one version, so
+  the second merge's CI goes red instead of a database. Options: (a) land those pull requests
+  first and renumber this branch above main's head again (the renumber tooling reruns
+  mechanically); (b) land this branch first and renumber theirs; (c) renumber this branch now
+  above the highest number claimed on origin. Not changed without a ruling.
 - **C16. ([RULED] 2026-11-25, §16.R2: accepted; marker table is §15.F8.) Cost not ruled on.** The C6/C2 arms' share of
   the worst case (§11.2; three arms plus the countersign act since 304) and the unmeasured name
   search cost of §15.R16's placeholder rows. C12 accepted only the readable-claim arm.
