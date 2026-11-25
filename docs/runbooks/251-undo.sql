@@ -52,6 +52,26 @@
 BEGIN;
 SET LOCAL lock_timeout = '3s';
 
+-- ORDER: refuse while migration 274 is in place. 274's retract definer
+-- writes a `retract` grant through `epigraph_mf_guard_grant`, which this
+-- undo drops, so every retraction would then fail (42883), and 251's text
+-- re-applied refuses the kind (22023); undo 274 first (`274-undo.sql`).
+-- Keyed on the definer calling the grant function with kind `retract`,
+-- not on an md5, so a later re-statement that keeps the dependency is
+-- still caught.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_proc p
+                WHERE p.oid = pg_catalog.to_regprocedure(
+                          'public.epigraph_retract_mass_function(uuid, text, uuid, uuid)')
+                  AND p.prosrc LIKE '%epigraph_mf_guard_grant(''retract''%') THEN
+        RAISE EXCEPTION '251-undo refuses: epigraph_retract_mass_function writes a retract grant '
+                        '(migration 274) through what this undo drops; nothing was changed'
+            USING ERRCODE = '55000',
+                  HINT = 'Run docs/runbooks/274-undo.sql first (undo newest first), then this file.';
+    END IF;
+END $$;
+
 -- Migration 184's body, verbatim; its path lists pg_temp last (see WHAT IT
 -- DOES), so the md5 is 184's and the proconfig is the interim mitigation's.
 CREATE OR REPLACE FUNCTION public.epigraph_mass_function_retract_guard()

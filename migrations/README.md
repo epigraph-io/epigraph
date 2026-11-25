@@ -4570,6 +4570,45 @@ restart.
   binaries: a binary built with 273 calls it from `GET /api/v1/groups/:id`, `GET
   /api/v1/agents`, `GET /api/v1/agents/:id`, `GET /api/v1/agents/search` and MCP `find_agent` /
   `get_agent`, and answers 42883 there without it.
+- **274**: public `retract_mark_grant` (backlog 03d444a9). Closes the residual 251 recorded:
+  184's retract guard MARK arm (an UPDATE that sets or changes the retract columns to a
+  retracted state, or an INSERT of a row that arrives retracted) admitted any privileged
+  session (`epigraph_bypass() OR epigraph_definer_bypass()`), so a maintenance login could
+  mark a live BBA retracted directly, with no audit row and a `retracted_by` of its choosing.
+  251's ledger takes a third kind, `retract`; `epigraph_mf_guard_grant` accepts it and
+  `epigraph_mf_guard_consume` consumes a `retract` grant only for a row whose
+  `retracted_by` is the grant's (non-NULL) `granted_by`, whose `retract_reason` is the
+  grant's `reason` and whose `retracted_at` is the transaction's `now()` (both stay `epigraph_bba_guard_owner`'s, SECURITY DEFINER on
+  `pg_catalog, pg_temp`, naming no public object but the ledger). The mark arm admits only
+  by consuming a `retract` grant with `to_jsonb(NEW)`, or on a SUPERUSER session
+  (`session_user` a superuser, who may disable the trigger anyway; test harnesses mark rows
+  directly that way). 184's `epigraph_retract_mass_function` writes that grant (its
+  principal, its trimmed reason) just before its UPDATE; every other line is 184's, on 190's
+  path. What is closed is the UNAUDITED mark. Residual (as 251's; backlog 03d444a9 stays
+  open for it): a maintenance login may call the grant function itself and then mark with a
+  direct UPDATE, naming any retractor in its own grant, with no `security_events` row and no
+  clearing of the stored folds; the ledger keeps a row it cannot remove naming its login, the
+  retractor, the reason and the row as stored. Binding the mark to the definer needs the
+  definer's privileged frame isolated first (251 section 0).
+  Preconditions (`55000`, nothing changed): the md5 and `proconfig` of the four bodies it
+  re-states are those at 271, and `epigraph_bba_guard_owner_faults()` is `{}` before and
+  after; a non-superuser runner is refused `42501`. Pinned by
+  `epigraph-db/tests/bba_retract.rs` (a real maintenance login and the maintenance role
+  refused RT06 on UPDATE and INSERT while the definer on the same login still retracts,
+  audits once and leaves one consumed `retract` grant; a self-granted mark admitted only
+  with the grant's retractor and reason; the superuser admission) and
+  `retract_mark_grant_migration.rs` (the bodies before 274, what is at head, the refusal
+  over another body, the undo and re-apply); `mass_function_purge_guard.rs`,
+  `bba_retract.rs` and `epigraph-cli`'s `operator_delete_frames.rs` now discount the
+  fixture retraction's `retract` grant where they count ledger rows. Undo:
+  `docs/runbooks/274-undo.sql` (restores the four bodies; keeps the widened CHECK and every
+  `retract` row; undo 274 BEFORE 251 or 194, whose undos drop what 274's definer writes;
+  `251-undo.sql` and `194-undo.sql` refuse, 55000, while 274's definer is in place).
+  Slot assigned by the 2026-11-24 backlog triage; checked before claiming: no migration on
+  main or any origin branch carries a `274`. **Deploy order:** none against the binaries
+  (same definer signature and answer). A tool that marked rows directly on the maintenance
+  DSN is refused after it; none in this repository does. **Applied to throwaway databases
+  only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
