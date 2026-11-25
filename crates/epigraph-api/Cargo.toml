@@ -328,5 +328,10 @@ name = "scratch_protocol"
 path = "tests/scratch_protocol.rs"
 required-features = ["scratch"]
 
+[[test]]
+name = "scratch_no_db"
+path = "tests/scratch_no_db.rs"
+required-features = ["scratch"]
+
 [lints]
 workspace = true
