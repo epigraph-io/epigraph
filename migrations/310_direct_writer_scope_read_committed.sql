@@ -1,5 +1,7 @@
 -- 310: the DIRECT-membership arm of the claims-path writer scope admits a
--- write only under READ COMMITTED (backlog e39af056).
+-- write only under READ COMMITTED, and the custodian answer of
+-- `epigraph_is_instance_admin` is decided at the statement's clock and, on a
+-- read-write transaction, only under READ COMMITTED (backlog e39af056).
 --
 -- ===================================================================
 -- 1. WHY
@@ -28,18 +30,66 @@
 -- writer in the tree runs on the maintenance DSN, which the exemption
 -- relieves).
 --
--- The CUSTODIAN half of the backlog item is not a write admission at this
--- head: 123 re-bodied `epigraph_operator_scope_exempt()` to
--- `epigraph_bypass()` alone (operator ruling OQ-1 (b)), so holding
--- role:platform-custodian relieves nothing here, live or ended, at any
--- level; no later migration re-states the exemption. The tests pin that
--- under all three levels with the assignment ended mid-transaction.
+-- THE CUSTODIAN HALF. The writer scope itself no longer consults the
+-- custodian role: 123 re-bodied `epigraph_operator_scope_exempt()` to
+-- `epigraph_bypass()` alone (operator ruling OQ-1 (b)), and no later
+-- migration re-states the exemption. The tests pin that under all three
+-- levels with the assignment ended, or elapsed, mid-transaction.
+--
+-- But 123's `epigraph_is_instance_admin(agent)` ("holds
+-- role:platform-custodian") is still a WRITE admission elsewhere: while the
+-- admin-scope switch is unarmed it is the admin arm of 239's agent-key
+-- definers (AK03: another agent's key status change and rotation); it is
+-- also the admin READ arm of 083, 087, 129 and 169's policies and of the
+-- prompt-history definers (161, 199, 268, 276). It decided at `now()`
+-- through the transaction's snapshot:
+--
+--   * under READ COMMITTED, `now()` is the TRANSACTION's start, so a
+--     custodian whose assignment's `valid_to` elapses mid-transaction keeps
+--     the admin answer until its transaction ends;
+--   * under REPEATABLE READ or SERIALIZABLE, an assignment ended by another
+--     session after the snapshot (committed) still reads as live.
+--
+-- Measured on a fresh database (`direct_writer_scope_read_committed.rs`):
+-- on 123's body such a custodian changes another agent's key status
+-- (AK03 admits); on 310's it is refused.
+--
+-- Low while the request path runs READ COMMITTED and the window is never
+-- bounded below a request's length; but the answer must be the current one.
 --
 -- ===================================================================
--- 2. THE CHANGE
+-- 1b. THE CUSTODIAN CHANGE
 -- ===================================================================
 --
--- `CREATE OR REPLACE` of the one function, same signature, STABLE, same
+-- `CREATE OR REPLACE` of `epigraph_is_instance_admin(uuid)`, same
+-- signature, SQL, STABLE, same search path (`public, pg_temp`), owner and
+-- grants (CREATE OR REPLACE keeps them), 123's body with two deltas:
+--
+--   * the role is checked at `clock_timestamp()` (the statement's clock, as
+--     125's elevation liveness and 165's derived arm do), not `now()`;
+--   * a privileged session (`epigraph_bypass()`) answers at any level, as
+--     before; otherwise the answer is true only when `transaction_isolation`
+--     is `read committed` OR the transaction is READ ONLY. A read-only
+--     transaction cannot write anything, and once it has run a query it can
+--     never become read-write, so a snapshot-old answer there only decides
+--     what the snapshot is read as (the export, audit and dry-run readers
+--     keep their admin arms). A read-write REPEATABLE READ / SERIALIZABLE
+--     application session gets false: its admin READ arms (083, 087, 129,
+--     169, 161/199/268/276) go dark too, which is the cost of one rule for
+--     every caller (no such session exists in the tree; every REPEATABLE
+--     READ writer runs on the maintenance DSN).
+--
+-- The subject binding (principal or privileged session) is verbatim.
+-- `epigraph_is_elevated()` (the armed arm) already decides at
+-- `clock_timestamp()`; its snapshot reads, and the audit readers' `now()`
+-- (123's `epigraph_platform_audit`, 127's `epigraph_elevated_access_audit`,
+-- both read-only), are not this item's.
+--
+-- ===================================================================
+-- 2. THE WRITER-SCOPE CHANGE
+-- ===================================================================
+--
+-- `CREATE OR REPLACE` of the writer scope, same signature, STABLE, same
 -- search path (`public, pg_temp`, pg_temp last), 256's body with one delta in
 -- the direct arm:
 --
@@ -69,10 +119,11 @@
 -- fragment `schema_contract.rs::migration_165_derived_arms_survive_at_head`
 -- pins (310's included).
 --
--- PRECONDITION: the body in place must be 256's (md5 of `prosrc`
--- `9693498b3365ddfa8f97d4ead83b2ee6`); over any other body this file raises
--- 55000 and changes nothing, so it never silently discards another
--- migration's re-statement.
+-- PRECONDITION: the writer scope in place must be 256's (md5 of `prosrc`
+-- `9693498b3365ddfa8f97d4ead83b2ee6`) and `epigraph_is_instance_admin` must
+-- be 123's (`e72b915989c3a98801e795d4eb53b769`); over any other body this
+-- file raises 55000 and changes nothing, so it never silently discards
+-- another migration's re-statement.
 --
 -- ===================================================================
 -- 3. DEPLOY ORDER AND UNDO
@@ -83,9 +134,16 @@
 -- default level (`default_transaction_isolation` set on the database or the
 -- role in `pg_db_role_setting`): such a write by a bound principal is
 -- refused OPL02 after 310 (loud) instead of outliving a revoke (silent).
+-- The same measurement covers the custodian change: at another default
+-- level an application-role custodian's admin arm answers false on every
+-- read-write transaction. Also measure whether the admin-scope switch is
+-- armed (`epigraph_admin_scopes_armed()`): armed, AK03 reads
+-- `epigraph_is_elevated()` instead, and the custodian change then touches
+-- only the admin read arms.
 --
--- UNDO: `docs/runbooks/310-undo.sql` restores 256's body; run it BEFORE
--- `256-undo.sql`.
+-- UNDO: `docs/runbooks/310-undo.sql` restores 256's writer scope and 123's
+-- `epigraph_is_instance_admin`; run it BEFORE `256-undo.sql` and BEFORE
+-- `123-undo.sql`.
 -- **Applied to throwaway databases only, NOT to any deployed database.**
 SET LOCAL lock_timeout = '3s';
 
@@ -99,6 +157,17 @@ BEGIN
         RAISE EXCEPTION '310: public.epigraph_require_writer_scope(uuid, uuid) is not the body '
                         '310 re-states (256''s, md5 9693498b3365ddfa8f97d4ead83b2ee6); found '
                         'md5 %. Another migration re-bodied it, or 256 is not applied; nothing '
+                        'was changed', COALESCE(v_found, '(absent)')
+            USING ERRCODE = '55000',
+                  HINT = 'Apply a reconciling migration that re-states the function with '
+                         'every delta instead of this one.';
+    END IF;
+    SELECT pg_catalog.md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
+     WHERE p.oid = pg_catalog.to_regprocedure('public.epigraph_is_instance_admin(uuid)');
+    IF v_found IS DISTINCT FROM 'e72b915989c3a98801e795d4eb53b769' THEN
+        RAISE EXCEPTION '310: public.epigraph_is_instance_admin(uuid) is not the body 310 '
+                        're-states (123''s, md5 e72b915989c3a98801e795d4eb53b769); found '
+                        'md5 %. Another migration re-bodied it, or 123 is not applied; nothing '
                         'was changed', COALESCE(v_found, '(absent)')
             USING ERRCODE = '55000',
                   HINT = 'Apply a reconciling migration that re-states the function with '
@@ -191,3 +260,19 @@ BEGIN
                      'session crosses humans, a custodian''s included.';
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_require_writer_scope(uuid, uuid) FROM PUBLIC;
+
+-- 123's custodian answer; delta: the statement's clock, and on a read-write
+-- transaction of an unprivileged session only under READ COMMITTED (1b).
+CREATE OR REPLACE FUNCTION public.epigraph_is_instance_admin(p_agent uuid)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT COALESCE(
+        p_agent IS NOT NULL
+        AND (p_agent = public.epigraph_principal_id() OR public.epigraph_bypass())
+        AND (public.epigraph_bypass()
+             OR current_setting('transaction_isolation') = 'read committed'
+             OR current_setting('transaction_read_only') = 'on')
+        AND public.epigraph_holds_role(p_agent, 'role:platform-custodian', clock_timestamp()),
+        false)
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_is_instance_admin(uuid) FROM PUBLIC;

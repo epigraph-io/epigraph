@@ -5330,8 +5330,9 @@ restart.
   column or column-ACL drift between a fresh migrate and the deployed database; this change did
   not measure parity with a deployed database.
 - **310**: `direct_writer_scope_read_committed` (backlog e39af056). Re-states 256's
-  `epigraph_require_writer_scope` (an md5 precondition refuses to apply over any other body)
-  so that 122's DIRECT-membership writer arm admits a write only under READ COMMITTED, closing
+  `epigraph_require_writer_scope` and 123's `epigraph_is_instance_admin` (md5 preconditions
+  refuse to apply over any other body). (1) 122's DIRECT-membership writer arm admits a write
+  only under READ COMMITTED, closing
   the residual 256 recorded. Under REPEATABLE READ or SERIALIZABLE the arm read
   `group_memberships` (and the human registration and link behind `epigraph_human_of`) through
   the transaction's first snapshot, so a membership revoked or demoted to reader by another
@@ -5340,21 +5341,35 @@ restart.
   OPL02 ("a write through a direct membership is admitted only under READ COMMITTED"), after the
   privileged-session exemption (the maintenance DSN's REPEATABLE READ tools are unaffected); an
   unbound principal, 256's derived-arm refusal and both of 122's OPL02 refusals are unchanged.
-  Same signature, STABLE, owner, grants and search path (`public, pg_temp`). The custodian half
-  of the backlog item needed no change: 123 re-bodied `epigraph_operator_scope_exempt` to
-  `epigraph_bypass()` alone, so holding role:platform-custodian relieves nothing here, live,
-  ended or elapsed. Pinned by `epigraph-db/tests/direct_writer_scope_read_committed.rs` (a
+  Same signature, STABLE, owner, grants and search path (`public, pg_temp`). (2) The custodian
+  half: the writer scope no longer consults the custodian role (123 re-bodied
+  `epigraph_operator_scope_exempt` to `epigraph_bypass()` alone), but `epigraph_is_instance_admin`
+  is still a write admission elsewhere (239's AK03 admin arm on another agent's key, while the
+  admin-scope switch is unarmed) and decided at the transaction's `now()` through its snapshot,
+  so a custodian whose assignment elapsed (READ COMMITTED) or was ended by another session
+  (REPEATABLE READ / SERIALIZABLE) mid-transaction kept it. It now checks the role at
+  `clock_timestamp()` and, for an unprivileged session, answers true only under READ COMMITTED or
+  in a READ ONLY transaction (which can write nothing); a read-write REPEATABLE READ /
+  SERIALIZABLE application session gets false, its admin read arms included. Same signature,
+  SQL, STABLE, owner, grants and search path. Pinned by
+  `epigraph-db/tests/direct_writer_scope_read_committed.rs` (a
   membership revoked or demoted from a second session mid-transaction: the REPEATABLE READ and
   SERIALIZABLE writer is refused and lands on 256's body; READ COMMITTED, unarmed and privileged
-  controls; a custodian ended or elapsed mid-transaction is refused at all three levels, and
-  writes with 122's exemption restored; the undo, twice, and both refusals over a foreign body),
+  controls; a custodian ended or elapsed mid-transaction is refused its cross-group write at
+  all three levels, even with 122's exemption restored, and writes with 122's exemption over
+  123's custodian answer; the same custodian is refused AK03 on another agent's key at all three
+  levels, a live one is admitted under READ COMMITTED, refused on read-write REPEATABLE READ /
+  SERIALIZABLE and answered true read-only, and on 123's body each refused case is admitted;
+  the undo, twice, and both refusals over a foreign body),
   `derived_writer_scope_read_committed.rs` (its REPEATABLE READ personal-group control is now
   refused; its undo test runs 310's undo first) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
-  `docs/runbooks/310-undo.sql` (run it before `256-undo.sql`). **Deploy order:** none; no binary
-  depends on it. Before applying, measure that no login writing claims on the application role
-  has a non-default `default_transaction_isolation` (`pg_db_role_setting`): such a write by a
-  bound principal is refused after 310. **Applied to throwaway databases only, NOT to any
+  `docs/runbooks/310-undo.sql` (run it before `256-undo.sql` and before `123-undo.sql`).
+  **Deploy order:** none; no binary depends on it. Before applying, measure that no
+  application-role login has a non-default `default_transaction_isolation`
+  (`pg_db_role_setting`): such a claim write by a bound principal is refused after 310, and a
+  custodian's admin arm answers false on its read-write transactions; and measure whether the
+  admin-scope switch is armed (armed, AK03 reads `epigraph_is_elevated()` instead). **Applied to throwaway databases only, NOT to any
   deployed database.**
 
 ## `-- no-transaction` migrations
