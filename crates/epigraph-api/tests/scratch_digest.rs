@@ -256,6 +256,103 @@ fn contested_pairs_are_listed_together_and_a_quoted_partner_only_by_pointer() {
     );
 }
 
+/// Every contested pair the open slice shows, as (smaller id, larger id), in
+/// entry order, duplicates kept so a test can see one.
+fn open_pairs(d: &Digest<'_>) -> Vec<(Uuid, Uuid)> {
+    let pair = |a: Uuid, b: Uuid| if a < b { (a, b) } else { (b, a) };
+    let mut out = Vec::new();
+    for e in &d.open {
+        for v in &e.vs {
+            out.push(pair(e.item.id, v.id));
+        }
+        for u in &e.vs_unlisted {
+            out.push(pair(e.item.id, u.id));
+        }
+    }
+    out
+}
+
+fn assert_each_pair_once(d: &Digest<'_>, expected: &[(u128, u128)]) {
+    let got = open_pairs(d);
+    let unique: BTreeSet<(Uuid, Uuid)> = got.iter().copied().collect();
+    assert_eq!(unique.len(), got.len(), "a pair is shown twice: {got:?}");
+    let want: BTreeSet<(Uuid, Uuid)> = expected
+        .iter()
+        .map(|&(a, b)| {
+            let (a, b) = (id(a), id(b));
+            if a < b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        })
+        .collect();
+    assert_eq!(unique, want);
+}
+
+#[test]
+fn a_partner_shown_under_another_head_still_shows_its_own_quoted_partner() {
+    // A(t3) contradicts P(t5) and W(t13, window); P contradicts Q(t12,
+    // window). A heads (latest conflict) with P in `vs`; P's conflict with Q
+    // must still reach the digest, as a pointer.
+    let s = graph(
+        vec![
+            atom(1, 3, AtomKind::Fact, "The pilot site has 40 beds."),
+            atom(2, 5, AtomKind::Fact, "The pilot site has 48 beds."),
+            atom(3, 13, AtomKind::Fact, "WINDOW The pilot site has 52 beds."),
+            atom(4, 12, AtomKind::Fact, "WINDOW The extension added 4 beds."),
+        ],
+        vec![
+            edge(50, 1, 2, Relationship::Contradicts),
+            edge(51, 3, 1, Relationship::Contradicts),
+            edge(52, 4, 2, Relationship::Refutes),
+        ],
+        &[3, 5, 12, 13],
+    );
+    let d = run(&s, "nothing", 10, 20);
+    assert_each_pair_once(&d, &[(1, 2), (1, 3), (2, 4)]);
+    let q = d
+        .open
+        .iter()
+        .flat_map(|e| e.vs_unlisted.iter())
+        .find(|u| u.id == id(4))
+        .expect("Q's pointer is in the digest");
+    assert_eq!(q.turn, 12);
+    let json = serde_json::to_string(&d).unwrap();
+    assert!(!json.contains("WINDOW"), "a window atom's text leaked");
+}
+
+#[test]
+fn every_contested_pair_is_shown_once_when_both_sides_were_listed_elsewhere() {
+    // A–P, P–Q, Q–C, C–D, all evicted and applied. C's conflict with D is
+    // the latest, so C heads first and lists Q; A then heads and lists P.
+    // Both sides of P–Q are now listed, but under different heads: the pair
+    // itself must still be shown, and no pair twice.
+    let s = graph(
+        vec![
+            atom(1, 3, AtomKind::Fact, "Alpha."),
+            atom(2, 9, AtomKind::Fact, "Papa."),
+            atom(3, 5, AtomKind::Fact, "Quebec."),
+            atom(4, 4, AtomKind::Fact, "Charlie."),
+            atom(5, 10, AtomKind::Fact, "Delta."),
+        ],
+        vec![
+            edge(50, 1, 2, Relationship::Contradicts),
+            edge(51, 2, 3, Relationship::Contradicts),
+            edge(52, 3, 4, Relationship::Contradicts),
+            edge(53, 4, 5, Relationship::Contradicts),
+        ],
+        &[3, 4, 5, 9, 10],
+    );
+    let d = run(&s, "nothing", 11, 20);
+    assert_each_pair_once(&d, &[(1, 2), (2, 3), (3, 4), (4, 5)]);
+    assert_eq!(
+        d.open.iter().map(|e| e.item.id).collect::<Vec<_>>(),
+        vec![id(4), id(1), id(3)],
+        "C, then A, then Q (the older side) for the pair no earlier entry showed"
+    );
+}
+
 #[test]
 fn relevant_pulls_in_a_one_hop_neighbour_with_no_lexical_match() {
     let s = graph(

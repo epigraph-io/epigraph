@@ -29,7 +29,7 @@
 //! | `standing` | decision, preference, instruction, commitment atoms, whatever the query | BetP, then newer turn |
 //! | `relevant` | BM25 top [`RELEVANT_BM25_TOP`], plus one hop from the top [`EXPANSION_SEEDS`] over [`EXPANSION_RELS`] at [`HOP_DECAY`] | blended score, then greedy coverage-vs-relevance selection |
 //! | `recent` | atoms from the [`RECENT_TURNS`] turns below `exclude_turns_from` | newer turn, then BetP |
-//! | `open` | CONTESTED atoms with every contradicting partner, then `question` atoms | latest conflict first; newer question first |
+//! | `open` | CONTESTED atoms with their contradicting partners, each conflict once, then `question` atoms | latest conflict first; newer question first |
 //!
 //! Each slice holds at most `k_per_slice` entries. The slices may overlap;
 //! the runner's packer (`digest.ts::packDigest`) removes duplicates and fits
@@ -153,16 +153,25 @@ pub struct UnlistedPartner {
     pub turn: u64,
 }
 
-/// One entry of the open slice: a CONTESTED atom with all its partners, or a
+/// One entry of the open slice: a CONTESTED atom with its partners, or a
 /// question.
+///
+/// Every contested pair with at least one eligible side appears in exactly
+/// one entry, headed by whichever side comes first in the slice's order
+/// (latest conflict, then the older side). An entry lists only the pairs no
+/// earlier entry showed, so an atom can appear as one entry's partner and
+/// later head its own entry for a different conflict. A renderer must expect
+/// that, and must not assume `vs` holds every partner of the head (the
+/// head's `atom` belief carries the full `contested_with`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OpenEntry<'a> {
     #[serde(flatten)]
     pub item: DigestItem<'a>,
-    /// Eligible partners, listed in full (both sides are always shown).
+    /// Eligible partners whose conflict with the head no earlier entry
+    /// showed, listed in full (both sides of a conflict are always shown).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vs: Vec<DigestItem<'a>>,
-    /// Partners in still-quoted turns.
+    /// Ineligible partners (in the window, or pending), same rule as `vs`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub vs_unlisted: Vec<UnlistedPartner>,
 }
@@ -469,22 +478,28 @@ fn open<'a>(
             .then_with(|| x.0.id.cmp(&y.0.id))
     });
 
+    // Coverage is by PAIR, not by atom: an atom listed as one head's partner
+    // can still head an entry of its own for a conflict no earlier entry
+    // showed. Covering by atom lost a conflict between two atoms that were
+    // each listed under a different head, and a shown partner's conflict with
+    // a still-quoted atom (which never heads an entry) vanished entirely.
+    let pair = |a: Uuid, b: Uuid| if a < b { (a, b) } else { (b, a) };
+    let mut covered: BTreeSet<(Uuid, Uuid)> = BTreeSet::new();
     let mut out = Vec::new();
     let mut shown: BTreeSet<Uuid> = BTreeSet::new();
     for (head, _) in contested {
         if out.len() >= k {
             return out;
         }
-        if shown.contains(&head.id) {
-            continue;
-        }
-        shown.insert(head.id);
         let mut vs = Vec::new();
         let mut vs_unlisted = Vec::new();
         for partner in &beliefs.of(&head.id).contested_with {
             let Some(p) = store.atom(partner) else {
                 continue;
             };
+            if !covered.insert(pair(head.id, p.id)) {
+                continue;
+            }
             if eligible_ids.contains(partner) {
                 shown.insert(p.id);
                 vs.push(item(p, beliefs.of(&p.id), None));
@@ -495,6 +510,11 @@ fn open<'a>(
                 });
             }
         }
+        if vs.is_empty() && vs_unlisted.is_empty() {
+            // Every conflict of this atom is already shown.
+            continue;
+        }
+        shown.insert(head.id);
         out.push(OpenEntry {
             item: item(head, beliefs.of(&head.id), None),
             vs,
