@@ -44,9 +44,13 @@
 -- 173's two tables (`elevation_arms_census.rs`). No function is added or
 -- re-stated, so no definer register entry is owed.
 --
--- PRIVILEGE: no derivation reads a FORCEd table, so any role that owns the
--- table can apply this file; the backfill runs before row security is
--- enabled on it.
+-- PRIVILEGE: apply as the maintenance role or a superuser. Owning the table
+-- is not enough: the two triggers need EXECUTE on 074's
+-- `epigraph_root_require_tenancy()` and 115's
+-- `epigraph_owner_immutable_guard()` (both revoked from PUBLIC), the FK needs
+-- REFERENCES on `groups`, and section 6 deletes from `tenancy_exempt`. No
+-- derivation reads a FORCEd table (the backfill runs before row security is
+-- enabled here), so 173's reads-every-row check has no counterpart.
 --
 -- DEPLOY ORDER: apply before, or with, the API binary that lists the table in
 -- `FORCE_PROTECTED_SET`. That binary refuses to serve on a database where the

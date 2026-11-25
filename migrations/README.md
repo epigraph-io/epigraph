@@ -4757,7 +4757,8 @@ restart.
   **Deploy order:** apply before, or with, the API binary that lists the table in
   `FORCE_PROTECTED_SET` (that binary refuses a database where the table is not FORCEd).
   Measure first: `SELECT count(*) FROM harvester_enriched_concepts` (every existing row becomes
-  public, world-owned, as it is read today). Applies as any role that owns the table.
+  public, world-owned, as it is read today). Apply as the maintenance role or a superuser (the
+  two triggers need EXECUTE on 074's and 115's bodies, revoked from PUBLIC).
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
