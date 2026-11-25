@@ -4815,11 +4815,27 @@ impl ClaimRepository {
     /// `is_current = false` rows (superseded/retired claims must never
     /// suppress a new near-paraphrase insert).
     ///
+    /// # Iterative HNSW scan, then exact (backlog b00aa40e)
+    ///
+    /// Run as [`Self::search_by_embedding_scoped`] runs: an iterative HNSW
+    /// scan ([`begin_iterative_hnsw`]), retried as an exact scan when it comes
+    /// back short ([`exact_retry_or_first_pass`]; `vector_scan` module doc),
+    /// each in a transaction rolled back so the settings never reach the
+    /// caller's later reads. A plain scan yields at most `hnsw.ef_search` rows
+    /// before the visibility splice runs, so rows the caller cannot read,
+    /// nearer the query than its own, emptied its neighbours: the gate missed
+    /// the caller's own near-duplicate (and inserted a second copy), and
+    /// whether it fired told the caller whether foreign rows sit near its
+    /// text.
+    ///
+    /// Takes a connection rather than an executor because the settings need
+    /// a transaction (a savepoint on a caller's own transaction).
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
-    pub async fn nearest_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    #[instrument(skip(conn, viewer, query_embedding_pgvector))]
+    pub async fn nearest_by_embedding(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
@@ -4837,13 +4853,29 @@ impl ClaimRepository {
             "#,
             3,
         );
-        let mut q = sqlx::query_as::<_, NearestClaimHit>(&sql)
-            .bind(query_embedding_pgvector)
-            .bind(limit);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+        // A macro, not a closure: see `search_by_embedding_scoped`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query_as::<_, NearestClaimHit>(&sql)
+                    .bind(query_embedding_pgvector)
+                    .bind(limit);
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q
+            }};
         }
-        let rows = q.fetch_all(executor).await?;
+
+        let mut tx = begin_iterative_hnsw(&mut *conn, limit).await?;
+        let fetched = build!().fetch_all(&mut *tx).await;
+        tx.rollback().await?;
+        let rows = fetched?;
+        if (rows.len() as i64) < limit {
+            let mut tx = begin_exact_vector_scan(&mut *conn).await?;
+            let retried = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            return exact_retry_or_first_pass(retried, rows, "nearest_by_embedding");
+        }
 
         Ok(rows)
     }

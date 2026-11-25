@@ -22,11 +22,11 @@
 //! Scope: the five legs pinned below, which serve `recall`,
 //! `recall_with_context`'s flat seeds, the library `recall`, and the diverse
 //! pipeline's theme-coverage probe and theme candidate query (MCP
-//! `recall_with_context diverse=true` and REST `search/semantic?diverse=true`).
+//! `recall_with_context diverse=true` and REST `search/semantic?diverse=true`),
+//! and the write-side novelty gate (`nearest_by_embedding`, backlog b00aa40e).
 //! NOT covered here: the opt-in workflows leg of `recall`
 //! (`search_by_goal_embedding_since`, served by an IVFFlat index, whose
-//! truncation knobs differ) and the write-side novelty gate
-//! (`nearest_by_embedding`).
+//! truncation knobs differ).
 //!
 //! Each test measures the viewer's page BEFORE and AFTER seeding the hidden
 //! rows, on one connection forced onto the HNSW plan (seq scans and explicit
@@ -314,6 +314,42 @@ async fn hybrid_page(conn: &mut sqlx::PgConnection, viewer: &Viewer) -> Vec<Hybr
     .into_iter()
     .map(|h| (h.claim_id, h.rrf_score, h.dense_similarity, h.in_lexical))
     .collect()
+}
+
+/// The write-side novelty gate's neighbours (`nearest_by_embedding`, what
+/// `submit_claim` and `memorize` read before deciding whether to insert).
+async fn novelty_page(conn: &mut sqlx::PgConnection, viewer: &Viewer) -> Vec<(Uuid, f64)> {
+    ClaimRepository::nearest_by_embedding(&mut *conn, viewer, &vec_angle(0.0), LIMIT)
+        .await
+        .expect("nearest_by_embedding")
+        .into_iter()
+        .map(|h| (h.claim_id, h.distance))
+        .collect()
+}
+
+/// The novelty gate's neighbour read (backlog b00aa40e). It ran a plain HNSW
+/// scan, so a foreign group's 40 nearest rows emptied the caller's
+/// neighbours: its own near-duplicate went unseen (a second copy was
+/// inserted), and whether the gate fired told the caller whether foreign rows
+/// sit near its text.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hidden_rows_do_not_change_the_novelty_gate_neighbours(pool: PgPool) {
+    let (w, visible) = world(&pool).await;
+
+    let (before, _) = on_hnsw!(&pool, VISIBLE as i64, |conn| novelty_page(conn, &w.viewer)
+        .await);
+    let own = before.iter().filter(|(id, _)| visible.contains(id)).count();
+    seed_hidden(&pool, &w).await;
+    let (after, used_index) = on_hnsw!(&pool, (VISIBLE + HIDDEN) as i64, |conn| novelty_page(
+        conn, &w.viewer
+    )
+    .await);
+
+    assert!(
+        used_index,
+        "calibration: the novelty gate's kNN was not served by idx_claims_embedding_hnsw"
+    );
+    assert_identical_pages("nearest_by_embedding", &before, &after, own);
 }
 
 /// The `search_by_embedding_current` / `search_by_embedding_scoped` leg —
@@ -837,4 +873,14 @@ async fn theme_coverage_probe_counts_past_max_scan_tuples(pool: PgPool) {
          hnsw.max_scan_tuples ({SCALED_MAX_SCAN_TUPLES} here) shrank the coverage probe; \
          the probe did not fall back to an exact scan"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn novelty_gate_neighbours_fill_past_max_scan_tuples(pool: PgPool) {
+    let (before, after, visible) =
+        past_bound_case!(&pool, "nearest_by_embedding", false, |conn, w, _t| {
+            novelty_page(conn, &w.viewer).await
+        });
+    let own = before.iter().filter(|(id, _)| visible.contains(id)).count();
+    assert_full_page_past_the_bound("nearest_by_embedding", &before, &after, own);
 }
