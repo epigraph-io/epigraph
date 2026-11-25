@@ -35,7 +35,16 @@ fn ev(turn: u64, c: char) -> Evidence {
     }
 }
 
-fn atom(n: u128, turn: u64, text: &str, supported: f64) -> NewAtom {
+/// A seed with an arbitrary fixed reliability; these tests are about storage,
+/// not belief (`tests/scratch_belief.rs` pins what the two factors mean).
+fn seed(confidence: f64) -> Seed {
+    Seed {
+        confidence,
+        reliability: 0.75,
+    }
+}
+
+fn atom(n: u128, turn: u64, text: &str, confidence: f64) -> NewAtom {
     NewAtom {
         id: id(n),
         text: text.to_string(),
@@ -45,7 +54,7 @@ fn atom(n: u128, turn: u64, text: &str, supported: f64) -> NewAtom {
         epoch: 0,
         quote: Some(format!("anchor {n}")),
         evidence: vec![ev(turn, 'a')],
-        seed: Seed { supported },
+        seed: seed(confidence),
     }
 }
 
@@ -79,7 +88,8 @@ fn put_atoms_is_idempotent_on_id_and_never_overwrites() {
     assert_eq!(first, before.atom(&id(1)).unwrap());
     assert_eq!(first.text, "The pilot site has 40 beds.");
     assert_eq!(first.bbas.len(), 1);
-    assert_eq!(first.bbas[0].supported, 0.71);
+    assert_eq!(first.bbas[0].confidence, 0.71);
+    assert_eq!(first.bbas[0].reliability, 0.75);
     assert_eq!(
         first.evidence,
         vec![Evidence {
@@ -145,15 +155,35 @@ fn put_atoms_rejects_a_bad_batch_whole() {
         (atom(9, 2, "   ", 0.5), StoreError::InvalidValue("text")),
         (
             atom(9, 2, "mass above one", 1.01),
-            StoreError::InvalidValue("seed.supported"),
+            StoreError::InvalidValue("seed.confidence"),
         ),
         (
             atom(9, 2, "negative mass", -0.1),
-            StoreError::InvalidValue("seed.supported"),
+            StoreError::InvalidValue("seed.confidence"),
         ),
         (
             atom(9, 2, "nan mass", f64::NAN),
-            StoreError::InvalidValue("seed.supported"),
+            StoreError::InvalidValue("seed.confidence"),
+        ),
+        (
+            NewAtom {
+                seed: Seed {
+                    confidence: 0.5,
+                    reliability: 1.5,
+                },
+                ..atom(9, 2, "reliability above one", 0.5)
+            },
+            StoreError::InvalidValue("seed.reliability"),
+        ),
+        (
+            NewAtom {
+                seed: Seed {
+                    confidence: 0.5,
+                    reliability: f64::NAN,
+                },
+                ..atom(9, 2, "nan reliability", 0.5)
+            },
+            StoreError::InvalidValue("seed.reliability"),
         ),
         (
             NewAtom {
@@ -196,8 +226,20 @@ fn masses_are_quantized_to_the_micro_grid() {
         atom(1, 1, "third", 1.0 / 3.0),
         atom(2, 1, "long", 0.712_345_678_9),
     ]);
-    assert_eq!(s.atom(&id(1)).unwrap().bbas[0].supported, 0.333_333);
-    assert_eq!(s.atom(&id(2)).unwrap().bbas[0].supported, 0.712_346);
+    assert_eq!(s.atom(&id(1)).unwrap().bbas[0].confidence, 0.333_333);
+    assert_eq!(s.atom(&id(2)).unwrap().bbas[0].confidence, 0.712_346);
+
+    // The reliability is stored on the same grid, apart from the confidence:
+    // neither is folded into the other at write time (critic finding X6).
+    let s = store_with(vec![NewAtom {
+        seed: Seed {
+            confidence: 0.8,
+            reliability: 2.0 / 3.0,
+        },
+        ..atom(3, 1, "two thirds", 0.0)
+    }]);
+    let bba = s.atom(&id(3)).unwrap().bbas[0];
+    assert_eq!((bba.confidence, bba.reliability), (0.8, 0.666_667));
 }
 
 #[test]
@@ -215,19 +257,13 @@ fn corroborate_appends_seed_and_evidence_once_per_corroboration_id() {
     }];
 
     assert!(s
-        .corroborate(
-            corroboration,
-            id(1),
-            Seed { supported: 0.6 },
-            restating.clone(),
-            t(4)
-        )
+        .corroborate(corroboration, id(1), seed(0.6), restating.clone(), t(4))
         .unwrap());
     let a = s.atom(&id(1)).unwrap();
     assert_eq!(
         a.bbas
             .iter()
-            .map(|b| (b.source, b.supported))
+            .map(|b| (b.source, b.confidence))
             .collect::<Vec<_>>(),
         vec![(id(1), 0.8), (corroboration, 0.6)]
     );
@@ -240,19 +276,13 @@ fn corroborate_appends_seed_and_evidence_once_per_corroboration_id() {
     // mark_applied) must not combine the BBA a second time.
     let after_first = s.clone();
     assert!(!s
-        .corroborate(
-            corroboration,
-            id(1),
-            Seed { supported: 0.6 },
-            restating,
-            t(8)
-        )
+        .corroborate(corroboration, id(1), seed(0.6), restating, t(8))
         .unwrap());
     assert_eq!(s, after_first);
 
     // A different corroboration id is new evidence and is combined.
     assert!(s
-        .corroborate(id(101), id(1), Seed { supported: 0.5 }, vec![], t(9))
+        .corroborate(id(101), id(1), seed(0.5), vec![], t(9))
         .unwrap());
     assert_eq!(s.atom(&id(1)).unwrap().bbas.len(), 3);
 }
@@ -262,15 +292,28 @@ fn corroborate_refuses_unknown_targets_and_bad_input() {
     let mut s = store_with(vec![atom(1, 1, "kept", 0.5)]);
     let before = s.clone();
     assert_eq!(
-        s.corroborate(id(100), id(42), Seed { supported: 0.5 }, vec![], t(2)),
+        s.corroborate(id(100), id(42), seed(0.5), vec![], t(2)),
         Err(StoreError::UnknownAtom(id(42)))
     );
     assert_eq!(
-        s.corroborate(id(100), id(1), Seed { supported: 2.0 }, vec![], t(2)),
-        Err(StoreError::InvalidValue("seed.supported"))
+        s.corroborate(id(100), id(1), seed(2.0), vec![], t(2)),
+        Err(StoreError::InvalidValue("seed.confidence"))
+    );
+    assert_eq!(
+        s.corroborate(
+            id(100),
+            id(1),
+            Seed {
+                confidence: 0.5,
+                reliability: -0.01
+            },
+            vec![],
+            t(2)
+        ),
+        Err(StoreError::InvalidValue("seed.reliability"))
     );
     assert!(matches!(
-        s.corroborate(id(1), id(1), Seed { supported: 0.5 }, vec![], t(2)),
+        s.corroborate(id(1), id(1), seed(0.5), vec![], t(2)),
         Err(StoreError::Conflict(_))
     ));
     assert_eq!(s, before);

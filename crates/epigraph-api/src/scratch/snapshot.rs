@@ -46,6 +46,11 @@ use sha2::{Digest, Sha256};
 use super::store::{ScratchAtom, ScratchEdge, ScratchStore};
 
 /// The snapshot format version this build reads and writes.
+///
+/// Still 1 after E2 replaced a seed's `supported` with `confidence` and
+/// `reliability`: no format-1 snapshot existed outside tests when it did. A
+/// snapshot of the older shape fails to decode, restore falls back to `.prev`
+/// or empty, and the runner backfills from its kept atoms (DESIGN §4.2).
 pub const FORMAT: u32 = 1;
 
 /// `,"sha256":"` — the member that closes every snapshot object.

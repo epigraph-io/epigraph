@@ -84,18 +84,30 @@ pub struct Evidence {
     pub quote: Option<String>,
 }
 
-/// The seed mass a caller supplies with an atom or a corroboration.
+/// The seed a caller supplies with an atom or a corroboration: the
+/// extractor's confidence and the speaker's reliability, kept apart.
 ///
-/// Slice 1 meaning: `supported` is the mass on `{supported}` exactly as the
-/// runner computed it; the rest is on Θ. The store applies no discount of its
-/// own. How that mass becomes an epigraph-ds `MassFunction` (and whether the
-/// speaker reliability is folded in here or applied as a source strength,
-/// critic finding X6) is decided in E2, which then changes this contract
-/// explicitly.
+/// The undiscounted mass is `m({supported}) = confidence`, the rest on Θ.
+/// `reliability` (the runner's speaker table, DESIGN §3.4) is applied ONCE,
+/// as the BBA's source strength, when the `belief` module seeds it through
+/// `epigraph_engine::cdst_bp::seed_mass`. The resulting
+/// `m({supported}) = confidence × reliability` is what DESIGN §3.4 asks for.
+///
+/// The two factors are separate fields with these names, not a single
+/// pre-multiplied `supported` mass (DESIGN §4.2's sketch), on purpose (critic
+/// finding X6): a caller that multiplied `confidence × reliability` itself
+/// and ALSO passed the reliability would discount twice, and the child could
+/// not tell. A caller still sending the old `supported` key is refused
+/// (`deny_unknown_fields`), never silently mis-weighted.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Seed {
-    pub supported: f64,
+    /// Extractor confidence in the atom, in `[0, 1]`, NOT yet multiplied by
+    /// the speaker reliability.
+    pub confidence: f64,
+    /// Speaker reliability in `[0, 1]`, applied by belief as the source
+    /// strength.
+    pub reliability: f64,
 }
 
 /// One stored seed BBA and the write that contributed it.
@@ -104,8 +116,11 @@ pub struct Seed {
 pub struct SeedBba {
     /// The atom id for the atom's own seed, or the corroboration id.
     pub source: Uuid,
-    /// Mass on `{supported}`, quantized to 1e-6 (see [`quantize_mass`]).
-    pub supported: f64,
+    /// Undiscounted mass on `{supported}`, quantized to 1e-6 (see
+    /// [`quantize_mass`]).
+    pub confidence: f64,
+    /// Source strength, quantized to 1e-6.
+    pub reliability: f64,
 }
 
 /// A stored atom (DESIGN §4.3 `ScratchAtom`).
@@ -285,11 +300,22 @@ fn validate_evidence(evidence: &[Evidence]) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_seed(seed: Seed) -> Result<f64, StoreError> {
-    if !seed.supported.is_finite() || !(0.0..=1.0).contains(&seed.supported) {
-        return Err(StoreError::InvalidValue("seed.supported"));
+fn unit_interval(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+/// Validate a seed and put both factors on the 1e-6 grid.
+fn validate_seed(seed: Seed) -> Result<(f64, f64), StoreError> {
+    if !unit_interval(seed.confidence) {
+        return Err(StoreError::InvalidValue("seed.confidence"));
     }
-    Ok(quantize_mass(seed.supported))
+    if !unit_interval(seed.reliability) {
+        return Err(StoreError::InvalidValue("seed.reliability"));
+    }
+    Ok((
+        quantize_mass(seed.confidence),
+        quantize_mass(seed.reliability),
+    ))
 }
 
 /// The scratch graph of one chat, for one epoch.
@@ -438,7 +464,7 @@ impl ScratchStore {
         }
         let mut outcome = BatchOutcome::default();
         let created_at = timestamp(now);
-        for (atom, supported) in atoms.into_iter().zip(seeds) {
+        for (atom, (confidence, reliability)) in atoms.into_iter().zip(seeds) {
             if self.atoms.contains_key(&atom.id) {
                 outcome.existing += 1;
                 continue;
@@ -469,7 +495,8 @@ impl ScratchStore {
                     evidence,
                     bbas: vec![SeedBba {
                         source: atom.id,
-                        supported,
+                        confidence,
+                        reliability,
                     }],
                 },
             );
@@ -492,7 +519,7 @@ impl ScratchStore {
         evidence: Vec<Evidence>,
         now: DateTime<Utc>,
     ) -> Result<bool, StoreError> {
-        let supported = validate_seed(seed)?;
+        let (confidence, reliability) = validate_seed(seed)?;
         validate_evidence(&evidence)?;
         if id == target {
             return Err(StoreError::Conflict(
@@ -508,7 +535,8 @@ impl ScratchStore {
         }
         atom.bbas.push(SeedBba {
             source: id,
-            supported,
+            confidence,
+            reliability,
         });
         atom.evidence.extend(evidence);
         self.touch(now);

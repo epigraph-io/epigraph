@@ -27,7 +27,7 @@
 //! | `health` | — | `status`, `format`, `scope`, `epoch`, `restored_from`, `restore_degraded`, `version` |
 //! | `stats` | — | `atoms`, `current_atoms`, `edges`, `applied_turns`, `max_applied_turn` |
 //! | `candidates` | `text`, `k`? (10), `recent`? (10) | `candidates: [{id,text,kind,speaker,turn,via,score}]` |
-//! | `put_atoms` | `atoms: [{id,text,kind,speaker,turn,epoch,quote?,evidence?,seed:{supported}}]` | `inserted`, `existing` |
+//! | `put_atoms` | `atoms: [{id,text,kind,speaker,turn,epoch,quote?,evidence?,seed:{confidence,reliability}}]` | `inserted`, `existing` |
 //! | `corroborate` | `corroboration_id`, `target`, `seed`, `evidence`? | `applied` |
 //! | `add_edges` | `edges: [{id,source,target,rel}]` | `inserted`, `existing` |
 //! | `supersede` | `old`, `new`, `reason`? | `changed` |
@@ -37,8 +37,12 @@
 //! | `snapshot` | — | `bytes` |
 //! | `update_belief`, `digest` | — | `not_implemented` until E2 |
 //!
-//! Two departures from DESIGN §4.2's sketch:
+//! Three departures from DESIGN §4.2's sketch:
 //!
+//! * `seed` is `{confidence, reliability}`, not a pre-multiplied
+//!   `{supported}` (critic finding X6): the child applies the reliability
+//!   once, as the source strength, so a caller never multiplies it in itself
+//!   (see [`super::store::Seed`]). The old key is refused.
 //! * `corroborate` takes a `corroboration_id` the sketch does not list: the
 //!   id the restating atom would have had (its UUIDv5). It makes a replayed
 //!   corroboration a no-op; without it a replay double-counts the BBA.

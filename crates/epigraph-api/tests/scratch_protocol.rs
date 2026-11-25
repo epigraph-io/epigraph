@@ -117,7 +117,7 @@ fn atom(n: u32, turn: u64, text: &str) -> Value {
         "id": uuid(n), "text": text, "kind": "decision", "speaker": "user",
         "turn": turn, "epoch": 0, "quote": "anchor",
         "evidence": [{"path": format!("turns/{turn}.json"), "sha256": sha(), "span": "user:0"}],
-        "seed": {"supported": 0.71},
+        "seed": {"confidence": 0.71, "reliability": 0.75},
     })
 }
 
@@ -158,11 +158,11 @@ fn a_session_of_ops_round_trips_over_stdio() {
     // A misspelt or mis-cased key is refused, never silently dropped.
     let refused = s.call(
         json!({"id": 4, "op": "corroborate", "corroborationId": uuid(100),
-        "target": uuid(2), "seed": {"supported": 0.6}}),
+        "target": uuid(2), "seed": {"confidence": 0.6, "reliability": 0.75}}),
     );
     assert_eq!(refused["error"], "bad_request", "{refused}");
     let corroborate = json!({"op": "corroborate", "id": 5, "corroboration_id": uuid(100), "target": uuid(2),
-        "seed": {"supported": 0.6}, "evidence": [{"path": "turns/9.json", "sha256": sha()}]});
+        "seed": {"confidence": 0.6, "reliability": 0.75}, "evidence": [{"path": "turns/9.json", "sha256": sha()}]});
     assert_eq!(s.ok(corroborate.clone())["applied"], true);
     // The replay (same corroboration_id) is acknowledged and not combined again.
     assert_eq!(s.ok(corroborate)["applied"], false);
@@ -277,16 +277,53 @@ fn bad_lines_get_an_error_and_the_child_keeps_serving() {
 }
 
 #[test]
+fn a_seed_must_carry_confidence_and_reliability_apart() {
+    // Critic finding X6: a caller following DESIGN §4.2's old sketch sends a
+    // pre-multiplied `{"supported": c×r}`. It must be refused, not stored as
+    // a confidence that belief would then discount by the reliability again.
+    let dir = TempDir::new("seed");
+    let mut s = Scratch::spawn(&dir.graph(), 0);
+    let with_seed = |n: u32, seed: Value| {
+        let mut a = atom(n, 1, "The pilot uses v2 probes.");
+        a["seed"] = seed;
+        json!({"id": n, "op": "put_atoms", "atoms": [a]})
+    };
+    for (n, seed) in [
+        (1, json!({"supported": 0.71})),
+        (2, json!({"supported": 0.71, "reliability": 0.75})),
+        (3, json!({"confidence": 0.71})),
+        (4, json!({"reliability": 0.75})),
+    ] {
+        let r = s.call(with_seed(n, seed.clone()));
+        assert_eq!(r["ok"], false, "{seed} -> {r}");
+        assert_eq!(r["error"], "bad_request", "{seed} -> {r}");
+    }
+    assert_eq!(s.ok(json!({"id": 9, "op": "stats"}))["atoms"], 0);
+
+    // The accepted shape stores both factors as sent.
+    s.ok(with_seed(
+        10,
+        json!({"confidence": 0.8, "reliability": 0.95}),
+    ));
+    let stored = s.ok(json!({"id": 11, "op": "atom", "atom_id": uuid(10)}));
+    assert_eq!(
+        stored["atom"]["bbas"],
+        json!([{"source": uuid(10), "confidence": 0.8, "reliability": 0.95}])
+    );
+    s.finish();
+}
+
+#[test]
 fn error_details_never_echo_request_text() {
     let dir = TempDir::new("detail");
     let mut s = Scratch::spawn(&dir.graph(), 0);
     let secret = "SECRET-CHAT-TEXT-7f3a";
     let probes = vec![
         json!({"id": 1, "op": "put_atoms", "atoms": [{"id": uuid(1), "text": secret, "kind": secret,
-            "speaker": "user", "turn": 1, "epoch": 0, "seed": {"supported": 0.5}}]}),
+            "speaker": "user", "turn": 1, "epoch": 0, "seed": {"confidence": 0.5, "reliability": 0.75}}]}),
         json!({"id": 2, "op": "candidates", "text": 17}),
         json!({"id": 3, "op": "put_atoms", "atoms": [{"id": uuid(1), "text": secret, "kind": "fact",
-            "speaker": "user", "turn": 1, "epoch": 3, "seed": {"supported": 0.5}}]}),
+            "speaker": "user", "turn": 1, "epoch": 3, "seed": {"confidence": 0.5, "reliability": 0.75}}]}),
         json!({"id": 4, "op": "mark_applied", "turn": secret}),
     ];
     for p in probes {

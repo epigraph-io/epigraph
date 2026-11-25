@@ -54,7 +54,7 @@ impl Drop for TempDir {
     }
 }
 
-fn new_atom(n: u128, turn: u64, text: &str, supported: f64) -> NewAtom {
+fn new_atom(n: u128, turn: u64, text: &str, confidence: f64) -> NewAtom {
     NewAtom {
         id: id(n),
         text: text.to_string(),
@@ -69,7 +69,12 @@ fn new_atom(n: u128, turn: u64, text: &str, supported: f64) -> NewAtom {
             span: Some("tool:2".into()),
             quote: None,
         }],
-        seed: Seed { supported },
+        seed: Seed {
+            confidence,
+            // Off the 1e-6 grid on purpose, like the confidences: both are
+            // quantized before they reach a snapshot.
+            reliability: 0.95 + 1.0 / 3.0e7,
+        },
     }
 }
 
@@ -106,7 +111,8 @@ fn rich_store() -> ScratchStore {
         id(90),
         id(3),
         Seed {
-            supported: 0.300_000_000_000_000_04,
+            confidence: 0.300_000_000_000_000_04,
+            reliability: 2.0 / 3.0,
         },
         vec![],
         t(2),
@@ -193,7 +199,8 @@ fn write_restore_write_is_byte_identical() {
             id(90),
             id(3),
             Seed {
-                supported: 0.300_000_000_000_000_04,
+                confidence: 0.300_000_000_000_000_04,
+                reliability: 2.0 / 3.0,
             },
             vec![],
             t(2),
