@@ -5,7 +5,8 @@
 //! - `POST /api/v1/experiments/hypothesize`  - Evaluate a scientific hypothesis
 //! - `POST /api/v1/methods`                  - Add a characterization/synthesis method
 //! - `GET  /api/v1/methods/search`           - Search methods by embedding similarity
-//! - `GET  /api/v1/methods/:id/gaps`         - Method gap analysis for a hypothesis
+//! - `GET  /api/v1/methods/gap-analysis`     - Method gap analysis for a hypothesis
+//!   (`?hypothesis_id=<uuid>&required_capabilities=a,b`; see `MethodGapQuery`)
 //! - `POST /api/v1/experiments/design`        - Design an experiment protocol
 //!
 //! # Tenancy: 3 of this file's 11 raw-pool sites are converted
@@ -85,11 +86,39 @@ pub struct FindMethodsQuery {
 #[derive(Debug, Deserialize)]
 pub struct MethodGapQuery {
     pub hypothesis_id: Uuid,
-    pub required_capabilities: Option<Vec<String>>,
+    /// The capabilities to analyse, as ONE comma-separated value:
+    /// `?required_capabilities=xps,afm`. Each entry is trimmed and empty
+    /// entries are dropped; read it through [`Self::capabilities`].
+    ///
+    /// A `String`, not a `Vec<String>` (backlog 97381982): axum's `Query`
+    /// decodes with `serde_urlencoded`, which takes no sequence, so a
+    /// `Vec` field turned every request that named a capability into a 400
+    /// before the handler ran. The repeated-key spelling
+    /// (`?required_capabilities=a&required_capabilities=b`) is still a 400
+    /// (a duplicate field), so a client cannot have half its list read.
+    pub required_capabilities: Option<String>,
     pub max_paper_age_years: Option<i32>,
 }
 
-/// Upper bound on `MethodGapQuery::required_capabilities`.
+#[cfg(feature = "db")]
+impl MethodGapQuery {
+    /// [`Self::required_capabilities`] split on `,`, each entry trimmed, empty
+    /// entries dropped. Absent, empty or all-blank is the empty list.
+    #[must_use]
+    pub fn capabilities(&self) -> Vec<String> {
+        self.required_capabilities
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// Upper bound on the number of entries in `MethodGapQuery::capabilities()`
+/// (the parsed, comma-separated `required_capabilities` list).
 ///
 /// `method_gap_analysis` holds one pooled connection for the duration of its
 /// analysis (conversion shard 6), and the statements it issues on that
@@ -454,7 +483,10 @@ pub async fn find_methods(
     })))
 }
 
-/// GET /api/v1/methods/:id/gaps - Method gap analysis for a hypothesis.
+/// GET /api/v1/methods/gap-analysis - Method gap analysis for a hypothesis.
+///
+/// `?hypothesis_id=<uuid>&required_capabilities=<a>,<b>&max_paper_age_years=<n>`:
+/// the capabilities are one comma-separated value (see `MethodGapQuery`).
 #[cfg(feature = "db")]
 pub async fn method_gap_analysis(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -464,7 +496,7 @@ pub async fn method_gap_analysis(
     let max_age = params.max_paper_age_years.unwrap_or(5);
     let current_year = chrono::Utc::now().year();
 
-    let capabilities = params.required_capabilities.clone().unwrap_or_default();
+    let capabilities = params.capabilities();
 
     // Bounded before the connection is acquired, deliberately in that order.
     // This handler now holds one pooled connection for the duration of its
