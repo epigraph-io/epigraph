@@ -17,7 +17,10 @@
 //! Scope guard: PR-1 only adds lower-case twins to UPPER readers. It does NOT
 //! widen the lower-case-only claim/claim readers to UPPER (scope §4.1 is an
 //! operator ruling), so `semantic_graph_neighbors` keeps ignoring an upper-case
-//! claim/claim `SUPPORTS` row, pinned below.
+//! claim/claim `SUPPORTS` row, pinned below. `SemanticLinkRepository::get_by_type`
+//! is the one claim/claim reader widened since, at backlog be76e301's request
+//! (its row mapping now reads both spellings); `semantic_graph_neighbors` is
+//! unchanged.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;

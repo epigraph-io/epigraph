@@ -844,7 +844,7 @@ pub struct ScopedPool {
     /// behaviour a `#[sqlx::test]` database (one DSN, a superuser role) wants.
     ///
     /// Set only by the `test-support` constructors and
-    /// [`ScopedPool::with_application_pool_maintenance_for_tests`]; every
+    /// `ScopedPool::with_application_pool_maintenance_for_tests`; every
     /// production constructor leaves it `false`. Deliberately NOT the same as
     /// attaching `inner` with [`ScopedPool::with_maintenance_pool`]:
     /// [`ScopedPool::has_maintenance_pool`] stays `false`, so a request-serving
@@ -1528,7 +1528,7 @@ impl ScopedPool {
     /// which is unsound in exactly the way plan §4.3 warns once row security is
     /// on — a bypass viewer emits no predicate but the policy still filters,
     /// so it returned zero rows with no error. The only fallback left is the
-    /// test-support opt-in ([`Self::with_application_pool_maintenance_for_tests`]).
+    /// test-support opt-in (`with_application_pool_maintenance_for_tests`, `test-support` only).
     /// The lease makes the coupling unforgeable; it does not make the
     /// connection privileged, which is why the privilege is checked separately
     /// by [`assert_maintenance_privilege`] at process start.
