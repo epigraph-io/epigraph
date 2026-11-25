@@ -4980,6 +4980,10 @@ mod definer_register_tests {
         // application and maintenance roles both SELECT it), as its caller;
         // its owner changes no answer.
         "epigraph_unnamed_agent_name",
+        // 298 (human-identity visibility, operator ruling C6): the LEAKPROOF
+        // accessor of an ingest record's ingester, `properties ->> 'ingested_by'`.
+        // It reads no table at all; its owner changes no answer.
+        "epigraph_ingest_record_ingester",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,

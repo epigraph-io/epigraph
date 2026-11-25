@@ -75,8 +75,8 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "idx_mass_functions_public_by_source",
     ),
     (
-        "294_idx_edges_public_ingest_records_by_ingester.sql",
-        "idx_edges_public_ingest_records_by_ingester",
+        "299_idx_edges_public_ingest_records_by_ingester_lp.sql",
+        "idx_edges_public_ingest_records_by_ingester_lp",
     ),
     // The per-bound-agent probe of 297's countersigned-authorship arm
     // (operator ruling C2).
@@ -95,6 +95,11 @@ const DROPPED_INDEX_MIGRATIONS: &[&str] = &[
     "276_idx_claims_group_by_agent.sql",
     "289_drop_idx_claims_public_by_agent.sql",
     "290_drop_idx_claims_group_by_agent.sql",
+    // 294's index on the bare `->>` could be no index condition under the
+    // core's row security; 299 (on 298's LEAKPROOF accessor) replaces it and
+    // 301 drops it.
+    "294_idx_edges_public_ingest_records_by_ingester.sql",
+    "301_drop_idx_edges_public_ingest_records_by_ingester.sql",
 ];
 
 /// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
@@ -215,6 +220,174 @@ async fn the_superseded_claim_arm_indexes_are_dropped(pool: PgPool) {
             .expect("to_regclass");
         assert!(found.is_some(), "CALIBRATION: {index} exists");
     }
+}
+
+/// Every per-bound-agent probe of the disclosure core reaches its index WITH
+/// the core's row security in force (human-identity visibility spec, section
+/// 11.1, after the C5 / C6 / C2 measurement).
+///
+/// The core is a maintenance-owned definer and the probed tables are FORCE
+/// RLS, so in the definer frame each probe runs under its table's policy. A
+/// qual that is not leakproof (a jsonb `->>`, a uuid-to-text cast on a Var)
+/// cannot be evaluated ahead of the policy qual, so it can be no index
+/// condition: 297's ingest-record probe (`(r.properties ->> 'ingested_by') =
+/// b.agent_id::text`) fell back to `idx_edges_created_at` and took 198 s per
+/// evaluation on the harness shape. The pins in
+/// `the_partial_tenancy_indexes_serve_an_explicit_visibility_qual` run on the
+/// superuser pool, where row security never applies, and passed regardless.
+/// These run under `SET ROLE epigraph_maintenance`, the core's owner, as the
+/// perf harness does, in the core's own per-bound-agent shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    for stmt in ["SET ROLE epigraph_maintenance", "SET enable_seqscan = off"] {
+        sqlx::query(stmt)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    async fn explain(conn: &mut sqlx::PgConnection, sql: &str) -> String {
+        sqlx::query_scalar::<_, String>(&format!("EXPLAIN (COSTS OFF) {sql}"))
+            .fetch_all(conn)
+            .await
+            .unwrap_or_else(|e| panic!("EXPLAIN {sql}: {e}"))
+            .join("\n")
+    }
+    let rows_from =
+        "ROWS FROM (pg_catalog.unnest(ARRAY['00000000-0000-0000-0000-00000000feed'::uuid, \
+                                                   '00000000-0000-0000-0000-00000000f00d'::uuid]), \
+                                pg_catalog.unnest(ARRAY['-infinity'::timestamptz, now()])) \
+                     AS b(agent_id, since)";
+    let text_rows_from = "ROWS FROM (pg_catalog.unnest(ARRAY['00000000-0000-0000-0000-00000000feed', \
+                                                        '00000000-0000-0000-0000-00000000f00d']::text[]), \
+                                     pg_catalog.unnest(ARRAY['-infinity'::timestamptz, now()])) \
+                          AS b(agent_text, since)";
+    let lateral =
+        |body: &str| format!("SELECT 1 FROM {rows_from} CROSS JOIN LATERAL ({body} LIMIT 1) x");
+    for (label, sql, index) in [
+        (
+            "public claim (288)",
+            lateral(
+                "SELECT 1 FROM public.claims c WHERE c.agent_id = b.agent_id \
+                   AND c.visibility = 'public' AND c.created_at >= b.since",
+            ),
+            "idx_claims_public_by_agent_since",
+        ),
+        (
+            "readable claim (288)",
+            format!(
+                "SELECT 1 FROM {rows_from} \
+                  CROSS JOIN pg_catalog.unnest(ARRAY['00000000-0000-0000-0000-00000000beef'::uuid]) \
+                             vg(group_id) \
+                  CROSS JOIN LATERAL (SELECT 1 FROM public.claims c \
+                                       WHERE c.agent_id = b.agent_id \
+                                         AND c.owner_group_id = vg.group_id \
+                                         AND c.visibility <> 'public' \
+                                         AND c.created_at >= b.since LIMIT 1) x"
+            ),
+            "idx_claims_group_by_agent_since",
+        ),
+        (
+            "evidence (295)",
+            lateral(
+                "SELECT 1 FROM public.evidence e WHERE e.signer_id = b.agent_id \
+                   AND e.visibility = 'public' AND e.created_at >= b.since",
+            ),
+            "idx_evidence_public_by_signer",
+        ),
+        (
+            "challenge (295)",
+            lateral(
+                "SELECT 1 FROM public.challenges ch WHERE ch.challenger_id = b.agent_id \
+                   AND ch.visibility = 'public' AND ch.created_at >= b.since",
+            ),
+            "idx_challenges_public_by_challenger",
+        ),
+        (
+            "BBA (295)",
+            lateral(
+                "SELECT 1 FROM public.mass_functions m WHERE m.source_agent_id = b.agent_id \
+                   AND m.visibility = 'public' AND m.created_at >= b.since",
+            ),
+            "idx_mass_functions_public_by_source",
+        ),
+        (
+            "ingest record (300)",
+            format!(
+                "SELECT 1 FROM {text_rows_from} \
+                  CROSS JOIN LATERAL (SELECT 1 FROM public.edges r \
+                                       WHERE public.epigraph_ingest_record_ingester(r.properties) \
+                                             = b.agent_text \
+                                         AND r.relationship = 'ingested_claim' \
+                                         AND r.visibility = 'public' \
+                                         AND r.created_at >= b.since \
+                                         AND (r.properties -> 'ingest_written' ->> 'by') \
+                                             = public.epigraph_ingest_record_ingester(r.properties) \
+                                       LIMIT 1) x"
+            ),
+            "idx_edges_public_ingest_records_by_ingester_lp",
+        ),
+        (
+            "countersign act (300)",
+            lateral(
+                "SELECT s.agent_id FROM public.security_events s WHERE s.agent_id = b.agent_id \
+                   AND s.event_type = 'authorship.countersigned' AND s.created_at >= b.since",
+            ),
+            "idx_security_events_countersigned",
+        ),
+    ] {
+        let plan = explain(&mut conn, &sql).await;
+        assert!(
+            plan.contains(index) && plan.contains("created_at >="),
+            "{label}: under the core's row security the probe must reach {index} with the \
+             binding start as an index bound. Plan:\n{plan}"
+        );
+    }
+
+    // The countersign arm's paper: the paper id is computed in a fenced
+    // subquery so the join is `uuid = Var` (leakproof) and reaches papers' key.
+    let plan = explain(
+        &mut conn,
+        &lateral(
+            "SELECT 1 FROM (SELECT (s.details ->> 'paper_id')::uuid AS paper_id \
+                              FROM public.security_events s \
+                             WHERE s.agent_id = b.agent_id \
+                               AND s.event_type = 'authorship.countersigned' \
+                               AND s.created_at >= b.since OFFSET 0) s \
+               JOIN public.papers p ON p.id = s.paper_id \
+              WHERE (p.visibility = 'public' \
+                     OR p.owner_group_id = ANY (ARRAY['00000000-0000-0000-0000-00000000beef'::uuid]))",
+        ),
+    )
+    .await;
+    assert!(
+        plan.contains("papers_pkey"),
+        "the countersign arm must look its paper up by key under row security. Plan:\n{plan}"
+    );
+
+    // CALIBRATION, and the record of why 300 exists: 297's spelling of the
+    // ingest-record probe reaches no ingester index under row security.
+    let plan = explain(
+        &mut conn,
+        &lateral(
+            "SELECT 1 FROM public.edges r \
+              WHERE (r.properties ->> 'ingested_by') = b.agent_id::text \
+                AND r.relationship = 'ingested_claim' AND r.visibility = 'public' \
+                AND r.created_at >= b.since",
+        ),
+    )
+    .await;
+    // The planner may still pick a partial index for its predicate and the
+    // created_at range, but the ingester comparison is left as a row filter.
+    assert!(
+        plan.lines()
+            .any(|l| l.contains("Filter:") && l.contains("ingested_by"))
+            && !plan
+                .lines()
+                .any(|l| l.contains("Index Cond:") && l.contains("ingested_by")),
+        "CALIBRATION: a non-leakproof `->>` is no index condition under row security. \
+         Plan:\n{plan}"
+    );
 }
 
 /// The three partial tenancy indexes must all spell their predicate the SAME
@@ -343,57 +516,6 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
         "288's readable-claim probe must reach idx_claims_group_by_agent_since with the \
          binding start as an index bound. Plan:\n{plan}"
     );
-
-    // 295's probes for every other kind of public assertion (C6) reach 291-294's
-    // indexes, each with the binding start in the index condition.
-    for (probe, index) in [
-        (
-            "SELECT 1 FROM evidence e \
-              WHERE e.signer_id = '00000000-0000-0000-0000-00000000feed'::uuid \
-                AND e.visibility = 'public' \
-                AND e.created_at >= '2026-01-01'::timestamptz LIMIT 1",
-            "idx_evidence_public_by_signer",
-        ),
-        (
-            "SELECT 1 FROM challenges ch \
-              WHERE ch.challenger_id = '00000000-0000-0000-0000-00000000feed'::uuid \
-                AND ch.visibility = 'public' \
-                AND ch.created_at >= '2026-01-01'::timestamptz LIMIT 1",
-            "idx_challenges_public_by_challenger",
-        ),
-        (
-            "SELECT 1 FROM mass_functions m \
-              WHERE m.source_agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
-                AND m.visibility = 'public' \
-                AND m.created_at >= '2026-01-01'::timestamptz LIMIT 1",
-            "idx_mass_functions_public_by_source",
-        ),
-        (
-            "SELECT 1 FROM edges r \
-              WHERE (r.properties ->> 'ingested_by') = '00000000-0000-0000-0000-00000000feed' \
-                AND r.relationship = 'ingested_claim' \
-                AND r.visibility = 'public' \
-                AND r.created_at >= '2026-01-01'::timestamptz \
-                AND (r.properties -> 'ingest_written' ->> 'by') = (r.properties ->> 'ingested_by') \
-              LIMIT 1",
-            "idx_edges_public_ingest_records_by_ingester",
-        ),
-        // 297's countersigned-authorship probe (C2).
-        (
-            "SELECT 1 FROM security_events s \
-              WHERE s.agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
-                AND s.event_type = 'authorship.countersigned' \
-                AND s.created_at >= '2026-01-01'::timestamptz LIMIT 1",
-            "idx_security_events_countersigned",
-        ),
-    ] {
-        let plan = explain(&mut conn, probe).await;
-        assert!(
-            plan.contains(index) && plan.contains("created_at >="),
-            "the core's probe must reach {index} with the binding start as an index bound. \
-             Plan:\n{plan}"
-        );
-    }
 
     // Also reachable from the `<>` spelling, which `= 'group'` does not admit.
     let plan = explain(

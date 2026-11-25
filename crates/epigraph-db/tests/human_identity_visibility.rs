@@ -2189,6 +2189,46 @@ async fn migration_297_refuses_over_another_core_body(pool: PgPool) {
     );
 }
 
+/// 300 re-states 297's core; over any other body it refuses (LPR01) with
+/// nothing changed. 298's accessor is LEAKPROOF and IMMUTABLE (what lets 299
+/// index it and the core's probe use it under row security).
+#[sqlx::test(migrations = false)]
+async fn migration_300_refuses_over_another_core_body(pool: PgPool) {
+    migrate(&pool, &below(300)).await.expect("migrate to 299");
+    let (leakproof, volatility): (bool, String) = sqlx::query_as(
+        "SELECT proleakproof, provolatile::text FROM pg_proc \
+          WHERE oid = to_regprocedure('public.epigraph_ingest_record_ingester(jsonb)')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("298's accessor");
+    assert!(leakproof, "298's accessor is LEAKPROOF");
+    assert_eq!(volatility, "i", "298's accessor is IMMUTABLE");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
+             p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean) \
+         RETURNS TABLE (named boolean, details boolean) \
+         LANGUAGE plpgsql STABLE SECURITY DEFINER COST 1000 \
+         SET search_path = pg_catalog, pg_temp AS $$ \
+         BEGIN RETURN QUERY SELECT false, false; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("300 must refuse over another body");
+    assert!(err.contains("LPR01"), "precondition refusal: {err}");
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE oid = to_regprocedure('public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("core source");
+    assert!(!src.contains("v_bound_text"), "nothing was changed");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_role_derived_probe_is_the_cores_last_arm(pool: PgPool) {
     let src: String = sqlx::query_scalar(

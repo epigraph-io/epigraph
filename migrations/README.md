@@ -4671,7 +4671,8 @@ restart.
   `idx_mass_functions_public_by_source (source_agent_id, created_at)`, each `WHERE visibility =
   'public'`; `idx_edges_public_ingest_records_by_ingester ((properties ->> 'ingested_by'),
   created_at) WHERE relationship = 'ingested_claim' AND visibility = 'public'`. Registered in
-  `tenancy_migration_shape.rs::INDEX_MIGRATIONS`, where each probe's plan is pinned.
+  `tenancy_migration_shape.rs`, where each probe's plan is pinned. 294's index is superseded
+  by 299 and dropped by 301: a bare `->>` is no index condition under the core's row security.
 - **295**: `disclosure_every_public_assertion` (operator ruling C6). Precondition PAK01 (55000):
   the core is still 288's (md5). Re-states `epigraph_agent_disclosure_for` with one arm after the
   public-claim arm: a PUBLIC row by an agent of B(H), at or after its binding start (288), of
@@ -4698,6 +4699,29 @@ restart.
   (`a_countersigned_authorship_of_a_readable_paper_names_the_human`,
   `a_countersign_from_before_the_binding_never_names_the_human`, the CSN01 refusal). Undo:
   `docs/runbooks/297-undo.sql` (295's body).
+- **298**: `ingest_record_ingester_leakproof`. NEW `epigraph_ingest_record_ingester(jsonb) ->
+  text` (`properties ->> 'ingested_by'`), `LANGUAGE sql IMMUTABLE LEAKPROOF PARALLEL SAFE`, path
+  `pg_catalog, pg_temp` (so it is never inlined back into a bare `->>`), maintenance-owned,
+  EXECUTE left with PUBLIC (pure; every edges writer evaluates 299's index expression).
+  Precondition LKP01 (42501): the migration runner must be a superuser (LEAKPROOF needs one).
+  Why: the disclosure core is a definer over FORCE RLS tables, so a non-leakproof qual is no
+  index condition there; 295's `->>` probe measured 198 s. Registered in `tenancy_backfill`'s
+  INVOKER_EXEMPT.
+- **299**: `idx_edges_public_ingest_records_by_ingester_lp
+  (epigraph_ingest_record_ingester(properties), created_at) WHERE relationship =
+  'ingested_claim' AND visibility = 'public'`, single-statement `-- no-transaction`. Registered
+  in `tenancy_migration_shape.rs::INDEX_MIGRATIONS`.
+- **300**: `disclosure_probes_leakproof`. Precondition LPR01 (55000): the core is still 297's
+  (md5). Re-states `epigraph_agent_disclosure_for` with the same arms and answers: B(H)'s ids
+  are also materialised as text once, the ingest-record probe reads 298's accessor (299's
+  index), and the countersign arm computes the paper id in a fenced subquery so its `papers`
+  join is `uuid = Var`. Pinned by
+  `tenancy_migration_shape.rs::the_disclosure_probes_reach_their_indexes_under_the_cores_row_security`
+  (EXPLAIN under `SET ROLE epigraph_maintenance`; red before 298-301) and the LPR01 refusal.
+  Undo: `docs/runbooks/300-undo.sql` (re-apply 294 first).
+- **301**: `DROP INDEX CONCURRENTLY IF EXISTS` of 294's index (unusable under row security),
+  single-statement `-- no-transaction`. Registered in `DROPPED_INDEX_MIGRATIONS`. Undo: re-run
+  294.
 
 ## `-- no-transaction` migrations
 
