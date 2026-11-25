@@ -15,13 +15,16 @@
 //! # Verified to fail
 //!
 //! With the gate's pre-a2d3e945 body (`auth.owner_id.unwrap_or(auth.client_id)
-//! == target`) both tests fail: the author's three edits are 403, and the
-//! client-id-authored claim's three edits are 200.
+//! == target`) the two router tests fail: the author's three edits are 403,
+//! and the client-id-authored claim's three edits are 200.
 //!
-//! The router runs on the harness pool (not the application role): `PUT` and
-//! `PATCH /claims/:id` still write on the unstamped pool for a non-admin caller
-//! (a separate backlog item), which would refuse them under row security for
-//! a reason unrelated to the gate.
+//! The router tests run on the harness pool, which bypasses row security, so
+//! they pin the GATE. What the write does after the gate admits is pinned on
+//! the application role by
+//! `put_by_the_author_lands_on_the_app_role_and_a_reader_author_is_refused`:
+//! with the new gate and `update_claim`'s writes still on the unstamped
+//! `state.db_pool`, the author's PUT is 404 there (the unstamped read and
+//! UPDATE reach no row), measured before the stamping landed.
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -31,6 +34,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+mod viewer_fixture;
 
 /// The URL of the per-test database `#[sqlx::test]` created.
 async fn url_for(pool: &PgPool) -> String {
@@ -287,4 +292,142 @@ async fn an_author_id_equal_to_the_oauth_client_id_owns_nothing(pool: PgPool) {
         "no property written: {props}"
     );
     assert!(labels.is_empty(), "no label written: {labels:?}");
+}
+
+/// The application role, as `claim_routes_bind_the_caller.rs` builds it: row
+/// security decides every write.
+async fn app_role_state(pool: &PgPool) -> epigraph_api::AppState {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: the arm is vacuous"
+    );
+    let url = viewer_fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let raw = viewer_fixture::downgraded_pool(pool, "epigraph_app").await;
+    let mut state = epigraph_api::AppState::with_db(raw, epigraph_api::ApiConfig::default());
+    state.scoped = Some(scoped);
+    state
+}
+
+fn agent_token(agent: Uuid) -> epigraph_api::middleware::bearer::AuthContext {
+    epigraph_api::middleware::bearer::AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: Some(agent),
+        owner_id: None,
+        client_type: epigraph_api::middleware::ClientType::Agent,
+        scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    }
+}
+
+async fn put_as(
+    pool: &PgPool,
+    state: &epigraph_api::AppState,
+    caller: Uuid,
+    claim: Uuid,
+    body: Value,
+) -> (StatusCode, String) {
+    use axum::response::IntoResponse;
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, caller)
+        .await
+        .expect("viewer");
+    let resp = epigraph_api::routes::claims::update_claim(
+        epigraph_api::middleware::bearer::ViewerExtractor(viewer),
+        axum::extract::State(state.clone()),
+        Some(axum::Extension(agent_token(caller))),
+        axum::extract::Path(claim),
+        axum::Json(serde_json::from_value(body).expect("request")),
+    )
+    .await
+    .into_response();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// On the APPLICATION ROLE (row security live), `PUT /api/v1/claims/:id` by the
+/// claim's author lands, and an author whose membership in the owning group was
+/// downgraded to `reader` is refused with nothing written: the gate admits by
+/// authorship, and the write itself must still be the caller's to make.
+#[sqlx::test(migrations = "../../migrations")]
+async fn put_by_the_author_lands_on_the_app_role_and_a_reader_author_is_refused(pool: PgPool) {
+    let (author, group) = viewer_fixture::seed_agent_with_group(&pool, "a2d3e945-put").await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, author, group, "a2d3e945: PUT on the app role")
+            .await;
+    let state = app_role_state(&pool).await;
+    let read = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (f64, Value)>(
+                "SELECT truth_value, COALESCE(properties, '{}'::jsonb) FROM claims WHERE id = $1",
+            )
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("claim")
+        }
+    };
+
+    let (status, body) = put_as(
+        &pool,
+        &state,
+        author,
+        claim,
+        json!({"truth_value": 0.8, "properties": {"a2d3e945": "put"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the author's PUT: {body}");
+    let (truth, props) = read(claim).await;
+    assert!((truth - 0.8).abs() < 1e-9, "truth landed: {truth}");
+    assert_eq!(
+        props["a2d3e945"],
+        json!("put"),
+        "properties landed: {props}"
+    );
+
+    sqlx::query(
+        "UPDATE group_memberships SET role = 'reader' WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(author)
+    .execute(&pool)
+    .await
+    .expect("downgrade the author");
+    let (status, body) = put_as(
+        &pool,
+        &state,
+        author,
+        claim,
+        json!({"truth_value": 0.2, "properties": {"a2d3e945": "reader"}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a reader author's PUT: {body}"
+    );
+    let (truth, props) = read(claim).await;
+    assert!((truth - 0.8).abs() < 1e-9, "truth unchanged: {truth}");
+    assert_eq!(
+        props["a2d3e945"],
+        json!("put"),
+        "properties unchanged: {props}"
+    );
 }

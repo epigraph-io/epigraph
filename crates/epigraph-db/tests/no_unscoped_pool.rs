@@ -869,7 +869,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 161 -> 158 (backlog 52b96600): `compose_subgraphs` reads on the caller's
 /// stamped connection; `routes/computation.rs` 3 -> 0, key DELETED
 /// (`HIGH_WATER_FILES` falls by one with it).
-const HIGH_WATER: usize = 158;
+/// 158 -> 153 (backlog a2d3e945): `update_claim` (PUT /claims/:id) reads its
+/// write target through `AppState::read_as` and writes on one
+/// `AppState::write_as` transaction (`routes/claims.rs` 12 -> 7). No file
+/// reached zero.
+const HIGH_WATER: usize = 153;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1009,7 +1013,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 13 -> 12 (backlog 7c2a0b36): `patch_claim`'s non-admin write moved off
     // `state.db_pool.begin()` onto `AppState::write_as`, the transaction its
     // admin branch already used.
-    ("routes/claims.rs", 12),
+    // 12 -> 7 (backlog a2d3e945): `update_claim` (PUT /claims/:id) reads its
+    // write target through `AppState::read_as` and runs its truth, trace,
+    // embedding and properties writes on one `AppState::write_as` transaction;
+    // its provenance append stays on the pool.
+    ("routes/claims.rs", 7),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
