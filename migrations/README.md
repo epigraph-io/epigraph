@@ -3469,8 +3469,8 @@ restart.
   upgraded: unset it on every unit for this rollout and apply 236 with `epigraph-migrate`
   only once every viewer-resolving binary is upgraded (or ship the binary change in a
   release before the one that embeds 236). The team lists `epigraph_writable_teams(agent)` /
-  `epigraph_readable_teams(agent)` still answer for any agent on the application role (an
-  open residual for a separate change). **Applied to throwaway databases only, NOT to any
+  `epigraph_readable_teams(agent)` still answer for any agent on the application role (a
+  residual 236 left open; 309 binds both to the principal). **Applied to throwaway databases only, NOT to any
   deployed database.**
 - **237**: public `workflows_update_owner_scope` (backlog 524f89c1). 183's
   `workflows_update` admitted an UPDATE of any row the session READS (public rows, and

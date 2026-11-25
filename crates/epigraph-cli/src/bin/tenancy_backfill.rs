@@ -2051,8 +2051,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_workflow_name_has_hidden_rows", 202),
     // 206, claim visibility controls. The two READS fail CLOSED and SILENTLY
     // under a non-member owner. `epigraph_writable_teams` reads `groups`
-    // through 077's `groups_tenancy`, which on the unstamped connection it is
-    // called on admits no row, so it answers "no team": every write that names
+    // through 077's `groups_tenancy`, which on the stamped application
+    // connection it is called on (309: it answers only for the session
+    // principal, the principal's operated agent, or a maintenance session)
+    // admits no team row, so it answers "no team": every write that names
     // no visibility lands private instead of in the author's team, and every
     // explicit team write is refused. `epigraph_default_group` reads only
     // `agents` (readable to every role) and 149's `epigraph_human_of`, so its

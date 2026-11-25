@@ -2428,10 +2428,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "privatization_authority",
         "READ of `groups` and of `group_memberships` through migration 273's \
          `epigraph_group_live_roster` (live admins only, backlog a91d957d), returning four scalars \
-         and no ids. It MUST run on the maintenance connection and its own doc says why: a count of \
-         a target \
-         group's other live admins narrowed to what the CALLER can see would report zero for a \
-         caller who cannot see the roster, and refuse — a fail-closed wrong answer that is \
+         and no ids. It MUST run on the maintenance connection and its own doc says why: a count \
+         of a target group's other live admins narrowed to what the CALLER can see would report \
+         zero for a caller who cannot see the roster, and refuse — a fail-closed wrong answer that is \
          indistinguishable from the true one. A viewer predicate here would corrupt the \
          authorisation decision rather than protect it.",
     ),
