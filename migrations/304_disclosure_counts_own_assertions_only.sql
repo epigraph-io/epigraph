@@ -59,7 +59,7 @@
 --
 -- Pinned by `human_identity_visibility.rs::
 -- only_an_agents_own_assertion_names_its_human` and
--- `migration_302_refuses_over_another_core_body`.
+-- `migration_304_refuses_over_another_core_body`.
 --
 -- UNDO: `docs/runbooks/304-undo.sql` (302's core; re-apply 293 and 295 first).
 SET LOCAL lock_timeout = '3s';

@@ -1475,7 +1475,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
     a binding change (under 280 a forged row whose source had only a revoked personal row made
     the unbind raise RVK01). Tested:
     `role_edges_team_only.rs::a_forged_role_edge_is_never_reowned_and_never_blocks_a_binding_change`,
-    `::migration_281_reconciles_genuine_projections_only`.
+    `::migration_283_reconciles_genuine_projections_only`.
   - 284: a row carrying the marker is written (INSERT, UPDATE, DELETE) only by a maintenance
     session or a maintenance-owned definer frame; OCC05 otherwise. A writer of the owning
     team cannot widen one to `public` (260's guard froze only the owner columns), strip or
@@ -1843,8 +1843,13 @@ recommendations, as put:
   branch's single core is kept where main had changed the hand-copied profile-detail
   predicate to read `epigraph_group_live_roster` (its 308 body applies the same 164 / 235
   lapse rules); main's new `live_membership_readers.rs` now reads the core's `details`.
-  Deploy note: a development or test database that applied the branch's OLD 272/273 holds
-  checksums sqlx will refuse; recreate it (production never applied them).
+  Deploy note: a development or test database that applied ANY of the branch's old 272-307
+  holds checksums sqlx will refuse, since every version in that range is now a different
+  file (272/273 are main's; 274-307 hold other branch bodies); sqlx refuses at the first
+  mismatch, so recreate it (production never applied them). The twenty test functions whose
+  names carried an old number were renamed by the same +2 afterwards (e.g. 304's refusal
+  test, first named after old 302, is now `migration_304_refuses_over_another_core_body`),
+  with the two migration header comments and the §15 citation that name them.
 - **C6a. Addendum 5's narrowing of C6.** Ruled: ACCEPT it, as built (migration 304): evidence
   is excluded and only assessment-slot BBAs count. Follow-up, not this PR: a write-once writer
   column on `evidence` and `mass_functions` (§15.F7).

@@ -41,7 +41,7 @@
 --    Every arm, its answer and the order are 304's.
 --
 -- Pinned by `human_identity_visibility.rs::a_lapsed_membership_row_shares_no_details`
--- (red before) and `migration_306_refuses_over_another_core_body`.
+-- (red before) and `migration_308_refuses_over_another_core_body`.
 --
 -- UNDO: `docs/runbooks/308-undo.sql` (304's core).
 SET LOCAL lock_timeout = '3s';

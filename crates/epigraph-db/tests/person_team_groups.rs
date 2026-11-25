@@ -1043,7 +1043,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 /// 286 re-states 263's invite; over any other body it refuses (TIV01) with
 /// nothing changed.
 #[sqlx::test(migrations = false)]
-async fn migration_284_refuses_over_another_invite_body(pool: PgPool) {
+async fn migration_286_refuses_over_another_invite_body(pool: PgPool) {
     let below = sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(
             MIGRATOR

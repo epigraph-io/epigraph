@@ -563,7 +563,7 @@ async fn seed_public_projections(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid, Uuid
 }
 
 #[sqlx::test(migrations = false)]
-async fn migration_278_backfills_every_projection_and_audits_the_counts(pool: PgPool) {
+async fn migration_280_backfills_every_projection_and_audits_the_counts(pool: PgPool) {
     migrate(&pool, &below(280)).await.expect("migrate to 279");
     let (h1, p1, h2, team, mate) = seed_public_projections(&pool).await;
     migrate(&pool, &MIGRATOR).await.expect("migrate to head");
@@ -615,7 +615,7 @@ async fn migration_278_backfills_every_projection_and_audits_the_counts(pool: Pg
 /// filters) refuses the migration instead of leaving the edges public.
 /// Reproduced by a trigger that silently skips the backfill's rows.
 #[sqlx::test(migrations = false)]
-async fn migration_278_refuses_when_the_backfill_moves_nothing(pool: PgPool) {
+async fn migration_280_refuses_when_the_backfill_moves_nothing(pool: PgPool) {
     migrate(&pool, &below(280)).await.expect("migrate to 279");
     let (h1, ..) = seed_public_projections(&pool).await;
     for stmt in [
@@ -638,7 +638,7 @@ async fn migration_278_refuses_when_the_backfill_moves_nothing(pool: PgPool) {
 /// The precondition: an audit trigger whose body is not 130's is never
 /// overwritten blind.
 #[sqlx::test(migrations = false)]
-async fn migration_278_refuses_over_another_audit_body(pool: PgPool) {
+async fn migration_280_refuses_over_another_audit_body(pool: PgPool) {
     migrate(&pool, &below(280)).await.expect("migrate to 279");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_role_assignments_audit() \
@@ -659,7 +659,7 @@ async fn migration_278_refuses_over_another_audit_body(pool: PgPool) {
 /// application-callable owner rule would be a binding oracle; an
 /// application-callable re-own would drive personal-group mints).
 #[sqlx::test(migrations = "../../migrations")]
-async fn migration_278_functions_are_pinned_owned_and_not_app_callable(pool: PgPool) {
+async fn migration_280_functions_are_pinned_owned_and_not_app_callable(pool: PgPool) {
     for sig in [
         "public.epigraph_role_edge_owner(text, uuid)",
         "public.epigraph_group_role_bindings_reown_role_edges()",
@@ -877,7 +877,7 @@ async fn a_forged_role_edge_is_never_reowned_and_never_blocks_a_binding_change(p
 /// forged public row does not trip the post-condition. One summary row with
 /// the count shape.
 #[sqlx::test(migrations = false)]
-async fn migration_281_reconciles_genuine_projections_only(pool: PgPool) {
+async fn migration_283_reconciles_genuine_projections_only(pool: PgPool) {
     migrate(&pool, &below(283)).await.expect("migrate to 282");
     let (h, _) = person(&pool, "below holder").await;
     let (mate, _) = fixture::seed_agent_with_group(&pool, "below mate").await;
@@ -1230,7 +1230,7 @@ async fn the_maintenance_verbs_still_re_project_through_the_guard(pool: PgPool) 
 /// 283's precondition: a binding trigger whose body is not 280's is never
 /// overwritten blind.
 #[sqlx::test(migrations = false)]
-async fn migration_281_refuses_over_another_binding_trigger_body(pool: PgPool) {
+async fn migration_283_refuses_over_another_binding_trigger_body(pool: PgPool) {
     migrate(&pool, &below(283)).await.expect("migrate to 282");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_group_role_bindings_reown_role_edges() \

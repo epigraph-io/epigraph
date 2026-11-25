@@ -1584,7 +1584,7 @@ async fn privileged_sessions_name_every_human(pool: PgPool) {
 /// PUBLIC executes none; every one is SECURITY DEFINER on
 /// `pg_catalog, pg_temp`, and the core and both wrappers cost 1000.
 #[sqlx::test(migrations = "../../migrations")]
-async fn migration_272_definers_are_pinned_owned_and_granted(pool: PgPool) {
+async fn migration_274_definers_are_pinned_owned_and_granted(pool: PgPool) {
     for (sig, app_exec, cost) in [
         ("public.epigraph_is_human_principal(uuid)", false, None),
         (
@@ -2141,7 +2141,7 @@ async fn the_setter_refuses_non_humans_anonymous_callers_and_bad_values(pool: Pg
 /// 275's catalog: SECURITY DEFINER on `pg_catalog, pg_temp`, owned by
 /// maintenance, EXECUTE for the application role and not for PUBLIC.
 #[sqlx::test(migrations = "../../migrations")]
-async fn migration_273_setter_is_pinned_owned_and_granted(pool: PgPool) {
+async fn migration_275_setter_is_pinned_owned_and_granted(pool: PgPool) {
     let sig = "public.epigraph_set_profile_visibility(text)";
     let (secdef, owner, config, app, public): (bool, String, Vec<String>, bool, bool) =
         sqlx::query_as(
@@ -2267,7 +2267,7 @@ async fn seed_reset_population(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
 /// both kinds of evidence; a non-human is untouched; one summary audit row
 /// carries the pre-count, the rows moved and the post-count.
 #[sqlx::test(migrations = false)]
-async fn migration_274_resets_every_human_and_audits_the_counts(pool: PgPool) {
+async fn migration_276_resets_every_human_and_audits_the_counts(pool: PgPool) {
     migrate(&pool, &below(276)).await.expect("migrate to 275");
     let (op, prov, already, svc) = seed_reset_population(&pool).await;
     for a in [op, prov, svc] {
@@ -2300,7 +2300,7 @@ async fn migration_274_resets_every_human_and_audits_the_counts(pool: PgPool) {
 /// must fail the migration, not leave every human reading as consented.
 /// Reproduced by a trigger that silently skips the reset's rows.
 #[sqlx::test(migrations = false)]
-async fn migration_274_refuses_when_the_reset_moves_nothing(pool: PgPool) {
+async fn migration_276_refuses_when_the_reset_moves_nothing(pool: PgPool) {
     migrate(&pool, &below(276)).await.expect("migrate to 275");
     let (op, _, _, _) = seed_reset_population(&pool).await;
     for stmt in [
@@ -2323,7 +2323,7 @@ async fn migration_274_refuses_when_the_reset_moves_nothing(pool: PgPool) {
 /// The precondition: a provisioning definer whose body is not 077's is never
 /// overwritten blind.
 #[sqlx::test(migrations = false)]
-async fn migration_274_refuses_over_another_provision_body(pool: PgPool) {
+async fn migration_276_refuses_over_another_provision_body(pool: PgPool) {
     migrate(&pool, &below(276)).await.expect("migrate to 275");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_provision_oauth_agent( \
@@ -2344,7 +2344,7 @@ async fn migration_274_refuses_over_another_provision_body(pool: PgPool) {
 /// refuses over a core whose body is not 279's (DAO01), and at head the
 /// readable-claim arm precedes the role-derived probe.
 #[sqlx::test(migrations = false)]
-async fn migration_279_refuses_over_another_core_body(pool: PgPool) {
+async fn migration_281_refuses_over_another_core_body(pool: PgPool) {
     migrate(&pool, &below(281)).await.expect("migrate to 280");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
@@ -2366,7 +2366,7 @@ async fn migration_279_refuses_over_another_core_body(pool: PgPool) {
 /// 285 re-states 281's core and 275's setter; over any other body of either
 /// it refuses (PCN01) with nothing changed.
 #[sqlx::test(migrations = false)]
-async fn migration_283_refuses_over_another_core_or_setter_body(pool: PgPool) {
+async fn migration_285_refuses_over_another_core_or_setter_body(pool: PgPool) {
     migrate(&pool, &below(285)).await.expect("migrate to 284");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_set_profile_visibility(p_visibility text) \
@@ -2396,7 +2396,7 @@ async fn migration_283_refuses_over_another_core_or_setter_body(pool: PgPool) {
 /// 290 (C5) re-states 285's core; over any other body it refuses (BWS01) with
 /// nothing changed.
 #[sqlx::test(migrations = false)]
-async fn migration_288_refuses_over_another_core_body(pool: PgPool) {
+async fn migration_290_refuses_over_another_core_body(pool: PgPool) {
     migrate(&pool, &below(290)).await.expect("migrate to 289");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
@@ -2426,7 +2426,7 @@ async fn migration_288_refuses_over_another_core_body(pool: PgPool) {
 /// 297 (C6) re-states 290's core; over any other body it refuses (PAK01) with
 /// nothing changed.
 #[sqlx::test(migrations = false)]
-async fn migration_295_refuses_over_another_core_body(pool: PgPool) {
+async fn migration_297_refuses_over_another_core_body(pool: PgPool) {
     migrate(&pool, &below(297)).await.expect("migrate to 296");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
@@ -2456,7 +2456,7 @@ async fn migration_295_refuses_over_another_core_body(pool: PgPool) {
 /// 299 (C2) re-states 297's core; over any other body it refuses (CSN01) with
 /// nothing changed.
 #[sqlx::test(migrations = false)]
-async fn migration_297_refuses_over_another_core_body(pool: PgPool) {
+async fn migration_299_refuses_over_another_core_body(pool: PgPool) {
     migrate(&pool, &below(299)).await.expect("migrate to 298");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
@@ -2490,7 +2490,7 @@ async fn migration_297_refuses_over_another_core_body(pool: PgPool) {
 /// nothing changed. 300's accessor is LEAKPROOF and IMMUTABLE (what lets 301
 /// index it and the core's probe use it under row security).
 #[sqlx::test(migrations = false)]
-async fn migration_300_refuses_over_another_core_body(pool: PgPool) {
+async fn migration_302_refuses_over_another_core_body(pool: PgPool) {
     migrate(&pool, &below(302)).await.expect("migrate to 301");
     let (leakproof, volatility): (bool, String) = sqlx::query_as(
         "SELECT proleakproof, provolatile::text FROM pg_proc \
@@ -2529,7 +2529,7 @@ async fn migration_300_refuses_over_another_core_body(pool: PgPool) {
 /// 304 re-states 302's core; over any other body it refuses (OWN01) with
 /// nothing changed.
 #[sqlx::test(migrations = false)]
-async fn migration_302_refuses_over_another_core_body(pool: PgPool) {
+async fn migration_304_refuses_over_another_core_body(pool: PgPool) {
     migrate(&pool, &below(304)).await.expect("migrate to 303");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
@@ -2562,7 +2562,7 @@ async fn migration_302_refuses_over_another_core_body(pool: PgPool) {
 /// 308 re-states 304's core; over any other body it refuses (LRD01) with
 /// nothing changed.
 #[sqlx::test(migrations = false)]
-async fn migration_306_refuses_over_another_core_body(pool: PgPool) {
+async fn migration_308_refuses_over_another_core_body(pool: PgPool) {
     migrate(&pool, &below(308)).await.expect("migrate to 307");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
@@ -3429,7 +3429,7 @@ async fn the_name_match_calls_the_predicate_once_per_match(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("track_functions");
-    // 302 unrelated agents and 4 that match.
+    // 300 unrelated agents and 4 that match.
     sqlx::query(
         "INSERT INTO agents (public_key, display_name) \
          SELECT pg_catalog.decode(pg_catalog.md5(g::text || 'x') || pg_catalog.md5(g::text || 'y'), \
