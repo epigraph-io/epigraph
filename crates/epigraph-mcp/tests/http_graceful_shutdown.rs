@@ -18,6 +18,12 @@
 //! `an_open_request_is_cut_off_at_the_drain_bound_after_the_sessions_end`
 //! fails; `main` back on `serve_with_listener` -> the binary test fails
 //! (killed by SIGTERM, no exit code).
+//!
+//! Two more binary tests pin `main`'s wiring (review of 526f7508): a queued
+//! `ingest_document_inline` walk of an HTTP session delays the exit until it
+//! commits (fails when `main` hands the listener a fresh tracker), and a
+//! client's open GET SSE stream is closed by ending the sessions rather than
+//! cut off (fails without `ending_sessions_with` in `main`).
 
 #![cfg(unix)]
 
@@ -236,6 +242,12 @@ impl Drop for Running {
 }
 
 fn start_listener(db_url: &str) -> Running {
+    start_listener_with(db_url, 3, &[])
+}
+
+/// The compiled binary on a fresh unix socket, `--allow-unauthenticated-http`,
+/// with a drain bound of `drain_secs` and `extra` arguments.
+fn start_listener_with(db_url: &str, drain_secs: u64, extra: &[&str]) -> Running {
     let socket = socket_path("bin");
     let listen = format!("unix:{}", socket.display());
     let key = hex::encode([0x5Du8; 32]);
@@ -243,7 +255,7 @@ fn start_listener(db_url: &str) -> Running {
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("RUST_LOG", "info")
-        .env("EPIGRAPH_MCP_STDIO_DRAIN_SECS", "3");
+        .env("EPIGRAPH_MCP_STDIO_DRAIN_SECS", drain_secs.to_string());
     for (name, value) in std::env::vars_os() {
         if name.to_str().is_some_and(|n| n.starts_with("PG")) {
             cmd.env(name, value);
@@ -259,6 +271,7 @@ fn start_listener(db_url: &str) -> Running {
             listen.as_str(),
             "--allow-unauthenticated-http",
         ])
+        .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -355,4 +368,294 @@ async fn sigterm_stops_the_binarys_http_listener_gracefully(pool: PgPool) {
         "SIGTERM must stop the listener gracefully, not kill it ({status}):\n{log}"
     );
     assert!(log.contains(SIGTERM_RECEIVED), "{log}");
+}
+
+const ACCEPT: &str = "application/json, text/event-stream";
+const SESSION_HEADER: &str = "Mcp-Session-Id";
+/// Logged by `stop_gracefully` when it ends the sessions still open.
+const ENDING_SESSIONS: &str = "ending the MCP sessions still open";
+/// Logged by `stop_gracefully` when every connection closed in time.
+const STOPPED_CLEAN: &str = "no connection left open";
+/// Logged by `stop_gracefully` when it gives up on open connections.
+const STOPPED_CUT_OFF: &str = "connections still open";
+
+fn unix_client(socket: &Path) -> reqwest::Client {
+    reqwest::Client::builder()
+        .unix_socket(socket)
+        .build()
+        .expect("client")
+}
+
+async fn post_mcp(
+    client: &reqwest::Client,
+    session: Option<&str>,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    let mut req = client
+        .post("http://localhost/mcp")
+        .header("Accept", ACCEPT)
+        .header("Content-Type", "application/json")
+        .json(&body);
+    if let Some(s) = session {
+        req = req.header(SESSION_HEADER, s);
+    }
+    req.send().await.expect("POST over the unix socket")
+}
+
+async fn read_sse_data(resp: &mut reqwest::Response) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut acc = String::new();
+    loop {
+        match tokio::time::timeout_at(deadline, resp.chunk()).await {
+            Ok(Ok(Some(bytes))) => {
+                acc.push_str(&String::from_utf8_lossy(&bytes));
+                if acc
+                    .lines()
+                    .any(|l| l.starts_with("data:") && l.trim_end().len() > 5)
+                {
+                    return acc;
+                }
+            }
+            _ => return acc,
+        }
+    }
+}
+
+/// `initialize` + `notifications/initialized`; returns the session id.
+async fn handshake(client: &reqwest::Client) -> String {
+    let mut resp = post_mcp(
+        client,
+        None,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "graceful-shutdown-test", "version": "0"}}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200, "CALIBRATION: serving");
+    let session = resp
+        .headers()
+        .get(SESSION_HEADER)
+        .expect("session header")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let _ = read_sse_data(&mut resp).await;
+    let notif = post_mcp(
+        client,
+        Some(&session),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    assert_eq!(notif.status().as_u16(), 202, "notifications/initialized");
+    session
+}
+
+fn sigterm(running: &Running) {
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&running.child),
+        rustix::process::Signal::TERM,
+    )
+    .expect("SIGTERM the child this test spawned");
+}
+
+/// Wait (blocking) up to `within` for the child to exit; its status (None if
+/// still running) and log.
+fn wait_exit(
+    running: &mut Running,
+    within: Duration,
+) -> (Option<std::process::ExitStatus>, String) {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(status) = running.child.try_wait().expect("try_wait") {
+            std::thread::sleep(Duration::from_millis(300));
+            return (Some(status), running.log());
+        }
+        if Instant::now() >= deadline {
+            return (None, running.log());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+const DETACHED_DOI: &str = "10.1234/graceful-http-drain";
+
+/// The BINARY's stop waits for the detached work of its HTTP sessions (review
+/// of 526f7508: the in-process tests pass any tracker, so `main` handing the
+/// listener a tracker no session spawns into went unnoticed).
+///
+/// A queued `ingest_document_inline` walk is held on a `SHARE` lock on
+/// `papers` (the preflight's read passes; the walk's insert waits). After
+/// SIGTERM, with no connection left open, the process must still be running,
+/// and once the lock is released it must exit 0 with the walk committed.
+///
+/// Mutation: `main` passing `BackgroundTasks::default()` instead of the
+/// template's tracker -> the process exits at once after SIGTERM and the walk
+/// is dropped; this test fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn sigterm_waits_for_a_queued_walk_of_an_http_session(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let mut running = tokio::task::spawn_blocking(move || {
+        start_listener_with(&url, 60, &["--allow-unauthenticated-writes"])
+    })
+    .await
+    .expect("join");
+
+    let mut lock = pool.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE papers IN SHARE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("hold the walk's insert");
+
+    {
+        let client = unix_client(&running.socket);
+        let session = handshake(&client).await;
+        let extraction = serde_json::json!({
+            "source": {
+                "title": "Graceful HTTP drain",
+                "doi": DETACHED_DOI,
+                "source_type": "Paper",
+                "authors": [{"name": "Alice Author", "affiliations": [], "roles": ["author"]}]
+            },
+            "thesis": "A stopping listener waits for its queued walks",
+            "thesis_derivation": "TopDown",
+            "sections": [{
+                "title": "Intro",
+                "paragraphs": [{
+                    "text": "A restart must not drop a queued walk",
+                    "atoms": ["A restart must not drop a queued walk"],
+                    "generality": [3],
+                    "confidence": 0.8
+                }]
+            }],
+            "relationships": []
+        });
+        let mut resp = post_mcp(
+            &client,
+            Some(&session),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "ingest_document_inline",
+                           "arguments": {"extraction": extraction}}
+            }),
+        )
+        .await;
+        let answer = read_sse_data(&mut resp).await;
+        assert!(
+            answer.contains("queued"),
+            "CALIBRATION: the walk was queued:\n{answer}\n--- log ---\n{}",
+            running.log()
+        );
+        // Dropped: no connection stays open to hold the request grace.
+    }
+
+    // CALIBRATION: the walk is waiting on this test's lock.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+              WHERE c.relname = 'papers' AND NOT l.granted",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pg_locks");
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CALIBRATION: the walk never reached the papers insert:\n{}",
+            running.log()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    sigterm(&running);
+    let (mut running, status, log) = tokio::task::spawn_blocking(move || {
+        let (status, log) = wait_exit(&mut running, Duration::from_secs(4));
+        (running, status, log)
+    })
+    .await
+    .expect("join");
+    assert!(
+        status.is_none(),
+        "the binary exited ({status:?}) with its HTTP session's queued walk still running:\n{log}"
+    );
+    assert!(log.contains(SIGTERM_RECEIVED), "{log}");
+
+    lock.commit().await.expect("release the lock");
+    let (status, log) =
+        tokio::task::spawn_blocking(move || wait_exit(&mut running, Duration::from_secs(40)))
+            .await
+            .expect("join");
+    let status =
+        status.unwrap_or_else(|| panic!("still running after the walk could finish:\n{log}"));
+    assert_eq!(status.code(), Some(0), "{status}:\n{log}");
+    let papers: i64 = sqlx::query_scalar("SELECT count(*) FROM papers WHERE doi = $1")
+        .bind(DETACHED_DOI)
+        .fetch_one(&pool)
+        .await
+        .expect("papers");
+    assert_eq!(
+        papers, 1,
+        "the walk ran to its commit before the exit:\n{log}"
+    );
+}
+
+/// A client's standalone GET SSE stream (rmcp's server-to-client channel) is
+/// CLOSED by the stop, not abandoned: after the request grace the binary ends
+/// the MCP sessions (rmcp's cancellation token), rmcp ends the stream, and the
+/// listener stops with no connection left open, then exits 0 (review of
+/// 526f7508: the in-process test only showed a mock closure was called).
+///
+/// Mutations: `main`'s session-ending closure made a no-op -> the stream is
+/// still open when the session-end grace runs out, the listener logs that it
+/// stops with connections still open, and this test fails; without
+/// `.ending_sessions_with(..)` at all it fails too. (The stop is bounded at
+/// request grace + session-end grace either way, about 15 s, not by the drain
+/// bound.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn ending_the_sessions_closes_an_open_sse_stream(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let mut running = tokio::task::spawn_blocking(move || start_listener_with(&url, 60, &[]))
+        .await
+        .expect("join");
+    let client = unix_client(&running.socket);
+    let session = handshake(&client).await;
+    let stream = client
+        .get("http://localhost/mcp")
+        .header("Accept", "text/event-stream")
+        .header(SESSION_HEADER, &session)
+        .send()
+        .await
+        .expect("GET the standalone stream");
+    assert_eq!(
+        stream.status().as_u16(),
+        200,
+        "CALIBRATION: the standalone SSE stream is open"
+    );
+
+    let t0 = Instant::now();
+    sigterm(&running);
+    let (status, log) =
+        tokio::task::spawn_blocking(move || wait_exit(&mut running, Duration::from_secs(30)))
+            .await
+            .expect("join");
+    let elapsed = t0.elapsed();
+    let status = status.unwrap_or_else(|| {
+        panic!("an open SSE stream held the stop past 30 s of a 60 s bound:\n{log}")
+    });
+    assert_eq!(status.code(), Some(0), "{status}:\n{log}");
+    assert!(
+        elapsed >= epigraph_mcp::HTTP_REQUEST_GRACE - Duration::from_millis(500),
+        "CALIBRATION: the stream held the stop for the request grace ({elapsed:?}):\n{log}"
+    );
+    assert!(log.contains(ENDING_SESSIONS), "{log}");
+    assert!(
+        log.contains(STOPPED_CLEAN) && !log.contains(STOPPED_CUT_OFF),
+        "ending the sessions must close the SSE stream, so the listener stops with no \
+         connection open rather than cutting it off ({elapsed:?}):\n{log}"
+    );
+    drop(stream);
 }
