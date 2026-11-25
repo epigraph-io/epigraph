@@ -248,7 +248,7 @@ fn bad_lines_get_an_error_and_the_child_keeps_serving() {
         ("{\"id\": 3, \"op\": 7}", "bad_request"),
         ("{\"id\": 4, \"op\": \"drop_tables\"}", "unknown_op"),
         ("{\"id\": 5, \"op\": \"digest\", \"query\": \"x\"}", "not_implemented"),
-        ("{\"id\": 6, \"op\": \"update_belief\"}", "not_implemented"),
+        ("{\"id\": 6, \"op\": \"update_belief\", \"verbose\": 1}", "bad_request"),
         ("{\"id\": 7, \"op\": \"health\", \"verbose\": true}", "bad_request"),
         ("{\"id\": 8, \"op\": \"put_atoms\", \"atoms\": [{\"id\": \"nope\"}]}", "bad_request"),
         ("{\"id\": 9, \"op\": \"supersede\", \"old\": \"00000000-0000-5000-8000-000000000001\", \"new\": \"00000000-0000-5000-8000-000000000002\"}", "unknown_atom"),
@@ -310,6 +310,56 @@ fn a_seed_must_carry_confidence_and_reliability_apart() {
         stored["atom"]["bbas"],
         json!([{"source": uuid(10), "confidence": 0.8, "reliability": 0.95}])
     );
+    s.finish();
+}
+
+#[test]
+fn update_belief_writes_nothing_and_atom_reports_belief() {
+    let dir = TempDir::new("belief");
+    let mut s = Scratch::spawn(&dir.graph(), 0);
+    let empty = s.ok(json!({"id": 1, "op": "update_belief"}));
+    assert_eq!(
+        (empty["current_atoms"].clone(), empty["contested"].clone()),
+        (json!(0), json!(0))
+    );
+    let seeded = |n: u32, c: f64, r: f64| {
+        let mut a = atom(n, n.into(), "A seeded atom.");
+        a["seed"] = json!({"confidence": c, "reliability": r});
+        a
+    };
+    s.ok(json!({"id": 2, "op": "put_atoms", "atoms": [seeded(1, 0.8, 0.95), seeded(2, 0.6, 0.5)]}));
+    s.ok(
+        json!({"id": 3, "op": "corroborate", "corroboration_id": uuid(90), "target": uuid(1),
+        "seed": {"confidence": 0.5, "reliability": 0.75}}),
+    );
+    s.ok(json!({"id": 4, "op": "add_edges", "edges": [
+        {"id": uuid(50), "source": uuid(2), "target": uuid(1), "rel": "contradicts"}]}));
+    let snapshot_before = fs::read(dir.graph()).unwrap();
+
+    let summary = s.ok(json!({"id": 5, "op": "update_belief"}));
+    assert_eq!(
+        (
+            summary["current_atoms"].clone(),
+            summary["contested"].clone(),
+            summary["seeds"].clone()
+        ),
+        (json!(2), json!(2), json!(3))
+    );
+    assert_eq!(
+        fs::read(dir.graph()).unwrap(),
+        snapshot_before,
+        "belief is derived: update_belief rewrites no snapshot"
+    );
+
+    // 0.8 × 0.95 = 0.76 restated by 0.5 × 0.75 = 0.375:
+    // 1 − 0.24 × 0.625 = 0.85; BetP 0.85 + 0.15 / 2 = 0.925.
+    let a = s.ok(json!({"id": 6, "op": "atom", "atom_id": uuid(1)}));
+    let b = &a["belief"];
+    assert!((b["bel"].as_f64().unwrap() - 0.85).abs() < 1e-12, "{b}");
+    assert!((b["pl"].as_f64().unwrap() - 1.0).abs() < 1e-12, "{b}");
+    assert!((b["betp"].as_f64().unwrap() - 0.925).abs() < 1e-12, "{b}");
+    assert_eq!(b["contested"], true);
+    assert_eq!(b["contested_with"], json!([uuid(2)]));
     s.finish();
 }
 

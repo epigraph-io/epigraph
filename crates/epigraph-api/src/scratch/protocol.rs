@@ -32,10 +32,11 @@
 //! | `add_edges` | `edges: [{id,source,target,rel}]` | `inserted`, `existing` |
 //! | `supersede` | `old`, `new`, `reason`? | `changed` |
 //! | `mark_applied` | `turn` | `changed` |
-//! | `atom` | `atom_id` | `atom` |
+//! | `update_belief` | — | `current_atoms`, `contested`, `seeds` |
+//! | `atom` | `atom_id` | `atom`, `belief: {bel,pl,betp,contested,contested_with}` |
 //! | `neighbors` | `atom_id` | `neighbors: [{edge,relationship,direction,atom:{id,text,kind,speaker,turn,is_current}}]` |
 //! | `snapshot` | — | `bytes` |
-//! | `update_belief`, `digest` | — | `not_implemented` until E2 |
+//! | `digest` | — | `not_implemented` until the digest lands |
 //!
 //! Three departures from DESIGN §4.2's sketch:
 //!
@@ -51,6 +52,13 @@
 //!   parameters are `atom_id`.
 //!
 //! `supersede`'s `reason` is accepted and not stored in slice 1.
+//!
+//! Belief ([`super::belief`]) is derived from the stored graph on every read
+//! and never stored, so `update_belief` writes nothing: it recomputes belief
+//! for the whole graph, which surfaces a seed that cannot be combined
+//! (`belief_failed`), and reports counts. DESIGN §3.4 calls it after each
+//! turn's batch; the snapshot that batch's writes took is already the
+//! complete state.
 //!
 //! # Durability
 //!
@@ -78,6 +86,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
+use super::belief::{BeliefError, BeliefView};
 use super::snapshot::{self, RestoreError, RestoreReport, RestoredFrom};
 use super::store::{Evidence, NewAtom, NewEdge, ScratchAtom, ScratchStore, Seed, StoreError};
 
@@ -101,6 +110,12 @@ impl OpError {
             code,
             detail: detail.into(),
         }
+    }
+}
+
+impl From<BeliefError> for OpError {
+    fn from(e: BeliefError) -> Self {
+        Self::new("belief_failed", e.to_string())
     }
 }
 
@@ -394,13 +409,20 @@ impl Session {
                 let changed = self.store.mark_applied(p.turn, now);
                 self.commit(changed, json!({ "changed": changed }))
             }
+            "update_belief" => {
+                params::<NoParams>(rest)?;
+                let view = BeliefView::compute(&self.store)?;
+                Ok(serde_json::to_value(view.summary(&self.store))
+                    .expect("belief summary serializes"))
+            }
             "atom" => {
                 let p: AtomIdParams = params(rest)?;
                 let atom = self
                     .store
                     .atom(&p.atom_id)
                     .ok_or(StoreError::UnknownAtom(p.atom_id))?;
-                Ok(json!({ "atom": atom }))
+                let view = BeliefView::compute(&self.store)?;
+                Ok(json!({ "atom": atom, "belief": view.get(&p.atom_id) }))
             }
             "neighbors" => {
                 let p: AtomIdParams = params(rest)?;
@@ -430,9 +452,9 @@ impl Session {
                 let bytes = self.persist()?;
                 Ok(json!({ "bytes": bytes }))
             }
-            "update_belief" | "digest" => Err(OpError::new(
+            "digest" => Err(OpError::new(
                 "not_implemented",
-                "belief update and digest arrive with the belief slice (E2)",
+                "the digest arrives with the ranking commit (E2)",
             )),
             _ => Err(OpError::new("unknown_op", "no such op")),
         }

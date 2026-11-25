@@ -33,6 +33,7 @@
 //! ([`snapshot::RestoreError::Foreign`]), 1 when stdout fails. Diagnostics on
 //! stderr are fixed phrases with no paths and no chat text.
 
+pub mod belief;
 pub mod bm25;
 pub mod protocol;
 pub mod snapshot;
