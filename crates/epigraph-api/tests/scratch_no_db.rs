@@ -180,6 +180,16 @@ fn code_of(text: &str) -> String {
         .join("\n")
 }
 
+/// The code of `text` with its two permitted `env` uses removed: reading
+/// argv (`std::env::args()`, in the binary) and the compile-time `env!`
+/// macro. Whatever `std::env`/`env::` remains is a runtime environment read,
+/// however it was imported.
+fn scanned(text: &str) -> String {
+    code_of(text)
+        .replace("std::env::args()", "")
+        .replace("env!(", "")
+}
+
 #[test]
 fn the_scratch_sources_read_no_environment_and_touch_no_database_or_router() {
     let sources = scratch_sources();
@@ -202,9 +212,10 @@ fn the_scratch_sources_read_no_environment_and_touch_no_database_or_router() {
         );
     }
     const FORBIDDEN: &[&str] = &[
-        "env::var",
-        "var_os(",
-        "vars()",
+        "std::env",
+        "env::",
+        "var_os",
+        "vars_os",
         "dotenv",
         "sqlx",
         "PgPool",
@@ -224,7 +235,7 @@ fn the_scratch_sources_read_no_environment_and_touch_no_database_or_router() {
     ];
     let mut hits = Vec::new();
     for (path, text) in &sources {
-        let code = code_of(text);
+        let code = scanned(text);
         for needle in FORBIDDEN {
             if code.contains(needle) {
                 hits.push(format!("{}: {needle}", path.display()));
@@ -236,11 +247,33 @@ fn the_scratch_sources_read_no_environment_and_touch_no_database_or_router() {
         "the scratch path must stay database- and network-free: {hits:#?}"
     );
 
-    // Calibration of the matcher itself: a source with these reads is caught.
-    let probe =
-        code_of("let u = std::env::var(\"DATABASE_URL\"); // fine\nlet p = PgPool::connect(&u);");
-    assert!(probe.contains("env::var") && probe.contains("PgPool"));
-    assert!(!code_of("// std::env::var in a comment").contains("env::var"));
+    // Calibration of the matcher itself, through the same pipeline: every
+    // spelling of an environment read is caught, and the permitted uses and
+    // comments are not.
+    let caught = |src: &str| {
+        let code = scanned(src);
+        FORBIDDEN.iter().any(|n| code.contains(n))
+    };
+    for read in [
+        "let u = std::env::var(\"DATABASE_URL\"); // fine\nlet p = PgPool::connect(&u);",
+        "use std::env::var;\nlet u = var(\"DATABASE_URL\");",
+        "let all: Vec<_> = std::env::vars_os().collect();",
+        "use std::{env::var};",
+        "use std::{env, io};\nlet u = env::var(\"X\");",
+        "use std::env as e;",
+    ] {
+        assert!(caught(read), "the scan misses: {read}");
+    }
+    for allowed in [
+        "std::process::exit(run(std::env::args().skip(1)));",
+        "let v = env!(\"CARGO_PKG_VERSION\");",
+        "// std::env::var in a comment",
+    ] {
+        assert!(
+            !caught(allowed),
+            "the scan flags a permitted use: {allowed}"
+        );
+    }
 }
 
 #[test]
