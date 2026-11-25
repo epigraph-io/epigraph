@@ -25,7 +25,17 @@
 //!   evaluation, including one local round trip;
 //! * call counts (`track_functions = 'all'`) for a 200-card read and a
 //!   two-character-prefix name search;
-//! * the insert cost of the two partial indexes (275, 276).
+//! * the insert cost of the two windowed claim indexes (286, 287; they
+//!   replaced 275 and 276) and of 291's evidence index.
+//!
+//! After operator rulings C5, C6 and C2 (migrations 286-297) the shape adds:
+//! (e) PRE-BINDING rows, created a day before every bound agent's link: 150
+//! public claims per bound agent (225,000) and, per bound agent, 20 public
+//! evidence rows, challenges, BBAs and ingest records and 2 countersign acts,
+//! which the windowed probes must skip by index range (under 283 the first
+//! public claim named H at once); (f) 1,000,000 public evidence rows, 300,000
+//! challenges, BBAs and ingest records, and 100,000 countersign acts by another
+//! agent.
 //!
 //! It asserts only the pass conditions it can state exactly: each probe plan
 //! uses the per-agent partial index and no plan scans a whole `claims`
@@ -47,6 +57,11 @@ const OTHER_GROUP_CLAIMS: i64 = 1_000_000;
 const OTHER_PUBLIC_CLAIMS: i64 = 1_000_000;
 const SKEW_OPERATORS: i64 = 10_000;
 const VIEWER_GROUPS: i64 = 30;
+const PRE_BINDING_CLAIMS_PER_AGENT: i64 = 150;
+const PRE_BINDING_ROWS_PER_AGENT: i64 = 20;
+const OTHER_EVIDENCE: i64 = 1_000_000;
+const OTHER_ROWS: i64 = 300_000;
+const OTHER_COUNTERSIGNS: i64 = 100_000;
 
 fn key_sql(seed: &str) -> String {
     format!(
@@ -266,19 +281,174 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     .await
     .expect("skew links");
 
+    // (e) pre-binding rows by the bound agents and (f) other agents' rows of
+    // every kind 295 / 297 probe. Replica mode: no FK or tenancy triggers, so
+    // every row hangs off one claim, one frame and one paper.
+    let any_claim: Uuid = sqlx::query_scalar("SELECT id FROM claims LIMIT 1")
+        .fetch_one(&mut *c)
+        .await
+        .expect("a claim");
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses, visibility, owner_group_id) \
+         VALUES ('perf frame', ARRAY['h0','h1'], 'public', $1) RETURNING id",
+    )
+    .bind(fixture::world_group(&pool).await)
+    .fetch_one(&mut *c)
+    .await
+    .expect("frame");
+    let paper: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, visibility, owner_group_id) \
+         VALUES ('10.9999/perf', 'perf', 'public', $1) RETURNING id",
+    )
+    .bind(fixture::world_group(&pool).await)
+    .fetch_one(&mut *c)
+    .await
+    .expect("paper");
+    // `agent_sql` names each row's asserting agent; `at` its created_at.
+    let rows = |table: &str, agent_sql: &str, at: &str, n: i64, tag: &str| -> String {
+        let common = format!("FROM pg_catalog.generate_series(1, {n}) g");
+        match table {
+            "claims" => format!(
+                "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                                     is_current, visibility, owner_group_id, created_at) \
+                 SELECT gen_random_uuid(), '{tag} ' || g, {}, 0.5, {agent_sql}, true, 'public', \
+                        '{world}', {at} {common}",
+                key_sql(&format!("'{tag}' || g::text"))
+            ),
+            "evidence" => format!(
+                "INSERT INTO evidence (claim_id, evidence_type, content_hash, signature, \
+                                       signer_id, created_at, visibility, owner_group_id) \
+                 SELECT '{any_claim}', 'testimony', {}, {} || {}, {agent_sql}, {at}, 'public', \
+                        '{world}' {common}",
+                key_sql(&format!("'{tag}' || g::text")),
+                key_sql(&format!("'{tag}s1' || g::text")),
+                key_sql(&format!("'{tag}s2' || g::text"))
+            ),
+            "challenges" => format!(
+                "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, \
+                                         created_at, visibility, owner_group_id) \
+                 SELECT '{any_claim}', {agent_sql}, 'factual', '{tag}', {at}, 'public', \
+                        '{world}' {common}"
+            ),
+            "mass_functions" => format!(
+                // 267's NULLS NOT DISTINCT key: one evidence slot per row.
+                "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, \
+                                             slot_kind, slot_id, created_at, visibility, \
+                                             owner_group_id) \
+                 SELECT '{any_claim}', '{frame}', {agent_sql}, '{{\"0\": 0.5}}'::jsonb, \
+                        'evidence', gen_random_uuid(), {at}, 'public', '{world}' {common}"
+            ),
+            "edges" => format!(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                                    relationship, properties, created_at, visibility, \
+                                    owner_group_id) \
+                 SELECT '{paper}', 'paper', '{any_claim}', 'claim', 'ingested_claim', \
+                        jsonb_build_object('ingested_by', ({agent_sql})::text, \
+                                           'ingest_written', jsonb_build_object( \
+                                               'tool', 'ingest_document', \
+                                               'by', ({agent_sql})::text)), \
+                        {at}, 'public', '{world}' {common}"
+            ),
+            "security_events" => format!(
+                "INSERT INTO security_events (event_type, agent_id, success, details, created_at) \
+                 SELECT 'authorship.countersigned', {agent_sql}, true, \
+                        jsonb_build_object('paper_id', '{paper}'), {at} {common}"
+            ),
+            other => panic!("{other}"),
+        }
+    };
+    let bound_agent = "(SELECT array_agg(id) FROM agents \
+                        WHERE display_name LIKE 'perf agent %')[1 + (g % 1500)::int]";
+    let pre_binding = "now() - interval '1 day'";
+    let t_e = Instant::now();
+    exec(
+        &mut c,
+        &rows(
+            "claims",
+            bound_agent,
+            pre_binding,
+            BOUND * PRE_BINDING_CLAIMS_PER_AGENT,
+            "pre-claim",
+        ),
+    )
+    .await;
+    for table in ["evidence", "challenges", "mass_functions", "edges"] {
+        exec(
+            &mut c,
+            &rows(
+                table,
+                bound_agent,
+                pre_binding,
+                BOUND * PRE_BINDING_ROWS_PER_AGENT,
+                &format!("pre-{table}"),
+            ),
+        )
+        .await;
+    }
+    exec(
+        &mut c,
+        &rows(
+            "security_events",
+            bound_agent,
+            pre_binding,
+            BOUND * 2,
+            "pre-cs",
+        ),
+    )
+    .await;
+    let other_sql = format!("'{other}'::uuid");
+    exec(
+        &mut c,
+        &rows("evidence", &other_sql, "now()", OTHER_EVIDENCE, "oe"),
+    )
+    .await;
+    for table in ["challenges", "mass_functions", "edges"] {
+        exec(
+            &mut c,
+            &rows(
+                table,
+                &other_sql,
+                "now()",
+                OTHER_ROWS,
+                &format!("o-{table}"),
+            ),
+        )
+        .await;
+    }
+    exec(
+        &mut c,
+        &rows(
+            "security_events",
+            &other_sql,
+            "now()",
+            OTHER_COUNTERSIGNS,
+            "o-cs",
+        ),
+    )
+    .await;
+    println!("(e)/(f) rows: {:.1}s", t_e.elapsed().as_secs_f64());
+
     exec(&mut c, "SET session_replication_role = origin").await;
-    exec(&mut c, "ANALYZE agents, operator_links, author_binding_clients, claims, group_memberships, groups, oauth_clients, human_operators").await;
+    exec(&mut c, "ANALYZE agents, operator_links, author_binding_clients, claims, group_memberships, groups, oauth_clients, human_operators, evidence, challenges, mass_functions, edges, security_events, papers").await;
     println!("load + analyze: {:.1}s", t0.elapsed().as_secs_f64());
 
     // ── generic plans of the body statements, as the definer's owner ───────
     let bound: Vec<Uuid> = sqlx::query_scalar(
         "SELECT ARRAY[$1::uuid] || ARRAY(SELECT l.agent_id FROM operator_links l \
-                                           WHERE l.operator_id = $1)",
+                                           WHERE l.operator_id = $1 ORDER BY l.agent_id)",
     )
     .bind(h)
     .fetch_one(&mut *c)
     .await
     .expect("bound");
+    let since: Vec<String> = sqlx::query_scalar(
+        "SELECT ARRAY['-infinity'::text] || ARRAY(SELECT l.created_at::text FROM operator_links l \
+                                                  WHERE l.operator_id = $1 ORDER BY l.agent_id)",
+    )
+    .bind(h)
+    .fetch_one(&mut *c)
+    .await
+    .expect("since");
     assert_eq!(
         bound.len(),
         usize::try_from(BOUND + 1).unwrap(),
@@ -295,33 +465,115 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     };
     exec(&mut c, "SET ROLE epigraph_maintenance").await;
     exec(&mut c, "SET plan_cache_mode = force_generic_plan").await;
+    // The statements of the core's body as 288 / 295 / 297 write them.
     exec(
         &mut c,
         "PREPARE p_bound(uuid) AS \
-           SELECT ARRAY[$1] \
-               || ARRAY(SELECT l.agent_id FROM public.operator_links l WHERE l.operator_id = $1) \
-               || ARRAY(SELECT r.agent_id FROM public.author_binding_clients r \
-                         WHERE r.operator_id = $1)",
+           SELECT pg_catalog.array_agg(s.agent_id ORDER BY s.since, s.agent_id), \
+                  pg_catalog.array_agg(s.since ORDER BY s.since, s.agent_id) \
+             FROM (SELECT b.agent_id, pg_catalog.min(b.since) AS since \
+                     FROM (SELECT $1 AS agent_id, '-infinity'::timestamptz AS since \
+                           UNION ALL \
+                           SELECT l.agent_id, l.created_at FROM public.operator_links l \
+                            WHERE l.operator_id = $1 \
+                           UNION ALL \
+                           SELECT r.agent_id, r.added_at FROM public.author_binding_clients r \
+                            WHERE r.operator_id = $1) b \
+                    GROUP BY b.agent_id) s",
+    )
+    .await;
+    let rows_from = "FROM ROWS FROM (pg_catalog.unnest($1), pg_catalog.unnest($2)) \
+                     AS b(agent_id, since)";
+    let probe = |name: &str, body: &str| {
+        format!(
+            "PREPARE {name}(uuid[], timestamptz[]) AS \
+               SELECT EXISTS (SELECT 1 {rows_from} \
+                              CROSS JOIN LATERAL ({body} LIMIT 1) x)"
+        )
+    };
+    exec(
+        &mut c,
+        &probe(
+            "p_public",
+            "SELECT 1 FROM public.claims c WHERE c.agent_id = b.agent_id \
+               AND c.visibility = 'public' AND c.created_at >= b.since",
+        ),
     )
     .await;
     exec(
         &mut c,
-        "PREPARE p_public(uuid[]) AS \
-           SELECT EXISTS (SELECT 1 FROM pg_catalog.unnest($1) b(agent_id) \
-                          CROSS JOIN LATERAL (SELECT 1 FROM public.claims c \
-                                               WHERE c.agent_id = b.agent_id \
-                                                 AND c.visibility = 'public' LIMIT 1) x)",
+        &probe(
+            "p_evidence",
+            "SELECT 1 FROM public.evidence e WHERE e.signer_id = b.agent_id \
+               AND e.visibility = 'public' AND e.created_at >= b.since",
+        ),
     )
     .await;
     exec(
         &mut c,
-        "PREPARE p_readable(uuid[], uuid[]) AS \
-           SELECT EXISTS (SELECT 1 FROM pg_catalog.unnest($1) b(agent_id) \
-                          CROSS JOIN pg_catalog.unnest($2) vg(group_id) \
+        &probe(
+            "p_challenges",
+            "SELECT 1 FROM public.challenges ch WHERE ch.challenger_id = b.agent_id \
+               AND ch.visibility = 'public' AND ch.created_at >= b.since",
+        ),
+    )
+    .await;
+    exec(
+        &mut c,
+        &probe(
+            "p_bbas",
+            "SELECT 1 FROM public.mass_functions m WHERE m.source_agent_id = b.agent_id \
+               AND m.visibility = 'public' AND m.created_at >= b.since",
+        ),
+    )
+    .await;
+    // 300's spelling: 298's LEAKPROOF accessor against the ids as text.
+    exec(
+        &mut c,
+        "PREPARE p_ingest(text[], timestamptz[]) AS \
+           SELECT EXISTS (SELECT 1 FROM ROWS FROM (pg_catalog.unnest($1), pg_catalog.unnest($2)) \
+                                        AS b(agent_text, since) \
+                          CROSS JOIN LATERAL (SELECT 1 FROM public.edges r \
+                                               WHERE public.epigraph_ingest_record_ingester(r.properties) \
+                                                     = b.agent_text \
+                                                 AND r.relationship = 'ingested_claim' \
+                                                 AND r.visibility = 'public' \
+                                                 AND r.created_at >= b.since \
+                                                 AND (r.properties -> 'ingest_written' ->> 'by') \
+                                                     = public.epigraph_ingest_record_ingester(r.properties) \
+                                               LIMIT 1) x)",
+    )
+    .await;
+    exec(
+        &mut c,
+        "PREPARE p_countersign(uuid[], timestamptz[], uuid[]) AS \
+           SELECT EXISTS (SELECT 1 FROM ROWS FROM (pg_catalog.unnest($1), pg_catalog.unnest($2)) \
+                                        AS b(agent_id, since) \
+                          CROSS JOIN LATERAL (SELECT 1 \
+                                                FROM (SELECT (s.details ->> 'paper_id')::uuid \
+                                                             AS paper_id \
+                                                        FROM public.security_events s \
+                                                       WHERE s.agent_id = b.agent_id \
+                                                         AND s.event_type = 'authorship.countersigned' \
+                                                         AND s.created_at >= b.since \
+                                                      OFFSET 0) s \
+                                                JOIN public.papers p ON p.id = s.paper_id \
+                                               WHERE (p.visibility = 'public' \
+                                                      OR p.owner_group_id = ANY ($3)) \
+                                               LIMIT 1) x)",
+    )
+    .await;
+    exec(
+        &mut c,
+        "PREPARE p_readable(uuid[], timestamptz[], uuid[]) AS \
+           SELECT EXISTS (SELECT 1 FROM ROWS FROM (pg_catalog.unnest($1), pg_catalog.unnest($2)) \
+                                        AS b(agent_id, since) \
+                          CROSS JOIN pg_catalog.unnest($3) vg(group_id) \
                           CROSS JOIN LATERAL (SELECT 1 FROM public.claims c \
                                                WHERE c.agent_id = b.agent_id \
                                                  AND c.owner_group_id = vg.group_id \
-                                                 AND c.visibility <> 'public' LIMIT 1) x)",
+                                                 AND c.visibility <> 'public' \
+                                                 AND c.created_at >= b.since LIMIT 1) x)",
     )
     .await;
     exec(
@@ -334,18 +586,68 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     )
     .await;
     let b = arr(&bound);
+    let bt = format!(
+        "ARRAY[{}]::text[]",
+        bound
+            .iter()
+            .map(|u| format!("'{u}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let ss = format!(
+        "ARRAY[{}]::timestamptz[]",
+        since
+            .iter()
+            .map(|t| format!("'{t}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let gs = arr(&groups);
     let plan_bound = generic_plan(&mut c, "B(H)", &format!("EXECUTE p_bound('{h}')")).await;
     let plan_public = generic_plan(
         &mut c,
         "public-claim arm",
-        &format!("EXECUTE p_public({b})"),
+        &format!("EXECUTE p_public({b}, {ss})"),
     )
     .await;
+    let mut other_plans = Vec::new();
+    for (label, stmt, want) in [
+        (
+            "evidence arm",
+            "p_evidence",
+            "idx_evidence_public_by_signer",
+        ),
+        (
+            "challenge arm",
+            "p_challenges",
+            "idx_challenges_public_by_challenger",
+        ),
+        ("BBA arm", "p_bbas", "idx_mass_functions_public_by_source"),
+        (
+            "ingest-record arm",
+            "p_ingest",
+            "idx_edges_public_ingest_records_by_ingester_lp",
+        ),
+    ] {
+        let ids = if stmt == "p_ingest" { &bt } else { &b };
+        let plan = generic_plan(&mut c, label, &format!("EXECUTE {stmt}({ids}, {ss})")).await;
+        other_plans.push((label, plan, want));
+    }
+    let plan_countersign = generic_plan(
+        &mut c,
+        "countersign arm",
+        &format!("EXECUTE p_countersign({b}, {ss}, {gs})"),
+    )
+    .await;
+    other_plans.push((
+        "countersign arm",
+        plan_countersign,
+        "idx_security_events_countersigned",
+    ));
     let plan_readable = generic_plan(
         &mut c,
         "readable-claim arm",
-        &format!("EXECUTE p_readable({b}, {gs})"),
+        &format!("EXECUTE p_readable({b}, {ss}, {gs})"),
     )
     .await;
     let plan_team = generic_plan(&mut c, "team arm", &format!("EXECUTE p_team('{h}', {gs})")).await;
@@ -363,10 +665,31 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     // Which index each probe chose is REPORTED, not asserted: the generic
     // plan's choice between 276 and `idx_claims_agent_id` moved between runs
     // of the same shape (statistics sampling), which is itself a finding.
+    for (label, plan, _) in &other_plans {
+        for table in [
+            "evidence",
+            "challenges",
+            "mass_functions",
+            "edges",
+            "security_events",
+        ] {
+            assert!(
+                !plan.contains(&format!("Seq Scan on {table}")),
+                "{label}: a sequential scan of {table}:\n{plan}"
+            );
+        }
+    }
     for (label, plan, want) in [
-        ("public", &plan_public, "idx_claims_public_by_agent"),
-        ("readable", &plan_readable, "idx_claims_group_by_agent"),
-    ] {
+        ("public", &plan_public, "idx_claims_public_by_agent_since"),
+        (
+            "readable",
+            &plan_readable,
+            "idx_claims_group_by_agent_since",
+        ),
+    ]
+    .into_iter()
+    .chain(other_plans.iter().map(|(l, p, w)| (*l, p, *w)))
+    {
         println!(
             "probe index, {label} arm: {}",
             if plan.contains(want) {
@@ -424,7 +747,10 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     // ── timings of the core, as its owner ──────────────────────────────────
     let ((p50, max), named) = time_core(&pool, h, v, &groups, 25).await;
     assert!(!named, "CALIBRATION: the worst case names nobody");
-    println!("\ncore, human, no arm holds (worst case): p50 {p50:.2} ms, max {max:.2} ms");
+    println!(
+        "\ncore, human, no arm holds (worst case; every bound agent has pre-binding public \
+         rows of every kind): p50 {p50:.2} ms, max {max:.2} ms"
+    );
     let ((p50n, maxn), named) = time_core(&pool, other, v, &groups, 25).await;
     assert!(named, "CALIBRATION: a non-human is named");
     println!("core, non-human: p50 {p50n:.3} ms, max {maxn:.3} ms");
@@ -599,7 +925,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     );
     drop(read);
 
-    // ── insert cost of 275 / 276 ───────────────────────────────────────────
+    // ── insert cost of 286 / 287 ───────────────────────────────────────────
     let mut c = pool.acquire().await.expect("conn");
     let insert = |tag: &'static str| {
         format!(
@@ -615,14 +941,14 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     let t = Instant::now();
     exec(&mut c, &insert("with-idx")).await;
     let with_ms = t.elapsed().as_secs_f64() * 1000.0;
-    exec(&mut c, "DROP INDEX public.idx_claims_public_by_agent").await;
-    exec(&mut c, "DROP INDEX public.idx_claims_group_by_agent").await;
+    exec(&mut c, "DROP INDEX public.idx_claims_public_by_agent_since").await;
+    exec(&mut c, "DROP INDEX public.idx_claims_group_by_agent_since").await;
     let t = Instant::now();
     exec(&mut c, &insert("without-idx")).await;
     let without_ms = t.elapsed().as_secs_f64() * 1000.0;
     exec(&mut c, "SET session_replication_role = origin").await;
     println!(
-        "\ninsert of 20,000 group claims: {with_ms:.0} ms with 275/276, {without_ms:.0} ms \
-         without (triggers off, so the difference is the two indexes)"
+        "\ninsert of 20,000 group claims: {with_ms:.0} ms with 286/287, {without_ms:.0} ms \
+         without (triggers off, so the difference is 286/287's two indexes)"
     );
 }
