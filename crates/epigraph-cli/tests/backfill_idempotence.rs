@@ -2128,14 +2128,18 @@ async fn verify_flags_a_registry_edge_off_its_meet_and_the_registry_arm_repairs_
 /// body that is neither 258's nor 246's; 284's own deploy notes say to run
 /// `284-undo.sql` before `258-undo.sql`. A later migration that re-states one
 /// of these bodies adds its runbook to the front of this list.
+///
+/// Each runbook is named by its full literal path: the CI shard planner maps
+/// a literal path to the file it names, and a bare directory literal would
+/// make this test target read every runbook.
 async fn undo_to_below_258(pool: &PgPool) {
-    for runbook in ["284-undo.sql", "258-undo.sql"] {
-        let undo = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../docs/runbooks")
-                .join(runbook),
-        )
-        .unwrap_or_else(|e| panic!("read the {runbook} runbook: {e}"));
+    for runbook in [
+        "../../docs/runbooks/284-undo.sql",
+        "../../docs/runbooks/258-undo.sql",
+    ] {
+        let undo =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(runbook))
+                .unwrap_or_else(|e| panic!("read the {runbook} runbook: {e}"));
         sqlx::raw_sql(&undo)
             .execute(pool)
             .await
