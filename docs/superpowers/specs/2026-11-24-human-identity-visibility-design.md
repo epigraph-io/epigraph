@@ -1216,6 +1216,9 @@ remains the one structural remedy.
   the plan observed at scale, or make 296 the only fitting index (as 287's three-column key did
   for the readable-claim arm). Until then 296 may be pure write cost. (The evidence half of
   the finding is moot: 305 drops 291's index with the probe.)
+- 306 (correctness#3) adds a `groups` join and, for a verb-made or personal group row, up to
+  two `epigraph_human_of` calls and one `author_binding_clients` probe to the details EXISTS,
+  which runs on EVERY evaluation, the non-human path (0.2 ms above) included. Not measured.
 - §15.R16's placeholder rows (an `epigraph_unnamed_agent_name` per human principal in every name
   search) are not measured against the §11 budget. Open: measure on the harness's 21,507
   agents before the PR is called ready.
