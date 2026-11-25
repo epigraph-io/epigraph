@@ -1,11 +1,11 @@
-//! The role-holding projection edges are team-only (migration 278; operator
+//! The role-holding projection edges are team-only (migration 280; operator
 //! ruling 2026-11-24, human-identity visibility spec section 7 row K1).
 //!
 //! # What is under test
 //!
 //! * The OWNER RULE on every path that writes the projection: a grant (the
 //!   `role_assignments` audit trigger), a bind / unbind (the
-//!   `group_role_bindings` re-own trigger), and the 278 backfill of existing
+//!   `group_role_bindings` re-own trigger), and the 280 backfill of existing
 //!   rows. One live binding to an active team/community: that group owns the
 //!   edge; zero, or more than one: the holder's personal group (minted by
 //!   105's function when absent, refused when only revoked rows exist).
@@ -21,12 +21,12 @@
 //!   `(visibility, owner, declared owner)`, so no later re-meet of the two
 //!   public endpoints widens it.
 //! * The migration's precondition (OCC01) and post-condition (OCC02).
-//! * Migration 281: only a GENUINE projection is re-owned (the marker the audit
+//! * Migration 283: only a GENUINE projection is re-owned (the marker the audit
 //!   trigger writes, joined to its `role_assignments` row by assignment id,
 //!   holder and role). A forged edge of the projection's shape, written by any
 //!   edge writer, is never re-owned by a bind / unbind or by the reconcile
 //!   pass, and never makes a binding change fail.
-//! * Migration 282: a projection edge (any row carrying the marker) is
+//! * Migration 284: a projection edge (any row carrying the marker) is
 //!   written only by a maintenance session or a maintenance-owned definer
 //!   frame. A writer of the owning team cannot widen, strip, re-time or
 //!   delete one, nor write the marker onto a row of its own (OCC05); the
@@ -510,7 +510,7 @@ async fn a_missing_personal_group_is_minted_and_a_revoked_one_refuses(pool: PgPo
     assert_eq!(world, 0, "no projection edge is ever public");
 }
 
-// ─── migration 278 ───────────────────────────────────────────────────────
+// ─── migration 280 ───────────────────────────────────────────────────────
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -540,7 +540,7 @@ async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) -> Result<()
     r
 }
 
-/// Below 278: an unbound role's edge and a bound role's edge, both public
+/// Below 280: an unbound role's edge and a bound role's edge, both public
 /// (130's body). After: each owned by the rule, its declaration recorded
 /// exactly as a grant at head records it, and one summary audit row with the
 /// count shape.
@@ -564,7 +564,7 @@ async fn seed_public_projections(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid, Uuid
 
 #[sqlx::test(migrations = false)]
 async fn migration_278_backfills_every_projection_and_audits_the_counts(pool: PgPool) {
-    migrate(&pool, &below(278)).await.expect("migrate to 277");
+    migrate(&pool, &below(280)).await.expect("migrate to 279");
     let (h1, p1, h2, team, mate) = seed_public_projections(&pool).await;
     migrate(&pool, &MIGRATOR).await.expect("migrate to head");
     assert_eq!(
@@ -605,7 +605,7 @@ async fn migration_278_backfills_every_projection_and_audits_the_counts(pool: Pg
     .expect("audit");
     assert_eq!(audits.len(), 1, "one summary row");
     let d = &audits[0];
-    assert_eq!(d["migration"], 278);
+    assert_eq!(d["migration"], 280);
     assert_eq!(d["before"], 2, "{d}");
     assert_eq!(d["rows"], 2, "{d}");
     assert_eq!(d["after"], 0, "{d}");
@@ -616,7 +616,7 @@ async fn migration_278_backfills_every_projection_and_audits_the_counts(pool: Pg
 /// Reproduced by a trigger that silently skips the backfill's rows.
 #[sqlx::test(migrations = false)]
 async fn migration_278_refuses_when_the_backfill_moves_nothing(pool: PgPool) {
-    migrate(&pool, &below(278)).await.expect("migrate to 277");
+    migrate(&pool, &below(280)).await.expect("migrate to 279");
     let (h1, ..) = seed_public_projections(&pool).await;
     for stmt in [
         "CREATE FUNCTION public.test_skip_edge_reown() RETURNS trigger \
@@ -639,7 +639,7 @@ async fn migration_278_refuses_when_the_backfill_moves_nothing(pool: PgPool) {
 /// overwritten blind.
 #[sqlx::test(migrations = false)]
 async fn migration_278_refuses_over_another_audit_body(pool: PgPool) {
-    migrate(&pool, &below(278)).await.expect("migrate to 277");
+    migrate(&pool, &below(280)).await.expect("migrate to 279");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_role_assignments_audit() \
          RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
@@ -650,11 +650,11 @@ async fn migration_278_refuses_over_another_audit_body(pool: PgPool) {
     .expect("another body");
     let err = migrate(&pool, &MIGRATOR)
         .await
-        .expect_err("278 must refuse over another body");
+        .expect_err("280 must refuse over another body");
     assert!(err.contains("OCC01"), "precondition refusal: {err}");
 }
 
-/// 278's and 281's functions: owned by the maintenance role, on 172's path,
+/// 280's and 283's functions: owned by the maintenance role, on 172's path,
 /// EXECUTE revoked from PUBLIC and not granted to the application role (an
 /// application-callable owner rule would be a binding oracle; an
 /// application-callable re-own would drive personal-group mints).
@@ -686,7 +686,7 @@ async fn migration_278_functions_are_pinned_owned_and_not_app_callable(pool: PgP
     }
 }
 
-// ─── migration 281: only a genuine projection is re-owned ────────────────
+// ─── migration 283: only a genuine projection is re-owned ────────────────
 
 /// An edge of the projection's shape written by an ordinary edge writer (the
 /// superuser stands in for any writer: what is under test is the row's shape,
@@ -741,10 +741,10 @@ async fn personal_groups_of(pool: &PgPool, agent: Uuid) -> i64 {
 /// genuine assignment `real` of holder `h`:
 /// * the holder's own `{role}` edge with no marker;
 /// * a `{role}` edge from an agent whose only personal row is REVOKED (105's
-///   RVK01 refuses a mint for it: 278's re-own called the owner rule for it and
+///   RVK01 refuses a mint for it: 280's re-own called the owner rule for it and
 ///   failed the whole binding change);
 /// * the full marker with an assignment id no `role_assignments` row has, from
-///   an agent with NO personal group (278 minted one for it);
+///   an agent with NO personal group (280 minted one for it);
 /// * the full marker naming the REAL assignment from another agent.
 struct Forged {
     ids: Vec<Uuid>,
@@ -872,20 +872,20 @@ async fn a_forged_role_edge_is_never_reowned_and_never_blocks_a_binding_change(p
     );
 }
 
-/// 281's reconcile pass, from 280: a genuine projection left public is
+/// 283's reconcile pass, from 282: a genuine projection left public is
 /// re-owned by the rule; forged rows are neither moved nor counted, and a
 /// forged public row does not trip the post-condition. One summary row with
 /// the count shape.
 #[sqlx::test(migrations = false)]
 async fn migration_281_reconciles_genuine_projections_only(pool: PgPool) {
-    migrate(&pool, &below(281)).await.expect("migrate to 280");
+    migrate(&pool, &below(283)).await.expect("migrate to 282");
     let (h, _) = person(&pool, "below holder").await;
     let (mate, _) = fixture::seed_agent_with_group(&pool, "below mate").await;
     let node = seed_role(&pool, "role:edge-test-reconcile").await;
     let team = group_of(&pool, "team", &[mate]).await;
     bind(&pool, team, "role:edge-test-reconcile").await;
     let real = grant(&pool, "role:edge-test-reconcile", h).await;
-    // A genuine projection left public (a row written before 278, or widened
+    // A genuine projection left public (a row written before 280, or widened
     // since): the reconcile pass must catch it.
     sqlx::query(
         "UPDATE edges SET visibility = 'public', owner_group_id = $2, \
@@ -896,7 +896,7 @@ async fn migration_281_reconciles_genuine_projections_only(pool: PgPool) {
     .bind(Uuid::nil())
     .execute(&pool)
     .await
-    .expect("widen the genuine projection below 281");
+    .expect("widen the genuine projection below 283");
     assert_eq!(tenancy(&pool, h).await[0].0, "public", "PREMISE");
     let forged = plant_forgeries(&pool, "role:edge-test-reconcile", node, h, real).await;
     let mut before = Vec::new();
@@ -934,13 +934,13 @@ async fn migration_281_reconciles_genuine_projections_only(pool: PgPool) {
     .expect("audit");
     assert_eq!(audits.len(), 1, "one summary row");
     let d = &audits[0];
-    assert_eq!(d["migration"], 281);
+    assert_eq!(d["migration"], 283);
     assert_eq!(d["before"], 1, "only the genuine public projection: {d}");
     assert_eq!(d["rows"], 1, "{d}");
     assert_eq!(d["after"], 0, "{d}");
 }
 
-// ─── migration 282: a projection edge is maintenance-only ────────────────
+// ─── migration 284: a projection edge is maintenance-only ────────────────
 
 /// The SQLSTATE and message of a refused write, or None when it succeeded.
 async fn try_write(scoped: &ScopedPool, v: &Viewer, sql: &str, id: Uuid) -> Option<String> {
@@ -1227,11 +1227,11 @@ async fn the_maintenance_verbs_still_re_project_through_the_guard(pool: PgPool) 
     assert_eq!(owner, personal, "the end keeps the owner");
 }
 
-/// 281's precondition: a binding trigger whose body is not 278's is never
+/// 283's precondition: a binding trigger whose body is not 280's is never
 /// overwritten blind.
 #[sqlx::test(migrations = false)]
 async fn migration_281_refuses_over_another_binding_trigger_body(pool: PgPool) {
-    migrate(&pool, &below(281)).await.expect("migrate to 280");
+    migrate(&pool, &below(283)).await.expect("migrate to 282");
     sqlx::query(
         "CREATE OR REPLACE FUNCTION public.epigraph_group_role_bindings_reown_role_edges() \
          RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
@@ -1242,6 +1242,6 @@ async fn migration_281_refuses_over_another_binding_trigger_body(pool: PgPool) {
     .expect("another body");
     let err = migrate(&pool, &MIGRATOR)
         .await
-        .expect_err("281 must refuse over another body");
+        .expect_err("283 must refuse over another body");
     assert!(err.contains("OCC03"), "precondition refusal: {err}");
 }

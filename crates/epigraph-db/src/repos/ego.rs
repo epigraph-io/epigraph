@@ -491,7 +491,7 @@ impl EgoRepository {
         // marker; writing one would enter it in `visibility_lint.rs`'s
         // `EXPECTED_EXEMPTIONS`, which is an exact set reserved for functions
         // that filter NOTHING.
-        // Names through migration 272's rule on the caller's stamped
+        // Names through migration 274's rule on the caller's stamped
         // connection: an unnamed human gets its `oauth:<client row id>`
         // placeholder, the label a nameless service principal gets (spec 7
         // row H1, operator ruling C7).

@@ -235,7 +235,7 @@ pub struct CapabilityFilter {
 }
 
 /// A Tier-B projection of one `agents` row, narrowed to what the reading
-/// session may see (migration 272's `epigraph_agent_disclosure`).
+/// session may see (migration 274's `epigraph_agent_disclosure`).
 ///
 /// See [`AgentRepository::get_public_profile`] for the rule. The four
 /// always-present fields are the ones authorship rendering needs; the three
@@ -243,15 +243,15 @@ pub struct CapabilityFilter {
 /// agent's PII, which is **indistinguishable from the agent simply not having
 /// set them** — deliberately, so the projection is not itself an oracle for
 /// "this agent has a private profile".
-/// A human principal's own choice of who sees its name (migration 273): the
+/// A human principal's own choice of who sees its name (migration 275): the
 /// two values 062's CHECK admits on `agents.profile_visibility`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileVisibility {
     /// The name is shown to everyone.
     Public,
-    /// The name is shown only to the readers 272's rule admits (teammates,
+    /// The name is shown only to the readers 274's rule admits (teammates,
     /// readers of the person's claims, and everyone once the person or an
-    /// agent bound to it made a public assertion while bound; 288, 295, 297).
+    /// agent bound to it made a public assertion while bound; 290, 297, 299).
     Group,
 }
 
@@ -289,7 +289,7 @@ pub struct ProfileVisibilitySet {
     pub named_to_everyone: bool,
 }
 
-/// Map migration 273's refusals to designed refusals (the VIS pattern,
+/// Map migration 275's refusals to designed refusals (the VIS pattern,
 /// `claim_visibility.rs::map_vis_error`). `refusal_codes.rs` is pinned to
 /// migration 176's codes, so the PVS codes are mapped here instead.
 fn map_profile_visibility_error(e: sqlx::Error) -> DbError {
@@ -898,7 +898,7 @@ impl AgentRepository {
     /// universally readable and PostgreSQL has no column-level RLS to narrow
     /// it." That migration names THIS function explicitly among the ones which
     /// "take no `Viewer` and return the full row". The compensating projection —
-    /// the name and `properties`, `orcid`, `ror_id` gated by migration 272's
+    /// the name and `properties`, `orcid`, `ror_id` gated by migration 274's
     /// disclosure rule — is applied by every caller that serializes the row
     /// (`epigraph_db::redact_agent` / `AgentDisclosureRepository::disclosure`),
     /// and `agent_name_disclosure_lint.rs` lists the callers it reviewed.
@@ -2782,7 +2782,7 @@ impl AgentRepository {
     /// the name itself.
     ///
     /// PostgreSQL has no column-level RLS, so the narrowing is a **repo-layer
-    /// projection**, decided by migration 272's `epigraph_agent_disclosure` on
+    /// projection**, decided by migration 274's `epigraph_agent_disclosure` on
     /// the session `executor` is stamped as (`read_as` from the caller's
     /// viewer): `id`, `public_key` and `key_kind` are always returned;
     /// `display_name` only when `named`; [`AgentPublicProfile::properties`],
@@ -2792,10 +2792,10 @@ impl AgentRepository {
     /// application session reads as the anonymous outsider.
     ///
     /// An UNNAMED human reads exactly as a nameless OAuth service principal
-    /// (operator ruling C7): such a principal's profile is `'public'` (274's
+    /// (operator ruling C7): such a principal's profile is `'public'` (276's
     /// mint) with the column default `{}` for properties and no ORCID / ROR,
     /// so the unnamed human is shown under its `oauth:<client row id>`
-    /// placeholder (migration 285) with `profile_visibility = 'public'`,
+    /// placeholder (migration 287) with `profile_visibility = 'public'`,
     /// `properties = {}` and null ORCID / ROR, whatever its row holds. Its
     /// `key_kind` is its own: a provider-provisioned person is `derived`, as
     /// the service principal is (a registered operator holding a real key is
@@ -2873,7 +2873,7 @@ impl AgentRepository {
     }
 
     /// Set the SESSION PRINCIPAL's own `profile_visibility` through migration
-    /// 273's definer `epigraph_set_profile_visibility`, on `conn` (which must
+    /// 275's definer `epigraph_set_profile_visibility`, on `conn` (which must
     /// be stamped from the caller's viewer). Only a human principal may; the
     /// target is always the principal, never an argument. One
     /// `agent.profile_visibility_set` audit row per successful call.

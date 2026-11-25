@@ -315,7 +315,7 @@ pub async fn export_provenance_prov_o(
 
         let agent_uuid: uuid::Uuid = claim.agent_id.into();
         if agents_seen.insert(agent_uuid) {
-            // The name through migration 272's rule on the caller's stamped
+            // The name through migration 274's rule on the caller's stamped
             // connection (spec 7 row G1). A filer of a claim the caller reads
             // is named by the rule's claim arms; the CLI's maintenance session
             // is the privileged arm.

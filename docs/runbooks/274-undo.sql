@@ -1,15 +1,12 @@
--- Undo migration 274 (human_profile_visibility_group): restore 077's provisioning body.
--- Run on a maintenance connection. The reset of existing humans to 'group' is NOT reversed:
--- the pre-state was the column default, not consent, and cannot be recovered. CREATE OR
--- REPLACE keeps the owner and ACL. Idempotent.
-CREATE OR REPLACE FUNCTION public.epigraph_provision_oauth_agent(
-    p_public_key bytea, p_display_name text, p_agent_type text)
-RETURNS uuid LANGUAGE sql SECURITY DEFINER
-SET search_path = public, pg_temp AS $$
-    INSERT INTO public.agents (public_key, display_name, agent_type, key_kind, labels)
-    VALUES (p_public_key, p_display_name, p_agent_type, 'derived',
-            ARRAY['oauth-principal'])
-    ON CONFLICT (public_key) DO UPDATE SET updated_at = now()
-        WHERE agents.key_kind = 'derived'
-    RETURNING id
-$$;
+-- Undo migration 274 (human_identity_disclosure): drop the disclosure predicate, the
+-- evidence guard and the allowance index.
+-- Run on a maintenance connection, AFTER rolling back any binary built against 274 (or
+-- 275/276, whose setter calls the core): such a binary calls these functions and fails
+-- (SQLSTATE 42883) without them. Undo 276 and 275 first. Idempotent. No rows change.
+DROP TRIGGER IF EXISTS epigraph_oauth_clients_human_evidence_guard ON public.oauth_clients;
+DROP FUNCTION IF EXISTS public.epigraph_oauth_clients_human_evidence_guard();
+DROP FUNCTION IF EXISTS public.epigraph_human_named_to_viewer(uuid);
+DROP FUNCTION IF EXISTS public.epigraph_agent_disclosure(uuid);
+DROP FUNCTION IF EXISTS public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean);
+DROP FUNCTION IF EXISTS public.epigraph_is_human_principal(uuid);
+DROP INDEX IF EXISTS public.idx_author_binding_clients_operator;

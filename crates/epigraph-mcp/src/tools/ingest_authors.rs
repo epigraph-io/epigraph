@@ -485,7 +485,7 @@ pub(crate) async fn resolve_document_authors(
     };
     // Another ingester's explicit attachment matched by SPELLING is a
     // name-to-id answer: reported only when its agent is named to this caller
-    // (migration 272, on the ingest's stamped transaction). An unnamed human
+    // (migration 274, on the ingest's stamped transaction). An unnamed human
     // must not be found by name (spec 7 row A6, finding L3); the
     // same-position report below (`at_position`, whatever the spelling) is
     // the DOI-plus-position exposure already accepted (spec 15.R3).

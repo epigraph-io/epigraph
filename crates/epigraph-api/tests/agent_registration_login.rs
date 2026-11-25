@@ -215,7 +215,7 @@ async fn registering_an_agent_mints_no_login_without_an_admin_login_request(pool
 #[sqlx::test(migrations = "../../migrations")]
 async fn re_registering_an_existing_key_does_not_read_back_its_private_profile(pool: PgPool) {
     // A find-hit's NAME is decided on a viewer-stamped connection (migration
-    // 272's disclosure, `create_agent`), so the state carries a ScopedPool as
+    // 274's disclosure, `create_agent`), so the state carries a ScopedPool as
     // the server's does; `AppState::read_as` refuses without one.
     let scoped = epigraph_db::ScopedPool::connect(
         &viewer_fixture::database_url_for(&pool).await,

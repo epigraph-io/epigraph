@@ -1,5 +1,5 @@
 #![cfg(feature = "db")]
-//! The human-identity disclosure rule (migration 272) on the REST surfaces,
+//! The human-identity disclosure rule (migration 274) on the REST surfaces,
 //! through the full router (spec
 //! `docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md`,
 //! section 7 and T1).
@@ -116,7 +116,7 @@ async fn provisioned(pool: &PgPool, client_type: &str, name: &str) -> Uuid {
 }
 
 /// H (a provider-provisioned person under its real name, profile `group` as
-/// migration 274 provisions it) and N (a production-shaped nameless OAuth
+/// migration 276 provisions it) and N (a production-shaped nameless OAuth
 /// service principal, left exactly as `ensure_for_client` mints it:
 /// `oauth:<client row id>`, profile `public`, label `oauth-principal`).
 /// Operator ruling C7: an unnamed H reads as THIS N on every surface.

@@ -102,7 +102,7 @@ async fn the_route_serves_the_callers_view_with_the_operator_human_for_every_rea
     viewer_fixture::make_human_operator(&pool, human).await;
     // The person opted in to a public profile, as the self-service setter
     // records it, so every reader may see the NAME too (the id is shown to
-    // every reader whatever the profile). Before migration 283 (operator
+    // every reader whatever the profile). Before migration 285 (operator
     // ruling C11) the fixture's column default 'public' was read as that
     // opt-in; it never was consent.
     sqlx::query(

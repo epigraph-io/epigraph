@@ -1,34 +1,113 @@
--- Undo migration 281 (role_edges_genuine_projections_only): restore 278's body of
--- epigraph_group_role_bindings_reown_role_edges (every edge of the relationship with a
--- matching `properties.role`, forged rows included) and drop the genuine-projection re-own.
--- Run on a maintenance connection, in reverse order (282's undo first when it was applied),
--- AFTER rolling back every binary built with 281 (none calls these functions; the trigger does).
--- Nothing the reconcile pass moved is reversed: it only ever re-owned genuine projections into
--- their team-only owner. CREATE OR REPLACE keeps the owner and ACL. Idempotent.
-CREATE OR REPLACE FUNCTION public.epigraph_group_role_bindings_reown_role_edges()
-RETURNS trigger
-LANGUAGE plpgsql SECURITY DEFINER
+-- Undo migration 281 (disclosure_role_derived_arm_last): restore 279's body of the
+-- disclosure core (same answers; only the order of the last two arms differs). Run on a
+-- maintenance connection. CREATE OR REPLACE keeps the owner and ACL. Idempotent.
+CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for(
+    p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean)
+RETURNS TABLE (named boolean, details boolean)
+LANGUAGE plpgsql STABLE SECURITY DEFINER COST 1000
 SET search_path = pg_catalog, pg_temp AS $$
+#variable_conflict use_column
+DECLARE
+    v_groups     uuid[]  := COALESCE(p_groups, ARRAY[]::uuid[]);
+    v_privileged boolean := COALESCE(p_privileged, false);
+    v_self       boolean := COALESCE(p_target = p_principal, false);
+    v_profile    text;
+    v_details    boolean;
+    v_bound      uuid[];
 BEGIN
-    IF TG_OP = 'UPDATE' AND NOT (OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL) THEN
-        RETURN NULL;
-    END IF;
-    WITH o AS (
-        SELECT e.id, public.epigraph_role_edge_owner(NEW.role, e.source_id) AS g
-          FROM public.edges e
-         WHERE e.relationship = 'OCCUPIES' AND e.source_type = 'agent'
-           AND e.properties ->> 'role' = NEW.role
-    )
-    UPDATE public.edges e
-       SET visibility = 'group', owner_group_id = o.g, co_owner_group_id = NULL,
-           declared_owner_group_id = o.g, declared_co_owner_group_id = NULL
-      FROM o
-     WHERE e.id = o.id
-       AND (e.visibility, e.owner_group_id, e.co_owner_group_id,
-            e.declared_owner_group_id, e.declared_co_owner_group_id)
-           IS DISTINCT FROM ('group'::varchar, o.g, NULL::uuid, o.g, NULL::uuid);
-    RETURN NULL;
-END $$;
-REVOKE ALL ON FUNCTION public.epigraph_group_role_bindings_reown_role_edges() FROM PUBLIC;
+    SELECT a.profile_visibility INTO v_profile FROM public.agents a WHERE a.id = p_target;
 
-DROP FUNCTION IF EXISTS public.epigraph_reown_role_projection_edges(text);
+    -- Today's details rule, for every agent.
+    v_details := COALESCE(
+        v_privileged OR v_self OR v_profile = 'public'
+        OR (pg_catalog.cardinality(v_groups) > 0
+            AND EXISTS (SELECT 1 FROM public.group_memberships gm
+                         WHERE gm.agent_id = p_target
+                           AND gm.revoked_at IS NULL
+                           AND gm.group_id = ANY (v_groups))),
+        false);
+
+    IF NOT public.epigraph_is_human_principal(p_target) THEN
+        RETURN QUERY SELECT true, v_details;
+        RETURN;
+    END IF;
+
+    -- privileged, self, opt-in
+    IF v_privileged OR v_self OR COALESCE(v_profile = 'public', false) THEN
+        RETURN QUERY SELECT true, v_details;
+        RETURN;
+    END IF;
+
+    v_bound := ARRAY[p_target]
+            || ARRAY(SELECT l.agent_id FROM public.operator_links l
+                      WHERE l.operator_id = p_target)
+            || ARRAY(SELECT r.agent_id FROM public.author_binding_clients r
+                      WHERE r.operator_id = p_target);
+
+    -- public claim: one forced probe per bound agent (no viewer state)
+    IF EXISTS (
+        SELECT 1
+          FROM pg_catalog.unnest(v_bound) b(agent_id)
+         CROSS JOIN LATERAL (SELECT 1 FROM public.claims c
+                              WHERE c.agent_id = b.agent_id
+                                AND c.visibility = 'public'
+                              LIMIT 1) x)
+    THEN
+        RETURN QUERY SELECT true, v_details;
+        RETURN;
+    END IF;
+
+    IF pg_catalog.cardinality(v_groups) > 0 THEN
+        -- team, direct: one probe of the target's rows in the viewer's groups
+        IF EXISTS (
+            SELECT 1
+              FROM public.group_memberships m
+              JOIN public.groups g ON g.id = m.group_id
+             WHERE m.agent_id = p_target
+               AND m.revoked_at IS NULL
+               AND m.group_id = ANY (v_groups)
+               AND g.kind IN ('team', 'community')
+               AND g.status = 'active'
+               AND (g.did_key NOT LIKE 'did:epigraph:group:%'
+                    OR public.epigraph_is_human_operator(
+                           public.epigraph_human_of(p_target, true))))
+        THEN
+            RETURN QUERY SELECT true, v_details;
+            RETURN;
+        END IF;
+
+        -- team, role-derived: only a bound group can be one
+        IF EXISTS (SELECT 1 FROM public.group_role_bindings b
+                    WHERE b.group_id = ANY (v_groups))
+           AND EXISTS (
+            SELECT 1
+              FROM public.epigraph_role_derived_memberships(p_target, pg_catalog.now()) d
+              JOIN public.groups g ON g.id = d.group_id
+             WHERE d.group_id = ANY (v_groups)
+               AND g.kind IN ('team', 'community')
+               AND g.status = 'active')
+        THEN
+            RETURN QUERY SELECT true, v_details;
+            RETURN;
+        END IF;
+
+        -- readable claim: one forced probe per (bound agent, viewer group),
+        -- two equalities, so 278's (agent_id, owner_group_id) index is the
+        -- only fitting one (section 2a)
+        IF EXISTS (
+            SELECT 1
+              FROM pg_catalog.unnest(v_bound) b(agent_id)
+             CROSS JOIN pg_catalog.unnest(v_groups) vg(group_id)
+             CROSS JOIN LATERAL (SELECT 1 FROM public.claims c
+                                  WHERE c.agent_id = b.agent_id
+                                    AND c.owner_group_id = vg.group_id
+                                    AND c.visibility <> 'public'
+                                  LIMIT 1) x)
+        THEN
+            RETURN QUERY SELECT true, v_details;
+            RETURN;
+        END IF;
+    END IF;
+
+    RETURN QUERY SELECT false, false;
+END $$;

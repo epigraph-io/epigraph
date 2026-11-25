@@ -1,6 +1,8 @@
--- Undo migration 279 (disclosure_role_derived_arm_last): restore 277's body of the
--- disclosure core (same answers; only the order of the last two arms differs). Run on a
--- maintenance connection. CREATE OR REPLACE keeps the owner and ACL. Idempotent.
+-- Undo migration 279 (disclosure_team_arm_without_the_twin): restore 274's body of
+-- `epigraph_agent_disclosure_for` (the team arm through `epigraph_live_memberships_unbound`,
+-- the public-claim arm after it). Same answers; only the evaluation (and its cost, spec
+-- section 11) changes back. CREATE OR REPLACE keeps the owner and the ACL. Run on a
+-- maintenance connection. Idempotent. No rows change.
 CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for(
     p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean)
 RETURNS TABLE (named boolean, details boolean)
@@ -38,13 +40,26 @@ BEGIN
         RETURN;
     END IF;
 
+    -- team
+    IF pg_catalog.cardinality(v_groups) > 0 AND EXISTS (
+        SELECT 1
+          FROM public.epigraph_live_memberships_unbound(p_target) m
+          JOIN public.groups g ON g.id = m.group_id
+         WHERE m.group_id = ANY (v_groups)
+           AND g.kind IN ('team', 'community')
+           AND g.status = 'active')
+    THEN
+        RETURN QUERY SELECT true, v_details;
+        RETURN;
+    END IF;
+
     v_bound := ARRAY[p_target]
             || ARRAY(SELECT l.agent_id FROM public.operator_links l
                       WHERE l.operator_id = p_target)
             || ARRAY(SELECT r.agent_id FROM public.author_binding_clients r
                       WHERE r.operator_id = p_target);
 
-    -- public claim: one forced probe per bound agent (no viewer state)
+    -- public claim: one forced probe per bound agent
     IF EXISTS (
         SELECT 1
           FROM pg_catalog.unnest(v_bound) b(agent_id)
@@ -57,56 +72,18 @@ BEGIN
         RETURN;
     END IF;
 
-    IF pg_catalog.cardinality(v_groups) > 0 THEN
-        -- team, direct: one probe of the target's rows in the viewer's groups
-        IF EXISTS (
-            SELECT 1
-              FROM public.group_memberships m
-              JOIN public.groups g ON g.id = m.group_id
-             WHERE m.agent_id = p_target
-               AND m.revoked_at IS NULL
-               AND m.group_id = ANY (v_groups)
-               AND g.kind IN ('team', 'community')
-               AND g.status = 'active'
-               AND (g.did_key NOT LIKE 'did:epigraph:group:%'
-                    OR public.epigraph_is_human_operator(
-                           public.epigraph_human_of(p_target, true))))
-        THEN
-            RETURN QUERY SELECT true, v_details;
-            RETURN;
-        END IF;
-
-        -- team, role-derived: only a bound group can be one
-        IF EXISTS (SELECT 1 FROM public.group_role_bindings b
-                    WHERE b.group_id = ANY (v_groups))
-           AND EXISTS (
-            SELECT 1
-              FROM public.epigraph_role_derived_memberships(p_target, pg_catalog.now()) d
-              JOIN public.groups g ON g.id = d.group_id
-             WHERE d.group_id = ANY (v_groups)
-               AND g.kind IN ('team', 'community')
-               AND g.status = 'active')
-        THEN
-            RETURN QUERY SELECT true, v_details;
-            RETURN;
-        END IF;
-
-        -- readable claim: one forced probe per (bound agent, viewer group),
-        -- two equalities, so 276's (agent_id, owner_group_id) index is the
-        -- only fitting one (section 2a)
-        IF EXISTS (
-            SELECT 1
-              FROM pg_catalog.unnest(v_bound) b(agent_id)
-             CROSS JOIN pg_catalog.unnest(v_groups) vg(group_id)
-             CROSS JOIN LATERAL (SELECT 1 FROM public.claims c
-                                  WHERE c.agent_id = b.agent_id
-                                    AND c.owner_group_id = vg.group_id
-                                    AND c.visibility <> 'public'
-                                  LIMIT 1) x)
-        THEN
-            RETURN QUERY SELECT true, v_details;
-            RETURN;
-        END IF;
+    -- readable claim: one forced probe per bound agent
+    IF pg_catalog.cardinality(v_groups) > 0 AND EXISTS (
+        SELECT 1
+          FROM pg_catalog.unnest(v_bound) b(agent_id)
+         CROSS JOIN LATERAL (SELECT 1 FROM public.claims c
+                              WHERE c.agent_id = b.agent_id
+                                AND c.visibility <> 'public'
+                                AND c.owner_group_id = ANY (v_groups)
+                              LIMIT 1) x)
+    THEN
+        RETURN QUERY SELECT true, v_details;
+        RETURN;
     END IF;
 
     RETURN QUERY SELECT false, false;

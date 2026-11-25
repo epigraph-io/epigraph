@@ -1,8 +1,7 @@
--- Undo migration 302 (disclosure_counts_own_assertions_only): restore 300's body
--- of the disclosure core. Run on a maintenance connection, after re-applying 291
--- and 293 (300's evidence and BBA probes name their indexes; without them each
--- probe walks every public row of the agent). CREATE OR REPLACE keeps the owner
--- and ACL. Idempotent.
+-- Undo migration 302 (disclosure_probes_leakproof): restore 299's body of the
+-- disclosure core. Run on a maintenance connection, after re-applying 296 (299's
+-- ingest-record probe names its index; without it the probe scans by created_at).
+-- CREATE OR REPLACE keeps the owner and ACL. Idempotent.
 CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for(
     p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean)
 RETURNS TABLE (named boolean, details boolean)
@@ -20,14 +19,13 @@ DECLARE
     v_details    boolean;
     v_bound      uuid[];
     v_since      timestamptz[];
-    v_bound_text text[];
 BEGIN
     SELECT a.profile_visibility, a.profile_public_consented_at INTO v_profile, v_consented
       FROM public.agents a WHERE a.id = p_target;
 
     v_human := public.epigraph_is_human_principal(p_target);
 
-    -- 283 (C11): a human's 'public' counts only with the setter's consent.
+    -- 285 (C11): a human's 'public' counts only with the setter's consent.
     v_public := COALESCE(v_profile = 'public' AND (NOT v_human OR v_consented IS NOT NULL),
                          false);
 
@@ -52,7 +50,7 @@ BEGIN
         RETURN;
     END IF;
 
-    -- 288 (C5): B(H) with each agent's binding START. H's own assertions
+    -- 290 (C5): B(H) with each agent's binding START. H's own assertions
     -- have no binding to start ('-infinity'); a bound agent's count from the
     -- EARLIEST start of any of its bindings to H (a link's created_at, an
     -- allowance's added_at), and keep counting after the binding is retired
@@ -69,15 +67,9 @@ BEGIN
                     SELECT r.agent_id, r.added_at FROM public.author_binding_clients r
                      WHERE r.operator_id = p_target) b
              GROUP BY b.agent_id) s;
-    -- 300: the same ids as text, in the same order, cast HERE (a uuid-to-text
-    -- cast on a probe's Var is not leakproof, so it could be no index
-    -- condition under row security).
-    v_bound_text := ARRAY(SELECT u.agent_id::text
-                            FROM pg_catalog.unnest(v_bound) WITH ORDINALITY AS u(agent_id, n)
-                           ORDER BY u.n);
 
     -- public claim: one forced probe per bound agent (no viewer state), from
-    -- the agent's binding start (286's (agent_id, created_at) index)
+    -- the agent's binding start (288's (agent_id, created_at) index)
     IF EXISTS (
         SELECT 1
           FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
@@ -92,9 +84,9 @@ BEGIN
         RETURN;
     END IF;
 
-    -- 295 (C6): a PUBLIC assertion of any other kind by B(H) names H, windowed
-    -- from the binding start as the claim arm is (288). One forced probe per
-    -- bound agent per kind, each on its own partial index (291-294):
+    -- 297 (C6): a PUBLIC assertion of any other kind by B(H) names H, windowed
+    -- from the binding start as the claim arm is (290). One forced probe per
+    -- bound agent per kind, each on its own partial index (293-296):
     --   evidence        signer_id (the table has no author column)
     --   challenges      challenger_id
     --   mass_functions  source_agent_id (a BBA; a retracted one still counts,
@@ -131,26 +123,23 @@ BEGIN
                                     AND m.created_at >= b.since
                                   LIMIT 1) x)
         OR EXISTS (
-            -- 300: 298's LEAKPROOF accessor against the text ids, so the
-            -- probe is an index condition (299) under edges' row security
             SELECT 1
-              FROM ROWS FROM (pg_catalog.unnest(v_bound_text), pg_catalog.unnest(v_since))
-                   AS b(agent_text, since)
+              FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
+                   AS b(agent_id, since)
              CROSS JOIN LATERAL (SELECT 1 FROM public.edges r
-                                  WHERE public.epigraph_ingest_record_ingester(r.properties)
-                                        = b.agent_text
+                                  WHERE (r.properties ->> 'ingested_by') = b.agent_id::text
                                     AND r.relationship = 'ingested_claim'
                                     AND r.visibility = 'public'
                                     AND r.created_at >= b.since
                                     AND (r.properties -> 'ingest_written' ->> 'by')
-                                        = public.epigraph_ingest_record_ingester(r.properties)
+                                        = (r.properties ->> 'ingested_by')
                                   LIMIT 1) x)
     THEN
         RETURN QUERY SELECT true, v_details;
         RETURN;
     END IF;
 
-    -- 297 (C2): a countersigned authorship (the person's own act, or its
+    -- 299 (C2): a countersigned authorship (the person's own act, or its
     -- agent's) of a paper the viewer can read names H. The act is 208's audit
     -- row (the caller in agent_id, the paper in details), windowed from the
     -- caller's binding start; the paper is readable as 246's papers_read
@@ -160,18 +149,13 @@ BEGIN
           FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
                AS b(agent_id, since)
          CROSS JOIN LATERAL (SELECT 1
-                               FROM (SELECT (s.details ->> 'paper_id')::uuid AS paper_id
-                                       FROM public.security_events s
-                                      WHERE s.agent_id = b.agent_id
-                                        AND s.event_type = 'authorship.countersigned'
-                                        AND s.created_at >= b.since
-                                     OFFSET 0) s
-                               -- 300: the id is computed in the fenced
-                               -- subquery, so this join is uuid = Var
-                               -- (leakproof) and looks the paper up by key
-                               -- under papers' row security
-                               JOIN public.papers p ON p.id = s.paper_id
-                              WHERE (p.visibility = 'public'
+                               FROM public.security_events s
+                               JOIN public.papers p
+                                 ON p.id = (s.details ->> 'paper_id')::uuid
+                              WHERE s.agent_id = b.agent_id
+                                AND s.event_type = 'authorship.countersigned'
+                                AND s.created_at >= b.since
+                                AND (p.visibility = 'public'
                                      OR p.owner_group_id = ANY (v_groups))
                               LIMIT 1) x)
     THEN
@@ -199,7 +183,7 @@ BEGIN
         END IF;
 
         -- readable claim: one forced probe per (bound agent, viewer group),
-        -- two equalities and the binding start, so 287's (agent_id,
+        -- two equalities and the binding start, so 289's (agent_id,
         -- owner_group_id, created_at) index is the only fitting one
         IF EXISTS (
             SELECT 1
@@ -217,7 +201,7 @@ BEGIN
             RETURN;
         END IF;
 
-        -- team, role-derived: only a bound group can be one. 279: LAST, and
+        -- team, role-derived: only a bound group can be one. 281: LAST, and
         -- 249's call only when its candidate set is wider than the target.
         IF EXISTS (SELECT 1 FROM public.group_role_bindings b
                     WHERE b.group_id = ANY (v_groups)) THEN

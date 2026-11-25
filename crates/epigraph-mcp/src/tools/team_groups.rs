@@ -140,7 +140,7 @@ pub async fn list_my_groups(
 /// # Errors
 /// `INVALID_PARAMS` for a malformed id, an invitee that names no agent, is a
 /// role's node or a system identity, or is the caller (whether it is a Person
-/// is never answered here, migration 284), a bad role or reason, or a group the caller holds no live
+/// is never answered here, migration 286), a bad role or reason, or a group the caller holds no live
 /// membership of (as for a missing one); `INVALID_REQUEST` when the caller is
 /// not a Person or not an admin of the group, the invitee is already a member
 /// or already invited, or the group takes no invitations.

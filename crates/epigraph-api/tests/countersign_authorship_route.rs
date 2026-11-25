@@ -240,7 +240,7 @@ async fn the_named_person_confirms_over_http_and_a_repeat_is_a_noop(pool: PgPool
     let before = edge_state(&pool, e).await;
     // Read by the person itself: before its countersign nothing names it to a
     // third party (spec section 4), so a name search by the third party finds
-    // nothing. After the countersign (operator ruling C2, migration 297) the
+    // nothing. After the countersign (operator ruling C2, migration 299) the
     // third party finds it, below.
     assert_eq!(
         card_counts(&state, h, h, "Hesper Quill").await,

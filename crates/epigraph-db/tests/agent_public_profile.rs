@@ -41,7 +41,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// `get_public_profile` as `viewer` reads it: on an `epigraph_app` connection
-/// stamped from `viewer` (`read_as`), because the decision is migration 272's
+/// stamped from `viewer` (`read_as`), because the decision is migration 274's
 /// `epigraph_agent_disclosure`, which reads the STAMPED session. On the
 /// superuser pool `epigraph_bypass()` holds and every detail would show.
 async fn profile_as(
@@ -315,7 +315,7 @@ async fn a_bypass_viewer_sees_everything(pool_opts: PgPoolOptions, conn_opts: Pg
 
     let subject = seed_agent(&pool, "group").await;
 
-    // A maintenance session is the privileged arm of migration 272's rule,
+    // A maintenance session is the privileged arm of migration 274's rule,
     // decided on the session itself. The harness login is a superuser, so the
     // read switches the session to the real `epigraph_maintenance` role
     // first (review finding tests#8: on the superuser it proved only the

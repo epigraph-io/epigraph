@@ -88,7 +88,7 @@ async fn superuser_server(pool: &PgPool) -> EpiGraphMcpFull {
 /// A registered human operator with `display_name = name`, opted in to a
 /// public profile as the self-service setter records it (`'public'` plus a
 /// consent stamp): these tests resolve an author by name as a stranger, which
-/// the disclosure rule admits only for a NAMED person. Before migration 283
+/// the disclosure rule admits only for a NAMED person. Before migration 285
 /// (operator ruling C11) the shared fixture's column default `'public'` was
 /// read as that opt-in; it never was consent, and now names no one.
 async fn human_named(pool: &PgPool, name: &str) -> Uuid {
@@ -2625,7 +2625,7 @@ async fn a_name_only_reingest_cannot_find_an_unnamed_person_by_spelling(pool: Pg
     );
 
     // The opt-in as the self-service setter writes it: 'public' with a
-    // consent stamp (migration 283, operator ruling C11).
+    // consent stamp (migration 285, operator ruling C11).
     sqlx::query(
         "UPDATE agents SET profile_visibility = 'public', profile_public_consented_at = now() \
           WHERE id = $1",

@@ -356,7 +356,7 @@ pub async fn epistemic_profile(
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
-    // The name as the caller may see it (migration 272, on this stamped
+    // The name as the caller may see it (migration 274, on this stamped
     // connection; spec 7 row F1).
     let d = epigraph_db::AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
     epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());

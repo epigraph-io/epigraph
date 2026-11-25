@@ -159,13 +159,13 @@ async fn service_principal(pool: &PgPool) -> Uuid {
 async fn every_reader_sees_the_operator_humans_id_and_its_name_by_the_rule(pool: PgPool) {
     // Was `every_reader_sees_the_operator_human_through_both_tools`, which
     // pinned the human's NAME to every reader. Since the human-identity rule
-    // (migration 272) the id is still on every reader's card, and the name
+    // (migration 274) the id is still on every reader's card, and the name
     // only on the cards of readers the rule admits: here the human itself.
     let server = app_server(&pool).await;
     let (outsider, _) = named(&pool, "outsider").await;
     let (human, _) = named(&pool, "Talia Brennick").await;
     fixture::make_human_operator(&pool, human).await;
-    // As provisioning writes a person since migration 274; the column
+    // As provisioning writes a person since migration 276; the column
     // default 'public' would read as the person's opt-in.
     sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
         .bind(human)

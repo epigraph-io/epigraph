@@ -234,7 +234,7 @@ async fn the_public_key_lookup_redacts_a_private_profile_like_the_list(pool: PgP
     assert_eq!(row["ror_id"], "03yrm5c26", "the agent itself: {row}");
 }
 
-// ─── PUT /api/v1/agents/:id { profile_visibility } (migration 273) ───────
+// ─── PUT /api/v1/agents/:id { profile_visibility } (migration 275) ───────
 
 async fn put(
     state: &AppState,

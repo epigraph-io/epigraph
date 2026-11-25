@@ -431,11 +431,11 @@ async fn agents_identity_columns_are_not_app_updatable(pool: PgPool) {
         // `epigraph_set_default_group` / `epigraph_set_agent_default_group`.
         "default_group_id",
         "default_private",
-        // Whether a human principal's name is shown to everyone (273): written
+        // Whether a human principal's name is shown to everyone (275): written
         // only through the audited self-service definer
         // `epigraph_set_profile_visibility`, never by a column grant.
         "profile_visibility",
-        // When that human consented to a public profile (283, operator
+        // When that human consented to a public profile (285, operator
         // ruling C11): stamped and cleared by the same definer only.
         "profile_public_consented_at",
     ] {

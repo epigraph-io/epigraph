@@ -319,7 +319,7 @@ async fn each_refusal_reaches_the_caller_by_its_kind(pool: PgPool) {
         (ErrorCode::INVALID_REQUEST, "TGP01:"),
         "{msg}"
     );
-    // Operator ruling C10 (migration 284): an agent a Person operates is
+    // Operator ruling C10 (migration 286): an agent a Person operates is
     // invited like anyone (the invite never says whether an id is a person);
     // only a role's node or a system identity, whose kind is public, is
     // refused TGP03. The agent's invitation is refused at accept (TGP01).

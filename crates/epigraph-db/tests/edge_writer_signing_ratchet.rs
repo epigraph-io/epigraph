@@ -332,11 +332,11 @@ const DB_REGISTER: &[DbSite] = &[
         count: 1,
         status: Unsigned(NO_KEY_DB_FUNCTION),
     },
-    // The role-assignment audit trigger (OCCUPIES verb-edges). 278 re-states
+    // The role-assignment audit trigger (OCCUPIES verb-edges). 280 re-states
     // it (the projection is team-only, owned by `epigraph_role_edge_owner`);
     // still one unsigned INSERT, no key in a database function.
     DbSite {
-        migration: "278_role_edges_team_only.sql",
+        migration: "280_role_edges_team_only.sql",
         function: "epigraph_role_assignments_audit",
         count: 1,
         status: Unsigned(NO_KEY_DB_FUNCTION),

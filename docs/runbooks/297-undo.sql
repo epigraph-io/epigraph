@@ -1,7 +1,7 @@
--- Undo migration 297 (disclosure_countersigned_authorship): restore 295's body of the
--- disclosure core (no authorship arm). Run on a maintenance connection. CREATE OR
--- REPLACE keeps the owner and ACL. Idempotent. 296's index may stay (unused) or be
--- dropped with DROP INDEX CONCURRENTLY.
+-- Undo migration 297 (disclosure_every_public_assertion): restore 290's body of the
+-- disclosure core (public claims only, windowed). Run on a maintenance connection.
+-- CREATE OR REPLACE keeps the owner and ACL. Idempotent. 293-296's indexes may stay
+-- (unused) or be dropped with DROP INDEX CONCURRENTLY.
 CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for(
     p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean)
 RETURNS TABLE (named boolean, details boolean)
@@ -25,7 +25,7 @@ BEGIN
 
     v_human := public.epigraph_is_human_principal(p_target);
 
-    -- 283 (C11): a human's 'public' counts only with the setter's consent.
+    -- 285 (C11): a human's 'public' counts only with the setter's consent.
     v_public := COALESCE(v_profile = 'public' AND (NOT v_human OR v_consented IS NOT NULL),
                          false);
 
@@ -50,7 +50,7 @@ BEGIN
         RETURN;
     END IF;
 
-    -- 288 (C5): B(H) with each agent's binding START. H's own assertions
+    -- 290 (C5): B(H) with each agent's binding START. H's own assertions
     -- have no binding to start ('-infinity'); a bound agent's count from the
     -- EARLIEST start of any of its bindings to H (a link's created_at, an
     -- allowance's added_at), and keep counting after the binding is retired
@@ -69,7 +69,7 @@ BEGIN
              GROUP BY b.agent_id) s;
 
     -- public claim: one forced probe per bound agent (no viewer state), from
-    -- the agent's binding start (286's (agent_id, created_at) index)
+    -- the agent's binding start (288's (agent_id, created_at) index)
     IF EXISTS (
         SELECT 1
           FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
@@ -79,61 +79,6 @@ BEGIN
                                 AND c.visibility = 'public'
                                 AND c.created_at >= b.since
                               LIMIT 1) x)
-    THEN
-        RETURN QUERY SELECT true, v_details;
-        RETURN;
-    END IF;
-
-    -- 295 (C6): a PUBLIC assertion of any other kind by B(H) names H, windowed
-    -- from the binding start as the claim arm is (288). One forced probe per
-    -- bound agent per kind, each on its own partial index (291-294):
-    --   evidence        signer_id (the table has no author column)
-    --   challenges      challenger_id
-    --   mass_functions  source_agent_id (a BBA; a retracted one still counts,
-    --                   as a superseded claim does)
-    --   edges           a `paper -ingested_claim-> claim` record whose
-    --                   properties.ingested_by is the agent and whose ingest
-    --                   marker names the same agent (the records' read
-    --                   contract, claim_ingest.rs)
-    IF EXISTS (
-        SELECT 1
-          FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
-               AS b(agent_id, since)
-         CROSS JOIN LATERAL (SELECT 1 FROM public.evidence e
-                              WHERE e.signer_id = b.agent_id
-                                AND e.visibility = 'public'
-                                AND e.created_at >= b.since
-                              LIMIT 1) x)
-        OR EXISTS (
-            SELECT 1
-              FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
-                   AS b(agent_id, since)
-             CROSS JOIN LATERAL (SELECT 1 FROM public.challenges ch
-                                  WHERE ch.challenger_id = b.agent_id
-                                    AND ch.visibility = 'public'
-                                    AND ch.created_at >= b.since
-                                  LIMIT 1) x)
-        OR EXISTS (
-            SELECT 1
-              FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
-                   AS b(agent_id, since)
-             CROSS JOIN LATERAL (SELECT 1 FROM public.mass_functions m
-                                  WHERE m.source_agent_id = b.agent_id
-                                    AND m.visibility = 'public'
-                                    AND m.created_at >= b.since
-                                  LIMIT 1) x)
-        OR EXISTS (
-            SELECT 1
-              FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
-                   AS b(agent_id, since)
-             CROSS JOIN LATERAL (SELECT 1 FROM public.edges r
-                                  WHERE (r.properties ->> 'ingested_by') = b.agent_id::text
-                                    AND r.relationship = 'ingested_claim'
-                                    AND r.visibility = 'public'
-                                    AND r.created_at >= b.since
-                                    AND (r.properties -> 'ingest_written' ->> 'by')
-                                        = (r.properties ->> 'ingested_by')
-                                  LIMIT 1) x)
     THEN
         RETURN QUERY SELECT true, v_details;
         RETURN;
@@ -159,7 +104,7 @@ BEGIN
         END IF;
 
         -- readable claim: one forced probe per (bound agent, viewer group),
-        -- two equalities and the binding start, so 287's (agent_id,
+        -- two equalities and the binding start, so 289's (agent_id,
         -- owner_group_id, created_at) index is the only fitting one
         IF EXISTS (
             SELECT 1
@@ -177,7 +122,7 @@ BEGIN
             RETURN;
         END IF;
 
-        -- team, role-derived: only a bound group can be one. 279: LAST, and
+        -- team, role-derived: only a bound group can be one. 281: LAST, and
         -- 249's call only when its candidate set is wider than the target.
         IF EXISTS (SELECT 1 FROM public.group_role_bindings b
                     WHERE b.group_id = ANY (v_groups)) THEN
