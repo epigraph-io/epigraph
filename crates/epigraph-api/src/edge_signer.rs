@@ -91,9 +91,9 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use epigraph_crypto::AgentSigner;
-use epigraph_db::repos::agent_key::{key_window_admits, KeyAdmissionEnd, SignerKeyAdmission};
+use epigraph_db::repos::agent_key::key_window_admits;
 use epigraph_db::repos::EdgeSigningKey;
 use epigraph_db::{AgentKeyRepository, AgentRepository};
 use sqlx::PgPool;
@@ -343,12 +343,13 @@ pub async fn decide(pool: &PgPool, key_file: Option<&str>) -> Result<BootDecisio
 /// its signing key's admission ([`spawn_admission_watch`]).
 pub const ENV_RECHECK_SECS: &str = "EPIGRAPH_API_SIGNING_KEY_RECHECK_SECS";
 
-/// How long before its key's recorded admission ends (a known cut-over, a
-/// `valid_until`) the server stops signing with it. The server stops BEFORE
-/// the end, not an interval after it, so an edge it signed is dated inside
-/// the window; the lead covers the re-check's latency, the exit, and a
-/// transaction that began just before the stop.
-pub const STOP_LEAD_SECS: i64 = 5;
+/// The stop lead, the verdict and the failed-re-read threshold are the shared
+/// signer-admission policy ([`epigraph_db::signer_admission`]), which the MCP
+/// server's watch applies too; re-exported under the names this module has
+/// always had.
+pub use epigraph_db::signer_admission::{
+    admission_verdict, AdmissionVerdict, FAILED_RECHECKS_BEFORE_ERROR, STOP_LEAD_SECS,
+};
 
 /// The stop text's fixed part when the running server's key is not admitted,
 /// or stops being admitted within [`STOP_LEAD_SECS`] ([`watch_admission`]).
@@ -364,98 +365,41 @@ pub const KEY_ADMISSION_ENDING: &str = "stops being admitted by the edge verifie
      stop lead; the server would stop at once. Point the variable at the signer agent's next \
      active signing key";
 
-/// What the server does with its key after an admission read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdmissionVerdict {
-    /// Keep signing, re-reading within at most this long (`None`: no recorded
-    /// end; the watch interval alone decides).
-    Keep(Option<std::time::Duration>),
-    /// Stop: not admitted (`None`), or its admission ends at this instant,
-    /// within [`STOP_LEAD_SECS`] of the read.
-    Stop(Option<DateTime<Utc>>),
-}
-
-/// The verdict on one admission read: stop when the key is not admitted or
-/// its admission ends within [`STOP_LEAD_SECS`] of the read (both on the
-/// database clock), otherwise keep signing until at most the lead before the
-/// end.
-#[must_use]
-pub fn admission_verdict(read: &SignerKeyAdmission) -> AdmissionVerdict {
-    match read.end {
-        KeyAdmissionEnd::NotAdmitted => AdmissionVerdict::Stop(None),
-        KeyAdmissionEnd::Open => AdmissionVerdict::Keep(None),
-        KeyAdmissionEnd::At(end) => {
-            let left = end - read.checked_at - chrono::Duration::seconds(STOP_LEAD_SECS);
-            match left.to_std() {
-                Ok(left) if !left.is_zero() => AdmissionVerdict::Keep(Some(left)),
-                _ => AdmissionVerdict::Stop(Some(end)),
-            }
-        }
-    }
-}
-
-/// Consecutive failed re-reads after which the watch logs at ERROR, not WARN.
-pub const FAILED_RECHECKS_BEFORE_ERROR: u32 = 5;
-
 /// Check whether the edge verifier still admits `signer`'s key for its signer
 /// agent, now and then every `interval` (sooner when a recorded window ends
 /// first), and return the stop text once [`admission_verdict`] says stop. A
 /// failed re-read is logged (WARN, then ERROR after
 /// [`FAILED_RECHECKS_BEFORE_ERROR`] in a row) and the watch goes on: the key
 /// passed its fail-closed boot check, and a transient database error must not
-/// stop the server. Only a positive read of an inadmissible key returns.
+/// stop the server. Only a positive read of an inadmissible key returns. The
+/// loop is [`epigraph_db::signer_admission::watch_signer_admission`].
 pub async fn watch_admission(
     pool: PgPool,
     signer: Arc<ApiEdgeSigner>,
     interval: std::time::Duration,
 ) -> String {
     let public_key = signer.signer.public_key();
-    let mut failures: u32 = 0;
-    loop {
-        let read =
-            AgentKeyRepository::signer_key_admission(&pool, signer.signer_id, &public_key).await;
-        let next = match read.map(|r| admission_verdict(&r)) {
-            Ok(AdmissionVerdict::Keep(cap)) => {
-                failures = 0;
-                cap.map_or(interval, |c| c.min(interval))
-            }
-            Ok(AdmissionVerdict::Stop(end)) => {
-                let ends = end.map_or(String::new(), |t| {
-                    format!(" (its admission ends at {})", t.to_rfc3339())
-                });
-                let stop = format!(
-                    "{ENV_KEY_FILE}: the API's signing key ({}) of signer agent {} \
-                     {KEY_NO_LONGER_ADMITTED}{ends}",
-                    hex::encode(public_key),
-                    signer.signer_id
-                );
-                tracing::error!("{stop}");
-                return stop;
-            }
-            Err(e) => {
-                failures = failures.saturating_add(1);
-                log_failed_recheck(failures, &e, interval);
-                interval
-            }
-        };
-        tokio::time::sleep(next).await;
-    }
-}
-
-fn log_failed_recheck(failures: u32, e: &epigraph_db::DbError, interval: std::time::Duration) {
-    let secs = interval.as_secs();
-    if failures >= FAILED_RECHECKS_BEFORE_ERROR {
-        tracing::error!(
-            "{ENV_KEY_FILE}: could not re-check the API signing key's admission {failures} \
-             times in a row ({e}); the API keeps signing with a key whose admission it cannot \
-             confirm, re-checking in {secs}s"
-        );
-    } else {
-        tracing::warn!(
-            "{ENV_KEY_FILE}: could not re-check the API signing key's admission ({e}); still \
-             signing, re-checking in {secs}s"
-        );
-    }
+    let stop = epigraph_db::signer_admission::watch_signer_admission(
+        pool,
+        epigraph_db::signer_admission::WatchedSigner::Agent(signer.signer_id),
+        public_key,
+        interval,
+        ENV_KEY_FILE,
+        // `boot` refused a key that is not admitted.
+        epigraph_db::signer_admission::Arming::FromBoot,
+    )
+    .await;
+    let ends = stop.end.map_or(String::new(), |t| {
+        format!(" (its admission ends at {})", t.to_rfc3339())
+    });
+    let stop = format!(
+        "{ENV_KEY_FILE}: the API's signing key ({}) of signer agent {} \
+         {KEY_NO_LONGER_ADMITTED}{ends}",
+        hex::encode(public_key),
+        stop.signer_id
+    );
+    tracing::error!("{stop}");
+    stop
 }
 
 /// Spawn [`watch_admission`] for `bin/server.rs`, at the interval

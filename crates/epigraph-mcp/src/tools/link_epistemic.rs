@@ -471,7 +471,8 @@ pub async fn do_link_epistemic(
         // SAVEPOINT-wrapped inside `publish_or_log_conn`, so a refused event
         // cannot abort the edge, and it shares the edge's fate: there is no
         // `edge.added` for an edge that was rolled back. Actor = the MCP
-        // signer agent, mirroring `emit_tool_invoked`'s actor resolution.
+        // signer agent, the edge's signer (the call's `tool.invoked` event
+        // names the caller instead: `emit_tool_invoked`).
         // Scoped to genuine creation only — a re-assertion of an existing edge
         // (including a wake-up wire) must not re-emit `edge.added`.
         let _ = EventRepository::publish_or_log_conn(
