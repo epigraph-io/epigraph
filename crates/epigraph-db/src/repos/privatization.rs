@@ -1056,6 +1056,28 @@ pub fn split_unsealed_evidence_properties(
 /// it `NOT NULL`, and an INSERT written from the plan would fail at runtime.
 const SEALED_PRIVACY_TIER: &str = "fully_private";
 
+/// The `sealed_only` CTE of
+/// [`PrivatizationRepository::sealed_only_cluster_centroids_conn`] and its
+/// DELETE twin, ONE text so the dry run and the delete cannot disagree. `$1`
+/// is a `uuid[]` narrowing the sealed members looked at, or NULL for all.
+const SEALED_ONLY_CLUSTERS: &str = "\
+    WITH touched AS ( \
+        SELECT DISTINCT m.cluster_run_id, m.cluster_id \
+          FROM public.claim_clusters m \
+          JOIN public.claim_encryption ce ON ce.claim_id = m.claim_id \
+         WHERE $1::uuid[] IS NULL OR m.claim_id = ANY($1::uuid[]) \
+    ), \
+    sealed_only AS ( \
+        SELECT t.cluster_run_id, t.cluster_id \
+          FROM touched t \
+         WHERE NOT EXISTS ( \
+                 SELECT 1 FROM public.claim_clusters o \
+                  WHERE o.cluster_run_id = t.cluster_run_id \
+                    AND o.cluster_id = t.cluster_id \
+                    AND NOT EXISTS (SELECT 1 FROM public.claim_encryption e \
+                                     WHERE e.claim_id = o.claim_id)) \
+    )";
+
 /// Derived tables whose rows are DELETED rather than encrypted on seal.
 ///
 /// §6.5.4's argument for deleting rather than encrypting: these are *derived*,
@@ -3763,6 +3785,93 @@ impl PrivatizationRepository {
             .collect())
     }
 
+    /// The `(cluster_run_id, cluster_id)` pairs whose `cluster_centroids` row
+    /// a seal must not leave behind (backlog 06cdffaa), ordered. Reads only.
+    ///
+    /// A pair qualifies when a sealed claim (one with a `claim_encryption`
+    /// row) is a `claim_clusters` member of it AND every member of it is
+    /// sealed. `claims` narrows the sealed members looked at to those ids;
+    /// `None` looks at every sealed claim, which is the one-off pass for
+    /// claims sealed before the seal cleared clusters (the operator runs it
+    /// as `epigraph-operator privatization purge-sealed-centroids`).
+    ///
+    /// # Why delete, and why only these
+    ///
+    /// `cluster_centroids` (migrations 001, 027, 222) holds a k-means centroid
+    /// per cluster of a clustering run: `umap_centroid`, a mean of member
+    /// points in `scripts/cluster_claims.py`'s 32-d UMAP space, plus the
+    /// legacy padded `centroid` and `centroid_3072`. It carries no tenancy
+    /// column and no policy. For a cluster whose members are all sealed, the
+    /// centroid is a projection of sealed vectors alone, and of ONE sealed
+    /// vector exactly when that is the cluster's only point. It cannot be
+    /// recomputed without the sealed members as the theme centroids are
+    /// (step 2b): the members' UMAP coordinates are not stored, and the fit
+    /// was over a sample nothing records. Nor can it be nulled: 222's CHECK
+    /// `cluster_centroids_has_a_centroid` requires one centroid column. So
+    /// the row is deleted; the script's `assign` maps a run with a deleted
+    /// cluster by its stored ids (same change), and a re-seed rebuilds it
+    /// from embedded claims only (a sealed claim has none).
+    ///
+    /// Residuals, not closed here:
+    /// - a cluster that keeps an unsealed member keeps its centroid, with
+    ///   the sealed points still averaged in (diluted, not removed). Whether
+    ///   to drop those too is an operator decision;
+    /// - `claim_clusters` is `UNIQUE (claim_id)`, so a claim's membership in
+    ///   an OLDER run was overwritten when a later run assigned it: such a
+    ///   run's centroids are not linked to the sealed claim and are not found.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn sealed_only_cluster_centroids_conn(
+        conn: &mut PgConnection,
+        claims: Option<&[Uuid]>,
+    ) -> Result<Vec<(Uuid, i32)>, DbError> {
+        sqlx::query_as::<_, (Uuid, i32)>(&format!(
+            "{SEALED_ONLY_CLUSTERS} \
+             SELECT cc.cluster_run_id, cc.cluster_id \
+               FROM public.cluster_centroids cc \
+               JOIN sealed_only s \
+                 ON s.cluster_run_id = cc.cluster_run_id AND s.cluster_id = cc.cluster_id \
+              ORDER BY cc.cluster_run_id, cc.cluster_id"
+        ))
+        .bind(claims)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// DELETE the `cluster_centroids` rows
+    /// [`Self::sealed_only_cluster_centroids_conn`] reports, in the caller's
+    /// transaction, and return their pairs, ordered. Step 2c of
+    /// [`Self::seal_claims_conn`] calls it with the claims it sealed.
+    ///
+    /// Needs DELETE on `cluster_centroids`, which 070 does not grant
+    /// `epigraph_maintenance` (like DELETE on the tables step 7 empties): the
+    /// seal, and this pass under `--apply`, run as the table owner.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault (`42501` without the DELETE grant).
+    pub async fn delete_sealed_only_cluster_centroids_conn(
+        conn: &mut PgConnection,
+        claims: Option<&[Uuid]>,
+    ) -> Result<Vec<(Uuid, i32)>, DbError> {
+        let mut deleted = sqlx::query_as::<_, (Uuid, i32)>(&format!(
+            "{SEALED_ONLY_CLUSTERS} \
+             DELETE FROM public.cluster_centroids cc \
+              USING sealed_only s \
+              WHERE s.cluster_run_id = cc.cluster_run_id AND s.cluster_id = cc.cluster_id \
+             RETURNING cc.cluster_run_id, cc.cluster_id"
+        ))
+        .bind(claims)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        deleted.sort_unstable();
+        Ok(deleted)
+    }
+
     /// THE SEAL MUTATION. The whole §6.5.4 TCB, in the caller's transaction.
     ///
     /// Returns the ids it actually sealed. A claim that already carries a
@@ -3803,6 +3912,9 @@ impl PrivatizationRepository {
     ///    centroid is an aggregate of member vectors, so nulling the claim's
     ///    vector without recomputing it leaves the sealed vector folded into
     ///    the theme.
+    ///    Step 2c deletes the `cluster_centroids` row of every clustering
+    ///    run's cluster whose members are all sealed (backlog 06cdffaa,
+    ///    [`Self::delete_sealed_only_cluster_centroids_conn`]).
     /// 3. `claim_version_encryption` + 4. `claim_versions` — the complete
     ///    plaintext version history, which is the survivor §6.5.4 names first.
     /// 5. `evidence_encryption` + 6. `evidence` — including
@@ -4056,6 +4168,23 @@ impl PrivatizationRepository {
                      3072-d embedding (if it commits): their centroid_3072 is now NULL"
                 );
             }
+        }
+
+        // 2c. The k-means cluster channel (backlog 06cdffaa). See
+        //     [`Self::delete_sealed_only_cluster_centroids_conn`]: the
+        //     centroid row of every clustering run's cluster whose members are
+        //     all sealed now goes, because a one-member cluster's centroid IS
+        //     the projection of the sealed vector and `cluster_centroids` has
+        //     no tenancy that would hide it. Statement 1 already wrote this
+        //     commit's `claim_encryption` rows, so a cluster this seal empties
+        //     of unsealed members is found here.
+        let cleared = Self::delete_sealed_only_cluster_centroids_conn(conn, Some(&sealed)).await?;
+        if !cleared.is_empty() {
+            tracing::info!(
+                clusters = ?cleared,
+                "this seal's transaction deletes the centroids of these (run, cluster) pairs, \
+                 whose every member is sealed (if it commits)"
+            );
         }
 
         // 3/4. Version history.

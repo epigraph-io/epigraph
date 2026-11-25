@@ -1001,6 +1001,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "elevation_ceremony.rs",
+        "record_standing_refusal",
+        "WRITE through 285's app-callable definer `epigraph_record_passkey_standing_refusal`: \
+         one `platform.passkey_standing_refused` audit row for a live ticket or act, by id, \
+         naming a live passkey of ITS person (the definer derives the person and refuses any \
+         other passkey). An audit row about a principal, not a corpus row; the ceremony page \
+         has no principal a Viewer could carry.",
+    ),
+    (
+        "elevation_ceremony.rs",
         "redeem",
         "WRITE through 125's app-callable definer `epigraph_redeem_elevation_ticket`, for the \
          token endpoint's elevate grant (pre-authentication: the redeem secret's SHA-256 is the \
@@ -1135,6 +1144,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          transaction-local pgvector knobs (`hnsw.iterative_scan`, `hnsw.ef_search`) for the \
          viewer-spliced kNN read its caller runs next (backlog a507966d); it reads and writes no \
          table, so there is nothing to filter.",
+    ),
+    (
+        "vector_scan.rs",
+        "begin_iterative_ivfflat",
+        "NO ROW READ. A crate-private helper that opens a savepoint and sets one \
+         transaction-local pgvector knob (`ivfflat.iterative_scan`) for the viewer-spliced kNN \
+         read its caller runs next (backlog b00aa40e); it reads and writes no table, so there is \
+         nothing to filter.",
     ),
     (
         "vector_scan.rs",
@@ -1625,6 +1642,27 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "privatization.rs",
+        "sealed_only_cluster_centroids_conn",
+        "READ of `claim_clusters`, `claim_encryption` and `cluster_centroids`, projecting \
+         `(cluster_run_id, cluster_id)` pairs only, no vector and no claim id. It answers which \
+         centroid rows are projections of sealed vectors alone (backlog 06cdffaa), and a \
+         viewer-filtered answer is the failure it exists to prevent: a cluster whose members a \
+         viewer cannot read would look empty and keep its centroid. `cluster_centroids` carries \
+         no tenancy and no policy; its callers are the seal's maintenance transaction and the \
+         operator's one-off pass on the maintenance DSN.",
+    ),
+    (
+        "privatization.rs",
+        "delete_sealed_only_cluster_centroids_conn",
+        "WRITE: DELETEs the `cluster_centroids` rows `sealed_only_cluster_centroids_conn` reports, \
+         with the same CTE text, from a table with no tenancy column and no policy. Called by \
+         `seal_claims_conn` (step 2c) inside the seal's maintenance transaction, bounded to the \
+         claims it sealed, and by the operator's one-off pass under `--apply`. A viewer has no \
+         predicate to contribute: the rows are derived aggregates, removed because their every \
+         member is sealed, whoever can read the members.",
+    ),
+    (
+        "privatization.rs",
         "unseal_manifest_page_conn",
         "READ of `claim_encryption`, `claim_version_encryption` and `evidence_encryption`, which \
          carry `group_id` but no `visibility`, and whose projection is CIPHERTEXT bound to a key \
@@ -1840,11 +1878,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent_identity.rs",
         "prompt_history_blob",
-        "READ through the same migration 161 `epigraph_agent_prompt_history` SECURITY DEFINER \
-         function as `prompt_history`, with the same gate on the SESSION principal (operator or \
-         admin, else AID06), filtered to the one file a row the definer marks `readable` names: \
-         it returns a subset of what `prompt_history` returns to the same caller, so a Viewer \
-         splice has no tenancy column to act on.",
+        "READ through migration 276's `epigraph_agent_prompt_history_blob` SECURITY DEFINER \
+         function: 161's gate on the SESSION principal (operator or admin, else AID06) and 161's \
+         walk and per-member `readable` mark, returning the one file a readable member's snapshot \
+         names and fetching no other blob: a subset of what `prompt_history` returns to the same \
+         caller, so a Viewer splice has no tenancy column to act on.",
     ),
     (
         "agent.rs",
@@ -2212,6 +2250,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE-PATH LOCK (backlog bf2e9aa6), private to the edge writers: before an `executes` \
          edge onto a claim is inserted, `WorkflowRepository::lock_step_lineage_shared` on the \
          writer's own transaction. Reads nothing back and returns nothing.",
+    ),
+    (
+        "claim.rs",
+        "lock_repoint_destination",
+        "WRITE-PATH LOCK (backlog 449a2afb), private to the replacement cascades (supersede, \
+         dedup repair, merge, un-mark reversal): before they re-point edges onto a claim, \
+         `FOR KEY SHARE` on that destination's row and then \
+         `WorkflowRepository::lock_step_lineage_shared` on it (an evolve's row-then-key order), \
+         on the cascade's own privileged transaction, so a re-pointed `executes` edge serializes \
+         against an `evolve_step` of the destination's lineage. Reads nothing back and returns \
+         nothing.",
     ),
     (
         "workflow.rs",
@@ -3776,6 +3825,20 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          reason the SQL/executor split above is stated: so a reader does not mistake the \
          motivation for the inventory.",
     ),
+    // Both `ExperimentRepository::update_status` and
+    // `ExperimentResultRepository::update_status` (one row: the lint keys on
+    // file and name).
+    (
+        "experiment.rs",
+        "update_status",
+        "Writes `status` (and the experiment's start/completion times) on one `experiments` or \
+         `experiment_results` row by id. Neither relation carries a `visibility` or \
+         `owner_group_id` column (see `get_for_hypothesis` below), so a `&Viewer` would be a \
+         parameter the statement could not spend; the API's callers gate on the hypothesis first. \
+         Widened from `&PgPool` so `bin/experiment.rs::analyze` marks the result and the \
+         experiment complete on the transaction that files the analysis and its BBA \
+         (backlog 2e64b8a2). The SQL is unchanged; every `&PgPool` caller is unchanged.",
+    ),
     (
         "experiment.rs",
         "get_for_hypothesis",
@@ -5233,6 +5296,18 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "migrate_superseded_edges_to_head_conn",
         &["migrate_superseded_edges", "require_privileged_session"],
     ),
+    // session: as `search_by_embedding_scoped` (below): the novelty gate's kNN (backlog
+    // b00aa40e).
+    (
+        "claim.rs",
+        "nearest_by_embedding",
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_hnsw",
+        ],
+    ),
     // session: `begin_iterative_hnsw` / `begin_exact_vector_scan` open the transaction and set
     // the vector scan (`repos/vector_scan.rs`); the two `?.fetch_all` are `build!()` runs of the
     // viewer-spliced `sql`, which binds `viewer.group_bind()` inside the macro (the scanner does
@@ -5489,6 +5564,32 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         &[
             "Self::find_root_by_canonical",
             "Self::max_generation_by_canonical",
+        ],
+    ),
+    // session: as `claim.rs::search_by_embedding_scoped`, on the IVFFlat goal index:
+    // `begin_iterative_ivfflat` / `begin_exact_vector_scan` open the transaction and set the
+    // vector scan; the two `?.fetch_all` are `build!()` runs of the viewer-spliced `sql`
+    // (backlog b00aa40e).
+    (
+        "workflow.rs",
+        "search_by_goal_embedding_since",
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_ivfflat",
+        ],
+    ),
+    // session: as `search_by_goal_embedding_since` (above): MCP `find_workflow`'s hierarchical
+    // leg and the store-time workflow match (backlog b00aa40e).
+    (
+        "workflow.rs",
+        "search_hierarchical_by_embedding_scored",
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_ivfflat",
         ],
     ),
 ];

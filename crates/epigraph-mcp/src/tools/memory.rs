@@ -674,7 +674,7 @@ async fn recall_post_embed(
     let workflow_hits: Vec<epigraph_db::WorkflowGoalEmbeddingHit> = if params.include_workflows {
         match pgvec_opt.as_deref() {
             Some(pgvec) => WorkflowRepository::search_by_goal_embedding_since(
-                &mut *read,
+                &mut read,
                 viewer,
                 pgvec,
                 HYBRID_CANDIDATE_POOL,

@@ -965,7 +965,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // create) the server's agent row: `self_link` and the first tool call both
     // do, and a refused boot must leave no row behind. (The mode is stdio-only:
     // `check_separate_key_transport` refused `--listen` before the connect.)
-    if let Some(identity) = &identity_public_key {
+    let separate_key_agent = if let Some(identity) = &identity_public_key {
         match epigraph_mcp::signing_identity::check_signing_key(
             &pool,
             identity,
@@ -973,18 +973,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
         {
-            Ok(agent) => tracing::info!(
-                agent_id = %agent,
-                identity_public_key = %hex::encode(identity),
-                signing_public_key = %hex::encode(signer.public_key()),
-                "separate signing key: an active signing key of the identity's agent"
-            ),
+            Ok(agent) => {
+                tracing::info!(
+                    agent_id = %agent,
+                    identity_public_key = %hex::encode(identity),
+                    signing_public_key = %hex::encode(signer.public_key()),
+                    "separate signing key: an active signing key of the identity's agent"
+                );
+                Some(agent)
+            }
             Err(reason) => {
                 eprintln!("ERROR: {reason}");
                 std::process::exit(1);
             }
         }
-    }
+    } else {
+        None
+    };
     // Read the rung off `select_signer`'s own return value rather than
     // re-deriving `agent_key.is_none()` and the separate-key pair here: the
     // precedence table is documented as living in one place, and a second copy
@@ -1033,6 +1038,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     tracing::info!(public_key = %hex::encode(identity_key), "Agent identity ready");
+
+    // And for as long as it serves, on every transport: a signing key revoked,
+    // rotated out or past its window while the process runs stops it, rather
+    // than sign every later claim and edge with a key the verifiers refuse
+    // (backlog ac52fcb0). The separate-signing-key mode was checked above, so
+    // its watch stops on any inadmissible read; a legacy key rung was never
+    // checked at boot, so its watch stops only once a key it saw admitted
+    // loses admission (see `signing_identity::WatchedKey`).
+    epigraph_mcp::signing_identity::spawn_admission_watch(
+        pool.clone(),
+        match separate_key_agent {
+            Some(agent) => {
+                epigraph_mcp::signing_identity::WatchedKey::separate(agent, signer.public_key())
+            }
+            None => epigraph_mcp::signing_identity::WatchedKey::agent_key(signer.public_key()),
+        },
+    );
 
     // Create embedder.
     //
@@ -1206,6 +1228,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             template.with_generated_signer_identity()
         };
+        // Taken before the factory owns the template: every session is a
+        // clone of it and spawns its detached work (a queued walk,
+        // post-commit embedding) into this one set, which a stopping listener
+        // waits for.
+        let background = template.background_tasks();
         let sessions = epigraph_mcp::SessionFactory::new(template);
 
         // The principal the `--allow-unauthenticated-http` middleware injects.
@@ -1275,6 +1302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let epigraph_mcp::http_listener::McpHttpListener {
             service,
             tcp_allowlist,
+            end_sessions,
             ..
         } = epigraph_mcp::http_listener::mcp_http_listener(addr, &cli.allowed_host, move || {
             Ok(sessions.session())
@@ -1361,7 +1389,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
-        epigraph_mcp::serve_with_listener(addr, router).await?;
+        // Until SIGTERM / SIGINT, then a graceful stop that waits for the
+        // detached work, as the stdio path does below (backlog 526f7508): a
+        // restart used to drop the runtime under a queued walk or an
+        // embedding loop. A signing key that loses admission does not come
+        // through here: its watch exits at once (`signing_identity`).
+        epigraph_mcp::serve_with_listener_until(
+            addr,
+            router,
+            epigraph_mcp::shutdown_signal(),
+            epigraph_mcp::GracefulShutdown::new(
+                background,
+                epigraph_mcp::background::exit_drain_timeout(),
+            )
+            .ending_sessions_with(move || end_sessions.end()),
+        )
+        .await?;
     } else {
         // ── Stdio transport (default) ───────────────────────────────────
         // Inject the same federation registry so stdio's `list_tools` surfaces

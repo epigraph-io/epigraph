@@ -2415,20 +2415,41 @@ writes the state flip and the job in one transaction, so a dispatch in
 progress is never reported.
 
 **How to recover.** The applied prefix stays applied until reverted, and the
-order of the two steps is the one §6.5.5 gives for any stop:
+order of the two steps is the one §6.5.5 gives for any stop. On the stock
+deployment, whose server attaches no maintenance pool (see "Maintenance work
+lives in timers and operator CLIs" above), the lifecycle routes answer 501,
+so the recovery is the operator verb on the maintenance DSN
+(`EPIGRAPH_OPERATOR_MAINTENANCE_DSN`; backlog bb682f72). It makes the routes'
+writes through the routes' own write code; its authority check is its own,
+and the two steps differ (below). Each step is a dry run without `--apply`:
 
-1. `POST /api/v1/admin/privatization/plans/:id/abort`: sets the plan `failed`
-   and writes a `plan.abort` audit row. The next drain run no longer reports it.
-2. `POST /api/v1/admin/privatization/plans/:id/revert`: un-applies exactly the
-   items marked `applied` (a revert accepts a `failed` plan). A `seal` plan with
-   a sealed item is refused until those items are unsealed.
+1. `epigraph-operator privatization abort --plan <id> --actor <custodian>
+   --assignment <their live role:platform-custodian assignment> --reason TEXT
+   --apply`: sets the plan `failed`, writes a `plan.abort` audit row and a
+   `platform.custodial_act` row (refused, CUS04, unless the assignment is the
+   actor's live one). The next drain run no longer reports it. A plan already
+   `failed` is reported and nothing is written. Abort needs only the live
+   custodian assignment: it changes no tenancy, and it alone clears exit 5,
+   so a plan whose target group has since lost its co-admins can still be
+   stopped.
+2. `epigraph-operator privatization revert --plan <id> --actor ... --assignment
+   ... --reason TEXT`, which prints the plan's digest, then the same with
+   `--apply --plan-digest b3:<hex>`: dispatches a revert job (the
+   `privatization_dispatch` event, the flip to `reverting`, the audit row,
+   the job and the custodial act, in one transaction). The next drain run
+   executes it, re-validating the plan as for a route dispatch, and it
+   un-applies exactly the items marked `applied`. A `seal` plan with a sealed
+   item is refused until those items are unsealed. Revert applies the
+   route's authority gate (`require_instance_admin_for_group`, conditions 2
+   to 4): the actor must also be a live `admin` of the plan's target group,
+   which must be at least 24 h old and have at least two other live admins.
+   A custodian outside the group is refused, because a revert moves the
+   group's claims back to their pre-plan tenancy.
 
-Both are privatization lifecycle routes, so they answer only on a deployment
-that attaches a maintenance pool to the API; the stock server attaches none
-(see "Maintenance work lives in timers and operator CLIs" above), and there
-they answer 501. On such a deployment no route recovers a stranded plan
-yet, and the drain keeps reporting it (exit 5). Before deploying a
-`drain_jobs` with this check, list the plans it will report (`SELECT id,
-state FROM privatization_plans WHERE state IN ('applying', 'reverting')` on
-the maintenance login, then look for a live job naming each one): every one
-of them makes every run exit 5 until it is recovered.
+A deployment that does attach a maintenance pool to the API can use the
+routes instead: `POST /api/v1/admin/privatization/plans/:id/abort`, then
+`POST …/revert`. Before deploying a `drain_jobs` with this check, list the
+plans it will report (`SELECT id, state FROM privatization_plans WHERE state
+IN ('applying', 'reverting')` on the maintenance login, then look for a live
+job naming each one): every one of them makes every run exit 5 until it is
+recovered.

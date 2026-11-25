@@ -692,7 +692,10 @@ impl Passkeys {
     ///   its model): recorded `none` with the nil AAGUID. It holds only
     ///   through its anchor: [`Self::hardware_attested`] never admits it as an
     ///   anchor, [`Self::check_anchor`] refuses any anchor whose lineage holds
-    ///   it, and migration 200's cascade revokes it with its anchor.
+    ///   it, migration 200's cascade revokes it with its anchor, migration
+    ///   285 records that anchor on its row, and every assertion it makes is
+    ///   held to the anchor's standing at that moment
+    ///   ([`Self::assertion_standing`]).
     /// * a statement that is hardware-attested under THIS configuration now
     ///   ([`Self::hardware_attested`]: an allowlisted model's chain, or an
     ///   Android key under the Android roots, rules and status list; device
@@ -1330,7 +1333,10 @@ impl Passkeys {
     /// an ASSERTION (an elevation, an admin act's confirmation): the check a
     /// caller runs after [`Self::finish_authentication`] verified the
     /// assertion, on the passkey row the database serves for the asserting
-    /// credential.
+    /// credential. `anchor` is the passkey that ANCHORED it (the live passkey
+    /// the database records as its admitting anchor, read from the same
+    /// ceremony's served rows), or `None` when it has none or that passkey is
+    /// not live.
     ///
     /// * `android-key` (by the row's `attestation_format` OR by the stored
     ///   credential's own; a row and credential that disagree are refused):
@@ -1349,28 +1355,80 @@ impl Passkeys {
     ///   ([`android::hardware_rules`]: checked at registration and at every
     ///   anchor use; a rule added since does not retire an enrolled key's
     ///   assertions).
-    /// * every other format: in good standing. `packed` / `tpm` have no
-    ///   status list, and a `none` passkey holds only through its anchor.
+    /// * `none` (by the row's format OR the stored credential's; a row and
+    ///   credential that disagree are refused): a `none` passkey holds ONLY
+    ///   through its anchor ([`Self::finish_anchored_registration`]), so it
+    ///   stands exactly as its anchor does, NOW: with no live anchor it is
+    ///   not in good standing, and otherwise the anchor is put through this
+    ///   same check (one level: an anchor is never `none`, and a `none` one is
+    ///   refused for having no anchor of its own). An `android-key` anchor
+    ///   whose certificate is listed on a fresh status list therefore stops
+    ///   every `none` passkey it anchored from asserting at the next refresh
+    ///   of the list, before anyone revokes the anchor's row (migration 200's
+    ///   cascade acts only on that revoke); a stale list refuses it as
+    ///   [`StandingRefusal::Unknown`], as it refuses the anchor.
+    /// * `packed` / `tpm` and every other format: in good standing (no status
+    ///   list applies to them).
     /// * under the software policy, every passkey: that policy trusts no
     ///   attestation, so none has a standing to lose.
     ///
     /// # Errors
     /// [`StandingRefusal::NotInGoodStanding`]: a certificate is listed, the
-    /// chain no longer reaches a configured Android root, or the row and the
-    /// credential disagree. [`StandingRefusal::Unknown`]: no Android roots or
-    /// no current status list to check it against.
+    /// chain no longer reaches a configured Android root, the row and the
+    /// credential disagree, or a `none` passkey has no live anchor (or one
+    /// not in good standing). [`StandingRefusal::Unknown`]: no Android roots
+    /// or no current status list to check it (or its anchor) against.
     pub fn assertion_standing(
         &self,
         passkey: &Value,
         attestation_format: &str,
+        anchor: Option<StandingAnchor<'_>>,
     ) -> Result<(), StandingRefusal> {
         if self.config.allows_software_attestation() {
             return Ok(());
         }
-        let cred = passkey.get("cred");
-        let stored_format = cred
+        let stored_format = passkey
+            .get("cred")
             .and_then(|c| c.get("attestation_format"))
             .and_then(Value::as_str);
+        if attestation_format != "none" && stored_format != Some("none") {
+            return self.attested_standing(passkey, attestation_format, stored_format);
+        }
+        if stored_format != Some(attestation_format) {
+            return Err(StandingRefusal::NotInGoodStanding(format!(
+                "the row's attestation format `{attestation_format}` is not the credential's \
+                 ({stored_format:?})"
+            )));
+        }
+        let anchor = anchor.ok_or_else(|| {
+            StandingRefusal::NotInGoodStanding(
+                "an unattested (`none`) passkey holds only through the passkey that anchored \
+                 it, and it has no live anchor"
+                    .into(),
+            )
+        })?;
+        // One level: the anchor checked with no anchor of its own, so a
+        // `none` anchor is refused rather than followed.
+        self.assertion_standing(anchor.passkey, anchor.attestation_format, None)
+            .map_err(|refusal| match refusal {
+                StandingRefusal::NotInGoodStanding(why) => StandingRefusal::NotInGoodStanding(
+                    format!("the passkey that anchored it is not in good standing: {why}"),
+                ),
+                StandingRefusal::Unknown(why) => StandingRefusal::Unknown(format!(
+                    "the standing of the passkey that anchored it cannot be checked: {why}"
+                )),
+            })
+    }
+
+    /// [`Self::assertion_standing`] for a passkey that is not `none` by its
+    /// row or its credential: an `android-key` one's chain and status list;
+    /// any other format is in good standing.
+    fn attested_standing(
+        &self,
+        passkey: &Value,
+        attestation_format: &str,
+        stored_format: Option<&str>,
+    ) -> Result<(), StandingRefusal> {
         let android = |f: Option<&str>| f == Some("android-key");
         if !android(Some(attestation_format)) && !android(stored_format) {
             return Ok(());
@@ -1381,7 +1439,7 @@ impl Passkeys {
                  ({stored_format:?})"
             )));
         }
-        let cred = cred.ok_or_else(|| {
+        let cred = passkey.get("cred").ok_or_else(|| {
             StandingRefusal::NotInGoodStanding("the stored credential has no `cred`".into())
         })?;
         let attestation: ParsedAttestation = cred
@@ -1872,6 +1930,19 @@ impl AnchorRefusal {
             Self::BackupEligibilityChanged => "backup_eligibility_changed",
         }
     }
+}
+
+/// The passkey a `none` passkey holds through, as
+/// [`Passkeys::assertion_standing`] judges it: the stored row of its
+/// admitting anchor (the database records it on the anchored row and serves
+/// it among the same person's live passkeys).
+#[derive(Clone, Copy, Debug)]
+pub struct StandingAnchor<'a> {
+    /// The anchor's stored credential (the library's record, with its stored
+    /// attestation).
+    pub passkey: &'a Value,
+    /// The anchor row's `attestation_format`.
+    pub attestation_format: &'a str,
 }
 
 /// Why a stored passkey may not assert now

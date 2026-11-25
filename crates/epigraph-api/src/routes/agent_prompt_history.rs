@@ -10,8 +10,9 @@
 //! retired link included, so the history outlives a hand-over; for an agent
 //! with no link at all, the operator of its allowlisted client (149's
 //! `author_binding_clients` arm); and a registered human operator asking about
-//! itself. The decision is the database's: migration 161's
-//! `epigraph_agent_prompt_history` reads the SESSION principal, so the call
+//! itself. The decision is the database's: the definers (migration 268's
+//! listing and 276's file read, both on 161's gate) read the SESSION
+//! principal, so the call
 //! runs on the caller's viewer-stamped connection ([`AppState::read_as`]),
 //! never on the raw pool, where the principal is unset and every caller is
 //! refused. Under armed admin scopes the definer's admin arm needs an ELEVATED
@@ -79,9 +80,10 @@
 //! key, as `{blob_hash, raw_size, text, lossy}`. A hash no readable snapshot
 //! names, an unreadable lineage member's included, is a 404; a stored blob that
 //! fails verification is WITHHELD, a 500 naming the failure, and its bytes are
-//! never served. The server holds at most one file's content per request. The
-//! file read still goes through 161's definer, which builds the whole
-//! lineage's content inside the database to return that one file.
+//! never served. The file read goes through migration 276's
+//! `epigraph_agent_prompt_history_blob` (161's gate, walk and readable mark),
+//! which fetches that one blob and no other, so neither the database nor the
+//! server builds more than one file's content per request.
 //!
 //! # No registration route
 //!
