@@ -863,7 +863,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 165 -> 162 (backlog f712db53): the three group membership gates in
 /// `routes/claims.rs` (16 -> 13) moved onto the caller's stamped connection.
 /// No file reached zero.
-const HIGH_WATER: usize = 162;
+/// 162 -> 161 (backlog 7c2a0b36): `patch_claim`'s non-admin branch runs on
+/// the caller's `AppState::write_as` transaction instead of
+/// `state.db_pool.begin()`, as its admin branch already did
+/// (`routes/claims.rs` 13 -> 12). No file reached zero.
+const HIGH_WATER: usize = 161;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -999,7 +1003,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // (`GroupMembershipRepository::is_member_conn`), the only shape in which
     // migration 236's principal-bound live-membership definer answers on the
     // application role. The SITE-level decline described above is retired.
-    ("routes/claims.rs", 13),
+    // 13 -> 12 (backlog 7c2a0b36): `patch_claim`'s non-admin write moved off
+    // `state.db_pool.begin()` onto `AppState::write_as`, the transaction its
+    // admin branch already used.
+    ("routes/claims.rs", 12),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
