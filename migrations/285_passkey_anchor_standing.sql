@@ -99,9 +99,10 @@
 -- append-only standing-refusal audit table". `security_events` already is
 -- one for every `platform.` row (immutable, writable only from a privileged
 -- session or a maintenance-owned definer frame, 123), and it is where the
--- elevation's other refusals are audited and read (`epigraph_platform_audit`,
--- the operator's `audit` verb). A separate table would split one ceremony's
--- trail in two and add a tenancy and row-security surface for nothing.
+-- elevation's other refusals are audited; 123's `epigraph_platform_audit`
+-- returns every `platform.` row, these included. A separate table would split
+-- one ceremony's trail in two and add a tenancy and row-security surface for
+-- nothing.
 --
 -- OWNERS AND GRANTS (role-guarded as every such block since 060): every
 -- function owned by `epigraph_maintenance`; EXECUTE revoked from PUBLIC; the
