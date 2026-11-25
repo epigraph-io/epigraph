@@ -4737,6 +4737,16 @@ restart.
 - **304**, **305**: `DROP INDEX CONCURRENTLY IF EXISTS` of 293's and 291's indexes, which no
   probe reads after 302, each single-statement `-- no-transaction`. Registered (with 291 and
   293) in `DROPPED_INDEX_MIGRATIONS`. Undo: re-run 293 / 291.
+- **306**: `disclosure_details_live_rows_only` (review 2, correctness#3; backlog f712db53).
+  Precondition LRD01 (55000): the core is still 302's (md5). Re-states
+  `epigraph_agent_disclosure_for` so the profile details rule counts a shared group only
+  through a membership row that still COUNTS: 164 (a verb-made group's row, while its agent's
+  human is a live human operator) and 235 (a personal-group row of an agent allowlisted for the
+  owner, while an allowance names the owner), 236's direct-arm rules. Main fixed the same rule
+  in its hand-copied predicates through `epigraph_group_live_roster`; a merge of main must keep
+  this core and may express the rule through that function. Pinned by
+  `human_identity_visibility.rs::a_lapsed_membership_row_shares_no_details` (red before) and the
+  LRD01 refusal. Undo: `docs/runbooks/306-undo.sql`.
 
 ## `-- no-transaction` migrations
 

@@ -494,6 +494,69 @@ async fn a_suspended_client_lapses_a_verb_made_team_but_not_a_readable_claim(poo
     );
 }
 
+/// The details rule counts only a membership row that still COUNTS (review2
+/// correctness#3; the f712db53 rule main's `epigraph_group_live_roster`
+/// applies): an unrevoked row can lapse without being revoked, by 164 (a
+/// verb-made group's row, while its agent's human is a live human operator)
+/// or by 235 (a personal-group row of an agent allowlisted for the group's
+/// owner, while that allowance names the owner). A viewer sharing only a
+/// lapsed row's group with a non-human whose profile is `'group'` reads its
+/// details withheld; while the row counts it reads them (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lapsed_membership_row_shares_no_details(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+
+    // 235: the allowlisted service's row in its operator's personal group.
+    let (owner, personal) = human(&pool, "Ivo Owner").await;
+    let (svc, client) = allowance_bound(&pool, owner, "ivo-service").await;
+    set_profile(&pool, svc, "group").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(personal)
+    .bind(svc)
+    .execute(&pool)
+    .await
+    .expect("the service's personal-group row");
+    assert!(
+        disclosure(&scoped, &viewer(&pool, owner).await, svc)
+            .await
+            .1,
+        "CALIBRATION: while the allowance names the owner, the row counts"
+    );
+    revoke_allowance(&pool, client).await;
+    assert!(
+        !disclosure(&scoped, &viewer(&pool, owner).await, svc)
+            .await
+            .1,
+        "a personal-group row that lapsed with its allowance (235) shares no details"
+    );
+
+    // 164: a bot's row in a verb-made group, while its human is live.
+    let (op, _) = human(&pool, "Jola Operator").await;
+    let (mate, _) = human(&pool, "Kai Groupmate").await;
+    let (bot, _) = named(&pool, "jola-bot").await;
+    set_profile(&pool, bot, "group").await;
+    link(&pool, bot, op).await;
+    group_of(
+        &pool,
+        "community",
+        &format!("did:epigraph:group:{}", Uuid::new_v4()),
+        &[mate, bot],
+    )
+    .await;
+    assert!(
+        disclosure(&scoped, &viewer(&pool, mate).await, bot).await.1,
+        "CALIBRATION: while the bot's human is live, its verb-made row counts"
+    );
+    retire_link(&pool, bot).await;
+    assert!(
+        !disclosure(&scoped, &viewer(&pool, mate).await, bot).await.1,
+        "a verb-made group's row whose agent has no live human (164) shares no details"
+    );
+}
+
 // ─── T5 (rule half): the opt-in arm ──────────────────────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -2455,6 +2518,39 @@ async fn migration_302_refuses_over_another_core_body(pool: PgPool) {
     .expect("core source");
     assert!(
         !src.contains("slot_kind = 'assessment'"),
+        "nothing was changed"
+    );
+}
+
+/// 306 re-states 302's core; over any other body it refuses (LRD01) with
+/// nothing changed.
+#[sqlx::test(migrations = false)]
+async fn migration_306_refuses_over_another_core_body(pool: PgPool) {
+    migrate(&pool, &below(306)).await.expect("migrate to 305");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
+             p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean) \
+         RETURNS TABLE (named boolean, details boolean) \
+         LANGUAGE plpgsql STABLE SECURITY DEFINER COST 1000 \
+         SET search_path = pg_catalog, pg_temp AS $$ \
+         BEGIN RETURN QUERY SELECT false, false; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("306 must refuse over another body");
+    assert!(err.contains("LRD01"), "precondition refusal: {err}");
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE oid = to_regprocedure('public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("core source");
+    assert!(
+        !src.contains("author_binding_clients"),
         "nothing was changed"
     );
 }

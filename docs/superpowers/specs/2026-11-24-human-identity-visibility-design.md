@@ -383,6 +383,14 @@ The core's body, in order (the decision is made in SQL; the Rust side only redac
    - `p_target = p_principal`;
    - `profile_visibility = 'public'`;
    - a live direct `group_memberships` row of `p_target` with `group_id = ANY(p_groups)`.
+     **Since migration 306** (review 2, correctness#3) the row must still COUNT under 236's
+     direct-arm lapse rules: 164 (a verb-made `did:epigraph:group:` group's row counts while
+     its agent's human is a live human operator) and 235 (a personal-group row of an agent
+     allowlisted for the group's owner counts while an allowance still names the owner). Main
+     fixed the same rule in its hand-copied predicates (`epigraph_group_live_roster`, backlog
+     f712db53); here it is the core's, so a merge of main must keep the core's version on every
+     conflicting Rust site. It is a third copy of 236's direct arm: the merge may express it
+     through main's roster function's counting rule.
 
    This text replaces the four copies that exist today (§7, rows A1, A2, B1, B2; the brief
    said three, but `profile_details_visible` is a fourth). Part A creates the core; part B
@@ -944,6 +952,9 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   **`304_drop_idx_mass_functions_public_by_source.sql`** and
   **`305_drop_idx_evidence_public_by_signer.sql`** drop 293's and 291's indexes, which no probe
   reads after M26.
+- **M28 `306_disclosure_details_live_rows_only.sql`** (review 2, correctness#3, transactional):
+  precondition LRD01 (302's core md5); the details rule's membership EXISTS applies 164's and
+  235's lapse rules (§6.1). Undo: `docs/runbooks/306-undo.sql`.
 
 Every index file is registered in `tenancy_migration_shape.rs` (validity, one statement), and
 `::the_partial_tenancy_indexes_serve_an_explicit_visibility_qual` pins, by EXPLAIN, that each probe reaches its index with the
