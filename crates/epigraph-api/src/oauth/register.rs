@@ -265,8 +265,9 @@ pub async fn register_endpoint(
                 // to this endpoint yielded a usable write credential. It now
                 // registers PENDING with an EMPTY granted set: `allowed_scopes`
                 // records what an admin MAY approve (a maintenance session,
-                // through `epigraph_oauth_client_approve`, migration 188; the
-                // REST approve route answers 501 MOVED), `granted_scopes` is
+                // through `epigraph_oauth_client_approve`, migration 188, which
+                // since 312 must also name the agent's owner; the REST approve
+                // route answers 501 MOVED), `granted_scopes` is
                 // what the client actually holds, and the client_credentials
                 // grant refuses it entirely until then because
                 // `OAuthClientRepository::get_by_client_id` filters
@@ -291,19 +292,6 @@ pub async fn register_endpoint(
         }
     };
 
-    // For agents, find the owner (first active human client)
-    let owner_id: Option<uuid::Uuid> = if client_type == "agent" {
-        let row: Option<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT id FROM oauth_clients WHERE client_type = 'human' AND status = 'active' ORDER BY created_at LIMIT 1"
-        )
-        .fetch_optional(&state.db_pool)
-        .await
-        .unwrap_or(None);
-        row.map(|(id,)| id)
-    } else {
-        None
-    };
-
     {
         use epigraph_db::repos::oauth_client::OAuthClientRepository;
         OAuthClientRepository::create(
@@ -325,7 +313,19 @@ pub async fn register_endpoint(
             // which is why oauth_clients.agent_id was NULL for every client
             // this endpoint ever created.)
             None,
-            owner_id,
+            // owner_id: NONE, for every client type (backlog be024524). The
+            // request is unauthenticated, so nothing in it names who answers
+            // for the client. The agent arm used to stamp the OLDEST ACTIVE
+            // HUMAN client here, so suspending that human
+            // (`OAuthClientRepository::suspend_by_owner`) suspended every
+            // approved self-registered agent, and the agent's token carried
+            // that human as its `owner_id`. The operator names the owner at
+            // approval instead: migration 312's
+            // `epigraph_oauth_client_approve(id, scopes, approved_by, owner)`
+            // refuses an agent approval without one, and 312's
+            // `agents_must_have_owner` admits a NULL owner only while the
+            // agent is not active.
+            None,
             req.legal_entity_name.as_deref(),
             req.legal_contact_email.as_deref(),
             redirect_uris.as_deref(),
