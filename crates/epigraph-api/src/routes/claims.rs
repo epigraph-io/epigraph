@@ -1391,28 +1391,45 @@ pub(crate) async fn create_claim_core(
         }
     }
 
-    // Materialize edges (best-effort, after commit) — ONLY for a row this call
-    // created.
+    // Materialize edges (best-effort, after commit).
+    //
+    // A row this call CREATED gets its structural edges: `AUTHORED`, and
+    // `HAS_TRACE` / `DERIVED_FROM` when the request names a trace / evidence.
     //
     // On an `if_not_exists` dedup hit `created_claim` is a row someone else
     // may own: `create_or_get` matches on `(content_hash, agent_id)`, and
     // `agent_id` is the request BODY's (see the note on `claim` above), so any
-    // caller can name another agent's public claim. These statements run on
-    // the raw, unstamped pool after the commit, so migration 122's trigger
-    // never sees them (no claims INSERT happens) and the edges land public and
-    // world-owned, which migration 120 makes administrative: neither the
-    // caller nor the claim's owner can retract them.
-    // Unguarded, a dedup hit let a caller hang `AUTHORED`, `HAS_TRACE` and
-    // `DERIVED_FROM` edges off another tenant's claim. Guarded the same way,
-    // and for the same reason, as the labels and properties writes above.
-    if was_created {
-        let mut structural: Vec<(Uuid, &str, Uuid, &str, &str)> =
-            vec![(request.agent_id, "agent", claim_uuid, "claim", "AUTHORED")];
-        if let Some(trace_uuid) = request.trace_id {
-            structural.push((claim_uuid, "claim", trace_uuid, "trace", "HAS_TRACE"));
-        }
-        if let Some(evidence_id) = request.evidence_id {
-            structural.push((claim_uuid, "claim", evidence_id, "evidence", "DERIVED_FROM"));
+    // caller can name another agent's public claim. These statements run
+    // after the commit, outside migration 122's trigger (no claims INSERT
+    // happens), and an agent-sourced edge is world-owned, which migration 120
+    // makes administrative: neither the caller nor the claim's owner can
+    // retract it. Unguarded, a dedup hit let a caller hang `AUTHORED`,
+    // `HAS_TRACE` and `DERIVED_FROM` edges off another tenant's claim, so a
+    // dedup hit writes them only for the matched claim's AUTHOR.
+    //
+    // For that author a resubmission is itself an authorship event, so it
+    // gets its own `AUTHORED` edge, as MCP's `submit_claim` emits on every
+    // submission (`claim_helper::create_claim_idempotent`; backlog 4952d77a).
+    // The author is the AUTHENTICATED principal (`author_agent_id`, never the
+    // body's `agent_id`), and the matched row's `agent_id` must equal it.
+    // `HAS_TRACE` / `DERIVED_FROM` are still not re-emitted on a resubmit
+    // (docs/architecture/noun-claims-and-verb-edges.md, `if_not_exists`
+    // semantics).
+    let resubmitted_by_author =
+        !was_created && Uuid::from(created_claim.agent_id) == author_agent_id;
+    if was_created || resubmitted_by_author {
+        let mut structural: Vec<(Uuid, &str, Uuid, &str, &str)> = if was_created {
+            vec![(request.agent_id, "agent", claim_uuid, "claim", "AUTHORED")]
+        } else {
+            vec![(author_agent_id, "agent", claim_uuid, "claim", "AUTHORED")]
+        };
+        if was_created {
+            if let Some(trace_uuid) = request.trace_id {
+                structural.push((claim_uuid, "claim", trace_uuid, "trace", "HAS_TRACE"));
+            }
+            if let Some(evidence_id) = request.evidence_id {
+                structural.push((claim_uuid, "claim", evidence_id, "evidence", "DERIVED_FROM"));
+            }
         }
         // A group-visible claim (the team / private default,
         // docs/tenancy/claim-visibility-controls.md) is invisible to the
@@ -1421,9 +1438,15 @@ pub(crate) async fn create_claim_core(
         // them as the caller that just wrote the claim, one transaction per
         // edge so one bad reference does not take the others with it (the
         // same best-effort contract as the public path).
-        let group_visible = resolved
-            .as_ref()
-            .is_some_and(|r| r.decl.visibility_bind() == Some("group"));
+        //
+        // A dedup hit's row is the one the author wrote EARLIER, whose
+        // visibility need not be the one this request asked for (a public
+        // resubmit can match the author's private claim), so that arm always
+        // writes as the caller: the author can see and reference its own row.
+        let group_visible = resubmitted_by_author
+            || resolved
+                .as_ref()
+                .is_some_and(|r| r.decl.visibility_bind() == Some("group"));
         for (source, source_type, target, target_type, relationship) in structural {
             if group_visible {
                 let written = async {

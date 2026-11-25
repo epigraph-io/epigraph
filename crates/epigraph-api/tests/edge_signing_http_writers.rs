@@ -64,9 +64,13 @@ async fn spawn_signed(url: &str, signer: ApiEdgeSigner) -> (SocketAddr, oneshot:
 
 /// The edge carries a verifying v1 attestation by `signer` over its row.
 async fn assert_attested(pool: &PgPool, edge: Uuid, signer: Uuid, what: &str) {
-    let viewer = Viewer::resolve(pool, Uuid::nil())
-        .await
-        .expect("public viewer");
+    assert_attested_as(pool, Uuid::nil(), edge, signer, what).await;
+}
+
+/// [`assert_attested`], read by `reader` (`Uuid::nil()` is the public viewer):
+/// an edge on a group-visible claim is readable only by a member.
+async fn assert_attested_as(pool: &PgPool, reader: Uuid, edge: Uuid, signer: Uuid, what: &str) {
+    let viewer = Viewer::resolve(pool, reader).await.expect("viewer");
     let mut conn = pool.acquire().await.expect("conn");
     let check = EdgeSignatureRepository::verify_conn(&mut conn, &viewer, edge)
         .await
@@ -256,6 +260,148 @@ async fn create_claim_attests_its_authored_edge() {
         author_is_not_signer,
         Some(author),
         "the signer is not the author"
+    );
+}
+
+/// The `AUTHORED` edges from `author` to `claim`.
+async fn authored_edges(pool: &PgPool, author: Uuid, claim: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'AUTHORED' ORDER BY created_at, id",
+    )
+    .bind(author)
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("AUTHORED edges")
+}
+
+/// Backlog 4952d77a: an `if_not_exists` resubmission over HTTP by the matched
+/// claim's AUTHOR is an authorship event and adds one `AUTHORED` edge,
+/// attested by the API key, as MCP's `submit_claim` does on every submission.
+/// A resubmission naming that author by a caller who is NOT it adds none.
+///
+/// The first write is PRIVATE and the resubmit asks for PUBLIC. This
+/// harness's pool bypasses row security, so the stamped write of the dedup
+/// arm is pinned on the application role instead
+/// (`claim_routes_bind_the_caller.rs`,
+/// `an_authors_resubmit_of_its_private_claim_adds_authored_on_the_app_role`).
+///
+/// Verified to fail on the pre-4952d77a handler (edges only `if was_created`):
+/// the count after the author's resubmit stays 1. With the dedup arm admitting
+/// any caller (no author check), the non-author's resubmit adds an edge.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authors_http_resubmit_adds_one_attested_authored_edge() {
+    let (url, pool) = pool().await;
+    let (signer, signer_id) = api_signer(&pool).await;
+    let (addr, _shutdown) = spawn_signed(&url, signer).await;
+    let (token, client) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+        .bind(client)
+        .fetch_one(&pool)
+        .await
+        .expect("the client's agent");
+    let content = format!(
+        "4952d77a: a resubmit over HTTP is an authorship event {}",
+        Uuid::new_v4()
+    );
+
+    let first = post(
+        addr,
+        &token,
+        "/api/v1/claims",
+        serde_json::json!({
+            "content": content, "agent_id": author, "if_not_exists": true,
+            "visibility": "private",
+        }),
+    )
+    .await;
+    assert_eq!(first["was_created"], serde_json::json!(true), "{first}");
+    let claim = id_of(&first, "id");
+    let before = authored_edges(&pool, author, claim).await;
+    assert_eq!(before.len(), 1, "CALIBRATION: the create's AUTHORED edge");
+
+    let second = post(
+        addr,
+        &token,
+        "/api/v1/claims",
+        serde_json::json!({
+            "content": content, "agent_id": author, "if_not_exists": true,
+            "visibility": "public",
+        }),
+    )
+    .await;
+    // `was_created: false` is omitted from the body (`skip_serializing_if`).
+    assert!(second.get("was_created").is_none(), "a dedup hit: {second}");
+    assert_eq!(
+        id_of(&second, "id"),
+        claim,
+        "the resubmit matched the claim"
+    );
+    let after = authored_edges(&pool, author, claim).await;
+    assert_eq!(
+        after.len(),
+        2,
+        "the author's resubmit adds exactly one AUTHORED edge: {after:?}"
+    );
+    let added = *after
+        .iter()
+        .find(|e| !before.contains(e))
+        .expect("the new edge");
+    // Read as the author: the matched claim is private, and so is its edge.
+    assert_attested_as(&pool, author, added, signer_id, "resubmit AUTHORED").await;
+
+    // Another caller resubmits the author's content naming the author: a
+    // dedup hit on a claim it did not author, so no edge at all. A PUBLIC
+    // claim of the author's, so that caller can see (and match) the row.
+    let public_content = format!(
+        "4952d77a: a public claim another caller resubmits {}",
+        Uuid::new_v4()
+    );
+    let public_body = serde_json::json!({
+        "content": public_content, "agent_id": author, "if_not_exists": true,
+        "visibility": "public",
+    });
+    let created = post(addr, &token, "/api/v1/claims", public_body.clone()).await;
+    let public_claim = id_of(&created, "id");
+    assert_eq!(
+        authored_edges(&pool, author, public_claim).await.len(),
+        1,
+        "CALIBRATION: the public create's AUTHORED edge"
+    );
+    let (stranger, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims"))
+        .bearer_auth(&stranger)
+        .json(&public_body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(
+        status.is_success(),
+        "CALIBRATION: the stranger's resubmit is answered (a dedup hit): {status} {text}"
+    );
+    let third: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert!(third.get("was_created").is_none(), "a dedup hit: {third}");
+    assert_eq!(
+        id_of(&third, "id"),
+        public_claim,
+        "the stranger's resubmit matched it"
+    );
+    let edges_to_claim: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'AUTHORED'",
+    )
+    .bind(public_claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        edges_to_claim, 1,
+        "a non-author's resubmit writes no AUTHORED edge, from anyone"
     );
 }
 
