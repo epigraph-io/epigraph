@@ -1156,12 +1156,14 @@ BEGIN
          WHERE e.id = c.id AND c.fits AND c.refs_ok
            AND (e.visibility, e.owner_group_id, e.co_owner_group_id)
                IS DISTINCT FROM ('group'::character varying(16), c.g, c.co)
-        RETURNING e.id
+        RETURNING e.id, c.unmet
     )
+    -- `unmet` is counted over the rows the UPDATE changed, so it is always a
+    -- part of `narrowed` (a candidate already on its target is not counted).
     SELECT (SELECT count(*) FROM upd),
            (SELECT count(*) FROM cand c WHERE NOT c.fits),
            (SELECT count(*) FROM cand c WHERE c.fits AND NOT c.refs_ok),
-           (SELECT count(*) FROM cand c WHERE c.fits AND c.refs_ok AND c.unmet)
+           (SELECT count(*) FILTER (WHERE u.unmet) FROM upd u)
       INTO v_fixed, v_wider, v_dangling, v_unmet;
     RAISE NOTICE '284: narrowed % declared edge(s) (% of them unmet); left % that would need '
                  'three groups; skipped % with a dangling endpoint',
