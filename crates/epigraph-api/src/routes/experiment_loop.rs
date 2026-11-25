@@ -886,7 +886,8 @@ mod caller_author_tests {
         };
         let scoped = ScopedPool::connect(&url, SessionGucMode::Session)
             .await
-            .expect("connect a ScopedPool");
+            .expect("connect a ScopedPool")
+            .with_application_pool_maintenance_for_tests();
         let session = scoped
             .maintenance_session(SystemReason::SchemaContractTest)
             .await

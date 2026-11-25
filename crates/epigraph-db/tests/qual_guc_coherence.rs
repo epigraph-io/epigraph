@@ -122,9 +122,12 @@ async fn env(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions, mode: Sessio
         .connect_with(conn_opts.clone())
         .await
         .expect("seeding pool");
+    // Opted in to the test-only application-pool maintenance fallback: the
+    // bypass-boundary tests below mint their lease here, on the superuser DSN.
     let scoped = ScopedPool::connect(&scoped_url(&conn_opts), mode)
         .await
-        .expect("ScopedPool::connect");
+        .expect("ScopedPool::connect")
+        .with_application_pool_maintenance_for_tests();
     Env { pool, scoped }
 }
 

@@ -946,6 +946,19 @@ impl From<DbError> for ApiError {
                     message: "ELEVATED ACCESS NOT RECORDED: the response is withheld",
                 }
             }
+            // Fail-closed (backlog e27ad9b6): maintenance work asked of a pool
+            // with no maintenance pool attached. A server-side fault; logged,
+            // not sent.
+            DbError::MaintenancePoolNotAttached { reason } => {
+                tracing::error!(
+                    target: "tenancy.maintenance",
+                    reason,
+                    "maintenance connection refused: no maintenance pool is attached"
+                );
+                ApiError::InternalErrorStatic {
+                    message: "this server holds no maintenance connection for this operation",
+                }
+            }
             DbError::MigrationFailed { source } => {
                 tracing::error!(error = %source, "Database migration failed");
                 ApiError::DatabaseError {

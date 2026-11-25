@@ -18,14 +18,14 @@
 //!     calls, and the test-only `build_app_for_tests_with_admin_cascade`
 //!     helper);
 //!   - leasing a maintenance connection from a `ScopedPool`:
-//!     `maintenance_session(`, `unscoped_for_maintenance(`,
-//!     `maintenance_inner(`. `ScopedPool` falls back to the APPLICATION pool
-//!     when no maintenance pool is attached (the operator CLI fleet relies on
-//!     that), so in a request binary such a call is a bypass on the
-//!     application DSN: on a privileged application DSN, the very surface D9
-//!     removed. The permitted sites are the two gated `maintenance_viewer`s
-//!     (each refuses first when no maintenance pool is attached) and the
-//!     embedding job handler, which only the drain registers;
+//!     `maintenance_session(`, `unscoped_for_maintenance(`. `ScopedPool`
+//!     REFUSES these when no maintenance pool is attached (backlog e27ad9b6;
+//!     it used to fall back to the APPLICATION pool), so in a request binary
+//!     such a call is either a refusal or, on a binary that attached a pool,
+//!     maintenance authority in a request unit. The permitted sites are the two
+//!     gated `maintenance_viewer`s (each answers "not served" first when no
+//!     maintenance pool is attached) and the embedding job handler, which only
+//!     the drain registers;
 //! * the environment variable is READ only by the two boot refusals (the
 //!   `server` and `epigraph-mcp-full` mains), each of which hands it straight to
 //!   the D9 predicate; and its NAME appears in production code only there and
@@ -76,7 +76,6 @@ const TOKENS: &[&str] = &[
     "PostgresJobQueue::new",
     "maintenance_session(",
     "unscoped_for_maintenance(",
-    "maintenance_inner(",
 ];
 
 /// The [`TOKENS`] that name a `ScopedPool` / `epigraph_db` function, each of
@@ -88,7 +87,6 @@ const POOL_FNS: &[&str] = &[
     "with_maintenance_pool(",
     "maintenance_session(",
     "unscoped_for_maintenance(",
-    "maintenance_inner(",
 ];
 
 /// `(repo-relative file, token, count)`: every permitted site.

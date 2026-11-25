@@ -303,6 +303,24 @@ pub enum DbError {
     #[error("ELEVATED ACCESS NOT RECORDED: {reason}; the response is withheld")]
     ElevatedAccessUnrecorded { reason: String },
 
+    /// A maintenance connection was asked of a `ScopedPool` with NO
+    /// maintenance pool attached (`ScopedPool::unscoped_for_maintenance` /
+    /// `maintenance_session`, backlog e27ad9b6).
+    ///
+    /// The pool used to fall back to its application pool, where row security
+    /// filters a bypass viewer to zero rows: maintenance work silently read
+    /// and wrote nothing. Now it refuses. A server fault, never the caller's
+    /// (HTTP 500, MCP internal error): a request-serving process holds no
+    /// maintenance DSN, and a maintenance binary attaches its vetted pool with
+    /// `ScopedPool::with_maintenance_pool`. `reason` is the `SystemReason`
+    /// the connection was asked for.
+    #[error(
+        "MAINTENANCE POOL NOT ATTACHED: a maintenance connection ({reason}) was refused because \
+         no maintenance pool is attached to this ScopedPool; it is never drawn from the \
+         application pool, where row security filters a bypass viewer to zero rows"
+    )]
+    MaintenancePoolNotAttached { reason: &'static str },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {

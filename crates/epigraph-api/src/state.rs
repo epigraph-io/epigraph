@@ -290,10 +290,10 @@ pub struct AppState {
     /// since PR-17.
     ///
     /// The residual a future author should know: `spawn_app` attaches no
-    /// maintenance pool, so `ScopedPool::maintenance_inner()` falls back to the
-    /// application pool — the fallback `unscoped_for_maintenance`'s own doc
-    /// calls unsound. A test written against that path would be measuring the
-    /// fallback, not the lease.
+    /// maintenance pool, so `ScopedPool::unscoped_for_maintenance` REFUSES on
+    /// it (backlog e27ad9b6) unless the fixture opted in to the test-only
+    /// application-pool fallback. A test written against that path would be
+    /// measuring the fallback, not the lease.
     ///
     /// Unit tests and every other non-`spawn_app` constructor are unchanged:
     /// [`Self::with_db`] still leaves this `None`, which is what the
@@ -1728,7 +1728,9 @@ impl AppState {
         // bypass viewer on a filtered connection, the empty-200 shape. So the
         // gate comes first, and the routes answer 501 MOVED. The mirror of
         // `epigraph-mcp/src/maintenance.rs::maintenance_viewer`'s first check.
-        // `ScopedPool`'s fallback itself stays: the operator CLI fleet uses it.
+        // `ScopedPool` itself no longer falls back either (backlog e27ad9b6:
+        // it refuses with `MaintenancePoolNotAttached`); this gate stays so the
+        // answer is the 501 MOVED the routes document, not a 500.
         if !scoped.has_maintenance_pool() {
             return Err(MaintenanceViewerError::NotServed);
         }
