@@ -470,3 +470,41 @@ fn recent_lists_the_last_eight_evicted_turns_and_their_corrections() {
     assert!(none.standing.is_empty() && none.relevant.is_empty());
     assert!(none.recent.is_empty() && none.open.is_empty());
 }
+
+#[test]
+fn a_recent_correction_carries_both_texts_unless_the_old_side_is_still_quoted() {
+    let mut s = graph(
+        vec![
+            atom(1, 5, AtomKind::Fact, "Two probes per bed."),
+            atom(2, 19, AtomKind::Correction, "Three probes per bed."),
+            // Turn 17's atoms were put but the turn was never marked applied
+            // (a reaped writer): the runner still quotes it as pending.
+            atom(3, 17, AtomKind::Fact, "PENDING-OLD The supplier is Acme."),
+            atom(4, 18, AtomKind::Correction, "The supplier is Bolt."),
+        ],
+        vec![],
+        &[5, 18, 19],
+    );
+    assert!(s.supersede(id(1), id(2), t(4)).unwrap());
+    assert!(s.supersede(id(3), id(4), t(4)).unwrap());
+    let d = run(&s, "", 20, 20);
+    assert_eq!(d.recent_corrections.len(), 2);
+
+    let c = d.recent_corrections[0];
+    assert_eq!((c.old, c.old_turn, c.new, c.turn), (id(1), 5, id(2), 19));
+    assert_eq!(c.old_text, Some("Two probes per bed."));
+    assert_eq!(c.new_text, "Three probes per bed.");
+
+    let p = d.recent_corrections[1];
+    assert_eq!((p.old, p.old_turn, p.new, p.turn), (id(3), 17, id(4), 18));
+    assert_eq!(p.old_text, None, "the old side is still quoted verbatim");
+    assert_eq!(p.new_text, "The supplier is Bolt.");
+
+    let json = serde_json::to_value(&d).unwrap();
+    assert!(!json.to_string().contains("PENDING-OLD"));
+    assert!(json["recent_corrections"][1].get("old_text").is_none());
+    assert_eq!(
+        json["recent_corrections"][0]["old_text"],
+        "Two probes per bed."
+    );
+}

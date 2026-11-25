@@ -177,10 +177,22 @@ pub struct OpenEntry<'a> {
 }
 
 /// A correction made in a recent turn: `old` was superseded by `new`.
+///
+/// It carries both texts so the runner can render "corrected in tN: X
+/// changed from A to B" (DESIGN §5.2) without an `atom` round trip: the old
+/// atom is superseded, so no slice lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct RecentCorrection {
+pub struct RecentCorrection<'a> {
     pub old: Uuid,
+    pub old_turn: u64,
+    /// The superseded atom's text, present only when its turn has left the
+    /// window and is applied. An old atom in a still-quoted turn is already
+    /// in the prompt verbatim, and the digest never repeats such text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<&'a str>,
     pub new: Uuid,
+    pub new_text: &'a str,
+    /// The turn of the correction (`new`'s turn).
     pub turn: u64,
 }
 
@@ -196,7 +208,7 @@ pub struct Digest<'a> {
     pub standing: Vec<DigestItem<'a>>,
     pub relevant: Vec<DigestItem<'a>>,
     pub recent: Vec<DigestItem<'a>>,
-    pub recent_corrections: Vec<RecentCorrection>,
+    pub recent_corrections: Vec<RecentCorrection<'a>>,
     pub open: Vec<OpenEntry<'a>>,
 }
 
@@ -295,7 +307,7 @@ pub fn digest<'a>(
             k_per_slice,
         ),
         recent: recent(&eligible, &beliefs, exclude_turns_from, k_per_slice),
-        recent_corrections: recent_corrections(store, &eligible_ids, exclude_turns_from),
+        recent_corrections: recent_corrections(store, &eligible_ids, &applied, exclude_turns_from),
         open: open(store, &eligible, &eligible_ids, &beliefs, k_per_slice),
     }
 }
@@ -424,19 +436,26 @@ fn recent<'a>(
         .collect()
 }
 
-fn recent_corrections(
-    store: &ScratchStore,
+fn recent_corrections<'a>(
+    store: &'a ScratchStore,
     eligible_ids: &BTreeSet<Uuid>,
+    applied: &BTreeSet<u64>,
     exclude_turns_from: u64,
-) -> Vec<RecentCorrection> {
+) -> Vec<RecentCorrection<'a>> {
     let from = exclude_turns_from.saturating_sub(RECENT_TURNS);
-    let mut out: Vec<RecentCorrection> = store
+    let mut out: Vec<RecentCorrection<'a>> = store
         .atoms()
         .filter_map(|old| {
             let new = store.atom(&old.superseded_by?)?;
+            // The old side's turn must have left the window and be applied,
+            // the same rule as eligibility minus `is_current`.
+            let old_listable = old.turn < exclude_turns_from && applied.contains(&old.turn);
             (eligible_ids.contains(&new.id) && new.turn >= from).then_some(RecentCorrection {
                 old: old.id,
+                old_turn: old.turn,
+                old_text: old_listable.then_some(old.text.as_str()),
                 new: new.id,
+                new_text: &new.text,
                 turn: new.turn,
             })
         })
