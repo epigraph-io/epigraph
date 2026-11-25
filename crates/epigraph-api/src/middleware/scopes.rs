@@ -16,23 +16,35 @@ pub fn check_scopes(auth: &AuthContext, required: &[&str]) -> Result<(), ApiErro
 
 /// Returns `Ok(())` if either:
 /// - `auth` has the `claims:admin` scope, OR
-/// - `auth.owner_id` (or `auth.client_id` when `owner_id` is `None`) matches `target_owner_id`.
+/// - `auth.agent_id` (the request's `agents.id` principal) is `target_author`,
+///   the row's `claims.agent_id`.
 ///
-/// Used to gate per-row mutations: admins can edit any row; others can
-/// only edit rows they authored/own.
+/// Used to gate per-row mutations of a claim (`PUT`, `PATCH` and
+/// `PATCH .../labels` on `/api/v1/claims/:id`): admins can edit any row they
+/// can read; others only rows they authored.
+///
+/// There is deliberately no arm comparing the token's `owner_id` or
+/// `client_id` with the author (backlog a2d3e945). Those are
+/// `oauth_clients.id` values and `claims.agent_id` is an `agents.id`, which
+/// every real token's principal gets from `AgentRepository::ensure_for_client`
+/// at mint, so the two never coincide: the old comparison refused every
+/// non-admin author of their own claim, and could only ever admit by an id
+/// collision. Nor does this gate carry the MCP gate's operator or delegate
+/// arms; how far those reach over HTTP is an open ruling (backlog d405f801).
+/// A delegated run token is admitted here only as its own principal, i.e. for
+/// the claims that principal authored.
 pub fn require_owner_or_admin(
     auth: &AuthContext,
-    target_owner_id: uuid::Uuid,
+    target_author: uuid::Uuid,
 ) -> Result<(), ApiError> {
     if auth.has_scope("claims:admin") {
         return Ok(());
     }
-    let principal = auth.owner_id.unwrap_or(auth.client_id);
-    if principal == target_owner_id {
+    if auth.agent_id == Some(target_author) {
         return Ok(());
     }
     Err(ApiError::Forbidden {
-        reason: "row is owned by another principal and caller lacks claims:admin".into(),
+        reason: "claim is authored by another agent and caller lacks claims:admin".into(),
     })
 }
 
@@ -92,10 +104,15 @@ mod tests {
     use crate::middleware::ClientType;
     use uuid::Uuid;
 
-    fn make_auth(scopes: &[&str], client_id: Uuid, owner_id: Option<Uuid>) -> AuthContext {
+    fn make_auth(
+        scopes: &[&str],
+        client_id: Uuid,
+        owner_id: Option<Uuid>,
+        agent_id: Option<Uuid>,
+    ) -> AuthContext {
         AuthContext {
             client_id,
-            agent_id: None,
+            agent_id,
             owner_id,
             client_type: ClientType::Service,
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
@@ -110,29 +127,65 @@ mod tests {
 
     #[test]
     fn admin_scope_passes_regardless_of_owner() {
-        let auth = make_auth(&["claims:admin"], Uuid::new_v4(), None);
+        let auth = make_auth(
+            &["claims:admin"],
+            Uuid::new_v4(),
+            None,
+            Some(Uuid::new_v4()),
+        );
         let target = Uuid::new_v4(); // completely different
         assert!(require_owner_or_admin(&auth, target).is_ok());
     }
 
+    /// The author arm: the token's `agents.id` principal wrote the claim.
+    /// Verified to fail on the pre-a2d3e945 gate, which compared only
+    /// `owner_id` / `client_id` (both different ids here, as on every real
+    /// token).
     #[test]
-    fn matching_owner_passes_without_admin() {
-        let owner_id = Uuid::new_v4();
-        let auth = make_auth(&["claims:write"], Uuid::new_v4(), Some(owner_id));
-        assert!(require_owner_or_admin(&auth, owner_id).is_ok());
+    fn the_author_passes_without_admin() {
+        let author = Uuid::new_v4();
+        let auth = make_auth(
+            &["claims:write"],
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+            Some(author),
+        );
+        assert!(require_owner_or_admin(&auth, author).is_ok());
     }
 
+    /// An `oauth_clients.id` (`owner_id`, or `client_id` without one) equal
+    /// to the claim's author admits nothing: it names a client row, not an
+    /// agent. Both passed on the pre-a2d3e945 gate.
     #[test]
-    fn matching_client_id_passes_when_no_owner_id() {
-        let client_id = Uuid::new_v4();
-        let auth = make_auth(&["claims:write"], client_id, None);
-        assert!(require_owner_or_admin(&auth, client_id).is_ok());
+    fn an_owner_or_client_id_equal_to_the_author_is_refused() {
+        let author = Uuid::new_v4();
+        let by_owner = make_auth(
+            &["claims:write"],
+            Uuid::new_v4(),
+            Some(author),
+            Some(Uuid::new_v4()),
+        );
+        assert!(require_owner_or_admin(&by_owner, author).is_err());
+        let by_client = make_auth(&["claims:write"], author, None, Some(Uuid::new_v4()));
+        assert!(require_owner_or_admin(&by_client, author).is_err());
+    }
+
+    /// A token naming no principal owns nothing.
+    #[test]
+    fn no_principal_no_admin_fails() {
+        let auth = make_auth(&["claims:write"], Uuid::new_v4(), None, None);
+        assert!(require_owner_or_admin(&auth, Uuid::new_v4()).is_err());
     }
 
     #[test]
     fn non_matching_no_admin_fails() {
-        let auth = make_auth(&["claims:write"], Uuid::new_v4(), None);
-        let target = Uuid::new_v4(); // different from client_id
+        let auth = make_auth(
+            &["claims:write"],
+            Uuid::new_v4(),
+            None,
+            Some(Uuid::new_v4()),
+        );
+        let target = Uuid::new_v4(); // different from every id the token carries
         assert!(require_owner_or_admin(&auth, target).is_err());
     }
 }
