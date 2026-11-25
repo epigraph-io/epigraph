@@ -4750,13 +4750,17 @@ restart.
   and own-admin row, `is_live_group_admin_conn`) move onto 273's roster in the same change. An
   md5 precondition refuses to apply over any other body of the three (55000). The binaries stamp
   the principal they ask about: `list_operator_readable_teams` for its one statement,
-  `resolve_visibility_choice` (the write's author) inside a savepoint it rolls back. Not
+  `resolve_visibility_choice` (the write's author) inside a savepoint it rolls back. Because
+  that resolution answers for a write's AUTHOR, `POST /api/v1/submit/packet` (whose author is a
+  body field) first refuses an author the caller may not name, with the claims trigger's own
+  codes (`AgentRepository::author_naming`; `OPL02` for another human's agent, before any team is
+  read), so the refusals cannot list another human's agent's teams on an armed database. Not
   changed: 081's privatization triggers still count raw admin rows (the API and job checks now
   refuse a lapsed admin first). Pinned by `epigraph-db/tests/membership_definers_bound.rs` (the
   operator arm, 209 on the app role, the viewer resolve and the visibility resolution on the
   app role, the lapsed admin's predicate, re-key mark and privatization checks, the undo and
-  the precondition) and `live_memberships_principal_bound.rs` (the flipped residual test, the
-  caller list). Undo: `docs/runbooks/309-undo.sql`. **Deploy order: BINARIES FIRST**, as 236: a
+  the precondition), `live_memberships_principal_bound.rs` (the flipped residual test, the
+  caller list) and `epigraph-api/tests/packet_author_team_oracle.rs` (the packet author gate). Undo: `docs/runbooks/309-undo.sql`. **Deploy order: BINARIES FIRST**, as 236: a
   binary that predates 309 asks both lists on an unstamped pool and gets no rows, so an
   operated agent stops reading its human's teams and a write that names no visibility lands
   private (silent, fail-closed). That includes every service linking an older `epigraph-db`

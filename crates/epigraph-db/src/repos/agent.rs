@@ -360,7 +360,125 @@ pub enum SpeaksFor {
     Operator,
 }
 
+/// May a request's authenticated principal NAME another agent as the author
+/// of the claim it writes ([`AgentRepository::author_naming`])? The verdict
+/// migration 122's claims trigger reaches on an application session (the
+/// writer check, then `epigraph_require_attributable`), decided BEFORE the
+/// request reads anything for that author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorNaming {
+    /// The writer is the author, or both belong to one live human, or the
+    /// database does not bind authors at all (not armed, or this process's
+    /// valve relieves the binding the case turns on).
+    Admitted,
+    /// `OPL01`: the writer is bound to no human, or the author is bound to no
+    /// live human (unbound, or a retired identity of the writer's own human).
+    Unbound,
+    /// `OPL02`: the author belongs to another human than the writer's.
+    OtherHuman,
+}
+
+/// The five facts [`AuthorNaming`] is decided from, read in one statement by
+/// [`AgentRepository::author_naming`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorNamingFacts {
+    /// `epigraph_operator_binding_armed()`.
+    pub armed: bool,
+    /// `epigraph_operator_binding_enforced()` on the asking connection: armed
+    /// and the process's valve not off.
+    pub enforced: bool,
+    /// `epigraph_human_of(writer, true)`.
+    pub writer_human: Option<Uuid>,
+    /// `epigraph_human_of(author, true)`.
+    pub author_live_human: Option<Uuid>,
+    /// `epigraph_human_of(author, false)`: a retired identity's human too.
+    pub author_any_human: Option<Uuid>,
+}
+
+impl AuthorNamingFacts {
+    /// The verdict, in the trigger's order: the writer binding (`OPL01`, the
+    /// valve relieves it), then attribution (`OPL02` across humans on arming
+    /// alone, whatever the valve; `OPL01` for an author bound to no live
+    /// human, which the valve relieves). The writer-is-the-author case is the
+    /// caller's ([`AgentRepository::author_naming`] never reads for it).
+    #[must_use]
+    pub fn verdict(&self) -> AuthorNaming {
+        if self.writer_human.is_some() && self.author_live_human == self.writer_human {
+            return AuthorNaming::Admitted;
+        }
+        if !self.armed {
+            return AuthorNaming::Admitted;
+        }
+        if self.writer_human.is_none() && self.enforced {
+            return AuthorNaming::Unbound;
+        }
+        if self.author_any_human.is_some() && self.author_any_human != self.writer_human {
+            return AuthorNaming::OtherHuman;
+        }
+        if self.enforced {
+            AuthorNaming::Unbound
+        } else {
+            AuthorNaming::Admitted
+        }
+    }
+}
+
 impl AgentRepository {
+    /// May `writer` (a request's authenticated principal) name `author` as
+    /// the author of the claim it is about to write? [`AuthorNaming`], from
+    /// the binding facts alone (`epigraph_human_of`, the arming and the
+    /// valve), never from anything about `author`'s groups.
+    ///
+    /// A write path that resolves the AUTHOR's visibility (its team lists,
+    /// its defaults) before its stamped transaction asks this first, so a
+    /// caller cannot read another human's agent's teams through the
+    /// resolution's answers and refusals (backlog 1c5edc26). The claims
+    /// trigger still decides the write; this only refuses earlier what it
+    /// would refuse, and with the same codes.
+    ///
+    /// `writer == Some(author)` is [`AuthorNaming::Admitted`] without a read.
+    /// Asked on any connection: every function read is an app-callable
+    /// definer, and the valve is read from the connection's own setting (so
+    /// ask on a connection of the pool the write's transaction comes from).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if a function is absent (a database below 149)
+    /// or the read fails.
+    pub async fn author_naming(
+        conn: &mut sqlx::PgConnection,
+        writer: Option<Uuid>,
+        author: Uuid,
+    ) -> Result<AuthorNaming, DbError> {
+        if writer == Some(author) {
+            return Ok(AuthorNaming::Admitted);
+        }
+        let (armed, enforced, writer_human, author_live_human, author_any_human): (
+            bool,
+            bool,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<Uuid>,
+        ) = sqlx::query_as(
+            "SELECT public.epigraph_operator_binding_armed(), \
+                    public.epigraph_operator_binding_enforced(), \
+                    public.epigraph_human_of($1, true), \
+                    public.epigraph_human_of($2, true), \
+                    public.epigraph_human_of($2, false)",
+        )
+        .bind(writer)
+        .bind(author)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(AuthorNamingFacts {
+            armed,
+            enforced,
+            writer_human,
+            author_live_human,
+            author_any_human,
+        }
+        .verdict())
+    }
+
     /// Create a new agent in the database
     ///
     /// Takes an `Acquire` so the agent row and its `agent.registered` event ride
@@ -2808,6 +2926,107 @@ impl AgentRepository {
                 .fetch_optional(executor)
                 .await?;
         Ok(row.map(|r| r.0))
+    }
+}
+
+#[cfg(test)]
+mod author_naming_tests {
+    use super::{AuthorNaming, AuthorNamingFacts};
+    use uuid::Uuid;
+
+    fn facts(
+        armed: bool,
+        enforced: bool,
+        writer_human: Option<Uuid>,
+        author_live_human: Option<Uuid>,
+        author_any_human: Option<Uuid>,
+    ) -> AuthorNamingFacts {
+        AuthorNamingFacts {
+            armed,
+            enforced,
+            writer_human,
+            author_live_human,
+            author_any_human,
+        }
+    }
+
+    /// The trigger's verdicts, case by case. Mutations caught: dropping the
+    /// arming short-circuit (an unarmed database refuses legacy cross-author
+    /// writes), testing `enforced` for the cross-human case (a valve-off
+    /// process admits another human's author, which 122 refuses on arming
+    /// alone), ordering attribution before the writer check (an unbound
+    /// writer gets OPL02, the trigger says OPL01), and admitting an author of
+    /// no live human (a retired identity) while enforced.
+    #[test]
+    fn the_verdict_is_the_triggers_on_an_application_session() {
+        let h = Some(Uuid::new_v4());
+        let other = Some(Uuid::new_v4());
+        let cases = [
+            // (armed, enforced, writer, author live, author any) -> verdict
+            (
+                facts(true, true, h, h, h),
+                AuthorNaming::Admitted,
+                "one live human",
+            ),
+            (
+                facts(true, true, h, other, other),
+                AuthorNaming::OtherHuman,
+                "another human",
+            ),
+            (
+                facts(true, false, h, other, other),
+                AuthorNaming::OtherHuman,
+                "valve off, another human",
+            ),
+            (
+                facts(true, true, None, other, other),
+                AuthorNaming::Unbound,
+                "unbound writer first",
+            ),
+            (
+                facts(true, false, None, other, other),
+                AuthorNaming::OtherHuman,
+                "valve off, unbound writer, bound author",
+            ),
+            (
+                facts(true, true, h, None, h),
+                AuthorNaming::Unbound,
+                "retired identity of the writer's human",
+            ),
+            (
+                facts(true, false, h, None, h),
+                AuthorNaming::Admitted,
+                "valve off, retired identity",
+            ),
+            (
+                facts(true, true, h, None, None),
+                AuthorNaming::Unbound,
+                "author bound to no human",
+            ),
+            (
+                facts(true, false, None, None, None),
+                AuthorNaming::Admitted,
+                "valve off, both unbound",
+            ),
+            (
+                facts(true, true, h, None, other),
+                AuthorNaming::OtherHuman,
+                "retired identity of another human",
+            ),
+            (
+                facts(false, false, None, other, other),
+                AuthorNaming::Admitted,
+                "unarmed binds no author",
+            ),
+            (
+                facts(false, false, h, other, other),
+                AuthorNaming::Admitted,
+                "unarmed, another human",
+            ),
+        ];
+        for (f, want, case) in cases {
+            assert_eq!(f.verdict(), want, "{case}");
+        }
     }
 }
 

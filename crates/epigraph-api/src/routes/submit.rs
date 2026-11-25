@@ -1247,6 +1247,51 @@ async fn persist_packet(
         ));
     }
 
+    // 1a. The packet's author is a BODY field. Before anything is resolved for
+    // it (its team lists, its defaults, its personal group), refuse an author
+    // the authenticated caller may not name, with the verdict and the codes
+    // 122's claims trigger would reach later. Otherwise the resolution's
+    // answers and refusals would tell any caller which teams another human's
+    // agent writes, and how many (backlog 1c5edc26).
+    if viewer.principal() != Some(agent_id.into()) {
+        let mut conn = pool.acquire().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new("DatabaseError", format!("Failed to acquire: {e}")),
+            )
+        })?;
+        match AgentRepository::author_naming(&mut conn, viewer.principal(), agent_id.into())
+            .await
+            .map_err(author_tenancy_error)?
+        {
+            epigraph_db::AuthorNaming::Admitted => {}
+            epigraph_db::AuthorNaming::Unbound => {
+                return Err(author_tenancy_error(
+                    epigraph_db::DbError::OperatorLinkRequired {
+                        message: format!(
+                            "submit_packet: the caller {:?} may not name author {}: one \
+                             of them is bound to no live human",
+                            viewer.principal(),
+                            packet.claim.agent_id
+                        ),
+                    },
+                ));
+            }
+            epigraph_db::AuthorNaming::OtherHuman => {
+                return Err(author_tenancy_error(
+                    epigraph_db::DbError::OperatorScopeRefused {
+                        message: format!(
+                            "submit_packet: the caller {:?} may not name author {}, \
+                             which belongs to another human",
+                            viewer.principal(),
+                            packet.claim.agent_id
+                        ),
+                    },
+                ));
+            }
+        }
+    }
+
     // 1b. Visibility (docs/tenancy/claim-visibility-controls.md), resolved for
     // the packet's author BEFORE the transaction: a team written through the
     // author's human (D-V3) must be stamped into it. The stamp is the CALLER's,

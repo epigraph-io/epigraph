@@ -1911,6 +1911,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "author_naming",
+        "CHECK through migration 122's `epigraph_operator_binding_armed` / `_enforced` and \
+         149's `epigraph_human_of` SECURITY DEFINER functions: the binding facts of the NAMED \
+         writer and author, never a group or a corpus row. It runs before the packet path's \
+         visibility resolution, on an unstamped connection of the write's pool (the valve is \
+         that connection's setting), so a Viewer would be the wrong control; same reason as \
+         `require_bound_author`.",
+    ),
+    (
+        "agent.rs",
         "author_binding",
         "READ through migration 122's `epigraph_author_binding` SECURITY DEFINER function; same \
          reason as `operator_actor`. It returns one label ('live_link' / 'human_operator' / \
