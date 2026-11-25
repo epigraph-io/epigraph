@@ -965,7 +965,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // create) the server's agent row: `self_link` and the first tool call both
     // do, and a refused boot must leave no row behind. (The mode is stdio-only:
     // `check_separate_key_transport` refused `--listen` before the connect.)
-    if let Some(identity) = &identity_public_key {
+    let separate_key_agent = if let Some(identity) = &identity_public_key {
         match epigraph_mcp::signing_identity::check_signing_key(
             &pool,
             identity,
@@ -973,18 +973,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
         {
-            Ok(agent) => tracing::info!(
-                agent_id = %agent,
-                identity_public_key = %hex::encode(identity),
-                signing_public_key = %hex::encode(signer.public_key()),
-                "separate signing key: an active signing key of the identity's agent"
-            ),
+            Ok(agent) => {
+                tracing::info!(
+                    agent_id = %agent,
+                    identity_public_key = %hex::encode(identity),
+                    signing_public_key = %hex::encode(signer.public_key()),
+                    "separate signing key: an active signing key of the identity's agent"
+                );
+                Some(agent)
+            }
             Err(reason) => {
                 eprintln!("ERROR: {reason}");
                 std::process::exit(1);
             }
         }
-    }
+    } else {
+        None
+    };
     // Read the rung off `select_signer`'s own return value rather than
     // re-deriving `agent_key.is_none()` and the separate-key pair here: the
     // precedence table is documented as living in one place, and a second copy
@@ -1033,6 +1038,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     tracing::info!(public_key = %hex::encode(identity_key), "Agent identity ready");
+
+    // And for as long as it serves, on every transport: a signing key revoked,
+    // rotated out or past its window while the process runs stops it, rather
+    // than sign every later claim and edge with a key the verifiers refuse
+    // (backlog ac52fcb0). The separate-signing-key mode was checked above, so
+    // its watch stops on any inadmissible read; a legacy key rung was never
+    // checked at boot, so its watch stops only once a key it saw admitted
+    // loses admission (see `signing_identity::WatchedKey`).
+    epigraph_mcp::signing_identity::spawn_admission_watch(
+        pool.clone(),
+        match separate_key_agent {
+            Some(agent) => {
+                epigraph_mcp::signing_identity::WatchedKey::separate(agent, signer.public_key())
+            }
+            None => epigraph_mcp::signing_identity::WatchedKey::agent_key(signer.public_key()),
+        },
+    );
 
     // Create embedder.
     //
