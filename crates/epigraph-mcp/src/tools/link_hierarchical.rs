@@ -263,6 +263,12 @@ pub async fn do_link_hierarchical(
     // write authority into a group this process cannot write is the cross-agent
     // ownership question (#374), not a stamping one.
     let actor = server.write_identity(auth, viewer).await?;
+    // This server's key attests the edge at INSERT. Resolved BEFORE the
+    // transaction: the first resolution of the server's own agent reads the
+    // pool, and taking a second pool connection while the write's transaction
+    // holds one is the hold-and-wait shape (backlog bdc96181), as the ingest
+    // resolves its key before its transaction.
+    let edge_key = server.edge_signing_key().await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, actor, "link_hierarchical").await?;
 
@@ -532,7 +538,7 @@ pub async fn do_link_hierarchical(
     // returns the existing edge unchanged.
     let (edge_row, was_created) = EdgeRepository::create_if_not_exists_signed_conn(
         &mut tx,
-        Some(server.edge_signing_key().await?),
+        Some(edge_key),
         source_id,
         source_type,
         target_id,

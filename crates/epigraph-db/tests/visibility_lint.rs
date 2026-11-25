@@ -1754,6 +1754,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "delegated_principal_conn",
+        "`delegated_principal_pool`'s one statement (the delegated run token's liveness check) \
+         on a transaction the caller holds, so a write does not take a second pool connection \
+         for it (backlog bdc96181). Every read is an app-executable SECURITY DEFINER \
+         (`epigraph_operator_actor`, `epigraph_author_binding`, `epigraph_human_of`, \
+         `epigraph_live_memberships`) answering about the NAMED delegator and principal, not a \
+         table read a viewer could narrow; the delegator stamp it needs is undone by a rolled-back \
+         savepoint.",
+    ),
+    (
+        "agent.rs",
         "operator_actor_for_act",
         "`operator_actor` (the same definer read, same reason) preceded by migration 107's link \
          advisory lock in shared mode, so an act that grants authority on the answer is \

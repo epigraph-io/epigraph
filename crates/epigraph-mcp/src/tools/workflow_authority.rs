@@ -71,7 +71,8 @@
 //!   107 refuses to record a chain). A retired link grants nothing. Over the
 //!   authenticated transport an operated caller holds a viewer only through a
 //!   delegated run token whose delegation is live
-//!   ([`crate::tools::viewer::live_delegation`]), and the arm re-asks that,
+//!   ([`crate::tools::viewer::live_delegation_on`], on the write's own
+//!   transaction), and the arm re-asks that,
 //!   as the claim gate's actor arm does. Recorded as `"arm": "delegate"` with
 //!   `operator` = `P`, the principal it acted for. Tenancy is unchanged: the
 //!   rows the write creates land in a group the delegate writes itself, and
@@ -251,9 +252,12 @@ impl WorkflowGrant {
 /// whether or not the caller reads it (the ruling masks answers and changes
 /// no authority).
 ///
-/// `viewer` is the view the tool resolved for this request. Only the stdio
-/// arm uses it, and only when it names `caller`, so its reads stay on `conn`
-/// (see [`stdio_workflow_authority`]).
+/// `viewer` is the view the tool resolved for this request. Over the
+/// authenticated transport it names `caller` (`write_identity` refuses any
+/// other), and the caller's view of the row is read through it on `conn`; the
+/// stdio arm uses it only when it names `caller`. Every read stays on `conn`,
+/// the write's own transaction, never a second pool connection (backlogs
+/// 26a436c6, bdc96181).
 ///
 /// # Errors
 /// A workflow-specific refusal naming the submitter (never the claim gate's
@@ -293,7 +297,7 @@ pub(crate) async fn require_workflow_authority(
     // The CALLER's view of the row (backlog c831df4a). It words refusals only:
     // a refusal to a caller that cannot read the row is answered as the call
     // site answers an unknown one, and names nothing. Admission is unchanged.
-    let view = caller_view_of(server, conn, caller_agent, workflow_id, tool_name).await?;
+    let view = caller_view_of(conn, viewer, caller_agent, workflow_id, tool_name).await?;
     let readable = view.is_some();
     let refuse = |text: String| {
         if readable {
@@ -366,7 +370,7 @@ pub(crate) async fn require_workflow_authority(
     //    or the submitter's operator. Over HTTP only with a live delegated
     //    run token, the one way an operated agent holds an HTTP viewer.
     if let Some(operator) = delegate_arm(conn, caller_agent, owner, tool_name).await? {
-        if crate::tools::viewer::live_delegation(server, Some(auth), caller_agent)
+        if crate::tools::viewer::live_delegation_on(server, &mut *conn, Some(auth), caller_agent)
             .await?
             .is_some()
         {
@@ -659,22 +663,28 @@ async fn stdio_workflow_authority(
 /// `caller_agent` reads it, on the act's own connection (so the answer is
 /// what both that connection's stamp and the caller read), or `None` when the
 /// caller cannot read it (backlog c831df4a).
+///
+/// The view is `viewer`, the caller's own: over the authenticated transport
+/// `write_identity` refused a viewer naming any other principal, and the
+/// ingest passes the caller's resolved viewer. It used to be resolved again
+/// here on `server.pool`, a SECOND pool connection taken while the write's
+/// transaction held `conn` (backlog bdc96181: concurrent HTTP workflow writes
+/// on a small pool each held one connection and waited for another). A viewer
+/// naming anyone else is refused, never resolved on the pool.
 async fn caller_view_of(
-    server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     caller_agent: uuid::Uuid,
     workflow_id: uuid::Uuid,
     tool_name: &'static str,
 ) -> Result<Option<(String, uuid::Uuid)>, McpError> {
-    let viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, caller_agent)
-        .await
-        .map_err(|e| {
-            internal_error_logged(
-                format!("{tool_name}: could not resolve the caller's view"),
-                e,
-            )
-        })?;
-    epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, &viewer, workflow_id)
+    if viewer.principal() != Some(caller_agent) {
+        return Err(internal_error_text(format!(
+            "{tool_name}: the request's view is not the caller's own, so the caller's authority \
+             over the workflow cannot be decided. Nothing was written."
+        )));
+    }
+    epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, viewer, workflow_id)
         .await
         .map_err(|e| {
             internal_error_logged(

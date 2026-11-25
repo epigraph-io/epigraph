@@ -22,6 +22,22 @@ pub const LIVE_LINK_BINDING: &str = "live_link";
 /// keeps its HTTP token and viewer.
 pub const CLIENT_ALLOWLIST_BINDING: &str = "client_allowlist";
 
+/// The one statement of a delegated run token's liveness check, shared by
+/// `AgentRepository::delegated_principal_pool` and
+/// `AgentRepository::delegated_principal_conn` so the two cannot drift.
+/// Binds: `$1` the delegator, `$2` the principal, `$3`
+/// [`CLIENT_ALLOWLIST_BINDING`]. It stamps `$1` as `epigraph.principal_id`
+/// transaction-locally first (migration 236).
+const DELEGATED_PRINCIPAL_SQL: &str = "SELECT a.operator_id, a.operator_group_id \
+       FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
+                    AS delegator) s \
+      CROSS JOIN LATERAL public.epigraph_operator_actor($2) a \
+      WHERE public.epigraph_author_binding($1) = $3 \
+        AND public.epigraph_human_of($1, true) = a.operator_id \
+        AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships(s.delegator) m \
+                     WHERE m.group_id = a.operator_group_id \
+                       AND m.role IN ('writer', 'admin'))";
+
 /// The environment variable that switches delegated run tokens on for a
 /// request-serving process ([`RunTokens`]). Read ONCE, at boot.
 pub const RUN_TOKENS_ENV: &str = "EPIGRAPH_RUN_TOKENS";
@@ -2164,23 +2180,70 @@ impl AgentRepository {
         // (transaction-local; the statement is its own transaction on a pool
         // connection). The read's argument is the stamped value, so the stamp
         // precedes the call. Nothing else here reads the principal.
-        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
-            "SELECT a.operator_id, a.operator_group_id \
-               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
-                            AS delegator) s \
-              CROSS JOIN LATERAL public.epigraph_operator_actor($2) a \
-              WHERE public.epigraph_author_binding($1) = $3 \
-                AND public.epigraph_human_of($1, true) = a.operator_id \
-                AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships(s.delegator) m \
-                             WHERE m.group_id = a.operator_group_id \
-                               AND m.role IN ('writer', 'admin'))",
-        )
-        .bind(delegator_agent)
-        .bind(principal)
-        .bind(CLIENT_ALLOWLIST_BINDING)
-        .fetch_optional(pool)
-        .await?;
+        let row: Option<(Uuid, Uuid)> = sqlx::query_as(DELEGATED_PRINCIPAL_SQL)
+            .bind(delegator_agent)
+            .bind(principal)
+            .bind(CLIENT_ALLOWLIST_BINDING)
+            .fetch_optional(pool)
+            .await?;
         Ok(row.map(|(operator_id, operator_group_id)| DelegationLive {
+            operator_id,
+            operator_group_id,
+        }))
+    }
+
+    /// [`Self::delegated_principal_pool`] on a connection the caller already
+    /// holds, inside its transaction: the same one statement, so the same
+    /// answer, without a second connection from the pool (backlog bdc96181:
+    /// a write that asks it while holding its own transaction's connection
+    /// must not wait on the pool for another).
+    ///
+    /// The statement stamps the DELEGATOR as `epigraph.principal_id`,
+    /// transaction-locally (migration 236; see the pool variant). On a pool
+    /// connection that stamp ended with the statement's own implicit
+    /// transaction; here it would outlive the statement and leave every later
+    /// statement of the caller's transaction (its writes included) stamped as
+    /// the delegator. So the statement runs inside a SAVEPOINT that is then
+    /// ROLLED BACK, which undoes the stamp (a GUC set inside a savepoint is
+    /// reverted with it): the caller's stamp after the call is the stamp
+    /// before it, whether the read answered or failed. The rows it read are
+    /// already in hand. It takes no lock and writes nothing, so the rollback
+    /// discards nothing else.
+    ///
+    /// `conn` must be inside a transaction (a `SAVEPOINT` outside one is an
+    /// error, returned as such).
+    ///
+    /// # Errors
+    /// As [`Self::delegated_principal_pool`]; also `DbError::QueryFailed` if
+    /// the savepoint cannot be opened or rolled back.
+    pub async fn delegated_principal_conn(
+        conn: &mut sqlx::PgConnection,
+        run_tokens: RunTokens,
+        delegator_agent: Uuid,
+        principal: Uuid,
+    ) -> Result<Option<DelegationLive>, DbError> {
+        if run_tokens != RunTokens::On {
+            return Ok(None);
+        }
+        sqlx::query("SAVEPOINT epigraph_delegated_principal")
+            .execute(&mut *conn)
+            .await?;
+        let row: Result<Option<(Uuid, Uuid)>, sqlx::Error> =
+            sqlx::query_as(DELEGATED_PRINCIPAL_SQL)
+                .bind(delegator_agent)
+                .bind(principal)
+                .bind(CLIENT_ALLOWLIST_BINDING)
+                .fetch_optional(&mut *conn)
+                .await;
+        // Undo the delegator stamp (and, after a failure, the aborted state),
+        // then drop the savepoint itself.
+        sqlx::query("ROLLBACK TO SAVEPOINT epigraph_delegated_principal")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT epigraph_delegated_principal")
+            .execute(&mut *conn)
+            .await?;
+        Ok(row?.map(|(operator_id, operator_group_id)| DelegationLive {
             operator_id,
             operator_group_id,
         }))

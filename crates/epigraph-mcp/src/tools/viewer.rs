@@ -478,6 +478,40 @@ pub(crate) async fn live_delegation(
     read_delegation(server, delegator, principal).await
 }
 
+/// [`live_delegation`] for a caller that holds a transaction: the dispatch's
+/// answer when it has one (no read), else the same check made on `conn`
+/// (`AgentRepository::delegated_principal_conn`), never on the pool (backlog
+/// bdc96181: a workflow write asking it while its transaction holds one pool
+/// connection must not wait on the pool for a second). The check's own
+/// principal stamp is undone before it returns, so `conn` keeps the caller's
+/// stamp.
+///
+/// # Errors
+/// As [`live_delegation`].
+pub(crate) async fn live_delegation_on(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&epigraph_auth::AuthContext>,
+    principal: uuid::Uuid,
+) -> Result<Option<epigraph_db::DelegationLive>, McpError> {
+    let Some(delegator) = auth.and_then(|a| a.delegated_by) else {
+        return Ok(None);
+    };
+    if let Ok(a) = ADMITTED.try_with(|a| *a) {
+        if a.delegator == delegator && a.principal == principal {
+            return Ok(Some(a.live));
+        }
+    }
+    epigraph_db::AgentRepository::delegated_principal_conn(
+        conn,
+        server.run_tokens,
+        delegator,
+        principal,
+    )
+    .await
+    .map_err(|e| delegation_check_failed(principal, delegator, &e))
+}
+
 /// The one read: `AgentRepository::delegated_principal_pool` on this
 /// listener's pool and switch. The database error is logged here and never
 /// sent to the client.
@@ -493,19 +527,27 @@ async fn read_delegation(
         principal,
     )
     .await
-    .map_err(|e| {
-        tracing::error!(
-            reason = "delegation_check_unavailable",
-            principal = %principal,
-            delegator = %delegator,
-            error = %e,
-            "the delegated run token check failed"
-        );
-        McpError::internal_error(
-            "could not check whether this token's delegation is live".to_string(),
-            None,
-        )
-    })
+    .map_err(|e| delegation_check_failed(principal, delegator, &e))
+}
+
+/// The answer to a delegation check that could not be made: logged here, and
+/// a fixed message to the client (the database error never reaches it).
+fn delegation_check_failed(
+    principal: uuid::Uuid,
+    delegator: uuid::Uuid,
+    e: &epigraph_db::DbError,
+) -> McpError {
+    tracing::error!(
+        reason = "delegation_check_unavailable",
+        principal = %principal,
+        delegator = %delegator,
+        error = %e,
+        "the delegated run token check failed"
+    );
+    McpError::internal_error(
+        "could not check whether this token's delegation is live".to_string(),
+        None,
+    )
 }
 
 impl EpiGraphMcpFull {

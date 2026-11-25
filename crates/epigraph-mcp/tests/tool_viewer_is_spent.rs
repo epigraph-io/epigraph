@@ -1729,18 +1729,12 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "share_claims_with_team",
         &["claim_helper::begin_author_stamped_tx"],
     ),
-    // resolves: `Viewer::resolve`. Raw pool: `Viewer::resolve` reads memberships on
-    // `server.pool`.
-    (
-        "workflow_authority.rs",
-        "caller_view_of",
-        &["Viewer::resolve"],
-    ),
     // authority: the workflow authority rule's arms (`admin_arm`, `claims::operator_arm_allows`,
     // `delegate_arm`, `owner_group_arm`, `unrecorded_row_owner_group_arm`,
-    // `viewer::live_delegation`), each an allow or refuse on `conn`; stamped:
-    // `WorkflowRepository::submitter_of` and `caller_view_of`, the `workflows` row on the caller's
-    // connection under its forced row security.
+    // `viewer::live_delegation_on`), each an allow or refuse on `conn`; stamped:
+    // `WorkflowRepository::submitter_of`, the `workflows` row on the caller's connection under
+    // its forced row security. (`caller_view_of` is handed the viewer since backlog bdc96181,
+    // and reads through it on `conn` instead of resolving one on `server.pool`.)
     (
         "workflow_authority.rs",
         "require_workflow_authority",
@@ -1748,12 +1742,11 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::submitter_of",
             "admin_arm",
             "admin_arm",
-            "caller_view_of",
             "claims::operator_arm_allows",
             "delegate_arm",
             "owner_group_arm",
             "unrecorded_row_owner_group_arm",
-            "viewer::live_delegation",
+            "viewer::live_delegation_on",
         ],
     ),
     // authority: `claims::operator_arm_allows`, `delegate_arm`, `owner_group_arm`,

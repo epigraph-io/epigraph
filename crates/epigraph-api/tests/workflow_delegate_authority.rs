@@ -2701,3 +2701,68 @@ async fn a_link_retired_during_a_delegate_workflow_write_refuses_it(pool: PgPool
 async fn a_membership_revoked_during_a_delegate_workflow_write_refuses_it(pool: PgPool) {
     a_link_end_during_a_delegate_write_refuses_it(&pool, LinkEnd::RevokeMembership).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// One connection (backlog bdc96181)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An app-role MCP server whose ONE pool holds a single connection (its plain
+/// pool is the scoped pool's own, as `main.rs` builds it), run tokens on.
+async fn one_connection_mcp_server(
+    pool: &PgPool,
+    seed: u8,
+) -> epigraph_mcp::server::EpiGraphMcpFull {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(3),
+            statement_timeout: None,
+        },
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("a one-connection app-role ScopedPool");
+    let plain = scoped.inner().clone();
+    let signer = epigraph_crypto::AgentSigner::from_bytes(&[seed; 32]).expect("signer");
+    let embedder = epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None)
+        .with_scoped_pool(scoped.clone())
+        .with_generator(std::sync::Arc::new(|_text: &str| Ok(vec![0.5_f32; 1536])));
+    epigraph_mcp::server::EpiGraphMcpFull::new(plain, signer, embedder, false)
+        .with_scoped_pool(scoped)
+        .with_run_tokens(RunTokens::On)
+}
+
+/// The delegate arm over the authenticated transport re-asks whether the
+/// caller's delegated run token is live (`viewer::live_delegation_on`). Called
+/// outside the dispatch (which would have left its own answer), that read was
+/// made on `server.pool` while the write's transaction held a connection.
+/// On a ONE-connection server the delegate's `add_step` on `p`'s public
+/// workflow now completes, recorded as a delegate write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_http_delegate_write_completes_on_a_one_connection_pool(pool: PgPool) {
+    let w = world(&pool).await;
+    let dl = &w.p_delegator;
+    let server = one_connection_mcp_server(&pool, 0xA2).await;
+    let via = Via::McpHttp(
+        &server,
+        mcp_auth(dl.delegator_client, w.d, Some(dl.delegator), WRITE_SCOPES),
+    );
+    let step = via
+        .add_step(PUB, "acme one-connection delegate step")
+        .await
+        .unwrap_or_else(|e| panic!("the delegate's write completes on one connection: {e}"));
+    assert_eq!(
+        claim_row(&pool, step).await,
+        (w.d, "public".to_string(), w.p_g),
+        "the step is the delegate's"
+    );
+    let rows = caller_writes(&pool, w.pub_wf, w.d).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].1, "delegate",
+        "admitted on the delegate arm: {rows:?}"
+    );
+}
