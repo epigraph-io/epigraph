@@ -42,6 +42,12 @@
 //! and `the_registry_is_exactly_the_measured_rows` pins the registry's
 //! whole membership, so a row for any other table is a visible diff.
 //!
+//! `harvester_enriched_concepts` is in the harvester pipeline too but has no
+//! foreign key in or out, so neither the generators nor the FK-neighbour rule
+//! reach it. Migration 313 (backlog f214b84e) gives it the same posture, and
+//! `the_harvester_neighbours_carry_the_fragment_row_security` names it
+//! explicitly so that posture is pinned rather than unreachable.
+//!
 //! # Deliberately non-macro
 //!
 //! `sqlx::query` / `query_scalar` throughout, never `query!`. CI runs with
@@ -467,6 +473,12 @@ async fn every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt(pool: Pg
 /// have. It also pins what 173 deliberately did not change: the application
 /// role reads both tables and writes neither (118 section 6).
 /// `harvester_tenancy.rs` is the behavioural half, as `epigraph_app`.
+///
+/// Migration 313 (backlog f214b84e) gives `harvester_enriched_concepts`, the
+/// parentless harvester table no generator or FK rule reaches, the same
+/// posture; it is compared here too, together with both tenancy columns NOT
+/// NULL and the absence of a registry row, which no other test would check
+/// for it. `harvester_enriched_concepts_tenancy.rs` is its behavioural half.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_harvester_neighbours_carry_the_fragment_row_security(pool: PgPool) {
     async fn policy(
@@ -496,7 +508,21 @@ async fn the_harvester_neighbours_carry_the_fragment_row_security(pool: PgPool) 
         "CALIBRATION: harvester_fragments lost its own policies, so the comparison is vacuous"
     );
 
-    for table in ["harvester_sources", "harvester_audit_reports"] {
+    let exempt = exempt_tables(&pool).await;
+    for table in [
+        "harvester_sources",
+        "harvester_audit_reports",
+        "harvester_enriched_concepts",
+    ] {
+        assert_eq!(
+            tenancy_columns(&pool, table).await,
+            (true, true),
+            "{table}: visibility and owner_group_id must both be NOT NULL"
+        );
+        assert!(
+            !exempt.iter().any(|e| e == table),
+            "{table}: a covered table keeps no tenancy_exempt row"
+        );
         assert_eq!(
             policy(&pool, table, "_tenancy").await,
             control_tenancy,

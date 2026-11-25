@@ -455,6 +455,8 @@ const PROTECTED: &[&str] = &[
     "workflow_outcome_reports",
     "behavioral_executions",
     "group_invitations",
+    // Migration 313 (backlog f214b84e): 173's posture, FOR ALL policy.
+    "harvester_enriched_concepts",
 ];
 
 // ===========================================================================

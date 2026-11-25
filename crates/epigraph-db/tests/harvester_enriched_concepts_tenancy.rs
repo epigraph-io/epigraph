@@ -341,3 +341,73 @@ async fn migration_313_stamps_existing_concepts_with_what_every_reader_saw(pool:
         "the upgrade does not hide a concept every reader read before it"
     );
 }
+
+/// `docs/runbooks/313-undo.sql` refuses while a concept is group-private (a
+/// pre-313 schema would publish it) and changes nothing; once no private
+/// concept is left it returns the table to its pre-313 shape: no tenancy
+/// columns, no row security, no 313 trigger or policy, rows kept.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_313_undo_refuses_over_a_private_concept_then_restores_the_old_shape(pool: PgPool) {
+    use sqlx::Executor;
+    const UNDO: &str = include_str!("../../../docs/runbooks/313-undo.sql");
+    let (_a, group_a) = fixture::seed_agent_with_group(&pool, "hec-undo").await;
+    let private = seed_concept(&pool, group_a, "group").await;
+    let public = seed_concept(&pool, group_a, "public").await;
+
+    // One connection: the runbook is several statements in one simple query,
+    // and a refusal inside its BEGIN leaves THAT session in an aborted
+    // transaction, which must be ended on the same connection.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = (&mut *conn)
+        .execute(UNDO)
+        .await
+        .expect_err("the undo must refuse while a concept is group-private");
+    let code = err
+        .as_database_error()
+        .and_then(|d| d.code().map(|c| c.to_string()));
+    assert_eq!(code.as_deref(), Some("55000"), "{err}");
+    (&mut *conn)
+        .execute("ROLLBACK")
+        .await
+        .expect("end the refused transaction");
+    drop(conn);
+    assert!(
+        has_tenancy_columns(&pool).await,
+        "a refused undo changes nothing"
+    );
+
+    sqlx::query("DELETE FROM harvester_enriched_concepts WHERE id = $1")
+        .bind(private)
+        .execute(&pool)
+        .await
+        .expect("remove the private concept");
+    pool.execute(UNDO).await.expect("the undo applies");
+
+    assert!(!has_tenancy_columns(&pool).await, "the columns are gone");
+    let (rls, forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class \
+          WHERE oid = 'public.harvester_enriched_concepts'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("row security flags");
+    assert!(!rls && !forced, "row security is off again");
+    let leftovers: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM pg_policy \
+                  WHERE polrelid = 'public.harvester_enriched_concepts'::regclass) \
+              + (SELECT count(*) FROM pg_trigger \
+                  WHERE tgrelid = 'public.harvester_enriched_concepts'::regclass \
+                    AND NOT tgisinternal)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("policy and trigger count");
+    assert_eq!(leftovers, 0, "no 313 policy or trigger survives the undo");
+    let kept: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM harvester_enriched_concepts WHERE id = $1")
+            .bind(public)
+            .fetch_one(&pool)
+            .await
+            .expect("count kept rows");
+    assert_eq!(kept, 1, "the undo keeps the rows");
+}
