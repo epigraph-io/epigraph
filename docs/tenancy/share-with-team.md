@@ -261,7 +261,9 @@ at the 12 rows pinned by `tenancy_coverage.rs::REGISTRY`.
 
 These rows have no tenancy columns and no RLS, and they reference tenancy-bearing rows. A share
 neither moves them nor needs to. Each one is either a leak that already exists whatever a share
-does, or a stale aggregate.
+does, or a stale aggregate. Two exceptions have since gained tenancy columns and row security but
+stay listed here because no share unit moves them: `papers` (migration 246) and
+`harvester_enriched_concepts` (migration 313, which references nothing at all).
 
 | table(s) | references | note |
 |---|---|---|
