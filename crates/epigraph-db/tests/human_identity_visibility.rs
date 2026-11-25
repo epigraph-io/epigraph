@@ -825,28 +825,65 @@ async fn an_assertion_after_the_binding_names_the_human_after_the_binding_ends(p
 
 // ─── C6: public assertions of every kind (operator ruling) ──────────────
 
-/// The kinds of public assertion besides a claim that operator ruling C6 counts
-/// for H, each keyed on the column HEAD records its asserting agent in.
+/// The kinds of public row besides a claim that operator ruling C6 considers,
+/// each keyed on the column HEAD records its agent in.
 #[derive(Debug, Clone, Copy)]
 enum Assertion {
-    /// `evidence.signer_id`: the table has no author column, so the agent that
-    /// signed the row is the one that asserted it.
+    /// `evidence.signer_id`. NOT counted since 302 (Addendum 5): the table has
+    /// no column recording the asserting agent, and over MCP the signer is the
+    /// server's own agent, so the signer is not the author.
     Evidence,
-    /// `challenges.challenger_id`.
+    /// `challenges.challenger_id`, which 170's CR08 pins to the filing
+    /// session's principal.
     Challenge,
-    /// `mass_functions.source_agent_id` (a BBA).
+    /// `mass_functions.source_agent_id` on an ASSESSMENT slot
+    /// (`/claims/:id/assess`, which keys the row to the caller or the caller's
+    /// live human): the only BBA shape whose writer is always the attributed
+    /// identity's (302).
     MassFunction,
     /// `edges` `paper -ingested_claim-> claim`, `properties.ingested_by`, marked
     /// by the same ingest (`properties.ingest_written.by`).
     IngestRecord,
 }
 
-const ASSERTIONS: [Assertion; 4] = [
-    Assertion::Evidence,
+/// The kinds C6 counts (302: evidence is dropped, Addendum 5).
+const ASSERTIONS: [Assertion; 3] = [
     Assertion::Challenge,
     Assertion::MassFunction,
     Assertion::IngestRecord,
 ];
+
+/// A fresh two-hypothesis frame.
+async fn fixture_frame(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) \
+         RETURNING id",
+    )
+    .bind(format!("visibility-frame-{}", Uuid::new_v4()))
+    .fetch_one(pool)
+    .await
+    .expect("frame")
+}
+
+/// A BBA on `claim` attributed to `agent`, keyed on `slot` (267's
+/// `slot_kind` / `slot_id`; `None` is an unscoped row), seeded on the
+/// superuser pool: the tenancy triggers give it the claim's visibility.
+async fn bba_row(pool: &PgPool, claim: Uuid, agent: Uuid, slot: Option<(&str, Uuid)>) -> Uuid {
+    let frame = fixture_frame(pool).await;
+    sqlx::query_scalar(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, slot_kind, \
+                                     slot_id) \
+         VALUES ($1, $2, $3, '{\"0\": 0.5, \"0,1\": 0.5}'::jsonb, $4, $5) RETURNING id",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(agent)
+    .bind(slot.map(|s| s.0))
+    .bind(slot.map(|s| s.1))
+    .fetch_one(pool)
+    .await
+    .expect("mass function")
+}
 
 /// A public paper (explicit tenancy: `papers` refuses an undeclared insert).
 async fn public_paper(pool: &PgPool, doi: &str) -> Uuid {
@@ -904,24 +941,8 @@ async fn assert_publicly(pool: &PgPool, kind: Assertion, agent: Uuid) -> (&'stat
             ("challenges", id)
         }
         Assertion::MassFunction => {
-            let frame: Uuid = sqlx::query_scalar(
-                "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) \
-                 RETURNING id",
-            )
-            .bind(format!("visibility-frame-{}", Uuid::new_v4()))
-            .fetch_one(pool)
-            .await
-            .expect("frame");
-            let id = sqlx::query_scalar(
-                "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses) \
-                 VALUES ($1, $2, $3, '{\"0\": 0.5, \"0,1\": 0.5}'::jsonb) RETURNING id",
-            )
-            .bind(claim)
-            .bind(frame)
-            .bind(agent)
-            .fetch_one(pool)
-            .await
-            .expect("mass function");
+            // The assess route's shape: the agent's own assessment slot.
+            let id = bba_row(pool, claim, agent, Some(("assessment", Uuid::new_v4()))).await;
             ("mass_functions", id)
         }
         Assertion::IngestRecord => {
@@ -966,8 +987,9 @@ async fn assert_publicly(pool: &PgPool, kind: Assertion, agent: Uuid) -> (&'stat
 }
 
 /// Operator ruling C6: a public assertion of ANY kind by H or by an agent bound
-/// to H names H, as a public claim does: evidence it signed, a challenge it
-/// raised, a BBA it stated, an ingest record of its document ingest. Each is
+/// to H names H, as a public claim does: a challenge it raised, an assessment
+/// it stated, an ingest record of its document ingest (evidence is not
+/// counted since 302: `only_an_agents_own_assertion_names_its_human`). Each is
 /// checked alone (on a stranger's claim, so no claim arm holds), by H itself
 /// and by a linked agent after its link began, then after the link is retired.
 #[sqlx::test(migrations = "../../migrations")]
@@ -1027,6 +1049,154 @@ async fn an_assertion_of_any_kind_from_before_the_binding_never_names_the_human(
             "CALIBRATION: {kind:?}: the same agent's assertion after the link names it"
         );
     }
+}
+
+/// Addendum 5 (security review of 295; review2 leaks#1, correctness#2): the
+/// C6 arms count only an assertion the agent ITSELF made, never a row another
+/// writer created that names the agent. Each row below is public and names
+/// H's bound agent, and each was written by someone else (or, for evidence,
+/// records no asserting agent at all), so none names H. CALIBRATION at the
+/// end: the agent's own assessment does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_an_agents_own_assertion_names_its_human(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (outsider, _) = named(&pool, "Dora Distant").await;
+    let (stranger, _) = named(&pool, "Egon Elsewhere").await;
+    let (h, _) = human(&pool, "Fritz Factor").await;
+    let (bot, _) = named(&pool, "fritz-bot").await;
+
+    // The bot's public claim P predates its link: by C5 it never names H.
+    let p = fixture::seed_public_claim(&pool, bot, "fritz-bot before the link").await;
+    backdate(&pool, "claims", p).await;
+    link(&pool, bot, h).await;
+    let t = fixture::seed_public_claim(&pool, stranger, "the stranger's own public claim").await;
+    assert!(
+        !named_to(&pool, &scoped, outsider, h).await,
+        "CALIBRATION: unnamed before any row below"
+    );
+
+    // (1) leaks#1 (a): the stranger links P -supports-> T. The edge writers
+    // (`edge_factor.rs::auto_wire_ds_for_edge`, REST and MCP) file the edge
+    // factor on T, attributed to P's AUTHOR, with T's visibility and a fresh
+    // `created_at` (`store_keyed`'s `created_at = NOW()` on every re-wire).
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+    )
+    .bind(p)
+    .bind(t)
+    .fetch_one(&pool)
+    .await
+    .expect("the stranger's edge");
+    let factor = bba_row(&pool, t, bot, Some(("edge", edge))).await;
+    // (2) a BBA filed under the agent's id by another writer with no slot
+    // (`MassFunctionRepository::copy_to_frame`, the operator CLIs).
+    let copied = bba_row(&pool, t, bot, None).await;
+    // (3) an evidence-slot BBA (the DS auto-wire's shape).
+    let derived = bba_row(&pool, t, bot, Some(("evidence", Uuid::new_v4()))).await;
+    for id in [factor, copied, derived] {
+        let v: String =
+            sqlx::query_scalar("SELECT visibility::text FROM mass_functions WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("visibility");
+        assert_eq!(v, "public", "CALIBRATION: the BBA inherits T's 'public'");
+    }
+    assert!(
+        !named_to(&pool, &scoped, outsider, h).await,
+        "a BBA another writer attributed to H's agent (edge factor, copy, evidence auto-wire) \
+         must not name H"
+    );
+
+    // (4) evidence signed under the agent's id: `evidence` records the signer,
+    // which over MCP is the server's agent, not the author; no column records
+    // the asserting agent, so evidence is not counted at all.
+    assert_publicly(&pool, Assertion::Evidence, bot).await;
+    assert!(
+        !named_to(&pool, &scoped, outsider, h).await,
+        "evidence names no one: the signer is not the asserting agent"
+    );
+
+    // (5) a challenge filed by the stranger's session under the bot's id is
+    // refused (170's CR08 pins challenger_id to the session principal).
+    let stranger_v = viewer(&pool, stranger).await;
+    let mut tx = scoped.begin_as(&stranger_v).await.expect("begin_as");
+    let refused = sqlx::query(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, state) \
+         VALUES ($1, $2, 'factual', 'a challenge in another agent''s name', 'pending')",
+    )
+    .bind(t)
+    .bind(bot)
+    .execute(&mut *tx)
+    .await
+    .expect_err("a challenge in another agent's name must be refused");
+    assert!(
+        refused.to_string().contains("CR08"),
+        "refused by the challenger pin: {refused}"
+    );
+    drop(tx);
+
+    // (6) ingest records naming the bot as ingester: one with no marker (any
+    // edge writer's), one whose marker names the stranger's ingest. Only the
+    // marker ties a record to the ingest that wrote it (correctness#5).
+    let paper = public_paper(&pool, &format!("10.9999/visibility.{}", Uuid::new_v4())).await;
+    let t2 = fixture::seed_public_claim(&pool, stranger, "a second stranger claim").await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'paper', $2, 'claim', 'ingested_claim', \
+                 jsonb_build_object('ingested_by', $3::text, 'created_claim', false, \
+                                    'tool', 'ingest_document'))",
+    )
+    .bind(paper)
+    .bind(t)
+    .bind(bot)
+    .execute(&pool)
+    .await
+    .expect("an unmarked record");
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SELECT pg_catalog.set_config('epigraph.ingest_written_edge', 'on', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("declare the ingest's write");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'paper', $2, 'claim', 'ingested_claim', \
+                 jsonb_build_object('ingested_by', $3::text, 'created_claim', false, \
+                                    'tool', 'ingest_document', \
+                                    'ingest_written', jsonb_build_object( \
+                                        'tool', 'ingest_document', 'by', $4::text)))",
+    )
+    .bind(paper)
+    .bind(t2)
+    .bind(bot)
+    .bind(stranger)
+    .execute(&mut *tx)
+    .await
+    .expect("a record the stranger's ingest marked");
+    tx.commit().await.expect("commit");
+    let public_records: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE relationship = 'ingested_claim' \
+            AND properties ->> 'ingested_by' = $1::text AND visibility = 'public'",
+    )
+    .bind(bot)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(public_records, 2, "CALIBRATION: both records are public");
+    assert!(
+        !named_to(&pool, &scoped, outsider, h).await,
+        "an ingest record no ingest of the agent marked must not name H"
+    );
+
+    // CALIBRATION: the bot's OWN assessment of T, after its link, names H.
+    bba_row(&pool, t, bot, Some(("assessment", Uuid::new_v4()))).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h).await,
+        "CALIBRATION: the agent's own public assessment names its human"
+    );
 }
 
 // ─── C2: a countersigned authorship (operator ruling) ───────────────────
@@ -2227,6 +2397,39 @@ async fn migration_300_refuses_over_another_core_body(pool: PgPool) {
     .await
     .expect("core source");
     assert!(!src.contains("v_bound_text"), "nothing was changed");
+}
+
+/// 302 re-states 300's core; over any other body it refuses (OWN01) with
+/// nothing changed.
+#[sqlx::test(migrations = false)]
+async fn migration_302_refuses_over_another_core_body(pool: PgPool) {
+    migrate(&pool, &below(302)).await.expect("migrate to 301");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
+             p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean) \
+         RETURNS TABLE (named boolean, details boolean) \
+         LANGUAGE plpgsql STABLE SECURITY DEFINER COST 1000 \
+         SET search_path = pg_catalog, pg_temp AS $$ \
+         BEGIN RETURN QUERY SELECT false, false; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("302 must refuse over another body");
+    assert!(err.contains("OWN01"), "precondition refusal: {err}");
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE oid = to_regprocedure('public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("core source");
+    assert!(
+        !src.contains("slot_kind = 'assessment'"),
+        "nothing was changed"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

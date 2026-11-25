@@ -4722,6 +4722,21 @@ restart.
 - **301**: `DROP INDEX CONCURRENTLY IF EXISTS` of 294's index (unusable under row security),
   single-statement `-- no-transaction`. Registered in `DROPPED_INDEX_MIGRATIONS`. Undo: re-run
   294.
+- **302**: `disclosure_counts_own_assertions_only` (security review of 295, "Addendum 5").
+  Precondition OWN01 (55000): the core is still 300's (md5). Re-states
+  `epigraph_agent_disclosure_for` so the public-assertion arm counts only rows the agent itself
+  made: the evidence probe is removed (`signer_id` is the server's agent on every MCP write; no
+  column records the asserting agent) and the BBA probe counts only `slot_kind = 'assessment'`
+  (an edge factor is attributed to the source claim's author whoever wrote the edge, and
+  unscoped rows are copied under another identity). Every other arm and the order are 300's.
+  Pinned by `human_identity_visibility.rs::only_an_agents_own_assertion_names_its_human` and
+  the OWN01 refusal. Undo: `docs/runbooks/302-undo.sql` (re-apply 291 and 293 first).
+- **303**: `idx_mass_functions_public_assessments_by_source (source_agent_id, created_at) WHERE
+  visibility = 'public' AND slot_kind = 'assessment'`, single-statement `-- no-transaction`.
+  Registered in `tenancy_migration_shape.rs::INDEX_MIGRATIONS`.
+- **304**, **305**: `DROP INDEX CONCURRENTLY IF EXISTS` of 293's and 291's indexes, which no
+  probe reads after 302, each single-statement `-- no-transaction`. Registered (with 291 and
+  293) in `DROPPED_INDEX_MIGRATIONS`. Undo: re-run 293 / 291.
 
 ## `-- no-transaction` migrations
 

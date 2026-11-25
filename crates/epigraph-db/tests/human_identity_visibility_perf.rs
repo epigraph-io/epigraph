@@ -26,7 +26,8 @@
 //! * call counts (`track_functions = 'all'`) for a 200-card read and a
 //!   two-character-prefix name search;
 //! * the insert cost of the two windowed claim indexes (286, 287; they
-//!   replaced 275 and 276) and of 291's evidence index.
+//!   replaced 275 and 276) and of 291's evidence index (dropped by 305; the
+//!   evidence rows below are kept as write load, no arm probes them since 302).
 //!
 //! After operator rulings C5, C6 and C2 (migrations 286-297) the shape adds:
 //! (e) PRE-BINDING rows, created a day before every bound agent's link: 150
@@ -331,12 +332,13 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
                         '{world}' {common}"
             ),
             "mass_functions" => format!(
-                // 267's NULLS NOT DISTINCT key: one evidence slot per row.
+                // 267's NULLS NOT DISTINCT key: one assessment slot per row
+                // (302 counts only assessment slots).
                 "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, \
                                              slot_kind, slot_id, created_at, visibility, \
                                              owner_group_id) \
                  SELECT '{any_claim}', '{frame}', {agent_sql}, '{{\"0\": 0.5}}'::jsonb, \
-                        'evidence', gen_random_uuid(), {at}, 'public', '{world}' {common}"
+                        'assessment', gen_random_uuid(), {at}, 'public', '{world}' {common}"
             ),
             "edges" => format!(
                 "INSERT INTO edges (source_id, source_type, target_id, target_type, \
@@ -503,15 +505,6 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     exec(
         &mut c,
         &probe(
-            "p_evidence",
-            "SELECT 1 FROM public.evidence e WHERE e.signer_id = b.agent_id \
-               AND e.visibility = 'public' AND e.created_at >= b.since",
-        ),
-    )
-    .await;
-    exec(
-        &mut c,
-        &probe(
             "p_challenges",
             "SELECT 1 FROM public.challenges ch WHERE ch.challenger_id = b.agent_id \
                AND ch.visibility = 'public' AND ch.created_at >= b.since",
@@ -523,7 +516,8 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
         &probe(
             "p_bbas",
             "SELECT 1 FROM public.mass_functions m WHERE m.source_agent_id = b.agent_id \
-               AND m.visibility = 'public' AND m.created_at >= b.since",
+               AND m.slot_kind = 'assessment' AND m.visibility = 'public' \
+               AND m.created_at >= b.since",
         ),
     )
     .await;
@@ -613,16 +607,15 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     let mut other_plans = Vec::new();
     for (label, stmt, want) in [
         (
-            "evidence arm",
-            "p_evidence",
-            "idx_evidence_public_by_signer",
-        ),
-        (
             "challenge arm",
             "p_challenges",
             "idx_challenges_public_by_challenger",
         ),
-        ("BBA arm", "p_bbas", "idx_mass_functions_public_by_source"),
+        (
+            "BBA arm",
+            "p_bbas",
+            "idx_mass_functions_public_assessments_by_source",
+        ),
         (
             "ingest-record arm",
             "p_ingest",

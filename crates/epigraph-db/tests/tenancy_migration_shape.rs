@@ -61,18 +61,15 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "idx_claims_group_by_agent_since",
     ),
     // The per-bound-agent probes of 295's arm for every other kind of public
-    // assertion (operator ruling C6).
-    (
-        "291_idx_evidence_public_by_signer.sql",
-        "idx_evidence_public_by_signer",
-    ),
+    // assertion (operator ruling C6), as 302 narrowed it to the agent's own
+    // assertions (Addendum 5): challenges, assessment-slot BBAs (303).
     (
         "292_idx_challenges_public_by_challenger.sql",
         "idx_challenges_public_by_challenger",
     ),
     (
-        "293_idx_mass_functions_public_by_source.sql",
-        "idx_mass_functions_public_by_source",
+        "303_idx_mass_functions_public_assessments_by_source.sql",
+        "idx_mass_functions_public_assessments_by_source",
     ),
     (
         "299_idx_edges_public_ingest_records_by_ingester_lp.sql",
@@ -100,6 +97,13 @@ const DROPPED_INDEX_MIGRATIONS: &[&str] = &[
     // 301 drops it.
     "294_idx_edges_public_ingest_records_by_ingester.sql",
     "301_drop_idx_edges_public_ingest_records_by_ingester.sql",
+    // 302 counts only an agent's own assertions (Addendum 5): evidence is no
+    // longer probed (305 drops 291's index) and a BBA only on an assessment
+    // slot (303's index; 304 drops 293's).
+    "291_idx_evidence_public_by_signer.sql",
+    "293_idx_mass_functions_public_by_source.sql",
+    "304_drop_idx_mass_functions_public_by_source.sql",
+    "305_drop_idx_evidence_public_by_signer.sql",
 ];
 
 /// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
@@ -210,6 +214,17 @@ async fn the_superseded_claim_arm_indexes_are_dropped(pool: PgPool) {
         assert_eq!(found, None, "{index} must be dropped (289 / 290)");
     }
     for index in [
+        "idx_evidence_public_by_signer",
+        "idx_mass_functions_public_by_source",
+    ] {
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass('public.' || $1)::text")
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass");
+        assert_eq!(found, None, "{index} must be dropped (304 / 305)");
+    }
+    for index in [
         "idx_claims_public_by_agent_since",
         "idx_claims_group_by_agent_since",
     ] {
@@ -288,14 +303,6 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
             "idx_claims_group_by_agent_since",
         ),
         (
-            "evidence (295)",
-            lateral(
-                "SELECT 1 FROM public.evidence e WHERE e.signer_id = b.agent_id \
-                   AND e.visibility = 'public' AND e.created_at >= b.since",
-            ),
-            "idx_evidence_public_by_signer",
-        ),
-        (
             "challenge (295)",
             lateral(
                 "SELECT 1 FROM public.challenges ch WHERE ch.challenger_id = b.agent_id \
@@ -304,12 +311,13 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
             "idx_challenges_public_by_challenger",
         ),
         (
-            "BBA (295)",
+            "assessment BBA (302)",
             lateral(
                 "SELECT 1 FROM public.mass_functions m WHERE m.source_agent_id = b.agent_id \
+                   AND m.slot_kind = 'assessment' \
                    AND m.visibility = 'public' AND m.created_at >= b.since",
             ),
-            "idx_mass_functions_public_by_source",
+            "idx_mass_functions_public_assessments_by_source",
         ),
         (
             "ingest record (300)",

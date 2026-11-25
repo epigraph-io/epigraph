@@ -116,7 +116,7 @@ H is **NAMED** to viewer V when any arm below holds. Otherwise H is **UNNAMED**.
 | team | V's live group set (the stamped `epigraph.group_ids`: direct, role-derived and the 234 operator-readable teams, i.e. what `Viewer::resolve` yields) contains a group G such that G has `kind IN ('team','community')`, `status = 'active'`, and G is among H's live memberships (`epigraph_live_memberships_unbound(H)`: direct, 165 role-derived, 164 lapse, 235 allowance lapse). Personal, world and seed groups never count. | approved rule |
 | opt-in | `agents.profile_visibility = 'public'` on H, set by H through the self-service definer (§8). Migration resets every human principal to `'group'` and new human principals are created as `'group'` (§10), so the value is evidence of consent. | approved rule |
 | public claim | some agent in B(H) is `claims.agent_id` of a claim with `visibility = 'public'`, current or superseded (`is_current` is not read), created at or after that agent's binding start. This is sticky across binding changes: retiring a link or revoking an allowance never re-hides H. | approved rule ("No anonymous claims"); window **[RULED] C5** |
-| public assertion | some agent in B(H), from its binding start, made a PUBLIC row of another kind: evidence it signed (`evidence.signer_id`), a challenge (`challenger_id`), a BBA (`mass_functions.source_agent_id`, retracted or not), or a document ingest record (`edges` `paper -ingested_claim-> claim`, `properties.ingested_by`, marked by the same ingest). | **[RULED] C6** (migration 295) |
+| public assertion | some agent in B(H), from its binding start, ITSELF made a PUBLIC row of another kind: a challenge (`challenger_id`, pinned to the filing principal by 170's CR08), an assessment (`mass_functions.source_agent_id` on a `slot_kind = 'assessment'` row, retracted or not), or a document ingest record (`edges` `paper -ingested_claim-> claim`, `properties.ingested_by`, marked by the same ingest). Evidence and every other BBA shape are not counted (Addendum 5, migration 302). | **[RULED] C6** (migration 295), narrowed by the security review's Addendum 5 (migration 302) |
 | countersigned authorship | some agent in B(H), from its binding start, countersigned (confirmed) an authorship of a paper V can read (`'public'`, or owned by one of V's groups): 208's `authorship.countersigned` audit row with that agent as caller. | **[RULED] C2** (migration 297) |
 | readable claim | V can read some claim whose `agent_id` is in B(H), created at or after that agent's binding start: `visibility = 'group' AND owner_group_id = ANY(V's groups)`. Whoever can read a claim can trace it to its human. | **[ORCHESTRATOR'S CALL]** (§16.A1); window **[RULED] C5** |
 
@@ -181,16 +181,51 @@ Consequences that follow directly from the rule and that the PR must state in it
   so each probe descends to the first row at or after the start (§11.1). The rejected
   revision-2 alternative, a per-claim `bound_at(c.agent_id, c.created_at) = H`, is not what
   was built: the start is read once per bound agent, not once per claim.
-- **Every kind of public assertion counts (**[RULED] C6**, migration 295; B15 superseded).**
-  Re-verified on this head: `evidence` has no author column, only `signer_id` (the packet's
-  agent on a signed REST submit, the MCP server's own agent on every MCP write), so evidence
-  names the human of the agent that SIGNED it (§15.R18); `challenges.challenger_id`;
-  `mass_functions.source_agent_id` (267: the edge's signer, the evidence writer, or the
-  assessment slot's owner; a retracted BBA still counts, as a superseded claim does); ingest
-  records are `edges` rows `paper -ingested_claim-> claim` (`properties.ingested_by`, and the
-  walk's `properties.ingest_written.by` marker, which must name the same agent, mirroring the
-  records' read contract). Only PUBLIC rows of these kinds count; there is no readable-row
-  variant for them (§15.R19).
+- **Every kind of public assertion counts (**[RULED] C6**, migration 295; B15 superseded),
+  but only an assertion the agent ITSELF made (security review "Addendum 5", migration 302).**
+  A row counts only where the column naming the agent is, on every writer, the identity that
+  wrote it. Re-verified per kind on this head:
+  - `challenges.challenger_id`: 170's CR08 refuses an application session whose principal is
+    not the challenger. Counted.
+  - `mass_functions.source_agent_id` on an ASSESSMENT slot (`slot_kind = 'assessment'`): the
+    only writer is `routes/assess.rs`, which keys the row to the caller or, when the caller is
+    bound, to the caller's live human (`epigraph_human_of`; §15.R14). A bound agent's
+    assessment therefore names H itself, which H's own `-infinity` entry counts. A retracted
+    assessment still counts, as a superseded claim does. Counted.
+  - every OTHER BBA shape: NOT counted. An edge factor (`slot_kind = 'edge'`) is attributed to
+    the SOURCE claim's author by every edge writer (REST `edges.rs`, MCP `link_epistemic.rs`,
+    `edge_factor.rs::auto_wire_ds_for_edge`), stored on the TARGET claim with the target's
+    visibility (070/168), and re-dated on every re-wire (`store_keyed`'s `created_at = NOW()`),
+    so a stranger's edge from B's pre-binding public claim to the stranger's own public claim
+    named H to everyone (review2 leaks#1). Unscoped and perspective rows are written under
+    another identity by `MassFunctionRepository::copy_to_frame` (`routes/hypothesis.rs`), the
+    DS auto-wire's truth-value seed (attributed to the claim's author) and operator CLIs.
+    Evidence-slot rows follow the evidence writer.
+  - `evidence`: NOT counted. No column records the asserting agent: `signer_id` is the
+    server's own agent on every MCP write and the packet's agent on a signed REST submit, and
+    no database guard pins it to the writing session.
+  - ingest records (`edges` `paper -ingested_claim-> claim`): counted while the walk's
+    reserved `properties.ingest_written.by` marker (198/208, writable only in a declared
+    transaction) names the same agent as `properties.ingested_by`. An unmarked record, or one
+    another principal's ingest marked, names no one (pinned, review2 correctness#5).
+  Only PUBLIC rows of these kinds count; there is no readable-row variant for them (§15.R19).
+  **The narrowing is an operator item** (§16.C, C6a): a public BBA a bound agent files through
+  `POST /api/v1/beliefs` (the route pins `agent_id` to the caller) or evidence it signs on a
+  REST packet no longer names H by itself. A write-once writer column on `evidence` and
+  `mass_functions` (stamped from the session principal by a trigger, the window read on it
+  instead of the re-datable `created_at`) would let both count again; it is a storage change on
+  two hot tables and was not built.
+- **A row of a counted kind is public by INHERITANCE (review2 leaks#3; the C4 analogue for C6
+  rows).** Challenges and BBAs take their claim's visibility on insert (070/168
+  `epigraph_inherit_tenancy_stmt`) and are re-stamped when it changes
+  (`epigraph_propagate_tenancy`), except rows that are `writer_owned` or pinned. So a fifth
+  third-party path makes H NAMED: B(H)'s agent challenges, or assesses, a group claim of team X
+  that is not B(H)'s, and an admin of X publicizes it (`epigraph_publicize_claims`, 242); or a
+  dedup moves B(H)'s group-scoped assessment onto a public canonical claim (267's
+  `epigraph_dedup_move_bbas` writes `visibility = v_c_vis` and keeps `source_agent_id` and
+  `created_at`). The widening act is the admin's or the sweep's, not H's; the assertion is
+  B(H)'s own and is now world-readable with its agent id, so it is accountability-positive in
+  the same way as C4. Implemented as built; listed for the operator (PR body).
 - **A countersigned authorship counts (**[RULED] C2**, migration 297; R3 closed).** The arm
   reads 208's audit row (caller and time), not the edge's `epigraph:countersigned_by:` label,
   because only the row carries the time the window needs; 208's RESTRICTIVE policy reserves
@@ -900,6 +935,15 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   md5); same arms and answers; B(H)'s ids as text once, the ingest probe on M23's accessor, the
   countersign arm's paper id fenced so its `papers` join is `uuid = Var`. Undo:
   `docs/runbooks/300-undo.sql` (re-apply 294 first).
+- **M26 `302_disclosure_counts_own_assertions_only.sql`** (security review Addendum 5,
+  transactional): precondition OWN01 (300's core md5); the evidence probe removed and the BBA
+  probe restricted to `slot_kind = 'assessment'` (§4); every other arm and the order are 300's.
+  Undo: `docs/runbooks/302-undo.sql` (re-apply 291 and 293 first).
+- **M27 `303_idx_mass_functions_public_assessments_by_source.sql`** (`-- no-transaction`):
+  `(source_agent_id, created_at) WHERE visibility = 'public' AND slot_kind = 'assessment'`.
+  **`304_drop_idx_mass_functions_public_by_source.sql`** and
+  **`305_drop_idx_evidence_public_by_signer.sql`** drop 293's and 291's indexes, which no probe
+  reads after M26.
 
 Every index file is registered in `tenancy_migration_shape.rs` (validity, one statement), and
 `::the_partial_tenancy_indexes_serve_an_explicit_visibility_qual` pins, by EXPLAIN, that each probe reaches its index with the
@@ -1514,14 +1558,11 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   claim no longer names the human, and the block shows the human's id under its placeholder
   unless another arm names it. Kept as ruled, not aligned silently; aligning 199 (or making the
   core reach back for recorded-retired links) needs the operator.
-- **R18. Evidence names its SIGNER's human** (operator ruling C6, migration 295). `evidence`
-  has no author column. Over MCP the signer is the server's own agent, so a caller's evidence
-  names the caller's human only through the claim it accompanies, and evidence a stdio server
-  signs names that server agent's human (the server is then also its only writer). Over a
-  signed `POST /api/v1/submit/packet` the signer is the packet's agent. Unsigned evidence
-  names no one. No supported flow binds the HTTP MCP server's own agent to a person (its
-  auth-lineage edges are `OPERATED_BY` edges, not bindings, §15.R12); a maintenance link of it
-  would name that person by every MCP-written evidence row.
+- **R18. (Closed by migration 302.) Evidence named its SIGNER's human** (operator ruling C6,
+  migration 295). `evidence` has no author column; over MCP the signer is the server's own
+  agent, so a maintenance link of that agent would have named its person by every
+  MCP-written evidence row. Since 302 evidence names no one by itself (§4, Addendum 5; open
+  item C6a), so the server-agent case is gone with it.
 - **R18a. A backfilled ingest record is windowed by its WRITE time** (C5 x C6). The operator's
   marker backfill (`epigraph-cli` `operator/backfill_markers.rs`) writes the
   `paper -ingested_claim-> claim` records of pre-record ingests through
@@ -1537,6 +1578,19 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   column), workflow rows, edges in general (an edge's author is its source claim's), and the
   NON-public rows of every C6 kind (the readable arm stays claims-only). Each would need its
   own ruling and index.
+  Re-verified on the review-2 head (every base table with a `visibility` column and an agent
+  column, review2 correctness#7), the remaining rejections and why:
+  - `claim_versions.created_by`: a PATCH of a public claim. The claim itself is the assertion
+    and its filer is counted; a version row records an edit, and its author is counted only if
+    it filed a claim of its own. Arguably an assertion: put to the operator with C6a.
+  - `perspectives.owner_agent_id`: a stated viewpoint, not an assertion about a claim; its
+    BBAs are perspective-keyed rows, which 302 does not count (C6a). Put to the operator with
+    C6a.
+  - `recall_events.agent_id`: a READ, not an assertion.
+  - `claim_signature_revocations` (`previous_signer_id`, `revoked_by`, `superseded_by`): an
+    administrative act on a signature, not an assertion by the agent it names.
+  - `evidence`, and every BBA except an assessment: not the agent's own assertion on every
+    writer (302, §4).
 - **F1.** Author nodes from ingested literature and git authors are not human principals.
   Their names are public-source names, and they stay named.
 - **F2.** Stale derivatives (finding L13): stored Atlas leaf documents built before deploy
@@ -1693,10 +1747,17 @@ stays open.
   evidence, challenges, BBAs/mass functions and public ingest records by H or B(H) name H,
   windowed as C5. Implemented: migration 295 (291-293's indexes; the ingest probe on 298's
   LEAKPROOF accessor and 299's index after the §11.2 measurement, migrations 298-301), tables
-  re-verified (§4).
+  re-verified (§4). **Narrowed by the security review's Addendum 5 (migration 302)**: a row
+  counts only where it is the agent's own assertion, so evidence is dropped (no asserting
+  column) and a BBA counts only on an assessment slot (303's index; 304/305 drop 293's and
+  291's); open item C6a (§16.C) asks the operator whether to restore the narrowed kinds with a
+  writer column.
   Pinned by `human_identity_visibility.rs::a_public_assertion_of_every_kind_names_the_human`,
-  `::an_assertion_of_any_kind_from_before_the_binding_never_names_the_human`, the PAK01 refusal
-  and `claim_authored_by.rs::a_human_ingesters_public_record_names_it_to_every_reader`.
+  `::an_assertion_of_any_kind_from_before_the_binding_never_names_the_human`,
+  `::only_an_agents_own_assertion_names_its_human` (edge factor, copied and evidence-slot BBAs,
+  evidence, a challenge in another's name, unmarked and foreign-marked ingest records), the
+  PAK01 and OWN01 refusals and
+  `claim_authored_by.rs::a_human_ingesters_public_record_names_it_to_every_reader`.
   Residuals: §15.R18, R19.
 - **C12. The readable-claim arm's worst-case cost** (§11.1: 20-38 ms p50 for a human with
   1,500 bound agents and a viewer in 30 groups, over the 10 ms budget). Ruled: accept option
@@ -1715,6 +1776,11 @@ Each item states the behaviour implemented until the operator rules.
 
 - **C1. (Closed in revision 2.)** E2 is redacted in this PR, `replaces` included (finding L2).
 - **C2, C5, C6.** Ruled (§16.R).
+- **C6a. (New, review round 2.)** Addendum 5 narrowed C6 (migration 302): evidence and every
+  BBA except an assessment no longer name H by themselves, because no column records which
+  identity wrote them. Implemented: narrowed. Alternative for the operator: a write-once
+  writer column on `evidence` and `mass_functions`, stamped from the session principal, and
+  the window read on it (§4).
 - **C8.** Whether an explicit `authored` edge's `affiliations` is identity, to be redacted with
   `author_name`. Implemented: shown as for N.
 - **C9.** The sticky public-claim marker table, only if the §11 budget is missed.
@@ -1840,7 +1906,9 @@ Not covered by part B (open):
   AND c.created_at < l.created_at` (humans with a pre-link public claim) against the same
   count with `>=` (humans still named by a windowed claim). A human only in the first count
   loses the public-claim arm.
-- 295 (C6) and 297 (C2) can only NAME more people (new arms), never fewer.
+- 295 (C6) and 297 (C2) can only NAME more people (new arms), never fewer. 302 (Addendum 5)
+  names FEWER: a human named only by evidence, or by a non-assessment BBA, of a bound agent
+  becomes unnamed. Nothing is deployed yet, so no one is named today by those arms.
 - 298 declares a LEAKPROOF function, which needs a SUPERUSER migration runner (as 212 / 238
   already assume); on another runner it refuses (LKP01) with nothing changed. Without 298-301,
   295's ingest-record probe scans `edges` by `created_at` on every human evaluation (198 s on

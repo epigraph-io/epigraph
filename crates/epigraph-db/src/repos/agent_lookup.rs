@@ -17,7 +17,7 @@
 //! every non-human agent is named to everyone; a human principal only to
 //! itself, a privileged session, a teammate, everyone once it opted in or
 //! once it or an agent bound to it made a public assertion of any kind
-//! (claim, evidence, challenge, BBA, ingest record) from the binding's start,
+//! (claim, challenge, assessment BBA, ingest record; 302) from the binding's start,
 //! whoever can read a claim one of them filed while bound, and whoever can
 //! read a paper whose authorship one of them countersigned (migrations
 //! 288, 295, 297). Everything on a card is computed under that
