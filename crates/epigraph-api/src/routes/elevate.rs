@@ -40,9 +40,12 @@
 //! the definer, the asserting passkey's attestation must still be in good
 //! standing (`epigraph_passkey::Passkeys::assertion_standing`: an
 //! `android-key` passkey none of whose certificates is on a CURRENT
-//! attestation status list); one that is not is refused here (403, or 503
-//! when the list cannot be checked) with the ticket left live, and that
-//! refusal is logged, not audited in the database. The
+//! attestation status list; a `none` passkey only while the passkey that
+//! ANCHORED it, recorded on its row since migration 285 and found among the
+//! same person's live passkeys the definer serves, is itself in good
+//! standing); one that is not is refused here (403, or 503 when the list
+//! cannot be checked) with the ticket left live, and that refusal is logged,
+//! not audited in the database. The
 //! signature counter is the definer's to check (under its row lock, with an
 //! audit row), not the library's: the challenge is started with
 //! `Passkeys::start_authentication_deferring_counter`.
@@ -120,11 +123,12 @@ use base64::Engine as _;
 use epigraph_db::{
     ActConfirmation, AdminActCeremony, AssertedCredential, CeremonyAct, CeremonyEnrollment,
     CeremonyTicket, Confirmation, DbError, ElevationCeremony, EnrollmentAnchor, PasskeyCeremony,
-    VerifiedPasskey,
+    TicketPasskey, VerifiedPasskey,
 };
 use epigraph_passkey::{
     act_challenge as act_challenge_of, ActAnchor, AuthenticationState, LineagePasskey,
-    PasskeyError, Passkeys, RegistrationState, StandingRefusal, StoredPasskey, ACT_NONCE_LEN,
+    PasskeyError, Passkeys, RegistrationState, StandingAnchor, StandingRefusal, StoredPasskey,
+    ACT_NONCE_LEN,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -152,6 +156,21 @@ fn standing_refused(refusal: &StandingRefusal) -> Response {
              operator to check it, then retry",
         ),
     }
+}
+
+/// The passkey `k` holds through, found among the SAME ceremony's served rows
+/// (the person's live passkeys, `keys`): `None` when its row records no
+/// anchor, or when that anchor is not served (revoked, or, on any rows,
+/// another person's), and `Passkeys::assertion_standing` then refuses a
+/// `none` passkey.
+fn standing_anchor<'a>(keys: &'a [TicketPasskey], k: &TicketPasskey) -> Option<StandingAnchor<'a>> {
+    let anchor = k.anchor_authenticator_id?;
+    keys.iter()
+        .find(|a| a.authenticator_id == anchor)
+        .map(|a| StandingAnchor {
+            passkey: &a.passkey,
+            attestation_format: &a.attestation_format,
+        })
 }
 
 /// The refusal of an assertion the library verified for a credential that is
@@ -895,7 +914,9 @@ pub async fn ticket_assert(
         let Some(k) = keys.iter().find(|k| k.credential_id == a.credential_id) else {
             return unmatched_assertion("elevate.ticket", id);
         };
-        if let Err(refusal) = rp.assertion_standing(&k.passkey, &k.attestation_format) {
+        if let Err(refusal) =
+            rp.assertion_standing(&k.passkey, &k.attestation_format, standing_anchor(&keys, k))
+        {
             tracing::warn!(
                 target: "elevate.ticket",
                 ticket = %id,
@@ -1339,7 +1360,9 @@ pub async fn act_assert(
         let Some(k) = keys.iter().find(|k| k.credential_id == a.credential_id) else {
             return unmatched_assertion("elevate.act", id);
         };
-        if let Err(refusal) = rp.assertion_standing(&k.passkey, &k.attestation_format) {
+        if let Err(refusal) =
+            rp.assertion_standing(&k.passkey, &k.attestation_format, standing_anchor(&keys, k))
+        {
             tracing::warn!(
                 target: "elevate.act",
                 act = %id,
