@@ -2820,6 +2820,95 @@ async fn provisioned(pool: &PgPool, client_type: &str, name: &str) -> Uuid {
     agent.into()
 }
 
+/// Review 2 (leaks#7), the paper-author listing (`PaperRepository::list_authors`,
+/// behind MCP `query_paper` and `authored_by.paper.authors`): an ingester that
+/// explicitly attaches an UNNAMED person as an author of a public paper (pending
+/// its countersignature, so C2 names no one) lists it, to an outsider, exactly
+/// as it lists a production-shaped nameless service principal attached the
+/// same way: same fields, the name being each one's own `oauth:<client row
+/// id>` placeholder. A teammate reads H's real name (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_person_is_listed_as_a_paper_author_as_a_service_principal_is(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, n) = h_and_n(&pool, "Quirin Authored").await;
+    let (outsider, _) = named(&pool, "Rhea Reader").await;
+    let (mate, _) = named(&pool, "Sven Mate").await;
+    let (ingester, _) = named(&pool, "Tess Ingester").await;
+    keyed_team(&pool, &[h, mate]).await;
+
+    let attach = |author: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let paper = public_paper(&pool, &format!("10.9999/authors.{}", Uuid::new_v4())).await;
+            let mut conn = pool.acquire().await.expect("conn");
+            epigraph_db::create_ingest_written_edge_if_absent_conn(
+                &mut conn,
+                None,
+                "ingest_document",
+                ingester,
+                author,
+                "agent",
+                paper,
+                "paper",
+                "authored",
+                Some(serde_json::json!({
+                    "position": 0,
+                    "role": "author",
+                    "affiliations": ["Fixture Institute"],
+                    "explicit_agent_id": true,
+                    "author_name": "A Spelling",
+                    "pending_countersign": true,
+                    "ingested_by": ingester.to_string(),
+                })),
+            )
+            .await
+            .expect("authored edge");
+            paper
+        }
+    };
+    let paper_h = attach(h).await;
+    let paper_n = attach(n).await;
+
+    let list = |who: Uuid, paper: Uuid| {
+        let pool = pool.clone();
+        let scoped = &scoped;
+        async move {
+            let v = viewer(&pool, who).await;
+            let mut read = scoped.read_as(&v).await.expect("read_as");
+            let rows = epigraph_db::PaperRepository::list_authors(&mut *read, &v, paper)
+                .await
+                .expect("list_authors");
+            assert_eq!(rows.len(), 1, "one author listed: {rows:?}");
+            rows.into_iter().next().expect("the author")
+        }
+    };
+    let (mut a_h, mut a_n) = (list(outsider, paper_h).await, list(outsider, paper_n).await);
+    assert_eq!(
+        a_h.display_name,
+        Some(format!("oauth:{}", client_of(&pool, h).await)),
+        "an unnamed person is listed under its placeholder"
+    );
+    assert_eq!(
+        a_n.display_name,
+        Some(format!("oauth:{}", client_of(&pool, n).await)),
+        "CALIBRATION: N is listed under its minted name"
+    );
+    // Modulo the id and each one's own placeholder, the listings are equal.
+    for a in [&mut a_h, &mut a_n] {
+        a.agent_id = Uuid::nil();
+        a.display_name = None;
+    }
+    assert_eq!(
+        a_h, a_n,
+        "the person's listing equals the service principal's"
+    );
+    assert_eq!(
+        list(mate, paper_h).await.display_name.as_deref(),
+        Some("Quirin Authored"),
+        "CALIBRATION: a teammate reads the name"
+    );
+}
+
 /// T1's pair: H, a provider-provisioned person under its real name, and N, a
 /// production-shaped nameless OAuth service principal, provisioned the same
 /// way and left exactly as `ensure_for_client` mints it: named

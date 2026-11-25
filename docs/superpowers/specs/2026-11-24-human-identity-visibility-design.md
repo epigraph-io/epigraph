@@ -1860,6 +1860,17 @@ Not covered by part B (open):
   (`list_authors_by`, the `claim_authored_by` tests), and PROV, sources and the leaderboard
   derive agents from claims the caller reads, so the readable-claim / public-claim arms name
   them and the redaction is near-unreachable there.
+- **After review 2 (leaks#7):** added the paper-author listing comparison against a
+  production-shaped N
+  (`human_identity_visibility.rs::an_unnamed_person_is_listed_as_a_paper_author_as_a_service_principal_is`,
+  the builder behind MCP `query_paper` and `authored_by.paper.authors`) and the edge-listing one
+  (`human_identity_routes_http.rs::an_unnamed_humans_authorship_edge_carries_no_spelling_of_its_name`).
+  Still residual, with the reason: `get_claim`'s `authored_by` ingesters / `named_by` /
+  `added_by`, PROV export, sources and the leaderboard. An unnamed H cannot appear there to an
+  outsider through its own rows: H's ingest record or claim that the outsider can read is public,
+  which names H (C6 / public-claim arm, H's own rows have no window). The reachable case is
+  `authored_by.human` of a pre-binding claim (§15.R17), where N has no counterpart (N is never a
+  claim's human).
 
 ## 17. Deploy notes
 
