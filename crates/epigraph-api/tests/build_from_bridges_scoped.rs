@@ -410,3 +410,59 @@ async fn on_the_app_role_a_public_paragraph_is_a_refused_write_and_nothing_commi
         assert_eq!(n, 0, "{table}: a refused run commits nothing");
     }
 }
+
+/// A `42501` from the retention sweep is a 500, not the row-security 403.
+///
+/// The sweep's tables (`graph_cluster_runs`, `graph_clusters`) carry no row
+/// security, so a `42501` there can only be a missing table grant: a
+/// deployment problem, not a caller without write authority. Answering the
+/// 403 ("no write authority over the group ...") would send an operator to
+/// group membership instead of the grant. Instrument: DELETE on
+/// `graph_cluster_runs` is revoked from `epigraph_app` in this test's own
+/// database (table privileges are per database), and the caller clusters only
+/// its own private pair, whose inserts row security admits. Nothing commits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_the_app_role_a_missing_grant_in_the_retention_sweep_is_a_500_not_a_403(pool: PgPool) {
+    let (caller, caller_group) = viewer_fixture::seed_agent_with_group(&pool, "67c9-caller").await;
+    own_private_pair(&pool, caller, caller_group).await;
+    let app = app_role_router(&pool).await;
+
+    // Calibration first, with the grant in place: the same caller and the
+    // same paragraphs are a 200, so the failure below is the revoke's.
+    let (status, body) = build(app.clone(), caller).await;
+    assert_eq!(status, StatusCode::OK, "calibration: {body}");
+    sqlx::query("DELETE FROM graph_cluster_runs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM graph_clusters")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query("REVOKE DELETE ON public.graph_cluster_runs FROM epigraph_app")
+        .execute(&pool)
+        .await
+        .expect("revoke");
+    let (status, body) = build(app, caller).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a missing grant is not a refused row write: {body}"
+    );
+    assert!(
+        !body.contains("no write authority"),
+        "the 403 wording must not appear: {body}"
+    );
+    for table in [
+        "graph_cluster_runs",
+        "graph_clusters",
+        "claim_cluster_membership",
+    ] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table}: a failed sweep commits nothing");
+    }
+}

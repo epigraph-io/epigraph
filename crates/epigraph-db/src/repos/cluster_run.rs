@@ -28,11 +28,14 @@
 //! route on the raw pool with no viewer (backlog 67c905a3 and 04ab6607). The
 //! handler now runs all four on ONE transaction stamped with the caller's
 //! viewer: the two reads splice it, so a paragraph the caller cannot read is
-//! not a node and an edge it cannot read is not a bridge, and the writes are
+//! not a node and an edge it cannot read is not a bridge, and the INSERTS are
 //! decided by row security against the same stamp. A membership row inherits
 //! its claim's tenancy (migration 070's `epigraph_inherit_tenancy_stmt`), so a
 //! run can only be committed by a caller who may write every paragraph it
 //! clusters; a refusal (`42501`) aborts the whole transaction.
+//!
+//! The retention sweep ([`ClusterRunRepository::gc_bridge_runs`]) is NOT
+//! decided by that stamp: see its doc.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -378,6 +381,16 @@ impl ClusterRunRepository {
     /// Garbage-collect old bridge runs, keeping the newest `retain` by
     /// `completed_at`. Scoped by `algo`, so the nightly Louvain runs are never
     /// touched.
+    ///
+    /// NOT scoped by caller. `graph_cluster_runs` and `graph_clusters` carry no
+    /// tenancy and no row security, and a run's membership rows go with its
+    /// clusters through a foreign-key cascade that consults no policy. So the
+    /// newest `retain` bridge runs are kept across EVERY caller: one caller's
+    /// run can retire runs another caller wrote, including runs that cluster
+    /// the other caller's group-private paragraphs. The stamp on the
+    /// connection does not narrow this sweep; only the inserts in
+    /// [`Self::insert_bridge_run`] are decided by it. Whether bridge runs
+    /// should be per-group, or a maintenance job, is open.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any delete fails.

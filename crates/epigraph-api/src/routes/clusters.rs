@@ -53,11 +53,17 @@ pub struct BuildFromBridgesResponse {
 /// * the two reads (bridge edges, paragraph nodes) splice the viewer, so a
 ///   paragraph the caller cannot read is not clustered and an edge it cannot
 ///   read is not a bridge;
-/// * the writes (run, clusters, memberships, retention sweep) are decided by
-///   row security against the same stamp. A membership row inherits its
-///   paragraph's tenancy, so the run commits only if the caller may write
-///   every paragraph it clusters; a refusal (`42501`) is a 403 and nothing is
-///   committed.
+/// * the INSERTS (run, clusters, memberships) are decided by row security
+///   against the same stamp. A membership row inherits its paragraph's
+///   tenancy, so the run commits only if the caller may write every paragraph
+///   it clusters; a refusal (`42501`) there is a 403 and nothing is committed.
+/// * the retention sweep is NOT owner-scoped: `graph_cluster_runs` and
+///   `graph_clusters` carry no tenancy, and memberships go with their cluster
+///   through a foreign-key cascade, so it keeps the newest `retain_runs`
+///   bridge runs across ALL callers (see
+///   `ClusterRunRepository::gc_bridge_runs`). A failure there is a 500, never
+///   the 403 above: a `42501` from the sweep can only be a missing table
+///   grant, and a 403 would send an operator to group membership instead.
 ///
 /// Before this the reads and the writes ran on the raw pool with no viewer:
 /// on a login that bypasses row security every paragraph in the database was
@@ -143,7 +149,7 @@ pub async fn build_from_bridges(
         .map_err(refused_or_internal)?;
     ClusterRunRepository::gc_bridge_runs(&mut tx, retain_runs)
         .await
-        .map_err(refused_or_internal)?;
+        .map_err(|e| internal("retention sweep", &e))?;
     tx.commit().await.map_err(|e| internal("commit", &e))?;
 
     let cluster_count: usize = {
@@ -175,9 +181,11 @@ fn internal(stage: &'static str, e: &epigraph_db::DbError) -> ApiError {
     }
 }
 
-/// A write refused by row security (`42501`: the run would cluster a
-/// paragraph whose membership row the caller may not write) is a 403, and the
-/// transaction is dropped uncommitted. Anything else is a 500.
+/// For the INSERTS of a run only: a write refused by row security (`42501`:
+/// the run would cluster a paragraph whose membership row the caller may not
+/// write) is a 403, and the transaction is dropped uncommitted. Anything else
+/// is a 500. Not used for the retention sweep, whose `42501` cannot be a row
+/// refusal (its tables carry no row security) and so is a misconfigured grant.
 #[cfg(feature = "db")]
 fn refused_or_internal(e: epigraph_db::DbError) -> ApiError {
     if crate::errors::db_is_insufficient_privilege(&e) {
