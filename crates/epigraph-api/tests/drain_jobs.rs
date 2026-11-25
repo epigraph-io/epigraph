@@ -276,6 +276,11 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
 /// A job left `running` by a crashed run (older than the 90-minute bound) is
 /// reset and drained; a `running` job younger than that is left alone, since it
 /// may still be running.
+///
+/// The reset counts an attempt, so the row waits out its handler's backoff
+/// before it is claimed again (backlog 000cca08): the reaper stores a
+/// not-before time, and the job completes on a run once that has passed (here
+/// back-dated). Before the fix the reaper stored none.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool) {
     let stale = enqueue(
@@ -294,8 +299,11 @@ async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool
         },
     )
     .await;
+    // Eight attempts used of ten: the counted reap schedules retry number 8,
+    // whose default backoff (2^8 s) is far longer than this run.
     sqlx::query(
-        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours' WHERE id = $1",
+        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours', \
+                retry_count = 8, max_retries = 10 WHERE id = $1",
     )
     .bind(stale)
     .execute(&pool)
@@ -317,7 +325,31 @@ async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool
         .expect("the drain ran");
 
     assert_eq!(report.recovered_stale, 1, "{report:?}");
-    assert_eq!(report.completed, 1, "{report:?}");
+    assert_eq!(
+        report.completed, 0,
+        "the run that reaped the job claimed it again inside its backoff: {report:?}"
+    );
+    let (state, wait): (String, Option<f64>) = sqlx::query_as(
+        "SELECT state, extract(epoch FROM run_after - now())::float8 FROM jobs WHERE id = $1",
+    )
+    .bind(stale)
+    .fetch_one(&pool)
+    .await
+    .expect("the reaped row");
+    assert_eq!(state, "pending");
+    assert!(
+        wait.is_some_and(|s| (200.0..=256.5).contains(&s)),
+        "the reaper reset the row without its handler's backoff(8) = 256 s: {wait:?}"
+    );
+    sqlx::query("UPDATE jobs SET run_after = now() - interval '1 second' WHERE id = $1")
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .expect("let the backoff elapse");
+    let next = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("the next drain ran");
+    assert_eq!(next.completed, 1, "{next:?}");
     assert_eq!(job_state(&pool, stale).await.0, "completed");
     assert_eq!(
         job_state(&pool, fresh).await.0,

@@ -409,18 +409,26 @@ pub trait JobHandler: Send + Sync {
     /// # Arguments
     /// * `attempt` - The retry attempt number (0 = first retry)
     fn backoff(&self, attempt: u32) -> Duration {
-        // Exponential backoff: 2^attempt seconds
-        // Cap at 1 hour (3600 seconds) to prevent excessive waits and overflow
-        const MAX_BACKOFF_SECS: u64 = 3600;
-
-        let backoff_secs = if attempt >= 63 {
-            MAX_BACKOFF_SECS
-        } else {
-            2u64.saturating_pow(attempt).min(MAX_BACKOFF_SECS)
-        };
-
-        Duration::from_secs(backoff_secs)
+        default_backoff(attempt)
     }
+}
+
+/// [`JobHandler::backoff`]'s default: `2^attempt` seconds, capped at one hour
+/// (`attempt` 0 = the first retry). Also the backoff the drain's reaper gives a
+/// reset row whose type has no handler in the run
+/// (`PostgresJobQueue::reap_stale_jobs_counting_attempts`).
+#[must_use]
+pub fn default_backoff(attempt: u32) -> Duration {
+    // Cap at 1 hour (3600 seconds) to prevent excessive waits and overflow
+    const MAX_BACKOFF_SECS: u64 = 3600;
+
+    let backoff_secs = if attempt >= 63 {
+        MAX_BACKOFF_SECS
+    } else {
+        2u64.saturating_pow(attempt).min(MAX_BACKOFF_SECS)
+    };
+
+    Duration::from_secs(backoff_secs)
 }
 
 /// How long a retryable failure waits before its retry: the handler's
