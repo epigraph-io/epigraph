@@ -474,7 +474,18 @@ impl MethodRepository {
         ))
     }
 
-    /// Get source papers for a method.
+    /// Get source papers for a method: the papers that `asserts` one of the
+    /// method's source claims, through edges `viewer` may read.
+    ///
+    /// `pub_year` and `source_type` are always `None`. `papers` has no
+    /// `properties` column and never had one (`id, doi, title, journal,
+    /// created_at`, plus `licence` and the tenancy columns), so this statement
+    /// used to read `p.properties->>'year'` and failed with `42703` whenever a
+    /// method matched; the method gap analysis, its only caller, answered 500
+    /// for every capability some method covers. That was invisible while the
+    /// route could not take a capability at all (backlog 97381982). The fields
+    /// stay, as `None`, so the response shape does not change; a stale flag
+    /// can only come from a year the schema does not store.
     pub async fn get_source_papers<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -482,14 +493,14 @@ impl MethodRepository {
     ) -> Result<Vec<MethodSourcePaper>, sqlx::Error> {
         let sql = viewer.splice(
             "SELECT DISTINCT p.id, p.doi, p.title, \
-                    (p.properties->>'year')::int AS pub_year, \
-                    p.properties->>'source_type' AS source_type \
+                    NULL::int AS pub_year, \
+                    NULL::text AS source_type \
              FROM methods m \
              CROSS JOIN LATERAL unnest(m.source_claim_ids) AS scid \
              JOIN edges e ON e.target_id = scid AND e.source_type = 'paper' AND e.relationship = 'asserts' \
              JOIN papers p ON p.id = e.source_id \
              WHERE m.id = $1 /* {EDGE_VISIBILITY:e} */ \
-             ORDER BY pub_year DESC NULLS LAST",
+             ORDER BY p.doi",
             2,
         );
         let mut q = sqlx::query_as::<_, MethodSourcePaperRow>(&sql).bind(method_id);
