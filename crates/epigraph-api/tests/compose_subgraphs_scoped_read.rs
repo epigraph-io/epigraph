@@ -115,11 +115,7 @@ async fn compose(
             .as_u64()
             .unwrap_or_else(|| panic!("`{k}` missing: {out}"))
     };
-    (
-        n("total_nodes"),
-        n("left_boundary"),
-        n("left_interior"),
-    )
+    (n("total_nodes"), n("left_boundary"), n("left_interior"))
 }
 
 struct Graph {

@@ -1491,8 +1491,7 @@ pub async fn compose_subgraphs(
 
     // Extract neighborhoods via recursive CTE
     let left_nodes = extract_neighborhood(&mut read, &viewer, request.center_a, max_depth).await?;
-    let right_nodes =
-        extract_neighborhood(&mut read, &viewer, request.center_b, max_depth).await?;
+    let right_nodes = extract_neighborhood(&mut read, &viewer, request.center_b, max_depth).await?;
 
     // Determine boundary (shared nodes)
     let left_set: std::collections::HashSet<Uuid> = left_nodes.iter().copied().collect();

@@ -211,7 +211,8 @@ fn is_arxiv_id(id: &str) -> bool {
     // A trailing `vN` after the numeric part.
     let body = match id.rsplit_once('v') {
         Some((head, ver))
-            if all_digits(ver, 1..=3) && head.bytes().last().is_some_and(|b| b.is_ascii_digit()) =>
+            if all_digits(ver, 1..=3)
+                && head.bytes().last().is_some_and(|b| b.is_ascii_digit()) =>
         {
             head
         }
@@ -336,7 +337,10 @@ async fn extract_pdf_structure(pdf_path: &Path, structure_path: &Path) -> Result
 }
 
 /// Run `extract_and_enrich.py` on a structure JSON file.
-async fn run_enrichment_pipeline(script_path: &Path, structure_path: &Path) -> Result<(), ApiError> {
+async fn run_enrichment_pipeline(
+    script_path: &Path,
+    structure_path: &Path,
+) -> Result<(), ApiError> {
     let output = tokio::process::Command::new("python3")
         .arg(script_path)
         .arg(structure_path)
