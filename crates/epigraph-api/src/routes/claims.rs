@@ -2486,37 +2486,29 @@ pub async fn patch_claim(
     // with `add_labels: [.., "resolved"]` on a world-owned public claim landed
     // (200, label on the row) through the orphan policy with NO audit row and
     // no admin principal, bypassing D2 on the one route it had not reached.
-    // The owning group comes from the viewer-scoped read above. Every other
-    // caller keeps the pre-existing (unstamped) path, which R3 item 2 still
-    // lists.
+    // The owning group comes from the viewer-scoped read above.
     let admin_path =
         auth.has_scope("claims:admin") && !viewer.writable_groups().contains(&owner_group_id);
 
     // ── 5. Open transaction — all mutations + provenance are atomic ──────────
-    // The admin path runs on a transaction stamped from the ADMIN's own viewer
-    // (so `epigraph.principal_id` is the admin, which the definer records);
-    // every other caller on the pool transaction this route always used.
-    let mut pool_tx: Option<sqlx::Transaction<'_, sqlx::Postgres>> = None;
-    let mut scoped_tx: Option<epigraph_db::ScopedTx<'_>> = None;
-    let tx: &mut sqlx::PgConnection = if admin_path {
-        scoped_tx.insert(state.write_as(&viewer, "patch_claim").await?)
-    } else {
-        pool_tx.insert(
-            state
-                .db_pool
-                .begin()
-                .await
-                .map_err(|e| ApiError::DatabaseError {
-                    message: format!("Failed to begin transaction: {e}"),
-                })?,
-        )
-    };
+    // EVERY path runs on a transaction stamped from the CALLER's own viewer.
+    // On the admin path that makes `epigraph.principal_id` the admin, which
+    // the definer records. On the plain path (backlog 7c2a0b36) it is what
+    // lets `claims_tenancy`'s WITH CHECK decide the write: this branch used
+    // `state.db_pool.begin()`, an unstamped transaction, so on the application
+    // role every author was refused (500, even on its own group's claim), and
+    // on a privileged pool an author patched a claim owned by a group it
+    // cannot write. A caller that cannot write the owning group is now refused
+    // by the database (uncoded 42501) and answered 403 with nothing written,
+    // exactly as `PATCH /api/v1/claims/:id/labels` answers it. That refusal is
+    // not pre-empted in Rust, for the reason `update_labels` gives.
+    let mut tx = state.write_as(&viewer, "patch_claim").await?;
 
     // ── 6 & 7. Fetch before-state and apply mutations atomically ─────────────
     let (before_labels, after_labels, before_props, after_props, before_trace, after_trace) =
         if admin_path {
             let w = ClaimRepository::admin_patch_claim_conn(
-                &mut *tx,
+                &mut tx,
                 epigraph_db::AdminToken {
                     client_id: auth.client_id,
                     jti: auth.jti,
@@ -2546,7 +2538,7 @@ pub async fn patch_claim(
                 remove_labels: request.remove_labels.clone().unwrap_or_default(),
             };
             let diff = epigraph_db::ClaimRepository::patch_claim_atomic_conn(
-                &mut *tx,
+                &mut tx,
                 claim_id,
                 &patch_input,
             )
@@ -2563,6 +2555,20 @@ pub async fn patch_claim(
                     field: "add_labels".to_string(),
                     reason,
                 },
+                // 42501: `claims_tenancy`'s WITH CHECK refused the caller's
+                // stamp, so the caller cannot write the owning group. The
+                // transaction is dropped uncommitted: nothing was written.
+                e if crate::errors::db_is_insufficient_privilege(&e) => {
+                    tracing::warn!(
+                        target: "tenancy.scoped_write",
+                        handler = "patch_claim",
+                        claim = %id,
+                        owner_group = %owner_group_id,
+                        error = %e,
+                        "the database refused the patch"
+                    );
+                    crate::errors::write_refused("claim")
+                }
                 other => ApiError::DatabaseError {
                     message: other.to_string(),
                 },
@@ -2578,7 +2584,7 @@ pub async fn patch_claim(
         };
 
     // ── 8. Re-fetch updated claim (for response) ─────────────────────────────
-    let updated_claim = ClaimRepository::get_by_id_conn(&mut *tx, &viewer, claim_id)
+    let updated_claim = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
@@ -2631,7 +2637,7 @@ pub async fn patch_claim(
     // ── 11. Append provenance — fail hard, inside transaction ────────────────
     let principal_id = auth.owner_id.unwrap_or(auth.client_id);
     ProvenanceRepository::append_conn(
-        &mut *tx,
+        &mut tx,
         "claim",
         id,
         "patch",
@@ -2651,16 +2657,9 @@ pub async fn patch_claim(
     })?;
 
     // ── 12. Commit ───────────────────────────────────────────────────────────
-    if let Some(t) = scoped_tx.take() {
-        t.commit().await.map_err(|e| ApiError::InternalError {
-            message: format!("Failed to commit transaction: {e}"),
-        })?;
-    }
-    if let Some(t) = pool_tx.take() {
-        t.commit().await.map_err(|e| ApiError::InternalError {
-            message: format!("Failed to commit transaction: {e}"),
-        })?;
-    }
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to commit transaction: {e}"),
+    })?;
 
     Ok(Json(updated_claim.into()))
 }

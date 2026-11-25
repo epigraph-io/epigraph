@@ -2569,3 +2569,158 @@ async fn a_seal_recomputes_a_set_centroid_3072_and_leaves_an_unset_one_null(pool
         "an unset centroid_3072 stays NULL"
     );
 }
+
+// =========================================================================
+// The k-means cluster channel (backlog 06cdffaa)
+// =========================================================================
+
+/// The clustering run every cluster fixture below writes under.
+const CLUSTER_RUN: Uuid = Uuid::from_u128(0x06cd_ffaa);
+
+/// Put `claim` in cluster `cluster` of [`CLUSTER_RUN`] (`claim_clusters`).
+async fn place_in_cluster(pool: &PgPool, claim: Uuid, cluster: i32) {
+    sqlx::query(
+        "INSERT INTO claim_clusters (claim_id, cluster_id, centroid_distance, \
+            second_centroid_dist, boundary_ratio, silhouette_score, cluster_run_id) \
+         VALUES ($1, $2, 0.1, 0.2, 0.5, 0.5, $3)",
+    )
+    .bind(claim)
+    .bind(cluster)
+    .bind(CLUSTER_RUN)
+    .execute(pool)
+    .await
+    .expect("place the claim in the cluster");
+}
+
+/// Store cluster `cluster`'s centroid in every centroid column a run can
+/// carry: the 32-d UMAP centroid (222), the legacy padded one (001) and the
+/// 3072-d one (027).
+async fn store_cluster_centroid(pool: &PgPool, cluster: i32) {
+    sqlx::query(
+        "INSERT INTO cluster_centroids (cluster_run_id, cluster_id, umap_centroid, centroid, \
+                                        centroid_3072, claim_count) \
+         VALUES ($1, $2, $3::vector, $4::vector, $5::vector, 1)",
+    )
+    .bind(CLUSTER_RUN)
+    .bind(cluster)
+    .bind(alternating_literal(32, 0))
+    .bind(alternating_literal(1536, 0))
+    .bind(alternating_literal(3072, 0))
+    .execute(pool)
+    .await
+    .expect("store the cluster centroid");
+}
+
+/// The cluster ids of [`CLUSTER_RUN`] that still hold a centroid row.
+async fn clusters_with_a_centroid(pool: &PgPool) -> Vec<i32> {
+    sqlx::query_scalar(
+        "SELECT cluster_id FROM cluster_centroids WHERE cluster_run_id = $1 ORDER BY cluster_id",
+    )
+    .bind(CLUSTER_RUN)
+    .fetch_all(pool)
+    .await
+    .expect("read the run's centroids")
+}
+
+/// A k-means cluster whose only member is the sealed claim stores a centroid
+/// that IS a projection of the sealed vector (the UMAP one exactly, for a
+/// one-point cluster), in a table with no tenancy and no policy. The seal
+/// deletes that row in its own transaction, and leaves the centroid of a
+/// cluster that keeps an unsealed member alone (a k-means centroid cannot be
+/// recomputed in SQL: the members' UMAP coordinates are not stored).
+///
+/// Verified to fail: without the seal's cluster step, cluster 0's centroid
+/// row survives the seal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seal_deletes_the_centroid_of_a_cluster_whose_members_are_all_sealed(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let sealed = seed_sealable_claim(&pool, &world, "the only member of cluster zero").await;
+    let co_sealed = seed_sealable_claim(&pool, &world, "a sealed member of cluster one").await;
+    let kept = seed_sealable_claim(&pool, &world, "the unsealed member of cluster one").await;
+    place_in_cluster(&pool, sealed, 0).await;
+    place_in_cluster(&pool, co_sealed, 1).await;
+    place_in_cluster(&pool, kept, 1).await;
+    for cluster in [0, 1, 2] {
+        store_cluster_centroid(&pool, cluster).await;
+    }
+    assert_eq!(
+        clusters_with_a_centroid(&pool).await,
+        vec![0, 1, 2],
+        "CALIBRATION: every cluster of the run holds a centroid before the seal"
+    );
+
+    let items = [
+        seal_payload(&pool, sealed).await,
+        seal_payload(&pool, co_sealed).await,
+    ];
+    let mut done = commit_seal(&pool, &world, &items).await;
+    done.sort();
+    let mut want = vec![sealed, co_sealed];
+    want.sort();
+    assert_eq!(done, want, "CALIBRATION: both claims were sealed");
+
+    assert_eq!(
+        clusters_with_a_centroid(&pool).await,
+        vec![1, 2],
+        "the centroid of a cluster whose every member is sealed must not survive the seal; a \
+         cluster that keeps an unsealed member (1) and one with no sealed member (2) keep theirs"
+    );
+
+    // A re-delivered commit finds the ciphertext rows and does nothing more.
+    assert!(commit_seal(&pool, &world, &items).await.is_empty());
+    assert_eq!(clusters_with_a_centroid(&pool).await, vec![1, 2]);
+}
+
+/// The one-off pass for claims sealed before the seal cleared clusters: the
+/// read reports exactly the centroid rows the seal would now delete, and
+/// writes nothing; the delete removes those rows and no other.
+///
+/// Verified to fail: with the read's all-members-sealed test dropped, it
+/// reports cluster 1 (a sealed member beside an unsealed one) as well.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_one_off_pass_finds_and_deletes_centroids_left_by_an_earlier_seal(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let sealed = seed_sealable_claim(&pool, &world, "sealed before the cluster step").await;
+    let co_sealed = seed_sealable_claim(&pool, &world, "also sealed before it").await;
+    let kept = seed_sealable_claim(&pool, &world, "never sealed").await;
+    let items = [
+        seal_payload(&pool, sealed).await,
+        seal_payload(&pool, co_sealed).await,
+    ];
+    assert_eq!(commit_seal(&pool, &world, &items).await.len(), 2);
+
+    // What an earlier seal left: memberships and centroids written as the
+    // clustering script writes them, the seal having touched neither.
+    place_in_cluster(&pool, sealed, 0).await;
+    place_in_cluster(&pool, co_sealed, 1).await;
+    place_in_cluster(&pool, kept, 1).await;
+    store_cluster_centroid(&pool, 0).await;
+    store_cluster_centroid(&pool, 1).await;
+
+    let (scoped, _viewer) = viewer_fixture::bypass(&pool).await;
+    let (mut conn, _lease) = scoped
+        .unscoped_for_maintenance(epigraph_db::visibility::SystemReason::PrivatizationApply)
+        .await
+        .expect("maintenance connection");
+
+    let found = PrivatizationRepository::sealed_only_cluster_centroids_conn(&mut conn, None)
+        .await
+        .expect("the dry-run read");
+    assert_eq!(
+        found,
+        vec![(CLUSTER_RUN, 0)],
+        "the read names cluster 0 only"
+    );
+    assert_eq!(
+        clusters_with_a_centroid(&pool).await,
+        vec![0, 1],
+        "the read writes nothing"
+    );
+
+    let deleted =
+        PrivatizationRepository::delete_sealed_only_cluster_centroids_conn(&mut conn, None)
+            .await
+            .expect("the delete");
+    assert_eq!(deleted, vec![(CLUSTER_RUN, 0)]);
+    assert_eq!(clusters_with_a_centroid(&pool).await, vec![1]);
+}

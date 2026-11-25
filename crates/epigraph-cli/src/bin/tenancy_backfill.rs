@@ -2227,6 +2227,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // nothing and has no lineage" (quiet, the stake that makes the owner a
     // control here).
     ("epigraph_agent_prompt_history_meta", 268),
+    // 276 (backlog aaaf3cad), the one-file prompt-history read behind 161's
+    // gate, for GET /api/v1/agents/:id/prompt-history/blobs/:hash. It reads
+    // the FORCEd `agent_succession`, `agent_prompt_snapshots` and
+    // `agent_prompt_blobs`, whose read policy admits only
+    // `epigraph_definer_bypass()`: under a non-member owner it sees no
+    // snapshot, so every file read answers "no readable snapshot names it"
+    // (a 404; quiet, the stake that makes the owner a control here).
+    ("epigraph_agent_prompt_history_blob", 276),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2859,6 +2867,21 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // no allowance, so a lapsed allowlisted row may count again: the owner is
     // load-bearing.
     ("epigraph_group_live_roster", 273),
+    // 285, an anchored passkey's recorded anchor (the BEFORE INSERT trigger
+    // that writes it from the enrollment's act, and the BEFORE UPDATE one
+    // that refuses changing it). Its reads of the FORCEd
+    // `passkey_enrollments` and `pending_admin_acts` are admitted by
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner it
+    // reads no act and records NO anchor: every anchored passkey enrolled
+    // then is refused at its first assertion (no live anchor), fail CLOSED.
+    ("epigraph_person_authenticators_anchor", 285),
+    // 285, the audit of an assertion refused on its passkey's standing. Its
+    // reads of the FORCEd `elevation_tickets`, `pending_admin_acts` and
+    // `person_authenticators`, and its `platform.` INSERT into
+    // `security_events`, are admitted only from a maintenance-owned definer
+    // frame. Under a non-member owner it reads no live ticket or act (ELV06 /
+    // ELV08, loud: the API answers 500 and the refusal still stands).
+    ("epigraph_record_passkey_standing_refusal", 285),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4057,6 +4080,15 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "public.epigraph_disclosed_role_attachments(uuid[])",
         true,
     ),
+    // 285: the ceremony pages' assertion handlers call it on the request DSN
+    // (unstamped, keyed by the ticket or act id) for every standing refusal;
+    // without the grant every such refusal answers 500 instead of its 403 /
+    // 503, still refused.
+    (
+        "epigraph_record_passkey_standing_refusal",
+        "public.epigraph_record_passkey_standing_refusal(text, uuid, uuid, text, text)",
+        true,
+    ),
     // 273: group info, the agent routes and `find_agent` / `get_agent` call it
     // on the request DSN; without the grant each is 42501.
     (
@@ -4069,6 +4101,13 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_agent_prompt_history_meta",
         "public.epigraph_agent_prompt_history_meta(uuid, integer, uuid, timestamptz, uuid, integer)",
+        true,
+    ),
+    // 276: the prompt-history file read calls it on the request DSN; without
+    // the grant every file read is 42501.
+    (
+        "epigraph_agent_prompt_history_blob",
+        "public.epigraph_agent_prompt_history_blob(uuid, bytea)",
         true,
     ),
     // 267: every edge withdrawal on the application role
@@ -4904,6 +4943,11 @@ mod definer_register_tests {
         // 207: the intake settings' audit trigger. It runs as the session
         // writing the settings row, which only a maintenance session can.
         "epigraph_bug_report_intake_settings_audit",
+        // 284: the declared-edge re-meet rule. IMMUTABLE SQL over its
+        // arguments, reads no table; called by the maintenance-owned tenancy
+        // trigger, propagation, publicize and share definers. EXECUTE is the
+        // maintenance role's alone.
+        "epigraph_edge_declared_meet",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,
@@ -5832,6 +5876,8 @@ mod definer_register_tests {
         "epigraph_events_assessment_guard",
         // 260: the edge declaration recorder.
         "epigraph_edges_record_declaration",
+        // 285: an anchored passkey's anchor, recorded and kept.
+        "epigraph_person_authenticators_anchor",
     ];
 
     /// The function names [`OPERATOR_FUNCTION_GRANTS`] checks, read from each

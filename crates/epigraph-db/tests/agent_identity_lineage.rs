@@ -500,6 +500,11 @@ async fn the_attestor_role_holds_registration_and_nothing_else_it_could_abuse(po
             false,
             true,
         ),
+        (
+            "public.epigraph_agent_prompt_history_blob(uuid, bytea)",
+            false,
+            true,
+        ),
         ("public.epigraph_role_agent_may_run(uuid)", true, true),
         (
             "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",

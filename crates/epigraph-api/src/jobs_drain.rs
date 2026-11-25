@@ -197,8 +197,10 @@ pub struct DrainReport {
     /// e8c8dd03). Nothing will move them: their job ended (most often failed
     /// by the reaper after its crash re-deliveries) and left the plan
     /// mid-flight, its claims possibly part-moved. They are reported on EVERY
-    /// run until an operator recovers them (abort, then revert), so the run
-    /// exits [`EXIT_PLAN_STRANDED`] instead of 0. Empty when there are none.
+    /// run until an operator recovers them (abort, then revert:
+    /// `epigraph-operator privatization abort|revert --plan <id>`, backlog
+    /// bb682f72), so the run exits [`EXIT_PLAN_STRANDED`] instead of 0. Empty
+    /// when there are none.
     pub stranded_privatization_plans: Vec<epigraph_jobs::StrandedPlan>,
 }
 

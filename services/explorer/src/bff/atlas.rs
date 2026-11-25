@@ -7,7 +7,7 @@
 //! |---|---|
 //! | `layout` | `GET /graph/themes/layout` (packed fallback: `/bff/themes`) |
 //! | `theme/{id}/claims` | `POST /search/semantic` (`theme_core`), then `POST /claims/batch-get` |
-//! | `claim/{id}` | `GET /claims/:id/context` + `/claims/:id/placement` (fallback `GET /claims/:id`) |
+//! | `claim/{id}` | `GET /claims/:id/context` + `/claims/:id/placement`, then `GET /claims/:id` for the provenance section (also the fallback when the context fails) |
 //! | `links` | `GET /graph/links` |
 //! | `search` | `POST /search/semantic` or `GET /claims/by-labels` |
 //! | `resolve/{key}` | `GET /claims/:id/placement` |
@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::{RequestAuth, SignedIn};
+use crate::bff::atlas_provenance::{provenance_out, ProvenanceOut};
 use crate::bff::graph::{one_line, parse_id, relationship_family, themes_body_cached, LABEL_CHARS};
 use crate::error::AppError;
 use crate::links::Links;
@@ -61,10 +62,9 @@ use crate::upstream::atlas::{
     ContextPaper, GraphLinks, LayoutLink, LayoutQuery, LayoutRegion, LayoutRun, LinkEnd,
     LinksQuery, RelCount, ThemesLayout, BATCH_GET_MAX_IDS,
 };
+use crate::upstream::atlas_provenance::ClaimRead;
 use crate::upstream::core::{LabelHit, SemanticHit, THEME_ID_IGNORED};
-use crate::upstream::{
-    Api, ClaimResponse, Degraded, EdgeDirection, PlacementResponse, UpstreamError,
-};
+use crate::upstream::{Api, Degraded, EdgeDirection, PlacementResponse, UpstreamError};
 
 /// Most items in any one array of a BFF body.
 pub const ATLAS_ITEM_CAP: usize = 200;
@@ -1566,6 +1566,8 @@ struct ClaimFullBody {
     contested: Degraded<Contested>,
     placement: Degraded<PlacementOut>,
     ring: Degraded<Ring>,
+    /// Who filed the claim, from `authored_by` on `GET /claims/:id` (P3b).
+    provenance: Degraded<ProvenanceOut>,
 }
 
 #[derive(Serialize)]
@@ -1668,11 +1670,14 @@ async fn claim_full(
             if tokio::time::Instant::now() >= deadline {
                 return Err(atlas_id_err("claim")(e));
             }
-            let fallback: ClaimResponse =
-                match tokio::time::timeout_at(deadline, api.claim(id)).await {
-                    Ok(r) => r.map_err(atlas_id_err("claim"))?,
-                    Err(_) => return Err(atlas_id_err("claim")(e)),
-                };
+            let read: ClaimRead = match tokio::time::timeout_at(deadline, api.claim_read(id)).await
+            {
+                Ok(r) => r.map_err(atlas_id_err("claim"))?,
+                Err(_) => return Err(atlas_id_err("claim")(e)),
+            };
+            let provenance =
+                provenance_out(read.authored_by.as_ref(), read.claim.created_at, links);
+            let fallback = read.claim;
             let reason = match e {
                 UpstreamError::NotFound { .. } => {
                     "Linked claims are not available from this EpiGraph API yet."
@@ -1694,6 +1699,7 @@ async fn claim_full(
                 contested: Degraded::unavailable(reason),
                 placement,
                 ring: Degraded::unavailable(reason),
+                provenance,
             });
         }
         Err(other) => return Err(atlas_id_err("claim")(other)),
@@ -1708,6 +1714,9 @@ async fn claim_full(
         Some(e) => Degraded::ok(contested_from(&e.by_relationship)),
         None => Degraded::unavailable("Linked claims are not available right now."),
     };
+    // Only once the context read succeeded: a claim the context refused is
+    // never read again here (the 403 and 404 answers stay as they are).
+    let provenance = provenance_section(&api, id, deadline, links).await?;
     finish(&ClaimFullBody {
         claim: centre_out(
             id,
@@ -1722,7 +1731,36 @@ async fn claim_full(
         contested,
         placement,
         ring: Degraded::ok(ring_out(&ctx, &cx)),
+        provenance,
     })
+}
+
+/// The provenance section: one `GET /claims/:id` inside the route budget. A
+/// failed or late read degrades this section only; an ended session still
+/// ends the request.
+async fn provenance_section(
+    api: &Api<'_>,
+    id: Uuid,
+    deadline: tokio::time::Instant,
+    links: &Links,
+) -> Result<Degraded<ProvenanceOut>, AppError> {
+    let late = || Ok(Degraded::unavailable(UpstreamError::Timeout.user_message()));
+    if tokio::time::Instant::now() >= deadline {
+        return late();
+    }
+    match tokio::time::timeout_at(deadline, api.claim_read(id)).await {
+        Err(_) => late(),
+        Ok(Ok(read)) => Ok(provenance_out(
+            read.authored_by.as_ref(),
+            read.claim.created_at,
+            links,
+        )),
+        Ok(Err(UpstreamError::SessionExpired)) => Err(AppError::SessionExpired),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "claim provenance unavailable");
+            Ok(Degraded::unavailable(e.user_message()))
+        }
+    }
 }
 
 async fn claim_page(

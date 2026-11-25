@@ -130,6 +130,13 @@ const DYNAMIC_READERS: &[DynamicReader] = &[
               pool's); their calls pass the file's `*_ENV` constants",
     },
     DynamicReader {
+        file: "crates/epigraph-cli/src/atlas_nightly/offbox.rs",
+        lookups: &[],
+        computed: 1,
+        why: "`kept_env`'s pass-through of the file's `KEPT_ENV` (PATH, HOME, LANG: platform \
+              variables) into the off-box command's otherwise cleared environment",
+    },
+    DynamicReader {
         file: "crates/epigraph-cli/src/operator/client_scope.rs",
         lookups: &[],
         computed: 1,

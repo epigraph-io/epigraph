@@ -879,9 +879,11 @@ async fn d4_a_maintenance_login_that_grants_itself_leaves_a_ledger_row_it_cannot
     }
     login::drop_login(&pool, &role, login).await;
 
+    // Since 274 the fixture's retraction leaves a consumed `retract` grant
+    // for the row too; this arm is about the purge grant.
     let rows: Vec<LedgerRow> = sqlx::query_as(
         "SELECT kind, reason, grant_login::text, consumed_login::text, consumed_row \
-               FROM public.mass_function_purge_grants WHERE mf_id = $1",
+               FROM public.mass_function_purge_grants WHERE mf_id = $1 AND kind <> 'retract'",
     )
     .bind(w.retracted)
     .fetch_all(&pool)
@@ -1384,8 +1386,11 @@ async fn e_the_purge_definer_deletes_audits_and_keeps_its_grants(pool: PgPool) {
     assert!(!exists(&pool, "mass_functions", w.live).await);
     assert!(!exists(&pool, "mass_functions", edge_row).await);
 
+    // Since 274 the fixture's retraction leaves a consumed `retract` grant;
+    // this arm counts the purge's own grants.
     let grants: Vec<(Uuid, String, Option<serde_json::Value>)> = sqlx::query_as(
-        "SELECT mf_id, kind, consumed_row FROM public.mass_function_purge_grants ORDER BY id",
+        "SELECT mf_id, kind, consumed_row FROM public.mass_function_purge_grants \
+          WHERE kind <> 'retract' ORDER BY id",
     )
     .fetch_all(&pool)
     .await
@@ -1882,13 +1887,38 @@ async fn at_head_the_rebody_and_the_new_definers_pin_pg_temp_last(pool: PgPool) 
 /// (k) `docs/runbooks/194-undo.sql` removes every object 194 created, restores
 /// 117's body (its md5) stating `pg_catalog, public, pg_temp`, after which a
 /// retracted row is deletable again; and 194's own text then applies again
-/// over the undone state (its precondition accepts it).
+/// over the undone state (its precondition accepts it). While 274 is applied
+/// the undo refuses (55000, nothing changed).
 #[sqlx::test(migrations = "../../migrations")]
 async fn k_the_undo_restores_117s_body_and_removes_every_new_object(pool: PgPool) {
     let undo = repo_file("docs/runbooks/194-undo.sql");
     let m194 = repo_file("migrations/194_retracted_bba_delete_guard.sql");
     let w = world(&pool).await;
 
+    // Undo runs newest first: 274's retract definer writes the ledger that
+    // 194's undo drops, so 194's undo refuses (55000, nothing changed) until
+    // 274 is undone (its runbook's ORDER).
+    let mut conn = pool.acquire().await.expect("acquire");
+    let refused = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("ROLLBACK");
+    drop(conn);
+    let e = refused.expect_err("194's undo refuses while 274 is applied");
+    assert_eq!(
+        e.as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string()))
+            .as_deref(),
+        Some("55000"),
+        "{e}"
+    );
+    assert!(e.to_string().contains("274"), "{e}");
+    proc_exists(&pool, PURGE_DEFINER).await;
+    sqlx::raw_sql(&repo_file("docs/runbooks/274-undo.sql"))
+        .execute(&pool)
+        .await
+        .expect("274's undo runs first");
     sqlx::raw_sql(&undo)
         .execute(&pool)
         .await

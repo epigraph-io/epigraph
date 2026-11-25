@@ -103,6 +103,16 @@
 //! sits in the same slot) was never counted and withdraws nothing. A track
 //! parameter never drops below the prior's `1.0`.
 //!
+//! # A widening act rebuilds the track (backlog 6e4ff46e)
+//!
+//! `publicize_claims` and `share_claims_with_team` widen a claim's audience
+//! while evidence pinned to the old audience stays behind. The track counted
+//! that evidence, so the act rebuilds it from the rows the new audience may
+//! read ([`rebuild_beta_track`]: from the prior, admissible rows only) in the
+//! act's transaction. That rebuild is the one place the track is recomputed
+//! rather than incremented, and it states where it differs from the live
+//! count.
+//!
 //! # Best-effort, under a SAVEPOINT
 //!
 //! Both records are derived. Neither may fail the submission that produced
@@ -162,7 +172,10 @@ pub fn beta_increments(bba: &MassFunction, hypothesis_index: Option<i32>) -> (f6
 /// (`auto_wire`), the vacuous hypothesis prior (`prior`), experiment
 /// evidence (`error_derived`). (`update_with_evidence` counts its BBA but
 /// files it under a perspective of its own, so no evidence write replaces it.)
-const COUNTED_METHODS: &[&str] = &[
+///
+/// [`rebuild_beta_track`] counts the rows stored under these methods, beside
+/// the `auto_wire` evidence rows, when it rebuilds a track.
+pub const COUNTED_METHODS: &[&str] = &[
     "discount",
     "Conjunctive",
     "Dempster",
@@ -368,6 +381,103 @@ pub fn replay_beta_params<'a>(
 ) -> (f64, f64) {
     bbas.into_iter().fold(start, |params, (bba, index)| {
         with_increments(params, Some(beta_increments(bba, index)))
+    })
+}
+
+/// What [`rebuild_beta_track`] did to one claim's track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RebuiltTrack {
+    /// The parameters written.
+    pub params: (f64, f64),
+    /// Rows the live writers count that the rebuild counted (admissible).
+    pub counted: usize,
+    /// Rows the live writers count that the rebuild left out: inadmissible
+    /// for the claim's audience, or unparsable.
+    pub left_out: usize,
+}
+
+/// Rebuild `claim_id`'s Beta track from the evidence its CURRENT audience may
+/// read (backlog 6e4ff46e): reset it to the `Beta(1, 1)` prior and replay,
+/// oldest first, every BBA a live writer counts
+/// (`ClaimRepository::beta_track_inputs`: the [`COUNTED_METHODS`] rows and
+/// the `auto_wire` evidence rows) that may enter the claim's cache
+/// (`crate::derivation_scope::retain_for_cache`, the rule the act's refold
+/// uses), by [`replay_beta_params`].
+///
+/// Run by the widening acts (`crate::visibility_act`) after the definer has
+/// moved the claim. The track the claim carried was accumulated from every
+/// BBA its OLD audience could read, including one citing evidence that stays
+/// behind; served unchanged, its posterior (and the divergence row the next
+/// live write records from it) would carry that evidence's direction and
+/// weight to the new audience. The rebuilt value is a function of admissible
+/// rows only. It is not subtracted from the old track: the floor at the prior
+/// and the withdrawals of replaced rows make the old track's history
+/// unrecoverable, and a subtraction would keep whatever it failed to remove.
+///
+/// It can differ from the track the live writers would have built from the
+/// same rows: it counts a row a live writer stored without moving the track
+/// (a non-owner's evidence on a claim it does not write, a row stored before
+/// its writer kept the track), rows that share a counted method with a
+/// writer that keeps no track (REST `POST /claims/:id/assess` stores
+/// `discount` rows; `backfill_factors` stores `auto_wire` evidence rows), and
+/// each row at the claim's current hypothesis index; and it drops the
+/// increments of rows since retracted. A row whose masses or frame do not
+/// parse is left out (logged), never counted.
+///
+/// The write is gated on the claim's group, as the live update is. The act
+/// has already refused a session that cannot write a moved claim, so a write
+/// that touches no row is an error here, not a skip: the stale track would
+/// otherwise be served to the new audience.
+///
+/// # Errors
+/// A database read or write, or a write that touched no row.
+pub async fn rebuild_beta_track(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    claim_id: Uuid,
+) -> Result<RebuiltTrack, String> {
+    let rows = ClaimRepository::beta_track_inputs(&mut *conn, viewer, claim_id, COUNTED_METHODS)
+        .await
+        .map_err(|e| format!("beta_track_inputs: {e}"))?;
+    let total = rows.len();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let admissible =
+        epigraph_db::repos::derivation_scope::DerivationScopeRepository::cache_admissible(
+            &mut *conn, &ids,
+        )
+        .await
+        .map_err(|e| format!("derivation scope read: {e}"))?;
+    let mut parsed: Vec<(MassFunction, Option<i32>)> = Vec::new();
+    for row in rows.into_iter().filter(|r| admissible.contains(&r.id)) {
+        let bba = FrameOfDiscernment::new(row.frame_name.clone(), row.hypotheses.clone())
+            .map_err(|e| e.to_string())
+            .and_then(|frame| {
+                MassFunction::from_json_masses(frame, &row.masses).map_err(|e| e.to_string())
+            });
+        match bba {
+            Ok(bba) => parsed.push((bba, row.hypothesis_index)),
+            Err(e) => tracing::warn!(
+                %claim_id,
+                bba = %row.id,
+                "Beta-track rebuild: BBA does not parse, left out: {e}"
+            ),
+        }
+    }
+    let params = replay_beta_params((1.0, 1.0), parsed.iter().map(|(bba, idx)| (bba, *idx)));
+    let written =
+        ClaimRepository::set_beta_params(&mut *conn, viewer, claim_id, params.0, params.1)
+            .await
+            .map_err(|e| format!("set_beta_params: {e}"))?;
+    if !written {
+        return Err(format!(
+            "claim {claim_id}: the rebuilt Beta track was not written (the session does not \
+             write the claim's group)"
+        ));
+    }
+    Ok(RebuiltTrack {
+        params,
+        counted: parsed.len(),
+        left_out: total - parsed.len(),
     })
 }
 

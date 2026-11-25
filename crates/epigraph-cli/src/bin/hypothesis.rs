@@ -125,8 +125,11 @@ async fn run(
                     return Err("exactly one of --public / --group <uuid> is required".into())
                 }
             };
+            let embedder = epigraph_cli::embedding_service()
+                .ok_or("OPENAI_API_KEY not set — embeddings required for hypothesis creation")?;
             create(
                 &pool,
+                embedder.as_ref(),
                 &statement,
                 tenancy,
                 search_radius,
@@ -142,6 +145,7 @@ async fn run(
 
 async fn create(
     pool: &sqlx::PgPool,
+    embedder: &dyn epigraph_embeddings::EmbeddingService,
     statement: &str,
     tenancy: TenancyChoice,
     search_radius: f64,
@@ -149,8 +153,6 @@ async fn create(
     research_question: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Embed the hypothesis
-    let embedder = epigraph_cli::embedding_service()
-        .ok_or("OPENAI_API_KEY not set — embeddings required for hypothesis creation")?;
     let embedding = embedder
         .generate(statement)
         .await
@@ -160,14 +162,22 @@ async fn create(
     let content_hash = epigraph_crypto::ContentHasher::hash(statement.as_bytes());
     let embedding_str = epigraph_db::pgvector_literal(&embedding);
 
+    // Everything from here on is ONE transaction (backlog 2e64b8a2): the
+    // claim, its frame row, the cached VOI score and the vacuous prior commit
+    // together or not at all. Each used to run on the pool by itself, so a
+    // failure part-way (no `hypothesis_assessment` frame, a refused write)
+    // left a hypothesis claim with no frame, no prior or no score, and a
+    // retry duplicated the claim. The embedding above is the one network
+    // call, made before the transaction opens.
+    let mut tx = pool.begin().await?;
+
     // Tenancy declaration (PR-16). `--public` owns the row with the AUTHOR's
     // personal group, not the world group: §8.2 A4 asserts no claim is
     // world-owned, and `public` is about who may read, not about who owns.
     let decl = match tenancy {
         TenancyChoice::Group(g) => epigraph_core::TenancyDecl::group(g),
         TenancyChoice::Public => {
-            let mut conn = pool.acquire().await?;
-            epigraph_db::ClaimRepository::default_decl_for_author(&mut conn, agent_id).await?
+            epigraph_db::ClaimRepository::default_decl_for_author(&mut tx, agent_id).await?
         }
     };
 
@@ -189,13 +199,13 @@ async fn create(
     .bind(&embedding_str)
     .bind(decl.visibility_bind())
     .bind(decl.owner_group_bind())
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
     // 3. Add to hypothesis_assessment frame
     let frame_id: (Uuid,) =
         sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| format!("hypothesis_assessment frame not found: {e}"))?;
 
@@ -204,7 +214,7 @@ async fn create(
     )
     .bind(claim_id.0)
     .bind(frame_id.0)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     // 4. Compute VOI
@@ -229,7 +239,7 @@ async fn create(
     .bind(&embedding_str)
     .bind(claim_id.0)
     .bind(search_radius)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
 
     let voi_neighbors: Vec<epigraph_engine::Neighbor> = neighbors
@@ -243,29 +253,34 @@ async fn create(
 
     let voi = epigraph_engine::compute_voi(&voi_neighbors);
 
-    // 5. Cache VOI
+    // 5. Cache VOI. Its error is the command's error: it used to be
+    //    discarded (`.ok()`), so the command printed a score it never stored.
     sqlx::query("UPDATE claims SET properties = properties || $2 WHERE id = $1")
         .bind(claim_id.0)
         .bind(serde_json::json!({"voi_score": voi.score}))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
-        .ok();
+        .map_err(|e| format!("caching the VOI score failed: {e}"))?;
 
     // 6. Submit vacuous prior
     let vacuous_masses = serde_json::json!({"0,1": 1.0});
-    epigraph_db::MassFunctionRepository::store(
-        pool,
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &mut *tx,
         claim_id.0,
         frame_id.0,
         Some(agent_id),
+        None, // no perspective
         &vacuous_masses,
         None,
         Some("prior"),
+        None,      // no source-strength discount
         None,      // vacuous prior: not evidence, so no evidence type (bc06ec6f)
         "unknown", // vacuous prior; no evidence yet (issue #197)
         None,      // vacuous prior — no evidence row (issue #197 Phase 3)
     )
     .await?;
+
+    tx.commit().await?;
 
     println!("Hypothesis created: {}", claim_id.0);
     println!("VOI score: {:.3}", voi.score);
@@ -549,4 +564,149 @@ async fn promote(
     println!("Research validity frame: {}", rv_frame.0);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! `hypothesis create` is one transaction (backlog 2e64b8a2): the claim,
+    //! its `claim_frames` row, the cached VOI score and the vacuous prior
+    //! commit together or not at all. Each statement used to run on the pool
+    //! by itself, so a failure part-way left a hypothesis claim with no
+    //! frame, no prior or no score, and the VOI cache write's error was
+    //! discarded (`.ok()`), so the command reported success without it.
+
+    use super::*;
+    use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+    use sqlx::PgPool;
+
+    fn embedder() -> MockProvider {
+        MockProvider::new(EmbeddingConfig::openai(1536))
+    }
+
+    async fn author(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, created_at, updated_at) \
+             VALUES ($1, sha256($1::text::bytea), NOW(), NOW())",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("insert the author");
+        id
+    }
+
+    async fn hypothesis_frame(pool: &PgPool) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO frames (name, hypotheses) \
+             VALUES ('hypothesis_assessment', ARRAY['true','false']::text[]) RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("seed the hypothesis_assessment frame")
+    }
+
+    /// `(claims, claim_frames rows, BBAs)` of the hypotheses whose content is
+    /// `statement`.
+    async fn written(pool: &PgPool, statement: &str) -> (i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM claims WHERE content = $1), \
+                    (SELECT count(*) FROM claim_frames cf JOIN claims c ON c.id = cf.claim_id \
+                      WHERE c.content = $1), \
+                    (SELECT count(*) FROM mass_functions m JOIN claims c ON c.id = m.claim_id \
+                      WHERE c.content = $1)",
+        )
+        .bind(statement)
+        .fetch_one(pool)
+        .await
+        .expect("count what create wrote")
+    }
+
+    async fn run_create(pool: &PgPool, agent: Uuid, statement: &str) -> Result<(), String> {
+        create(
+            pool,
+            &embedder(),
+            statement,
+            TenancyChoice::Public,
+            0.3,
+            agent,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// Calibration: with the frame present every part is written, the VOI
+    /// score included.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_writes_the_claim_its_frame_row_its_prior_and_its_voi(pool: PgPool) {
+        let agent = author(&pool).await;
+        hypothesis_frame(&pool).await;
+        let statement = "2e64b8a2 calibration hypothesis";
+        run_create(&pool, agent, statement)
+            .await
+            .expect("create succeeds");
+        assert_eq!(written(&pool, statement).await, (1, 1, 1));
+        let voi: Option<f64> = sqlx::query_scalar(
+            "SELECT (properties->>'voi_score')::float8 FROM claims WHERE content = $1",
+        )
+        .bind(statement)
+        .fetch_one(&pool)
+        .await
+        .expect("read the cached score");
+        assert!(voi.is_some(), "the VOI score is cached on the claim");
+    }
+
+    /// No `hypothesis_assessment` frame: create fails after the claim INSERT,
+    /// and that INSERT must not survive it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_create_that_fails_after_the_claim_insert_leaves_no_claim(pool: PgPool) {
+        let agent = author(&pool).await;
+        let statement = "2e64b8a2 hypothesis with no frame";
+        let err = run_create(&pool, agent, statement)
+            .await
+            .expect_err("no hypothesis_assessment frame");
+        assert!(err.contains("hypothesis_assessment"), "{err}");
+        assert_eq!(
+            written(&pool, statement).await,
+            (0, 0, 0),
+            "a failed create writes nothing"
+        );
+    }
+
+    /// The VOI cache write is refused (a trigger stands in for any refusal,
+    /// e.g. row security): create reports the failure and writes nothing,
+    /// instead of answering success with no score stored.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_refused_voi_cache_write_fails_the_create_and_writes_nothing(pool: PgPool) {
+        let agent = author(&pool).await;
+        hypothesis_frame(&pool).await;
+        sqlx::query(
+            "CREATE FUNCTION zz_refuse_voi() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF NEW.properties ? 'voi_score' THEN RAISE EXCEPTION 'voi cache refused'; END IF; \
+               RETURN NEW; \
+             END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("create the refusing function");
+        sqlx::query(
+            "CREATE TRIGGER zz_refuse_voi BEFORE UPDATE ON claims \
+             FOR EACH ROW EXECUTE FUNCTION zz_refuse_voi()",
+        )
+        .execute(&pool)
+        .await
+        .expect("create the refusing trigger");
+        let statement = "2e64b8a2 hypothesis whose score is refused";
+        let err = run_create(&pool, agent, statement)
+            .await
+            .expect_err("the VOI cache write is refused");
+        assert!(err.contains("voi cache refused"), "{err}");
+        assert_eq!(
+            written(&pool, statement).await,
+            (0, 0, 0),
+            "a failed create writes nothing"
+        );
+    }
 }

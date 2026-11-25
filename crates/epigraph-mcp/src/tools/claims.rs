@@ -1718,7 +1718,14 @@ pub async fn update_with_evidence(
         epigraph_db::EvidenceEdge::new(Some(server.edge_signing_key().await?), params.supports),
     )
     .await
-    .map_err(internal_error)?;
+    // A claim this caller can read but not write (not public, so not
+    // migration 114's attach): the evidence inherits the claim's group and
+    // row security refuses it. A named refusal, not an internal error
+    // (backlog 1c93eec8); `tx` is dropped, so nothing is written. On a
+    // foreign PUBLIC claim the same refusal has a different cause (no
+    // writable personal or operator group to own the attachment), so it takes
+    // its own refusal.
+    .map_err(|e| evidence_insert_error(e, claim_id, foreign_claim))?;
 
     let before = claim.truth_value.value();
     let strength = params.strength.clamp(0.0, 1.0);
@@ -2871,6 +2878,115 @@ async fn gate_retirement_label(
     Ok(Some(grant))
 }
 
+/// Whether `e` is the database's UNCODED row-security refusal of a write to
+/// `table` (`42501`, "new row violates row-level security policy ... for table
+/// \"<table>\""): a tenancy `WITH CHECK` refused the stamp. A CODED `42501` a
+/// trigger raises (a designed refusal with its own text), or a row-security
+/// refusal on any OTHER table, is not this.
+fn refused_by_row_security_on(e: &epigraph_db::DbError, table: &str) -> bool {
+    matches!(
+        e,
+        epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
+            if d.code().as_deref() == Some("42501")
+                && d.message().starts_with("new row violates row-level security policy")
+                && d.message().ends_with(&format!("for table \"{table}\""))
+    )
+}
+
+/// The `data.rule` of [`evidence_not_writer`].
+pub const EVIDENCE_NOT_WRITER_RULE: &str = "evidence_requires_claim_group_writer";
+
+/// The named refusal for `update_with_evidence` on a claim the caller can read
+/// but whose owning group its stamp cannot write (backlog 1c93eec8): a claim
+/// that is not public (so migration 114's non-owner attach does not apply)
+/// in a group where the caller is, say, a reader.
+///
+/// The evidence row inherits the claim's group, so the database refuses its
+/// INSERT with an uncoded `42501`, before the DS wiring or the truth write
+/// run. That is a denial of authority, so it is `INVALID_REQUEST` like
+/// [`label_not_writer`], not the `INTERNAL_ERROR` a server fault takes: no
+/// retry of the same request can succeed. It does not name the owning group,
+/// and unlike [`label_not_writer`] it names no admin path, because this tool
+/// has none.
+fn evidence_not_writer(claim_id: Uuid) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "cannot attach evidence to claim {claim_id}: the claim is not public and is owned \
+             by a group this write's identity holds no live writer or admin membership in, so \
+             the database refused the write; nothing was written. Attach it as a writer of \
+             that group"
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_writer",
+            "rule": EVIDENCE_NOT_WRITER_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// The `data.rule` of [`evidence_attach_no_home_group`].
+pub const EVIDENCE_ATTACH_NO_HOME_GROUP_RULE: &str = "evidence_attach_requires_writable_home_group";
+
+/// The named refusal for `update_with_evidence` on a PUBLIC claim the caller
+/// does not own (migration 114's non-owner attach) when the attachment has no
+/// group to be owned by.
+///
+/// Migration 114 owns an attachment to a foreign public claim by
+/// `epigraph_writer_group()`: the caller's personal group, or its operator's
+/// for an operated agent, and only when the stamp can write that group. A
+/// caller whose stamp writes some other group but neither of those gets NULL,
+/// the row falls back to the claim's group, and row security refuses it with
+/// the same uncoded `42501` as [`evidence_not_writer`]. The claim IS public
+/// and joining its owning group is not the remedy, so this refusal says so
+/// rather than reusing that text. Same class (`INVALID_REQUEST`, not
+/// retryable, no group id).
+fn evidence_attach_no_home_group(claim_id: Uuid) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "cannot attach evidence to public claim {claim_id}: evidence a non-owner attaches \
+             to a public claim is owned by the caller's own personal group (or its operator's \
+             personal group), and this write's identity holds no live writer membership in \
+             either, so the database refused the write; nothing was written. Attach it from \
+             an identity that can write its own personal group"
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_writer",
+            "rule": EVIDENCE_ATTACH_NO_HOME_GROUP_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// Map the error of `update_with_evidence`'s evidence INSERT: the uncoded
+/// row-security refusal on `evidence` is [`evidence_not_writer`] on a claim
+/// that is not foreign-public, and [`evidence_attach_no_home_group`] on one
+/// that is (`foreign_claim`, measured on the same transaction before the
+/// INSERT); everything else keeps [`internal_error`], so a coded refusal or a
+/// fault still reaches the caller as it did before.
+fn evidence_insert_error(e: epigraph_db::DbError, claim_id: Uuid, foreign_claim: bool) -> McpError {
+    if refused_by_row_security_on(&e, "evidence") {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            claim_id = %claim_id,
+            tool = "update_with_evidence",
+            foreign_claim,
+            error = %e,
+            "evidence write refused by row security: the row's owning group is not in the \
+             stamp's writable set; nothing was written"
+        );
+        return if foreign_claim {
+            evidence_attach_no_home_group(claim_id)
+        } else {
+            evidence_not_writer(claim_id)
+        };
+    }
+    internal_error(e)
+}
+
 /// The `data.rule` of [`label_not_writer`].
 pub const LABEL_NOT_WRITER_RULE: &str = "label_requires_claim_group_writer";
 
@@ -2920,14 +3036,7 @@ fn label_not_writer(claim_id: Uuid, action: &str) -> McpError {
 /// writable set, so it changes the ANSWER only, never which writes are
 /// admitted: the database's own decision stays the one that counts.
 fn label_write_error(e: epigraph_db::DbError, claim_id: Uuid, action: &str) -> McpError {
-    let refused_by_row_security = matches!(
-        &e,
-        epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
-            if d.code().as_deref() == Some("42501")
-                && d.message().starts_with("new row violates row-level security policy")
-                && d.message().ends_with("for table \"claims\"")
-    );
-    if refused_by_row_security {
+    if refused_by_row_security_on(&e, "claims") {
         tracing::warn!(
             target: "tenancy.scoped_write",
             claim_id = %claim_id,
@@ -3827,6 +3936,117 @@ mod tests {
                 "{e:?} -> {m}"
             );
             assert!(!m.contains("5c1e") && !m.contains("ASSIGN"), "{e:?} -> {m}");
+        }
+    }
+
+    mod evidence_insert_error_tests {
+        //! Which database errors `update_with_evidence`'s evidence INSERT names
+        //! (backlog 1c93eec8): only the UNCODED row-security refusal on
+        //! `evidence` itself, split by whether the claim is foreign-public. A
+        //! coded `42501` a trigger raises, a row-security refusal on another
+        //! table, and any other fault keep `internal_error`. The two named
+        //! arms are measured end to end in
+        //! `tests/update_with_evidence_not_writer_refusal.rs`; the negative
+        //! arms cannot be produced on demand through the tool, so they are
+        //! pinned here on a synthetic database error.
+        use super::super::{
+            evidence_insert_error, EVIDENCE_ATTACH_NO_HOME_GROUP_RULE, EVIDENCE_NOT_WRITER_RULE,
+        };
+        use rmcp::model::ErrorCode;
+        use std::borrow::Cow;
+
+        #[derive(Debug)]
+        struct FakeDbError {
+            code: &'static str,
+            message: String,
+        }
+        impl std::fmt::Display for FakeDbError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.message)
+            }
+        }
+        impl std::error::Error for FakeDbError {}
+        impl sqlx::error::DatabaseError for FakeDbError {
+            fn message(&self) -> &str {
+                &self.message
+            }
+            fn code(&self) -> Option<Cow<'_, str>> {
+                Some(Cow::Borrowed(self.code))
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+
+        fn db_error(code: &'static str, message: &str) -> epigraph_db::DbError {
+            epigraph_db::DbError::QueryFailed {
+                source: sqlx::Error::Database(Box::new(FakeDbError {
+                    code,
+                    message: message.to_string(),
+                })),
+            }
+        }
+
+        const RLS_ON_EVIDENCE: &str =
+            "new row violates row-level security policy for table \"evidence\"";
+
+        #[test]
+        fn the_uncoded_refusal_on_evidence_is_named_by_claim_kind() {
+            let claim = uuid::Uuid::new_v4();
+            let e = evidence_insert_error(db_error("42501", RLS_ON_EVIDENCE), claim, false);
+            assert_eq!(e.code, ErrorCode::INVALID_REQUEST, "{e:?}");
+            let data = e.data.clone().expect("data");
+            assert_eq!(data["rule"], EVIDENCE_NOT_WRITER_RULE, "{e:?}");
+            assert!(e.message.contains("is not public"), "{e:?}");
+
+            let e = evidence_insert_error(db_error("42501", RLS_ON_EVIDENCE), claim, true);
+            assert_eq!(e.code, ErrorCode::INVALID_REQUEST, "{e:?}");
+            let data = e.data.clone().expect("data");
+            assert_eq!(data["error"], "not_writer", "{e:?}");
+            assert_eq!(data["rule"], EVIDENCE_ATTACH_NO_HOME_GROUP_RULE, "{e:?}");
+            assert!(
+                !e.message.contains("is not public"),
+                "a foreign PUBLIC claim's refusal must not call it not public: {e:?}"
+            );
+        }
+
+        #[test]
+        fn other_refusals_and_faults_stay_internal_errors() {
+            let claim = uuid::Uuid::new_v4();
+            for foreign in [false, true] {
+                for (code, message) in [
+                    // A coded refusal a trigger raises with its own text.
+                    ("42501", "permission denied: designed trigger refusal"),
+                    // Row security on a table OTHER than evidence.
+                    (
+                        "42501",
+                        "new row violates row-level security policy for table \"mass_functions\"",
+                    ),
+                    // The right text under another SQLSTATE.
+                    ("23514", RLS_ON_EVIDENCE),
+                ] {
+                    let e = evidence_insert_error(db_error(code, message), claim, foreign);
+                    assert_eq!(
+                        e.code,
+                        ErrorCode::INTERNAL_ERROR,
+                        "({code}, {message:?}, foreign={foreign}) must stay an internal error: \
+                         {e:?}"
+                    );
+                    assert!(
+                        e.data.as_ref().is_none_or(|d| d.get("rule").is_none()),
+                        "no named rule on an internal error: {e:?}"
+                    );
+                }
+            }
         }
     }
 }

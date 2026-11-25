@@ -39,17 +39,26 @@ impl Run {
     }
 }
 
+/// Runs the binary with `EPIGRAPH_ENV=test`: a `#[sqlx::test]` database is
+/// named `_sqlx_test_*`, which does not end in `_test`, and `--allow-mock`
+/// is refused on any other database (backlog bb710d7b).
 async fn run_bin(pool: &PgPool, args: &[&str]) -> Run {
+    run_bin_in(pool, args, Some("test")).await
+}
+
+async fn run_bin_in(pool: &PgPool, args: &[&str], epigraph_env: Option<&str>) -> Run {
     let url = viewer_fixture::database_url_for(pool).await;
-    let out = Command::new(BIN)
-        .env_clear()
+    let mut cmd = Command::new(BIN);
+    cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("DATABASE_URL", &url)
         .env("RUST_LOG", "warn")
         .current_dir(std::env::temp_dir())
-        .args(args)
-        .output()
-        .expect("run embed_backfill");
+        .args(args);
+    if let Some(env) = epigraph_env {
+        cmd.env("EPIGRAPH_ENV", env);
+    }
+    let out = cmd.output().expect("run embed_backfill");
     Run {
         code: out.status.code(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -304,4 +313,77 @@ async fn workflow_leg_counts_a_vanished_row_as_failed(pool: PgPool) {
             failed: 1
         }
     );
+}
+
+/// Backlog bb710d7b: `--allow-mock` on a database that is not a test one (its
+/// name does not end in `_test`, and `EPIGRAPH_ENV` is not `test`) is
+/// refused before anything is read or written: mock vectors in a
+/// production `claims.embedding` or `workflows.goal_embedding` look like
+/// real ones to every recall search and are never refilled (the backfill
+/// selects NULL rows only). It used to log a WARN and write them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn allow_mock_is_refused_on_a_database_that_is_not_a_test_one(pool: PgPool) {
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("read the database name");
+    assert!(
+        !db.ends_with("_test"),
+        "CALIBRATION: a #[sqlx::test] database is not named for tests: {db}"
+    );
+    let agent: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type, labels) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), 'bb710d7b-bin', 'system', ARRAY['test']) \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed agent");
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current) \
+         VALUES ('bb710d7b claim needing an embedding', sha256(gen_random_uuid()::text::bytea), \
+                 0.5, $1, true) RETURNING id",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed claim");
+    let wf = seed_unembedded_workflow(&pool, "bb710d7b refusal probe goal").await;
+
+    for env in [None, Some("production"), Some("development")] {
+        let run = run_bin_in(&pool, &["--allow-mock"], env).await;
+        assert_ne!(
+            run.code,
+            Some(0),
+            "EPIGRAPH_ENV={env:?}; stdout: {}",
+            run.stdout
+        );
+        assert!(
+            run.stderr.contains("--allow-mock") && run.stderr.contains(&db),
+            "the refusal names the flag and the database; EPIGRAPH_ENV={env:?}; stderr: {}",
+            run.stderr
+        );
+        assert!(
+            !run.stdout.contains("embedded"),
+            "nothing ran; stdout: {}",
+            run.stdout
+        );
+    }
+    let claim_embedded: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the claim embedding");
+    assert!(!claim_embedded, "no mock vector was written to the claim");
+    assert_eq!(
+        goal_embedding_dims(&pool, wf).await,
+        None,
+        "no mock vector was written to the workflow"
+    );
+
+    // The same database with EPIGRAPH_ENV=test is allowed, and writes.
+    let run = run_bin_in(&pool, &["--allow-mock"], Some("test")).await;
+    assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+    assert_eq!(goal_embedding_dims(&pool, wf).await, Some(1536));
 }

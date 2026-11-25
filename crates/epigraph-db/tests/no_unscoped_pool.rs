@@ -337,7 +337,6 @@
 //!   Enumerated so no shard author mistakes this table for complete —
 //!   `middleware/provenance.rs::record_provenance`,
 //!   `oauth/providers/provision.rs::emit_oauth_audit`,
-//!   `routes/computation.rs::extract_neighborhood`,
 //!   `routes/events.rs::retain_visible_events`,
 //!   `routes/graph_query_utils.rs::load_subgraph`,
 //!   `routes/independence.rs::analyze_independence`,
@@ -862,9 +861,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 165 -> 162 (backlog f712db53): the three group membership gates in
 /// `routes/claims.rs` (16 -> 13) moved onto the caller's stamped connection.
 /// No file reached zero.
-/// 162 -> 161 (backlog 67c905a3): `routes/clusters.rs::build_from_bridges`
-/// moved onto the caller's stamped transaction (`routes/clusters.rs` 1 -> 0).
-const HIGH_WATER: usize = 161;
+/// 162 -> 161 (backlog 7c2a0b36): `patch_claim`'s non-admin branch runs on
+/// the caller's `AppState::write_as` transaction instead of
+/// `state.db_pool.begin()`, as its admin branch already did
+/// (`routes/claims.rs` 13 -> 12). No file reached zero.
+/// 161 -> 158 (backlog 52b96600): `compose_subgraphs` reads on the caller's
+/// stamped connection; `routes/computation.rs` 3 -> 0, key DELETED
+/// (`HIGH_WATER_FILES` falls by one with it).
+/// 158 -> 157 (backlog 67c905a3): `routes/clusters.rs::build_from_bridges`
+/// moved onto the caller's stamped transaction (`routes/clusters.rs` 1 -> 0,
+/// key DELETED).
+const HIGH_WATER: usize = 157;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -938,8 +945,9 @@ const HIGH_WATER: usize = 161;
 /// staging after the line above).
 /// 35 -> 34 when `routes/embeddings.rs` reached zero (backlog batch B37).
 /// 34 -> 33 when `routes/assess.rs` reached zero (backlog 74feb76b).
-/// 33 -> 32 when `routes/clusters.rs` reached zero (backlog 67c905a3).
-const HIGH_WATER_FILES: usize = 32;
+/// 33 -> 32 when `routes/computation.rs` reached zero (backlog 52b96600).
+/// 32 -> 31 when `routes/clusters.rs` reached zero (backlog 67c905a3).
+const HIGH_WATER_FILES: usize = 31;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1001,7 +1009,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // (`GroupMembershipRepository::is_member_conn`), the only shape in which
     // migration 236's principal-bound live-membership definer answers on the
     // application role. The SITE-level decline described above is retired.
-    ("routes/claims.rs", 13),
+    // 13 -> 12 (backlog 7c2a0b36): `patch_claim`'s non-admin write moved off
+    // `state.db_pool.begin()` onto `AppState::write_as`, the transaction its
+    // admin branch already used.
+    ("routes/claims.rs", 12),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
@@ -1015,27 +1026,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 106's definer takes the actor from the stamped principal. The two that
     // remain are `create_community` and `add_member`'s existence checks.
     ("routes/community.rs", 2),
-    // 15 before this PR. Shard 4 converted the five sites belonging to its four
-    // read-only handlers (`sheaf_consistency`, `sheaf_cohomology`,
-    // `sheaf_reconcile`, `belief_at_time`). Unlike `routes/belief.rs` the sites
-    // here are PER-STATEMENT, so a partially-converted handler is expressible;
-    // the shard declined to produce one. Of the ten that remain, seven are
-    // `propagate_beliefs`, which writes through two of them, and three are
-    // `compose_subgraphs`. Both are named in that file's module doc.
-    // 8 -> 7 (atom-level belief): `propagate_beliefs`' factor load moved onto
-    // `AppState::read_as`, because the `decomposes_to` exclusion's legacy arm
-    // reads `edges` and must see the caller's own private edges.
-    // 7 -> 6 (R-22 / R-36): the CDST seed rows are loaded once (`bp_seed_rows`).
-    // 6 -> 5 (HTTP public-only reads, 2026-11-05): `bp_seed_rows`' BBA load
-    // moved onto the stamped read its source reads already used. On the
-    // production pool (`scoped.inner()`, `epigraph_app`) the unstamped load saw
-    // public `mass_functions` rows only.
-    // 5 -> 3 (backlog 073d24a3, finding F-SHARD4-A2): `propagate_beliefs`'
-    // scalar-prior and alternative-set reads (both reads; its writes were on
-    // `AppState::write_as` already) moved onto the stamped read its factor
-    // load uses, each through a repo fn that splices the caller's viewer. What
-    // remains: `compose_subgraphs` (3, no `Viewer`).
-    ("routes/computation.rs", 3),
+    // `routes/computation.rs` was 15 and is GONE, not zeroed. Shard 4
+    // converted its four read-only handlers; `propagate_beliefs` followed
+    // (backlog 073d24a3, finding F-SHARD4-A2). 3 -> 0, key DELETED (backlog
+    // 52b96600, finding F-SHARD4-A1): `compose_subgraphs` takes a `Viewer`
+    // and runs its two neighborhood walks and its belief read on ONE
+    // `AppState::read_as` connection, through repo fns that splice it.
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 8),

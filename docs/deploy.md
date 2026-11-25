@@ -493,7 +493,7 @@ as `--database-url`, while `drain_jobs` reads it from the environment only:
 | Cascade replay | `replay_deferred_cascades --max-failures 20` | every 90 s (the binary's own documentation) | Exit 2 while a cascade is stuck: read the report and `--retire <event id> --reason <text>` it. `--report-only` is a read-only staleness check that takes no lock. |
 | Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 5 a privatization plan is stranded in `applying` or `reverting` with no job to finish it (the report's `stranded_privatization_plans` names each; reported on every run until it is recovered, see `docs/tenancy.md`, "A plan stranded in `applying` or `reverting`"), 4 pending jobs of a type this run has no handler for are waiting (the report's `pending_unregistered` names each type and its count; typically `embedding_generation` on an instance whose embedding provider may not write `claims.embedding`, which wait until a drain that registers the type runs), 3 out of time with work pending. Treat 4 and 5 as failures (do not add either to `SuccessExitStatus=`). On an instance that will never register the type, clear it once by hand with `drain_jobs --cancel-pending <TYPE>` (repeatable): that run sets the type's pending jobs `cancelled`, lists them in `cancelled_unregistered`, and refuses (exit 1, nothing written) a type it has a handler for. Cancelling an `embedding_generation` job leaves its claim's `claims.embedding` NULL; `embed_backfill` refills missing vectors, and needs an OpenAI key. `epigraph-cli reembed` does NOT restore them: it writes `embedding_3072`. |
 | Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or retired kind, a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
-| Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY` (or `--allow-mock` for a non-production smoke run). |
+| Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY`. `--allow-mock` (deterministic mock vectors, for a smoke run) is refused, exit 1 with nothing read or written, unless the database's name ends in `_test` or `EPIGRAPH_ENV=test` is set: a mock vector in a real database is served by recall as a real one and never refilled. |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 
 `replay_deferred_cascades` and `drain_jobs` each take their own session
@@ -624,7 +624,8 @@ For the others, anything else is off.
 | `EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS` | `300` | Longest a proxied federated `tools/call` may take before the gateway abandons it and answers the caller with a timeout. |
 | `EPIGRAPH_MCP_TOKEN_EXCHANGE_URL` | unset | The kernel's absolute `/oauth/token` URL (https, or http to a loopback host; anything else is a boot error). An http URL naming `localhost` is dialled as `127.0.0.1`, never resolved. A loopback URL is dialled directly, whatever proxy the environment names; a remote https URL keeps the environment's proxy settings. Every federated `tools/call` exchanges the caller's bearer there for a token of at most five minutes whose audience is the extension's name, and forwards only that; the caller's own bearer never reaches an extension. Unset with extensions mounted: every federated call is refused (warned at boot). The extension must accept `aud = <its name>`. |
 | `EPIGRAPH_MCP_PROFILE_ROOT`, `EPIGRAPH_MCP_PROFILE_PIN`, `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` | unset | Label-dedup tool configuration (`crates/epigraph-mcp/src/tools/label_dedup.rs`). |
-| `EPIGRAPH_MCP_STDIO_DRAIN_SECS` | `120` | stdio, and the operator `ingest-document` CLI. After the client disconnects (or, for the CLI, after its walk returns), how long the process waits for work its tools detached (a `queued` document ingest, post-commit embedding) before exiting. `0` exits at once and abandons that work. |
+| `EPIGRAPH_MCP_STDIO_DRAIN_SECS` | `120` | stdio, the HTTP listener, and the operator `ingest-document` CLI. After the client disconnects (or, for the CLI, after its walk returns), how long the process waits for work its tools detached (a `queued` document ingest, post-commit embedding) before exiting. On the HTTP listener it bounds the whole stop after SIGTERM or SIGINT, from the signal: the listener stops accepting, gives open requests up to 10 s, ends the MCP sessions still open (which closes a client's open SSE stream), then waits for that work. A connected client's stream therefore holds every restart for about 10 s, during which new connections are refused. Keep the unit's `TimeoutStopSec` above it (plus a few seconds), or systemd kills the process mid-drain. `0` exits at once and abandons that work. |
+| `EPIGRAPH_MCP_SIGNING_KEY_RECHECK_SECS` | `30` | How often, in seconds, the running server re-checks that the claim and edge verifiers still admit its signing key (clamped to 1..=300), on every transport. A key no longer admitted (revoked, rotated out, window closed), or whose recorded window ends within 5 s, logs the reason and exits 1 at once, without draining detached work. In the separate-signing-key mode the key is watched from boot (boot already refused an inadmissible one). With `--agent-key` there is no boot check: a key not admitted at startup is logged (WARN, "do not admit this signing key") and the server keeps serving, and the watch stops it only once a key it saw admitted loses admission, so after such a stop a restart on the same key serves again. To rotate, register the new key and restart onto it before retiring the old one, as for the API. |
 | `EPIGRAPH_MCP_LOG_PAYLOADS` | off | Lifts the INFO cap on `rmcp` logging, which then writes request and result bodies to the log. Local debugging only. |
 | `RUST_LOG` | `epigraph_mcp=info,tenancy=info` | Log filter, to stderr. `rmcp*` is capped at INFO regardless. |
 | `CALIBRATION_PATH`, the belief-mode variables | as for the API | |
@@ -685,7 +686,7 @@ at a time.
 | `RERANK_ENDPOINT`, `RERANK_MODEL` | as above, only when `RERANK_API_KEY` is set | `https://api.cohere.com/v2/rerank`, `rerank-english-v3.0` | The rerank endpoint and the model it is asked for. |
 | `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` | the built-in Anthropic client (`epigraph-cli`, `enrichment::llm_client`): the CLIs that call an LLM (`decompose_claims`, `protocol_gen`, `method_search`, `embed_bridge`, `rerank_bridges`, `ingest_git --enricher llm`) and the API server in a `genai` build | unset | Credentials for the Anthropic API. The OAuth token is used when both are set. With neither, the `epigraph` auto-detect selector finds no active provider and the caller fails. |
 | `ENRICHMENT_MODEL` | the same client | `claude-sonnet-4-5-20250929` | The model that client requests. |
-| `EPIGRAPH_LLM_PROVIDER` | the API server, in a build with the `genai` feature | `anthropic` | The provider behind `POST /api/v1/analyze/unconstrained`: `anthropic`, `epigraph` (the first active registered provider), `mock`, or the name of a registered extension. The request's question is sent to it. A build without `genai` answers that route 503. |
+| `EPIGRAPH_LLM_PROVIDER` | the API server, in a build with the `genai` feature | `anthropic` | The provider behind `POST /api/v1/analyze/unconstrained`: `anthropic`, `epigraph` (the first active registered provider), `mock`, or the name of a registered extension. The request's question is sent to it; the route requires `claims:admin`. A build without `genai` answers that route 503. |
 | `ENRICHMENT_LLM_PROVIDER` | `ingest_git --enricher llm` | `epigraph` | The provider selector for the commit enricher; same values. |
 | `ENRICHMENT_WINDOW_SIZE`, `ENRICHMENT_WINDOW_OVERLAP` | `ingest_git --enricher llm` | `20`, `5` | Commits per enrichment window, and how many of them overlap the next window. |
 | `EPIGRAPH_GIT_AUTHOR_KEY_FILE` | `ingest_git` (when `--author-key-file` is not given), the git-ingest reconciler (when its config has no `author_key_file`) | unset | A file holding 64 hex characters (32 bytes, e.g. `openssl rand -hex 32`, mode 0600). Every git-author agent key, and the repository node's system agent key, is derived from this secret, so the key is not computable from the public `git log`. A live `--pr-ingest` or `--agent-key per-author` run without it is refused; a dry run uses a random secret. Changing it changes every author agent. |
@@ -1411,6 +1412,8 @@ undocumented, not anonymous.
 |---|---|---|
 | `GET /api/v1/admin/stats` | `claims:admin` | **403**, not 401. Its `webhooks.webhook_count` field is the cross-tenant count of `webhook_subscriptions`, so the whole aggregate is admin-only. |
 | `GET /api/v1/claims/needing-embeddings` | `claims:admin`, and then a maintenance surface | **403** without the scope. With it, `501` MOVED naming `embed_backfill` (section 5). |
+| `POST /api/v1/ingest/paper`, `POST /api/v1/ingest/paper-url` | `claims:admin` | **403**. With the scope, a `source` that is not an arXiv id or arXiv DOI is **400** and an unknown body field (such as the removed `output_dir`) is **422**, before any file is written. |
+| `POST /api/v1/analyze/unconstrained` | `claims:admin` | **403**, checked before the body is parsed, so no provider call is made. |
 | `POST /api/v1/groups`, `POST /api/v1/communities` | `groups:write` | 403 |
 | `POST`/`DELETE /api/v1/groups/:id/members`, `POST /api/v1/communities/:id/members` | `groups:admin` **and** live membership | 403 |
 | `DELETE /api/v1/communities/:id/members/:perspective_id` | `groups:admin` **and** live membership, or the caller's own perspective | 403 |
@@ -3365,14 +3368,28 @@ The policy:
   API re-checks an `android-key` passkey's stored chain against the CURRENT
   list: a listed certificate (the leaf, a batch intermediate, the root)
   answers `403 attestation_not_in_good_standing`, the ticket or act left
-  live, and is logged at WARN (`elevate.ticket` / `elevate.act`); it is not
-  recorded as a refusal in the database. Only the standing is re-checked
-  there: certificate validity periods and the TEE/StrongBox and boot-state
-  rules are not (an expired attestation chain still elevates). A passkey
-  recorded `none` on the anchored path is not re-checked either, even when
-  its anchor's certificate is later listed: it holds through its anchor, and
-  stops only when the anchor is revoked (`revoke-passkey`). Under the
-  software policy nothing is re-checked.
+  live, is logged at WARN (`elevate.ticket` / `elevate.act`), and is
+  audited as a `platform.passkey_standing_refused` row (migration 285; so is
+  every `503 attestation_status_unavailable`, without the reason, which
+  stays in the log). Only the standing is re-checked there: certificate
+  validity periods and the TEE/StrongBox and boot-state rules are not (an
+  expired attestation chain still elevates). A passkey recorded `none` on
+  the anchored path stands as its ANCHOR stands (the passkey that admitted
+  it, recorded on its row since migration 285): once the anchor's
+  certificate is listed it is refused `403` too, while the list is stale
+  `503`, and with its anchor revoked it is refused (and 200's cascade has
+  revoked it anyway). A live `none` passkey with no recorded anchor (one
+  registered while the software policy served) is refused under the
+  attested policy: count them after applying 285 and before deploying the
+  API binary that reads its column (the older binary ignores the column, so
+  nobody is refused in between), or before switching policy
+  (`attestation_format = 'none' AND anchor_authenticator_id IS NULL AND
+  revoked_at IS NULL`; the column exists only from 285), and enroll an attested passkey through a
+  maintenance enrollment (`passkey-enroll`) for any person whose only
+  passkey that is. Only the anchor's own certificate is re-checked, not the
+  lineage above it. A standing refusal is audited only while its ticket or
+  act and its passkey are live; one that ends in between answers 500,
+  unaudited (logged). Under the software policy nothing is re-checked.
 - **Keep a retired Android root in the PEM while any passkey chains to it.**
   The same re-check verifies the stored chain to a root configured NOW. An
   enrolled `android-key` passkey whose chain reaches no root in
