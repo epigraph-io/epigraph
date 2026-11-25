@@ -7,7 +7,13 @@ head; the PR must re-verify each one again at commit time (§7 says how).
 Section 16 lists every decision in this spec that the operator did not make directly. Each
 one is marked either **[ORCHESTRATOR'S CALL]** or **[SPEC AUTHOR'S CALL]**. Items marked
 **[OPEN]** need a ruling before or during implementation. The operator's rulings of
-2026-11-24 on the open items are in §16.R; an item ruled there is marked **[RULED]**.
+2026-11-24 on the open items are in §16.R, and those of 2026-11-25 (C14, C15, C16, C6a) in
+§16.R2; an item ruled there is marked **[RULED]**.
+
+**Migration numbers.** Every migration number in this spec is the branch's number AFTER the
+C15 renumber (§16.R2): the branch's migrations, first written as 272-307 on a head of 271, are
+274-309, above origin/main's 272 (`bug_report_intake_marker`) and 273 (`group_live_roster`).
+Only §16.C's record of C15 and §20's correctness#1 row quote the old numbers, as history.
 
 **Revision 2.** Two adversarial reviews (a leak hunt, findings L1-L15, and an
 accountability / migration-safety / performance review, findings 1-20) were resolved into
@@ -1648,6 +1654,14 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 - **F5.** Have `provision.rs` stop storing an email as `client_name`, and carry the asserted
   name explicitly.
 - **F6.** (Revision 1: "if E2 is deferred".) Closed: E2 is resolved in this PR (part B).
+- **F7. (From [RULED] C6a, §16.R2.)** A write-once writer column on `evidence` and
+  `mass_functions`, stamped from the session principal at INSERT and never updatable, so the
+  C6 arm can count a row by WHO WROTE IT rather than by an attribution column another writer
+  can fill (Addendum 5). With it, evidence and the non-assessment BBA kinds 304 dropped could
+  name H again, windowed as C5 rules. Not this PR.
+- **F8. (From [RULED] C16, §16.R2; was [OPEN] C9.)** The sticky public-assertion marker table
+  (§11, `human_public_claim_marks(human_id)` maintained by triggers), built only if the
+  measured worst case (§11.2) shows up in production latency. Not this PR.
 
 ## 16. Decisions not made by the operator (clearly marked)
 
@@ -1806,13 +1820,49 @@ stays open.
   beyond maintenance (agent containers hold it, §15.R9), so the premise needs that
   distribution narrowed; that is a deployment change, not part of this PR.
 
+### R2. Ruled by the operator (2026-11-25, Addendum 6)
+
+The operator's answer, verbatim: "Yes, launch it with your recommendations". The
+recommendations, as put:
+
+- **C15. Migration numbering.** Ruled: RENUMBER the branch's migrations (unmerged, never
+  applied on production) above origin/main's highest, preserving their relative order, and
+  merge origin/main into the branch. The standing rule "never edit an applied migration"
+  protects APPLIED migrations; these were applied nowhere that persists. Implemented: one
+  offset, +2 (272-307 -> 274-309, 36 migrations and 18 undo runbooks), in one commit before
+  the merge, with every reference to the old numbers rewritten (tests that migrate below a
+  version, refusal-test messages, the `tenancy_backfill` registers, `tenancy_migration_shape`'s
+  file lists, `edge_writer_signing_ratchet`'s site, the README, the runbooks, this spec).
+  **Correction to the record below:** the md5 preconditions hash `prosrc`, and `prosrc` carries
+  the migration numbers in its comments and audit literals (`'migration', N`), so 9 of the 13
+  preconditions changed hash; they were recomputed from the renamed bodies (each matches
+  exactly one migration body and its runbook copy, which stays byte-identical). The four on
+  bodies the renumber does not touch (077's, 130's, 263's and 280's trigger) are unchanged.
+  Main's 272/273 re-body none of the functions the branch pins, and the branch re-bodies
+  neither theirs nor 236's twin that main's `group_live_roster.rs` pins by md5. Merge: the
+  branch's single core is kept where main had changed the hand-copied profile-detail
+  predicate to read `epigraph_group_live_roster` (its 308 body applies the same 164 / 235
+  lapse rules); main's new `live_membership_readers.rs` now reads the core's `details`.
+  Deploy note: a development or test database that applied the branch's OLD 272/273 holds
+  checksums sqlx will refuse; recreate it (production never applied them).
+- **C6a. Addendum 5's narrowing of C6.** Ruled: ACCEPT it, as built (migration 304): evidence
+  is excluded and only assessment-slot BBAs count. Follow-up, not this PR: a write-once writer
+  column on `evidence` and `mass_functions` (§15.F7).
+- **C16. Cost of the C6 / C2 arms** (§11.2). Ruled: ACCEPT the measured worst case (57 ms p50,
+  81 ms max) for now. Follow-up, not this PR: the C9 marker table if it shows up in production
+  latency (§15.F8). §15.R16's name-search cost stays unmeasured.
+- **C14. An END bound on the binding window.** Ruled: unchanged; the 2026-11-24 ruling stands:
+  a START-of-binding window, sticky, with no end. Implemented as built.
+- Deploy pre-check for 300's LEAKPROOF step (§17): kept. The orchestrator measured the
+  migration login read-only on 2026-11-25; the §17 pre-check is still re-run at deploy time.
+
 ### C. Open, needs a ruling
 
 Each item states the behaviour implemented until the operator rules.
 
 - **C1. (Closed in revision 2.)** E2 is redacted in this PR, `replaces` included (finding L2).
 - **C2, C5, C6.** Ruled (§16.R).
-- **C14. (New, review round 2, leaks#4.) An END bound on the binding window.** C5 is built as
+- **C14. ([RULED] 2026-11-25, §16.R2: start only, as built.) An END bound on the binding window.** C5 is built as
   a START bound only, per agent the earliest start of its bindings to H, with no end. So an
   agent bound to H1 (allowance revoked) and later to H2 names H1 by the public assertions it
   makes for H2, even when H1 was never named while bound. The ruling's text ("it stays
@@ -1820,7 +1870,8 @@ Each item states the behaviour implemented until the operator rules.
   `[start, end)` window: an assertion made while bound stays counted, later ones belong to
   someone else. Implemented: start only, as built; the `[start, end)` reading is put to the
   operator, not changed without a ruling.
-- **C15. (New, review round 2, correctness#1; orchestrator / operator.) Migration numbering.**
+- **C15. ([RULED] 2026-11-25, §16.R2: renumbered to 274-309 and merged; the text below is the
+  record as written before the renumber, in the old numbers.) Migration numbering.**
   origin/main now carries `272_bug_report_intake_marker.sql` and `273_group_live_roster.sql`,
   colliding with this branch's 272 and 273 (sqlx keys migrations by version), and conflicts in
   `tenancy_backfill.rs`, `agent.rs`, `agent_lookup.rs`, `visibility_lint.rs`,
@@ -1830,17 +1881,17 @@ Each item states the behaviour implemented until the operator rules.
   version (`below(N)`, refusal tests). The standing rule forbids editing 272-282 on this branch,
   so the rename needs an explicit ruling. The md5 preconditions hash `prosrc`, not file names,
   and survive the rename. Main's 272/273 re-body none of the functions this branch pins.
-- **C16. (New, review round 2, correctness#9.) Cost not ruled on.** The C6/C2 arms' share of
+- **C16. ([RULED] 2026-11-25, §16.R2: accepted; marker table is §15.F8.) Cost not ruled on.** The C6/C2 arms' share of
   the worst case (§11.2; three arms plus the countersign act since 304) and the unmeasured name
   search cost of §15.R16's placeholder rows. C12 accepted only the readable-claim arm.
-- **C6a. (New, review round 2.)** Addendum 5 narrowed C6 (migration 304): evidence and every
+- **C6a. ([RULED] 2026-11-25, §16.R2: narrowing accepted; writer column is §15.F7.)** Addendum 5 narrowed C6 (migration 304): evidence and every
   BBA except an assessment no longer name H by themselves, because no column records which
   identity wrote them. Implemented: narrowed. Alternative for the operator: a write-once
   writer column on `evidence` and `mass_functions`, stamped from the session principal, and
   the window read on it (§4).
 - **C8.** Whether an explicit `authored` edge's `affiliations` is identity, to be redacted with
   `author_name`. Implemented: shown as for N.
-- **C9.** The sticky public-claim marker table, only if the §11 budget is missed.
+- **C9. ([RULED] 2026-11-25 with C16: not built; §15.F8.)** The sticky public-claim marker table, only if the §11 budget is missed.
 
 ## 16a. Part B implementation notes (deviations and what was not covered)
 
