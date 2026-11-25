@@ -287,7 +287,9 @@ pub const fn failure_is_terminal(error: &JobError, retry_count: u32, max_retries
 /// # A retry waits out the handler's backoff
 ///
 /// The not-before time is `now() + handler.backoff(retry_count - 1)`, the
-/// same attempt index the in-process `JobRunner` worker loop sleeps for, and
+/// same attempt index the in-process `JobRunner` worker loop sleeps for (or,
+/// for a [`JobError::RateLimited`] failure, `now() + retry_after_secs` when
+/// that is later: [`epigraph_jobs::retry_delay`]), and
 /// no run claims the row before it (backlog 6cf042a9). Nor does THIS run claim
 /// it again even once it is due (it is excluded for the rest of the run, so a
 /// short backoff cannot spin a failing job through its retry budget in one
@@ -412,14 +414,19 @@ pub async fn drain_cancelling(
                     // `process_job` counted this attempt, so the retry about to
                     // be scheduled is number `retry_count - 1` (0 = the first),
                     // as in the worker loop. The handler is registered (the
-                    // claim only hands out registered types).
+                    // claim only hands out registered types). A rate limit's
+                    // retry-after lengthens it (backlog 000cca08).
                     let backoff = runner
                         .retry_backoff(&job.job_type, job.retry_count.saturating_sub(1))
                         .unwrap_or_default();
                     job.state = JobState::Pending;
                     job.started_at = None;
                     retry_next_run.push(job.id.into());
-                    Some(queue.requeue_after(&job, backoff).await?)
+                    Some(
+                        queue
+                            .requeue_after(&job, epigraph_jobs::retry_delay(&e, backoff))
+                            .await?,
+                    )
                 };
                 tracing::warn!(
                     job_id = %job.id,

@@ -1087,6 +1087,60 @@ async fn a_retry_waits_out_the_handlers_backoff(pool: PgPool) {
     assert_eq!(retries, 2);
 }
 
+/// A rate limit's `retry_after_secs` is a floor on the retry's not-before time
+/// (backlog 000cca08): the drain stores `now() + max(retry_after, backoff)`.
+/// The handler here backs off one second while the provider asks for two
+/// hours, so the row must wait the two hours. Before the fix the drain read
+/// only the handler's backoff and the job was due one second later, so the
+/// next timer run hit the same rate limit and spent another attempt.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rate_limited_retry_waits_out_retry_after_when_the_backoff_is_shorter(pool: PgPool) {
+    let id = enqueue_typed(&pool, "drain_test_rate_limited", 5).await;
+
+    let scoped = maintenance_scoped(&pool).await;
+    let handler = FailsWith {
+        job_type: "drain_test_rate_limited",
+        error: epigraph_jobs::JobError::RateLimited {
+            retry_after_secs: 7200,
+        },
+        backoff: |_| Duration::from_secs(1),
+        calls: Arc::default(),
+    };
+    let calls = Arc::clone(&handler.calls);
+    let (runner, queue) = runner_with(&scoped, handler);
+
+    let first = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        first.failures.len() == 1 && !first.failures[0].terminal,
+        "a rate limit must be retryable: {first:?}"
+    );
+    let (wait, retries) = wait_and_retries(&pool, id).await;
+    let wait = wait.expect("a retryable failure stored no not-before time");
+    assert!(
+        (7200.0 - 10.0..=7200.0 + 0.5).contains(&wait),
+        "the retry is not retry_after = 2h out on the database clock (the handler's backoff \
+         is 1s): {wait}s"
+    );
+    assert_eq!(retries, 1);
+
+    // Past the handler's one-second backoff, still inside the rate limit.
+    sqlx::query("SELECT pg_sleep(1.5)")
+        .execute(&pool)
+        .await
+        .expect("outlast the handler's backoff");
+    let early = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a run inside the provider's retry-after window re-ran the job: {early:?}"
+    );
+    assert_eq!(job_state(&pool, id).await.0, "pending");
+}
+
 /// A job whose handler fails PERMANENTLY (`JobError::should_retry` false: here
 /// a payload that will never parse) is `failed` after its first run, with its
 /// retry budget unspent, and never handed out again (backlog 09109b93). Before

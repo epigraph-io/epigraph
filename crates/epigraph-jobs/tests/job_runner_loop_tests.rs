@@ -190,3 +190,74 @@ async fn a_permanent_failure_is_terminal_on_the_first_attempt() {
         "a permanent failure was retried: {mine:?}"
     );
 }
+
+/// A handler that answers every attempt with `JobError::RateLimited`, declares
+/// NO backoff of its own, and records the (tokio) time of each attempt.
+struct RateLimitedNoBackoff {
+    retry_after_secs: u64,
+    calls: Arc<Mutex<Vec<tokio::time::Instant>>>,
+}
+
+#[async_trait]
+impl JobHandler for RateLimitedNoBackoff {
+    async fn handle(&self, _job: &Job) -> Result<JobResult, JobError> {
+        self.calls.lock().unwrap().push(tokio::time::Instant::now());
+        Err(JobError::RateLimited {
+            retry_after_secs: self.retry_after_secs,
+        })
+    }
+
+    fn job_type(&self) -> &str {
+        "rate_limited"
+    }
+
+    fn backoff(&self, _attempt: u32) -> Duration {
+        Duration::ZERO
+    }
+}
+
+/// The worker loop waits out a rate limit's `retry_after_secs` before the
+/// retry, even when the handler's own backoff is shorter (backlog 000cca08):
+/// the wait is the LONGER of the two. Before the fix the loop slept only the
+/// handler's backoff (zero here), so a provider's "retry after 10 minutes" was
+/// retried at once and the job burned its whole retry budget inside the
+/// provider's window.
+///
+/// The clock is tokio's paused clock, so the ten minutes are virtual.
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_retry_waits_out_retry_after_not_just_the_handler_backoff() {
+    const RETRY_AFTER: u64 = 600;
+    let queue = Arc::new(RecordingQueue::default());
+    let job = Job::new("rate_limited", json!({})).with_max_retries(2);
+    let id = job.id;
+    queue.enqueue(job).await.unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+
+    let mut runner = JobRunner::new(1, Arc::clone(&queue) as Arc<dyn JobQueue>);
+    runner.register_handler(Arc::new(RateLimitedNoBackoff {
+        retry_after_secs: RETRY_AFTER,
+        calls: Arc::clone(&calls),
+    }));
+    runner.start().await;
+    tokio::time::sleep(Duration::from_secs(RETRY_AFTER + 60)).await;
+    runner.shutdown().await;
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        2,
+        "CALIBRATION: one attempt and one retry (max_retries = 2): {calls:?}"
+    );
+    let gap = calls[1] - calls[0];
+    assert!(
+        gap >= Duration::from_secs(RETRY_AFTER),
+        "the retry came {gap:?} after a rate limit that asked for {RETRY_AFTER}s"
+    );
+    let last = queue
+        .updates()
+        .into_iter()
+        .rev()
+        .find(|j| j.id == id)
+        .expect("the loop wrote the job back");
+    assert_eq!((last.state, last.retry_count), (JobState::Failed, 2));
+}
