@@ -499,9 +499,14 @@ async fn tool_dispatch_emits_tool_invoked_event() {
         .emit_tool_invoked("system_stats", epigraph_mcp::server::ToolCaller::Stdio)
         .await;
 
+    // Read as the agent the event names (the stdio server's own): a
+    // `tool.invoked` row is listed only to its actor (backlog 8c4908d6).
+    let actor = server.server_agent_id().await.expect("the server's agent");
     let result = tools::events::list_events(
         &server,
-        &fixture::public_viewer(&pool).await,
+        &epigraph_db::visibility::Viewer::resolve(&pool, actor)
+            .await
+            .expect("the actor's viewer"),
         ListEventsParams {
             event_type: Some("tool.invoked".to_string()),
             actor_id: None,

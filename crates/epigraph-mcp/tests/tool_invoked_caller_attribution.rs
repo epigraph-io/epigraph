@@ -251,3 +251,108 @@ async fn a_caller_without_an_agent_is_not_attributed_to_the_gateway(pool: PgPool
     assert_eq!(*actor, None, "{payload}");
     assert_eq!(payload["client_id"], client.to_string(), "{payload}");
 }
+
+/// The `tool.invoked` rows `list_events` returns to `viewer`, filtered by
+/// `actor` when given, through the MCP tool a caller would use.
+async fn listed_tool_invoked(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    actor: Option<Uuid>,
+) -> Vec<serde_json::Value> {
+    let signer = AgentSigner::from_bytes(&[0x8D; 32]).expect("signer");
+    let embedder = epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None);
+    let server = epigraph_mcp::EpiGraphMcpFull::new(pool.clone(), signer, embedder, false)
+        .with_scoped_pool(fixture::scoped_pool(pool).await);
+    let result = epigraph_mcp::tools::events::list_events(
+        &server,
+        viewer,
+        epigraph_mcp::types::ListEventsParams {
+            event_type: Some("tool.invoked".to_string()),
+            actor_id: actor.map(|a| a.to_string()),
+            limit: Some(500),
+        },
+    )
+    .await
+    .expect("list_events");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text content");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+    body["events"].as_array().expect("events").clone()
+}
+
+/// The caller-attributed event is not a public timeline (review of 8c4908d6):
+/// another agent, in a group of its own, cannot list it, not even by naming
+/// the caller as `actor_id`, and neither can a group-less reader. The caller
+/// itself and a maintenance reader can.
+///
+/// On the code before the actor gate in `EventRepository::list`, the
+/// stranger's two reads return the caller's event (its actor, tool and
+/// client id), and this test fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_agent_cannot_list_the_callers_tool_invoked_events(pool: PgPool) {
+    let (caller, _) = fixture::seed_agent_with_group(&pool, "tool-invoked-caller").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "tool-invoked-stranger").await;
+    let client = Uuid::new_v4();
+    let url = spawn_listener(pool.clone()).await;
+    let body = call_system_stats(&url, &mint(client, Some(caller))).await;
+    let events = system_stats_events(&pool).await;
+    assert_eq!(
+        events.first().map(|e| e.0),
+        Some(Some(caller)),
+        "CALIBRATION: the call recorded a caller-attributed event: {events:?}\n{body}"
+    );
+
+    let resolve = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            epigraph_db::visibility::Viewer::resolve(&pool, agent)
+                .await
+                .expect("viewer")
+        }
+    };
+    let names_caller = |rows: &[serde_json::Value]| {
+        rows.iter()
+            .any(|e| e["actor_id"].as_str() == Some(caller.to_string().as_str()))
+    };
+
+    let stranger_viewer = resolve(stranger).await;
+    let all = listed_tool_invoked(&pool, &stranger_viewer, None).await;
+    assert!(
+        !names_caller(&all),
+        "a stranger listed the caller's tool calls: {all:?}"
+    );
+    let by_actor = listed_tool_invoked(&pool, &stranger_viewer, Some(caller)).await;
+    assert!(
+        by_actor.is_empty(),
+        "a stranger listed the caller's tool calls by naming its actor id: {by_actor:?}"
+    );
+    let public = listed_tool_invoked(&pool, &fixture::public_viewer(&pool).await, None).await;
+    assert!(
+        !names_caller(&public),
+        "a group-less reader listed the caller's tool calls: {public:?}"
+    );
+
+    let own = listed_tool_invoked(&pool, &resolve(caller).await, Some(caller)).await;
+    assert!(
+        own.iter().any(|e| e["payload"]["tool"] == "system_stats"
+            && e["payload"]["client_id"] == client.to_string()),
+        "the caller must still list its own tool calls: {own:?}"
+    );
+
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let maintenance = epigraph_db::EventRepository::list(
+        &pool,
+        &bypass,
+        Some("tool.invoked"),
+        Some(caller),
+        None,
+        50,
+    )
+    .await
+    .expect("list as maintenance");
+    assert_eq!(maintenance.len(), 1, "{maintenance:?}");
+}

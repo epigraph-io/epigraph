@@ -636,9 +636,12 @@ impl EpiGraphMcpFull {
     /// writes). It used to be the server's agent on every transport, so an
     /// HTTP call was attributed to the gateway rather than to the caller its
     /// writes are authored by. The payload names the transport and, for a
-    /// token-bearing HTTP caller, its OAuth `client_id`. Not the token's
-    /// `jti`: `list_events` serves this table to any `claims:read` caller,
-    /// and the token identifiers go to `security_events` instead.
+    /// token-bearing HTTP caller, its OAuth `client_id`. Because that names a
+    /// person's activity, `EventRepository::list` (MCP `list_events`,
+    /// `GET /api/v1/events`) returns a `tool.invoked` row only to the agent
+    /// it names as actor, or to a maintenance viewer
+    /// (`EventRepository::ACTOR_PRIVATE_EVENT_TYPES`). Not the token's `jti`:
+    /// the token identifiers go to `security_events`.
     ///
     /// Awaited before dispatch (one INSERT on the raw pool per call), and
     /// best-effort: a failed publish is logged, never returned, and never
@@ -2744,7 +2747,7 @@ impl EpiGraphMcpFull {
     // ── Events (2 tools) ──
 
     #[tool(
-        description = "Query the event log with optional type and actor filters. Returns recent graph events."
+        description = "Query the event log with optional type and actor filters. Returns recent graph events. An event naming a claim you cannot read is left out, and a tool.invoked event (one per MCP tool call) is returned only to the agent that made the call."
     )]
     async fn list_events(
         &self,
