@@ -1965,6 +1965,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim_visibility.rs",
+        "writable_teams_as_self",
+        "READ through the same definer as `writable_teams`, for a write's AUTHOR asked as its \
+         own principal: it stamps the author for the one read inside a transaction or \
+         savepoint it always rolls back, so the connection's principal is unchanged after it \
+         (migration 309). Group ids about the author, no corpus row and no `visibility` \
+         column, so there is nothing for a viewer to narrow.",
+    ),
+    (
+        "claim_visibility.rs",
         "default_group_of",
         "READ through 206's definer `epigraph_default_group(agent)`: one group id \
          (`agents.default_group_id`, else the live human's). A preference about the agent, not \
