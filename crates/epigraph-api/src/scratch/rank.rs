@@ -4,11 +4,23 @@
 //! # Eligibility
 //!
 //! An atom is eligible only when it is current (not superseded), its turn is
-//! applied (`mark_applied`), and its turn is below `exclude_turns_from`, the
-//! oldest turn the runner still quotes verbatim. A turn in the window, or
-//! evicted but still pending, is quoted in full by the runner, so its atoms
-//! never appear here (DONE criterion (1): the prompt sees atoms only for
-//! turns that left the window).
+//! applied (`mark_applied`), and its turn is below `exclude_turns_from`.
+//!
+//! `exclude_turns_from` is the FIRST TURN OF THE VERBATIM WINDOW (the oldest
+//! of the last W completed turns). It is not "the oldest turn still quoted":
+//! an evicted turn that is still pending sits below this bound and is kept
+//! out by `applied` (its turn is not yet written), not by the bound. The
+//! difference matters when a pending turn is stuck below a turn that has
+//! since been written: with window 17–20, turn 15 stuck at `captured` and
+//! turn 16 written, the runner passes 17, and turn 16's atoms are listed.
+//! Passing 15 would drop turn 16 from the prompt altogether (it is neither
+//! quoted nor listed). The only overlap this reading allows is a pending
+//! turn that is written between the runner's quote decision and this call,
+//! which is then both quoted and listed: a duplicate, never a loss.
+//!
+//! So a turn in the window, or evicted but still pending, is quoted in full
+//! by the runner and its atoms never appear here (DONE criterion (1): the
+//! prompt sees atoms only for turns that left the window).
 //!
 //! # Slices
 //!
@@ -130,9 +142,11 @@ pub struct DigestItem<'a> {
     pub score: Option<f64>,
 }
 
-/// A contradicting partner the digest does not list because its turn is
-/// still quoted verbatim (in the window, or evicted and pending). The runner
-/// renders a pointer to that turn; the text is already in the prompt.
+/// A contradicting partner the digest does not list because it is not
+/// eligible: its turn is at or after `exclude_turns_from` (in the window) or
+/// not yet applied (evicted and pending). The runner renders an `ev:tN`
+/// pointer to that turn; a window or quoted pending turn's text is already
+/// in the prompt, and a pending turn past the quote cap is a pointer line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct UnlistedPartner {
     pub id: Uuid,
@@ -168,7 +182,7 @@ pub struct Digest<'a> {
     pub atoms_total: usize,
     /// Eligible atoms (current, applied, before the window).
     pub eligible: usize,
-    /// Applied turns before `exclude_turns_from`.
+    /// Applied turns before `exclude_turns_from` (the window's first turn).
     pub turns_archived: usize,
     pub standing: Vec<DigestItem<'a>>,
     pub relevant: Vec<DigestItem<'a>>,

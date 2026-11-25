@@ -166,6 +166,35 @@ fn atoms_still_quoted_unapplied_or_superseded_are_never_listed() {
     assert_eq!(d.atoms_total, 5);
 }
 
+/// `exclude_turns_from` is the window's first turn, not the oldest quoted
+/// turn: a pending turn stuck below a written one must not hide it.
+#[test]
+fn a_written_turn_above_a_stuck_pending_turn_is_listed() {
+    // Window 17–20. Turn 15 is stuck at `captured` (never applied); turn 16
+    // was evicted and written, so the runner no longer quotes it.
+    let s = graph(
+        vec![
+            atom(1, 15, AtomKind::Decision, "STUCK-PENDING Ship batch B-18."),
+            atom(2, 16, AtomKind::Decision, "Hold batch B-19 until December."),
+            atom(3, 18, AtomKind::Decision, "WINDOW Batch B-20 is cancelled."),
+            atom(4, 14, AtomKind::Fact, "Batch B-17 shipped."),
+        ],
+        vec![],
+        &[14, 16, 18],
+    );
+    let d = run(&s, "batch", 17, 20);
+    assert_eq!(
+        listed(&d),
+        BTreeSet::from([id(2), id(4)]),
+        "turn 16 is listed; 15 (pending) and 18 (window) are not"
+    );
+    assert_eq!(ids(&d.standing), vec![id(2)]);
+    assert_eq!(ids(&d.recent), vec![id(2), id(4)]);
+    assert_eq!(d.turns_archived, 2, "turns 14 and 16");
+    let json = serde_json::to_string(&d).unwrap();
+    assert!(!json.contains("STUCK-PENDING") && !json.contains("WINDOW"));
+}
+
 #[test]
 fn contested_pairs_are_listed_together_and_a_quoted_partner_only_by_pointer() {
     let s = graph(
