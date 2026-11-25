@@ -359,6 +359,67 @@ fn a_damaged_snapshot_restores_from_prev_and_reports_degraded() {
 }
 
 #[test]
+fn the_first_write_after_a_prev_restore_never_rotates_damage_over_prev() {
+    let dir = TempDir::new("keep-prev");
+    let prev = PathBuf::from(format!("{}.prev", dir.graph().display()));
+    let tmp = PathBuf::from(format!("{}.tmp", dir.graph().display()));
+    let mut s = Scratch::spawn(&dir.graph(), 0);
+    s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [atom(1, 1, "kept in prev")]}));
+    s.ok(json!({"id": 2, "op": "mark_applied", "turn": 1}));
+    s.finish();
+    let good_prev = fs::read(&prev).unwrap();
+    let bytes = fs::read(dir.graph()).unwrap();
+    fs::write(dir.graph(), &bytes[..bytes.len() / 2]).unwrap();
+
+    let mut again = Scratch::spawn(&dir.graph(), 0);
+    assert_eq!(
+        again.ok(json!({"id": 1, "op": "health"}))["restored_from"],
+        "prev"
+    );
+    // The first write fails; the retry must still not rotate.
+    fs::create_dir(&tmp).unwrap();
+    let r = again.call(json!({"id": 2, "op": "mark_applied", "turn": 1}));
+    assert_eq!(r["error"], "snapshot_failed", "{r}");
+    fs::remove_dir(&tmp).unwrap();
+    again.ok(json!({"id": 3, "op": "snapshot"}));
+    assert_eq!(
+        fs::read(&prev).unwrap(),
+        good_prev,
+        "the damaged graph.json was rotated over the only good .prev"
+    );
+    let replaced = fs::read(dir.graph()).unwrap();
+    assert_ne!(
+        replaced,
+        &bytes[..bytes.len() / 2],
+        "graph.json was replaced"
+    );
+    // Only the first write skips the rotation.
+    again.ok(json!({"id": 4, "op": "put_atoms", "atoms": [atom(2, 2, "second")]}));
+    assert_eq!(
+        fs::read(&prev).unwrap(),
+        replaced,
+        "later writes rotate as usual"
+    );
+    again.finish();
+
+    let mut third = Scratch::spawn(&dir.graph(), 0);
+    let health = third.ok(json!({"id": 1, "op": "health"}));
+    assert_eq!(
+        (
+            health["restored_from"].clone(),
+            health["restore_degraded"].clone()
+        ),
+        (json!("snapshot"), json!(false))
+    );
+    let stats = third.ok(json!({"id": 2, "op": "stats"}));
+    assert_eq!(
+        (stats["atoms"].clone(), stats["max_applied_turn"].clone()),
+        (json!(2), json!(1))
+    );
+    third.finish();
+}
+
+#[test]
 fn a_snapshot_write_failure_is_reported_and_retried() {
     let dir = TempDir::new("fail");
     let mut s = Scratch::spawn(&dir.graph(), 0);

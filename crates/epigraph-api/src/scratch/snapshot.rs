@@ -19,7 +19,9 @@
 //! [`write_atomic`] writes `graph.json.tmp`, fsyncs it, renames `graph.json`
 //! to `graph.json.prev`, renames the tmp file into place and fsyncs the
 //! directory. A crash at any point leaves `graph.json` or `graph.json.prev`
-//! (or both) whole.
+//! (or both) whole. The first write after a restore from `.prev` uses
+//! [`write_atomic_keeping_prev`] instead, so a damaged `graph.json` is never
+//! rotated over the good `.prev`.
 //!
 //! # Restoring
 //!
@@ -179,16 +181,34 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 /// Write `bytes` to `path` atomically, keeping the previous file as
 /// `<path>.prev` (see the module docs for the sequence).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_inner(path, bytes, true)
+}
+
+/// Write `bytes` to `path` atomically WITHOUT rotating: `<path>.prev` is
+/// left as it is and the tmp file replaces `path` directly.
+///
+/// For the first write after a restore from `.prev`: `path` then holds a
+/// damaged file (or none), and rotating would rename that damage over the
+/// only good copy. A crash before the rename leaves the damaged file and the
+/// good `.prev` (the next restore still reports it); a crash after leaves the
+/// new snapshot and the good `.prev`.
+pub fn write_atomic_keeping_prev(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_inner(path, bytes, false)
+}
+
+fn write_inner(path: &Path, bytes: &[u8], rotate: bool) -> io::Result<()> {
     let tmp = tmp_path(path);
     {
         let mut file = File::create(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    match fs::rename(path, prev_path(path)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    if rotate {
+        match fs::rename(path, prev_path(path)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     fs::rename(&tmp, path)?;
     if let Some(dir) = path.parent() {
@@ -236,6 +256,12 @@ pub struct RestoreReport {
 impl RestoreReport {
     /// True when some snapshot file existed but could not be used, so the
     /// runner must backfill turns the graph does not list as applied.
+    ///
+    /// `false` does NOT prove the graph holds every acknowledged write: a
+    /// `graph.json` deleted outside a crash window restores from an older
+    /// `.prev`, and both files deleted restores empty. The runner reconciles
+    /// its own ledger against `stats.applied_turns` on every spawn and
+    /// replays any written turn the graph does not list.
     pub fn degraded(&self) -> bool {
         let real = |p: Option<&'static str>| p.is_some_and(|code| code != "missing");
         real(self.snapshot_problem) || real(self.prev_problem)

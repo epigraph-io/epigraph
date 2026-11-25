@@ -55,6 +55,15 @@
 //! snapshot fails the response is `snapshot_failed`; the change stays in
 //! memory and the next mutating op (or `snapshot`) retries the write. Every
 //! write is idempotent, so the runner's replay is safe either way.
+//!
+//! After a restore from `.prev`, the first successful write replaces
+//! `graph.json` without rotating it over `.prev`, so the damaged file never
+//! displaces the only good copy.
+//!
+//! `restore_degraded: false` does not prove the graph holds every
+//! acknowledged write (a deleted `graph.json` restores an older `.prev`; two
+//! deleted files restore empty). The runner compares its ledger's written
+//! turns with `stats.applied_turns` on every spawn and replays the gap.
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -65,7 +74,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use super::snapshot::{self, RestoreError, RestoreReport};
+use super::snapshot::{self, RestoreError, RestoreReport, RestoredFrom};
 use super::store::{Evidence, NewAtom, NewEdge, ScratchAtom, ScratchStore, Seed, StoreError};
 
 /// Default BM25 hits for `candidates`.
@@ -194,6 +203,9 @@ pub struct Session {
     restore: RestoreReport,
     /// The in-memory graph has changes no snapshot holds yet.
     dirty: bool,
+    /// The graph came from `.prev`: the next successful write must not
+    /// rotate the (damaged or missing) `graph.json` over that good `.prev`.
+    keep_prev_once: bool,
 }
 
 impl Session {
@@ -201,11 +213,13 @@ impl Session {
     /// [`snapshot::restore`]).
     pub fn open(snapshot_path: PathBuf, scope: &str, epoch: u64) -> Result<Self, RestoreError> {
         let (store, restore) = snapshot::restore(&snapshot_path, scope, epoch, Utc::now())?;
+        let keep_prev_once = restore.from == RestoredFrom::Prev;
         Ok(Self {
             store,
             snapshot_path,
             restore,
             dirty: false,
+            keep_prev_once,
         })
     }
 
@@ -219,12 +233,19 @@ impl Session {
 
     fn persist(&mut self) -> Result<usize, OpError> {
         let bytes = snapshot::encode(&self.store);
-        snapshot::write_atomic(&self.snapshot_path, &bytes).map_err(|e| {
+        let write = if self.keep_prev_once {
+            snapshot::write_atomic_keeping_prev
+        } else {
+            snapshot::write_atomic
+        };
+        write(&self.snapshot_path, &bytes).map_err(|e| {
             OpError::new(
                 "snapshot_failed",
                 format!("snapshot write failed: {:?}", e.kind()),
             )
         })?;
+        // Cleared only on success: a failed write retries without rotating.
+        self.keep_prev_once = false;
         self.dirty = false;
         Ok(bytes.len())
     }
