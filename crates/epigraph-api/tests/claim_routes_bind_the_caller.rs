@@ -825,6 +825,79 @@ async fn batch_dedup_hit_on_another_humans_claim_writes_no_edges_or_provenance(p
     );
 }
 
+/// Backlog 4952d77a on the APPLICATION ROLE, with no orphan policy (row
+/// security alone decides): an `if_not_exists` resubmit by the matched
+/// claim's author adds one `AUTHORED` edge, and does so even when the matched
+/// claim is PRIVATE while the resubmit asks for PUBLIC. Such a row is
+/// invisible to the unstamped pool, so the edge lands only because the dedup
+/// arm writes on the caller's stamp.
+///
+/// Verified to fail: with the pre-4952d77a handler (edges only on create) and
+/// with the dedup arm left on the unstamped pool (`group_visible` not forced
+/// for it), the count after the resubmit stays 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_authors_resubmit_of_its_private_claim_adds_authored_on_the_app_role(pool: PgPool) {
+    let (a, _) = seed_human_operator(&pool, "human-a").await;
+    let state = app_role_state(&pool).await;
+    let content = format!("4952d77a: A resubmits its private claim {}", Uuid::new_v4());
+    let post = |visibility: &'static str| {
+        let pool = pool.clone();
+        let state = state.clone();
+        let content = content.clone();
+        async move {
+            let req: epigraph_api::routes::claims::CreateClaimRequest =
+                serde_json::from_value(serde_json::json!({
+                    "content": content, "agent_id": a, "if_not_exists": true,
+                    "visibility": visibility,
+                }))
+                .expect("request");
+            let resp = epigraph_api::routes::claims::create_claim(
+                ViewerExtractor(Viewer::resolve(&pool, a).await.expect("viewer")),
+                State(state),
+                Some(Extension(token(a, ClientType::Human))),
+                Json(req),
+            )
+            .await
+            .into_response();
+            let (status, body) = body_text(resp).await;
+            assert!(status.is_success(), "{visibility}: {status} {body}");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let id: Uuid = v["id"].as_str().expect("id").parse().expect("uuid");
+            (id, v.get("was_created").is_some())
+        }
+    };
+    let authored = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2 \
+                    AND relationship = 'AUTHORED'",
+            )
+            .bind(a)
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+
+    let (claim, created) = post("private").await;
+    assert!(created, "CALIBRATION: the first write creates");
+    assert_eq!(
+        authored(claim).await,
+        1,
+        "CALIBRATION: the create's AUTHORED edge"
+    );
+    let (again, created) = post("public").await;
+    assert_eq!(again, claim, "the resubmit matched A's private claim");
+    assert!(!created, "a dedup hit");
+    assert_eq!(
+        authored(claim).await,
+        2,
+        "A's resubmit adds exactly one AUTHORED edge, on A's stamp"
+    );
+}
+
 /// The `claims:write` scope the write handlers now take as their first
 /// extractor (backlog f00d75ab). A direct handler call stands in for the
 /// bearer middleware, so it supplies the scope the route checks.

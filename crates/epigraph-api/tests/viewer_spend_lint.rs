@@ -377,14 +377,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ProvenanceRepository::append_conn",
         ],
     ),
-    // gated (`ClaimRepository::get_by_id`) then write.
+    // gated (`write_target_of`, viewed) then write, on one transaction stamped
+    // from the caller's viewer (backlog a2d3e945): the two `_conn` updates and
+    // the properties UPDATE run on that stamp, which `claims_tenancy`'s WITH
+    // CHECK decides; provenance stays on the pool, as `create_claim`'s does.
     (
         "claims.rs",
         "update_claim",
         &[
-            "ClaimRepository::store_embedding",
-            "ClaimRepository::update_trace_id",
-            "ClaimRepository::update_truth_value",
+            "ClaimRepository::update_trace_id_conn",
+            "ClaimRepository::update_truth_value_conn",
             "provenance::record_provenance",
             "sqlx::query(UPDATE).execute",
         ],

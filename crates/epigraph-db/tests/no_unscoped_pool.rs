@@ -871,7 +871,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 158 -> 157 (backlog 67c905a3): `routes/clusters.rs::build_from_bridges`
 /// moved onto the caller's stamped transaction (`routes/clusters.rs` 1 -> 0,
 /// key DELETED).
-const HIGH_WATER: usize = 157;
+/// 157 -> 152 (backlog a2d3e945): `update_claim` (PUT /claims/:id) reads its
+/// write target through `AppState::read_as` and writes on one
+/// `AppState::write_as` transaction (`routes/claims.rs` 12 -> 7). No file
+/// reached zero. (Staging 2026-11-25-3: #1101's 158 -> 157 and #1102's
+/// 158 -> 153 compose to 152 on the merged tree.)
+const HIGH_WATER: usize = 152;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1012,7 +1017,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 13 -> 12 (backlog 7c2a0b36): `patch_claim`'s non-admin write moved off
     // `state.db_pool.begin()` onto `AppState::write_as`, the transaction its
     // admin branch already used.
-    ("routes/claims.rs", 12),
+    // 12 -> 7 (backlog a2d3e945): `update_claim` (PUT /claims/:id) reads its
+    // write target through `AppState::read_as` and runs its truth, trace,
+    // embedding and properties writes on one `AppState::write_as` transaction;
+    // its provenance append stays on the pool.
+    ("routes/claims.rs", 7),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,

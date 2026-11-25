@@ -2,7 +2,8 @@
 mod common;
 use sqlx::postgres::PgPoolOptions;
 
-/// PATCH /api/v1/claims/:id/labels with a matching-owner token returns 200.
+/// PATCH /api/v1/claims/:id/labels by the claim's author returns 200 (the
+/// author is the token's `agents.id` principal; backlog a2d3e945).
 #[tokio::test(flavor = "multi_thread")]
 async fn update_labels_matching_owner_returns_200() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
@@ -16,7 +17,7 @@ async fn update_labels_matching_owner_returns_200() {
     let (token, client_id) =
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
     let claim_id =
-        common::seed_claim_with_agent(&pool, "update labels owner match", client_id).await;
+        common::seed_claim_writable_by_client(&pool, "update labels owner match", client_id).await;
 
     let body = serde_json::json!({ "add": ["owner-label"] });
     let resp = reqwest::Client::new()
