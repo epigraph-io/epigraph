@@ -1860,11 +1860,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent_identity.rs",
         "prompt_history_blob",
-        "READ through the same migration 161 `epigraph_agent_prompt_history` SECURITY DEFINER \
-         function as `prompt_history`, with the same gate on the SESSION principal (operator or \
-         admin, else AID06), filtered to the one file a row the definer marks `readable` names: \
-         it returns a subset of what `prompt_history` returns to the same caller, so a Viewer \
-         splice has no tenancy column to act on.",
+        "READ through migration 276's `epigraph_agent_prompt_history_blob` SECURITY DEFINER \
+         function: 161's gate on the SESSION principal (operator or admin, else AID06) and 161's \
+         walk and per-member `readable` mark, returning the one file a readable member's snapshot \
+         names and fetching no other blob: a subset of what `prompt_history` returns to the same \
+         caller, so a Viewer splice has no tenancy column to act on.",
     ),
     (
         "agent.rs",

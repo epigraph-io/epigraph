@@ -34,9 +34,9 @@
 //!   metadata only, never `agent_prompt_blobs`), one keyset page at a time, so
 //!   no file content is built or crosses the connection for a listing and a
 //!   page is bounded in rows. The second fetches, decompresses and verifies
-//!   the ONE file a readable snapshot in that history names; it still reads
-//!   through 161's definer, which builds the whole lineage's content inside
-//!   the database for that one file.
+//!   the ONE file a readable snapshot in that history names, through
+//!   migration 276's `epigraph_agent_prompt_history_blob` (161's gate, walk
+//!   and readable mark), which fetches that one blob row and no other.
 
 use std::borrow::Cow;
 
@@ -618,14 +618,16 @@ impl AgentIdentityRepository {
         })
     }
 
-    /// One file of an agent's prompt history, by key: fetched only when a
-    /// snapshot the caller may READ in `agent_id`'s history (its own, or a
-    /// lineage member's the definer marks readable) names `blob_hash`, then
-    /// decompressed and re-hashed. Only that file's content crosses the
+    /// One file of an agent's prompt history, by key, through migration 276's
+    /// `epigraph_agent_prompt_history_blob`: fetched only when a snapshot the
+    /// caller may READ in `agent_id`'s history (its own, or a lineage
+    /// member's the definer marks readable, 161's mark) names `blob_hash`,
+    /// then decompressed and re-hashed. The definer fetches that one blob row
+    /// and no other, so only that file's content is built or crosses the
     /// connection.
     ///
-    /// The gate is the definer's: the connection must be stamped with the
-    /// caller's principal, exactly as for [`Self::prompt_history`].
+    /// The gate is the definer's (161's): the connection must be stamped with
+    /// the caller's principal, exactly as for [`Self::prompt_history`].
     ///
     /// # Errors
     /// As [`Self::prompt_history`]: `AID06` ([`PROMPT_HISTORY_REFUSED`]) for a
@@ -635,21 +637,12 @@ impl AgentIdentityRepository {
         agent_id: Uuid,
         blob_hash: &[u8; 32],
     ) -> Result<PromptBlobRead, DbError> {
-        let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-            "SELECT CASE $2 WHEN identity_md_hash      THEN identity_md \
-                            WHEN global_claude_md_hash THEN global_claude_md \
-                            WHEN group_claude_md_hash  THEN group_claude_md \
-                            ELSE learned_md END \
-               FROM public.epigraph_agent_prompt_history($1) \
-              WHERE readable \
-                AND $2 IN (identity_md_hash, global_claude_md_hash, group_claude_md_hash, \
-                           learned_md_hash) \
-              LIMIT 1",
-        )
-        .bind(agent_id)
-        .bind(blob_hash.as_slice())
-        .fetch_optional(&mut *conn)
-        .await?;
+        let row: Option<(Option<Vec<u8>>,)> =
+            sqlx::query_as("SELECT content FROM public.epigraph_agent_prompt_history_blob($1, $2)")
+                .bind(agent_id)
+                .bind(blob_hash.as_slice())
+                .fetch_optional(&mut *conn)
+                .await?;
         let Some((content,)) = row else {
             return Ok(PromptBlobRead::NotNamed);
         };
