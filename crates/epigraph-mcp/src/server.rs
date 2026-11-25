@@ -621,24 +621,51 @@ impl EpiGraphMcpFull {
         Ok(id)
     }
 
-    /// Emit a durable `tool.invoked` event for an MCP dispatch.
+    /// Emit a durable `tool.invoked` event for an MCP dispatch, attributed to
+    /// the CALLER (backlog 8c4908d6).
     ///
     /// Called from `ServerHandler::call_tool` for every tool invocation
     /// (closes #61's tool.invoked requirement). Public so integration
     /// tests can exercise the same wiring without having to synthesize a
-    /// full `rmcp::service::RequestContext`. Always best-effort: failure
-    /// to publish must not break dispatch.
-    pub async fn emit_tool_invoked(&self, tool_name: &str) {
-        let actor_id = match self.agent_id().await {
-            Ok(id) => Some(id),
-            Err(e) => {
-                tracing::warn!(
-                    tool = tool_name,
-                    error = ?e,
-                    "tool.invoked: could not resolve MCP agent_id; recording event with NULL actor"
-                );
-                None
+    /// full `rmcp::service::RequestContext`.
+    ///
+    /// The actor is who the call ran as: on HTTP the request's
+    /// `AuthContext.agent_id` (NULL when the context names no agent, or when
+    /// no auth layer attached one), on stdio this server's own agent (the
+    /// process boundary is the trust gate, and this agent authors its
+    /// writes). It used to be the server's agent on every transport, so an
+    /// HTTP call was attributed to the gateway rather than to the caller its
+    /// writes are authored by. The payload names the transport and, for a
+    /// token-bearing HTTP caller, its OAuth `client_id`. Not the token's
+    /// `jti`: `list_events` serves this table to any `claims:read` caller,
+    /// and the token identifiers go to `security_events` instead.
+    ///
+    /// Awaited before dispatch (one INSERT on the raw pool per call), and
+    /// best-effort: a failed publish is logged, never returned, and never
+    /// stops the dispatch.
+    pub async fn emit_tool_invoked(&self, tool_name: &str, caller: ToolCaller<'_>) {
+        let (actor_id, transport, client_id) = match caller {
+            ToolCaller::Stdio => {
+                let actor = match self.agent_id().await {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        tracing::warn!(
+                            tool = tool_name,
+                            error = ?e,
+                            "tool.invoked: could not resolve MCP agent_id; recording event \
+                             with NULL actor"
+                        );
+                        None
+                    }
+                };
+                (actor, "stdio", None)
             }
+            ToolCaller::Http(auth) => (
+                auth.and_then(|a| a.agent_id),
+                "http",
+                auth.filter(|a| !crate::auth::is_principal_less(a))
+                    .map(|a| a.client_id),
+            ),
         };
 
         let _ = epigraph_db::EventRepository::publish_or_log(
@@ -648,6 +675,8 @@ impl EpiGraphMcpFull {
             &serde_json::json!({
                 "tool": tool_name,
                 "read_only": self.read_only,
+                "transport": transport,
+                "client_id": client_id,
             }),
         )
         .await;
@@ -3291,6 +3320,31 @@ impl EpiGraphMcpFull {
     }
 }
 
+/// Who a tool call ran as, for its `tool.invoked` event
+/// ([`EpiGraphMcpFull::emit_tool_invoked`]).
+#[derive(Debug, Clone, Copy)]
+pub enum ToolCaller<'a> {
+    /// stdio: no `AuthContext`; the caller is this server's own agent.
+    Stdio,
+    /// HTTP: the request's `AuthContext`, `None` when no auth layer attached
+    /// one (the listener arm with neither auth mode).
+    Http(Option<&'a epigraph_auth::AuthContext>),
+}
+
+impl<'a> ToolCaller<'a> {
+    /// The caller of a `call_tool` dispatch: `is_http` is whether the request
+    /// came over HTTP (rmcp attached its `http::request::Parts`), `auth` the
+    /// `AuthContext` it carries.
+    #[must_use]
+    pub fn of(is_http: bool, auth: Option<&'a epigraph_auth::AuthContext>) -> Self {
+        if is_http {
+            Self::Http(auth)
+        } else {
+            Self::Stdio
+        }
+    }
+}
+
 // Manual `ServerHandler` impl (in lieu of `#[tool_handler]`) so `call_tool`
 // can be wrapped with durable event emission. Mirrors the macro's expansion
 // for `list_tools` and `get_tool` verbatim — see
@@ -3299,8 +3353,9 @@ impl EpiGraphMcpFull {
 // `call_tool` is the single chokepoint for every MCP tool invocation. We
 // emit one `tool.invoked` event per call (closes #61's tool.invoked
 // requirement) and forward to the macro-built dispatcher unchanged. Event
-// emission is fire-and-forget; a failed event publish must not break tool
-// dispatch.
+// emission is best-effort but AWAITED (one INSERT per call, before
+// dispatch); a failed event publish is logged and must not break tool
+// dispatch. The event names the caller (`ToolCaller`), not this gateway.
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -3349,8 +3404,11 @@ impl ServerHandler for EpiGraphMcpFull {
             {
                 Ok(admitted) => admitted,
                 Err(err) => {
-                    self.emit_tool_invoked(&format!("denied:{}", request.name))
-                        .await;
+                    self.emit_tool_invoked(
+                        &format!("denied:{}", request.name),
+                        ToolCaller::of(is_http_call, auth_owned.as_ref()),
+                    )
+                    .await;
                     return Err(err);
                 }
             };
@@ -3416,16 +3474,22 @@ impl ServerHandler for EpiGraphMcpFull {
                 // below nor the per-access recorder would see it.
                 if let Err(err) = Self::refuse_elevated_federated(elevated.is_some(), &request.name)
                 {
-                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
-                        .await;
+                    self.emit_tool_invoked(
+                        &format!("denied:{}:{}", ext_name, request.name),
+                        ToolCaller::of(is_http_call, auth_owned.as_ref()),
+                    )
+                    .await;
                     return Err(err);
                 }
                 // (a) enforce the extension's configured scope against the caller.
                 if let Err(err) =
                     Self::enforce_federated_scope(auth_owned.as_ref(), &request.name, &ext_scope)
                 {
-                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
-                        .await;
+                    self.emit_tool_invoked(
+                        &format!("denied:{}:{}", ext_name, request.name),
+                        ToolCaller::of(is_http_call, auth_owned.as_ref()),
+                    )
+                    .await;
                     return Err(err);
                 }
                 // (b) require the caller's raw bearer: the gateway exchanges it at the
@@ -3434,8 +3498,11 @@ impl ServerHandler for EpiGraphMcpFull {
                 // b6559e75): reachable over HTTP by a caller the gates above
                 // admit with no token, the unauthenticated listener's.
                 let Some(token) = raw_token else {
-                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
-                        .await;
+                    self.emit_tool_invoked(
+                        &format!("denied:{}:{}", ext_name, request.name),
+                        ToolCaller::of(is_http_call, auth_owned.as_ref()),
+                    )
+                    .await;
                     return Err(McpError {
                         code: rmcp::model::ErrorCode::INVALID_REQUEST,
                         message: std::borrow::Cow::Borrowed(
@@ -3446,8 +3513,11 @@ impl ServerHandler for EpiGraphMcpFull {
                     });
                 };
                 // (c) durable audit event, namespaced by the owning extension.
-                self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
-                    .await;
+                self.emit_tool_invoked(
+                    &format!("{}:{}", ext_name, request.name),
+                    ToolCaller::of(is_http_call, auth_owned.as_ref()),
+                )
+                .await;
                 // (d) proxy to the downstream on a fresh session authenticated with a
                 // token exchanged for the caller's (aud = the extension; c9b82fae).
                 // A failure is answered as what it is (backlog 7ea4bd74): the
@@ -3496,8 +3566,11 @@ impl ServerHandler for EpiGraphMcpFull {
         if is_http_call {
             if let Err(err) = Self::enforce_tool_scope(auth_owned.as_ref(), &request.name) {
                 // Emit a denial audit event so 403s show up alongside successes.
-                self.emit_tool_invoked(&format!("denied:{}", request.name))
-                    .await;
+                self.emit_tool_invoked(
+                    &format!("denied:{}", request.name),
+                    ToolCaller::of(is_http_call, auth_owned.as_ref()),
+                )
+                .await;
                 return Err(err);
             }
             // An elevated request is read-only: every write tool is refused
@@ -3506,8 +3579,11 @@ impl ServerHandler for EpiGraphMcpFull {
                 .refuse_elevated_write(auth_owned.as_ref(), &request.name)
                 .await
             {
-                self.emit_tool_invoked(&format!("denied:{}", request.name))
-                    .await;
+                self.emit_tool_invoked(
+                    &format!("denied:{}", request.name),
+                    ToolCaller::of(is_http_call, auth_owned.as_ref()),
+                )
+                .await;
                 return Err(err);
             }
             // An HTTP listener must never serve as an operator-linked signer
@@ -3520,8 +3596,11 @@ impl ServerHandler for EpiGraphMcpFull {
             // proxied under the caller's own token and never author as this
             // signer.
             if let Err(err) = crate::operator::refuse_linked_http_signer(self).await {
-                self.emit_tool_invoked(&format!("denied:{}", request.name))
-                    .await;
+                self.emit_tool_invoked(
+                    &format!("denied:{}", request.name),
+                    ToolCaller::of(is_http_call, auth_owned.as_ref()),
+                )
+                .await;
                 return Err(err);
             }
         }
@@ -3540,7 +3619,11 @@ impl ServerHandler for EpiGraphMcpFull {
         //
         // **DO NOT remove this line without updating
         // `tests/event_log_wiring_tests.rs::tool_dispatch_emits_tool_invoked_event`.**
-        self.emit_tool_invoked(&request.name).await;
+        self.emit_tool_invoked(
+            &request.name,
+            ToolCaller::of(is_http_call, auth_owned.as_ref()),
+        )
+        .await;
 
         // ── Auth-lineage provenance (OPERATED_BY) ───────────────────────────
         // When the caller authenticated under a user/agent scope, record that

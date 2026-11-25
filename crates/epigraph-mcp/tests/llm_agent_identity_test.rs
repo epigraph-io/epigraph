@@ -18,6 +18,7 @@
 
 use epigraph_crypto::{keypair_from_llm_agent, AgentSigner};
 use epigraph_mcp::embed::McpEmbedder;
+use epigraph_mcp::server::ToolCaller;
 use epigraph_mcp::EpiGraphMcpFull;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -130,7 +131,9 @@ async fn llm_identity_stamps_properties_and_collapses_to_one_agent(pool: PgPool)
     let server1 = llm_server(pool.clone());
     // emit_tool_invoked internally calls the pub(crate) agent_id(), whose CREATE
     // branch stamps the LLM properties — the production path, driven publicly.
-    server1.emit_tool_invoked("query_claims").await;
+    server1
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await;
     let id1 = resolve_mcp_agent_id(&pool).await;
 
     // Exactly one row for this pubkey-derived identity.
@@ -168,7 +171,9 @@ async fn llm_identity_stamps_properties_and_collapses_to_one_agent(pool: PgPool)
     // resolves to the SAME agent id via get_by_public_key (the FOUND branch,
     // which does NOT re-set properties — it reads the row server1 created).
     let server2 = llm_server(pool.clone());
-    server2.emit_tool_invoked("query_claims").await;
+    server2
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await;
     let id2 = resolve_mcp_agent_id(&pool).await;
     assert_eq!(
         id1, id2,
@@ -214,7 +219,9 @@ async fn absent_llm_identity_leaves_agent_properties_clean(pool: PgPool) {
         EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped)
     };
 
-    server.emit_tool_invoked("query_claims").await;
+    server
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await;
     let id = epigraph_db::AgentRepository::get_by_public_key(&pool, &pk)
         .await
         .expect("query agent")
@@ -255,7 +262,9 @@ async fn agent_type_of(pool: &PgPool, id: Uuid) -> String {
 #[sqlx::test(migrations = "../../migrations")]
 async fn llm_configured_signer_is_created_with_agent_type_llm(pool: PgPool) {
     let server = llm_server(pool.clone());
-    server.emit_tool_invoked("query_claims").await;
+    server
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await;
     let id = resolve_mcp_agent_id(&pool).await;
     assert_eq!(agent_type_of(&pool, id).await, "llm");
 }
@@ -273,7 +282,9 @@ async fn unconfigured_signer_is_created_with_agent_type_software_agent(pool: PgP
     );
     let server =
         EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped);
-    server.emit_tool_invoked("query_claims").await;
+    server
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await;
     let id = epigraph_db::AgentRepository::get_by_public_key(&pool, &pk)
         .await
         .expect("query agent")
@@ -297,7 +308,9 @@ async fn an_existing_signer_row_is_reused_and_not_retyped(pool: PgPool) {
     .await
     .expect("seed legacy row");
     let server = llm_server(pool.clone());
-    server.emit_tool_invoked("query_claims").await;
+    server
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await;
     assert_eq!(resolve_mcp_agent_id(&pool).await, existing);
     assert_eq!(agent_type_of(&pool, existing).await, "human");
 }
@@ -314,7 +327,9 @@ async fn an_existing_signer_row_is_reused_and_not_retyped(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn lineage_writes_exactly_one_operated_by_edge_idempotently(pool: PgPool) {
     let server = llm_server(pool.clone());
-    server.emit_tool_invoked("query_claims").await; // creates the mcp agent
+    server
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await; // creates the mcp agent
     let mcp_agent = resolve_mcp_agent_id(&pool).await;
     let principal = seed_agent(&pool).await;
 
@@ -389,7 +404,9 @@ async fn lineage_edge_retracted_after_success_is_rewritten_once_the_memo_expires
     let ttl = std::time::Duration::from_secs(3);
     let past_ttl = ttl + std::time::Duration::from_millis(500);
     let server = llm_server(pool.clone()).with_auth_lineage_ttl(ttl);
-    server.emit_tool_invoked("query_claims").await; // creates the mcp agent
+    server
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await; // creates the mcp agent
     let mcp_agent = resolve_mcp_agent_id(&pool).await;
     let principal = seed_agent(&pool).await;
 
@@ -454,7 +471,9 @@ async fn lineage_edge_retracted_after_success_is_rewritten_once_the_memo_expires
 #[sqlx::test(migrations = "../../migrations")]
 async fn lineage_none_principal_writes_no_edge(pool: PgPool) {
     let server = llm_server(pool.clone());
-    server.emit_tool_invoked("query_claims").await; // creates the mcp agent
+    server
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await; // creates the mcp agent
     let mcp_agent = resolve_mcp_agent_id(&pool).await;
 
     server.record_auth_lineage(None).await;
@@ -477,7 +496,9 @@ async fn lineage_none_principal_writes_no_edge(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn lineage_nonexistent_principal_is_best_effort(pool: PgPool) {
     let server = llm_server(pool.clone());
-    server.emit_tool_invoked("query_claims").await; // creates the mcp agent
+    server
+        .emit_tool_invoked("query_claims", ToolCaller::Stdio)
+        .await; // creates the mcp agent
     let mcp_agent = resolve_mcp_agent_id(&pool).await;
     let ghost = Uuid::new_v4(); // never inserted into agents
 

@@ -495,7 +495,9 @@ async fn tool_dispatch_emits_tool_invoked_event() {
 
     // This is exactly what `ServerHandler::call_tool` does before
     // forwarding to the tool_router.
-    server.emit_tool_invoked("system_stats").await;
+    server
+        .emit_tool_invoked("system_stats", epigraph_mcp::server::ToolCaller::Stdio)
+        .await;
 
     let result = tools::events::list_events(
         &server,
