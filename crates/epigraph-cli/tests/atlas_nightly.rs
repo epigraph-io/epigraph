@@ -779,16 +779,29 @@ async fn dense_claim_in_t1(pool: &PgPool, c: &Corpus) -> Uuid {
     dense[0]
 }
 
-/// One new team-A claim in `t1`, near `u`, whose evidence is linked to it
-/// under a relationship name the contract's pattern refuses (`edges` takes
-/// any non-empty name, and the leaf passes the stored name through: the
-/// atlas_leaf module documentation's "relationship spelling" gap), so theme
-/// `t1`'s update fails. One more claim joins `t2`.
+/// One new team-A claim in `t1`, near `u`, with an evidence row that shares
+/// its id and is linked to it, so theme `t1`'s update fails: the leaf draws
+/// a claim node and an evidence node with one id, joined by an edge whose
+/// two ends are that id, and the contract refuses both. (`edges` refuses a
+/// self-loop only between two rows of one type; the tables do not share an
+/// id space.) One more claim joins `t2`.
+///
+/// This used to link the evidence under a relationship name the contract's
+/// pattern refuses; the leaf builder now maps such a name to a contract
+/// name (backlog 9de2ebad), so that no longer fails a theme.
 async fn break_t1_and_grow_t2(pool: &PgPool, c: &Corpus) -> Uuid {
     let fx = agent(pool, "Filer X").await;
     let bad = claims(pool, Some(c.t1), fx, Some(c.a_team), 1, 200).await;
-    let ev = evidence_on_each(pool, &bad).await;
-    link(pool, ev[0], "evidence", bad[0], "not-a-contract-name").await;
+    sqlx::query(
+        "INSERT INTO evidence (id, claim_id, evidence_type, content_hash, raw_content) \
+         VALUES ($1, $1, 'document', decode(md5(random()::text) || md5(random()::text), 'hex'), \
+                 'twin evidence') ",
+    )
+    .bind(bad[0])
+    .execute(pool)
+    .await
+    .expect("seed evidence sharing the claim's id");
+    link(pool, bad[0], "evidence", bad[0], "supports").await;
     claims(pool, Some(c.t2), c.fa, Some(c.a_team), 1, 300).await[0]
 }
 
@@ -942,7 +955,7 @@ async fn a_theme_that_fails_is_carried_and_the_night_completes(pool: PgPool) {
         carried[0]["error"]
             .as_str()
             .unwrap()
-            .contains("relationship"),
+            .contains("breaks the contract"),
         "{r:#}"
     );
     let run = latest(&pool, a_map).await;
@@ -977,6 +990,77 @@ async fn a_theme_that_fails_is_carried_and_the_night_completes(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(params["themes"]["carried"], serde_json::json!([c.t1]));
+}
+
+/// Backlog 9de2ebad: `edges` takes any non-empty relationship name, and a
+/// leaf used to serve the stored one, so ONE edge named outside the
+/// contract's pattern (`has-part`) failed its whole theme on every night.
+/// Now the leaf serves the name mapped to a contract name (`has_part`), the
+/// theme builds, its stats report the mapping, and the next night over the
+/// same input writes nothing. A later failure of that theme still carries
+/// it: the carry check compares the stored leaves with the mapped names.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_relationship_name_outside_the_contract_is_mapped_and_its_theme_builds(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let backend = namer();
+    night(&pool, &viewer, &backend, &opts()).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let fh = agent(&pool, "Filer H").await;
+    let part = claims(&pool, Some(c.t1), fh, Some(c.a_team), 1, 200).await[0];
+    let ev = evidence_on_each(&pool, &[part]).await[0];
+    link(&pool, ev, "evidence", part, "has-part").await;
+
+    let summary = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    for k in ["carried", "dropped", "unbuilt"] {
+        assert!(r["themes"][k].as_array().unwrap().is_empty(), "{k}: {r:#}");
+    }
+    let t1 = r["themes"]["built"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["theme_id"] == serde_json::json!(c.t1))
+        .expect("t1 built");
+    assert_eq!(
+        t1["stats"]["leaf_relationship_names"],
+        serde_json::json!({"renamed_edges": 2, "names": {"has-part": "has_part"}}),
+        "{r:#}"
+    );
+    let after = levels(&pool, latest(&pool, a_map).await).await;
+    let mut drawn = 0;
+    for (_, payload) in after.values() {
+        let LevelDocument::Leaf(l) = parse(payload) else {
+            continue;
+        };
+        assert!(l.edges.iter().all(|e| e.relationship != "has-part"));
+        drawn += l
+            .edges
+            .iter()
+            .filter(|e| e.source == ev && e.target == part && e.relationship == "has_part")
+            .count();
+    }
+    assert_eq!(drawn, 2, "the edge is drawn, mapped, in both hierarchies");
+
+    let again = night(&pool, &viewer, &backend, &opts()).await;
+    assert_eq!(
+        map_report(&again, a_map)["status"],
+        "unchanged",
+        "{again:#}"
+    );
+
+    break_t1_and_grow_t2(&pool, &c).await;
+    let third = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&third, a_map);
+    assert!(
+        r["themes"]["dropped"].as_array().unwrap().is_empty(),
+        "{r:#}"
+    );
+    let carried = r["themes"]["carried"].as_array().unwrap();
+    assert_eq!(carried.len(), 1, "{r:#}");
+    assert_eq!(carried[0]["theme_id"], serde_json::json!(c.t1));
 }
 
 /// The first night after an operator build carries a failing theme too: the

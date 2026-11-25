@@ -12,18 +12,25 @@
 //! whose own agents and evidence carry more edges among them than the
 //! contract allows, reaches the cap (backlog 8d09e6bc: such a claim used to
 //! fail its theme on every night).
+//!
+//! A stored relationship name outside the contract's pattern (`edges` takes
+//! any non-empty name, e.g. `has-part`) is served mapped to a contract name
+//! and the mapping is reported ([`contract_edges`]); one such edge used to
+//! fail its whole theme on every night (backlog 9de2ebad).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context};
 use epigraph_atlas_contract::{
-    ClaimNode, Edge, LeafLevel, Node, NodeKind, PlainNode, MAX_LEAF_EDGES,
+    is_relationship_name, ClaimNode, Edge, LeafLevel, Node, NodeKind, PlainNode, MAX_LEAF_EDGES,
+    MAX_RELATIONSHIP_CHARS,
 };
 use epigraph_db::repos::atlas_flow::FlowInputs;
 use epigraph_db::repos::atlas_leaf::{
     assemble_leaf, LeafNodeKind, LeafNodeSet, LeafOutcome, LeafRows,
 };
 use epigraph_engine::atlas_flow::weigh_leaf_edges;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::atlas_meaning::docs::claim_label;
@@ -84,9 +91,10 @@ pub fn node_set(rows: &LeafRows, claims: &[Uuid], cap: usize) -> anyhow::Result<
 /// without it). A claim `truths` does not hold, or a value outside [0, 1],
 /// carries none.
 ///
-/// The edges are capped at the contract's [`MAX_LEAF_EDGES`]
-/// ([`cap_leaf_edges`]); the number cut is returned (0 for almost every
-/// leaf).
+/// Each edge's relationship is served as a contract name
+/// ([`contract_edges`]), then the edges are capped at the contract's
+/// [`MAX_LEAF_EDGES`] ([`cap_leaf_edges`]). The names mapped and the number
+/// cut are returned (none for almost every leaf).
 ///
 /// # Errors
 /// A claim of `set` the skeleton does not label.
@@ -97,7 +105,7 @@ pub fn fill_leaf(
     agents: &BTreeMap<Uuid, String>,
     evidence: &BTreeMap<Uuid, String>,
     truths: &BTreeMap<Uuid, f64>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<LeafFill> {
     let claim_labels: BTreeMap<Uuid, String> = leaf
         .nodes
         .iter()
@@ -140,10 +148,113 @@ pub fn fill_leaf(
             }),
         });
     }
-    let (edges, cut) = cap_leaf_edges(&nodes, weigh_leaf_edges(set, inputs), MAX_LEAF_EDGES);
+    let (named, renamed) = contract_edges(weigh_leaf_edges(set, inputs));
+    let (edges, cut) = cap_leaf_edges(&nodes, named, MAX_LEAF_EDGES);
     leaf.nodes = nodes;
     leaf.edges = edges;
-    Ok(cut)
+    Ok(LeafFill { cut, renamed })
+}
+
+/// What [`fill_leaf`] changed from the weighted edges to make the leaf fit
+/// the contract.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LeafFill {
+    /// The edges the contract's edge limit cut ([`cap_leaf_edges`]).
+    pub cut: usize,
+    /// The relationship names served mapped ([`contract_edges`]).
+    pub renamed: RenamedNames,
+}
+
+/// The relationship names a leaf (or a theme's leaves) serves mapped to a
+/// contract name ([`contract_relationship_name`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RenamedNames {
+    /// The weighted edges whose name was mapped, counted before two mapped
+    /// to one edge collapse.
+    pub edges: usize,
+    /// Each stored name (lower-cased, as the builder serves names) and the
+    /// contract name it is served as.
+    pub names: BTreeMap<String, String>,
+}
+
+impl RenamedNames {
+    pub fn add(&mut self, other: Self) {
+        self.edges += other.edges;
+        self.names.extend(other.names);
+    }
+
+    /// The report: `{"renamed_edges": n, "names": {stored: served}}`.
+    #[must_use]
+    pub fn json(&self) -> Value {
+        json!({"renamed_edges": self.edges, "names": self.names})
+    }
+}
+
+/// The contract name a stored relationship name is served as: the name
+/// itself when the contract's pattern admits it; otherwise every character
+/// outside `[A-Za-z0-9_]` becomes `_`, `r_` is prefixed when the result does
+/// not start with a letter, and it is cut to [`MAX_RELATIONSHIP_CHARS`]. So
+/// `has-part` is `has_part`, `2nd-order` is `r_2nd_order`.
+///
+/// Two stored names can map to one (`has-part` and `has_part`); the caller
+/// collapses such edges as the builder collapses two spellings of one name.
+#[must_use]
+pub fn contract_relationship_name(stored: &str) -> String {
+    if is_relationship_name(stored) {
+        return stored.to_string();
+    }
+    let mut out: String = stored
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !out.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        out.insert_str(0, "r_");
+    }
+    // ASCII only by now, so a byte cut is a character cut.
+    out.truncate(MAX_RELATIONSHIP_CHARS);
+    out
+}
+
+/// `edges` (W7's weighted edges of one leaf) with every relationship served
+/// as a contract name ([`contract_relationship_name`]), and what was mapped.
+///
+/// The edges `edges` holds under one (source, target, mapped name) collapse
+/// into one with the largest `flow_weight`, the first of them on a tie, as
+/// `weigh_leaf_edges` collapses the stored rows of one name (the contract
+/// refuses a duplicate triple). The result is ordered by (source, target,
+/// name), the order `weigh_leaf_edges` returns, so a leaf whose names all
+/// fit is returned unchanged and a night over unchanged input writes
+/// nothing.
+///
+/// The nightly's builder and its carry check both read edges through this,
+/// so a carried leaf is compared with the names it was served under.
+#[must_use]
+pub fn contract_edges(edges: Vec<Edge>) -> (Vec<Edge>, RenamedNames) {
+    let mut renamed = RenamedNames::default();
+    let mut out: BTreeMap<(Uuid, Uuid, String), Edge> = BTreeMap::new();
+    for mut e in edges {
+        let name = contract_relationship_name(&e.relationship);
+        if name != e.relationship {
+            renamed.edges += 1;
+            renamed.names.insert(e.relationship.clone(), name.clone());
+            e.relationship = name;
+        }
+        let key = (e.source, e.target, e.relationship.to_ascii_lowercase());
+        match out.get_mut(&key) {
+            Some(prev) if prev.flow_weight >= e.flow_weight => {}
+            Some(prev) => *prev = e,
+            None => {
+                out.insert(key, e);
+            }
+        }
+    }
+    (out.into_values().collect(), renamed)
 }
 
 /// The edges of a leaf over `max`: its heaviest `max`, in their input order,
@@ -371,7 +482,7 @@ mod tests {
 
         let fill = || {
             let mut leaf = skeleton(&[c]);
-            let cut = fill_leaf(
+            let fill = fill_leaf(
                 &mut leaf,
                 &set,
                 &FlowInputs::default(),
@@ -380,7 +491,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-            (leaf, cut)
+            (leaf, fill.cut)
         };
         let (leaf, cut) = fill();
         assert_eq!(cut, 1_090 - MAX_LEAF_EDGES);
@@ -461,6 +572,93 @@ mod tests {
         );
         let (same, none) = cap_leaf_edges(&nodes, edges.clone(), 4);
         assert_eq!((same, none), (edges, 0), "a leaf that fits is untouched");
+    }
+
+    /// Backlog 9de2ebad: a stored relationship name outside the contract's
+    /// pattern is served mapped to a contract name (every character outside
+    /// `[A-Za-z0-9_]` to `_`, a letter prefixed when it does not start with
+    /// one, then cut to 32), and two stored names that map to one name on
+    /// one (source, target) become one edge. The leaf validates instead of
+    /// failing its theme.
+    #[test]
+    fn relationship_names_outside_the_contract_are_mapped_and_the_leaf_validates() {
+        let (c, d, ag) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let mut rows = LeafRows::default();
+        rows.claims.insert(c, Some(ag));
+        rows.claims.insert(d, Some(ag));
+        rows.agents.insert(ag);
+        let long = "a".repeat(40);
+        for (i, (s, t, rel)) in [
+            (c, d, "has-part"),
+            (c, d, "has_part"),
+            (d, c, "2nd-order"),
+            (c, d, long.as_str()),
+            (d, c, "causé"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rows.edges
+                .push(epigraph_db::repos::atlas_leaf::StoredLeafEdge {
+                    id: Uuid::from_u128(100 + i as u128),
+                    source: LeafNode::claim(s),
+                    target: LeafNode::claim(t),
+                    relationship: rel.into(),
+                });
+        }
+        let set = node_set(&rows, &[c, d], 100).unwrap();
+        let mut leaf = skeleton(&[c, d]);
+        fill_leaf(
+            &mut leaf,
+            &set,
+            &FlowInputs::default(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let between: BTreeSet<(Uuid, Uuid, String)> = leaf
+            .edges
+            .iter()
+            .filter(|e| e.source != ag)
+            .map(|e| (e.source, e.target, e.relationship.clone()))
+            .collect();
+        let want: BTreeSet<(Uuid, Uuid, String)> = [
+            (c, d, "has_part".to_string()),
+            (c, d, "a".repeat(32)),
+            (d, c, "r_2nd_order".to_string()),
+            (d, c, "caus_".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(between, want);
+        epigraph_atlas_contract::LevelDocument::Leaf(leaf)
+            .validate()
+            .expect("a leaf with mapped names validates");
+    }
+
+    /// Every mapped name is a contract name, and a contract name is kept.
+    #[test]
+    fn a_mapped_relationship_name_is_always_a_contract_name() {
+        for kept in ["SUPPORTS", "has_part", "a"] {
+            assert_eq!(contract_relationship_name(kept), kept);
+        }
+        for stored in [
+            "-",
+            "_x",
+            "9",
+            "is part of",
+            "ünïcode-only",
+            &"x-".repeat(40),
+        ] {
+            let name = contract_relationship_name(stored);
+            assert!(
+                epigraph_atlas_contract::is_relationship_name(&name),
+                "{stored:?} -> {name:?}"
+            );
+        }
+        assert_eq!(contract_relationship_name("_x"), "r__x");
+        assert_eq!(contract_relationship_name("is part of"), "is_part_of");
     }
 
     /// A leaf claim's `truth_value` is its stored one; a claim the truth read

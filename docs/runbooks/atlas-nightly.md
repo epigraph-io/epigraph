@@ -62,15 +62,21 @@ newer run was published while the night ran; nothing was written) or
   caps it keeps the heaviest and never fails the night: the claim and every
   one of its agents and evidence rows are still drawn, only the weakest
   edges among them are not;
+- per theme in `themes.built[].stats`, `leaf_relationship_names`
+  (`renamed_edges`, and `names`: each stored relationship name the contract
+  refuses and the name it is served as). The contract allows letters, digits
+  and `_`, at most 32 characters, starting with a letter; `edges` takes any
+  non-empty name. A refused name is served with every other character
+  turned into `_`, `r_` put in front when it does not start with a letter,
+  and cut to 32 (`has-part` is served as `has_part`). It never fails the
+  night; a non-empty `names` is a hint to fix the writer that stored them;
 - `layout.relaid` (the levels laid out again) and `naming.renamed` (the
   levels whose naming input changed), `naming.report.calls`.
 
 A theme whose update FAILS does not fail the night. A leaf over the edge
 limit no longer fails one (above: several claims are split, one claim is
-capped). The known remaining cause is a stored edge whose relationship name
-the contract refuses (it allows letters, digits and `_`, at most 32
-characters, starting with a letter; `edges` takes any non-empty name and the
-leaf serves the stored one lower-cased). The theme is:
+capped), and neither does a stored relationship name the contract refuses
+(above: it is served mapped). The theme is:
 - **carried**: the previous run's levels of that theme are kept, both
   hierarchies, when every node and edge of every carried leaf is still in
   that leaf assembled from what the map may draw now (claims that arrived
@@ -78,10 +84,10 @@ leaf serves the stored one lower-cased). The theme is:
 - **dropped** from the run otherwise (a claim, agent, evidence row or edge
   of it left the map's audience: carrying it would leak it).
 
-Both list the error. For a refused relationship name an operator build does
-NOT clear it (the build would store the same leaf again): file the error
-(it names the level and the edge). Any other error: rebuild the map (below) and
-file the error.
+Both list the error. Rebuild the map (below) and file the error, unless the
+error says a level "breaks the contract": that is a builder defect an
+operator build does not clear (it would store the same leaf again), so file
+it (it names the level) and do not rebuild.
 
 Exit codes: 0 when every map was written, unchanged, skipped or a dry run;
 1 when a map failed or the night refused to start (the timer's alert fires);
