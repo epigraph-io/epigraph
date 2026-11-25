@@ -940,15 +940,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // of the caller's own viewer (`detach_scoped`), then writes on ONE
     // transaction stamped with that viewer (`write_as`, backlog b9c4e809), so
     // row security decides every statement below; the two SELECTs are frames
-    // by name.
+    // by name. The factor move (migration 311, backlog 9a9d6850) is a
+    // definer that reads that stamp: it refuses a session that does not write
+    // the promoted claim.
     (
         "hypothesis.rs",
         "promote_hypothesis",
         &[
+            "FactorRepository::promote_hypothesis_factors",
             "MassFunctionRepository::copy_to_frame",
             "hypothesis_status",
             "sqlx::query(INSERT).execute",
-            "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
             "sqlx::query_as(SELECT).fetch_one",
             "sqlx::query_as(SELECT).fetch_one",
