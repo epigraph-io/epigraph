@@ -288,6 +288,16 @@ impl SemanticLinkRepository {
     /// `relationship = ANY($1)` so the btree index on `edges.relationship`
     /// stays usable. `str_to_link_type` maps both spellings.
     ///
+    /// A mixed-case spelling (`Supports`) is NOT matched here, although
+    /// `str_to_link_type` (through `canonical_relationship`, which folds any
+    /// ASCII case) maps such a row when `get_by_source` / `get_by_target`
+    /// return it. That asymmetry is deliberate: an array bind can only carry
+    /// a finite spelling list, and no writer stores a mixed-case spelling
+    /// (every edge writer stores the lower-case form `canonical_relationship`
+    /// returns; older rows carry the upper-case form). Matching one would
+    /// need a `lower()` predicate, which gives up the index this query
+    /// relies on.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]

@@ -252,7 +252,11 @@ impl MaintenancePool {
     /// borrow checker's job.
     ///
     /// # Errors
-    /// `DbError::ConnectionFailed` if the connection cannot be acquired.
+    /// * `DbError::ConnectionFailed` if the connection cannot be acquired.
+    /// * `DbError::MaintenancePoolNotAttached` if no maintenance pool is
+    ///   attached. Unreachable for a pool built by [`Self::connect_to`], which
+    ///   attaches its own vetted pool after the privilege check; listed so a
+    ///   future constructor that skips the attach is caught by its callers.
     pub async fn viewer(
         &self,
         reason: epigraph_db::visibility::SystemReason,
