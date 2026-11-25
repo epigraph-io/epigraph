@@ -1908,7 +1908,10 @@ Each item states the behaviour implemented until the operator rules.
   mechanically); (b) land this branch first and renumber theirs; (c) renumber this branch now
   above the highest number claimed on origin. Ruled (a): the renumber is a blocking step
   before merge; once `main` carries those migrations, the guard above fails this branch's
-  CI until it is done.
+  CI until it is done. The first renumber's reference rewrite skipped identifiers, which left
+  test names on the old numbers (§16.R2 C15); the second must rename every
+  `migration_NNN_...` test identifier in the range, and the migration header comments and
+  spec citations that name them, in the same pass.
 - **C16. ([RULED] 2026-11-25, §16.R2: accepted; marker table is §15.F8.) Cost not ruled on.** The C6/C2 arms' share of
   the worst case (§11.2; three arms plus the countersign act since 304) and the unmeasured name
   search cost of §15.R16's placeholder rows. C12 accepted only the readable-claim arm.

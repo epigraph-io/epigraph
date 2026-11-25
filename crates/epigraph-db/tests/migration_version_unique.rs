@@ -10,8 +10,8 @@
 //! This ratchet fails the merged tree instead, on the file listing and on the
 //! migrator sqlx actually embeds.
 //!
-//! The version is parsed the way sqlx parses it (an integer, so `0274_a` and
-//! `274_b` collide). A reversible pair (`N_x.up.sql` / `N_x.down.sql`) shares
+//! The version is parsed the way sqlx parses it (an integer, so `09001_a` and
+//! `9001_b` collide). A reversible pair (`N_x.up.sql` / `N_x.down.sql`) shares
 //! one version by design; only the up half is counted.
 
 use std::collections::BTreeMap;
@@ -105,25 +105,28 @@ fn the_embedded_migrator_holds_each_version_once() {
 /// with a leading zero, and leaves a reversible pair and non-migrations alone.
 #[test]
 fn a_planted_duplicate_version_is_reported() {
+    // Versions far above any migration range: a later mechanical renumber of
+    // the migrations rewrites in-range numbers on the lines it touches, and
+    // must not rewrite this fixture.
     let planted = [
-        "273_group_live_roster.sql",
-        "274_retract_mark_grant.sql",
-        "274_human_identity_disclosure.sql",
-        "0275_padded.sql",
-        "275_profile_visibility_setter.sql",
-        "276_reversible.up.sql",
-        "276_reversible.down.sql",
+        "9000_first.sql",
+        "9001_one_branch.sql",
+        "9001_another_branch.sql",
+        "09002_padded.sql",
+        "9002_unpadded.sql",
+        "9003_reversible.up.sql",
+        "9003_reversible.down.sql",
         "README.md",
         "SCHEMA_DIAGRAM.md",
     ];
     let dups = duplicate_versions(planted);
     assert_eq!(
         dups.keys().copied().collect::<Vec<_>>(),
-        vec![274, 275],
-        "the planted 274 pair and the zero-padded 275 pair, nothing else: {dups:?}"
+        vec![9001, 9002],
+        "the planted 9001 pair and the zero-padded 9002 pair, nothing else: {dups:?}"
     );
     assert!(
-        duplicate_versions(["273_a.sql", "274_b.sql", "README.md"]).is_empty(),
+        duplicate_versions(["9000_a.sql", "9001_b.sql", "README.md"]).is_empty(),
         "CALIBRATION: distinct versions report nothing"
     );
 }
