@@ -58,8 +58,8 @@ reports a BetP for a no-DS claim agrees with the effective score.
 | REST `GET /api/v1/claims/:id/belief` (`epigraph-api` `routes/belief.rs::get_claim_belief`) | the raw DS cache columns (`ClaimRepository::get_belief_columns`) | every interval field `null`; **no** `truth_value` fallback |
 | REST `GET /api/v1/claims/:id/pignistic` (`routes/belief.rs::get_pignistic`) | live combination over one frame | uniform `1/n` per hypothesis, Bel 0, Pl 1 |
 | REST `GET /api/v1/claims/by-belief` (`ClaimRepository::list_by_belief_bounds`) | raw `belief >= min` and `plausibility <= max` | excluded (NULL compares false) |
-| MCP `recall` `min_truth` gate (`tools/memory.rs`, `effective_belief_batch`) | effective score | `truth_value` |
-| MCP `recall_with_context` `min_truth` gate and per-hit / context-atom `belief_score` (`tools/recall.rs`) | effective score | `truth_value` |
+| MCP `recall` `min_truth` gate (`epigraph-mcp` `tools/memory.rs::recall_post_embed`, through `ClaimRepository::effective_belief_batch`) | effective score | `truth_value` |
+| MCP `recall_with_context` `min_truth` gate and per-hit / context-atom `belief_score` (`tools/recall.rs::recall_with_context_core`) | effective score | `truth_value` |
 | MCP `traverse` `min_truth` gate (`tools/graph.rs::traverse`) | effective score | `truth_value` |
 | engine recall (`epigraph-engine` `recall.rs::effective_beliefs`) | effective score | `truth_value` |
 | MCP `query_claims` `min_truth` / `max_truth` filter and projection (`ClaimRepository::list_by_belief_range`) | effective score | `truth_value` |
