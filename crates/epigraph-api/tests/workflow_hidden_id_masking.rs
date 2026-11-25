@@ -1305,3 +1305,271 @@ async fn the_audited_admin_path_reaches_a_plan_whose_executes_edge_is_hidden(poo
     assert_eq!(rows.len(), 2, "a second admin_write row: {rows:?}");
     assert_eq!(rows[1].1["workflow_id"], w.workflow.to_string(), "{rows:?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backlog ea93e471: a re-ingest of a hidden row is refused, not answered
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A stdio MCP server keyed by `seed`, on `plain` and `scoped`.
+fn stdio_server(
+    plain: PgPool,
+    scoped: ScopedPool,
+    seed: u8,
+) -> epigraph_mcp::server::EpiGraphMcpFull {
+    let signer = epigraph_crypto::AgentSigner::from_bytes(&[seed; 32]).expect("signer");
+    let embedder =
+        epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None).with_scoped_pool(scoped.clone());
+    epigraph_mcp::server::EpiGraphMcpFull::new(plain, signer, embedder, false)
+        .with_scoped_pool(scoped)
+}
+
+/// The world's surfaces again, on the harness SUPERUSER (BYPASSRLS): row
+/// security hides nothing there, so the ingest's own stamp FINDS a row the
+/// caller's viewer cannot read and the executor reports it `already_ingested`
+/// (`epigraph_db::WorkflowRepository::tenancy_as_viewer` is then the only
+/// thing that knows the caller cannot read it). On `epigraph_app` the same
+/// row is hidden from the stamp and the executor refuses the lineage
+/// (migration 202). `(router, authenticated MCP server, stdio server keyed
+/// by OUTSIDER_STDIO)`.
+async fn privileged_surfaces(
+    pool: &PgPool,
+) -> (
+    Api,
+    epigraph_mcp::server::EpiGraphMcpFull,
+    epigraph_mcp::server::EpiGraphMcpFull,
+) {
+    let rolbypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user")
+            .fetch_one(pool)
+            .await
+            .expect("read the harness role");
+    assert!(
+        rolbypassrls,
+        "PREMISE: the harness login skips row security"
+    );
+    let state = AppState::with_scoped_pool(fixture::scoped_pool(pool).await, ApiConfig::default());
+    state
+        .load_entity_type_cache()
+        .await
+        .expect("load the entity-type cache");
+    let api = Api {
+        router: epigraph_api::routes::create_router(state),
+    };
+    let server = stdio_server(pool.clone(), fixture::scoped_pool(pool).await, 0x5A);
+    let stdio = stdio_server(
+        pool.clone(),
+        fixture::scoped_pool(pool).await,
+        OUTSIDER_STDIO,
+    );
+    (api, server, stdio)
+}
+
+/// The stdio server key of a non-member that ingests over stdio.
+const OUTSIDER_STDIO: u8 = 0x6B;
+
+/// The app-role stdio server keyed by [`OUTSIDER_STDIO`] (the same agent as
+/// the privileged one: an agent is its key).
+async fn app_role_stdio(pool: &PgPool) -> epigraph_mcp::server::EpiGraphMcpFull {
+    let url = fixture::database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
+    stdio_server(plain, scoped, OUTSIDER_STDIO)
+}
+
+/// `ingest_workflow` on `server` as `auth` (`None`: stdio).
+async fn mcp_ingest_on(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    extraction: Value,
+) -> ToolAnswer {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, auth)
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::types::IngestWorkflowParams =
+        serde_json::from_value(json!({ "extraction": extraction })).expect("params");
+    tool_answer(
+        epigraph_mcp::tools::workflow_ingest::ingest_workflow(server, &viewer, params, auth).await,
+    )
+}
+
+/// `store_workflow` on `server` as `auth`.
+async fn mcp_store_on(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    body: Value,
+) -> ToolAnswer {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, auth)
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::types::StoreWorkflowParams =
+        serde_json::from_value(body).expect("params");
+    tool_answer(epigraph_mcp::tools::workflows::store_workflow(server, &viewer, params, auth).await)
+}
+
+/// The fields of a SUCCESSFUL ingest answer: none may appear in the answer
+/// to a non-reader's re-ingest of a hidden row.
+const SUCCESS_FIELDS: &[&str] = &[
+    "already_ingested",
+    "claims_ingested",
+    "reused_items",
+    "workflow_id",
+    "executes_edges",
+];
+
+fn assert_no_success_fields(what: &str, answer: &str) {
+    for field in SUCCESS_FIELDS {
+        assert!(
+            !answer.contains(field),
+            "{what}: the answer carries a success field ({field}): {answer}"
+        );
+    }
+}
+
+/// Backlog ea93e471. A non-member's re-ingest of the hidden `(name, 0)` is
+/// refused on every surface (REST ingest, REST store, MCP over HTTP and over
+/// stdio), and the refusal is the SAME answer whether or not row security
+/// hid the row from the ingest's own stamp. Before, on a stamp that found the
+/// row the answer was a success, `already_ingested: true` with a
+/// re-ingest's counts and only the id left out, which no fresh name ever
+/// answers: an existence oracle for a hidden workflow. Controls on the same
+/// privileged surfaces: a fresh name is ingested (no `already_ingested`), and
+/// the member's re-ingest still carries the id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_readers_reingest_of_a_hidden_row_is_refused_alike_on_every_session(pool: PgPool) {
+    let w = world(&pool).await;
+    let (priv_api, priv_server, priv_stdio) = privileged_surfaces(&pool).await;
+    let app_stdio = app_role_stdio(&pool).await;
+    let hidden = extraction(&w.name, 0);
+    let before = row_counts(&pool).await;
+    let mut divergent = Vec::new();
+
+    // REST `POST /workflows/ingest`.
+    let app = w
+        .api
+        .post("/api/v1/workflows/ingest", &token(w.outsider), &hidden)
+        .await;
+    let privileged = priv_api
+        .post("/api/v1/workflows/ingest", &token(w.outsider), &hidden)
+        .await;
+    assert_eq!(
+        app.0,
+        StatusCode::CONFLICT,
+        "PREMISE: app role refuses: {}",
+        app.1
+    );
+    if app != privileged {
+        divergent.push(format!(
+            "REST ingest: app {app:?} / privileged {privileged:?}"
+        ));
+    }
+    assert_no_success_fields("privileged REST ingest", &privileged.1.to_string());
+
+    // REST `POST /workflows` (store), idempotent on `(slug(goal), 0)`.
+    let store = json!({"goal": w.name, "steps": ["a stored step"]});
+    let app = w
+        .api
+        .post("/api/v1/workflows", &token(w.outsider), &store)
+        .await;
+    let privileged = priv_api
+        .post("/api/v1/workflows", &token(w.outsider), &store)
+        .await;
+    assert_eq!(
+        app.0,
+        StatusCode::CONFLICT,
+        "PREMISE: app role refuses: {}",
+        app.1
+    );
+    if app != privileged {
+        divergent.push(format!(
+            "REST store: app {app:?} / privileged {privileged:?}"
+        ));
+    }
+    assert_no_success_fields("privileged REST store", &privileged.1.to_string());
+
+    // MCP over the authenticated transport: ingest and store.
+    let auth = auth_for(w.outsider);
+    let app = mcp_ingest_on(&w.server, Some(&auth), hidden.clone()).await;
+    let privileged = mcp_ingest_on(&priv_server, Some(&auth), hidden.clone()).await;
+    assert!(app.is_err(), "PREMISE: app role refuses: {app:?}");
+    if app != privileged {
+        divergent.push(format!(
+            "MCP-HTTP ingest: app {app:?} / privileged {privileged:?}"
+        ));
+    }
+    assert_no_success_fields("privileged MCP-HTTP ingest", &text_of(&privileged));
+    let app = mcp_store_on(&w.server, Some(&auth), store.clone()).await;
+    let privileged = mcp_store_on(&priv_server, Some(&auth), store.clone()).await;
+    assert!(app.is_err(), "PREMISE: app role refuses: {app:?}");
+    if app != privileged {
+        divergent.push(format!(
+            "MCP-HTTP store: app {app:?} / privileged {privileged:?}"
+        ));
+    }
+    assert_no_success_fields("privileged MCP-HTTP store", &text_of(&privileged));
+
+    // MCP over stdio: the server's own agent, a non-member.
+    let app = mcp_ingest_on(&app_stdio, None, hidden.clone()).await;
+    let privileged = mcp_ingest_on(&priv_stdio, None, hidden.clone()).await;
+    assert!(app.is_err(), "PREMISE: app role refuses: {app:?}");
+    if app != privileged {
+        divergent.push(format!(
+            "MCP-stdio ingest: app {app:?} / privileged {privileged:?}"
+        ));
+    }
+    assert_no_success_fields("privileged MCP-stdio ingest", &text_of(&privileged));
+
+    assert!(
+        divergent.is_empty(),
+        "a non-reader's re-ingest of a hidden row must answer as row security answers it, on \
+         every surface: {divergent:#?}"
+    );
+    assert_eq!(
+        row_counts(&pool).await,
+        before,
+        "the refusals wrote nothing"
+    );
+
+    // CONTROLS on the privileged surfaces, so the refusals above are the
+    // hidden row's and not a surface that refuses everything.
+    let fresh = format!("{}-fresh", w.name);
+    let (s, out) = priv_api
+        .post(
+            "/api/v1/workflows/ingest",
+            &token(w.outsider),
+            &extraction(&fresh, 0),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "a fresh name is ingested: {out}");
+    assert_eq!(out["already_ingested"], json!(false), "{out}");
+    assert!(out["workflow_id"].is_string(), "{out}");
+    let m = mcp_ingest_on(&priv_stdio, None, extraction(&format!("{fresh}-stdio"), 0))
+        .await
+        .expect("a fresh name is ingested over stdio");
+    assert_eq!(m["already_ingested"], json!(false), "{m}");
+    let (s, out) = priv_api
+        .post("/api/v1/workflows/ingest", &token(w.member), &hidden)
+        .await;
+    assert_eq!(s, StatusCode::OK, "the member's re-ingest: {out}");
+    assert_eq!(out["workflow_id"], json!(w.workflow), "{out}");
+    assert_eq!(out["already_ingested"], json!(true), "{out}");
+    let m = mcp_ingest_on(&priv_server, Some(&auth_for(w.member)), hidden)
+        .await
+        .expect("the member's MCP re-ingest");
+    assert_eq!(m["workflow_id"], json!(w.workflow.to_string()), "{m}");
+}
+
+/// `(claims, edges, workflows, workflow.created events)`: a refusal changes
+/// none.
+async fn row_counts(pool: &PgPool) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM claims), (SELECT count(*) FROM edges), \
+                (SELECT count(*) FROM workflows), \
+                (SELECT count(*) FROM events WHERE event_type = 'workflow.created')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("row counts")
+}

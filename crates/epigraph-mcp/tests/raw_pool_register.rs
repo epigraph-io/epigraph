@@ -352,12 +352,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/tools/workflow_authority.rs",
-        "caller_view_of",
-        1,
-        PRE_VIEWER,
-    ),
-    (
-        "epigraph-mcp/src/tools/workflow_authority.rs",
         "stdio_workflow_authority",
         1,
         PRE_VIEWER,
@@ -529,7 +523,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// Backlog 7a2cfa54 deleted `source_dependence::bba_sources_for_rows_on_pool`,
 /// whose last caller (`compare_methods`' no-ScopedPool arm) was already gone:
 /// 65 -> 64 (82 -> 81 on its own branch).
-const HIGH_WATER: usize = 64;
+/// Backlog bdc96181 moved the HTTP workflow gate's view of the row
+/// (`workflow_authority::caller_view_of`) onto the request viewer, read on
+/// the act's own transaction: 64 -> 63.
+const HIGH_WATER: usize = 63;
 
 // ===========================================================================
 // The scanner.
