@@ -183,8 +183,8 @@ async fn every_gated_route_refuses_a_token_without_its_scope(pool: PgPool) {
             .await;
         w.assert_admitted(method, &uri, READ_WRITE, &empty).await;
     }
-    // `POST /api/v1/ingest/paper` creates a directory at a caller-chosen path,
-    // reads a caller-named local PDF and runs a host script: `claims:admin`.
+    // `POST /api/v1/ingest/paper` downloads a paper into the server's work
+    // directory and runs host scripts, LLM extraction included: `claims:admin`.
     for uri in ["/api/v1/ingest/paper", "/api/v1/ingest/paper-url"] {
         w.assert_refused(Method::POST, uri, READ_ONLY, "claims:admin", &empty)
             .await;
@@ -192,6 +192,20 @@ async fn every_gated_route_refuses_a_token_without_its_scope(pool: PgPool) {
             .await;
         w.assert_admitted(Method::POST, uri, ADMIN, &empty).await;
     }
+    // `POST /api/v1/analyze/unconstrained` writes nothing but spends the
+    // server's LLM credential on the caller's prompt: `claims:admin`
+    // (backlog f2973ec9). The refusal is a 403 from the extractor, so it holds
+    // before any provider is built whatever the build's `genai` feature, and
+    // a valid question does not change it.
+    let uri = "/api/v1/analyze/unconstrained";
+    let question = json!({ "question": "What is the boiling point of water?" });
+    for body in [&empty, &question] {
+        w.assert_refused(Method::POST, uri, READ_ONLY, "claims:admin", body)
+            .await;
+        w.assert_refused(Method::POST, uri, READ_WRITE, "claims:admin", body)
+            .await;
+    }
+    w.assert_admitted(Method::POST, uri, ADMIN, &empty).await;
 }
 
 /// One route of the backlog item's evidence: a valid `body`, the row it

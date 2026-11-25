@@ -311,7 +311,7 @@ enum MigrateCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Auto-create frames by clustering claim embeddings (k-means via linfa)
+    /// Auto-create public frames by clustering PUBLIC claim embeddings (k-means via linfa)
     CreateFrames {
         /// Database URL (overrides DATABASE_URL env var)
         #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
@@ -1005,9 +1005,12 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 bad_mass.0
             );
 
-            // Check frames have hypotheses
+            // Check frames have hypotheses. `frames.hypotheses` is `text[]`,
+            // so its size is `cardinality` (0 for an empty array, where
+            // `array_length` would be NULL); `jsonb_array_length` was refused
+            // by Postgres on every call (backlog 06385b31).
             let bad_frames: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM frames WHERE hypotheses IS NULL OR jsonb_array_length(hypotheses) = 0"
+                "SELECT COUNT(*) FROM frames WHERE hypotheses IS NULL OR cardinality(hypotheses) = 0",
             )
             .fetch_one(&pool)
             .await
@@ -1284,11 +1287,25 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 if dry_run { " (DRY RUN)" } else { "" }
             );
 
-            // 1. Fetch claims with embeddings
+            // 1. Fetch claims with embeddings. pgvector casts `vector` to
+            //    `real[]` directly; going through `::text` handed Postgres
+            //    pgvector's `[..]` rendering, which array input refuses as a
+            //    malformed literal on every row (backlog 06385b31).
+            //
+            //    PUBLIC CLAIMS ONLY. This pool is the maintenance pool, which
+            //    row security does not filter, and every frame below is
+            //    written instance-wide (`visibility = 'public'`, the world
+            //    group) with a name and hypotheses QUOTED from its members'
+            //    content. A group-visible claim read here would have its text
+            //    copied into a row every authenticated reader can list, and
+            //    its frame binding would name a hypothesis space built from
+            //    other groups' text. Group claims are left out of the
+            //    clustering entirely.
             let rows: Vec<(Uuid, String, Vec<f32>)> = sqlx::query_as(
-                r#"SELECT id, content, embedding::text::float4[]
+                r#"SELECT id, content, embedding::real[]
                    FROM claims
                    WHERE embedding IS NOT NULL
+                     AND visibility = 'public'
                    ORDER BY id"#,
             )
             .fetch_all(&pool)
@@ -1396,7 +1413,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 let frame_name = format!(
                     "Auto-frame-{}: {}",
                     cluster_idx,
-                    &representative[..representative.len().min(60)]
+                    prefix_on_char_boundary(representative, 60)
                 );
 
                 // Generate hypothesis names from top 2-3 claims
@@ -1404,7 +1421,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                     .iter()
                     .take(3)
                     .map(|(_, _, content): &(usize, &Uuid, &str)| {
-                        content[..content.len().min(80)].to_string()
+                        prefix_on_char_boundary(content, 80).to_string()
                     })
                     .collect();
 
@@ -1420,8 +1437,10 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                         cluster_claims.len()
                     );
                 } else {
-                    // Create frame
-                    let hyp_json = serde_json::to_value(&hypotheses).unwrap();
+                    // Create frame. `frames.hypotheses` is `text[]`
+                    // (migration 001), so the names bind as a `Vec<String>`;
+                    // a `serde_json::Value` binds as `jsonb`, which Postgres
+                    // refused on every insert (backlog 06385b31).
                     // Tenancy declaration (PR-16): same as
                     // `FrameRepository::create` -- an instance-wide hypothesis
                     // space with no parent and no author.
@@ -1430,7 +1449,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                          VALUES ($1, $2, $3, $4) RETURNING id",
                     )
                     .bind(&frame_name)
-                    .bind(&hyp_json)
+                    .bind(&hypotheses)
                     .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
                     .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
                     .fetch_one(&pool)
@@ -1475,6 +1494,18 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
 // =============================================================================
 // UTILITIES
 // =============================================================================
+
+/// The longest prefix of `s` that is at most `max_bytes` long and ends on a
+/// character boundary. A plain `&s[..max_bytes]` panics when that offset falls
+/// inside a multi-byte character, which aborted `create-frames` on the first
+/// cluster whose claim text had one there.
+fn prefix_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 fn fmt_opt(v: Option<f64>) -> String {
     v.map_or_else(|| "-".to_string(), |x| format!("{x:.3}"))

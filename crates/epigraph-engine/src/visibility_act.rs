@@ -63,6 +63,22 @@
 //! route writes them), so a scoped read right after the act finds a value
 //! (backlog 4d8df0cf). A key with nothing admissible left gets no row.
 //!
+//! # The Beta track
+//!
+//! The claim's Beta-Bernoulli track (`claims.beta_alpha` / `beta_beta`) is
+//! read by everyone who can read the claim, and its posterior is what the
+//! claim's next live evidence write returns to its writer and records in a
+//! `ds_bayesian_divergence` row. It was accumulated from every BBA the OLD
+//! audience could read, so it can count a BBA citing evidence that stays
+//! behind (backlog 6e4ff46e). The act therefore rebuilds it for every moved
+//! claim, in the same transaction: back to the `Beta(1, 1)` prior, then every
+//! BBA a live writer counts that may enter the claim's cache under its new
+//! tenancy, oldest first
+//! ([`crate::ds_divergence::rebuild_beta_track`], which states where the
+//! rebuilt track differs from the live count). A moved claim with nothing
+//! admissible to count is back at the prior, so its next live write is a cold
+//! start and records no divergence row.
+//!
 //! # An operated agent is refused in the definer (migration 242)
 //!
 //! Neither act runs on an operated agent's own authority (share-with-team
@@ -109,17 +125,26 @@
 //!   which can still carry an input the new audience cannot read (a value a
 //!   propagation wrote); there is no admissible fold to replace it with here.
 //!   A claim at the deprecation marker keeps it (see "`truth_value`").
-//! * Claims moved by 206 before this ran keep the value folded then.
+//! * Claims moved by 206 before this ran keep the value folded then. Claims
+//!   moved before the Beta-track rebuild existed keep the track they carried
+//!   (see "The Beta track") until an operator runs the one-off
+//!   [`rebuild_moved_beta_tracks`] (the `rebuild_moved_beta_tracks` binary):
+//!   the act rebuilds only the claims it moves.
+//! * A live evidence write racing the act. The act locks each claim row
+//!   `FOR NO KEY UPDATE`, which does not block the evidence write's
+//!   foreign-key check, so its `mass_functions` row can be stamped with the
+//!   claim's OLD tenancy and its track increment then wait for the act and
+//!   land on the rebuilt track: one inadmissible increment served to the new
+//!   audience. The cache refold has the same window. The next act on the
+//!   claim, or [`rebuild_moved_beta_tracks`] (which locks `FOR UPDATE`),
+//!   clears it.
 //! * A `community` scoped row is not written afresh: its fold reads the
 //!   community's members and mass override on the raw pool. It stays absent
 //!   until the next computation that stores it.
-//! * `ds_bayesian_divergence` rows are not written afresh. Their posterior is
-//!   the claim's Beta track (`claims.beta_alpha` / `beta_beta`), which moves
-//!   with the claim unchanged and was accumulated from every BBA the old
-//!   audience could read. That track is itself an open leak this act does not
-//!   close: the claim's next live evidence write returns its posterior to the
-//!   writer and records a divergence row from it, both served to the new
-//!   audience. Recomputing the row here would only serve it sooner.
+//! * `ds_bayesian_divergence` rows are not written afresh. A row records one
+//!   evidence write (the BetP after it against the posterior after it), and
+//!   the act is not one; the claim's next live evidence write records its row
+//!   against the rebuilt track (see "The Beta track").
 
 use std::collections::HashMap;
 
@@ -138,8 +163,8 @@ pub enum VisibilityActError {
     /// visibility refusal.
     #[error(transparent)]
     Db(#[from] DbError),
-    /// The refold of a moved claim's cached belief failed. The act must not
-    /// commit.
+    /// The refold of a moved claim's cached belief, or the rebuild of its
+    /// Beta track, failed. The act must not commit.
     #[error("cached belief recompute after the act: {0}")]
     Cache(String),
 }
@@ -265,6 +290,13 @@ async fn refold_moved(
             edge_factor::recompute_widened_claim_cached_belief(&mut *conn, viewer, claim_id)
                 .await
                 .map_err(VisibilityActError::Cache)?;
+        // The Beta track, rebuilt from the evidence the new audience may read
+        // (see the module doc, "The Beta track"). For every moved claim, with
+        // or without a cache-owner frame: the track is served either way.
+        let track = crate::ds_divergence::rebuild_beta_track(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| VisibilityActError::Cache(format!("Beta track: {e}")))?;
+        tracing::debug!(%claim_id, ?track, "{act}: Beta track rebuilt");
         // `truth_value` may be a copy of the cache as folded for the OLD
         // audience (see the module doc, "truth_value"): replace it with the
         // refolded value, which is admissible by construction.
@@ -282,4 +314,152 @@ async fn refold_moved(
         }
     }
     Ok(())
+}
+
+/// One moved claim's Beta track as [`rebuild_moved_beta_tracks`] found and
+/// rebuilt it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MovedTrack {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// `(beta_alpha, beta_beta)` before, a `NULL` read as the prior.
+    pub before: (f64, f64),
+    /// `(beta_alpha, beta_beta)` rebuilt.
+    pub after: (f64, f64),
+    /// BBAs the rebuild counted (admissible for the claim's audience).
+    pub counted: usize,
+    /// Counted-method BBAs the rebuild left out (inadmissible or unparsable).
+    pub left_out: usize,
+    /// `ds_bayesian_divergence` rows of the claim deleted.
+    pub divergence_rows_cleared: u64,
+}
+
+/// What [`rebuild_moved_beta_tracks`] did.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MovedTracksReport {
+    /// Whether the rebuilt tracks were committed (`false`: a dry run, every
+    /// claim's transaction rolled back).
+    pub applied: bool,
+    /// Distinct claims the act audit rows name.
+    pub moved_claims: usize,
+    /// Every claim rebuilt (or, in a dry run, that would be).
+    pub rebuilt: Vec<MovedTrack>,
+    /// Claims an audit row names that no longer exist.
+    pub missing: Vec<Uuid>,
+    /// Claims whose rebuild failed, with the error; each rolled back alone.
+    pub failed: Vec<(Uuid, String)>,
+}
+
+/// The one-off rebuild of the Beta track of every claim a widening act moved
+/// BEFORE the act rebuilt it (backlog 6e4ff46e, "The Beta track" in the
+/// module doc): claims an act moved before this code was deployed still carry
+/// the track their old audience's evidence built, and serve it to the new
+/// audience.
+///
+/// The claims are the ones named by the act audit rows
+/// (`security_events`, `claim.publicized` and `claim.shared_with_team`,
+/// `details.claim_ids`), restricted to acts recorded before `moved_before`
+/// when it is given (the deploy time: a claim moved after it was rebuilt by
+/// its act). For each, in its own transaction:
+///
+/// * the claim row is locked `FOR UPDATE`, which also blocks a live evidence
+///   write's foreign-key check, so no increment lands between the rebuild's
+///   read and its write;
+/// * its track is rebuilt by [`crate::ds_divergence::rebuild_beta_track`],
+///   the act's own rebuild, for the claim's CURRENT tenancy;
+/// * every `ds_bayesian_divergence` row of the claim is deleted, as the
+///   widening definers delete them when they move a claim (migration 242):
+///   each row a live write recorded since the move compared against the
+///   leaky track, and it is served to the new audience.
+///
+/// Without `apply` every transaction is rolled back, so the report states
+/// what an applying run would write and nothing changes. A claim that no
+/// longer exists is reported and skipped; a claim whose rebuild fails is
+/// reported, rolled back alone, and the run goes on.
+///
+/// Must run on a maintenance connection with a bypass viewer: the audit rows,
+/// the claims and their evidence span every owner.
+///
+/// # Errors
+/// A refused (non-bypass) viewer, or a database error outside one claim's
+/// rebuild (the audit read, a transaction that cannot begin or end).
+pub async fn rebuild_moved_beta_tracks(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    moved_before: Option<chrono::DateTime<chrono::Utc>>,
+    apply: bool,
+) -> Result<MovedTracksReport, DbError> {
+    use sqlx::Connection;
+    if !viewer.is_bypass() {
+        return Err(DbError::Refused {
+            kind: RefusalKind::Authority,
+            message: "rebuild_moved_beta_tracks runs across every owner: it needs a \
+                      maintenance connection and a bypass viewer"
+                .to_string(),
+        });
+    }
+    let claim_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT c.id::uuid \
+           FROM security_events e \
+          CROSS JOIN LATERAL jsonb_array_elements_text( \
+                CASE WHEN jsonb_typeof(e.details -> 'claim_ids') = 'array' \
+                     THEN e.details -> 'claim_ids' ELSE '[]'::jsonb END) AS c(id) \
+          WHERE e.event_type IN ('claim.publicized', 'claim.shared_with_team') \
+            AND e.success \
+            AND ($1::timestamptz IS NULL OR e.created_at < $1::timestamptz) \
+          ORDER BY 1",
+    )
+    .bind(moved_before)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut report = MovedTracksReport {
+        applied: apply,
+        moved_claims: claim_ids.len(),
+        ..MovedTracksReport::default()
+    };
+    for claim_id in claim_ids {
+        let mut tx = conn.begin().await?;
+        let before: Option<(f64, f64)> = sqlx::query_as(
+            "SELECT COALESCE(beta_alpha, 1.0)::float8, COALESCE(beta_beta, 1.0)::float8 \
+               FROM claims WHERE id = $1 FOR UPDATE",
+        )
+        .bind(claim_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(before) = before else {
+            tx.rollback().await?;
+            report.missing.push(claim_id);
+            continue;
+        };
+        let rebuilt =
+            match crate::ds_divergence::rebuild_beta_track(&mut tx, viewer, claim_id).await {
+                Ok(track) => track,
+                Err(e) => {
+                    tx.rollback().await?;
+                    tracing::warn!(%claim_id, "moved-claim Beta-track rebuild failed: {e}");
+                    report.failed.push((claim_id, e));
+                    continue;
+                }
+            };
+        let cleared = sqlx::query("DELETE FROM ds_bayesian_divergence WHERE claim_id = $1")
+            .bind(claim_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if apply {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        report.rebuilt.push(MovedTrack {
+            claim_id,
+            before,
+            after: rebuilt.params,
+            counted: rebuilt.counted,
+            left_out: rebuilt.left_out,
+            divergence_rows_cleared: cleared,
+        });
+    }
+    Ok(report)
 }

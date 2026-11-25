@@ -28,6 +28,21 @@ Commands:
             (`compute` prints the digest of its own result, which always
             matches itself: it is not a review.)
   reverse   Restores exactly what a manifest's apply changed.
+  offbox    export, then the operator's off-box COMMAND, then apply, in one
+            run (the nightly's hook, `atlas_nightly --theme-cap-split`):
+            COMMAND is run as `COMMAND theme-cap EXPORT_DIR RESULT_FILE`
+            with a cleared environment (PATH, HOME and LANG only: never a
+            database URL), the export is deleted once it returns, and the
+            result is applied as `apply` does with every structural check
+            (`--cap` is both the export's and apply's cap; the result must
+            name exactly the exported themes). A theme whose members changed
+            while the command ran is skipped and reported
+            (`skipped_changed`), not rolled back with the others; it stays
+            over the cap for the next run. It is not checked against a
+            reviewed plan (there is none: no UMAP on the box); the manifest
+            records `review: "offbox-command"`, and `reverse` undoes it.
+            `scripts/atlas_offbox_compute.py` is a reference COMMAND that
+            computes in place.
 
 What apply writes, per theme:
   * The largest part keeps the theme's id; every other part becomes a new
@@ -101,9 +116,17 @@ the parts, never read from either file. `--unreviewed` applies such a result
 unchecked, and the output and manifest record which of these it was
 (`review`).
 
-After an apply, Atlas layouts (`atlas_layout_themes`) and graph neighbourhoods
-of a split theme are stale until rebuilt. `reverse` deletes the new parts'
-rows, and rows that reference them cascade.
+After an apply, and after a reverse, the derived rows of the touched themes
+are stale until rebuilt (backlog 30633061): the newest clustering run still
+files the moved claims under their old theme's graph neighbourhoods and has
+none for the new parts, and the newest Atlas layout run has no position for
+the parts (it reads `stale`). Both are built per run, so the rebuild is a new
+run of each: a `ClusterGraph` job (enqueued, then drained), which writes
+neighbourhoods for every theme, then a new layout run. Both commands print,
+and the manifest records, `touched_theme_ids` (every parent and every new
+part, to check the new run against), and print the REQUIRED follow-up steps
+(`REBUILD_STEPS`; docs/runbooks/atlas-nightly.md, "After a theme-cap split").
+`reverse` deletes the new parts' rows, and rows that reference them cascade.
 
 Usage:
     MAINTENANCE_DATABASE_URL=... python3 scripts/theme_cap_split.py plan --out plan.json
@@ -118,11 +141,16 @@ Usage:
         --reviewed-plan plan.json --manifest manifest.json
 """
 import argparse
+import contextlib
 import datetime
 import json
 import os
 import pathlib
 import re
+import shutil
+import signal
+import stat
+import subprocess
 import sys
 import urllib.parse
 import uuid
@@ -341,6 +369,27 @@ def _commit(conn):
     conn.commit()
 
 
+# What an apply or a reverse leaves stale, and the steps that rebuild it
+# (docs/runbooks/atlas-nightly.md, "After a theme-cap split").
+REBUILD_STEPS = [
+    """enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique""",
+    "drain_jobs",
+    "python3 scripts/label_themes_llm.py --neighborhoods",
+    "atlas_layout --apply",
+]
+
+
+def touched_theme_ids(manifest):
+    """Every theme a manifest's apply changed (each parent and each new part),
+    sorted: the themes whose graph neighbourhoods and Atlas layout rows must
+    be rebuilt after the apply, and again after its reverse."""
+    ids = set()
+    for t in manifest.get("themes", []):
+        ids.add(t["parent_id"])
+        ids.update(p["theme_id"] for p in t["new_parts"])
+    return sorted(ids)
+
+
 def _parent_path(props):
     if isinstance(props.get("split_path"), list):
         return list(props["split_path"])
@@ -398,6 +447,8 @@ REVIEW_PLAN_FILE = "reviewed-plan"
 REVIEW_DIGEST = "expect-digest"
 REVIEW_IS_PLAN = "result-is-the-plan"
 REVIEW_NONE = "unreviewed"
+# The nightly's off-box hook (`offbox`): structural checks only, recorded as such.
+REVIEW_OFFBOX = "offbox-command"
 
 
 def review_digest(result, reviewed_plan=None, expect_digest=None, unreviewed=False):
@@ -424,8 +475,17 @@ def review_digest(result, reviewed_plan=None, expect_digest=None, unreviewed=Fal
 
 
 def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_digest=None,
-                 review=None):
+                 review=None, skip_changed=False):
     """Write a result document in one transaction; returns the manifest.
+
+    With `skip_changed` (the nightly's `offbox`), a theme whose live embedded
+    members are no longer exactly the claims of its parts (one arrived, left,
+    or lost or gained an embedding since the export) is SKIPPED, untouched,
+    and listed in the manifest's `skipped_changed`, instead of rolling back
+    every other theme; it stays over the cap and the next run splits it. A
+    result whose parts DO cover the members but fail another check (a claim
+    twice, a part over the cap) is still refused whole: that is a broken
+    compute, not churn.
 
     The result's own cap is enforced, and a result whose cap exceeds `max_cap`
     (apply's `--cap`) is refused: the file may come back from off the box,
@@ -449,6 +509,9 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
                 "review": review,
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "themes": []}
+    skipped = []
+    if skip_changed:
+        manifest["skipped_changed"] = skipped
     touched = []
     try:
         with conn.cursor() as cur:
@@ -463,6 +526,9 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
                 cur.execute("SELECT id::text FROM claims WHERE theme_id = %s "
                             "AND embedding IS NOT NULL", (parent,))
                 members = [r[0] for r in cur.fetchall()]
+                if skip_changed and set(members) != {c for part in parts for c in part}:
+                    skipped.append(parent)
+                    continue
                 try:
                     core.validate_parts(members, parts, cap)
                 except ValueError as e:
@@ -512,7 +578,10 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
             # EVERY theme the result names, not only the ones written: a
             # safety net behind the placement above, so no theme the result
             # names can stay over the cap behind a successful apply.
-            checked = sorted({t for t, _ in touched} | {str(e["theme_id"]) for e in result["themes"]})
+            # A theme skipped as changed is untouched and stays over the cap
+            # (the next run splits it): it is not this apply's to check.
+            checked = sorted({t for t, _ in touched}
+                             | ({str(e["theme_id"]) for e in result["themes"]} - set(skipped)))
             cur.execute(f"SELECT theme_id::text, count(*) FROM claims "
                         f"WHERE theme_id = ANY(%s::uuid[]) AND {CURRENT} "
                         "GROUP BY theme_id HAVING count(*) > %s ORDER BY 1",
@@ -524,12 +593,97 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
         if not manifest["themes"]:
             conn.rollback()
             return manifest
+        manifest["touched_theme_ids"] = touched_theme_ids(manifest)
         _write_json_new(manifest_path, manifest)
         _commit(conn)
     except BaseException:
         conn.rollback()
         raise
     return manifest
+
+
+# ── offbox (the nightly's hook) ─────────────────────────────────────────────
+
+OFFBOX_KIND = "theme-cap"
+# The only variables the off-box command inherits.
+OFFBOX_KEPT_ENV = ("PATH", "HOME", "LANG")
+
+
+def offbox_env():
+    """The off-box command's whole environment: OFFBOX_KEPT_ENV from ours, so
+    no database URL or other credential of this process reaches it."""
+    return {k: os.environ[k] for k in OFFBOX_KEPT_ENV if k in os.environ}
+
+
+def check_private_dir(path):
+    """Refuse a work directory that is missing, a symlink, not a directory,
+    or open to group or other: the export holds embeddings."""
+    path = pathlib.Path(path)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise ValueError(f"{path} is not a directory (a symlink is refused too)")
+    if st.st_mode & 0o077:
+        raise ValueError(f"{path} has mode {st.st_mode & 0o777:o}: it holds embeddings, so it "
+                         "must be owner-only (chmod 700)")
+
+
+def run_offbox_command(command, export_dir, result_path, timeout):
+    """`command theme-cap export_dir result_path`, cleared environment, no
+    stdin, stdout discarded (ours is the JSON report). It runs in its own
+    session, and at `timeout` (or if we are interrupted) its WHOLE process
+    group is killed, so a wrapper's background copy or ssh cannot outlive it.
+    Raises subprocess.TimeoutExpired or CalledProcessError."""
+    argv = [str(command), OFFBOX_KIND, str(export_dir), str(result_path)]
+    proc = subprocess.Popen(argv, env=offbox_env(), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, start_new_session=True)
+    try:
+        code = proc.wait(timeout=timeout)
+    except BaseException:
+        # The leader is not reaped yet, so its pid is still the group's id.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise
+    if code != 0:
+        raise subprocess.CalledProcessError(code, argv)
+
+
+def offbox_split(conn, command, work_dir, manifest_path, cap=core.DEFAULT_CAP,
+                 seed=core.DEFAULT_SEED, theme_ids=None, timeout=3600):
+    """Export the over-cap themes into `work_dir`, run the off-box `command`
+    on the export, delete the export, and apply the result. Returns
+    (manifest, exported theme ids); the manifest has no themes when nothing
+    was over the cap or nothing needed splitting."""
+    check_private_dir(work_dir)
+    work_dir = pathlib.Path(work_dir)
+    export_dir = work_dir / "export"
+    result_path = work_dir / "result.json"
+    for p in (export_dir, result_path):
+        if os.path.lexists(p):
+            raise ValueError(f"{p} already exists: give offbox a fresh work directory")
+    try:
+        index = export(conn, export_dir, cap, seed, theme_ids)
+        exported = sorted(t["theme_id"] for t in index["themes"])
+        if not exported:
+            return {"format": MANIFEST_FORMAT, "themes": [], "split_run": None,
+                    "parts_digest": None, "review": REVIEW_OFFBOX}, []
+        run_offbox_command(command, export_dir, result_path, timeout)
+    finally:
+        # The embeddings never outlive the call, whatever it returned.
+        shutil.rmtree(export_dir, ignore_errors=True)
+    result = json.loads(result_path.read_text())
+    if not isinstance(result, dict) or result.get("format") != core.RESULT_FORMAT:
+        raise ValueError(f"the off-box result is not a {core.RESULT_FORMAT} result; nothing "
+                         "was written")
+    named = sorted(str(t.get("theme_id")) for t in result.get("themes") or [])
+    if named != exported:
+        raise ValueError(f"the off-box result names themes {named}, not the exported "
+                         f"{exported}; nothing was written")
+    # Skip (and report) a theme whose members changed during the call rather
+    # than roll back every other theme's split with it.
+    manifest = apply_result(conn, result, manifest_path, max_cap=cap, review=REVIEW_OFFBOX,
+                            skip_changed=True)
+    return manifest, exported
 
 
 # ── reverse ─────────────────────────────────────────────────────────────────
@@ -671,6 +825,19 @@ def main(argv=None):
                           help="apply a result that is not a plan without checking it against "
                                "a reviewed plan")
 
+    sp = sub.add_parser("offbox", help="export, run the off-box command, apply (the nightly "
+                                       "hook); writes a manifest")
+    db_args(sp)
+    select_args(sp)
+    sp.add_argument("--command", dest="command_path", required=True,
+                    help="run as COMMAND theme-cap EXPORT_DIR RESULT_FILE, cleared environment")
+    sp.add_argument("--work-dir", required=True,
+                    help="an owner-only directory for the export (deleted after) and result")
+    sp.add_argument("--manifest", default=None,
+                    help="manifest to create (default <work-dir>/manifest.json)")
+    sp.add_argument("--timeout", type=int, default=3600,
+                    help="seconds the command may take (default %(default)s)")
+
     sp = sub.add_parser("reverse", help="restore what an apply changed")
     db_args(sp)
     sp.add_argument("--manifest", required=True)
@@ -732,6 +899,25 @@ def main(argv=None):
                               "parts_digest": manifest["parts_digest"],
                               "checked_against_review": expect_digest is not None,
                               "review": review,
+                              "touched_theme_ids": manifest.get("touched_theme_ids", []),
+                              "rebuild_next": REBUILD_STEPS if manifest["themes"] else [],
+                              "themes": [{"parent_id": t["parent_id"],
+                                          "kept": len(t["kept_claim_ids"]),
+                                          "new_parts": [{"theme_id": n["theme_id"],
+                                                         "claims": len(n["claim_ids"])}
+                                                        for n in t["new_parts"]]}
+                                         for t in manifest["themes"]]}))
+        elif args.command == "offbox":
+            mpath = args.manifest or str(pathlib.Path(args.work_dir) / "manifest.json")
+            manifest, exported = offbox_split(conn, args.command_path, args.work_dir, mpath,
+                                              args.cap, args.seed, args.theme_id, args.timeout)
+            print(json.dumps({"status": "applied" if manifest["themes"] else "nothing to split",
+                              "exported": exported,
+                              "skipped_changed": manifest.get("skipped_changed", []),
+                              "manifest": mpath if manifest["themes"] else None,
+                              "split_run": manifest["split_run"],
+                              "parts_digest": manifest["parts_digest"],
+                              "review": REVIEW_OFFBOX,
                               "themes": [{"parent_id": t["parent_id"],
                                           "kept": len(t["kept_claim_ids"]),
                                           "new_parts": [{"theme_id": n["theme_id"],
@@ -740,8 +926,15 @@ def main(argv=None):
                                          for t in manifest["themes"]]}))
         elif args.command == "reverse":
             manifest = json.loads(pathlib.Path(args.manifest).read_text())
+            statuses = reverse_manifest(conn, manifest, args.allow_drift)
+            # Only a reverse that changed something leaves derived rows stale:
+            # "nothing to reverse" (an apply that never committed, or a second
+            # reverse) asks for no whole-graph re-cluster.
+            changed = any(s["status"] in ("reversed", "reversed with drift") for s in statuses)
             print(json.dumps({"status": "reversed",
-                              "themes": reverse_manifest(conn, manifest, args.allow_drift)}))
+                              "themes": statuses,
+                              "touched_theme_ids": touched_theme_ids(manifest),
+                              "rebuild_next": REBUILD_STEPS if changed else []}))
     finally:
         conn.close()
     return 0

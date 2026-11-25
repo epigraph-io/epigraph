@@ -2407,6 +2407,8 @@
     }
     if (c.theme && c.theme.label) top.appendChild(el('p', 'small muted', 'Theme: ' + c.theme.label));
 
+    if (body.provenance) provenanceSection(body.provenance);
+
     const ringS = section('Linked claims');
     if (!body.ring || body.ring.status !== 'ok') {
       unavailable(ringS, body.ring ? body.ring.reason : null, () => {
@@ -2493,6 +2495,46 @@
     share.appendChild(input);
     share.appendChild(copy);
     more.appendChild(share);
+  }
+
+  /**
+   * Who filed the claim (P3b), as rows from AtlasViews.provenanceRows. Text
+   * goes in through textContent only; a document links out only through
+   * doiHref, a person only through link() (same-origin paths).
+   */
+  function provenanceSection(prov) {
+    const box = section('Provenance');
+    if (prov.status !== 'ok') {
+      unavailable(box, prov.reason, null);
+      return;
+    }
+    const rows = VIEWS ? VIEWS.provenanceRows(prov.data) : null;
+    if (!rows) {
+      unavailable(box, 'Who filed this claim cannot be shown here.', null);
+      return;
+    }
+    for (const row of rows) {
+      box.appendChild(el('h4', 'small', row.title));
+      const p = el('p', 'small');
+      for (const part of row.parts) {
+        if (part.href && part.external) {
+          const href = doiHref(part.href);
+          if (href) {
+            const a = el('a', null, part.text);
+            a.setAttribute('href', href);
+            a.setAttribute('rel', 'noopener noreferrer');
+            a.setAttribute('target', '_blank');
+            p.appendChild(a);
+            continue;
+          }
+        } else if (part.href) {
+          p.appendChild(link(part.href, part.text));
+          continue;
+        }
+        p.appendChild(document.createTextNode(part.text));
+      }
+      box.appendChild(p);
+    }
   }
 
   async function showLinksPanel(a, b) {

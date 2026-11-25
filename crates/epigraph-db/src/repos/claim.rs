@@ -770,6 +770,21 @@ pub struct NearestClaimHit {
     pub distance: f64,
 }
 
+/// One BBA a live Beta-track writer counts, as
+/// [`ClaimRepository::beta_track_inputs`] returns it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BetaTrackInput {
+    /// The `mass_functions` row.
+    pub id: Uuid,
+    /// The stored masses.
+    pub masses: serde_json::Value,
+    /// The frame the BBA is on.
+    pub frame_name: String,
+    pub hypotheses: Vec<String>,
+    /// The claim's current `claim_frames.hypothesis_index` on that frame.
+    pub hypothesis_index: Option<i32>,
+}
+
 /// One fused hit from [`ClaimRepository::search_hybrid_scoped`] /
 /// [`ClaimRepository::search_lexical_scoped`].
 ///
@@ -1525,6 +1540,74 @@ async fn require_privileged_session(
     })
 }
 
+/// Before a replacement cascade re-points edges onto `destination`, take the
+/// step lineage lock of `destination` in SHARE mode
+/// (`WorkflowRepository::lock_step_lineage_shared`, keyed on its
+/// `COALESCE(step_lineage_id, id)`), held to the end of the cascade's
+/// transaction (backlog 449a2afb).
+///
+/// # Why
+///
+/// The `evolve_step` gates hold the caller to workflow authority over every
+/// workflow that executes the parent's step lineage, read under the lineage's
+/// EXCLUSIVE lock (`WorkflowRepository::lock_step_lineage_for_evolve`). Every
+/// `executes` INSERT takes the same key in share mode first (bf2e9aa6), but a
+/// cascade does not insert its edges: it re-points them with `UPDATE edges SET
+/// target_id`, so a workflow's `executes` edge moved onto a member of the
+/// lineage by a supersede, a dedup, a merge or an un-mark used to land beside
+/// an evolve's authority read without either waiting for the other, and the
+/// evolve then changed what that workflow runs without authority over it.
+/// With this lock the two serialize: a cascade waits for an evolve in flight
+/// on the destination's lineage, and an evolve waits for a cascade in flight,
+/// then reads the re-pointed edge.
+///
+/// Taken unconditionally, not only when an `executes` edge is about to move:
+/// whether one is depends on rows a concurrent writer can commit between such
+/// a check and the UPDATE. Each cascade re-points onto ONE destination, so it
+/// takes one key and there is no lock order to keep between keys. Every
+/// caller runs on the privileged maintenance session (or the privileged
+/// one-transaction form), whose row security reads the destination, so the
+/// key is its true lineage. The cascades run after the act's transaction has
+/// committed (the request paths acquire the maintenance session before, and
+/// use it after, the commit), so an `evolve_step(supersedes)` no longer holds
+/// its exclusive lock when its own cascade takes this one.
+///
+/// # Row before key
+///
+/// The destination's claims row is locked `FOR KEY SHARE` BEFORE the key, the
+/// order an evolve takes them in (`lock_step_lineage_for_evolve`: the parent's
+/// row `FOR UPDATE`, then the key). A cascade body can take that row lock
+/// later anyway: the dedup repair binds the canonical to the duplicate's
+/// frames (`INSERT INTO claim_frames`) and moves BBAs onto it, and each
+/// foreign-key check takes `FOR KEY SHARE` on the canonical's row. Taken after
+/// the key, that deadlocked an evolve whose parent IS the destination: the
+/// cascade held the key and waited for the row, the evolve held the row and
+/// waited for the key, and Postgres aborted one of them (review of 449a2afb).
+/// Taken first, the cascade waits for the evolve's row lock and holds no key
+/// meanwhile, and an evolve arriving later waits for the cascade on the row.
+/// `FOR KEY SHARE` is the mode the foreign-key checks take: it conflicts with
+/// the evolve's `FOR UPDATE` and with nothing a plain `UPDATE` of a non-key
+/// column takes, so it blocks no writer the body's own checks would not.
+async fn lock_repoint_destination(
+    conn: &mut sqlx::PgConnection,
+    destination: Uuid,
+) -> Result<(), DbError> {
+    let row: Option<i32> = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; locks the cascade's destination row, returns nothing to a caller.
+         SELECT 1 FROM claims WHERE id = $1 FOR KEY SHARE"#,
+    )
+    .bind(destination)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if row.is_none() {
+        return Err(DbError::NotFound {
+            entity: "Claim".to_string(),
+            id: destination,
+        });
+    }
+    crate::repos::workflow::WorkflowRepository::lock_step_lineage_shared(conn, destination).await
+}
+
 /// The two edge-migration statements of a supersession, unchecked: the
 /// callers ([`ClaimRepository::supersede_conn`],
 /// [`ClaimRepository::migrate_superseded_edges_conn`]) establish the privilege
@@ -1588,6 +1671,9 @@ async fn migrate_superseded_edges(
             reason: format!("no replacement named for {old_uuid}; refusing to migrate its edges"),
         });
     };
+    // The incoming re-point below can move a workflow's `executes` edge onto
+    // `onto`'s step lineage: serialize with an `evolve_step` of that lineage.
+    lock_repoint_destination(&mut *conn, onto).await?;
     let weakening: Vec<String> = crate::repos::edge::WEAKENING_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -4800,11 +4886,27 @@ impl ClaimRepository {
     /// `is_current = false` rows (superseded/retired claims must never
     /// suppress a new near-paraphrase insert).
     ///
+    /// # Iterative HNSW scan, then exact (backlog b00aa40e)
+    ///
+    /// Run as [`Self::search_by_embedding_scoped`] runs: an iterative HNSW
+    /// scan ([`begin_iterative_hnsw`]), retried as an exact scan when it comes
+    /// back short ([`exact_retry_or_first_pass`]; `vector_scan` module doc),
+    /// each in a transaction rolled back so the settings never reach the
+    /// caller's later reads. A plain scan yields at most `hnsw.ef_search` rows
+    /// before the visibility splice runs, so rows the caller cannot read,
+    /// nearer the query than its own, emptied its neighbours: the gate missed
+    /// the caller's own near-duplicate (and inserted a second copy), and
+    /// whether it fired told the caller whether foreign rows sit near its
+    /// text.
+    ///
+    /// Takes a connection rather than an executor because the settings need
+    /// a transaction (a savepoint on a caller's own transaction).
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
-    pub async fn nearest_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    #[instrument(skip(conn, viewer, query_embedding_pgvector))]
+    pub async fn nearest_by_embedding(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
@@ -4822,13 +4924,29 @@ impl ClaimRepository {
             "#,
             3,
         );
-        let mut q = sqlx::query_as::<_, NearestClaimHit>(&sql)
-            .bind(query_embedding_pgvector)
-            .bind(limit);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+        // A macro, not a closure: see `search_by_embedding_scoped`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query_as::<_, NearestClaimHit>(&sql)
+                    .bind(query_embedding_pgvector)
+                    .bind(limit);
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q
+            }};
         }
-        let rows = q.fetch_all(executor).await?;
+
+        let mut tx = begin_iterative_hnsw(&mut *conn, limit).await?;
+        let fetched = build!().fetch_all(&mut *tx).await;
+        tx.rollback().await?;
+        let rows = fetched?;
+        if (rows.len() as i64) < limit {
+            let mut tx = begin_exact_vector_scan(&mut *conn).await?;
+            let retried = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            return exact_retry_or_first_pass(retried, rows, "nearest_by_embedding");
+        }
 
         Ok(rows)
     }
@@ -9373,6 +9491,103 @@ impl ClaimRepository {
         Ok(q.fetch_optional(&mut *conn).await?)
     }
 
+    /// The BBAs of `claim_id` that a live Beta-track writer counts, oldest
+    /// first, with the claim's hypothesis index on each one's frame: the
+    /// input of a Beta-track rebuild (backlog 6e4ff46e,
+    /// `epigraph_engine::ds_divergence::rebuild_beta_track`).
+    ///
+    /// A row is returned when it is a fold input (not retracted, not a cached
+    /// combination: the predicates every combine-input reader uses) and its
+    /// writer counts it on the track when it stores it:
+    ///
+    /// * its `combination_method` is one of `counted_methods` (the engine's
+    ///   list of the counting writers' methods: `POST /frames/:id/evidence`
+    ///   and MCP `submit_ds_evidence`); or
+    /// * it is an `auto_wire` row keyed on a perspective or a slot: an evidence
+    ///   row of `update_with_evidence` or `report_workflow_outcome`. An
+    ///   `auto_wire` row with neither is a creation BBA (`submit_claim`,
+    ///   `memorize`, batch ingest), the claim's prior, which no live writer
+    ///   counts.
+    ///
+    /// The hypothesis index is the claim's CURRENT `claim_frames` index on the
+    /// row's frame (`None` when it has none; such a row counts nothing).
+    /// Viewer-scoped on the BBA row; the caller decides which rows are
+    /// admissible for the audience the rebuilt track is served to.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, counted_methods))]
+    pub async fn beta_track_inputs(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        counted_methods: &[&str],
+    ) -> Result<Vec<BetaTrackInput>, DbError> {
+        let not_retracted = crate::repos::mass_function::not_retracted_predicate("mf.");
+        let cached = crate::repos::mass_function::cached_combination_predicate("mf.");
+        let sql = viewer.splice(
+            &format!(
+                "SELECT mf.id, mf.masses, f.name AS frame_name, f.hypotheses, \
+                        cf.hypothesis_index \
+                   FROM mass_functions mf \
+                   JOIN frames f ON f.id = mf.frame_id \
+                   LEFT JOIN claim_frames cf \
+                          ON cf.claim_id = mf.claim_id AND cf.frame_id = mf.frame_id \
+                  WHERE mf.claim_id = $1 \
+                    AND {not_retracted} AND NOT {cached} \
+                    AND (mf.combination_method = ANY($2::text[]) \
+                         OR (mf.combination_method = 'auto_wire' \
+                             AND (mf.perspective_id IS NOT NULL OR mf.slot_id IS NOT NULL))) \
+                    /* {{VISIBILITY:mf}} */ \
+                  ORDER BY mf.created_at, mf.id"
+            ),
+            3,
+        );
+        let methods: Vec<String> = counted_methods.iter().map(|m| (*m).to_string()).collect();
+        let mut q = sqlx::query_as::<_, BetaTrackInput>(&sql)
+            .bind(claim_id)
+            .bind(methods);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
+    /// Set the claim's Beta-Bernoulli parameters to `(alpha, beta)`, replacing
+    /// whatever the track held: the write of a Beta-track rebuild (backlog
+    /// 6e4ff46e). Each parameter is held at or above the prior's `1.0`, as
+    /// [`Self::add_beta_increments`] holds it.
+    ///
+    /// Gated on the claim's group (`{WRITABLE:c}`), as the live update is.
+    /// Returns whether a row was written: `false` for a claim that does not
+    /// exist or that the viewer may not write.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn set_beta_params(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+        alpha: f64,
+        beta: f64,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "UPDATE claims AS c \
+                SET beta_alpha = GREATEST($2::float8, 1.0), \
+                    beta_beta = GREATEST($3::float8, 1.0), \
+                    updated_at = NOW() \
+              WHERE c.id = $1 /* {WRITABLE:c} */",
+            4,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(alpha).bind(beta);
+        // Conditional: a `Bypass` viewer renders `" "` and has no `$4`.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.execute(&mut *conn).await?.rows_affected() > 0)
+    }
+
     /// The claim's stored Beta-Bernoulli parameters `(beta_alpha, beta_beta)`,
     /// a `NULL` read as the `Beta(1, 1)` prior. `None` when the claim does not
     /// exist or the viewer cannot see it.
@@ -13414,6 +13629,9 @@ async fn migrate_consolidated_edges(
     merged_id: Uuid,
     source_ids: &[Uuid],
 ) -> Result<ConsolidateEdgeMigration, DbError> {
+    // The survivors' re-point below can move a workflow's `executes` edge onto
+    // the merged claim's step lineage: serialize with an `evolve_step` of it.
+    lock_repoint_destination(&mut *tx, merged_id).await?;
     let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
     // Collect every LIVE non-supersedes edge (either spelling: a legacy
     // upper-case `SUPERSEDES` is lineage too, SPEC §5.1) touching a source,
@@ -14175,6 +14393,10 @@ async fn repair_marked_duplicate(
     // is workflow-sourced, so only the incoming retarget below meets one
     // today; the outgoing clauses and the claim-sourced incoming collision
     // guard cover a claim-sourced `executes`, which the edges table accepts.
+    //
+    // That incoming retarget can move a workflow's `executes` edge onto the
+    // canonical's step lineage: serialize with an `evolve_step` of it first.
+    lock_repoint_destination(&mut *conn, canon_uuid).await?;
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
     // Agents' authorship of the duplicate and act-marked edges stay on it
     // (ruling R-133, as in `migrate_superseded_edges`), and so do the
@@ -14859,6 +15081,9 @@ async fn reverse_marked_duplicate(
         });
     };
     let chain: Vec<Uuid> = canonical_chain.to_vec();
+    // The re-target back below can move a workflow's `executes` edge onto the
+    // duplicate's step lineage: serialize with an `evolve_step` of it.
+    lock_repoint_destination(&mut *conn, dup_uuid).await?;
     let mut out = DedupReversal::default();
     let mut drifted: Vec<Uuid> = Vec::new();
     let note_drift = |asked: &[Uuid], done: &[Uuid], drifted: &mut Vec<Uuid>| {

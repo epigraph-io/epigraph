@@ -224,7 +224,7 @@ pub async fn decide(
         }
     };
     let nearest =
-        match ClaimRepository::nearest_by_embedding(&mut *read, viewer, &pgvec, NEAREST_K).await {
+        match ClaimRepository::nearest_by_embedding(&mut read, viewer, &pgvec, NEAREST_K).await {
             Ok(hits) => hits,
             Err(e) => {
                 tracing::warn!("novelty gate: nearest_by_embedding failed: {e}");

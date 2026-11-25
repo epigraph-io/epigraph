@@ -89,9 +89,14 @@ async fn nearest_by_embedding_orders_closest_first(pool: PgPool) {
         seed_claim_with_embedding(&pool, agent, "close claim", 1, &close_vec, true).await;
     let far_id = seed_claim_with_embedding(&pool, agent, "far claim", 2, &far_vec, true).await;
 
-    let hits = ClaimRepository::nearest_by_embedding(&pool, &viewer, &close_vec, 5)
-        .await
-        .expect("nearest_by_embedding");
+    let hits = ClaimRepository::nearest_by_embedding(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        &close_vec,
+        5,
+    )
+    .await
+    .expect("nearest_by_embedding");
 
     assert!(!hits.is_empty(), "expected at least one hit");
     assert_eq!(hits[0].claim_id, close_id, "closest vector must rank first");
@@ -139,9 +144,14 @@ async fn nearest_by_embedding_excludes_non_current(pool: PgPool) {
     .await
     .expect("seed stale claim");
 
-    let hits = ClaimRepository::nearest_by_embedding(&pool, &viewer, &v, 5)
-        .await
-        .expect("nearest_by_embedding");
+    let hits = ClaimRepository::nearest_by_embedding(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        &v,
+        5,
+    )
+    .await
+    .expect("nearest_by_embedding");
 
     assert!(
         hits.is_empty(),
@@ -169,9 +179,14 @@ async fn nearest_by_embedding_excludes_null_embedding(pool: PgPool) {
     .expect("seed claim without embedding");
 
     let v = unit_vec(0, 1.0);
-    let hits = ClaimRepository::nearest_by_embedding(&pool, &viewer, &v, 5)
-        .await
-        .expect("nearest_by_embedding");
+    let hits = ClaimRepository::nearest_by_embedding(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        &v,
+        5,
+    )
+    .await
+    .expect("nearest_by_embedding");
 
     assert!(
         hits.is_empty(),
@@ -204,9 +219,14 @@ async fn nearest_by_embedding_respects_limit(pool: PgPool) {
             .await;
     }
 
-    let hits = ClaimRepository::nearest_by_embedding(&pool, &viewer, &query_vec, 3)
-        .await
-        .expect("nearest_by_embedding");
+    let hits = ClaimRepository::nearest_by_embedding(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        &query_vec,
+        3,
+    )
+    .await
+    .expect("nearest_by_embedding");
 
     assert_eq!(hits.len(), 3, "limit must cap the returned hit count");
 }

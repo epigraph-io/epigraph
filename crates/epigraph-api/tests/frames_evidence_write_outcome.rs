@@ -731,6 +731,82 @@ async fn a_rest_write_on_an_unlinked_claim_moves_beta_and_then_records_divergenc
     assert_eq!(rows, 1, "the second write records one divergence row");
 }
 
+/// Backlog 7e8202bb (the residual of 1ce62137): `POST /claims/:id/assess` was
+/// the last writer that linked a claim to a frame with a NULL
+/// `hypothesis_index`. The REST evidence route's link is `ON CONFLICT DO
+/// NOTHING`, so it kept that NULL link, and `ds_divergence::beta_increments`
+/// counts a NULL index as nothing: every later evidence write on that frame
+/// left the claim's Beta track at the prior, each update was a cold start, and
+/// no divergence row was ever recorded for it.
+///
+/// At origin/main the assess link carried no index: this arm failed at the
+/// index assertion (NULL), and with that assertion removed at the Beta one
+/// (the track stayed at (1, 1)).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_assessed_claims_frame_link_names_hypothesis_0_so_evidence_moves_beta(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "7e8202bb-a").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/v1/claims/{}/assess",
+            w.addr, w.claim
+        ))
+        .bearer_auth(&token_a)
+        .json(&serde_json::json!({
+            "evidence_type": "empirical", "methodology": "instrumental",
+            "confidence": 0.8, "supports": true, "frame_id": w.frame,
+        }))
+        .send()
+        .await
+        .expect("assess request");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.expect("assess body");
+    assert!(
+        status == 200 || status == 201,
+        "assess must succeed: {status} {text}"
+    );
+
+    let index: Option<i32> = sqlx::query_scalar(
+        "SELECT hypothesis_index FROM claim_frames WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(w.claim)
+    .bind(w.frame)
+    .fetch_one(&w.pool)
+    .await
+    .expect("the assessment links the claim to the frame");
+    assert_eq!(index, Some(0), "the assessment's link names hypothesis 0");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.0, 1.0),
+        "assess keeps no Beta track (it is not one of the tracked writers)",
+    );
+
+    let first = post(
+        &w,
+        &token_a,
+        serde_json::json!({
+            "claim_id": w.claim, "reliability": 1.0, "masses": {"0": 0.7, "0,1": 0.3},
+        }),
+    )
+    .await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.7, 1.3),
+        "evidence on the assessed claim's frame moves the track",
+    );
+}
+
 async fn divergence_count(w: &World) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM ds_bayesian_divergence WHERE claim_id = $1")
         .bind(w.claim)

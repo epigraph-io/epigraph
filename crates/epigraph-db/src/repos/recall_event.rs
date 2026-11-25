@@ -28,9 +28,10 @@ pub const DEFAULT_RETENTION_DAYS: i32 = 90;
 /// pruned until someone adds it here on purpose. The inverse (prune everything
 /// except a keep-list) would silently start deleting any future type.
 ///
-/// `tool.invoked` is pure telemetry: the payload is `{"tool", "read_only"}`
-/// with no query, result, or provenance content, so nothing is recoverable
-/// from it that is not better recorded elsewhere.
+/// `tool.invoked` is pure telemetry: the payload is `{"tool", "read_only",
+/// "transport", "client_id"}` with no query, result, or provenance content
+/// (and is listed only to its own actor, `EventRepository::list`), so nothing
+/// is recoverable from it that is not better recorded elsewhere.
 ///
 /// NOT included, and not to be added without an explicit decision:
 /// `claim.created` / `edge.added` / `agent.registered` / `claim.challenged` /

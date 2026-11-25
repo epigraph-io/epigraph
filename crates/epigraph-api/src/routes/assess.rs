@@ -412,9 +412,10 @@ pub async fn assess_claim(
     // The claim's hypothesis on this frame, read before the slot transaction:
     // whether this call contests the assessment it replaces is decided once,
     // inside that transaction, and the durable record and the response both
-    // take that one value. Nothing below sets `hypothesis_index` (the
-    // `claim_frames` insert after the commit carries none), so reading it
-    // here is the same read as after the write.
+    // take that one value. The `claim_frames` insert below only ever creates
+    // a missing link, at index 0, which is what a missing index already
+    // resolves to (`edge_factor::resolve_hypothesis_index`), so reading it
+    // here gives the same values as a read after the write.
     let claim_assignment =
         epigraph_db::FrameRepository::get_claim_assignment(&mut *tx, &viewer, claim_id, frame_id)
             .await?;
@@ -606,13 +607,23 @@ pub async fn assess_claim(
     // SAVEPOINT: a non-owner's assignment is refused by row security
     // (migration 114), and unsavepointed that refusal would abort the
     // transaction and roll the assessment back at the COMMIT).
+    //
+    // A NEW link names hypothesis 0, as `POST /frames/:id/evidence` links one
+    // (49a0ab1af): it is the index every belief read resolves a missing one
+    // to, so the values this handler serves do not change. Linked with a NULL
+    // index, every later Beta update on this frame counted nothing (the
+    // evidence route's own `ON CONFLICT DO NOTHING` keeps the NULL), so the
+    // claim's track never left Beta(1, 1) and no divergence row was ever
+    // recorded for it (backlog 7e8202bb, the residual of 1ce62137). An
+    // existing link, NULL or not, is left as it is.
     {
         use sqlx::Acquire as _;
         let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to open a savepoint: {e}"),
         })?;
         let assigned = sqlx::query(
-            "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(claim_id)
         .bind(frame_id)

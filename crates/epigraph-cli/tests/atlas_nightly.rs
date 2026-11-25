@@ -21,6 +21,7 @@ use epigraph_cli::atlas_meaning::files::{ComputeVersions, ResultDoc, ResultTheme
 use epigraph_cli::atlas_meaning::tree::{group_id, map_key, root_id, WireGroup, WireKind};
 use epigraph_cli::atlas_naming::backend::RecordingBackend;
 use epigraph_cli::atlas_nightly::build::{run_night, NightOptions};
+use epigraph_cli::atlas_nightly::offbox::{OffBox, ThemeCapSplit};
 use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap, MapEpochs, NewMapRun};
 use epigraph_db::{AtlasMapRepository, Viewer};
 use serde_json::Value;
@@ -779,16 +780,29 @@ async fn dense_claim_in_t1(pool: &PgPool, c: &Corpus) -> Uuid {
     dense[0]
 }
 
-/// One new team-A claim in `t1`, near `u`, whose evidence is linked to it
-/// under a relationship name the contract's pattern refuses (`edges` takes
-/// any non-empty name, and the leaf passes the stored name through: the
-/// atlas_leaf module documentation's "relationship spelling" gap), so theme
-/// `t1`'s update fails. One more claim joins `t2`.
+/// One new team-A claim in `t1`, near `u`, with an evidence row that shares
+/// its id and is linked to it, so theme `t1`'s update fails: the leaf draws
+/// a claim node and an evidence node with one id, joined by an edge whose
+/// two ends are that id, and the contract refuses both. (`edges` refuses a
+/// self-loop only between two rows of one type; the tables do not share an
+/// id space.) One more claim joins `t2`.
+///
+/// This used to link the evidence under a relationship name the contract's
+/// pattern refuses; the leaf builder now maps such a name to a contract
+/// name (backlog 9de2ebad), so that no longer fails a theme.
 async fn break_t1_and_grow_t2(pool: &PgPool, c: &Corpus) -> Uuid {
     let fx = agent(pool, "Filer X").await;
     let bad = claims(pool, Some(c.t1), fx, Some(c.a_team), 1, 200).await;
-    let ev = evidence_on_each(pool, &bad).await;
-    link(pool, ev[0], "evidence", bad[0], "not-a-contract-name").await;
+    sqlx::query(
+        "INSERT INTO evidence (id, claim_id, evidence_type, content_hash, raw_content) \
+         VALUES ($1, $1, 'document', decode(md5(random()::text) || md5(random()::text), 'hex'), \
+                 'twin evidence') ",
+    )
+    .bind(bad[0])
+    .execute(pool)
+    .await
+    .expect("seed evidence sharing the claim's id");
+    link(pool, bad[0], "evidence", bad[0], "supports").await;
     claims(pool, Some(c.t2), c.fa, Some(c.a_team), 1, 300).await[0]
 }
 
@@ -942,7 +956,7 @@ async fn a_theme_that_fails_is_carried_and_the_night_completes(pool: PgPool) {
         carried[0]["error"]
             .as_str()
             .unwrap()
-            .contains("relationship"),
+            .contains("breaks the contract"),
         "{r:#}"
     );
     let run = latest(&pool, a_map).await;
@@ -977,6 +991,81 @@ async fn a_theme_that_fails_is_carried_and_the_night_completes(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(params["themes"]["carried"], serde_json::json!([c.t1]));
+}
+
+/// Backlog 9de2ebad: `edges` takes any non-empty relationship name, and a
+/// leaf used to serve the stored one, so ONE edge named outside the
+/// contract's pattern (`has-part`) failed its whole theme on every night.
+/// Now the leaf serves the name mapped to a contract name (`has_part`), the
+/// theme builds, its stats report the mapping, and the next night over the
+/// same input writes nothing. A later failure of that theme still carries
+/// it: the carry check compares the stored leaves with the mapped names.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_relationship_name_outside_the_contract_is_mapped_and_its_theme_builds(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let backend = namer();
+    night(&pool, &viewer, &backend, &opts()).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let fh = agent(&pool, "Filer H").await;
+    let part = claims(&pool, Some(c.t1), fh, Some(c.a_team), 1, 200).await[0];
+    let ev = evidence_on_each(&pool, &[part]).await[0];
+    link(&pool, ev, "evidence", part, "has-part").await;
+
+    let summary = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    for k in ["carried", "dropped", "unbuilt"] {
+        assert!(r["themes"][k].as_array().unwrap().is_empty(), "{k}: {r:#}");
+    }
+    let t1 = r["themes"]["built"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["theme_id"] == serde_json::json!(c.t1))
+        .expect("t1 built");
+    assert_eq!(
+        t1["stats"]["leaf_relationship_names"],
+        serde_json::json!({
+            "renamed_edges": 2,
+            "distinct_names": 1,
+            "names": {"has-part": "has_part"},
+        }),
+        "{r:#}"
+    );
+    let after = levels(&pool, latest(&pool, a_map).await).await;
+    let mut drawn = 0;
+    for (_, payload) in after.values() {
+        let LevelDocument::Leaf(l) = parse(payload) else {
+            continue;
+        };
+        assert!(l.edges.iter().all(|e| e.relationship != "has-part"));
+        drawn += l
+            .edges
+            .iter()
+            .filter(|e| e.source == ev && e.target == part && e.relationship == "has_part")
+            .count();
+    }
+    assert_eq!(drawn, 2, "the edge is drawn, mapped, in both hierarchies");
+
+    let again = night(&pool, &viewer, &backend, &opts()).await;
+    assert_eq!(
+        map_report(&again, a_map)["status"],
+        "unchanged",
+        "{again:#}"
+    );
+
+    break_t1_and_grow_t2(&pool, &c).await;
+    let third = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&third, a_map);
+    assert!(
+        r["themes"]["dropped"].as_array().unwrap().is_empty(),
+        "{r:#}"
+    );
+    let carried = r["themes"]["carried"].as_array().unwrap();
+    assert_eq!(carried.len(), 1, "{r:#}");
+    assert_eq!(carried[0]["theme_id"], serde_json::json!(c.t1));
 }
 
 /// The first night after an operator build carries a failing theme too: the
@@ -1960,4 +2049,523 @@ async fn leaf_claims_carry_their_stored_truth_value(pool: PgPool) {
         }
     }
     assert_eq!(seen, 2 * stored.len());
+}
+
+// ── the off-box hook (backlog 691d283a) ─────────────────────────────────────
+
+/// A scratch directory, owner-only (the hook refuses any other).
+fn private_dir() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let d = std::env::temp_dir().join(format!("atlas-offbox-test-{}", Uuid::new_v4()));
+    std::fs::create_dir(&d).unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    d
+}
+
+/// An executable shell script at `path`.
+fn script(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// A fake off-box command in `dir`: it records its arguments, its whole
+/// environment and the export's file names, then copies `result` (a tree
+/// the test computed) to the result path. It refuses a call without an
+/// export.
+fn fake_command(dir: &std::path::Path, result: &std::path::Path) -> std::path::PathBuf {
+    let cmd = dir.join("offbox.sh");
+    let d = dir.display();
+    script(
+        &cmd,
+        &format!(
+            "printf '%s\\n' \"$@\" > {d}/args\nenv > {d}/env\n\
+             [ -f \"$2/export.json\" ] || exit 3\nls \"$2\" > {d}/listing\n\
+             cp {} \"$3\"",
+            result.display()
+        ),
+    );
+    cmd
+}
+
+fn offbox(command: std::path::PathBuf, work_dir: std::path::PathBuf) -> OffBox {
+    OffBox {
+        command,
+        work_dir,
+        timeout: std::time::Duration::from_secs(60),
+        theme_cap_split: None,
+    }
+}
+
+/// A theme new to team A's map after its build, 60 claims with an evidence
+/// row each (121 nodes: over one leaf), so the nightly cannot build it from
+/// a previous tree. Returns (theme, its claims).
+async fn new_theme_over_one_leaf(pool: &PgPool, c: &Corpus) -> (Uuid, Vec<Uuid>) {
+    let tn = theme(pool, "nightly new", 600).await;
+    let members = claims(pool, Some(tn), c.fa, Some(c.a_team), 60, 600).await;
+    evidence_on_each(pool, &members).await;
+    (tn, members)
+}
+
+/// The tree an off-box compute would return for `parts` of `theme`.
+fn result_file(
+    dir: &std::path::Path,
+    map: AtlasMap,
+    theme: Uuid,
+    parts: &[BTreeSet<Uuid>],
+) -> std::path::PathBuf {
+    result_file_of(dir, map, theme, flat(map, M, theme, parts))
+}
+
+/// A result file holding `groups` as `theme`'s tree.
+fn result_file_of(
+    dir: &std::path::Path,
+    map: AtlasMap,
+    theme: Uuid,
+    groups: Vec<WireGroup>,
+) -> std::path::PathBuf {
+    let doc = ResultDoc {
+        format: "atlas-meaning-result/1".to_string(),
+        map: map_key(map),
+        hierarchy: "meaning".to_string(),
+        cap: CAP,
+        seed: 42,
+        versions: ComputeVersions::default(),
+        themes: vec![ResultTheme {
+            theme_id: theme,
+            id_chunk_cuts: 0,
+            groups,
+        }],
+    };
+    let path = dir.join("prepared.json");
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    path
+}
+
+fn ids_of(v: &Value) -> Vec<Value> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["theme_id"].clone())
+        .collect()
+}
+
+/// Done when (691d283a): a night with a theme new to the map that does not
+/// fit one leaf builds it through the configured off-box command instead of
+/// reporting it `unbuilt`. The command gets the export (ids and embeddings
+/// files only) and a cleared environment (no database URL), the export is
+/// gone afterwards, and the tree it returned is stored in both hierarchies.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_new_theme_over_one_leaf_is_built_through_the_offbox_command(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let (tn, members) = new_theme_over_one_leaf(&pool, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let parts = vec![set(&members[..30]), set(&members[30..])];
+    let dir = private_dir();
+    let work = private_dir();
+    let cmd = fake_command(&dir, &result_file(&dir, a_map, tn, &parts));
+    assert!(
+        std::env::var_os("DATABASE_URL").is_some(),
+        "precondition: the test process holds a database URL the command must not see"
+    );
+
+    // Without the hook the theme is unbuilt (the old behaviour).
+    let dry = NightOptions {
+        apply: false,
+        ..opts()
+    };
+    let r0 = night(&pool, &viewer, &namer(), &dry).await;
+    assert_eq!(
+        ids_of(&map_report(&r0, a_map)["themes"]["unbuilt"]),
+        vec![serde_json::json!(tn)]
+    );
+
+    let o = NightOptions {
+        offbox: Some(offbox(cmd, work.clone())),
+        ..opts()
+    };
+    let summary = night(&pool, &viewer, &namer(), &o).await;
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert_eq!(r["offbox"]["status"], "computed", "{r:#}");
+    assert_eq!(r["offbox"]["still_unbuilt"], serde_json::json!([]), "{r:#}");
+    assert!(ids_of(&r["themes"]["unbuilt"]).is_empty(), "{r:#}");
+    assert!(
+        ids_of(&r["themes"]["built"]).contains(&serde_json::json!(tn)),
+        "{r:#}"
+    );
+
+    // The call: kind, export, result; the export held W4's files only and is gone.
+    let args: Vec<String> = std::fs::read_to_string(dir.join("args"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(args.len(), 3, "{args:?}");
+    assert_eq!(args[0], "atlas-meaning");
+    let export = std::path::PathBuf::from(&args[1]);
+    assert!(export.starts_with(&work), "{args:?}");
+    assert!(
+        !export.exists(),
+        "the export (embeddings) outlived the call"
+    );
+    let mut listing: Vec<String> = std::fs::read_to_string(dir.join("listing"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    listing.sort();
+    let mut want = vec![
+        "export.json".to_string(),
+        format!("{tn}.f32"),
+        format!("{tn}.json"),
+    ];
+    want.sort();
+    assert_eq!(listing, want);
+    // The environment: nothing of ours but the kept variables.
+    let env = std::fs::read_to_string(dir.join("env")).unwrap();
+    for line in env.lines() {
+        let key = line.split('=').next().unwrap();
+        assert!(
+            ["PATH", "HOME", "LANG", "PWD", "SHLVL", "_", "OLDPWD"].contains(&key),
+            "the off-box command saw {key}"
+        );
+    }
+    assert!(!env.contains("DATABASE_URL"));
+
+    // Stored: the computed meaning tree, and a links tree, for the new theme.
+    let after = levels(&pool, latest(&pool, a_map).await).await;
+    let root = &after[&("meaning".to_string(), root_id(a_map, M, tn))].1;
+    assert_eq!(root["kind"], "group", "{root:#}");
+    for p in &parts {
+        let leaf = &after[&("meaning".to_string(), group_id(a_map, M, tn, p))].1;
+        let claims: BTreeSet<Uuid> = leaf["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["kind"] == "claim")
+            .map(|n| serde_json::from_value(n["id"].clone()).unwrap())
+            .collect();
+        assert_eq!(&claims, p);
+    }
+    assert!(after.contains_key(&("links".to_string(), root_id(a_map, L, tn))));
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// A tree the members no longer match (here: one member missing, as when a
+/// claim arrived after the export) is refused by W4's check; the theme stays
+/// unbuilt with the reason, and the rest of the map is still written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_offbox_tree_that_does_not_match_the_members_leaves_the_theme_unbuilt(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let (tn, members) = new_theme_over_one_leaf(&pool, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let dir = private_dir();
+    let work = private_dir();
+    let short = vec![set(&members[..30]), set(&members[30..59])];
+    let cmd = fake_command(&dir, &result_file(&dir, a_map, tn, &short));
+    let o = NightOptions {
+        offbox: Some(offbox(cmd, work.clone())),
+        ..opts()
+    };
+    let summary = night(&pool, &viewer, &namer(), &o).await;
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert_eq!(
+        r["offbox"]["still_unbuilt"],
+        serde_json::json!([tn]),
+        "{r:#}"
+    );
+    // Churn, not a broken command: reported, no alert (`night` asserts the
+    // night is ok).
+    assert_eq!(r["offbox"]["status"], "computed", "{r:#}");
+    let unbuilt = r["themes"]["unbuilt"].as_array().unwrap();
+    assert!(
+        unbuilt[0]["offbox_tree_refused"].as_str().is_some(),
+        "{r:#}"
+    );
+    assert_eq!(unbuilt[0]["offbox_members_changed"], true, "{r:#}");
+    let after = levels(&pool, latest(&pool, a_map).await).await;
+    assert!(!after.contains_key(&("meaning".to_string(), root_id(a_map, M, tn))));
+    assert!(after.contains_key(&("meaning".to_string(), root_id(a_map, M, c.t2))));
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// A dry run ships nothing off the box: the command is never called and no
+/// export is written; the report says what an applied night would compute.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dry_run_never_calls_the_offbox_command(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let (tn, members) = new_theme_over_one_leaf(&pool, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let dir = private_dir();
+    let work = private_dir();
+    let cmd = fake_command(&dir, &result_file(&dir, a_map, tn, &[set(&members)]));
+    let o = NightOptions {
+        apply: false,
+        offbox: Some(offbox(cmd, work.clone())),
+        ..opts()
+    };
+    let summary = night(&pool, &viewer, &namer(), &o).await;
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["offbox"]["status"], "dry_run", "{r:#}");
+    assert_eq!(r["offbox"]["would_compute"], serde_json::json!([tn]));
+    assert!(!dir.join("args").exists(), "a dry run called the command");
+    assert_eq!(
+        std::fs::read_dir(&work).unwrap().count(),
+        0,
+        "a dry run exported"
+    );
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// With `--theme-cap-split`, the themes over the cap are split through W1's
+/// `theme_cap_split.py offbox` (export, the command, apply) before the maps
+/// are built: called with exactly those themes, the cap, the command and a
+/// manifest in the work directory, and its report kept in the summary. A
+/// failed split fails the night's status (the alert fires) but the maps are
+/// still built.
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_over_the_cap_are_split_through_the_theme_cap_script(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let dir = private_dir();
+    let work = private_dir();
+    let cmd = dir.join("offbox.sh");
+    script(&cmd, &format!("touch {}/called", dir.display()));
+    let python = dir.join("python.sh");
+    script(
+        &python,
+        &format!(
+            "printf '%s\\n' \"$@\" > {}/split-args\n\
+             echo '{{\"status\": \"applied\", \"manifest\": \"m.json\"}}'",
+            dir.display()
+        ),
+    );
+    let script_path = std::path::PathBuf::from("/opt/epigraph/scripts/theme_cap_split.py");
+    let mut hook = offbox(cmd.clone(), work.clone());
+    hook.theme_cap_split = Some(ThemeCapSplit {
+        python: python.clone(),
+        script: script_path.clone(),
+    });
+    // t1 holds 85 current members; t2 5 and t3 8.
+    let o = NightOptions {
+        theme_cap: 80,
+        offbox: Some(hook.clone()),
+        ..opts()
+    };
+
+    // A dry run calls nothing.
+    let dry = NightOptions {
+        apply: false,
+        ..o.clone()
+    };
+    let s = night(&pool, &viewer, &namer(), &dry).await;
+    assert_eq!(s["themes"]["split"]["status"], "dry_run", "{s:#}");
+    assert_eq!(
+        s["themes"]["split"]["would_split"],
+        serde_json::json!([c.t1])
+    );
+    assert!(!dir.join("split-args").exists());
+
+    let s = night(&pool, &viewer, &namer(), &o).await;
+    assert_eq!(s["themes"]["split"]["status"], "applied", "{s:#}");
+    assert_eq!(s["themes"]["split"]["report"]["manifest"], "m.json");
+    let args: Vec<String> = std::fs::read_to_string(dir.join("split-args"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let run_dir = std::path::PathBuf::from(&args[5]);
+    assert!(run_dir.starts_with(&work), "{args:?}");
+    assert_eq!(
+        args,
+        vec![
+            script_path.display().to_string(),
+            "offbox".into(),
+            "--command".into(),
+            cmd.display().to_string(),
+            "--work-dir".into(),
+            run_dir.display().to_string(),
+            "--cap".into(),
+            "80".into(),
+            "--timeout".into(),
+            "60".into(),
+            "--manifest".into(),
+            run_dir.join("manifest.json").display().to_string(),
+            "--theme-id".into(),
+            c.t1.to_string(),
+        ]
+    );
+    assert!(
+        !dir.join("called").exists(),
+        "no theme needed a meaning tree"
+    );
+
+    // A split that fails: reported, the night not ok, every map still built.
+    script(&python, "exit 1");
+    let mut conn = pool.acquire().await.unwrap();
+    let (s, ok) = run_night(&mut conn, &viewer, &namer(), &o).await.unwrap();
+    assert!(!ok, "a failed split must fail the night's status");
+    assert_eq!(s["themes"]["split"]["status"], "failed", "{s:#}");
+    for m in s["maps"].as_array().unwrap() {
+        assert_ne!(m["status"], "failed", "{s:#}");
+    }
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// Review finding 1: a tree whose leaves ARE the members but that W4's check
+/// still refuses (here a leaf id that is not the minted one, as from a
+/// compute host on another version) is a broken command, not churn: the
+/// map's call is `failed` and the night's status fails, so the alert fires
+/// instead of the theme staying unbuilt silently every night. The rest of
+/// the map is still written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_offbox_tree_with_wrong_ids_fails_the_night(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let (tn, members) = new_theme_over_one_leaf(&pool, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let dir = private_dir();
+    let work = private_dir();
+    let parts = vec![set(&members[..30]), set(&members[30..])];
+    let mut groups = flat(a_map, M, tn, &parts);
+    // Re-id the second leaf consistently (the root's children follow), so
+    // only the minted-id check fails; the leaves still cover the members.
+    let wrong = Uuid::new_v4();
+    let old = groups[2].id;
+    groups[2].id = wrong;
+    for k in groups[0].children.as_mut().unwrap() {
+        if *k == old {
+            *k = wrong;
+        }
+    }
+    let cmd = fake_command(&dir, &result_file_of(&dir, a_map, tn, groups));
+    let o = NightOptions {
+        offbox: Some(offbox(cmd, work.clone())),
+        ..opts()
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let (summary, ok) = run_night(&mut conn, &viewer, &namer(), &o).await.unwrap();
+    assert!(
+        !ok,
+        "a malformed off-box tree must fail the night: {summary:#}"
+    );
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert_eq!(r["offbox"]["status"], "failed", "{r:#}");
+    assert_eq!(r["offbox"]["malformed"], serde_json::json!([tn]), "{r:#}");
+    let unbuilt = r["themes"]["unbuilt"].as_array().unwrap();
+    assert_eq!(unbuilt[0]["offbox_members_changed"], false, "{r:#}");
+    let after = levels(&pool, latest(&pool, a_map).await).await;
+    assert!(!after.contains_key(&("meaning".to_string(), root_id(a_map, M, tn))));
+    assert!(after.contains_key(&("meaning".to_string(), root_id(a_map, M, c.t2))));
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// Review finding 7 (ordering half): the split of the over-cap themes runs,
+/// and has finished, BEFORE any map is read, so the parts it creates are new
+/// themes the same night's map step builds through the meaning hook. The
+/// fake meaning command refuses to run unless the split already ran, and the
+/// new theme is built.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_split_runs_before_the_maps_build_new_themes_through_the_hook(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let (tn, members) = new_theme_over_one_leaf(&pool, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let dir = private_dir();
+    let work = private_dir();
+    let parts = vec![set(&members[..30]), set(&members[30..])];
+    let result = result_file(&dir, a_map, tn, &parts);
+    let d = dir.display();
+    let cmd = dir.join("offbox.sh");
+    script(
+        &cmd,
+        &format!(
+            "[ -f {d}/split-ran ] || exit 4\ntouch {d}/meaning-ran\ncp {} \"$3\"",
+            result.display()
+        ),
+    );
+    let python = dir.join("python.sh");
+    script(
+        &python,
+        &format!(
+            "[ -f {d}/meaning-ran ] && exit 5\ntouch {d}/split-ran\n\
+             echo '{{\"status\": \"applied\", \"manifest\": \"m.json\"}}'"
+        ),
+    );
+    let mut hook = offbox(cmd, work.clone());
+    hook.theme_cap_split = Some(ThemeCapSplit {
+        python,
+        script: std::path::PathBuf::from("theme_cap_split.py"),
+    });
+    // t1 holds 85 current members: over a cap of 80.
+    let o = NightOptions {
+        theme_cap: 80,
+        offbox: Some(hook),
+        ..opts()
+    };
+    let s = night(&pool, &viewer, &namer(), &o).await;
+    assert_eq!(s["themes"]["split"]["status"], "applied", "{s:#}");
+    let r = map_report(&s, a_map);
+    assert_eq!(r["offbox"]["status"], "computed", "{r:#}");
+    assert!(
+        ids_of(&r["themes"]["built"]).contains(&serde_json::json!(tn)),
+        "{r:#}"
+    );
+    assert!(dir.join("split-ran").exists() && dir.join("meaning-ran").exists());
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// Review finding 6: the summary carries the script's own status, so a run
+/// that split nothing is not reported as `applied`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_split_that_split_nothing_is_not_reported_applied(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let dir = private_dir();
+    let work = private_dir();
+    let python = dir.join("python.sh");
+    script(
+        &python,
+        "echo '{\"status\": \"nothing to split\", \"manifest\": null}'",
+    );
+    let mut hook = offbox(std::path::PathBuf::from("/bin/true"), work.clone());
+    hook.theme_cap_split = Some(ThemeCapSplit {
+        python,
+        script: std::path::PathBuf::from("theme_cap_split.py"),
+    });
+    let o = NightOptions {
+        theme_cap: 80,
+        offbox: Some(hook),
+        ..opts()
+    };
+    let s = night(&pool, &viewer, &namer(), &o).await;
+    assert_eq!(s["themes"]["split"]["status"], "nothing to split", "{s:#}");
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
 }

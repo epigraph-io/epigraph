@@ -1828,7 +1828,6 @@ pub async fn abort_plan(
     Path(plan_id): Path<Uuid>,
 ) -> Result<Json<PlanStateResponse>, ApiError> {
     lifecycle_served(&state, "abort_plan")?;
-    use epigraph_db::repos::privatization::{PlanTransition, PrivatizationRepository};
 
     let Some(axum::Extension(ref auth)) = auth_ctx else {
         return Err(ApiError::Unauthorized {
@@ -1854,28 +1853,15 @@ pub async fn abort_plan(
     let mut tx = sqlx::Connection::begin(&mut *maint)
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
-    let moved = PrivatizationRepository::transition_plan_conn(
-        &mut tx,
-        plan_id,
-        PlanTransition::Finish {
-            state: "failed",
-            // NOT the empty list. The state check above read the plan before
-            // this transaction opened, and the job handler's terminal write can
-            // commit in between; an unconditional `failed` would stamp itself
-            // over an `applied` that every item and every claim agree with, and
-            // report a successful run as failed to `GET /plans/:id` and to the
-            // audit timeline. `failed` is IN the list, so a double abort still
-            // matches and stays idempotent rather than becoming a 409.
-            from_states: &[
-                "applying".to_string(),
-                "reverting".to_string(),
-                "failed".to_string(),
-            ],
-        },
-    )
-    .await
-    .map_err(plan_write_error)?;
-    if moved == 0 {
+    // The conditional flip and its `plan.abort` row, shared with
+    // `epigraph-operator privatization abort` (backlog bb682f72). The state
+    // check above read the plan before this transaction opened, and the job
+    // handler's terminal write can commit in between; the flip's source states
+    // are why that cannot be stamped over (see `abort_plan_conn`).
+    let moved = epigraph_jobs::privatization::abort_plan_conn(&mut tx, &plan, actor)
+        .await
+        .map_err(plan_write_error)?;
+    if !moved {
         // The transaction is dropped un-committed, so no `plan.abort` row is
         // written for an abort that aborted nothing.
         return Err(ApiError::Conflict {
@@ -1883,20 +1869,6 @@ pub async fn abort_plan(
                 .to_string(),
         });
     }
-    PrivatizationRepository::record_plan_audit_conn(
-        &mut tx,
-        epigraph_db::repos::privatization::PlanAuditEntry {
-            plan_id,
-            actor_agent_id: actor,
-            action: "plan.abort",
-            kind: None,
-            entity_id: None,
-            plan_digest: plan.plan_digest.as_deref(),
-            correlation_id: None,
-        },
-    )
-    .await
-    .map_err(plan_write_error)?;
     record_custodial_act(
         &mut tx,
         authority,
@@ -3342,29 +3314,19 @@ fn refuse_stale_digest(
 
 /// Which job a dispatch enqueues.
 #[cfg(feature = "db")]
-#[derive(Clone, Copy)]
-enum DispatchKind {
-    /// `privatization_apply`.
-    Apply,
-    /// `privatization_revert`.
-    Revert,
-}
+use epigraph_jobs::privatization::DispatchKind;
 
 /// The `security_events.event_type` `GET /audit` writes.
 ///
 /// §6.5.7's `/audit` row: "every read writes a `security_events` row". A distinct
-/// type from [`DISPATCH_EVENT_TYPE`], because an audit READ and a privatization
+/// type from `epigraph_jobs::privatization::DISPATCH_EVENT_TYPE`, because an audit READ and a privatization
 /// DISPATCH are different events and a single type would make the timeline
 /// unfilterable.
 #[cfg(feature = "db")]
 const AUDIT_READ_EVENT_TYPE: &str = "privatization_audit_read";
 
-/// The `security_events.event_type` `apply`/`revert` write and the job handler's
-/// sixth condition looks for.
-#[cfg(feature = "db")]
-const DISPATCH_EVENT_TYPE: &str = epigraph_jobs::privatization::DISPATCH_EVENT_TYPE;
-
-/// A fresh correlation id: 32 hex characters, inside `varchar(64)`.
+/// A fresh correlation id (`epigraph_jobs::privatization::new_correlation_id`,
+/// which a dispatch also uses): 32 hex characters, inside `varchar(64)`.
 ///
 /// Hyphenless so the same token is a legal `security_events.correlation_id`, a
 /// legal `privatization_audit.correlation_id` and a legal JSON string without
@@ -3372,13 +3334,16 @@ const DISPATCH_EVENT_TYPE: &str = epigraph_jobs::privatization::DISPATCH_EVENT_T
 /// which request they describe.
 #[cfg(feature = "db")]
 fn new_correlation_id() -> String {
-    Uuid::new_v4().simple().to_string()
+    epigraph_jobs::privatization::new_correlation_id()
 }
 
 /// The one transaction that turns an authorized request into a running plan.
 ///
 /// The `security_events` row, the CONDITIONAL state flip, the audit row and the
-/// `jobs` row, in that order, on one maintenance connection, committed together.
+/// `jobs` row, in that order (`epigraph_jobs::privatization::dispatch_conn`,
+/// shared with `epigraph-operator privatization revert`), then the
+/// `platform.custodial_act` row, on one maintenance connection, committed
+/// together.
 ///
 /// # Why all four and not three
 ///
@@ -3403,32 +3368,7 @@ async fn dispatch(
     from_states: &[String],
     kind: DispatchKind,
 ) -> Result<(axum::http::StatusCode, Json<DispatchResponse>), ApiError> {
-    use epigraph_db::repos::privatization::{
-        PlanAuditEntry, PlanTransition, PrivatizationRepository,
-    };
-    use epigraph_db::repos::security_event::{SecurityEventRepository, SecurityEventRow};
-
     let actor = authority.agent_id;
-    let correlation_id = new_correlation_id();
-    let job = match kind {
-        DispatchKind::Apply => epigraph_jobs::EpiGraphJob::PrivatizationApply {
-            plan_id: plan.id,
-            dispatched_by: actor,
-            correlation_id: correlation_id.clone(),
-        },
-        DispatchKind::Revert => epigraph_jobs::EpiGraphJob::PrivatizationRevert {
-            plan_id: plan.id,
-            dispatched_by: actor,
-            correlation_id: correlation_id.clone(),
-        },
-    };
-    let job_type = job.job_type().to_string();
-    let payload = serde_json::to_value(&job).map_err(|e| {
-        tracing::error!(target: "tenancy.privatization", error = %e, "job payload");
-        ApiError::InternalError {
-            message: "Failed to encode the privatization job".to_string(),
-        }
-    })?;
 
     let mut session = maintenance(state).await?;
     let (maint, _bypass) = session.split();
@@ -3436,82 +3376,42 @@ async fn dispatch(
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
 
-    SecurityEventRepository::log_conn(
+    // The event, the conditional flip, the audit row and the job, shared with
+    // `epigraph-operator privatization revert` (backlog bb682f72) and written
+    // next to the handler condition that reads them.
+    let dispatched = epigraph_jobs::privatization::dispatch_conn(
         &mut tx,
-        &SecurityEventRow {
-            id: Uuid::new_v4(),
-            event_type: DISPATCH_EVENT_TYPE.to_string(),
-            agent_id: Some(actor),
-            success: Some(true),
-            // The plan id and the target state, and NOT the item ids or any
-            // content. `security_events` is read by a principal-keyed policy,
-            // not by a group-admin one, so its `details` must not carry the
-            // entity ids `privatization_plan_items` exists to fence.
-            details: serde_json::json!({
-                "plan_id": plan.id,
-                "target_group_id": plan.target_group_id,
-                "to_state": to_state,
-                "item_count": plan.item_count,
-            }),
-            ip_address: None,
-            user_agent: None,
-            correlation_id: Some(correlation_id.clone()),
-            created_at: chrono::Utc::now(),
-        },
+        plan,
+        actor,
+        kind,
+        to_state,
+        from_states,
     )
     .await
-    .map_err(plan_write_error)?;
-
-    let moved = PrivatizationRepository::transition_plan_conn(
-        &mut tx,
-        plan.id,
-        PlanTransition::Dispatch {
-            dispatched_by: actor,
-            to_state,
-            from_states,
-        },
-    )
-    .await
-    .map_err(plan_write_error)?;
-    if moved == 0 {
+    .map_err(|e| match e {
+        epigraph_jobs::privatization::LifecycleError::Db(e) => plan_write_error(e),
+        epigraph_jobs::privatization::LifecycleError::Encode(e) => {
+            tracing::error!(target: "tenancy.privatization", error = %e, "job payload");
+            ApiError::InternalError {
+                message: "Failed to encode the privatization job".to_string(),
+            }
+        }
+    })?;
+    let Some(dispatched) = dispatched else {
         return Err(ApiError::Conflict {
             reason: "the plan moved while it was being dispatched; re-read it and try again"
                 .to_string(),
         });
-    }
-
-    PrivatizationRepository::record_plan_audit_conn(
-        &mut tx,
-        PlanAuditEntry {
-            plan_id: plan.id,
-            actor_agent_id: actor,
-            action: "plan.dispatch",
-            kind: None,
-            entity_id: None,
-            plan_digest: plan.plan_digest.as_deref(),
-            correlation_id: Some(&correlation_id),
-        },
-    )
-    .await
-    .map_err(plan_write_error)?;
+    };
     record_custodial_act(
         &mut tx,
         authority,
         "privatization.plan_transition",
         plan.id,
         serde_json::json!({"transition": "dispatch", "to_state": to_state,
-                           "correlation_id": correlation_id}),
+                           "correlation_id": dispatched.correlation_id}),
     )
     .await?;
-
-    let job_id = PrivatizationRepository::enqueue_job_conn(
-        &mut tx,
-        &job_type,
-        &payload,
-        epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
-    )
-    .await
-    .map_err(plan_write_error)?;
 
     tx.commit()
         .await
@@ -3521,9 +3421,9 @@ async fn dispatch(
         axum::http::StatusCode::ACCEPTED,
         Json(DispatchResponse {
             plan_id: plan.id,
-            job_id,
+            job_id: dispatched.job_id,
             state: to_state.to_string(),
-            correlation_id,
+            correlation_id: dispatched.correlation_id,
         }),
     ))
 }

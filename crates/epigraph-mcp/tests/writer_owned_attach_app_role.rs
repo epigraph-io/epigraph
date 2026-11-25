@@ -691,6 +691,61 @@ async fn report_workflow_outcome_records_the_run_of_a_group_workflow_claim(pool:
     );
 }
 
+/// The run counters a flat report answers come from the workflow's
+/// persisted runs (backlog b2ac99f2), read on the caller's STAMPED
+/// transaction: a GROUP-PRIVATE workflow claim's runs are visible only to a
+/// session that reads the claim (migration 240), so an unstamped application
+/// read counts none of them. Before the fix the counter was the claim
+/// content's `use_count` plus one, so the second report also answered 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_reports_on_a_group_private_flat_workflow_count_two_uses(pool: PgPool) {
+    let (server, _agent, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let wf = workflow_claim_with_truth(&pool, "count a private team workflow").await;
+    sqlx::query("UPDATE claims SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
+        .bind(wf)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("make the workflow claim private to the server agent's group");
+
+    let first = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        clean_outcome(wf),
+        None,
+    )
+    .await
+    .expect("first report");
+    let first = first_text(&first);
+    assert_eq!(first["total_uses"].as_i64(), Some(1), "{first}");
+
+    // A second, distinct run (an identical report is the same evidence).
+    let mut second_outcome = clean_outcome(wf);
+    second_outcome.outcome_details = format!("{} (second run)", second_outcome.outcome_details);
+    let second = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        second_outcome,
+        None,
+    )
+    .await
+    .expect("second report");
+    let second = first_text(&second);
+    assert_eq!(
+        second["total_uses"].as_i64(),
+        Some(2),
+        "the second report of a group-private flat workflow counts the first run: {second}"
+    );
+    let runs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM behavioral_executions WHERE workflow_id = $1")
+            .bind(wf)
+            .fetch_one(&pool)
+            .await
+            .expect("count the runs on the superuser pool");
+    assert_eq!(runs, 2, "fixture: one run row per report");
+}
+
 /// A non-owner reporting on a SHARED workflow claim does not seed it (scope
 /// Q2), exactly as update_with_evidence's foreign attach does not.
 #[sqlx::test(migrations = "../../migrations")]
