@@ -211,7 +211,9 @@ pub use claim_visibility::{
     ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome,
     WriteTenancyReport,
 };
-pub use cluster_run::{ClaimPlacement, ClusterRunRepository, ClusterRunRow};
+pub use cluster_run::{
+    BridgeEdgeRow, ClaimPlacement, ClusterRunRepository, ClusterRunRow, ALGO_LOUVAIN_BRIDGE,
+};
 pub use community::{CommunityRepository, MembershipOutcome};
 pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity, HighConflictClaim};
 pub use context::ContextRepository;

@@ -97,7 +97,6 @@ const REGISTER: &[(&str, usize)] = &[
     ("assess.rs", 2),
     ("belief.rs", 7),
     ("claims.rs", 3),
-    ("clusters.rs", 8),
     ("computation.rs", 4),
     ("conventions.rs", 3),
     ("cross_source.rs", 1),
@@ -150,7 +149,11 @@ const REGISTER: &[(&str, usize)] = &[
 /// and belief read moved into `GraphViewRepository::claim_neighborhood_ids`
 /// and `FactorRepository::bp_priors`, both spending the caller's viewer
 /// (`computation.rs` 6 -> 4).
-const HIGH_WATER: usize = 82;
+/// Lowered to 74 by backlog 04ab6607 / 67c905a3: `build_from_bridges`' two
+/// reads, its run / cluster / membership inserts and its retention sweep moved
+/// into `ClusterRunRepository` on one viewer-stamped transaction
+/// (`clusters.rs` 8 -> 0, row removed).
+const HIGH_WATER: usize = 74;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

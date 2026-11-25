@@ -15,6 +15,8 @@
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
 #[cfg(feature = "db")]
+use crate::middleware::bearer::ViewerExtractor;
+#[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
 use axum::{extract::State, Json};
@@ -41,16 +43,38 @@ pub struct BuildFromBridgesResponse {
     pub bridge_edge_count: usize,
 }
 
-/// Algorithm discriminator written to `graph_cluster_runs.algo` so this run is
-/// distinguishable from the nightly SUPPORTS/CONTRADICTS Louvain run (which
-/// uses `algo='louvain'`).
-#[cfg(feature = "db")]
-const ALGO_LOUVAIN_BRIDGE: &str = "louvain_bridge";
-
+/// `POST /api/v1/clusters/build-from-bridges`.
+///
+/// # Tenancy: one stamped transaction, reads and writes (backlog 67c905a3)
+///
+/// Every statement runs on ONE transaction stamped with the caller's viewer
+/// ([`AppState::write_as`]), through `epigraph_db::ClusterRunRepository`:
+///
+/// * the two reads (bridge edges, paragraph nodes) splice the viewer, so a
+///   paragraph the caller cannot read is not clustered and an edge it cannot
+///   read is not a bridge;
+/// * the INSERTS (run, clusters, memberships) are decided by row security
+///   against the same stamp. A membership row inherits its paragraph's
+///   tenancy, so the run commits only if the caller may write every paragraph
+///   it clusters; a refusal (`42501`) there is a 403 and nothing is committed.
+/// * the retention sweep is NOT owner-scoped: `graph_cluster_runs` and
+///   `graph_clusters` carry no tenancy, and memberships go with their cluster
+///   through a foreign-key cascade, so it keeps the newest `retain_runs`
+///   bridge runs across ALL callers (see
+///   `ClusterRunRepository::gc_bridge_runs`). A failure there is a 500, never
+///   the 403 above: a `42501` from the sweep can only be a missing table
+///   grant, and a 403 would send an operator to group membership instead.
+///
+/// Before this the reads and the writes ran on the raw pool with no viewer:
+/// on a login that bypasses row security every paragraph in the database was
+/// clustered for any `claims:admin` bearer. Reads and writes had to move
+/// together, because stamping only the reads would hand an unstamped writer
+/// membership rows for claims its own session cannot see.
 #[cfg(feature = "db")]
 pub async fn build_from_bridges(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): ViewerExtractor,
     Json(req): Json<BuildFromBridgesRequest>,
 ) -> Result<Json<BuildFromBridgesResponse>, ApiError> {
     let auth = auth_ctx
@@ -59,92 +83,37 @@ pub async fn build_from_bridges(
         })?
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+    use epigraph_db::ClusterRunRepository;
     use epigraph_jobs::cluster_graph::louvain::{louvain, LouvainInput};
     use std::collections::HashMap;
 
-    let pool = &state.db_pool;
-
-    let min_shared = req.min_shared_atoms.unwrap_or(1) as i64;
+    let min_shared = i64::from(req.min_shared_atoms.unwrap_or(1));
     let resolution = req.resolution.unwrap_or(1.0);
     let retain_runs = req.retain_runs.unwrap_or(5);
 
-    // -- Step 1: pre-aggregate bridge edges via SQL.
-    //
-    // For each pair of paragraph-level claims (level=2), count the number of
-    // atom-level children (level=3 — by convention; we don't strictly require
-    // it on the child side because the parent gate is what matters for the
-    // bridge graph) they share via `decomposes_to`.
-    //
-    // The `paragraph_id < other.paragraph_id` join condition emits each
-    // unordered pair exactly once.
-    #[derive(sqlx::FromRow)]
-    struct BridgeEdgeRow {
-        para_a: Uuid,
-        para_b: Uuid,
-        weight: i64,
-    }
-    let edges: Vec<BridgeEdgeRow> = sqlx::query_as::<_, BridgeEdgeRow>(
-        r#"WITH atom_parents AS (
-            SELECT e.target_id AS atom_id, e.source_id AS paragraph_id
-            FROM edges e
-            JOIN claims p ON p.id = e.source_id
-            WHERE e.relationship = 'decomposes_to'
-              AND (p.properties->>'level')::int = 2
-        )
-        SELECT
-            a.paragraph_id  AS para_a,
-            b.paragraph_id  AS para_b,
-            COUNT(*)::bigint AS weight
-        FROM atom_parents a
-        JOIN atom_parents b
-            ON a.atom_id = b.atom_id
-           AND a.paragraph_id < b.paragraph_id
-        GROUP BY a.paragraph_id, b.paragraph_id
-        HAVING COUNT(*) >= $1
-        "#,
-    )
-    .bind(min_shared)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("bridge edge query: {e}"),
-    })?;
+    let mut tx = state.write_as(&viewer, "build_from_bridges").await?;
 
-    // -- Step 2a: enumerate paragraph nodes.
-    //
-    // A paragraph is a node in the bridge graph if it is level=2 and has at
-    // least one atom child via `decomposes_to`. This keeps singleton
-    // paragraphs in the result (they get their own cluster) — matching the
-    // Phase 5.B spec contract that paragraph_count counts "paragraphs in the
-    // bridge graph", not just paragraphs with at least one bridge.
-    let para_rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT DISTINCT e.source_id
-         FROM edges e
-         JOIN claims p ON p.id = e.source_id
-         WHERE e.relationship = 'decomposes_to'
-           AND (p.properties->>'level')::int = 2",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("paragraph node query: {e}"),
-    })?;
+    // -- Step 1: the bridge edges (pairs of level-2 paragraphs sharing at least
+    //    `min_shared` atom children) and the paragraph nodes, both as the
+    //    caller may see them.
+    let edges = ClusterRunRepository::bridge_edges(&mut tx, &viewer, min_shared)
+        .await
+        .map_err(|e| internal("bridge edge query", &e))?;
+    let paragraphs = ClusterRunRepository::bridge_paragraphs(&mut tx, &viewer)
+        .await
+        .map_err(|e| internal("paragraph node query", &e))?;
 
-    // -- Step 2b: build a dense node index for Louvain.
-    //
-    // Louvain expects nodes to be 0..n. We seed the index with every
-    // paragraph node (so isolates are nodes too), then ensure both endpoints
-    // of each bridge edge are present.
+    // -- Step 2: a dense node index for Louvain (nodes are 0..n). Seeded with
+    //    every paragraph node so isolates are nodes too, then both endpoints
+    //    of each bridge edge.
     let mut node_idx: HashMap<Uuid, u32> = HashMap::new();
-    for (id,) in &para_rows {
-        let next = node_idx.len() as u32;
-        node_idx.entry(*id).or_insert(next);
-    }
-    for e in &edges {
-        let next = node_idx.len() as u32;
-        node_idx.entry(e.para_a).or_insert(next);
-        let next = node_idx.len() as u32;
-        node_idx.entry(e.para_b).or_insert(next);
+    let mut order: Vec<Uuid> = Vec::new();
+    let endpoints = edges.iter().flat_map(|e| [e.para_a, e.para_b]);
+    for id in paragraphs.iter().copied().chain(endpoints) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = node_idx.entry(id) {
+            slot.insert(order.len() as u32);
+            order.push(id);
+        }
     }
 
     let louvain_edges: Vec<(u32, u32, f64)> = edges
@@ -168,9 +137,20 @@ pub async fn build_from_bridges(
             .assignments
     };
 
-    // -- Step 4: persist run row + clusters + memberships, then GC old runs.
-    let run_id = persist_bridge_run(pool, &node_idx, &assignments).await?;
-    gc_bridge_runs(pool, retain_runs).await?;
+    // -- Step 4: persist the run, clusters and memberships, then GC old runs,
+    //    all on the stamped transaction; commit once.
+    let members: Vec<(Uuid, u32)> = order
+        .iter()
+        .copied()
+        .zip(assignments.iter().copied())
+        .collect();
+    let run_id = ClusterRunRepository::insert_bridge_run(&mut tx, &members)
+        .await
+        .map_err(refused_or_internal)?;
+    ClusterRunRepository::gc_bridge_runs(&mut tx, retain_runs)
+        .await
+        .map_err(|e| internal("retention sweep", &e))?;
+    tx.commit().await.map_err(|e| internal("commit", &e))?;
 
     let cluster_count: usize = {
         use std::collections::BTreeSet;
@@ -185,196 +165,39 @@ pub async fn build_from_bridges(
     }))
 }
 
+/// A repo failure as the 500 this handler has always answered, with the stage
+/// named in the log rather than the response.
+#[cfg(feature = "db")]
+fn internal(stage: &'static str, e: &epigraph_db::DbError) -> ApiError {
+    tracing::error!(
+        target: "tenancy.scoped_write",
+        error = %e,
+        handler = "build_from_bridges",
+        stage,
+        "build_from_bridges failed"
+    );
+    ApiError::InternalError {
+        message: format!("{stage}: {e}"),
+    }
+}
+
+/// For the INSERTS of a run only: a write refused by row security (`42501`:
+/// the run would cluster a paragraph whose membership row the caller may not
+/// write) is a 403, and the transaction is dropped uncommitted. Anything else
+/// is a 500. Not used for the retention sweep, whose `42501` cannot be a row
+/// refusal (its tables carry no row security) and so is a misconfigured grant.
+#[cfg(feature = "db")]
+fn refused_or_internal(e: epigraph_db::DbError) -> ApiError {
+    if crate::errors::db_is_insufficient_privilege(&e) {
+        crate::errors::write_refused("bridge cluster run")
+    } else {
+        internal("persist bridge run", &e)
+    }
+}
+
 #[cfg(not(feature = "db"))]
 pub async fn build_from_bridges(
     axum::extract::Json(_req): axum::extract::Json<BuildFromBridgesRequest>,
 ) -> Result<axum::Json<BuildFromBridgesResponse>, axum::http::StatusCode> {
     Err(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-}
-
-/// Insert a `graph_cluster_runs` row + `graph_clusters` rows for each unique
-/// community + `claim_cluster_membership` rows tying each paragraph (looked up
-/// via the reverse of `node_idx`) to its assigned cluster id.
-///
-/// Mirrors `epigraph_jobs::cluster_graph::runner::write_clusters` for the
-/// epistemic Louvain runs but operates over paragraph nodes only and writes
-/// `algo='louvain_bridge'` on the run row.
-#[cfg(feature = "db")]
-async fn persist_bridge_run(
-    pool: &sqlx::PgPool,
-    node_idx: &std::collections::HashMap<Uuid, u32>,
-    assignments: &[u32],
-) -> Result<Uuid, ApiError> {
-    use std::collections::HashMap;
-
-    let run_id = Uuid::new_v4();
-
-    // Reverse mapping: dense u32 idx -> paragraph UUID.
-    let mut idx_to_id: HashMap<u32, Uuid> = HashMap::with_capacity(node_idx.len());
-    for (id, idx) in node_idx {
-        idx_to_id.insert(*idx, *id);
-    }
-
-    // Group node indices by assigned community id.
-    let mut groups: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (idx, comm) in assignments.iter().enumerate() {
-        groups.entry(*comm).or_default().push(idx as u32);
-    }
-
-    let mut tx = pool.begin().await.map_err(|e| ApiError::InternalError {
-        message: format!("begin tx: {e}"),
-    })?;
-
-    // 1. Run row. NOTE: the existing schema has columns
-    //    (run_id, completed_at, cluster_count, degraded). Migration 027 adds
-    //    `algo`. `degraded` is FALSE for bridge runs since we don't fall back
-    //    to per-frame grouping when the graph is sparse — empty graphs simply
-    //    produce zero clusters and that's the truthful answer.
-    sqlx::query(
-        "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded, algo)
-         VALUES ($1, $2, FALSE, $3)",
-    )
-    .bind(run_id)
-    .bind(groups.len() as i32)
-    .bind(ALGO_LOUVAIN_BRIDGE)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("insert run: {e}"),
-    })?;
-
-    // 2. Cluster rows + memberships.
-    let mut cluster_id_map: HashMap<u32, Uuid> = HashMap::with_capacity(groups.len());
-    for (comm, members) in &groups {
-        let cluster_id = Uuid::new_v4();
-        cluster_id_map.insert(*comm, cluster_id);
-        let size = members.len() as i32;
-        let label = format!("bridge-cluster-{comm}");
-
-        sqlx::query(
-            "INSERT INTO graph_clusters
-             (id, run_id, label, size, mean_betp, dominant_type, dominant_frame_id, degraded)
-             VALUES ($1, $2, $3, $4, NULL, 'paragraph', NULL, FALSE)",
-        )
-        .bind(cluster_id)
-        .bind(run_id)
-        .bind(&label)
-        .bind(size)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("insert cluster: {e}"),
-        })?;
-    }
-
-    // 3. Membership rows. Batch in chunks of 1000 to keep the query plan small.
-    let chunk = 1000usize;
-    let mut batch: Vec<(Uuid, Uuid)> = Vec::with_capacity(chunk);
-    for (idx, comm) in assignments.iter().enumerate() {
-        let cluster_id = cluster_id_map[comm];
-        let claim_id = idx_to_id[&(idx as u32)];
-        batch.push((claim_id, cluster_id));
-        if batch.len() == chunk {
-            flush_membership(&mut tx, &batch, run_id).await?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        flush_membership(&mut tx, &batch, run_id).await?;
-    }
-
-    tx.commit().await.map_err(|e| ApiError::InternalError {
-        message: format!("commit tx: {e}"),
-    })?;
-
-    Ok(run_id)
-}
-
-#[cfg(feature = "db")]
-async fn flush_membership(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    batch: &[(Uuid, Uuid)],
-    run_id: Uuid,
-) -> Result<(), ApiError> {
-    let mut q =
-        String::from("INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) VALUES ");
-    let placeholders: Vec<String> = (0..batch.len())
-        .map(|i| {
-            let base = i * 3;
-            format!("(${}, ${}, ${})", base + 1, base + 2, base + 3)
-        })
-        .collect();
-    q.push_str(&placeholders.join(", "));
-
-    let mut query = sqlx::query(&q);
-    for (claim_id, cluster_id) in batch {
-        query = query.bind(claim_id).bind(cluster_id).bind(run_id);
-    }
-    query
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("insert membership: {e}"),
-        })?;
-    Ok(())
-}
-
-/// Garbage-collect old `louvain_bridge` runs, keeping only the newest
-/// `retain` runs by `completed_at`. Scoped by `algo` so we don't touch the
-/// nightly epistemic Louvain runs.
-#[cfg(feature = "db")]
-async fn gc_bridge_runs(pool: &sqlx::PgPool, retain: u32) -> Result<(), ApiError> {
-    sqlx::query(
-        r#"
-        WITH old AS (
-            SELECT run_id FROM graph_cluster_runs
-            WHERE algo = $2
-            ORDER BY completed_at DESC
-            OFFSET $1
-        )
-        DELETE FROM graph_cluster_runs WHERE run_id IN (SELECT run_id FROM old)
-        "#,
-    )
-    .bind(retain as i64)
-    .bind(ALGO_LOUVAIN_BRIDGE)
-    .execute(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("gc runs: {e}"),
-    })?;
-
-    // Cascade: clean up clusters + memberships whose run no longer exists.
-    // (`graph_clusters` is not declared FK to `graph_cluster_runs`, and
-    // `claim_cluster_membership.run_id` isn't either; only
-    // `claim_cluster_membership.cluster_id` cascades. So we explicitly clean.)
-    //
-    // ZERO ROWS IS FINE HERE (W10 sweep). On the application role this
-    // membership DELETE is owner-scoped (migration 115) and may match nothing
-    // without an error. Nothing is lost: every membership row hangs off a
-    // `graph_clusters` row of the same run, and the `graph_clusters` DELETE
-    // below removes those memberships through
-    // `claim_cluster_membership_cluster_id_fkey ON DELETE CASCADE`, a
-    // referential action that consults no policy. This statement is
-    // idempotent cleanup that runs first only so a privileged session does
-    // the work without the cascade.
-    sqlx::query(
-        "DELETE FROM claim_cluster_membership
-         WHERE run_id NOT IN (SELECT run_id FROM graph_cluster_runs)",
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("gc memberships: {e}"),
-    })?;
-    sqlx::query(
-        "DELETE FROM graph_clusters
-         WHERE run_id NOT IN (SELECT run_id FROM graph_cluster_runs)",
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("gc clusters: {e}"),
-    })?;
-
-    Ok(())
 }
