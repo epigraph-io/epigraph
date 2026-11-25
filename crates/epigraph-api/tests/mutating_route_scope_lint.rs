@@ -59,13 +59,6 @@ const READ_ONLY_POST: &str =
     "a read shaped as POST: the body is a query, the handler writes nothing and its reads are \
      viewer-filtered";
 const PURE_COMPUTE: &str = "pure computation over the request body: no database read or write";
-/// Honest, not a clean bill: these read on the unstamped `state.db_pool`
-/// with no viewer, so row security admits only what an anonymous session
-/// sees. A scope would not change what they read; whether they leak beyond
-/// public rows is a viewer question, recorded as a found-not-fixed item.
-const RAW_POOL_READ_POST: &str =
-    "a read shaped as POST that writes nothing, but reads on the unstamped `state.db_pool` with \
-     no viewer (not viewer-filtered); a scope would not narrow what it reads";
 const OAUTH: &str =
     "OAuth protocol endpoint: authenticated by the protocol's own client or user credential, \
      before any bearer exists";
@@ -135,7 +128,9 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("community::add_member", Scope("groups:admin")),
     ("community::create_community", Scope("groups:write")),
     ("community::remove_member", Scope("groups:admin")),
-    ("computation::compose_subgraphs", Exempt(RAW_POOL_READ_POST)),
+    // Its reads run on the caller's stamped connection, viewer-spliced
+    // (backlog 52b96600); it was the one `state.db_pool` read listed here.
+    ("computation::compose_subgraphs", Exempt(READ_ONLY_POST)),
     (
         "computation::propagate_beliefs",
         Exempt(

@@ -9,7 +9,7 @@
 //! - `POST /api/v1/graph/compose`         - Compose two subgraphs via decorated cospans
 //! - `GET  /api/v1/claims/:id/belief-at`  - Reconstruct belief at a past timestamp
 //!
-//! # Tenancy: 12 of this file's 15 raw-pool sites are converted, and 3 are not
+//! # Tenancy: all 15 of this file's raw-pool sites are converted
 //!
 //! Conversion shard 4 against `D-PR17-request-path-never-stamps-session-gucs`
 //! (`epigraph-db/tests/no_unscoped_pool.rs`). Unlike `routes/belief.rs`, the
@@ -33,14 +33,13 @@
 //! stamped read, and its apply writes on an [`AppState::write_as`]
 //! transaction (`apply_bp_updates`).
 //!
-//! Not converted, and NOT merely deferred:
-//!
-//! * `compose_subgraphs` (3 sites) is registered as `F-SHARD4-A1`; analysis
-//!   held outside this repository. Owner: the conversion-shard series. Two of
-//!   its three sites reach the database through [`extract_neighborhood`], which
-//!   takes a `&PgPool` PARAMETER — a shape `no_unscoped_pool.rs` already
-//!   enumerates as invisible to its `.db_pool` needle — so a change that moved
-//!   this file's counter would not by itself settle the entry.
+//! `compose_subgraphs` is converted whole (finding `F-SHARD4-A1`, closed by
+//! backlog 52b96600). Its two neighborhood walks and its belief read run on
+//! ONE [`AppState::read_as`] connection, through
+//! `GraphViewRepository::claim_neighborhood_ids` and
+//! `FactorRepository::bp_priors`, both splicing the caller's viewer, so the
+//! counts and the boundary inconsistency it returns are computed only over
+//! claims and edges the caller can read.
 
 #[cfg(feature = "db")]
 use axum::{
@@ -1472,17 +1471,28 @@ pub async fn propagate_beliefs(
 }
 
 /// POST /api/v1/graph/compose - Compose two subgraphs via decorated cospans.
+///
+/// Both neighborhoods and the belief read run on ONE viewer-stamped
+/// connection, through repo fns that splice the caller's viewer (backlog
+/// 52b96600). Every count and the boundary inconsistency in the response are
+/// computed over what the caller can read: a hop crosses only a readable edge
+/// onto a readable claim, and a center the caller cannot read answers as an
+/// id that names no claim.
 #[cfg(feature = "db")]
 pub async fn compose_subgraphs(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ComposeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let max_depth = request.max_depth.unwrap_or(2).clamp(1, 4);
     let threshold = request.consistency_threshold.unwrap_or(0.2);
 
+    let mut read = crate::routes::open_scoped_read(&state, &viewer, "compose_subgraphs").await?;
+
     // Extract neighborhoods via recursive CTE
-    let left_nodes = extract_neighborhood(&state.db_pool, request.center_a, max_depth).await?;
-    let right_nodes = extract_neighborhood(&state.db_pool, request.center_b, max_depth).await?;
+    let left_nodes = extract_neighborhood(&mut read, &viewer, request.center_a, max_depth).await?;
+    let right_nodes =
+        extract_neighborhood(&mut read, &viewer, request.center_b, max_depth).await?;
 
     // Determine boundary (shared nodes)
     let left_set: std::collections::HashSet<Uuid> = left_nodes.iter().copied().collect();
@@ -1501,14 +1511,13 @@ pub async fn compose_subgraphs(
         .into_iter()
         .collect();
 
-    let belief_rows: Vec<(Uuid, Option<f64>)> =
-        sqlx::query_as("SELECT id, pignistic_prob FROM claims WHERE id = ANY($1)")
-            .bind(&all_ids)
-            .fetch_all(&state.db_pool)
+    let belief_rows =
+        epigraph_db::repos::factor::FactorRepository::bp_priors(&mut read, &viewer, &all_ids)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to load beliefs: {e}"),
             })?;
+    crate::routes::finish_scoped_read(read, "compose_subgraphs").await?;
 
     let beliefs: HashMap<Uuid, f64> = belief_rows
         .into_iter()
@@ -1659,38 +1668,20 @@ pub async fn belief_at_time(
 
 // ── Internal helpers ──
 
-/// Extract the neighborhood of a node via recursive CTE.
+/// The claim neighborhood of `center` that `viewer` can read
+/// ([`epigraph_db::GraphViewRepository::claim_neighborhood_ids`]).
 #[cfg(feature = "db")]
 async fn extract_neighborhood(
-    pool: &sqlx::PgPool,
+    read: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     center: Uuid,
     max_depth: i32,
 ) -> Result<Vec<Uuid>, ApiError> {
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "WITH RECURSIVE neighborhood AS ( \
-            SELECT $1::uuid AS node_id, 0 AS depth \
-            UNION \
-            SELECT CASE WHEN e.source_id = n.node_id THEN e.target_id ELSE e.source_id END, \
-                   n.depth + 1 \
-            FROM neighborhood n \
-            JOIN edges e ON ( \
-                (e.source_id = n.node_id AND e.source_type = 'claim' AND e.target_type = 'claim') \
-                OR (e.target_id = n.node_id AND e.source_type = 'claim' AND e.target_type = 'claim') \
-            ) \
-            WHERE n.depth < $2 \
-              AND e.relationship IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes') \
-        ) \
-        SELECT DISTINCT node_id FROM neighborhood",
-    )
-    .bind(center)
-    .bind(max_depth)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to extract neighborhood: {e}"),
-    })?;
-
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    epigraph_db::GraphViewRepository::claim_neighborhood_ids(&mut *read, viewer, center, max_depth)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to extract neighborhood: {e}"),
+        })
 }
 
 #[cfg(all(test, feature = "db"))]
