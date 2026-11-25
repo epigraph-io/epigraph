@@ -1378,10 +1378,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "privatization.rs",
         "is_live_group_admin_conn",
-        "READ of `group_memberships`, which carries no `visibility` column. MUST be the \
-         maintenance connection: migration 077's policy narrows that table to what the session can \
-         see, and this asks about the APPROVER rather than about the session, so on an app \
-         connection an authorised approver reads as revoked. Returns a boolean and no rows.",
+        "READ of `group_memberships` through migration 273's `epigraph_group_live_roster` (live \
+         admins only, backlog a91d957d), which carries no `visibility` column. MUST be the \
+         maintenance connection: the roster answers a session that may read the group's roster, \
+         and this asks about the APPROVER rather than about the session, so on an app connection \
+         an authorised approver reads as revoked. Returns a boolean and no rows.",
     ),
     (
         "privatization.rs",
@@ -2366,8 +2367,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "instance_admin.rs",
         "privatization_authority",
-        "READ of `group_memberships` and `groups`, returning four scalars and no ids. It MUST run \
-         unfiltered on the maintenance connection and its own doc says why: a count of a target \
+        "READ of `groups` and of `group_memberships` through migration 273's \
+         `epigraph_group_live_roster` (live admins only, backlog a91d957d), returning four scalars \
+         and no ids. It MUST run on the maintenance connection and its own doc says why: a count of \
+         a target \
          group's other live admins narrowed to what the CALLER can see would report zero for a \
          caller who cannot see the roster, and refuse — a fail-closed wrong answer that is \
          indistinguishable from the true one. A viewer predicate here would corrupt the \

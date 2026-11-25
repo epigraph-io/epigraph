@@ -24,12 +24,18 @@
 //! human's registration was revoked):
 //! * `epigraph_is_group_admin` is false for the lapsed admin;
 //! * 181's `epigraph_mark_group_reseal_required` refuses it at its admin
-//!   gate (GRA01).
+//!   gate (GRA01);
+//! * `InstanceAdminRepository::privatization_authority` neither counts it
+//!   among the other live admins nor calls it a target-group admin;
+//! * `PrivatizationRepository::is_live_group_admin_conn` (the dispatch-time
+//!   approver check) answers false for it.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
 use epigraph_core::VisibilityChoice;
+use epigraph_db::repos::instance_admin::InstanceAdminRepository;
+use epigraph_db::repos::privatization::PrivatizationRepository;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ChoiceResolution, ClaimRepository};
 use sqlx::PgPool;
@@ -501,6 +507,65 @@ async fn a_lapsed_admin_cannot_mark_the_reseal_obligation(pool: PgPool) {
             .await
             .expect("read the mark");
     assert_eq!(marked, None);
+}
+
+/// A connection whose `session_user` is `epigraph_maintenance`: the
+/// connection both privatization checks run on (`epigraph_bypass()`).
+async fn maintenance_conn(pool: &PgPool) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    fixture::grant_app_privileges(pool, "epigraph_maintenance").await;
+    fixture::downgraded_pool(pool, "epigraph_maintenance")
+        .await
+        .acquire()
+        .await
+        .expect("maintenance connection")
+}
+
+/// `privatization_authority` on a maintenance session: the lapsed admin is
+/// not one of the target group's other live admins (condition 3b), and is not
+/// a target-group admin itself (condition 4).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_privatization_authority_ignores_a_lapsed_admin(pool: PgPool) {
+    let a = admins(&pool, "priv").await;
+    let mut conn = maintenance_conn(&pool).await;
+
+    let owner = InstanceAdminRepository::privatization_authority(&mut conn, a.owner, a.group)
+        .await
+        .expect("authority for the owner");
+    assert!(owner.is_target_group_admin, "POSITIVE CONTROL");
+    assert_eq!(
+        owner.other_live_admins, 2,
+        "two live admins besides the owner; the lapsed row is not one"
+    );
+
+    let lapsed = InstanceAdminRepository::privatization_authority(&mut conn, a.lapsed, a.group)
+        .await
+        .expect("authority for the lapsed admin");
+    assert!(
+        !lapsed.is_target_group_admin,
+        "a lapsed admin is not an admin of the target group"
+    );
+    assert_eq!(lapsed.other_live_admins, 3, "owner, live2 and live3");
+}
+
+/// `is_live_group_admin_conn` (the dispatch-time approver check) on a
+/// maintenance session: a lapsed admin's approval does not survive to
+/// dispatch.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dispatch_approver_check_refuses_a_lapsed_admin(pool: PgPool) {
+    let a = admins(&pool, "approver").await;
+    let mut conn = maintenance_conn(&pool).await;
+    assert!(
+        PrivatizationRepository::is_live_group_admin_conn(&mut conn, a.group, a.live2)
+            .await
+            .expect("approver check"),
+        "POSITIVE CONTROL: a live admin approves"
+    );
+    assert!(
+        !PrivatizationRepository::is_live_group_admin_conn(&mut conn, a.group, a.lapsed)
+            .await
+            .expect("approver check"),
+        "a lapsed admin's approval does not survive to dispatch"
+    );
 }
 
 // ─── the migration's precondition and its undo ───────────────────────────
