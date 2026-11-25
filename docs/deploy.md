@@ -1411,6 +1411,8 @@ undocumented, not anonymous.
 |---|---|---|
 | `GET /api/v1/admin/stats` | `claims:admin` | **403**, not 401. Its `webhooks.webhook_count` field is the cross-tenant count of `webhook_subscriptions`, so the whole aggregate is admin-only. |
 | `GET /api/v1/claims/needing-embeddings` | `claims:admin`, and then a maintenance surface | **403** without the scope. With it, `501` MOVED naming `embed_backfill` (section 5). |
+| `POST /api/v1/ingest/paper`, `POST /api/v1/ingest/paper-url` | `claims:admin` | **403**. With the scope, a `source` that is not an arXiv id or arXiv DOI is **400** and an unknown body field (such as the removed `output_dir`) is **422**, before any file is written. |
+| `POST /api/v1/analyze/unconstrained` | `claims:admin` | **403**, checked before the body is parsed, so no provider call is made. |
 | `POST /api/v1/groups`, `POST /api/v1/communities` | `groups:write` | 403 |
 | `POST`/`DELETE /api/v1/groups/:id/members`, `POST /api/v1/communities/:id/members` | `groups:admin` **and** live membership | 403 |
 | `DELETE /api/v1/communities/:id/members/:perspective_id` | `groups:admin` **and** live membership, or the caller's own perspective | 403 |
