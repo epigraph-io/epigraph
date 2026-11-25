@@ -36,7 +36,7 @@
 //! | `atom` | `atom_id` | `atom`, `belief: {bel,pl,betp,contested,contested_with}` |
 //! | `neighbors` | `atom_id` | `neighbors: [{edge,relationship,direction,atom:{id,text,kind,speaker,turn,is_current}}]` |
 //! | `snapshot` | — | `bytes` |
-//! | `digest` | — | `not_implemented` until the digest lands |
+//! | `digest` | `query`, `exclude_turns_from`, `k_per_slice`? (20, at most 200) | `atoms_total`, `eligible`, `turns_archived`, `standing`, `relevant`, `recent`, `recent_corrections`, `open` (see [`super::rank`]) |
 //!
 //! Three departures from DESIGN §4.2's sketch:
 //!
@@ -87,6 +87,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::belief::{BeliefError, BeliefView};
+use super::rank::{self, DEFAULT_K_PER_SLICE, MAX_K_PER_SLICE};
 use super::snapshot::{self, RestoreError, RestoreReport, RestoredFrom};
 use super::store::{Evidence, NewAtom, NewEdge, ScratchAtom, ScratchStore, Seed, StoreError};
 
@@ -195,6 +196,15 @@ struct SupersedeParams {
 #[serde(deny_unknown_fields)]
 struct TurnParams {
     turn: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DigestParams {
+    query: String,
+    exclude_turns_from: u64,
+    #[serde(default)]
+    k_per_slice: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -452,10 +462,19 @@ impl Session {
                 let bytes = self.persist()?;
                 Ok(json!({ "bytes": bytes }))
             }
-            "digest" => Err(OpError::new(
-                "not_implemented",
-                "the digest arrives with the ranking commit (E2)",
-            )),
+            "digest" => {
+                let p: DigestParams = params(rest)?;
+                let k = p.k_per_slice.unwrap_or(DEFAULT_K_PER_SLICE);
+                if k > MAX_K_PER_SLICE {
+                    return Err(OpError::new(
+                        "bad_request",
+                        format!("k_per_slice is at most {MAX_K_PER_SLICE}"),
+                    ));
+                }
+                let view = BeliefView::compute(&self.store)?;
+                let digest = rank::digest(&self.store, &view, &p.query, p.exclude_turns_from, k);
+                Ok(serde_json::to_value(digest).expect("digest serializes"))
+            }
             _ => Err(OpError::new("unknown_op", "no such op")),
         }
     }

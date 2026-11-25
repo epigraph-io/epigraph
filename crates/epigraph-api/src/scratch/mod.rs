@@ -36,6 +36,7 @@
 pub mod belief;
 pub mod bm25;
 pub mod protocol;
+pub mod rank;
 pub mod snapshot;
 pub mod store;
 

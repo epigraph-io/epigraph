@@ -247,7 +247,8 @@ fn bad_lines_get_an_error_and_the_child_keeps_serving() {
         ("{\"id\": 2}", "bad_request"),
         ("{\"id\": 3, \"op\": 7}", "bad_request"),
         ("{\"id\": 4, \"op\": \"drop_tables\"}", "unknown_op"),
-        ("{\"id\": 5, \"op\": \"digest\", \"query\": \"x\"}", "not_implemented"),
+        ("{\"id\": 5, \"op\": \"digest\", \"query\": \"x\"}", "bad_request"),
+        ("{\"id\": 12, \"op\": \"digest\", \"query\": \"x\", \"exclude_turns_from\": 4, \"k_per_slice\": 201}", "bad_request"),
         ("{\"id\": 6, \"op\": \"update_belief\", \"verbose\": 1}", "bad_request"),
         ("{\"id\": 7, \"op\": \"health\", \"verbose\": true}", "bad_request"),
         ("{\"id\": 8, \"op\": \"put_atoms\", \"atoms\": [{\"id\": \"nope\"}]}", "bad_request"),
@@ -360,6 +361,43 @@ fn update_belief_writes_nothing_and_atom_reports_belief() {
     assert!((b["betp"].as_f64().unwrap() - 0.925).abs() < 1e-12, "{b}");
     assert_eq!(b["contested"], true);
     assert_eq!(b["contested_with"], json!([uuid(2)]));
+    s.finish();
+}
+
+#[test]
+fn digest_over_stdio_lists_only_evicted_applied_atoms() {
+    let dir = TempDir::new("digest");
+    let mut s = Scratch::spawn(&dir.graph(), 0);
+    // `atom` makes decisions: every one is a standing-slice candidate.
+    s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [
+        atom(1, 2, "The pilot uses v2 probes."),
+        atom(2, 3, "Pending turn decision about probes."),
+        atom(3, 9, "Window turn decision about probes."),
+    ]}));
+    s.ok(json!({"id": 2, "op": "mark_applied", "turn": 2}));
+    s.ok(json!({"id": 3, "op": "mark_applied", "turn": 9}));
+    let d = s.ok(json!({"id": 4, "op": "digest", "query": "probes",
+        "exclude_turns_from": 6}));
+    let standing: Vec<Value> = d["standing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].clone())
+        .collect();
+    assert_eq!(standing, vec![json!(uuid(1))], "{d}");
+    assert_eq!(d["relevant"][0]["id"], uuid(1), "{d}");
+    assert!(d["relevant"][0]["score"].is_f64(), "{d}");
+    assert_eq!(d["standing"][0]["evidence"][0]["path"], "turns/2.json");
+    assert_eq!(
+        (d["eligible"].clone(), d["turns_archived"].clone()),
+        (json!(1), json!(1))
+    );
+    assert!(!d.to_string().contains("Window turn"), "{d}");
+    assert!(!d.to_string().contains("Pending turn"), "{d}");
+    // Read-only: no snapshot beyond the writes'.
+    let before = fs::read(dir.graph()).unwrap();
+    s.ok(json!({"id": 5, "op": "digest", "query": "", "exclude_turns_from": 0, "k_per_slice": 0}));
+    assert_eq!(fs::read(dir.graph()).unwrap(), before);
     s.finish();
 }
 
