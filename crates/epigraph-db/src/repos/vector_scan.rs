@@ -1,10 +1,13 @@
-//! Scan settings shared by the viewer-spliced kNN reads over `claims`.
+//! Scan settings shared by the viewer-spliced kNN reads: over `claims` (HNSW)
+//! and over `workflows.goal_embedding` (IVFFlat, [`begin_iterative_ivfflat`]).
 //!
 //! # The two passes
 //!
 //! Every read here orders by a pgvector distance and applies predicates the
-//! HNSW index does not encode (`is_current`, scope filters, the visibility
-//! splice) AFTER the index scan. pgvector's iterative scan
+//! vector index does not encode (`is_current`, scope filters, the visibility
+//! splice) AFTER the index scan. The rest of this section speaks of HNSW; the
+//! IVFFlat read has the same two passes, its first bounded by
+//! `ivfflat.max_probes` instead. pgvector's iterative scan
 //! ([`begin_iterative_hnsw`], backlog a507966d) keeps scanning past
 //! `hnsw.ef_search` until `LIMIT` matching rows are found, but it still stops
 //! at `hnsw.max_scan_tuples` (pgvector default 20,000) or at its memory budget
