@@ -3089,6 +3089,26 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
          column to name.",
     ),
+    // Backlog 67c905a3: `POST /api/v1/clusters/build-from-bridges`' writes,
+    // moved out of the route onto the caller's stamped transaction.
+    (
+        "cluster_run.rs",
+        "insert_bridge_run",
+        "WRITE. One `louvain_bridge` run: a `graph_cluster_runs` row (untenanted), its \
+         `graph_clusters` rows and one `claim_cluster_membership` row per paragraph the SAME \
+         transaction read through `bridge_edges` / `bridge_paragraphs`, which spend the \
+         caller's viewer. Nothing is read here. A membership row inherits its paragraph's \
+         tenancy (migration 070), so `claim_cluster_membership_tenancy`'s WITH CHECK refuses \
+         (42501) a paragraph the stamp may not write, and the route answers 403.",
+    ),
+    (
+        "cluster_run.rs",
+        "gc_bridge_runs",
+        "WRITE. Retention sweep: deletes all but the newest N `louvain_bridge` rows of the \
+         untenanted `graph_cluster_runs`, then the `graph_clusters` / `claim_cluster_membership` \
+         rows of runs that no longer exist. Returns nothing; the membership DELETE is \
+         owner-scoped by row security (migration 115) and the rest goes by the FK cascade.",
+    ),
     // Atlas W2 (migration 210): the nightly's writes of a team or public map.
     (
         "atlas_map.rs",

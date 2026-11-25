@@ -399,6 +399,22 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "state.write_as",
         ],
     ),
+    // write (backlog 67c905a3): on the transaction stamped from the caller's
+    // viewer, after the two viewed reads (`bridge_edges`,
+    // `bridge_paragraphs`). `insert_bridge_run` writes the run, its clusters
+    // and one membership row per paragraph those reads returned; a membership
+    // row inherits its paragraph's tenancy, so `WITH CHECK` refuses (42501,
+    // answered 403) a paragraph the caller may not write. `gc_bridge_runs`
+    // deletes old `louvain_bridge` runs (`graph_cluster_runs`, untenanted)
+    // and their orphaned clusters / memberships (owner-scoped DELETE).
+    (
+        "clusters.rs",
+        "build_from_bridges",
+        &[
+            "ClusterRunRepository::gc_bridge_runs",
+            "ClusterRunRepository::insert_bridge_run",
+        ],
+    ),
     // write: the caller's principal is the community's creator (one `groups`
     // insert, no read).
     (

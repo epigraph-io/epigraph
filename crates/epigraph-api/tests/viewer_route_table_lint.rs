@@ -214,9 +214,15 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs
 /// The register entries with **no filter and, since PR-14, no post-pass
 /// anywhere in the tree**.
 ///
-/// Four handler sites across two files read `tier_a` claim content inline in
-/// the route layer with no `Viewer` spliced into the statement: `clusters.rs`
-/// (2) and `policies.rs` (2). It was ten across seven before backlog 67c905a3
+/// **The register is now EMPTY**: no handler site reads `tier_a` claim content
+/// inline in the route layer with no `Viewer` spliced into the statement. The
+/// last two, `clusters.rs::build_from_bridges` (2), moved into
+/// `ClusterRunRepository` on a stamped transaction under backlog 67c905a3;
+/// `policies.rs`'s two had gone earlier, under backlog 56d2430b. The constant is
+/// kept, empty, so that [`no_new_inline_claim_content_reads_in_the_route_layer`]
+/// still compares the measurement against an exact set and a NEW unfiltered
+/// handler read fails it. Before that this paragraph read "four handler sites
+/// across two files: `clusters.rs` (2) and `policies.rs` (2)". It was ten across seven before backlog 67c905a3
 /// retired `conflicts.rs`, `embeddings.rs`, `political.rs`, `search.rs` and the
 /// rest of `workflows.rs` (see the comment on each removal below); this
 /// paragraph said "twelve" from before `workflows.rs` went 4 -> 2. It was
@@ -249,14 +255,17 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs
 /// handler. Do not add to it — move the statement into
 /// `crates/epigraph-db/src/repos/`, mark it, and splice a `Viewer`.
 const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
-    // `build_from_bridges`' two `edges ⨝ claims` reads (the bridge edges and
-    // the paragraph nodes). Not converted with the rest of backlog 67c905a3:
-    // this handler WRITES the shared `graph_cluster_runs` / `graph_clusters` /
-    // `claim_cluster_membership` rows from what it reads, on the raw pool, so
-    // stamping only the reads would hand an unstamped writer membership rows
-    // for claims its own session cannot see. The reads and the writes have to
-    // move onto one stamped transaction together.
-    ("clusters.rs", 2),
+    // `clusters.rs` was 2 and is now 0, so it is gone from the register
+    // (backlog 67c905a3). The sites were `build_from_bridges`' two
+    // `edges ⨝ claims` reads (the bridge edges and the paragraph nodes), on
+    // the raw pool with no viewer, from which the handler WROTE the shared
+    // `graph_cluster_runs` / `graph_clusters` / `claim_cluster_membership`
+    // rows. Reads and writes moved together onto ONE transaction stamped with
+    // the caller's viewer (`AppState::write_as`), as
+    // `ClusterRunRepository::{bridge_edges, bridge_paragraphs}` (marked
+    // `{EDGE_VISIBILITY:e}` and `{VISIBILITY:p}`) and
+    // `::{insert_bridge_run, gc_bridge_runs}`. Pinned by
+    // `build_from_bridges_scoped.rs`.
     // `conflicts.rs` was 1 and is now 0, so it is gone from the register
     // (backlog 67c905a3). The site was `scan_conflicts`'s
     // `mass_functions ⨝ claims` scan, run on the raw pool with no viewer and

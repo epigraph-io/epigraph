@@ -337,7 +337,6 @@
 //!   Enumerated so no shard author mistakes this table for complete —
 //!   `middleware/provenance.rs::record_provenance`,
 //!   `oauth/providers/provision.rs::emit_oauth_audit`,
-//!   `routes/clusters.rs::{persist_bridge_run, gc_bridge_runs}`,
 //!   `routes/computation.rs::extract_neighborhood`,
 //!   `routes/events.rs::retain_visible_events`,
 //!   `routes/graph_query_utils.rs::load_subgraph`,
@@ -863,7 +862,9 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 165 -> 162 (backlog f712db53): the three group membership gates in
 /// `routes/claims.rs` (16 -> 13) moved onto the caller's stamped connection.
 /// No file reached zero.
-const HIGH_WATER: usize = 162;
+/// 162 -> 161 (backlog 67c905a3): `routes/clusters.rs::build_from_bridges`
+/// moved onto the caller's stamped transaction (`routes/clusters.rs` 1 -> 0).
+const HIGH_WATER: usize = 161;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -937,7 +938,8 @@ const HIGH_WATER: usize = 162;
 /// staging after the line above).
 /// 35 -> 34 when `routes/embeddings.rs` reached zero (backlog batch B37).
 /// 34 -> 33 when `routes/assess.rs` reached zero (backlog 74feb76b).
-const HIGH_WATER_FILES: usize = 33;
+/// 33 -> 32 when `routes/clusters.rs` reached zero (backlog 67c905a3).
+const HIGH_WATER_FILES: usize = 32;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1004,7 +1006,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
     // so a `0` row could never be satisfied.
-    ("routes/clusters.rs", 1),
+    // `routes/clusters.rs` was 1 and is GONE (backlog 67c905a3):
+    // `build_from_bridges` runs its reads and writes on one transaction from
+    // the caller's `AppState::write_as` instead of `state.db_pool`.
     // 3 before batch F. `remove_member` no longer touches `state.db_pool` at
     // all: both membership writes run on a transaction stamped from the
     // caller's viewer (`routes/community.rs::membership_tx`), because migration
