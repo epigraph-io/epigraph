@@ -3368,14 +3368,28 @@ The policy:
   API re-checks an `android-key` passkey's stored chain against the CURRENT
   list: a listed certificate (the leaf, a batch intermediate, the root)
   answers `403 attestation_not_in_good_standing`, the ticket or act left
-  live, and is logged at WARN (`elevate.ticket` / `elevate.act`); it is not
-  recorded as a refusal in the database. Only the standing is re-checked
-  there: certificate validity periods and the TEE/StrongBox and boot-state
-  rules are not (an expired attestation chain still elevates). A passkey
-  recorded `none` on the anchored path is not re-checked either, even when
-  its anchor's certificate is later listed: it holds through its anchor, and
-  stops only when the anchor is revoked (`revoke-passkey`). Under the
-  software policy nothing is re-checked.
+  live, is logged at WARN (`elevate.ticket` / `elevate.act`), and is
+  audited as a `platform.passkey_standing_refused` row (migration 285; so is
+  every `503 attestation_status_unavailable`, without the reason, which
+  stays in the log). Only the standing is re-checked there: certificate
+  validity periods and the TEE/StrongBox and boot-state rules are not (an
+  expired attestation chain still elevates). A passkey recorded `none` on
+  the anchored path stands as its ANCHOR stands (the passkey that admitted
+  it, recorded on its row since migration 285): once the anchor's
+  certificate is listed it is refused `403` too, while the list is stale
+  `503`, and with its anchor revoked it is refused (and 200's cascade has
+  revoked it anyway). A live `none` passkey with no recorded anchor (one
+  registered while the software policy served) is refused under the
+  attested policy: count them after applying 285 and before deploying the
+  API binary that reads its column (the older binary ignores the column, so
+  nobody is refused in between), or before switching policy
+  (`attestation_format = 'none' AND anchor_authenticator_id IS NULL AND
+  revoked_at IS NULL`; the column exists only from 285), and enroll an attested passkey through a
+  maintenance enrollment (`passkey-enroll`) for any person whose only
+  passkey that is. Only the anchor's own certificate is re-checked, not the
+  lineage above it. A standing refusal is audited only while its ticket or
+  act and its passkey are live; one that ends in between answers 500,
+  unaudited (logged). Under the software policy nothing is re-checked.
 - **Keep a retired Android root in the PEM while any passkey chains to it.**
   The same re-check verifies the stored chain to a root configured NOW. An
   enrolled `android-key` passkey whose chain reaches no root in

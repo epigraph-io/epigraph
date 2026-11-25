@@ -223,8 +223,8 @@ pub use edge::EdgeRepository;
 pub use ego::{EgoEdgeRow, EgoEdges, EgoEntity, EgoRepository};
 pub use elevated_access::ElevatedAccess;
 pub use elevation_ceremony::{
-    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
-    Redemption, TicketMode, TicketPasskey,
+    record_standing_refusal, AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony,
+    EndReason, LiveElevation, Redemption, StandingCeremony, TicketMode, TicketPasskey,
 };
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};

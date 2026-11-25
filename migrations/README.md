@@ -4692,6 +4692,46 @@ restart.
   against the binaries. Measure first:
   `SELECT count(*) FROM edges WHERE declared_owner_group_id IS NOT NULL`.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **285**: `passkey_anchor_standing` (backlog 09ca9ab0). An anchored (`none`) passkey's row
+  records the passkey that ADMITTED it, the ceremony readers serve it, and every refusal of an
+  assertion on attestation standing is audited. Adds `person_authenticators.anchor_authenticator_id`
+  (FK to the same table, ON DELETE RESTRICT; CHECKs: only a `none` row carries one, never itself),
+  set by a BEFORE INSERT trigger (`person_authenticators_record_anchor`, after 124's and 200's
+  insert guards) to the confirming passkey of the enrollment's act for a `none` passkey enrolled on
+  an act, NULL otherwise, overwriting any inserted value; a BEFORE UPDATE trigger
+  (`person_authenticators_keep_anchor`) refuses changing it (ELV03). BACKFILLED from 200's
+  enrollment -> act -> confirming-passkey step for every existing `none` act-enrolled row, revoked
+  ones included, with row security OFF and 124's update guard disabled for that one statement (the
+  same transaction; the ADD COLUMN's ACCESS EXCLUSIVE lock leaves no gap for an in-flight
+  completion). Re-creates 125's `epigraph_passkeys_for_ticket` and 130's
+  `epigraph_passkeys_for_act` with the extra column (same rows, gate, owner and grants; now 172's
+  form). Adds `epigraph_record_passkey_standing_refusal(ceremony, id, authenticator, code, reason)
+  -> uuid` (app-callable, 172's form): one `platform.passkey_standing_refused` `security_events`
+  row (success false) for a LIVE ticket (`elevation`, else ELV06) or act (`admin_act`, else ELV08),
+  naming a LIVE passkey of its person (else ELV02), one of the two API codes (else 22023), reason
+  at most 2000 characters (else 22001); person, credential, format and anchor come from the rows.
+  WHY `security_events`, not a new table: it is already the append-only audit of every other
+  elevation refusal. The API (`routes/elevate.rs`) finds a `none` passkey's anchor among the same
+  ceremony's served live passkeys and holds it to that anchor's standing at every assertion
+  (`epigraph_passkey::Passkeys::assertion_standing`: an anchor whose Android certificate is listed
+  on a fresh status list refuses the anchored passkey, a stale list refuses it 503, no live anchor
+  refuses it; only the anchor's own certificate, not the lineage above it), and audits each
+  standing refusal before answering it (unless the ticket or act ends, or the passkey is revoked,
+  in between: then the definer refuses the row and the API answers 500, unaudited). Registered in
+  `tenancy_backfill` (deferred definers at 285, the grant register, the exempt trigger) and
+  `definer_search_path_ratchet` (the two readers leave the `public` path register). Pinned by
+  `epigraph-db/tests/passkey_anchor_standing.rs` (the trigger, the backfill from below 285, the
+  audit definer's gates, the undo) and `epigraph-api/tests/elevation_ceremony.rs`. Undo:
+  `docs/runbooks/285-undo.sql` (restores 125's and 130's readers verbatim, drops the column and
+  every recorded anchor; audit rows stay). **Deploy order:** migrate BEFORE the API binary of this
+  change (it selects the readers' new column, 42703, and calls the definer, 42883); an older API
+  runs on 285 unchanged. **After applying 285 and before deploying the API binary, measure** live
+  `none` passkeys with NO recorded anchor after the backfill (`SELECT count(*) FROM person_authenticators WHERE revoked_at IS NULL AND
+  attestation_format = 'none' AND anchor_authenticator_id IS NULL`): under the attested policy each
+  is refused at its next assertion (they hold through nothing; e.g. a passkey registered while the
+  software policy served). If any is a person's only passkey, enroll an attested passkey for that
+  person through a maintenance enrollment (`passkey-enroll`) first. Under the software policy
+  nothing changes.
 
 ## `-- no-transaction` migrations
 
