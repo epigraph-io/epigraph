@@ -40,7 +40,11 @@ struct Cli {
     dry_run: bool,
 
     /// Permit deterministic mock embeddings when OPENAI_API_KEY is unset.
-    /// Useful for local/CI smoke tests, not for production recall quality.
+    /// For local/CI smoke tests only: refused (exit 1, nothing read or
+    /// written) unless the database's name ends in `_test` or
+    /// `EPIGRAPH_ENV=test` is set, since a mock vector in a real
+    /// `claims.embedding` is served by recall as a real one and is never
+    /// refilled.
     #[arg(long)]
     allow_mock: bool,
 
@@ -88,6 +92,10 @@ async fn run(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> anyhow::Result<()> {
+    if cli.allow_mock {
+        refuse_mock_outside_tests(pool).await?;
+    }
+
     // Select both legs before deciding anything: a dry run, or a run with
     // nothing to do, must report both legs and must not need a provider.
     let claims = ClaimRepository::find_claims_needing_embeddings(pool, viewer, cli.limit)
@@ -146,6 +154,40 @@ async fn run(
     Ok(())
 }
 
+/// Whether `--allow-mock` may run against the database named `database`:
+/// only a test database, i.e. one whose name ends in `_test`, or any
+/// database when `EPIGRAPH_ENV` is exactly `test` (backlog bb710d7b).
+///
+/// The backfill selects rows whose embedding is NULL, so a mock vector
+/// written to a real `claims.embedding` or `workflows.goal_embedding` is
+/// never replaced, and every recall search ranks it as if it were real. The
+/// flag used to log a WARN and write them wherever it pointed.
+fn mock_allowed(database: &str, epigraph_env: Option<&str>) -> bool {
+    database.ends_with("_test") || epigraph_env == Some("test")
+}
+
+/// Refuse `--allow-mock` unless [`mock_allowed`] admits the database `pool`
+/// is connected to: the maintenance connection, which is the one that
+/// writes (`MAINTENANCE_DATABASE_URL` overrides `--database-url`). Runs
+/// before anything is read, and refuses whether or not a key is set: the
+/// flag is the hazard (an empty `OPENAI_API_KEY` falls back to mock).
+async fn refuse_mock_outside_tests(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .context("read the database name for the --allow-mock check")?;
+    let env = std::env::var("EPIGRAPH_ENV").ok();
+    if mock_allowed(&database, env.as_deref()) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "--allow-mock refused: database {database:?} is not a test database (its name \
+         does not end in _test and EPIGRAPH_ENV is not test). Mock vectors written there \
+         would be served by recall as real embeddings and never refilled; set \
+         OPENAI_API_KEY instead. Nothing was read or written."
+    )
+}
+
 /// The claims leg: embed and store each row. Returns `(written, failed)`.
 async fn backfill_claims(
     pool: &sqlx::PgPool,
@@ -193,4 +235,31 @@ fn build_1536d_provider(
         return Ok(Arc::new(MockProvider::new(config)));
     }
     anyhow::bail!("OPENAI_API_KEY is required unless --allow-mock is set");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mock_allowed;
+
+    /// Backlog bb710d7b: `--allow-mock` runs on a test database only.
+    #[test]
+    fn allow_mock_is_admitted_on_a_test_database_only() {
+        assert!(mock_allowed("epigraph_test", None));
+        assert!(mock_allowed("x_test", Some("production")));
+        assert!(mock_allowed("_sqlx_test_1", Some("test")));
+        assert!(mock_allowed("epigraph", Some("test")));
+        for (db, env) in [
+            ("epigraph", None),
+            ("epigraph", Some("production")),
+            ("epigraph", Some("development")),
+            ("epigraph", Some("Test")),
+            ("epigraph", Some("")),
+            ("_sqlx_test_1", None),
+            ("x_test_y", None),
+            ("test", None),
+            ("epigraph_TEST", None),
+        ] {
+            assert!(!mock_allowed(db, env), "{db:?} with EPIGRAPH_ENV={env:?}");
+        }
+    }
 }
