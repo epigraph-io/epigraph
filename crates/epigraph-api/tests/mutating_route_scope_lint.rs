@@ -94,13 +94,9 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("agent_keys::rotate_agent_key", Scope("agents:write")),
     ("agents::create_agent", Scope("agents:write")),
     ("agents::update_agent", Scope("agents:write")),
-    (
-        "analyze::unconstrained_analysis",
-        Exempt(
-            "writes nothing: forwards the question to the configured LLM provider and returns \
-             its answer",
-        ),
-    ),
+    // Writes nothing, but spends the server's LLM credential on the caller's
+    // prompt (backlog f2973ec9).
+    ("analyze::unconstrained_analysis", Scope("claims:admin")),
     ("assess::assess_claim", Scope("claims:write")),
     ("batch::batch_create_claims", Scope("claims:write")),
     ("bba_retract::retract_bba", Scope("claims:write")),
