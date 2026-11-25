@@ -221,14 +221,17 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs
 /// `policies.rs`'s two had gone earlier, under backlog 56d2430b. The constant is
 /// kept, empty, so that [`no_new_inline_claim_content_reads_in_the_route_layer`]
 /// still compares the measurement against an exact set and a NEW unfiltered
-/// handler read fails it. Before that this paragraph read "four handler sites
-/// across two files: `clusters.rs` (2) and `policies.rs` (2)". It was ten across seven before backlog 67c905a3
-/// retired `conflicts.rs`, `embeddings.rs`, `political.rs`, `search.rs` and the
-/// rest of `workflows.rs` (see the comment on each removal below); this
-/// paragraph said "twelve" from before `workflows.rs` went 4 -> 2. It was
-/// thirteen across eight before `tenancy/fix-security-track` retired
-/// `hypothesis.rs`'s. Before PR-14
-/// the register carried the sentence *"Deadline **PR-12**, not PR-14: these
+/// handler read fails it.
+///
+/// History of the count, newest first. It was four handler sites across two
+/// files (`clusters.rs` 2, `policies.rs` 2) until the two removals above. It
+/// was ten across seven before backlog 67c905a3 retired `conflicts.rs`,
+/// `embeddings.rs`, `political.rs`, `search.rs` and the rest of
+/// `workflows.rs` (see the comment on each removal below); this paragraph said
+/// "twelve" from before `workflows.rs` went 4 -> 2. It was thirteen across
+/// eight before `tenancy/fix-security-track` retired `hypothesis.rs`'s.
+///
+/// Before PR-14 the register carried the sentence *"Deadline **PR-12**, not PR-14: these
 /// become live disclosure the moment ownership is transcribed into the tenancy
 /// columns, with nothing behind them."* That prediction is not stale — it has
 /// come true, and PR-14 is the commit that removes any ambiguity about it:
