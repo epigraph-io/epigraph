@@ -4651,6 +4651,47 @@ restart.
   `epigraph-api/tests/agent_prompt_history_route.rs`. Undo: `docs/runbooks/276-undo.sql`.
   **Deploy order:** migrate BEFORE the binary that reads files through it (without it every
   file read is a 500, 42883); an older binary ignores it.
+- **284**: `declared_edge_remeets_only_narrow` (backlog 49044d29). 260 recorded an edge's
+  declared tenancy and taught only the privatization re-meet to honour it; the propagation
+  trigger, 206's publicize and share re-meets (242's bodies) and a re-point (120's
+  `epigraph_edges_tenancy` on `UPDATE OF source_id, target_id`) still treated a declared edge
+  as derived: a claim re-tenanted into G outside the privatization re-owned a declared
+  `('group', H)` edge to G, publicize widened one to the world, share re-owned one on a moved
+  claim's evidence to the team, and a re-point onto a private endpoint dropped the declared
+  owner. Adds `epigraph_edge_declared_meet(dg, dco, mv, mg, mco)`, the privatization re-meet's
+  rule as one IMMUTABLE SQL function (SECURITY INVOKER, 172's path, owned by
+  `epigraph_maintenance`, no PUBLIC EXECUTE; `tenancy_backfill`'s `INVOKER_EXEMPT` lists it),
+  and re-states the four bodies so each passes a declared edge through it: the intersection of
+  the declaration and the endpoints' meet where one owner plus one co-owner expresses it, the
+  meet (declared owner kept where it can be) where not, the exact declaration when the meet is
+  public. The re-point reads the declaration from OLD (a bound value never counts); the
+  propagation still writes only where the meet is `group`; publicize and share also re-meet
+  every declared edge incident to the moved claims (publicize) or their evidence (both), on or
+  off its meet, and their audit rows add `declared_edges_held` /
+  `declared_evidence_edges_held` and say `migration: 284`. A one-time repair gives every
+  declared edge whose tuple is not the rule's the rule's owner plus, as co-owner, the one other
+  group the rule's tuple and its current tuple require together (no session gains an edge),
+  and leaves and counts one that would need three groups (NOTICE). Refuses (55000) unless the
+  four bodies are exactly 120's, 258's and 242's two (md5 of `prosrc`), and (42501) unless run
+  as the maintenance role or a superuser. Not changed: the Rust privatization re-meet (same
+  rule; pinned to agree), 260's recording trigger, the operator CLI's cascade models. Those
+  models still predict a moved claim's edge as its plain meet, so in one stacked case (a
+  declared `('group', H)` edge whose other endpoint is already in H, its first endpoint
+  restricted into G) the trigger writes `(H, co G)` where the model expects `(G, co H)`: the
+  same readers, but owner and co-owner differ in write rights, so `restrict-claims` (and
+  likely `regroup-claims`) now rolls such a batch back where it used to succeed (fail-closed;
+  nothing is exposed; making the models read the declaration is a follow-up). The repair's
+  NOTICE counts `unmet` among the edges it changed only. Pinned by
+  `epigraph-db/tests/declared_edge_remeet.rs` (re-tenant, publicize and share on the
+  application role, re-point, agreement with the privatization re-meet, the rule's cases, the
+  repair across an upgrade from 283, the refusal, the undo). Undo: `docs/runbooks/284-undo.sql`
+  (re-states the four predecessor bodies, drops the rule; tested twice-run to the catalog below
+  284; repaired edges stay narrowed). Run it BEFORE `258-undo.sql` (refuses over 284's
+  propagation body), `242-undo.sql` (unguarded: it would silently put 242's publicize and share
+  back) or `260-undo.sql` (drops the columns the four bodies read). **Deploy order:** none
+  against the binaries. Measure first:
+  `SELECT count(*) FROM edges WHERE declared_owner_group_id IS NOT NULL`.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

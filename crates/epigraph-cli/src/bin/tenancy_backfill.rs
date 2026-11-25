@@ -4919,6 +4919,11 @@ mod definer_register_tests {
         // 207: the intake settings' audit trigger. It runs as the session
         // writing the settings row, which only a maintenance session can.
         "epigraph_bug_report_intake_settings_audit",
+        // 284: the declared-edge re-meet rule. IMMUTABLE SQL over its
+        // arguments, reads no table; called by the maintenance-owned tenancy
+        // trigger, propagation, publicize and share definers. EXECUTE is the
+        // maintenance role's alone.
+        "epigraph_edge_declared_meet",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,
