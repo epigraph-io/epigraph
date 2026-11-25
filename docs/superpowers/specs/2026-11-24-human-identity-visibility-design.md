@@ -293,7 +293,7 @@ The approved rule accepts this.
 
 `operator_human` is **not** the only id-level human signal. The others are recorded in §15
 (R7, R12 world-readable `OPERATED_BY` edges, R13 timing, R14 assessment-slot BBAs, R16 the
-C7 residuals, R17-R19 the C5/C6 residuals; R11, the TGP03 invite oracle, is closed by C10). The pending-papers count (L11) is served as
+C7 residuals, R17-R19 (and R18a) the C5/C6 residuals; R11, the TGP03 invite oracle, is closed by C10). The pending-papers count (L11) is served as
 computed to every reader, for H as for N (§7 row A2). Revision 2 zeroed it for an unnamed
 H on the premise that "a pending explicit attachment exists only for a registered person";
 that premise is false (`ingest_authors.rs::check_explicit_author_ids` has no human gate,
@@ -1522,6 +1522,15 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   names no one. No supported flow binds the HTTP MCP server's own agent to a person (its
   auth-lineage edges are `OPERATED_BY` edges, not bindings, §15.R12); a maintenance link of it
   would name that person by every MCP-written evidence row.
+- **R18a. A backfilled ingest record is windowed by its WRITE time** (C5 x C6). The operator's
+  marker backfill (`epigraph-cli` `operator/backfill_markers.rs`) writes the
+  `paper -ingested_claim-> claim` records of pre-record ingests through
+  `ClaimIngestRepository::record_signed_conn`, so their `created_at` is the backfill run, not the
+  ingest. A public record backfilled for a principal S therefore names S's human (if S was bound
+  when the backfill ran) even for an ingest S made before its binding. The records carry no
+  earlier time to window on; the paper's `asserts` edge's `created_at` is the nearest proxy and
+  was not adopted (it would need a join per probe and is itself rewritten by the same backfill
+  for legacy rows). Records written by the ingest walk itself are timed correctly.
 - **R19. Kinds C6 does not count** (found re-verifying the tables; not ruled). An agent's own
   `asserts` edge onto a claim (`agent -asserts-> claim`, written by a document ingest that names
   the agent as an author: the ingester's record already counts), reasoning traces (no agent
