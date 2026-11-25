@@ -103,11 +103,30 @@ fn a_full_session_never_dials_the_database_address_and_holds_no_socket() {
         r#"{"id":4,"op":"mark_applied","turn":1}"#.to_string(),
         r#"{"id":5,"op":"stats"}"#.to_string(),
         r#"{"id":6,"op":"snapshot"}"#.to_string(),
+        // The engine paths E2 added run under the same trap: seed_mass and
+        // Dempster (update_belief, atom), BM25 and diverse_select (digest:
+        // turn 1 is evicted and applied, and the query matches it).
+        r#"{"id":7,"op":"update_belief"}"#.to_string(),
+        r#"{"id":8,"op":"atom","atom_id":"00000000-0000-5000-8000-000000000001"}"#.to_string(),
+        r#"{"id":9,"op":"digest","query":"pilot probes","exclude_turns_from":2}"#.to_string(),
     ];
+    let mut responses = Vec::new();
     for line in &session {
         let r = call(line);
         assert_eq!(r["ok"], true, "{line} -> {r}");
+        responses.push(r);
     }
+    // The engine calls really ran: a seeded belief and a ranked hit came back.
+    let belief = &responses[7]["belief"];
+    assert!(
+        (belief["bel"].as_f64().unwrap() - 0.665).abs() < 1e-12,
+        "{belief}"
+    );
+    let digest = &responses[8];
+    assert_eq!(
+        digest["relevant"][0]["id"], "00000000-0000-5000-8000-000000000001",
+        "{digest}"
+    );
 
     // The child is alive and idle, its graph written: list what it holds.
     #[cfg(target_os = "linux")]
@@ -205,6 +224,8 @@ fn the_scratch_sources_read_no_environment_and_touch_no_database_or_router() {
         "store.rs",
         "bm25.rs",
         "snapshot.rs",
+        "belief.rs",
+        "rank.rs",
     ] {
         assert!(
             names.iter().any(|n| n == expected),
