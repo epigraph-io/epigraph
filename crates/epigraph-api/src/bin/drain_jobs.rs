@@ -31,7 +31,8 @@
 //! or terminal; a failure outranks every other code), or the run could not
 //! start; 5 a privatization plan is stranded in `applying` or `reverting`
 //! with no job to finish it (`stranded_privatization_plans` in the report;
-//! reported on every run until an operator aborts and reverts it; it
+//! reported on every run until an operator aborts and reverts it, with
+//! `epigraph-operator privatization abort|revert --plan <id>`; it
 //! outranks 4); 4 pending jobs of a type this run has no handler for are waiting
 //! (`pending_unregistered` in the report, per type; for example
 //! `embedding_generation` on an instance whose provider may not write

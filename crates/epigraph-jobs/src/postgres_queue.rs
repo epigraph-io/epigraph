@@ -83,8 +83,10 @@ pub struct ReapedJob {
 /// Nothing will move such a plan: its job ended (failed by the reaper after
 /// its crash re-deliveries, failed by its handler, or cancelled) without the
 /// plan reaching `applied`, `reverted` or `failed`. Its claims may be partly
-/// moved. Recovery is the operator's: abort the plan, then revert it (see
-/// `docs/tenancy.md`, "A plan stranded in `applying` or `reverting`").
+/// moved. Recovery is the operator's: abort the plan, then revert it, with
+/// `epigraph-operator privatization abort|revert --plan <id>` on the
+/// maintenance DSN (backlog bb682f72; see `docs/tenancy.md`, "A plan stranded
+/// in `applying` or `reverting`").
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StrandedPlan {
     /// The plan.

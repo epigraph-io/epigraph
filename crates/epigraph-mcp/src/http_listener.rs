@@ -93,6 +93,22 @@ pub struct McpHttpListener<S> {
     /// `main.rs` installs it as the outer guard layer; the rmcp config inside
     /// `service` was built from this same value.
     pub tcp_allowlist: Option<HostAllowlist>,
+    /// Ends every MCP session of `service` and refuses new requests (rmcp's
+    /// cancellation token), for a stopping listener
+    /// ([`crate::GracefulShutdown::ending_sessions_with`]): an open SSE stream
+    /// otherwise holds the listener's graceful wait open.
+    pub end_sessions: EndSessions,
+}
+
+/// Ends the MCP sessions of one listener's service when called
+/// ([`McpHttpListener::end_sessions`]).
+pub struct EndSessions(Box<dyn FnOnce() + Send>);
+
+impl EndSessions {
+    /// End the sessions.
+    pub fn end(self) {
+        (self.0)();
+    }
 }
 
 /// Build the rmcp streamable-HTTP service for the `--listen` address `listen`,
@@ -115,14 +131,13 @@ where
     let tcp_allowlist = (!crate::is_unix_listener(listen))
         .then(|| HostAllowlist::for_tcp_listener(listen, allowed_hosts));
     let sessions = Arc::new(session_manager());
-    let service = StreamableHttpService::new(
-        factory,
-        sessions.clone(),
-        streamable_http_server_config(tcp_allowlist.as_ref()),
-    );
+    let config = streamable_http_server_config(tcp_allowlist.as_ref());
+    let token = config.cancellation_token.clone();
+    let service = StreamableHttpService::new(factory, sessions.clone(), config);
     McpHttpListener {
         service,
         sessions,
         tcp_allowlist,
+        end_sessions: EndSessions(Box::new(move || token.cancel())),
     }
 }

@@ -63,6 +63,18 @@ impl EventRepository {
     /// create one.
     pub const RESERVED_EVENT_TYPES: &'static [&'static str] = &[Self::ASSESSMENT_EVENT_TYPE];
 
+    /// Event types whose rows [`Self::list`] returns only to the agent they
+    /// name as actor (or to a maintenance `Bypass` viewer), never to another
+    /// caller (backlog 8c4908d6).
+    ///
+    /// `tool.invoked` is written for EVERY MCP tool call, attributed to the
+    /// calling agent and carrying its OAuth `client_id`. Its payload names no
+    /// claim, so the claim-keyed suppression below never hides it: served to
+    /// every caller, the table was a per-person timeline of tool calls,
+    /// refusals and client ids, which the caller never chose to publish. A row
+    /// with no actor (a token naming no agent) is shown to no caller at all.
+    pub const ACTOR_PRIVATE_EVENT_TYPES: &'static [&'static str] = &["tool.invoked"];
+
     /// Whether a caller-supplied `event_type` names a reserved type.
     ///
     /// Compared trimmed and ASCII-case-insensitively, so a padded or
@@ -245,10 +257,23 @@ impl EventRepository {
     /// multi-table gate with its own placement reasoning and is deliberately
     /// not attempted inline here.
     ///
+    /// ## Actor-private types (backlog 8c4908d6)
+    ///
+    /// A second, independent filter: a row whose type is in
+    /// [`Self::ACTOR_PRIVATE_EVENT_TYPES`] (`tool.invoked`, one per MCP tool
+    /// call, attributed to the caller) is returned only when its `actor_id` is
+    /// the viewer's own principal, or to a `Bypass` viewer. A row with a NULL
+    /// actor matches no principal and is therefore bypass-only. An `Elevated`
+    /// viewer is held to its own rows too: elevation widens what the ROW
+    /// POLICIES admit, and `events` has none, so there is nothing for it to
+    /// widen here. Filtering by `actor_id` does not get around it: the actor
+    /// filter narrows the rows this predicate already admitted.
+    ///
     /// ## Two shapes that deliberately survive the filter
     ///
     /// * **An event naming no claim at all** — most of them. `NOT EXISTS` over
-    ///   an empty match set is true.
+    ///   an empty match set is true (an actor-private type is still subject to
+    ///   the filter above).
     /// * **An event naming a uuid that resolves to no `claims` row** (a
     ///   hard-deleted claim, an `agent_id`, a malformed or foreign id). There
     ///   is no row to classify, no owner to protect, and dropping it would make
@@ -314,6 +339,8 @@ impl EventRepository {
                AND ($2::uuid IS NULL OR e.actor_id = $2) \
                AND ($4::timestamptz IS NULL OR e.created_at > $4 \
                     OR (e.created_at = $4 AND ($5::uuid IS NULL OR e.id > $5))) \
+               AND (e.event_type <> ALL($6::text[]) OR $7::bool \
+                    OR (e.actor_id IS NOT NULL AND e.actor_id = $8::uuid)) \
                AND NOT EXISTS ( \
                      SELECT 1 \
                      FROM regexp_matches(e.payload::text, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-\
@@ -330,14 +357,19 @@ impl EventRepository {
                    ) \
              ORDER BY __EVENT_ORDER__ LIMIT $3"
                 .replace("__EVENT_ORDER__", order),
-            6,
+            9,
         );
         let mut q = sqlx::query_as::<_, EventRow>(&sql)
             .bind(event_type)
             .bind(actor_id)
             .bind(limit)
             .bind(cursor.map(|c| c.since))
-            .bind(cursor.and_then(|c| c.after_id));
+            .bind(cursor.and_then(|c| c.after_id))
+            .bind(Self::ACTOR_PRIVATE_EVENT_TYPES)
+            // Only the maintenance shape reads every actor's rows. Explicit,
+            // not "no principal": a NULL bind below must never mean "all".
+            .bind(viewer.is_bypass())
+            .bind(viewer.principal());
         // Guarded, not `unwrap_or(&[])`: `render_predicate` emits nothing for a
         // `Bypass` viewer, so an unconditional bind would send one more
         // parameter than the rendered statement references.

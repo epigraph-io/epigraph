@@ -218,8 +218,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_passkey_enrollments_audit()",
     "public.epigraph_passkey_enrollments_guard_insert()",
     "public.epigraph_passkey_enrollments_guard_update()",
-    "public.epigraph_passkeys_for_act(uuid)",
-    "public.epigraph_passkeys_for_ticket(uuid)",
     "public.epigraph_pending_admin_acts_audit()",
     "public.epigraph_pending_admin_acts_guard_insert()",
     "public.epigraph_pending_admin_acts_guard_update()",
@@ -297,7 +295,9 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 // 190 -> 191: 250 registers `epigraph_prune_telemetry_events(integer)` (its
 // delete fires 001's INVOKER `cascade_delete_edges`); 192 -> 193 on its own
 // branch.
-const HIGH_WATER: usize = 191;
+// 191 -> 189: 285 re-creates `epigraph_passkeys_for_ticket` and
+// `epigraph_passkeys_for_act` (a new result column) on 172's form.
+const HIGH_WATER: usize = 189;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.

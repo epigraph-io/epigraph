@@ -4231,6 +4231,42 @@ async fn an_android_key_with_a_stale_status_list_is_refused_on_the_anchored_path
     );
 }
 
+/// The id of `person`'s only passkey.
+async fn only_passkey(pool: &PgPool, person: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM person_authenticators WHERE person_agent_id = $1")
+        .bind(person)
+        .fetch_one(pool)
+        .await
+        .expect("the passkey")
+}
+
+/// `(agent_id, details)` of every `platform.passkey_standing_refused` row whose
+/// `details->>key` is `id`, oldest first.
+async fn standing_audits(pool: &PgPool, key: &str, id: Uuid) -> Vec<(Uuid, Value)> {
+    sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'platform.passkey_standing_refused' AND details->>$1 = $2 \
+          AND success = false ORDER BY created_at, id",
+    )
+    .bind(key)
+    .bind(id.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("standing audits")
+}
+
+/// How many `platform.passkey_standing_refused` rows name `person`.
+async fn standing_audits_of(pool: &PgPool, person: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'platform.passkey_standing_refused' AND agent_id = $1",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("standing audit count")
+}
+
 /// `path` rewritten with `list`, modified `age` ago.
 fn rewrite_status(path: &std::path::Path, list: &str, age: std::time::Duration) {
     std::fs::write(path, list).expect("rewrite the status list");
@@ -4250,11 +4286,14 @@ fn rewrite_status(path: &std::path::Path, list: &str, age: std::time::Duration) 
 /// hours (`503 attestation_status_unavailable`); each refusal leaves the
 /// ticket or act live, opens no session and confirms nothing. CALIBRATION:
 /// once the list is refreshed without the certificate, the SAME ticket and
-/// the SAME act confirm.
+/// the SAME act confirm. Every refusal is audited
+/// (`platform.passkey_standing_refused`, backlog 09ca9ab0): one row per
+/// refusal, naming the ticket or act, the passkey and the code, and the
+/// listed certificate for a 403 but no reason for a 503.
 /// Mutations: the `assertion_standing` call removed from `ticket_assert` ->
 /// the listed elevation confirms; removed from `act_assert` -> the listed act
 /// confirms; `standing_refused` answering 403 for both -> the stale case's
-/// status.
+/// status; the audit call removed (the code before 09ca9ab0) -> no rows.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_revoked_android_attestation_neither_elevates_nor_confirms_an_act(pool: PgPool) {
     use support::{android_status, AndroidKeyOpts};
@@ -4313,6 +4352,22 @@ async fn a_revoked_android_attestation_neither_elevates_nor_confirms_an_act(pool
     );
     assert_eq!(ticket_row(&pool, ticket).await, (None, None, None));
     assert_eq!(sessions_of(&pool, p.person).await, 0);
+    let phone_id = only_passkey(&pool, p.person).await;
+    let audits = standing_audits(&pool, "ticket_id", ticket).await;
+    assert_eq!(audits.len(), 1, "the 403 is audited once: {audits:?}");
+    assert_eq!(audits[0].0, p.person, "under the ticket's person");
+    let row = &audits[0].1;
+    assert_eq!(row["ceremony"], "elevation", "{row}");
+    assert_eq!(row["authenticator_id"], phone_id.to_string(), "{row}");
+    assert_eq!(row["code"], "attestation_not_in_good_standing", "{row}");
+    assert_eq!(row["attestation_format"], "android-key", "{row}");
+    assert!(row["anchor_authenticator_id"].is_null(), "{row}");
+    assert!(
+        row["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("2c8cdddfd5e03bfc is REVOKED")),
+        "{row}"
+    );
 
     // A list the API cannot check against refuses too (fail closed).
     rewrite_status(
@@ -4328,6 +4383,14 @@ async fn a_revoked_android_attestation_neither_elevates_nor_confirms_an_act(pool
         "the list's path stays in the log: {body}"
     );
     assert_eq!(sessions_of(&pool, p.person).await, 0);
+    let audits = standing_audits(&pool, "ticket_id", ticket).await;
+    assert_eq!(audits.len(), 2, "the 503 is audited too: {audits:?}");
+    assert_eq!(audits[1].1["code"], "attestation_status_unavailable");
+    assert!(
+        audits[1].1["reason"].is_null(),
+        "an unknown standing's reason (server paths) stays in the log: {}",
+        audits[1].1
+    );
 
     // CALIBRATION: refreshed, without the certificate, the same ticket
     // confirms.
@@ -4354,6 +4417,10 @@ async fn a_revoked_android_attestation_neither_elevates_nor_confirms_an_act(pool
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["error"], "attestation_not_in_good_standing", "{body}");
     assert_eq!(act_row(&pool, act).await, (None, None));
+    let audits = standing_audits(&pool, "act_id", act).await;
+    assert_eq!(audits.len(), 1, "the act's 403 is audited: {audits:?}");
+    assert_eq!(audits[0].1["ceremony"], "admin_act");
+    assert_eq!(audits[0].1["authenticator_id"], phone_id.to_string());
 
     rewrite_status(
         &status_file,
@@ -4365,4 +4432,197 @@ async fn a_revoked_android_attestation_neither_elevates_nor_confirms_an_act(pool
     let (status, body) = s.act_assert(act, &response).await;
     assert_eq!(status, StatusCode::OK, "CALIBRATION: {body}");
     assert_eq!(act_row(&pool, act).await.0.as_deref(), Some("confirmed"));
+}
+
+/// Backlog 09ca9ab0, through the real router: P's FIRST passkey is an
+/// Android hardware key (the phone); a synced passkey registers on the
+/// ANCHORED path on a `passkey.register` act the phone confirmed, and its
+/// row records the phone as its anchor. Once a fresh status list names the
+/// phone's leaf, the synced passkey can neither confirm an admin act nor
+/// elevate (`403 attestation_not_in_good_standing`, naming the anchor's
+/// certificate), though nobody revoked the phone's row; while the list is
+/// stale it is `503`. Each refusal leaves the act or ticket live and is
+/// audited once (`platform.passkey_standing_refused`, naming the synced
+/// passkey and its anchor). CALIBRATION: under the empty list the synced
+/// passkey confirms an act, and once the list is refreshed without the leaf
+/// the SAME ticket confirms with it.
+/// Mutations: the anchor not passed to `assertion_standing`
+/// (`standing_anchor` answering `None`) -> the calibration act is refused;
+/// the `none` arm of `assertion_standing` answering Ok (the code before
+/// 09ca9ab0) -> the listed act and ticket confirm; the audit call removed ->
+/// no rows; a standing audit written on success too -> the zero count after
+/// the calibration act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_anchored_passkey_stands_as_its_anchor_stands_and_each_refusal_is_audited(pool: PgPool) {
+    use support::{android_status, AndroidKeyOpts};
+    let google = TestAttestation::new("Android");
+    let status_file = android_status::fresh_empty();
+    let rp = Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::Attested(epigraph_passkey::AttestedPolicy {
+            allowlist: None,
+            android_key_ca_pem: Some(google.root_pem()),
+            android_key_status_file: Some(status_file.clone()),
+            allow_synced_anchored: true,
+        }),
+    })
+    .expect("relying party");
+    let s = spawn(&pool, Some(rp)).await;
+    let p = person(&pool, "anchored on a phone").await;
+    fixture::make_custodian(&pool, p.person).await;
+
+    // The phone, enrolled while the list names nothing.
+    let id = maintenance_enrollment(&pool, p.person).await;
+    let base = format!("/elevate/enroll/{id}");
+    let (status, options) = s.post(&format!("{base}/challenge"), None, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{options}");
+    let mut phone = SoftAuthenticator::new(MODEL).hardware();
+    let created = phone.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let response = google.android_key_with(
+        &phone,
+        &created,
+        true,
+        &AndroidKeyOpts {
+            leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+            ..AndroidKeyOpts::default()
+        },
+    );
+    let (status, body) = s.post(&format!("{base}/finish"), None, &response).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the phone enrolls: {body}"
+    );
+    assert_eq!(body["attestation_format"], "android-key", "{body}");
+    let phone_id = only_passkey(&pool, p.person).await;
+
+    // Elevated by the phone through the real ceremony; the synced passkey
+    // registers on an act the phone confirms.
+    let (ticket, _) = open(&s, &p, "to register a synced passkey").await;
+    let (status, body) = s.ceremony(ticket, &mut phone).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the phone elevates: {body}"
+    );
+    let session = ticket_row(&pool, ticket).await.2.expect("a session");
+    let token = s.scoped_token(&p, Some(session), &["claims:read", "platform:admin"]);
+    let act = register_act(&s, &p, &token, &mut phone).await;
+    let enrollment = act_enrollment(&pool, p.person, act).await;
+    let mut synced = SoftAuthenticator::new(SYNCED_MODEL);
+    let (options, (status, body)) = enroll_on(&s, enrollment, &mut synced, Value::clone).await;
+    assert!(anchored_options(&options), "{options}");
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: anchored: {body}");
+    assert_eq!(body["attestation_format"], "none", "{body}");
+    assert_eq!(body["anchored_by"], act.to_string(), "{body}");
+    let (synced_id, anchor): (Uuid, Option<Uuid>) = sqlx::query_as(
+        "SELECT id, anchor_authenticator_id FROM person_authenticators \
+          WHERE person_agent_id = $1 AND attestation_format = 'none'",
+    )
+    .bind(p.person)
+    .fetch_one(&pool)
+    .await
+    .expect("the synced passkey");
+    assert_eq!(anchor, Some(phone_id), "its row records the phone");
+
+    // CALIBRATION: under the empty list the synced passkey confirms an act.
+    let clean = propose_with(&pool, &s, &token, "synced under a clean list").await;
+    let response = synced
+        .authenticate(ORIGIN, s.act_options(clean).await)
+        .await;
+    let (status, body) = s.act_assert(clean, &response).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: in good standing: {body}"
+    );
+    assert_eq!(
+        standing_audits_of(&pool, p.person).await,
+        0,
+        "an assertion in good standing (the phone's elevation and act, the synced act) is not audited"
+    );
+
+    // Google lists the phone's leaf. Nobody revokes the phone's row.
+    rewrite_status(
+        &status_file,
+        android_status::GOOGLE_EXAMPLE,
+        std::time::Duration::ZERO,
+    );
+    let listed = propose_with(&pool, &s, &token, "synced under a listed anchor").await;
+    let response = synced
+        .authenticate(ORIGIN, s.act_options(listed).await)
+        .await;
+    let (status, body) = s.act_assert(listed, &response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "attestation_not_in_good_standing", "{body}");
+    assert!(
+        body["detail"].as_str().is_some_and(|d| d.contains("anchored it")
+            && d.contains("2c8cdddfd5e03bfc is REVOKED")),
+        "{body}"
+    );
+    assert_eq!(
+        act_row(&pool, listed).await,
+        (None, None),
+        "the act stays live"
+    );
+    let audits = standing_audits(&pool, "act_id", listed).await;
+    assert_eq!(audits.len(), 1, "{audits:?}");
+    assert_eq!(audits[0].0, p.person);
+    let row = &audits[0].1;
+    assert_eq!(row["ceremony"], "admin_act", "{row}");
+    assert_eq!(row["authenticator_id"], synced_id.to_string(), "{row}");
+    assert_eq!(
+        row["anchor_authenticator_id"],
+        phone_id.to_string(),
+        "{row}"
+    );
+    assert_eq!(row["attestation_format"], "none", "{row}");
+    assert_eq!(row["code"], "attestation_not_in_good_standing", "{row}");
+
+    // The elevation, on another family of the same client (the first family
+    // holds the phone's session).
+    let other = Person {
+        family: family(&pool, p.client).await,
+        ..p.clone()
+    };
+    let (second, _) = open(&s, &other, "synced under a listed anchor").await;
+    let sessions = sessions_of(&pool, p.person).await;
+    let (status, body) = s.ceremony(second, &mut synced).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "attestation_not_in_good_standing", "{body}");
+    assert_eq!(ticket_row(&pool, second).await, (None, None, None));
+    assert_eq!(sessions_of(&pool, p.person).await, sessions, "no session");
+    let audits = standing_audits(&pool, "ticket_id", second).await;
+    assert_eq!(audits.len(), 1, "{audits:?}");
+    assert_eq!(audits[0].1["ceremony"], "elevation");
+    assert_eq!(audits[0].1["authenticator_id"], synced_id.to_string());
+
+    // A list the API cannot check against refuses it too (fail closed).
+    rewrite_status(
+        &status_file,
+        android_status::EMPTY,
+        std::time::Duration::from_secs(49 * 3600),
+    );
+    let (status, body) = s.ceremony(second, &mut synced).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "attestation_status_unavailable", "{body}");
+    let audits = standing_audits(&pool, "ticket_id", second).await;
+    assert_eq!(audits.len(), 2, "{audits:?}");
+    assert_eq!(audits[1].1["code"], "attestation_status_unavailable");
+
+    // CALIBRATION: refreshed without the leaf, the SAME ticket confirms.
+    rewrite_status(
+        &status_file,
+        android_status::EMPTY,
+        std::time::Duration::ZERO,
+    );
+    let (status, body) = s.ceremony(second, &mut synced).await;
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: {body}");
+    assert!(ticket_row(&pool, second).await.2.is_some(), "a session");
+    assert_eq!(
+        standing_audits_of(&pool, p.person).await,
+        3,
+        "the three refusals only: the confirmation in good standing adds no row"
+    );
 }

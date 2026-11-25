@@ -223,6 +223,60 @@ def test_apply_then_reverse_is_byte_identical(db, seed_agent, tmp_path):
     assert _snapshot(db) == before, "reverse must restore claim_themes and membership exactly"
 
 
+def _theme_ids(db):
+    with db.cursor() as cur:
+        cur.execute("SELECT id::text FROM claim_themes")
+        out = {r[0] for r in cur.fetchall()}
+    db.rollback()
+    return out
+
+
+def test_apply_and_reverse_name_every_theme_whose_derived_rows_are_stale(db, seed_agent,
+                                                                         tmp_path):
+    """Backlog 30633061: after an apply (and after its reverse) the graph
+    neighbourhoods and Atlas layout rows of every split parent and every new
+    part are stale. Both commands name exactly those themes, the manifest
+    records them, and the output carries the rebuild steps: a new ClusterGraph
+    run (enqueued, then drained), then a new layout run."""
+    big, _, _ = _theme(db, seed_agent, (30, 25, 20))
+    pair, _, _ = _theme(db, seed_agent, (25, 25), label="Second Theme", seed0=10)
+    small, _, _ = _theme(db, seed_agent, (12,), label="Small Theme", seed0=20)
+    themes_before = _theme_ids(db)
+    plan, manifest = tmp_path / "plan.json", tmp_path / "m.json"
+    _run(["plan", "--database-url", script_dsn(), "--cap", str(CAP), "--out", str(plan)])
+
+    out, _ = _run(["apply", "--database-url", script_dsn(), "--from", str(plan),
+                   "--manifest", str(manifest)])
+
+    new_parts = _theme_ids(db) - themes_before
+    assert len(new_parts) == 3, "CALIBRATION: the fixture splits into three new parts"
+    stale = sorted({big, pair} | new_parts)
+    applied = json.loads(out)
+    assert applied["touched_theme_ids"] == stale
+    assert small not in applied["touched_theme_ids"]
+    assert json.loads(manifest.read_text())["touched_theme_ids"] == stale
+    assert applied["rebuild_next"] == S.REBUILD_STEPS
+    steps = [step.split()[0] for step in S.REBUILD_STEPS]
+    assert steps.index("enqueue_job") < steps.index("drain_jobs") < steps.index("atlas_layout")
+    assert '"ClusterGraph"' in S.REBUILD_STEPS[steps.index("enqueue_job")]
+
+    out, _ = _run(["reverse", "--database-url", script_dsn(), "--manifest", str(manifest)])
+
+    reversed_ = json.loads(out)
+    assert _theme_ids(db) == themes_before, "CALIBRATION: the reverse deleted the parts"
+    assert reversed_["touched_theme_ids"] == stale
+    assert reversed_["rebuild_next"] == S.REBUILD_STEPS
+
+    # A second reverse of the same manifest changes nothing, so it must not
+    # ask for a whole-graph re-cluster.
+    out, _ = _run(["reverse", "--database-url", script_dsn(), "--manifest", str(manifest)])
+
+    again = json.loads(out)
+    assert {t["status"] for t in again["themes"]} == {"nothing to reverse"}, \
+        "CALIBRATION: the second reverse is a no-op"
+    assert again["rebuild_next"] == []
+
+
 def _intake_group(cur, agent_id):
     gid = str(uuid.uuid4())
     cur.execute(
@@ -733,3 +787,185 @@ def test_application_role_dsn_is_refused(dsn):
 ])
 def test_other_dsns_pass_the_role_guard(dsn):
     S.refuse_application_role(dsn)
+
+
+# ── offbox: the nightly's hook (backlog 691d283a) ───────────────────────────
+
+OFFBOX_ALLOWED_ENV = {"PATH", "HOME", "LANG", "PWD", "SHLVL", "_", "OLDPWD"}
+
+
+def _offbox_command(tmp_path, body=None):
+    """A fake off-box command that records its argv, environment and the
+    export's file names, then runs the reference command
+    (scripts/atlas_offbox_compute.py) unless `body` replaces that."""
+    log = tmp_path / "cmd"
+    log.mkdir()
+    ref = REPO / "scripts" / "atlas_offbox_compute.py"
+    run = body or f'exec {sys.executable} {ref} "$@"'
+    cmd = tmp_path / "offbox.sh"
+    cmd.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {log}/args\nenv > {log}/env\n'
+                   f'ls "$2" > {log}/listing\n{run}\n')
+    cmd.chmod(0o700)
+    return cmd, log
+
+
+def _work_dir(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    work.chmod(0o700)
+    return work
+
+
+def _offbox_argv(cmd, work):
+    return ["offbox", "--database-url", script_dsn(), "--cap", str(CAP),
+            "--command", str(cmd), "--work-dir", str(work)]
+
+
+def test_offbox_splits_through_the_command_with_no_credentials_and_reverses(
+        db, seed_agent, tmp_path, monkeypatch):
+    big, _, _ = _theme(db, seed_agent, (30, 25, 20))
+    _theme(db, seed_agent, (12,), label="Small Theme", seed0=20)
+    before = _snapshot(db)
+    # Credentials in our environment, which the command must not inherit.
+    monkeypatch.setenv("MAINTENANCE_DATABASE_URL", script_dsn())
+    monkeypatch.setenv("DATABASE_URL", script_dsn())
+    cmd, log = _offbox_command(tmp_path)
+    work = _work_dir(tmp_path)
+
+    out, _ = _run(_offbox_argv(cmd, work))
+
+    report = json.loads(out)
+    assert report["status"] == "applied" and report["exported"] == [big], report
+    assert report["review"] == S.REVIEW_OFFBOX
+    assert max(_sizes(db).values()) <= CAP
+    manifest = json.loads((work / "manifest.json").read_text())
+    assert manifest["review"] == S.REVIEW_OFFBOX
+    # The call: kind, export, result; the export held ids and embeddings only
+    # and is gone; the environment carried none of our variables.
+    args = (log / "args").read_text().split("\n")[:3]
+    assert args == ["theme-cap", str(work / "export"), str(work / "result.json")]
+    assert not (work / "export").exists(), "the export (embeddings) outlived the call"
+    assert sorted((log / "listing").read_text().split()) == sorted([f"{big}.npz", "export.json"])
+    env = (log / "env").read_text()
+    assert {line.split("=", 1)[0] for line in env.splitlines()} <= OFFBOX_ALLOWED_ENV, env
+    assert "DATABASE_URL" not in env and script_dsn() not in env
+
+    _run(["reverse", "--database-url", script_dsn(), "--manifest", str(work / "manifest.json")])
+    assert _snapshot(db) == before, "the offbox apply did not reverse exactly"
+
+
+@pytest.mark.parametrize("body", [
+    # a result that leaves out the exported theme (would read as "nothing to split")
+    "printf '{\"format\": \"theme-cap-result/1\", \"cap\": 40, \"seed\": 42, "
+    "\"themes\": []}' > \"$3\"",
+    # a result for a theme that was not exported
+    "printf '{\"format\": \"theme-cap-result/1\", \"cap\": 40, \"seed\": 42, \"themes\": "
+    "[{\"theme_id\": \"" + str(uuid.UUID(int=7)) + "\", \"parts\": []}]}' > \"$3\"",
+    # a command that fails
+    "exit 1",
+])
+def test_offbox_refuses_a_bad_command_and_writes_nothing(db, seed_agent, tmp_path, body):
+    _theme(db, seed_agent, (30, 25, 20))
+    before = _snapshot(db)
+    cmd, _ = _offbox_command(tmp_path, body)
+    work = _work_dir(tmp_path)
+
+    with pytest.raises((ValueError, subprocess.CalledProcessError)):
+        _run(_offbox_argv(cmd, work))
+
+    assert _snapshot(db) == before
+    assert not (work / "export").exists(), "the export outlived a failed call"
+    assert not (work / "manifest.json").exists()
+
+
+def test_offbox_refuses_a_work_directory_others_can_read(db, seed_agent, tmp_path):
+    _theme(db, seed_agent, (30, 25, 20))
+    cmd, log = _offbox_command(tmp_path)
+    work = _work_dir(tmp_path)
+    work.chmod(0o750)
+
+    with pytest.raises(ValueError, match="owner-only"):
+        _run(_offbox_argv(cmd, work))
+
+    assert not (log / "args").exists() and not (work / "export").exists()
+
+
+def test_offbox_command_past_the_timeout_is_killed_with_its_group(tmp_path):
+    """A wrapper that backgrounds a copy (or an ssh) must not outlive the
+    timeout: the command's whole process group is killed."""
+    import time
+
+    marker = tmp_path / "survived"
+    cmd = tmp_path / "slow.sh"
+    cmd.write_text(f"#!/bin/sh\n(sleep 2; touch {marker}) &\nsleep 30\n")
+    cmd.chmod(0o700)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        S.run_offbox_command(cmd, tmp_path / "export", tmp_path / "result.json", timeout=1)
+    assert time.monotonic() - started < 5
+    time.sleep(3)
+    assert not marker.exists(), "a process of the command's group outlived the timeout"
+
+
+def _edit_result_body(tmp_path, edit, theme):
+    """A fake command body: the reference compute, then `edit` (Python source
+    run with `d`, the result document, and `t`, `theme`) rewrites the result
+    before the script reads it."""
+    ref = REPO / "scripts" / "atlas_offbox_compute.py"
+    prog = tmp_path / "edit.py"
+    prog.write_text("import json, sys\np = sys.argv[1]\nd = json.load(open(p))\n"
+                    "t = sys.argv[2]\n" + edit + "\njson.dump(d, open(p, 'w'))\n")
+    return (f'{sys.executable} {ref} "$@" || exit 1\n'
+            f'exec {sys.executable} {prog} "$3" {theme}')
+
+
+def test_offbox_skips_a_theme_whose_members_changed_and_splits_the_rest(
+        db, seed_agent, tmp_path):
+    """Review finding 2: a member of one theme changing while the command
+    ran (here its result leaves one claim out, as when that claim arrived
+    after the export) skips THAT theme, untouched and reported, and still
+    applies the other theme's split, which reverses exactly."""
+    changed, _, _ = _theme(db, seed_agent, (30, 25, 20))
+    other, _, _ = _theme(db, seed_agent, (28, 22, 20), label="Other Theme", seed0=40)
+    before = _snapshot(db)
+    sizes_before = _sizes(db)
+    edit = ("e = [x for x in d['themes'] if x['theme_id'] == t][0]\n"
+            "e['parts'][-1] = e['parts'][-1][:-1]")
+    cmd, _ = _offbox_command(tmp_path, _edit_result_body(tmp_path, edit, changed))
+    work = _work_dir(tmp_path)
+
+    out, _ = _run(_offbox_argv(cmd, work))
+
+    report = json.loads(out)
+    assert report["status"] == "applied", report
+    assert report["exported"] == sorted([changed, other]), report
+    assert report["skipped_changed"] == [changed], report
+    assert [t["parent_id"] for t in report["themes"]] == [other], report
+    sizes = _sizes(db)
+    assert sizes[changed] == sizes_before[changed], "the changed theme was touched"
+    assert sizes[other] <= CAP and len(sizes) > len(sizes_before), sizes
+    manifest = json.loads((work / "manifest.json").read_text())
+    assert manifest["skipped_changed"] == [changed]
+
+    _run(["reverse", "--database-url", script_dsn(), "--manifest", str(work / "manifest.json")])
+    assert _snapshot(db) == before, "the offbox apply did not reverse exactly"
+
+
+def test_offbox_still_refuses_a_result_that_covers_the_members_but_breaks_the_cap(
+        db, seed_agent, tmp_path):
+    """The skip is for churn only: parts that cover the live members exactly
+    but break another check (here one part over the cap) are a broken
+    compute, refused whole, nothing written."""
+    big, _, _ = _theme(db, seed_agent, (30, 25, 20))
+    other, _, _ = _theme(db, seed_agent, (28, 22, 20), label="Other Theme", seed0=40)
+    before = _snapshot(db)
+    edit = ("e = [x for x in d['themes'] if x['theme_id'] == t][0]\n"
+            "e['parts'] = [[c for part in e['parts'] for c in part]]")
+    cmd, _ = _offbox_command(tmp_path, _edit_result_body(tmp_path, edit, big))
+    work = _work_dir(tmp_path)
+
+    with pytest.raises(ValueError, match="over the cap"):
+        _run(_offbox_argv(cmd, work))
+
+    assert _snapshot(db) == before
+    assert not (work / "manifest.json").exists()
