@@ -148,8 +148,15 @@ impl ExperimentRepository {
         Ok(q.fetch_optional(executor).await?)
     }
 
-    #[instrument(skip(pool))]
-    pub async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<(), DbError> {
+    /// Generic over the executor so the `experiment analyze` CLI can mark the
+    /// experiment complete on the transaction that files the analysis
+    /// (backlog 2e64b8a2). Callers passing `&PgPool` are unchanged.
+    #[instrument(skip(executor))]
+    pub async fn update_status<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        status: &str,
+    ) -> Result<(), DbError> {
         let now = if status == "running" {
             Some(Utc::now())
         } else {
@@ -174,7 +181,7 @@ impl ExperimentRepository {
         .bind(status)
         .bind(now)
         .bind(completed)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -341,12 +348,17 @@ impl ExperimentResultRepository {
         Ok(())
     }
 
-    #[instrument(skip(pool))]
-    pub async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<(), DbError> {
+    /// Generic over the executor, as `ExperimentRepository::update_status`.
+    #[instrument(skip(executor))]
+    pub async fn update_status<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+        status: &str,
+    ) -> Result<(), DbError> {
         sqlx::query("UPDATE experiment_results SET status = $2 WHERE id = $1")
             .bind(id)
             .bind(status)
-            .execute(pool)
+            .execute(executor)
             .await?;
         Ok(())
     }

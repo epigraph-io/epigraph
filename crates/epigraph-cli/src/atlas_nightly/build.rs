@@ -20,7 +20,7 @@ use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
 use super::incremental::{shape_of, to_wire, update_links, update_meaning, Shape};
-use super::leaves::{fill_leaf, leaf_claims, leaf_shape, node_set};
+use super::leaves::{contract_edges, fill_leaf, leaf_claims, leaf_shape, node_set, RenamedNames};
 use super::links::{fill_cross_links, LinksReport};
 use super::offbox::OffBox;
 use super::previous::{by_theme, prev_tree};
@@ -191,7 +191,8 @@ fn tree_documents(
 /// value only, read under the map's predicate); then check every document against the
 /// contract. A leaf whose edges exceed the contract's limit (in practice one
 /// claim whose own attachments carry more) keeps its heaviest and the cut is
-/// returned, as the cross-group link caps report theirs.
+/// returned, as the cross-group link caps report theirs; so are the
+/// relationship names served mapped to a contract name (backlog 9de2ebad).
 async fn real_leaves(
     tx: &mut PgConnection,
     viewer: &Viewer,
@@ -199,7 +200,7 @@ async fn real_leaves(
     rows: &epigraph_db::repos::atlas_leaf::LeafRows,
     docs: &mut [LevelDocument],
     cap: usize,
-) -> anyhow::Result<EdgeCut> {
+) -> anyhow::Result<(EdgeCut, RenamedNames)> {
     let mut sets = Vec::new();
     for doc in docs.iter() {
         if let LevelDocument::Leaf(l) = doc {
@@ -233,23 +234,25 @@ async fn real_leaves(
         .collect();
     let truths = AtlasMeaningRepository::claim_truth_values(tx, viewer, map, &claims).await?;
     let mut cut = EdgeCut::default();
+    let mut renamed = RenamedNames::default();
     for (doc, set) in docs.iter_mut().zip(&sets) {
         if let (LevelDocument::Leaf(l), Some(set)) = (doc, set) {
             let inputs = AtlasFlowRepository::read_flow_inputs(tx, viewer, map, set).await?;
-            let dropped = fill_leaf(l, set, &inputs, &agent_labels, &evidence_labels, &truths)?;
-            if dropped > 0 {
+            let fill = fill_leaf(l, set, &inputs, &agent_labels, &evidence_labels, &truths)?;
+            if fill.cut > 0 {
                 cut.add(EdgeCut {
                     capped_leaves: 1,
-                    dropped_edges: dropped,
+                    dropped_edges: fill.cut,
                 });
             }
+            renamed.add(fill.renamed);
         }
     }
     for doc in docs.iter() {
         doc.to_stored_json()
             .map_err(|v| anyhow::anyhow!("level {} breaks the contract: {v}", doc.level_id()))?;
     }
-    Ok(cut)
+    Ok((cut, renamed))
 }
 
 /// One theme's night, on the build's snapshot (the caller runs it inside a
@@ -363,7 +366,7 @@ async fn build_theme(
     let labels = AtlasMeaningRepository::claim_labels(tx, viewer, map, &ids).await?;
     let mut docs = tree_documents(&m_tree, &labels, &m_switch)?;
     docs.extend(tree_documents(&l_tree, &labels, &l_switch)?);
-    let edge_cut = real_leaves(tx, viewer, map, &rows, &mut docs, cap).await?;
+    let (edge_cut, renamed) = real_leaves(tx, viewer, map, &rows, &mut docs, cap).await?;
 
     let inner = |t: &MeaningTree| {
         t.nodes
@@ -387,6 +390,7 @@ async fn build_theme(
                       "new_link_leaves": l_delta.new_link_leaves,
                       "new_mirrors": l_delta.new_mirrors},
             "leaf_edge_cap": edge_cut.json(),
+            "leaf_relationship_names": renamed.json(),
         }),
         edge_cut,
     }))
@@ -437,10 +441,13 @@ async fn carry_theme(
             .with_context(|| format!("leaf {} no longer assembles", l.level_id))?;
         let inputs = AtlasFlowRepository::read_flow_inputs(tx, viewer, map, &set).await?;
         let fresh_nodes: BTreeSet<Uuid> = set.nodes.iter().map(|n| n.id).collect();
-        let fresh_edges: BTreeSet<(Uuid, Uuid, String)> = weigh_leaf_edges(&set, &inputs)
-            .into_iter()
-            .map(|e| (e.source, e.target, e.relationship))
-            .collect();
+        // Under the names the leaf was served with (`contract_edges`).
+        let fresh_edges: BTreeSet<(Uuid, Uuid, String)> =
+            contract_edges(weigh_leaf_edges(&set, &inputs))
+                .0
+                .into_iter()
+                .map(|e| (e.source, e.target, e.relationship))
+                .collect();
         let (nodes, edges) = leaf_shape(l);
         ensure!(
             nodes.is_subset(&fresh_nodes) && edges.is_subset(&fresh_edges),
