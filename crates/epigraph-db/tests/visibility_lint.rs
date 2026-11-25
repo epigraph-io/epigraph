@@ -2097,9 +2097,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent_disclosure.rs",
         "redact_authored_edges",
-        "untenanted `agents`: strips the spelling of a name from agent `authored` edges the \
-         caller already read under its viewer's splice, deciding through migration 272's \
-         `epigraph_agent_disclosure` on the STAMPED session; reads no edge itself.",
+        "reads no table: strips the spelling of a name from every agent `authored` edge the \
+         caller already read under its viewer's splice, unless the STAMPED session is \
+         privileged (`epigraph_bypass()` / `epigraph_is_elevated()`); reads no edge itself.",
     ),
     (
         "agent_disclosure.rs",

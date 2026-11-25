@@ -96,9 +96,14 @@ pub fn redact_agent(agent: &mut epigraph_core::Agent, d: Disclosure) {
 /// extraction's spelling ([`crate::repos::paper::AUTHORED_NAME_KEY`]) and the
 /// retracted name-derived node it replaced
 /// ([`crate::repos::paper::AUTHORED_REPLACES_KEY`], whose `display_name` is
-/// the name). Both sit on an edge whose source is the person's own id, and
-/// agent-endpoint edges are world-readable (migration 120), so they are
-/// withheld wherever the person is unnamed (spec 7, rows E2 / E3).
+/// the name). Both sit on an edge whose source is the agent's own id, and
+/// agent-endpoint edges are world-readable (migration 120). They are withheld
+/// from EVERY non-privileged reader, whoever the agent is (spec 7, rows E2 /
+/// E3; review 2, leaks#2): withholding them only where the agent is an
+/// unnamed human left `explicit_agent_id: true` with no `author_name`, a shape
+/// no other agent's explicit edge has, so an edge read alone told "this id is
+/// a hidden human". The ingest-time matcher (row A6) reads stored rows, not
+/// this projection.
 pub const AUTHORED_IDENTITY_KEYS: [&str; 2] = [
     crate::repos::paper::AUTHORED_NAME_KEY,
     crate::repos::paper::AUTHORED_REPLACES_KEY,
@@ -187,10 +192,14 @@ impl AgentDisclosureRepository {
     }
 
     /// Remove [`AUTHORED_IDENTITY_KEYS`] from every agent `authored` edge in
-    /// `edges` whose agent the session may not see named, in place. The edge
-    /// itself, its endpoints, `position`, `role` and `affiliations` (OPEN C8)
-    /// are unchanged. One disclosure read for the whole set, only when some
-    /// edge carries a key.
+    /// `edges`, in place, unless the session is privileged (a maintenance
+    /// session or a live elevated viewer: the same privileged term migration
+    /// 272's session wrapper passes to the core). Not per agent: an explicit
+    /// edge reads alike whether its agent is a named person, an unnamed one or
+    /// a nameless service principal, so the edge is no marker (operator ruling
+    /// C7; review 2, leaks#2). The edge itself, its endpoints, `position`,
+    /// `role`, `explicit_agent_id` and `affiliations` (OPEN C8) are unchanged.
+    /// One read of the session's privilege, only when some edge carries a key.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the read fails.
@@ -198,21 +207,21 @@ impl AgentDisclosureRepository {
         conn: &mut PgConnection,
         edges: &mut [EdgeRow],
     ) -> Result<(), DbError> {
-        let mut ids: Vec<Uuid> = edges
+        if !edges
             .iter()
-            .filter(|e| carries_author_identity(&e.source_type, &e.relationship, &e.properties))
-            .map(|e| e.source_id)
-            .collect();
-        if ids.is_empty() {
+            .any(|e| carries_author_identity(&e.source_type, &e.relationship, &e.properties))
+        {
             return Ok(());
         }
-        ids.sort_unstable();
-        ids.dedup();
-        let d = Self::disclosure(conn, &ids).await?;
+        let privileged: bool =
+            sqlx::query_scalar("SELECT public.epigraph_bypass() OR public.epigraph_is_elevated()")
+                .fetch_one(&mut *conn)
+                .await?;
+        if privileged {
+            return Ok(());
+        }
         for e in edges.iter_mut() {
-            if carries_author_identity(&e.source_type, &e.relationship, &e.properties)
-                && !d.get(&e.source_id).is_some_and(|x| x.named)
-            {
+            if carries_author_identity(&e.source_type, &e.relationship, &e.properties) {
                 if let Some(o) = e.properties.as_object_mut() {
                     for k in AUTHORED_IDENTITY_KEYS {
                         o.remove(k);

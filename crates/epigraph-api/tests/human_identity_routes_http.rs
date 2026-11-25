@@ -361,11 +361,17 @@ async fn explicit_authorship(pool: &PgPool, ingester: Uuid, author: Uuid, name: 
     paper
 }
 
-/// Rows E2 / E3: `GET /api/v1/edges` serves an unnamed human's explicit
-/// `authored` edge without `author_name` or `replaces_author` to an
-/// outsider; position and role stay. A teammate gets both keys
-/// (CALIBRATION), and a non-human agent's same edge keeps them (the rule
-/// redacts humans only).
+/// Rows E2 / E3 (review 2, leaks#2): `GET /api/v1/edges` serves NO explicit
+/// `authored` edge with `author_name` or `replaces_author` to a
+/// non-privileged caller, whoever its agent is. Withholding the spelling only
+/// for an unnamed human left `explicit_agent_id: true` with no `author_name`,
+/// a shape no other agent's explicit edge had, so an outsider's read of the
+/// edge alone marked the id as a hidden human (C7: an unnamed human reads as a
+/// nameless OAuth service principal on every surface). So: an outsider's read
+/// of H's edge equals its read of N's (a production-shaped nameless service
+/// principal's) edge; position, role and the explicit flag stay; a teammate,
+/// to whom H is named, reads the same edge (CALIBRATION that the rule, not
+/// the reader, decides).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unnamed_humans_authorship_edge_carries_no_spelling_of_its_name(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -392,19 +398,34 @@ async fn an_unnamed_humans_authorship_edge_carries_no_spelling_of_its_name(pool:
             edges[0]["properties"].clone()
         }
     };
-    let p = edge_of(outsider, h).await;
-    assert!(p.get("author_name").is_none(), "{p}");
-    assert!(p.get("replaces_author").is_none(), "{p}");
-    assert_eq!(p["position"], 0, "the edge's other data stays: {p}");
-    assert_eq!(p["role"], "author");
-    let p = edge_of(mate, h).await;
-    assert_eq!(p["author_name"], "Leocadia Spelled", "CALIBRATION: {p}");
-    assert!(p.get("replaces_author").is_some(), "CALIBRATION: {p}");
-    let p = edge_of(outsider, n).await;
+    let p_h = edge_of(outsider, h).await;
+    assert!(p_h.get("author_name").is_none(), "{p_h}");
+    assert!(p_h.get("replaces_author").is_none(), "{p_h}");
+    assert_eq!(p_h["position"], 0, "the edge's other data stays: {p_h}");
+    assert_eq!(p_h["role"], "author");
+    assert_eq!(p_h["explicit_agent_id"], true, "the flag stays: {p_h}");
+    let p_n = edge_of(outsider, n).await;
     assert_eq!(
-        p["author_name"], "A Service Spelling",
-        "a non-human keeps it: {p}"
+        p_h, p_n,
+        "an outsider's read of an unnamed person's explicit authored edge equals its read of a \
+         nameless service principal's"
     );
+    let p_mate = edge_of(mate, h).await;
+    assert_eq!(
+        p_mate, p_h,
+        "CALIBRATION: a reader H is named to reads the same edge (no per-agent marker)"
+    );
+    // CALIBRATION: the spelling is still stored (the ingest-time matcher reads
+    // the stored row, spec row A6), so the redaction, not the writer, hid it.
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT properties ->> 'author_name' FROM edges \
+          WHERE source_id = $1 AND relationship = 'authored'",
+    )
+    .bind(h)
+    .fetch_one(&pool)
+    .await
+    .expect("stored edge");
+    assert_eq!(stored.as_deref(), Some("Leocadia Spelled"));
 }
 
 /// Row H6 (finding L5): a graph-query predicate on an agent's `properties`

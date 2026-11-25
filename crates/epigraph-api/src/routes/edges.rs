@@ -2026,9 +2026,10 @@ pub async fn list_edges(
         1000,
     )
     .await?;
-    // An unnamed human's explicit `authored` edge carries the extraction's
-    // spelling of its name: withheld from a caller the person is not named
-    // to (migration 272, on this stamped connection; spec 7 rows E2 / E3).
+    // An explicit `authored` edge carries the extraction's spelling of its
+    // agent's name: withheld from every non-privileged caller, whoever the
+    // agent is, so the edge never tells an unnamed person from a nameless
+    // agent (on this stamped connection; spec 7 rows E2 / E3, review 2).
     epigraph_db::AgentDisclosureRepository::redact_authored_edges(&mut read, &mut rows).await?;
 
     // No endpoint re-check. `list_filtered` is spliced with `&viewer`, and
@@ -2152,7 +2153,7 @@ pub async fn claim_neighborhood(
         .into_iter()
         .filter(|e| seen_edge_ids.insert(e.id))
         .collect();
-    // As in `list_edges`: an unnamed human's `authored` edge keeps no name.
+    // As in `list_edges`: no `authored` edge keeps a spelling of a name.
     epigraph_db::AgentDisclosureRepository::redact_authored_edges(&mut read, &mut deduped).await?;
 
     // Every `get_by_source`/`get_by_target` hop above was spliced with

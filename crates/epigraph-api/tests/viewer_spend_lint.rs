@@ -204,10 +204,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::get_by_id",
         ],
     ),
-    // stamped: an unnamed human's `authored` edges lose the spelling of its name
-    // through migration 272's disclosure, decided on the handler's
-    // `read_as(viewer)` connection (a definer that applies its own audience);
-    // the edges themselves were read under the viewer's splice.
+    // stamped: every agent's `authored` edges lose the spelling of its name
+    // unless the handler's `read_as(viewer)` session is privileged (review 2,
+    // leaks#2: per-agent redaction was itself a marker); the edges themselves
+    // were read under the viewer's splice.
     (
         "edges.rs",
         "claim_neighborhood",
