@@ -22,8 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use epigraph_passkey::android::StatusFreshness;
 use epigraph_passkey::{
     act_challenge, AaguidAllowlist, ActAnchor, AnchorRefusal, AttestationPolicy, AttestedPolicy,
-    LineagePasskey, PasskeyConfig, PasskeyError, Passkeys, RegisteredPasskey, StandingRefusal,
-    StoredPasskey, ACT_NONCE_LEN, STATEMENT_KEY,
+    LineagePasskey, PasskeyConfig, PasskeyError, Passkeys, RegisteredPasskey, StandingAnchor,
+    StandingRefusal, StoredPasskey, ACT_NONCE_LEN, STATEMENT_KEY,
 };
 use support::{
     android_status, AndroidKeyOpts, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID,
@@ -756,7 +756,7 @@ async fn an_android_passkey_revoked_after_enrollment_no_longer_asserts() {
     for reg in [&by_leaf, &by_batch] {
         assert_eq!(reg.attestation_format, "android-key");
         assert_eq!(
-            rp.assertion_standing(&reg.passkey, &reg.attestation_format),
+            rp.assertion_standing(&reg.passkey, &reg.attestation_format, None),
             Ok(()),
             "CALIBRATION: in good standing"
         );
@@ -767,7 +767,7 @@ async fn an_android_passkey_revoked_after_enrollment_no_longer_asserts() {
         (&by_leaf, "2c8cdddfd5e03bfc is REVOKED"),
         (&by_batch, "c8966fcb2fbb0d7a is SUSPENDED"),
     ] {
-        match rp.assertion_standing(&reg.passkey, &reg.attestation_format) {
+        match rp.assertion_standing(&reg.passkey, &reg.attestation_format, None) {
             Err(StandingRefusal::NotInGoodStanding(why)) => {
                 assert!(why.contains(expected), "{why}");
             }
@@ -775,7 +775,9 @@ async fn an_android_passkey_revoked_after_enrollment_no_longer_asserts() {
         }
     }
     // The row's column cannot opt the credential out of the check.
-    let refusal = rp.assertion_standing(&by_leaf.passkey, "none").unwrap_err();
+    let refusal = rp
+        .assertion_standing(&by_leaf.passkey, "none", None)
+        .unwrap_err();
     assert_eq!(refusal.code(), "attestation_not_in_good_standing");
 
     rewrite_status(
@@ -783,20 +785,20 @@ async fn an_android_passkey_revoked_after_enrollment_no_longer_asserts() {
         android_status::EMPTY,
         Duration::from_secs(49 * 3600),
     );
-    match rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format) {
+    match rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format, None) {
         Err(StandingRefusal::Unknown(why)) => assert!(why.contains("refresh"), "{why}"),
         other => panic!("a stale list: {other:?}"),
     }
     std::fs::remove_file(&status).expect("remove the status list");
     assert_eq!(
-        rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format)
+        rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format, None)
             .map_err(|r| r.code()),
         Err("attestation_status_unavailable")
     );
 
     rewrite_status(&status, android_status::EMPTY, Duration::ZERO);
     assert_eq!(
-        rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format),
+        rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format, None),
         Ok(()),
         "a refreshed list that does not list it"
     );
@@ -820,13 +822,13 @@ async fn an_android_passkey_whose_root_is_no_longer_configured_does_not_assert()
     let (_, reg) = android_registration(&rp, &google, &AndroidKeyOpts::default()).await;
     let reg = reg.expect("a genuine phone registers");
     assert_eq!(
-        rp.assertion_standing(&reg.passkey, &reg.attestation_format),
+        rp.assertion_standing(&reg.passkey, &reg.attestation_format, None),
         Ok(()),
         "CALIBRATION: under its own root"
     );
 
     let dropped = attested(None, Some(&rotated), false);
-    match dropped.assertion_standing(&reg.passkey, &reg.attestation_format) {
+    match dropped.assertion_standing(&reg.passkey, &reg.attestation_format, None) {
         Err(StandingRefusal::NotInGoodStanding(why)) => {
             assert!(why.contains("Android key root"), "{why}");
         }
@@ -834,7 +836,7 @@ async fn an_android_passkey_whose_root_is_no_longer_configured_does_not_assert()
     }
 
     let no_roots = attested(Some((&vendor, &[MODEL][..])), None, false);
-    match no_roots.assertion_standing(&reg.passkey, &reg.attestation_format) {
+    match no_roots.assertion_standing(&reg.passkey, &reg.attestation_format, None) {
         Err(StandingRefusal::Unknown(why)) => {
             assert!(why.contains("no Android key roots"), "{why}");
         }
@@ -846,10 +848,13 @@ async fn an_android_passkey_whose_root_is_no_longer_configured_does_not_assert()
 /// passkey to its certificates' validity periods (an attestation speaks for
 /// its registration; an expiry is not a revocation): a stored chain whose
 /// leaf expired yesterday is in good standing under a fresh list that does
-/// not list it, and refused under one that does. It does not touch other
-/// formats: a `packed` passkey asserts under a list naming nothing of it,
-/// and a `none` one too. And under the software policy, which trusts no
-/// attestation, an Android passkey with a listed certificate asserts.
+/// not list it, and refused under one that does. It does not touch `packed`:
+/// a `packed` passkey asserts under a list naming nothing of it, and a
+/// `packed` ANCHOR carries a `none` passkey (backlog 09ca9ab0: before it, a
+/// `none` passkey asserted with no anchor at all; that case is now refused,
+/// `a_none_passkey_stands_only_as_its_anchor_stands`). And under the
+/// software policy, which trusts no attestation, an Android passkey with a
+/// listed certificate asserts.
 /// Mutations: the library's time checks left on in `android_key_serials`
 /// (or `chain_valid_at` called) -> the expired case is refused; the
 /// software-policy early return removed -> that case is `Unknown`.
@@ -898,7 +903,7 @@ async fn the_assertion_recheck_is_about_standing_only() {
         "CALIBRATION: the spliced chain has expired"
     );
     assert_eq!(
-        rp.assertion_standing(&expired.passkey, &expired.attestation_format),
+        rp.assertion_standing(&expired.passkey, &expired.attestation_format, None),
         Ok(())
     );
 
@@ -914,13 +919,13 @@ async fn the_assertion_recheck_is_about_standing_only() {
 
     rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
     assert_eq!(
-        rp.assertion_standing(&expired.passkey, &expired.attestation_format)
+        rp.assertion_standing(&expired.passkey, &expired.attestation_format, None)
             .map_err(|r| r.code()),
         Err("attestation_not_in_good_standing"),
         "CALIBRATION: the expired chain's leaf is listed"
     );
     assert_eq!(
-        rp.assertion_standing(&packed.passkey, &packed.attestation_format),
+        rp.assertion_standing(&packed.passkey, &packed.attestation_format, None),
         Ok(())
     );
     let soft = software();
@@ -935,14 +940,139 @@ async fn the_assertion_recheck_is_about_standing_only() {
         )
         .expect("a synced passkey");
     assert_eq!(none.attestation_format, "none");
+    let by_packed = StandingAnchor {
+        passkey: &packed.passkey,
+        attestation_format: &packed.attestation_format,
+    };
     assert_eq!(
-        rp.assertion_standing(&none.passkey, &none.attestation_format),
-        Ok(())
+        rp.assertion_standing(&none.passkey, &none.attestation_format, Some(by_packed)),
+        Ok(()),
+        "a `none` passkey anchored by a `packed` key stands as the `packed` key does"
     );
     assert_eq!(
-        soft.assertion_standing(&reg.passkey, &reg.attestation_format),
+        soft.assertion_standing(&reg.passkey, &reg.attestation_format, None),
         Ok(()),
         "the software policy trusts no attestation"
+    );
+    assert_eq!(
+        soft.assertion_standing(&none.passkey, &none.attestation_format, None),
+        Ok(()),
+        "nor asks a `none` passkey for an anchor"
+    );
+}
+
+/// Backlog 09ca9ab0: an anchored `none` passkey (a synced passkey enrolled
+/// on an act an Android hardware key confirmed) stands only as its anchor
+/// stands, judged at EVERY assertion against the status list as it is then.
+/// Once a fresh list names the anchor's leaf, the `none` passkey is
+/// `NotInGoodStanding` (before the anchor's row is revoked: migration 200's
+/// cascade waits for that revoke); while the list is stale or missing it is
+/// `Unknown` (fail closed, as for the anchor itself); with no live anchor it
+/// is refused; a `none` passkey offered as the anchor is refused (it has no
+/// anchor of its own); a row and credential that disagree about `none` are
+/// refused. CALIBRATION: under the empty list both the anchor and the
+/// anchored passkey stand, and a refreshed list that does not name the
+/// anchor lets the anchored passkey stand again.
+/// Mutations: the `none` arm returning Ok (the code before 09ca9ab0) -> the
+/// listed, stale, no-anchor and `none`-anchor cases pass; the anchor checked
+/// without its status list -> the listed case passes; the `none` arm
+/// following a `none` anchor's own anchor -> the `none`-anchor case's reason.
+#[tokio::test]
+async fn a_none_passkey_stands_only_as_its_anchor_stands() {
+    let google = TestAttestation::new("Android");
+    let status = android_status::fresh_empty();
+    let rp = attested_with(None, Some(&google), Some(status.clone()), true);
+    let (mut phone, anchor) = android_registration(
+        &rp,
+        &google,
+        &AndroidKeyOpts {
+            leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+            ..AndroidKeyOpts::default()
+        },
+    )
+    .await;
+    let anchor = anchor.expect("CALIBRATION: the phone registers under the empty list");
+    assert_eq!(anchor.attestation_format, "android-key");
+
+    // The synced passkey, through the real anchored ceremony on an act the
+    // phone confirmed.
+    let person = Uuid::new_v4();
+    let act = confirmed_anchor(&rp, &mut phone, &anchor, person).await;
+    let (options, state) = rp
+        .start_anchored_registration(person, "op", "Op")
+        .expect("the anchored path is on");
+    let mut synced = SoftAuthenticator::new(OTHER_MODEL);
+    let none = rp
+        .finish_anchored_registration(
+            &synced
+                .register(ORIGIN, options, ClientUv::AsRequested)
+                .await,
+            &state,
+            &act,
+        )
+        .expect("CALIBRATION: the synced passkey registers on the anchored path");
+    assert_eq!(none.attestation_format, "none");
+    let by_phone = StandingAnchor {
+        passkey: &anchor.passkey,
+        attestation_format: &anchor.attestation_format,
+    };
+    let standing = |a: Option<StandingAnchor<'_>>| {
+        rp.assertion_standing(&none.passkey, &none.attestation_format, a)
+    };
+    assert_eq!(
+        standing(Some(by_phone)),
+        Ok(()),
+        "CALIBRATION: in good standing"
+    );
+
+    // Google lists the phone's leaf: the anchored passkey stops asserting.
+    rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
+    match standing(Some(by_phone)) {
+        Err(StandingRefusal::NotInGoodStanding(why)) => {
+            assert!(why.contains("anchored it"), "{why}");
+            assert!(why.contains("2c8cdddfd5e03bfc is REVOKED"), "{why}");
+        }
+        other => panic!("its anchor's leaf is listed: {other:?}"),
+    }
+
+    // A list that cannot be checked refuses it too (fail closed).
+    rewrite_status(
+        &status,
+        android_status::EMPTY,
+        Duration::from_secs(49 * 3600),
+    );
+    match standing(Some(by_phone)) {
+        Err(StandingRefusal::Unknown(why)) => assert!(why.contains("refresh"), "{why}"),
+        other => panic!("a stale list: {other:?}"),
+    }
+
+    // CALIBRATION: refreshed, without the leaf, it stands again.
+    rewrite_status(&status, android_status::EMPTY, Duration::ZERO);
+    assert_eq!(standing(Some(by_phone)), Ok(()), "a refreshed list");
+
+    // No live anchor: refused, whatever the list says.
+    assert_eq!(
+        standing(None).map_err(|r| r.code()),
+        Err("attestation_not_in_good_standing"),
+        "a `none` passkey with no live anchor"
+    );
+    // A `none` passkey is no anchor (one level: its own anchor is not asked).
+    let by_none = StandingAnchor {
+        passkey: &none.passkey,
+        attestation_format: &none.attestation_format,
+    };
+    match standing(Some(by_none)) {
+        Err(StandingRefusal::NotInGoodStanding(why)) => {
+            assert!(why.contains("no live anchor"), "{why}");
+        }
+        other => panic!("a `none` anchor: {other:?}"),
+    }
+    // The row cannot call a `none` credential attested, nor the reverse.
+    assert_eq!(
+        rp.assertion_standing(&none.passkey, "packed", Some(by_phone))
+            .map_err(|r| r.code()),
+        Err("attestation_not_in_good_standing"),
+        "a `packed` row over a `none` credential"
     );
 }
 
@@ -1001,7 +1131,7 @@ async fn an_enrolled_android_passkey_asserts_whatever_its_key_description_says()
     });
     for (label, stored) in &spliced {
         assert_eq!(
-            rp.assertion_standing(&stored.passkey, &stored.attestation_format),
+            rp.assertion_standing(&stored.passkey, &stored.attestation_format, None),
             Ok(()),
             "{label}"
         );
@@ -1009,7 +1139,7 @@ async fn an_enrolled_android_passkey_asserts_whatever_its_key_description_says()
     rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
     for (label, stored) in &spliced {
         assert_eq!(
-            rp.assertion_standing(&stored.passkey, &stored.attestation_format)
+            rp.assertion_standing(&stored.passkey, &stored.attestation_format, None)
                 .map_err(|r| r.code()),
             Err("attestation_not_in_good_standing"),
             "{label}: its leaf is listed"

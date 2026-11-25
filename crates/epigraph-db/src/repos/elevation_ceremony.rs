@@ -85,6 +85,65 @@ pub struct TicketPasskey {
     pub backup_eligible: bool,
     /// Its attestation statement format.
     pub attestation_format: String,
+    /// The passkey that ADMITTED it (migration 285): for a `none` passkey
+    /// enrolled on the anchored path, the passkey that confirmed its
+    /// enrollment's act; `None` for every other passkey.
+    pub anchor_authenticator_id: Option<Uuid>,
+}
+
+/// Which ceremony a standing refusal was made in
+/// ([`record_standing_refusal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandingCeremony {
+    /// An elevation ticket's (`/elevate/:ticket`).
+    Elevation,
+    /// An admin act's confirmation (`/elevate/act/:id`).
+    AdminAct,
+}
+
+impl StandingCeremony {
+    /// The definer's `p_ceremony`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Elevation => "elevation",
+            Self::AdminAct => "admin_act",
+        }
+    }
+}
+
+/// Audit ONE refusal of an assertion on its passkey's attestation standing
+/// (migration 285's `epigraph_record_passkey_standing_refusal`): a
+/// `platform.passkey_standing_refused` row for the live ticket or act `id`,
+/// naming `authenticator` (a live passkey of that ticket's person or act's
+/// proposer), the refusal's `code` and, optionally, its `reason`. Returns the
+/// audit row's id. Runs on the ceremony's unstamped application connection,
+/// keyed by its id like every other ceremony call.
+///
+/// # Errors
+/// `DbError::QueryFailed` carrying `ELV06` / `ELV08` (the ticket or act is
+/// not live), `ELV02` (not a live passkey of its person), `22023` (an
+/// unknown code) or `22001` (a reason over 2000 characters).
+#[instrument(skip(conn, reason))]
+pub async fn record_standing_refusal(
+    conn: &mut sqlx::PgConnection,
+    ceremony: StandingCeremony,
+    id: Uuid,
+    authenticator: Uuid,
+    code: &str,
+    reason: Option<&str>,
+) -> Result<Uuid, DbError> {
+    let event = sqlx::query_scalar::<_, Uuid>(
+        "SELECT public.epigraph_record_passkey_standing_refusal($1, $2, $3, $4, $5)",
+    )
+    .bind(ceremony.as_str())
+    .bind(id)
+    .bind(authenticator)
+    .bind(code)
+    .bind(reason)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(event)
 }
 
 /// `epigraph_confirm_elevation`'s answer.
@@ -250,7 +309,7 @@ impl ElevationCeremony {
     ) -> Result<Vec<TicketPasskey>, DbError> {
         let rows = sqlx::query_as::<_, TicketPasskey>(
             "SELECT authenticator_id, credential_id, passkey, sign_count, backup_eligible, \
-                    attestation_format \
+                    attestation_format, anchor_authenticator_id \
                FROM public.epigraph_passkeys_for_ticket($1)",
         )
         .bind(ticket)

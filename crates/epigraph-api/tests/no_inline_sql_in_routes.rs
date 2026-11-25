@@ -98,7 +98,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("belief.rs", 7),
     ("claims.rs", 3),
     ("clusters.rs", 8),
-    ("computation.rs", 6),
+    ("computation.rs", 4),
     ("conventions.rs", 3),
     ("cross_source.rs", 1),
     ("crud.rs", 3),
@@ -146,7 +146,11 @@ const REGISTER: &[(&str, usize)] = &[
 /// when its priors and alternative-set reads moved into
 /// `FactorRepository::bp_priors` / `bp_alternative_sets`, both spending the
 /// caller's viewer (finding F-SHARD4-A2, `computation.rs` 8 -> 6).
-const HIGH_WATER: usize = 84;
+/// Lowered to 82 by backlog 52b96600: `/graph/compose`'s neighborhood walk
+/// and belief read moved into `GraphViewRepository::claim_neighborhood_ids`
+/// and `FactorRepository::bp_priors`, both spending the caller's viewer
+/// (`computation.rs` 6 -> 4).
+const HIGH_WATER: usize = 82;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

@@ -1018,8 +1018,14 @@ async fn delete_frames_purges_a_retracted_companion_bba_then_deletes_the_frame(p
         1,
         "one consumed ledger grant names the purged row"
     );
+    // Since 274 the fixture's retraction leaves its own consumed `retract`
+    // grant; the purge wrote no other row.
     assert_eq!(
-        count(&pool, "SELECT count(*) FROM mass_function_purge_grants").await,
+        count(
+            &pool,
+            "SELECT count(*) FROM mass_function_purge_grants WHERE kind <> 'retract'"
+        )
+        .await,
         1,
         "and no other grant row"
     );

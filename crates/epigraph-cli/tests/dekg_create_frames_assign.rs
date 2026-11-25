@@ -15,7 +15,8 @@
 //! * a frame with no hypotheses is refused before anything is written;
 //! * the one call site in `src/bin/dekg.rs` adds the returned count to the
 //!   command's `claims_assigned` and propagates the error with `.await?`
-//!   (a source check, since the whole command cannot run end to end today).
+//!   (a source check; `tests/dekg_migrate_verbs.rs` runs the whole command
+//!   end to end, but only on its success path).
 //!
 //! # Verified to fail
 //!
@@ -204,9 +205,10 @@ async fn zero_hypotheses_is_refused(pool: PgPool) {
 /// The binary's one call of `assign_claims_to_frame` must add the returned
 /// count to `claims_assigned` and propagate the error with `?` to `main`
 /// (which returns `Result`, so the command exits non-zero). The tests above pin
-/// the library function; this pins the call site, which they cannot reach: the
-/// command needs the clustering pipeline's embeddings to get there. A source
-/// check, so it runs without a database.
+/// the library function; this pins the call site, whose error path they cannot
+/// reach: the end-to-end run in `tests/dekg_migrate_verbs.rs` only sees a
+/// clustering whose writes all succeed. A source check, so it runs without a
+/// database.
 #[test]
 fn create_frames_call_site_counts_and_propagates() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/dekg.rs"))

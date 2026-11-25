@@ -262,3 +262,40 @@ fn the_hash_is_a_blake3_hex_digest_and_differs_between_distinct_profiles() {
     // profile does, so their hashes must differ.
     assert_ne!(h, populated(false).profile_hash());
 }
+
+/// The section tier weights (`[section_tier_weights]`, the REST assess write
+/// path's section discount) are profile parameters (backlog 5274ad05): two
+/// calibrations that differ ONLY in that table resolve to different profile
+/// hashes, so a served value can be traced to the weights it was built with.
+/// Before they were carried, both resolved to one hash and the change was
+/// invisible to the profile.
+#[test]
+fn a_section_tier_weight_change_moves_the_profile_hash() {
+    let base = fixtures::golden_calibration();
+    assert_eq!(
+        base.section_tier_weights.get("introduction").copied(),
+        Some(0.5),
+        "fixture: the snapshot carries the table"
+    );
+    let base_hash = BeliefProfile::from_calibration(&base).profile_hash();
+
+    let mut moved = fixtures::golden_calibration();
+    moved
+        .section_tier_weights
+        .insert("introduction".to_string(), 0.4);
+    assert_ne!(
+        BeliefProfile::from_calibration(&moved).profile_hash(),
+        base_hash,
+        "a moved section weight must move the hash"
+    );
+
+    let mut added = fixtures::golden_calibration();
+    added
+        .section_tier_weights
+        .insert("supplementary".to_string(), 0.6);
+    assert_ne!(
+        BeliefProfile::from_calibration(&added).profile_hash(),
+        base_hash,
+        "a new section tier must move the hash"
+    );
+}

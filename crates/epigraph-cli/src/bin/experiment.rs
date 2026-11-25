@@ -448,6 +448,16 @@ async fn analyze(
 
     let mass_result = build_error_mass(&budget)?;
 
+    // Everything from here on is ONE transaction (backlog 2e64b8a2): the
+    // analysis node, its `analyzes` and `provides_evidence` edges, the
+    // error-derived BBA and both status writes commit together or not at
+    // all. Each used to run on the pool by itself, so an analyze that failed
+    // part-way (e.g. at the frame lookup, after the edges) left an analysis
+    // that `provides_evidence` to the hypothesis with no BBA behind it, which
+    // the promotion gate counts as a completed experiment with analysis; and
+    // the status writes' errors were discarded.
+    let mut tx = pool.begin().await?;
+
     // Create analysis node
     let analysis_id: (Uuid,) = sqlx::query_as(
         r#"
@@ -470,13 +480,13 @@ async fn analyze(
         },
         "supports_hypothesis": direction == "supports",
     }))
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
     // Create edges
     sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) VALUES ($1, 'analysis', $2, 'experiment_result', 'analyzes', '{}')",
-    ).bind(analysis_id.0).bind(result_id).execute(pool).await?;
+    ).bind(analysis_id.0).bind(result_id).execute(&mut *tx).await?;
 
     sqlx::query(
         r#"
@@ -491,35 +501,35 @@ async fn analyze(
         "precision_ratio": mass_result.precision_ratio,
         "evidence_strength": mass_result.evidence_strength,
     }))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     // Submit the mass function to the frame the hypothesis's readers read:
     // hypothesis_assessment, or research_validity once it is promoted (writers
     // follow the readers, operator ruling R-8).
-    let evidence_frame = {
-        let mut conn = pool.acquire().await?;
-        epigraph_engine::promotion::hypothesis_evidence_frame(
-            &mut conn,
-            viewer,
-            experiment.hypothesis_id,
-        )
-        .await?
-    };
+    let evidence_frame = epigraph_engine::promotion::hypothesis_evidence_frame(
+        &mut tx,
+        viewer,
+        experiment.hypothesis_id,
+    )
+    .await?;
     let frame_id: (Uuid,) = sqlx::query_as("SELECT id FROM frames WHERE name = $1")
         .bind(evidence_frame)
-        .fetch_one(pool)
-        .await?;
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("{evidence_frame} frame not found: {e}"))?;
 
     let masses_json = mass_result.mass_function.masses_to_json();
-    epigraph_db::MassFunctionRepository::store(
-        pool,
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &mut *tx,
         experiment.hypothesis_id,
         frame_id.0,
         Some(agent_id),
+        None, // no perspective
         &masses_json,
         None,
         Some("error_derived"),
+        None, // no source-strength discount
         // Untyped on purpose (bc06ec6f): the only type source in scope is the
         // submitter-declared `data_source`, and typing from it would raise the
         // row above the 0.5 unknown-type weight.
@@ -529,13 +539,13 @@ async fn analyze(
     )
     .await?;
 
-    // Update statuses
-    epigraph_db::ExperimentResultRepository::update_status(pool, result_id, "complete")
-        .await
-        .ok();
-    epigraph_db::ExperimentRepository::update_status(pool, result.experiment_id, "complete")
-        .await
-        .ok();
+    // Update statuses, on the same transaction; their errors used to be
+    // discarded (`.ok()`).
+    epigraph_db::ExperimentResultRepository::update_status(&mut *tx, result_id, "complete").await?;
+    epigraph_db::ExperimentRepository::update_status(&mut *tx, result.experiment_id, "complete")
+        .await?;
+
+    tx.commit().await?;
 
     println!("Analysis created: {}", analysis_id.0);
     println!("Hypothesis: {}", experiment.hypothesis_id);
