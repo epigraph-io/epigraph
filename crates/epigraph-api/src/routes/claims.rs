@@ -2406,7 +2406,7 @@ pub async fn update_claim(
     // Update embedding if provided (used by backfill_embeddings.py)
     if let Some(ref embedding) = request.embedding {
         let pgvector = epigraph_db::pgvector_literal(embedding);
-        ClaimRepository::store_embedding_if_unsealed(&mut tx, &viewer, id, &pgvector)
+        let stored = ClaimRepository::store_embedding_if_unsealed(&mut tx, &viewer, id, &pgvector)
             .await
             .map_err(|e| {
                 if crate::errors::db_is_insufficient_privilege(&e) {
@@ -2416,6 +2416,32 @@ pub async fn update_claim(
                     message: format!("Failed to store embedding: {e}"),
                 }
             })?;
+        // The store filters to current, unsealed rows the caller may write,
+        // so a refusal matches zero rows and raises nothing. Answering 200
+        // then would report a vector that was never stored; say which of the
+        // three it was instead (the transaction is dropped, so nothing else in
+        // this request is written either).
+        if !stored {
+            return Err(
+                match ClaimRepository::embedding_refusal_of_conn(&mut tx, &viewer, id).await? {
+                    None => ApiError::NotFound {
+                        entity: "Claim".to_string(),
+                        id: id.to_string(),
+                    },
+                    Some((false, _)) => ApiError::Conflict {
+                        reason: "the claim is superseded; embed its current version. \
+                                 Nothing was written"
+                            .to_string(),
+                    },
+                    Some((true, true)) => ApiError::Conflict {
+                        reason: "the claim is sealed and takes no embedding. \
+                                 Nothing was written"
+                            .to_string(),
+                    },
+                    Some((true, false)) => crate::errors::write_refused("claim"),
+                },
+            );
+        }
     }
 
     // Update properties if provided

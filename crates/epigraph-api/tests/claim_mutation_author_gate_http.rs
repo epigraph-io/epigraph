@@ -431,3 +431,175 @@ async fn put_by_the_author_lands_on_the_app_role_and_a_reader_author_is_refused(
         "properties unchanged: {props}"
     );
 }
+
+/// The claim's vector as text, `None` when it holds none.
+async fn vector_of(pool: &PgPool, claim: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT embedding::text FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read the claim's vector")
+}
+
+/// A 1536-dimension vector whose every component is `x`.
+fn vector(x: f32) -> Value {
+    json!(vec![x; 1536])
+}
+
+/// On the APPLICATION ROLE, a `PUT /api/v1/claims/:id` carrying an embedding
+/// that the store refuses is not answered 200. The store filters to current,
+/// unsealed rows the caller may write, so each refusal matches zero rows and
+/// raises nothing; the handler must name it: 409 for a superseded or a sealed
+/// claim, 403 for an author downgraded to `reader`. Each time nothing is
+/// written, including a truth value sent in the same request.
+///
+/// # Verified to fail
+///
+/// With the handler discarding the store's `bool` (the review finding this
+/// pins), the first refusal, the superseded claim's, answers 200 having
+/// committed its truth value without the vector (measured by mutation).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_put_embedding_the_store_refuses_is_not_answered_200(pool: PgPool) {
+    let (author, group) = viewer_fixture::seed_agent_with_group(&pool, "a2d3e945-emb").await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, author, group, "a2d3e945: PUT embedding").await;
+    let state = app_role_state(&pool).await;
+    let truth = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, f64>("SELECT truth_value FROM claims WHERE id = $1")
+                .bind(claim)
+                .fetch_one(&pool)
+                .await
+                .expect("truth")
+        }
+    };
+
+    // CALIBRATION: the author's embedding lands, so the refusals below are the
+    // store's filters, not a route that never stores anything.
+    let (status, body) = put_as(
+        &pool,
+        &state,
+        author,
+        claim,
+        json!({"embedding": vector(0.25)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the author's embedding PUT: {body}");
+    let stored = vector_of(&pool, claim).await;
+    assert!(stored.is_some(), "CALIBRATION: the author's vector landed");
+
+    // Superseded: the store's `is_current` filter (a fresh, unembedded claim:
+    // `chk_deprecated_no_embedding` forbids a vector on a non-current row, so
+    // the old store answered this with a constraint error, not a silent 200).
+    let superseded =
+        viewer_fixture::seed_group_claim(&pool, author, group, "a2d3e945: superseded PUT").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(superseded)
+        .execute(&pool)
+        .await
+        .expect("supersede");
+    let (status, body) = put_as(
+        &pool,
+        &state,
+        author,
+        superseded,
+        json!({"truth_value": 0.9, "embedding": vector(0.5)}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a superseded claim's embedding: {body}"
+    );
+    assert!(
+        body.contains("superseded"),
+        "the answer names the cause: {body}"
+    );
+    assert_eq!(
+        vector_of(&pool, superseded).await,
+        None,
+        "no vector written"
+    );
+    assert!(
+        (truth(superseded).await - 0.8).abs() < 1e-9,
+        "truth not written either"
+    );
+
+    // A reader author: the store's write filter.
+    sqlx::query(
+        "UPDATE group_memberships SET role = 'reader' WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(author)
+    .execute(&pool)
+    .await
+    .expect("downgrade the author");
+    let (status, body) = put_as(
+        &pool,
+        &state,
+        author,
+        claim,
+        json!({"embedding": vector(0.75)}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a reader author's embedding: {body}"
+    );
+    assert_eq!(vector_of(&pool, claim).await, stored, "vector unchanged");
+    sqlx::query(
+        "UPDATE group_memberships SET role = 'admin' WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(author)
+    .execute(&pool)
+    .await
+    .expect("restore the author");
+
+    // Sealed: the store's `claim_encryption` filter (a fresh, unembedded claim).
+    let sealed =
+        viewer_fixture::seed_group_claim(&pool, author, group, "a2d3e945: sealed PUT embedding")
+            .await;
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("seed the group key epoch the FK requires");
+    sqlx::query(
+        "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, \
+                                       encrypted_content) \
+         VALUES ($1, $2, 0, 'fully_private', decode('0badc0de', 'hex'))",
+    )
+    .bind(sealed)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("seal the claim");
+    let (status, body) = put_as(
+        &pool,
+        &state,
+        author,
+        sealed,
+        json!({"embedding": vector(0.5)}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a sealed claim's embedding: {body}"
+    );
+    assert!(
+        body.contains("sealed"),
+        "the answer names the cause: {body}"
+    );
+    assert_eq!(
+        vector_of(&pool, sealed).await,
+        None,
+        "no vector on a sealed claim"
+    );
+}

@@ -9432,6 +9432,41 @@ impl ClaimRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Why [`store_embedding_if_unsealed`](Self::store_embedding_if_unsealed)
+    /// wrote nothing, for a caller that must answer with a status rather than
+    /// skip the claim: `(is_current, sealed)` of the row as `viewer` reads it,
+    /// or `None` when the viewer cannot read it.
+    ///
+    /// Read on the SAME connection, after the `false`. When that call could
+    /// lock the row, the enclosing transaction still holds the lock, so
+    /// neither a supersede nor a seal (both update the `claims` row) moves
+    /// under the answer. A current, unsealed row the viewer reads is one the
+    /// viewer may not write; that answer can race a concurrent supersede only
+    /// when the viewer could not lock the row, i.e. could not write it anyway.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn embedding_refusal_of_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<(bool, bool)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT COALESCE(c.is_current, true), \
+                    EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = c.id) \
+               FROM claims c \
+              WHERE c.id = $1 \
+                /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (bool, bool)>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
     /// Add `(d_alpha, d_beta)` to the claim's Beta-Bernoulli parameters
     /// (`claims.beta_alpha` / `beta_beta`) and return the parameters it stored.
     ///
