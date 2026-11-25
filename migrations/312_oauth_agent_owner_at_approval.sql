@@ -1,0 +1,184 @@
+-- 312: a self-registered agent client has no owner until an operator names
+-- one at approval (backlog be024524).
+--
+-- ===================================================================
+-- 1. WHY
+--
+-- `POST /oauth/register`'s agent arm stamped every self-registered agent
+-- client's `owner_id` with the OLDEST ACTIVE HUMAN client (an inline
+-- `SELECT id FROM oauth_clients WHERE client_type = 'human' AND status =
+-- 'active' ORDER BY created_at LIMIT 1`, its error swallowed). Nothing about
+-- the registration names that human: the request is unauthenticated. It ran
+-- only because 001's `agents_must_have_owner` CHECK refuses an agent row with
+-- a NULL owner. Two consequences:
+--
+--   * the token minted for the agent once approved carries that human's
+--     `oauth_clients.id` as its `owner_id` (the `require_owner_or_admin`
+--     principal, and the principal a few legacy routes fall back to);
+--   * `OAuthClientRepository::suspend_by_owner(<that human>)` suspends every
+--     approved self-registered agent with it.
+--
+-- And when no human was active, the swallowed lookup returned NULL and the
+-- CHECK made every agent registration a 500.
+--
+-- Agent registrations are `pending` since PR-02 and are approved only by a
+-- maintenance session through `epigraph_oauth_client_approve` (188), so the
+-- approval is the first point where a principal who can vouch for the agent
+-- exists. That is where the owner is named now.
+--
+-- ===================================================================
+-- 2. THE CHANGE
+--
+-- (a) `agents_must_have_owner` (001) is re-stated as: an agent client that
+--     is ACTIVE has an owner. A pending (or suspended, or revoked) agent may
+--     have none, so `/oauth/register` writes `owner_id = NULL` and a pending
+--     ownerless agent can still be revoked. Activation without an owner is
+--     refused by the CHECK (23514) whatever path attempts it: 118's
+--     three-argument approval, a status UPDATE, an INSERT.
+--     PRECONDITION: the constraint still has 001's definition (55000,
+--     nothing changed, otherwise).
+-- (b) `public.epigraph_oauth_client_approve(p_id uuid, p_granted_scopes
+--     text[], p_approved_by uuid, p_owner_id uuid) RETURNS boolean`: a NEW
+--     OVERLOAD beside 118's three-argument definer (224's body, unchanged
+--     here). It is 224's body plus the owner:
+--       * an `agent` client's approval must name `p_owner_id` (22004
+--         otherwise, nothing changed), even when the row already has an
+--         owner: rows registered before this migration carry the oldest
+--         human, and an approval that silently kept it would keep the
+--         defect;
+--       * any other client may name one or pass NULL (its owner is kept);
+--       * a named owner must be another `oauth_clients` row (22023 for the
+--         client itself, 23503 for no such row) that is `active` (22023);
+--       * the `oauth.client_approved` audit row records `owner_id` and
+--         `previous_owner_id`, and `migration` 312.
+--     SECURITY DEFINER on 172's path `pg_catalog, pg_temp`, every relation
+--     and function schema-qualified; owned by `epigraph_maintenance`; no
+--     EXECUTE for PUBLIC or `epigraph_app` (188's rule: approval is a
+--     maintenance act).
+--
+-- NOT CHANGED: 118's three-argument definer keeps its 224 body, owner and
+-- ACL (224's ratchet pins it). For an ownerless agent it now fails on the
+-- CHECK (23514, nothing changed): fail closed. No existing row is touched:
+-- an agent already approved with the oldest human as its owner keeps it (SQL
+-- cannot tell such a row from an agent `POST /api/v1/agents` provisioned with
+-- its creator as owner); re-owning those is an operator decision.
+--
+-- ===================================================================
+-- 3. DEPLOY ORDER
+--
+-- Migrate BEFORE the API binary of this change: that binary registers an
+-- agent with `owner_id = NULL`, which 001's CHECK refuses (every agent
+-- registration a 500). An older API runs on 312 unchanged. The operator
+-- CLI's `approve-client` of this change calls the four-argument definer
+-- (42883 below 312); an older CLI, or a hand-written three-argument
+-- `SELECT`, on 312 cannot activate an ownerless agent (23514).
+--
+-- UNDO: `docs/runbooks/312-undo.sql` (drops the overload, restores 001's
+-- CHECK; refuses while an agent row has no owner).
+-- ===================================================================
+
+SET LOCAL lock_timeout = '3s';
+
+-- -------------------------------------------------------------------
+-- (a) The CHECK: an ACTIVE agent client has an owner.
+-- -------------------------------------------------------------------
+DO $$
+DECLARE
+    v_def text;
+BEGIN
+    SELECT pg_catalog.pg_get_constraintdef(c.oid) INTO v_def
+      FROM pg_catalog.pg_constraint c
+     WHERE c.conrelid = 'public.oauth_clients'::regclass
+       AND c.conname = 'agents_must_have_owner';
+    IF v_def IS DISTINCT FROM
+       'CHECK ((((client_type)::text <> ''agent''::text) OR (owner_id IS NOT NULL)))' THEN
+        RAISE EXCEPTION '312: oauth_clients.agents_must_have_owner is not 001''s CHECK '
+                        '(found %); nothing was changed', COALESCE(v_def, '(absent)')
+            USING ERRCODE = '55000';
+    END IF;
+END $$;
+
+ALTER TABLE public.oauth_clients DROP CONSTRAINT agents_must_have_owner;
+ALTER TABLE public.oauth_clients ADD CONSTRAINT agents_must_have_owner
+    CHECK (((client_type)::text <> 'agent'::text)
+           OR (owner_id IS NOT NULL)
+           OR ((status)::text <> 'active'::text));
+
+-- -------------------------------------------------------------------
+-- (b) The approval that names the owner.
+-- -------------------------------------------------------------------
+CREATE FUNCTION public.epigraph_oauth_client_approve(
+    p_id uuid, p_granted_scopes text[], p_approved_by uuid, p_owner_id uuid)
+RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_prev text;
+    v_type text;
+    v_prev_owner uuid;
+    v_owner_status text;
+BEGIN
+    SELECT c.status, c.client_type, c.owner_id INTO v_prev, v_type, v_prev_owner
+      FROM public.oauth_clients c WHERE c.id = p_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    IF v_type = 'agent' AND p_owner_id IS NULL THEN
+        RAISE EXCEPTION 'agent client % is approved only with its owner named; nothing was '
+                        'approved', p_id
+            USING ERRCODE = '22004',
+                  HINT = 'Pass the oauth_clients.id of the client that answers for this '
+                         'agent as p_owner_id.';
+    END IF;
+    IF p_owner_id IS NOT NULL THEN
+        IF p_owner_id = p_id THEN
+            RAISE EXCEPTION 'oauth client % cannot own itself; nothing was approved', p_id
+                USING ERRCODE = '22023';
+        END IF;
+        SELECT o.status INTO v_owner_status
+          FROM public.oauth_clients o WHERE o.id = p_owner_id FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'owner % is not an oauth client; nothing was approved', p_owner_id
+                USING ERRCODE = '23503';
+        END IF;
+        IF v_owner_status IS DISTINCT FROM 'active' THEN
+            RAISE EXCEPTION 'owner % is %, not active; nothing was approved',
+                            p_owner_id, v_owner_status
+                USING ERRCODE = '22023';
+        END IF;
+    END IF;
+    UPDATE public.oauth_clients
+       SET granted_scopes = COALESCE(p_granted_scopes, ARRAY[]::text[]), status = 'active',
+           created_by = p_approved_by, owner_id = COALESCE(p_owner_id, v_prev_owner),
+           updated_at = pg_catalog.now()
+     WHERE id = p_id;
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('oauth.client_approved', NULL, true,
+            pg_catalog.jsonb_build_object('oauth_client_id', p_id, 'approved_by', p_approved_by,
+                               'previous_status', v_prev,
+                               'granted_scopes', pg_catalog.to_jsonb(COALESCE(p_granted_scopes, ARRAY[]::text[])),
+                               'owner_id', COALESCE(p_owner_id, v_prev_owner),
+                               'previous_owner_id', v_prev_owner,
+                               'migration', 312));
+    RETURN true;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_client_approve(uuid, text[], uuid, uuid)
+    FROM PUBLIC;
+
+-- Ownership, guarded as every such block since 060. The ALTER names its
+-- function literally (tenancy_backfill.rs's static re-own scan reads it).
+-- No GRANT: approval is a maintenance act (188).
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_oauth_client_approve(uuid, text[], uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+    ELSE
+        RAISE NOTICE 'epigraph tenancy: role epigraph_maintenance absent; '
+                     'epigraph_oauth_client_approve(uuid, text[], uuid, uuid) stays owned by '
+                     'the migration runner.';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_oauth_client_approve(uuid, text[], uuid, uuid) FROM epigraph_app';
+    END IF;
+END $$;

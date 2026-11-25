@@ -2292,6 +2292,9 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_oauth_session_take", 118),
     ("epigraph_oauth_client_lock_for_link", 118),
     ("epigraph_oauth_client_link_agent", 118),
+    // 312 adds a four-argument overload (the approval that names an agent's
+    // owner), also re-owned to the maintenance role; this entry checks every
+    // overload of the name (the worst-owned one is reported).
     ("epigraph_oauth_client_approve", 118),
     ("epigraph_agent_key_set_status", 118),
     // 120, writer-owned edges (D8). The scope predicate is IMMUTABLE SQL and

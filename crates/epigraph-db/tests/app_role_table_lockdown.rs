@@ -1414,6 +1414,7 @@ async fn oauth_client_link_is_write_once_and_approval_is_audited(pool: PgPool) {
         client,
         &["claims:read".into(), "claims:write".into()],
         approver,
+        None,
     )
     .await
     .expect("approve on the maintenance role");
@@ -1478,7 +1479,7 @@ async fn the_app_role_cannot_approve_an_oauth_client(pool: PgPool) {
         Some("42501"),
         "the application role approved a client"
     );
-    let e = OAuthClientRepository::approve(&app, pending, &["claims:admin".into()], pending)
+    let e = OAuthClientRepository::approve(&app, pending, &["claims:admin".into()], pending, None)
         .await
         .expect_err("the repository approval on the application role");
     assert_eq!(db_err_code(&e).as_deref(), Some("42501"));
@@ -1528,7 +1529,7 @@ async fn the_app_role_cannot_approve_an_oauth_client(pool: PgPool) {
 
     // Control: the maintenance role approves, and the approval is audited.
     let maint = role_pool(&pool, "epigraph_maintenance").await;
-    OAuthClientRepository::approve(&maint, pending, &["claims:write".into()], pending)
+    OAuthClientRepository::approve(&maint, pending, &["claims:write".into()], pending, None)
         .await
         .expect("approve on the maintenance role");
     assert_eq!(

@@ -4732,6 +4732,25 @@ restart.
   software policy served). If any is a person's only passkey, enroll an attested passkey for that
   person through a maintenance enrollment (`passkey-enroll`) first. Under the software policy
   nothing changes.
+- **312**: `oauth_agent_owner_at_approval` (backlog be024524). `/oauth/register` stamped every
+  self-registered agent client's `owner_id` with the OLDEST ACTIVE HUMAN client (001's
+  `agents_must_have_owner` refused NULL), so suspending that human by owner suspended every approved
+  self-registered agent, and the agent's token carried that human as its owner; with no active human
+  every agent registration was a 500. Re-states `agents_must_have_owner` as "an ACTIVE agent has an
+  owner" (a pending, suspended or revoked one may have none; precondition: 001's definition, else
+  55000) and adds the overload `epigraph_oauth_client_approve(id, granted_scopes, approved_by,
+  owner) -> boolean` (172's form, owned by `epigraph_maintenance`, no PUBLIC or application EXECUTE):
+  224's body plus the owner. An agent approval must name its owner even when the row holds one (rows
+  registered before 312 hold the oldest human; 22004 otherwise); a named owner is another (22023),
+  existing (23503), active (22023) client; any other client keeps its owner when none is named; the
+  `oauth.client_approved` row records `owner_id` and `previous_owner_id`. 118's three-argument
+  approval is unchanged (224's ratchet pins it) and now cannot activate an ownerless agent (23514).
+  No existing row is touched. Registered in `tenancy_backfill` by name (the 118 entry covers every
+  overload). Pinned by `epigraph-db/tests/oauth_agent_owner_at_approval.rs`,
+  `epigraph-api/tests/agent_registration_owner.rs` and `epigraph-cli/tests/operator_approve_client.rs`
+  (`approve-client --owner`). Undo: `docs/runbooks/312-undo.sql` (refuses while an agent client has no
+  owner). **Deploy order:** migrate BEFORE the API binary of this change (it registers an agent with
+  no owner, which 001's CHECK refuses); an older API runs on 312 unchanged.
 
 ## `-- no-transaction` migrations
 
