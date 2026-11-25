@@ -146,6 +146,21 @@
 //!   attach it by name, only where a copy written fresh from the root's row
 //!   would admit it (refused `ROL04` otherwise, nothing written).
 //!
+//! And privatization plan recovery (backlogs bb682f72, 06cdffaa; see
+//! [`privatization`]):
+//!
+//! * `privatization abort --plan <id>` / `privatization revert --plan <id>` —
+//!   the routes' abort and revert writes on the maintenance DSN, attributed to
+//!   a custodian (`--actor`, `--assignment`): the recovery for a plan stranded
+//!   in `applying` or `reverting`, which keeps `drain_jobs` at exit 5 until it
+//!   is aborted. Abort needs the live custodian assignment; revert also needs
+//!   the route's target-group conditions (admin of the group, maturity,
+//!   plurality).
+//! * `privatization purge-sealed-centroids --reason TEXT` — list (or, as the
+//!   table owner with `--apply`, delete and audit) the cluster centroids of
+//!   clusters whose members are all sealed, left by a seal before the seal
+//!   cleared them.
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -196,6 +211,7 @@ pub mod legacy;
 pub mod link;
 pub mod manifest;
 pub mod passkey;
+pub mod privatization;
 pub mod regroup;
 pub mod reown;
 pub mod reown_linked;

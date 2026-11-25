@@ -267,6 +267,12 @@ def load_centroids_from_db(conn, run_id=None):
     cluster_centroids.umap_centroid (migration 222; it backfilled pre-222
     padded rows). Exits on a run with a row 222 could not backfill (its
     legacy `centroid` had a non-zero tail, so it is no padded UMAP centroid).
+
+    Returns (centroids, run_id, cluster_ids): row i of `centroids` is the
+    centroid of cluster `cluster_ids[i]`. The ids need not be 0..k-1: a seal
+    deletes the centroid of a cluster whose members are all sealed (backlog
+    06cdffaa), so a run can have gaps, and `assign_batch` must write the
+    stored id, never the row position.
     """
     with conn.cursor() as cur:
         if run_id:
@@ -299,14 +305,44 @@ def load_centroids_from_db(conn, run_id=None):
               file=sys.stderr)
         sys.exit(1)
     centroids = np.array([json.loads(r[1]) for r in rows], dtype=np.float32)
+    cluster_ids = [int(r[0]) for r in rows]
     print(f"  Loaded {len(centroids)} centroids (run_id={actual_run_id})", file=sys.stderr)
-    return centroids, actual_run_id
+    return centroids, actual_run_id, cluster_ids
+
+
+def nearest_two(dists, cluster_ids):
+    """One claim's assignment from its distances to a run's centroids, where
+    `dists[i]` is the distance to the centroid of cluster `cluster_ids[i]`:
+    (nearest cluster id, its distance, the second-nearest distance). The
+    position of the nearest centroid is translated to its stored cluster id,
+    which differs from the position once a cluster of the run was deleted.
+    With one centroid left the second distance is the nearest one."""
+    order = np.argsort(dists)
+    nearest = int(order[0])
+    second = float(dists[order[1]]) if len(order) > 1 else float(dists[nearest])
+    return int(cluster_ids[nearest]), float(dists[nearest]), second
+
+
+def distances_by_cluster_id(dists, cluster_ids):
+    """`claim_clusters.centroid_distances` indexed by cluster id: entry c is
+    the distance to cluster c's centroid, NULL for an id the run has no
+    centroid for (a deleted cluster)."""
+    full = [None] * (max(cluster_ids) + 1)
+    for cid, d in zip(cluster_ids, dists):
+        full[int(cid)] = float(d)
+    return full
 
 
 def assign_batch(conn, reducer, centroids, run_id, batch_size=100000,
-                 resume=False):
-    """Stream claims, UMAP transform, compute all centroid distances, store."""
+                 resume=False, cluster_ids=None):
+    """Stream claims, UMAP transform, compute all centroid distances, store.
+    `cluster_ids[i]` is the cluster id of `centroids[i]` (default 0..k-1, a
+    freshly seeded run); pass `load_centroids_from_db`'s ids for a stored run."""
     k = len(centroids)
+    if cluster_ids is None:
+        cluster_ids = list(range(k))
+    if len(cluster_ids) != k:
+        raise ValueError(f"{len(cluster_ids)} cluster ids for {k} centroids")
     total = 0
     batch_num = 0
 
@@ -364,16 +400,13 @@ def assign_batch(conn, reducer, centroids, run_id, batch_size=100000,
             batch_data = []
             for i, cid in enumerate(claim_ids):
                 dists = distances[i]
-                sorted_idx = np.argsort(dists)
-                nearest = int(sorted_idx[0])
-                nearest_dist = float(dists[nearest])
-                second_dist = float(dists[sorted_idx[1]])
+                nearest, nearest_dist, second_dist = nearest_two(dists, cluster_ids)
                 boundary = nearest_dist / second_dist if second_dist > 0 else 0.0
                 sil_approx = 1.0 - boundary
 
                 batch_data.append((
                     cid, nearest, nearest_dist, second_dist, boundary,
-                    sil_approx, run_id, dists.tolist()
+                    sil_approx, run_id, distances_by_cluster_id(dists, cluster_ids)
                 ))
 
             psycopg2.extras.execute_batch(cur, """
@@ -487,7 +520,7 @@ def main():
     run_id = args.run_id or str(uuid.uuid4())
 
     if args.discover_only:
-        _, run_id = load_centroids_from_db(conn, args.run_id)
+        _, run_id, _ = load_centroids_from_db(conn, args.run_id)
         discovery = discover_new_clusters(conn, run_id)
         print(json.dumps({"status": "discovery_complete", **discovery}, indent=2))
         conn.close()
@@ -497,6 +530,7 @@ def main():
         # Phase 1
         reducer, centroids, k = seed_phase(conn, args.sample_size, args.k, run_id,
                                            all_claims=args.all_claims)
+        cluster_ids = None  # a fresh seed: ids 0..k-1
 
         if args.seed_only:
             print(json.dumps({"status": "seeded", "run_id": run_id, "k": k}))
@@ -506,14 +540,15 @@ def main():
         # Load existing
         print("Loading existing reducer and centroids...", file=sys.stderr)
         reducer = load_reducer()
-        centroids, run_id = load_centroids_from_db(conn, args.run_id)
+        centroids, run_id, cluster_ids = load_centroids_from_db(conn, args.run_id)
 
     # Phase 2
     k = len(centroids)
     print(f"\nPhase 2: Assigning all claims ({k} centroids, "
           f"batch_size={args.batch_size})...", file=sys.stderr)
     total = assign_batch(conn, reducer, centroids, run_id,
-                         batch_size=args.batch_size, resume=args.resume)
+                         batch_size=args.batch_size, resume=args.resume,
+                         cluster_ids=cluster_ids)
 
     # Phase 3
     discovery = discover_new_clusters(conn, run_id)

@@ -132,6 +132,103 @@ fn signing_key_verdict(
     ))
 }
 
+/// The re-check interval of the running server's signing-key watch
+/// ([`spawn_admission_watch`]): whole seconds, clamped to 1..=300, 30 when
+/// unset or not a number (the operator-binding watch's mapping).
+pub const ENV_RECHECK_SECS: &str = "EPIGRAPH_MCP_SIGNING_KEY_RECHECK_SECS";
+
+/// The fixed part of the stop text when the running server's signing key is
+/// no longer admitted ([`spawn_admission_watch`]).
+pub const KEY_NO_LONGER_ADMITTED: &str = "is no longer admitted by the claim and edge verifiers \
+     (revoked, rotated out, or past its validity window); stopping rather than sign rows they \
+     refuse. Restart the server on an admitted key";
+
+/// The key the running server signs with and how its watch is armed: what
+/// `main` hands [`spawn_admission_watch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchedKey {
+    /// The agent the key is admitted for: the identity's agent in the
+    /// separate-signing-key mode (found at boot), the agent whose
+    /// `agents.public_key` is the signer's key otherwise (created lazily on
+    /// the first tool call, so looked up on each check until it exists).
+    pub signer: epigraph_db::signer_admission::WatchedSigner,
+    /// The public half of the key every signature of this process is made by.
+    pub public_key: [u8; 32],
+    /// [`Arming::FromBoot`](epigraph_db::signer_admission::Arming::FromBoot)
+    /// when the boot refused an inadmissible key (the separate-signing-key
+    /// mode, [`check_signing_key`]),
+    /// [`Arming::AfterFirstAdmission`](epigraph_db::signer_admission::Arming::AfterFirstAdmission)
+    /// for the legacy key rungs, which have no boot check.
+    pub arming: epigraph_db::signer_admission::Arming,
+}
+
+impl WatchedKey {
+    /// The separate-signing-key mode: `agent` is what [`check_signing_key`]
+    /// returned for `signing_public_key`.
+    #[must_use]
+    pub fn separate(agent: Uuid, signing_public_key: [u8; 32]) -> Self {
+        Self {
+            signer: epigraph_db::signer_admission::WatchedSigner::Agent(agent),
+            public_key: signing_public_key,
+            arming: epigraph_db::signer_admission::Arming::FromBoot,
+        }
+    }
+
+    /// A legacy key rung: the signer's key is its agent's identity key.
+    #[must_use]
+    pub fn agent_key(public_key: [u8; 32]) -> Self {
+        Self {
+            signer: epigraph_db::signer_admission::WatchedSigner::IdentityKey(public_key),
+            public_key,
+            arming: epigraph_db::signer_admission::Arming::AfterFirstAdmission,
+        }
+    }
+}
+
+/// Watch `key`'s admission (backlog `ac52fcb0`, the API's watch of backlog
+/// `07ed8d4d` on the shared [`epigraph_db::signer_admission`]) and return the
+/// stop text once the verifiers no longer admit it.
+pub async fn watch_admission(
+    pool: PgPool,
+    key: WatchedKey,
+    interval: std::time::Duration,
+) -> String {
+    let stop = epigraph_db::signer_admission::watch_signer_admission(
+        pool,
+        key.signer,
+        key.public_key,
+        interval,
+        "epigraph-mcp signing key",
+        key.arming,
+    )
+    .await;
+    let ends = stop.end.map_or(String::new(), |t| {
+        format!(" (its admission ends at {})", t.to_rfc3339())
+    });
+    format!(
+        "the MCP server's signing key ({}) of signer agent {} {KEY_NO_LONGER_ADMITTED}{ends}",
+        hex::encode(key.public_key),
+        stop.signer_id
+    )
+}
+
+/// Spawn [`watch_admission`] at the interval [`ENV_RECHECK_SECS`] sets, and
+/// EXIT the process (status 1, the stop text on stderr) when it returns, on
+/// every transport. The exit is immediate, with no drain of detached work:
+/// a queued walk or a request in flight would go on signing with the key the
+/// verifiers just stopped admitting. A write in flight rolls back with its
+/// transaction.
+pub fn spawn_admission_watch(pool: PgPool, key: WatchedKey) {
+    let interval = epigraph_db::operator_binding::recheck_interval_from_env_value(
+        std::env::var(ENV_RECHECK_SECS).ok().as_deref(),
+    );
+    tokio::spawn(async move {
+        let stop = watch_admission(pool, key, interval).await;
+        eprintln!("ERROR: {stop}");
+        std::process::exit(1);
+    });
+}
+
 /// What `verify_claim` reports about which key signed a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyBinding {

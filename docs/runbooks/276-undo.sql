@@ -1,0 +1,15 @@
+-- Undo migration 276 (agent_prompt_history_blob): drop the one-file
+-- prompt-history definer.
+--
+-- READ FIRST: roll the binaries back BEFORE this runs. A 276 binary reads
+-- GET /api/v1/agents/:id/prompt-history/blobs/:hash through this function; a
+-- unit left serving after the undo answers every file read with a 500
+-- (42883). A binary from before 276 reads the file through 161's
+-- `epigraph_agent_prompt_history`, which this leaves untouched (as it leaves
+-- 268's `epigraph_agent_prompt_history_meta`).
+--
+-- Run on the migration (superuser) or maintenance DSN. Idempotent. Nothing
+-- else to restore: 276 wrote no rows and changed no other object. 276's
+-- `_sqlx_migrations` row stays; re-introducing the function is a NEW
+-- migration, never a re-run of 276.
+DROP FUNCTION IF EXISTS public.epigraph_agent_prompt_history_blob(uuid, bytea);

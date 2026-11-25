@@ -19,16 +19,20 @@ use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
-use super::incremental::{to_wire, update_links, update_meaning, Shape};
-use super::leaves::{fill_leaf, leaf_claims, leaf_shape, node_set};
+use super::incremental::{shape_of, to_wire, update_links, update_meaning, Shape};
+use super::leaves::{contract_edges, fill_leaf, leaf_claims, leaf_shape, node_set, RenamedNames};
 use super::links::{fill_cross_links, LinksReport};
+use super::offbox::OffBox;
 use super::previous::{by_theme, prev_tree};
 use crate::atlas_layout::fill::{fill_positions, LayoutRecord, PreviousRun};
 use crate::atlas_links::graph::{
     check_mirrors, counted_links, linked_claims, meaning_leaf_of, switch_targets,
 };
 use crate::atlas_meaning::docs::level_documents_with_switch;
-use crate::atlas_meaning::tree::{check_tree, map_key, resolve_tree, MeaningTree, NodeBody};
+use crate::atlas_meaning::files::ResultTheme;
+use crate::atlas_meaning::tree::{
+    check_tree, map_key, resolve_tree, MeaningTree, NodeBody, WireGroup, WireKind,
+};
 use crate::atlas_naming::backend::NameBackend;
 use crate::atlas_naming::build::{read_member_texts, read_previous};
 use crate::atlas_naming::name::{name_levels, plan_samples, NamingOptions, NamingRecord};
@@ -50,7 +54,8 @@ pub struct NightOptions {
     pub apply: bool,
     /// W3's leaf node cap.
     pub cap: usize,
-    /// W1's theme member cap: themes over it are reported, not split.
+    /// W1's theme member cap: themes over it are reported, and split through
+    /// the off-box hook when one is configured (with `apply`).
     pub theme_cap: i64,
     /// Finished runs kept per map by the prune.
     pub keep_runs: usize,
@@ -58,6 +63,11 @@ pub struct NightOptions {
     pub max_calls: Option<usize>,
     /// Claims per theme-assignment statement.
     pub assign_batch: i64,
+    /// The off-box hook ([`super::offbox`]): W1's split of the themes over
+    /// the cap, and W4's meaning tree of a theme new to a map that does not
+    /// fit one leaf. Without it both are only reported. Never called
+    /// without `apply`.
+    pub offbox: Option<OffBox>,
 }
 
 impl Default for NightOptions {
@@ -70,6 +80,7 @@ impl Default for NightOptions {
             keep_runs: 3,
             max_calls: None,
             assign_batch: 2_000,
+            offbox: None,
         }
     }
 }
@@ -106,8 +117,30 @@ struct BuiltTheme {
 
 enum ThemeOutcome {
     Built(BuiltTheme),
-    /// A theme new to the map that does not fit one leaf: an operator build.
-    Unbuilt(usize),
+    /// A theme new to the map that does not fit one leaf, with no tree
+    /// computed off the box for it (or one W4's check refused, with why).
+    Unbuilt(usize, Option<Refused>),
+}
+
+/// Why W4's check refused a tree the off-box command returned.
+struct Refused {
+    why: String,
+    /// The tree's leaves are not the theme's members now: a claim arrived or
+    /// left since the export (churn; the next night computes it again).
+    /// Otherwise the leaves are exactly the members and the TREE is wrong
+    /// (an id that is not the minted one, a bad shape): the command is
+    /// broken, and the night must say so.
+    members_changed: bool,
+}
+
+/// The claims under the leaves of an off-box tree, as the tree states them
+/// (unchecked).
+fn leaf_claims_of(groups: &[WireGroup]) -> BTreeSet<Uuid> {
+    groups
+        .iter()
+        .filter(|g| g.kind == WireKind::Leaf)
+        .flat_map(|g| g.members.iter().flatten().copied())
+        .collect()
 }
 
 fn db_hierarchy(h: Hierarchy) -> AtlasHierarchy {
@@ -158,7 +191,8 @@ fn tree_documents(
 /// value only, read under the map's predicate); then check every document against the
 /// contract. A leaf whose edges exceed the contract's limit (in practice one
 /// claim whose own attachments carry more) keeps its heaviest and the cut is
-/// returned, as the cross-group link caps report theirs.
+/// returned, as the cross-group link caps report theirs; so are the
+/// relationship names served mapped to a contract name (backlog 9de2ebad).
 async fn real_leaves(
     tx: &mut PgConnection,
     viewer: &Viewer,
@@ -166,7 +200,7 @@ async fn real_leaves(
     rows: &epigraph_db::repos::atlas_leaf::LeafRows,
     docs: &mut [LevelDocument],
     cap: usize,
-) -> anyhow::Result<EdgeCut> {
+) -> anyhow::Result<(EdgeCut, RenamedNames)> {
     let mut sets = Vec::new();
     for doc in docs.iter() {
         if let LevelDocument::Leaf(l) = doc {
@@ -200,29 +234,33 @@ async fn real_leaves(
         .collect();
     let truths = AtlasMeaningRepository::claim_truth_values(tx, viewer, map, &claims).await?;
     let mut cut = EdgeCut::default();
+    let mut renamed = RenamedNames::default();
     for (doc, set) in docs.iter_mut().zip(&sets) {
         if let (LevelDocument::Leaf(l), Some(set)) = (doc, set) {
             let inputs = AtlasFlowRepository::read_flow_inputs(tx, viewer, map, set).await?;
-            let dropped = fill_leaf(l, set, &inputs, &agent_labels, &evidence_labels, &truths)?;
-            if dropped > 0 {
+            let fill = fill_leaf(l, set, &inputs, &agent_labels, &evidence_labels, &truths)?;
+            if fill.cut > 0 {
                 cut.add(EdgeCut {
                     capped_leaves: 1,
-                    dropped_edges: dropped,
+                    dropped_edges: fill.cut,
                 });
             }
+            renamed.add(fill.renamed);
         }
     }
     for doc in docs.iter() {
         doc.to_stored_json()
             .map_err(|v| anyhow::anyhow!("level {} breaks the contract: {v}", doc.level_id()))?;
     }
-    Ok(cut)
+    Ok((cut, renamed))
 }
 
 /// One theme's night, on the build's snapshot (the caller runs it inside a
 /// savepoint). `prev_rows` are the theme's levels in the previous run and
-/// `prev_mirrors` that run's mirror record.
-#[allow(clippy::too_many_lines)]
+/// `prev_mirrors` that run's mirror record. `computed` is the theme's meaning
+/// tree from the off-box hook, used only when the theme has no previous tree
+/// and does not fit one leaf.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn build_theme(
     tx: &mut PgConnection,
     viewer: &Viewer,
@@ -230,6 +268,7 @@ async fn build_theme(
     theme: Uuid,
     prev_rows: &[&RunLevel],
     prev_mirrors: Option<&BTreeSet<Uuid>>,
+    computed: Option<&ResultTheme>,
     cap: usize,
 ) -> anyhow::Result<ThemeOutcome> {
     let members = AtlasMeaningRepository::theme_members(tx, viewer, map, theme).await?;
@@ -257,16 +296,32 @@ async fn build_theme(
             member_set.difference(&before).count(),
             before.difference(&member_set).count(),
         )
-    } else {
-        let Some(p) = prev_m.as_ref() else {
-            return Ok(ThemeOutcome::Unbuilt(ids.len()));
-        };
+    } else if let Some(p) = prev_m.as_ref() {
         let (shape, delta) = update_meaning(p, &emb);
         (
             shape.context("the theme has no member")?,
             delta.added,
             delta.removed,
         )
+    } else if let Some(c) = computed {
+        // The off-box tree, checked exactly as an operator's result is: every
+        // id the minted one, the leaves exactly the members now. A member
+        // that arrived or left since the export fails the check, and the
+        // theme stays unbuilt (the next night computes it again); a tree
+        // whose leaves ARE the members but that still fails is malformed,
+        // which the caller reports as a failed call.
+        match check_tree(map, AtlasHierarchy::Meaning, theme, &c.groups, &member_set) {
+            Ok(t) => (shape_of(&t), ids.len(), 0),
+            Err(e) => {
+                let refused = Refused {
+                    why: format!("{e:#}"),
+                    members_changed: leaf_claims_of(&c.groups) != member_set,
+                };
+                return Ok(ThemeOutcome::Unbuilt(ids.len(), Some(refused)));
+            }
+        }
+    } else {
+        return Ok(ThemeOutcome::Unbuilt(ids.len(), None));
     };
     let wire = to_wire(map, AtlasHierarchy::Meaning, theme, &meaning_shape);
     let m_tree = check_tree(map, AtlasHierarchy::Meaning, theme, &wire, &member_set)?;
@@ -311,7 +366,7 @@ async fn build_theme(
     let labels = AtlasMeaningRepository::claim_labels(tx, viewer, map, &ids).await?;
     let mut docs = tree_documents(&m_tree, &labels, &m_switch)?;
     docs.extend(tree_documents(&l_tree, &labels, &l_switch)?);
-    let edge_cut = real_leaves(tx, viewer, map, &rows, &mut docs, cap).await?;
+    let (edge_cut, renamed) = real_leaves(tx, viewer, map, &rows, &mut docs, cap).await?;
 
     let inner = |t: &MeaningTree| {
         t.nodes
@@ -335,6 +390,7 @@ async fn build_theme(
                       "new_link_leaves": l_delta.new_link_leaves,
                       "new_mirrors": l_delta.new_mirrors},
             "leaf_edge_cap": edge_cut.json(),
+            "leaf_relationship_names": renamed.json(),
         }),
         edge_cut,
     }))
@@ -385,10 +441,13 @@ async fn carry_theme(
             .with_context(|| format!("leaf {} no longer assembles", l.level_id))?;
         let inputs = AtlasFlowRepository::read_flow_inputs(tx, viewer, map, &set).await?;
         let fresh_nodes: BTreeSet<Uuid> = set.nodes.iter().map(|n| n.id).collect();
-        let fresh_edges: BTreeSet<(Uuid, Uuid, String)> = weigh_leaf_edges(&set, &inputs)
-            .into_iter()
-            .map(|e| (e.source, e.target, e.relationship))
-            .collect();
+        // Under the names the leaf was served with (`contract_edges`).
+        let fresh_edges: BTreeSet<(Uuid, Uuid, String)> =
+            contract_edges(weigh_leaf_edges(&set, &inputs))
+                .0
+                .into_iter()
+                .map(|e| (e.source, e.target, e.relationship))
+                .collect();
         let (nodes, edges) = leaf_shape(l);
         ensure!(
             nodes.is_subset(&fresh_nodes) && edges.is_subset(&fresh_edges),
@@ -447,12 +506,14 @@ struct MapBuild {
     names: crate::atlas_naming::name::Previous,
 }
 
+/// `computed`: meaning trees from the off-box hook, by theme.
 #[allow(clippy::too_many_lines)]
 async fn read_and_build(
     conn: &mut PgConnection,
     viewer: &Viewer,
     map: AtlasMap,
     cap: usize,
+    computed: &BTreeMap<Uuid, ResultTheme>,
 ) -> anyhow::Result<Option<MapBuild>> {
     let mut tx = conn.begin().await.context("begin the build snapshot")?;
     let epochs = AtlasMapRepository::begin_build_snapshot(&mut tx, viewer, map).await?;
@@ -502,6 +563,7 @@ async fn read_and_build(
             theme,
             rows,
             prev_mirrors.as_ref(),
+            computed.get(&theme),
             cap,
         )
         .await;
@@ -513,11 +575,17 @@ async fn read_and_build(
                 edge_cut.add(b.edge_cut);
                 built.push(json!({"theme_id": theme, "stats": b.stats}));
             }
-            Ok(ThemeOutcome::Unbuilt(n)) => {
+            Ok(ThemeOutcome::Unbuilt(n, why)) => {
                 sp.rollback().await.context("roll back a theme savepoint")?;
-                unbuilt.push(json!({"theme_id": theme, "members": n,
-                    "reason": "new to the map and over one leaf: build it with atlas_meaning \
-                               and atlas_links (operator)"}));
+                let mut row = json!({"theme_id": theme, "members": n,
+                    "reason": "new to the map and over one leaf: configure the off-box hook \
+                               (--offbox-command) or build it with atlas_meaning and atlas_links \
+                               (operator)"});
+                if let Some(r) = why {
+                    row["offbox_tree_refused"] = json!(r.why);
+                    row["offbox_members_changed"] = json!(r.members_changed);
+                }
+                unbuilt.push(row);
             }
             Err(e) => {
                 sp.rollback().await.context("roll back a theme savepoint")?;
@@ -602,10 +670,61 @@ pub async fn night_for_map(
     map: AtlasMap,
     opts: &NightOptions,
 ) -> anyhow::Result<Value> {
-    let Some(b) = read_and_build(conn, viewer, map, opts.cap).await? else {
-        return Ok(json!({"map": map_key(map), "status": "skipped",
-            "reason": "no finished run: build the map with atlas_meaning and atlas_links first"}));
+    let skipped = || {
+        json!({"map": map_key(map), "status": "skipped",
+            "reason": "no finished run: build the map with atlas_meaning and atlas_links first"})
     };
+    let Some(mut b) = read_and_build(conn, viewer, map, opts.cap, &BTreeMap::new()).await? else {
+        return Ok(skipped());
+    };
+    // The off-box hook: a theme new to the map that does not fit one leaf
+    // gets its meaning tree computed off the box (no transaction open), and
+    // the map is read and built again with it, so it is built tonight.
+    let mut offbox_report = Value::Null;
+    let unbuilt = unbuilt_theme_ids(&b.themes);
+    if let (Some(off), false) = (&opts.offbox, unbuilt.is_empty()) {
+        if opts.apply {
+            match off
+                .meaning_trees(conn, viewer, map, &unbuilt, opts.cap)
+                .await
+            {
+                Ok(doc) => {
+                    let computed: BTreeMap<Uuid, ResultTheme> =
+                        doc.themes.into_iter().map(|t| (t.theme_id, t)).collect();
+                    // Only `unbuilt` was needed from the first build: free it
+                    // before the second, so two whole-map builds are never
+                    // held at once.
+                    drop(b);
+                    let Some(again) =
+                        read_and_build(conn, viewer, map, opts.cap, &computed).await?
+                    else {
+                        return Ok(skipped());
+                    };
+                    b = again;
+                    let left = unbuilt_theme_ids(&b.themes);
+                    let malformed = malformed_offbox_trees(&b.themes);
+                    offbox_report = if malformed.is_empty() {
+                        json!({"status": "computed", "themes": unbuilt, "still_unbuilt": left})
+                    } else {
+                        // Leaves exactly the members, yet W4's check refused
+                        // the tree: the command is broken (not churn), so the
+                        // call failed and the night's alert must fire.
+                        json!({"status": "failed", "themes": unbuilt, "still_unbuilt": left,
+                               "malformed": malformed,
+                               "error": "the off-box command returned trees W4's check refuses \
+                                         although their leaves are exactly the members (see \
+                                         offbox_tree_refused)"})
+                    };
+                }
+                Err(e) => {
+                    offbox_report = json!({"status": "failed", "themes": unbuilt,
+                                           "error": format!("{e:#}")});
+                }
+            }
+        } else {
+            offbox_report = json!({"status": "dry_run", "would_compute": unbuilt});
+        }
+    }
     let MapBuild {
         prev,
         prev_docs,
@@ -685,6 +804,9 @@ pub async fn night_for_map(
         "documents_unchanged": same,
         "epochs_unchanged": epochs == prev.epochs,
     });
+    if !offbox_report.is_null() {
+        report["offbox"] = offbox_report;
+    }
     if !opts.apply {
         report["status"] = json!("dry_run");
         report["would_write"] = json!(!unchanged);
@@ -758,9 +880,42 @@ pub async fn night_for_map(
     Ok(report)
 }
 
-/// The whole night: the theme assignment, then every map. Returns the
-/// summary and whether every map succeeded (a failed map is reported and the
-/// next one still runs).
+/// The ids of the `unbuilt` themes of a map's theme report.
+fn unbuilt_theme_ids(themes: &Value) -> Vec<Uuid> {
+    themes["unbuilt"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| serde_json::from_value(t["theme_id"].clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `unbuilt` themes of a map's theme report whose off-box tree W4's
+/// check refused although its leaves were exactly the members (a malformed
+/// tree, not churn).
+fn malformed_offbox_trees(themes: &Value) -> Vec<Value> {
+    themes["unbuilt"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|t| t["offbox_members_changed"] == json!(false))
+                .map(|t| t["theme_id"].clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a report holds a failed off-box call.
+fn offbox_failed(report: &Value) -> bool {
+    report["offbox"]["status"] == "failed"
+}
+
+/// The whole night: the theme assignment (and, with the off-box hook, W1's
+/// split of the themes over the cap), then every map. Returns the summary
+/// and whether every map succeeded and every configured off-box call worked
+/// (a failure is reported and the night goes on).
 ///
 /// # Errors
 /// A database error in the theme step (before any map is built).
@@ -795,25 +950,71 @@ pub async fn run_night(
     }
     let over_cap =
         AtlasMeaningRepository::themes_over_member_cap(conn, viewer, opts.theme_cap).await?;
-    let themes = json!({
+    let listed = |v: &[(Uuid, i64)]| {
+        v.iter()
+            .map(|(t, n)| json!({"theme_id": t, "members": n}))
+            .collect::<Vec<_>>()
+    };
+    let mut ok = true;
+    let mut themes = json!({
         "unthemed_embedded": unthemed,
         "assigned": assigned,
-        "over_cap": over_cap.iter().map(|(t, n)| json!({"theme_id": t, "members": n})).collect::<Vec<_>>(),
+        "over_cap": listed(&over_cap),
         "theme_cap": opts.theme_cap,
-        "note": "themes over the cap are not split by the nightly: run W1's theme_cap_split \
-                 (operator, off-box compute)",
     });
+    // 1b. W1's split of the themes over the cap, through the off-box hook,
+    //     BEFORE the maps are read: the new parts are new themes, which the
+    //     map step then builds (through the same hook) tonight.
+    match opts.offbox.as_ref().filter(|o| o.theme_cap_split.is_some()) {
+        Some(_) if over_cap.is_empty() => {}
+        Some(off) if opts.apply => {
+            let ids: Vec<Uuid> = over_cap.iter().map(|(t, _)| *t).collect();
+            match off.split_themes(&ids, opts.theme_cap).await {
+                Ok(r) => {
+                    let left = AtlasMeaningRepository::themes_over_member_cap(
+                        conn,
+                        viewer,
+                        opts.theme_cap,
+                    )
+                    .await?;
+                    // The script's own status: "applied", or "nothing to
+                    // split" when no exported theme needed (or could take) a
+                    // split.
+                    let status = r["status"].as_str().unwrap_or("applied").to_string();
+                    themes["split"] = json!({"status": status, "report": r,
+                                             "still_over_cap": listed(&left)});
+                }
+                Err(e) => {
+                    ok = false;
+                    themes["split"] = json!({"status": "failed", "error": format!("{e:#}")});
+                }
+            }
+        }
+        Some(_) => {
+            themes["split"] = json!({"status": "dry_run",
+                "would_split": over_cap.iter().map(|(t, _)| *t).collect::<Vec<_>>()});
+        }
+        None => {
+            themes["note"] = json!(
+                "themes over the cap are not split: configure the off-box hook \
+                 (--offbox-command, --theme-cap-split) or run W1's theme_cap_split \
+                 (operator, off-box compute)"
+            );
+        }
+    }
 
     // 2. Maps.
     let maps = match &opts.maps {
         Some(m) => m.clone(),
         None => AtlasMapRepository::maps_with_finished_runs(conn, viewer).await?,
     };
-    let mut ok = true;
     let mut reports = Vec::with_capacity(maps.len());
     for map in maps {
         match night_for_map(conn, viewer, backend, map, opts).await {
-            Ok(r) => reports.push(r),
+            Ok(r) => {
+                ok &= !offbox_failed(&r);
+                reports.push(r);
+            }
             Err(e) => {
                 ok = false;
                 reports.push(json!({"map": map_key(map), "status": "failed",

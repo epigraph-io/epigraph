@@ -33,14 +33,15 @@ def test_centroids_are_stored_as_32_d_vectors_and_load_back(db, script_db):
         )
         assert cur.fetchone()[0] == "vector(32)"
 
-    got, run = C.load_centroids_from_db(script_db, RUN)
+    got, run, ids = C.load_centroids_from_db(script_db, RUN)
     assert run == RUN
+    assert ids == [0, 1, 2]
     assert got.shape == (3, C.UMAP_DIM)
     np.testing.assert_allclose(got, want, rtol=1e-6)
 
     # Re-seeding the same run replaces the centroids in place.
     C.store_centroids(script_db, RUN, want * 2)
-    got, _ = C.load_centroids_from_db(script_db, RUN)
+    got, _, _ = C.load_centroids_from_db(script_db, RUN)
     np.testing.assert_allclose(got, want * 2, rtol=1e-6)
 
 
@@ -96,5 +97,41 @@ def test_reseeding_a_pre_222_row_clears_its_stale_padded_centroid(db, script_db)
             (RUN,),
         )
         assert cur.fetchone() == (True,)
-    got, _ = C.load_centroids_from_db(script_db, RUN)
+    got, _, _ = C.load_centroids_from_db(script_db, RUN)
     np.testing.assert_allclose(got, new, rtol=1e-6)
+
+
+def test_a_run_with_a_deleted_cluster_loads_its_stored_ids(db, script_db):
+    """A seal deletes the centroid of a cluster whose members are all sealed
+    (backlog 06cdffaa), leaving a gap in the run's cluster ids. The load
+    returns the stored ids beside the rows, so row i is not taken for
+    cluster i."""
+    want = _centroids(k=3)
+    C.store_centroids(script_db, RUN, want)
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM cluster_centroids WHERE cluster_run_id = %s AND cluster_id = 1",
+            (RUN,),
+        )
+    db.commit()
+    got, _, ids = C.load_centroids_from_db(script_db, RUN)
+    assert ids == [0, 2]
+    np.testing.assert_allclose(got, want[[0, 2]], rtol=1e-6)
+
+
+def test_the_nearest_centroid_is_named_by_its_stored_cluster_id():
+    """Backlog 06cdffaa: with cluster 1 deleted, row 1 of the centroid matrix
+    is cluster 2. A claim nearest that row is assigned to cluster 2; before,
+    `assign_batch` wrote the row position (1), the deleted cluster's id, and
+    shifted every later cluster down by one."""
+    dists = np.array([0.9, 0.1], dtype=np.float32)
+    assert C.nearest_two(dists, [0, 2]) == (2, pytest.approx(0.1), pytest.approx(0.9))
+    assert C.nearest_two(np.array([0.3], dtype=np.float32), [5]) == (
+        5, pytest.approx(0.3), pytest.approx(0.3))
+
+
+def test_centroid_distances_are_indexed_by_cluster_id():
+    full = C.distances_by_cluster_id(np.array([0.9, 0.1], dtype=np.float32), [0, 2])
+    assert full[1] is None
+    assert full[0] == pytest.approx(0.9) and full[2] == pytest.approx(0.1)
+    assert len(full) == 3
