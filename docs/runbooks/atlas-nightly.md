@@ -63,8 +63,12 @@ newer run was published while the night ran; nothing was written) or
   one of its agents and evidence rows are still drawn, only the weakest
   edges among them are not;
 - per theme in `themes.built[].stats`, `leaf_relationship_names`
-  (`renamed_edges`, and `names`: each stored relationship name the contract
-  refuses and the name it is served as). The contract allows letters, digits
+  (`renamed_edges`: the leaf edges served under a mapped name, summed over
+  the theme's leaves in both hierarchies, so one stored edge usually counts
+  once per hierarchy and `renamed_edges: 2` can be a single stored row;
+  `distinct_names`: how many stored names were mapped; and `names`: each
+  stored relationship name the contract refuses and the name it is served
+  as, the first 32 in name order). The contract allows letters, digits
   and `_`, at most 32 characters, starting with a letter; `edges` takes any
   non-empty name. A refused name is served with every other character
   turned into `_`, `r_` put in front when it does not start with a letter,

@@ -1026,7 +1026,11 @@ async fn a_relationship_name_outside_the_contract_is_mapped_and_its_theme_builds
         .expect("t1 built");
     assert_eq!(
         t1["stats"]["leaf_relationship_names"],
-        serde_json::json!({"renamed_edges": 2, "names": {"has-part": "has_part"}}),
+        serde_json::json!({
+            "renamed_edges": 2,
+            "distinct_names": 1,
+            "names": {"has-part": "has_part"},
+        }),
         "{r:#}"
     );
     let after = levels(&pool, latest(&pool, a_map).await).await;

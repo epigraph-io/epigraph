@@ -44,6 +44,12 @@ pub fn agent_fallback(id: Uuid) -> String {
 /// The label of an evidence row the label read did not return.
 pub const EVIDENCE_FALLBACK: &str = "Evidence";
 
+/// The most stored-to-served relationship-name pairs one theme's
+/// [`RenamedNames::json`] lists; `distinct_names` carries the total, so a
+/// writer storing many distinct refused names cannot grow the nightly report
+/// without bound.
+pub const MAX_REPORTED_RELATIONSHIP_NAMES: usize = 32;
+
 /// The claim ids of a leaf document.
 #[must_use]
 pub fn leaf_claims(leaf: &LeafLevel) -> Vec<Uuid> {
@@ -170,7 +176,9 @@ pub struct LeafFill {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RenamedNames {
     /// The weighted edges whose name was mapped, counted before two mapped
-    /// to one edge collapse.
+    /// to one edge collapse, summed over every leaf added (a theme's leaves
+    /// in both hierarchies, so one stored edge usually counts once per
+    /// hierarchy).
     pub edges: usize,
     /// Each stored name (lower-cased, as the builder serves names) and the
     /// contract name it is served as.
@@ -183,10 +191,22 @@ impl RenamedNames {
         self.names.extend(other.names);
     }
 
-    /// The report: `{"renamed_edges": n, "names": {stored: served}}`.
+    /// The report: `{"renamed_edges": n, "distinct_names": m, "names":
+    /// {stored: served}}`, `names` holding the first
+    /// [`MAX_REPORTED_RELATIONSHIP_NAMES`] stored names in order and
+    /// `distinct_names` how many there are in all.
     #[must_use]
     pub fn json(&self) -> Value {
-        json!({"renamed_edges": self.edges, "names": self.names})
+        let names: BTreeMap<&String, &String> = self
+            .names
+            .iter()
+            .take(MAX_REPORTED_RELATIONSHIP_NAMES)
+            .collect();
+        json!({
+            "renamed_edges": self.edges,
+            "distinct_names": self.names.len(),
+            "names": names,
+        })
     }
 }
 
@@ -635,6 +655,34 @@ mod tests {
         epigraph_atlas_contract::LevelDocument::Leaf(leaf)
             .validate()
             .expect("a leaf with mapped names validates");
+    }
+
+    /// The report lists at most [`MAX_REPORTED_RELATIONSHIP_NAMES`] names
+    /// (the first in order) and counts them all, so many distinct refused
+    /// names do not grow the nightly report without bound.
+    #[test]
+    fn the_renamed_names_report_is_capped_and_counts_every_name() {
+        let mut renamed = RenamedNames::default();
+        for i in 0..(MAX_REPORTED_RELATIONSHIP_NAMES + 8) {
+            let stored = format!("rel-{i:03}");
+            renamed.edges += 1;
+            renamed
+                .names
+                .insert(stored.clone(), contract_relationship_name(&stored));
+        }
+        let report = renamed.json();
+        assert_eq!(
+            report["distinct_names"],
+            json!(MAX_REPORTED_RELATIONSHIP_NAMES + 8)
+        );
+        assert_eq!(
+            report["renamed_edges"],
+            json!(MAX_REPORTED_RELATIONSHIP_NAMES + 8)
+        );
+        let names = report["names"].as_object().unwrap();
+        assert_eq!(names.len(), MAX_REPORTED_RELATIONSHIP_NAMES);
+        assert_eq!(names["rel-000"], json!("rel_000"));
+        assert!(!names.contains_key(&format!("rel-{MAX_REPORTED_RELATIONSHIP_NAMES:03}")));
     }
 
     /// Every mapped name is a contract name, and a contract name is kept.
