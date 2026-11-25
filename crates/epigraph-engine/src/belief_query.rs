@@ -86,17 +86,73 @@ impl BeliefInterval {
         }
     }
 
-    /// Default returned when no frame is specified and the claim has no DS data.
+    /// Default returned when no frame is specified and the claim has no DS data:
+    /// the interval of the LEAST-COMMITTED binary BBA whose pignistic
+    /// probability is `truth_value` (backlog 3c4ddac0).
+    ///
+    /// That BBA is [`MassFunction::from_pignistic_prior`], the same shape
+    /// `ds_auto` seeds from a claim's `truth_value`, read here through the same
+    /// `epigraph_ds::measures` the framed path uses:
+    ///
+    /// | `t` | BBA | Bel | Pl | BetP |
+    /// |---|---|---|---|---|
+    /// | `t > ½` | m(true) = 2t−1, m(Θ) = 2−2t | 2t−1 | 1 | t |
+    /// | `t = ½` | vacuous | 0 | 1 | ½ |
+    /// | `t < ½` | m(false) = 1−2t, m(Θ) = 2t | 0 | 2t | t |
+    /// | `t = 1` / `t = 0` | dogmatic | 1 / 0 | 1 / 0 | 1 / 0 |
+    ///
+    /// The earlier `{belief: t, plausibility: 1, pignistic_prob: t}` was no
+    /// BBA at all: on a binary frame BetP = Bel + (Pl − Bel)/2, so Bel = t with
+    /// Pl = 1 has BetP (1+t)/2, not t. BetP is still exactly `t`, which keeps
+    /// this read in agreement with `EFFECTIVE_BELIEF_SCORE_SQL`'s no-DS arm
+    /// (the score the recall / traverse / query_claims gates compare). Bel and
+    /// Pl are LOWER than before for every `t < 1`.
+    ///
+    /// Unlike the `ds_auto` seed, `t` is not capped to the profile's
+    /// truth-seed bounds: that cap keeps a stored BBA from absorbing later
+    /// evidence under Dempster's rule, and nothing is combined here, while a
+    /// cap would move BetP off the gates' `truth_value`. A `t` outside
+    /// `[0, 1]` is clamped; a NaN reads as total ignorance.
+    #[must_use]
     pub fn cached_from_truth(truth_value: f64) -> Self {
+        let frame = truth_prior_frame();
+        let target = FocalElement::positive(BTreeSet::from([TRUTH_PRIOR_TRUE]));
+        let prior = MassFunction::from_pignistic_prior(
+            frame.clone(),
+            TRUTH_PRIOR_TRUE,
+            truth_value.clamp(0.0, 1.0),
+        )
+        // `Ok(None)`: t = ½, the vacuous BBA. `Err`: only a NaN `t` reaches
+        // here (the frame is binary and the index valid), which carries no
+        // information either.
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| MassFunction::vacuous(frame));
         Self {
-            belief: truth_value,
-            plausibility: 1.0,
-            pignistic_prob: truth_value,
+            belief: epigraph_ds::measures::belief(&prior, &target),
+            plausibility: epigraph_ds::measures::plausibility(&prior, &target),
+            pignistic_prob: epigraph_ds::measures::pignistic_probability(&prior, TRUTH_PRIOR_TRUE),
             mass_on_conflict: 0.0,
             mass_on_missing: 0.0,
             framed: false,
             source: "cached".to_string(),
         }
+    }
+}
+
+/// Hypothesis index of "the claim is true" in [`truth_prior_frame`].
+const TRUTH_PRIOR_TRUE: usize = 0;
+
+/// The binary frame [`BeliefInterval::cached_from_truth`] reads its prior on:
+/// `truth_value` is a scalar about one proposition, so its BBA lives on
+/// {true, false}. Built as a literal rather than through the fallible
+/// `FrameOfDiscernment::new`, whose only refusal (an empty frame) cannot
+/// apply to two distinct names.
+fn truth_prior_frame() -> FrameOfDiscernment {
+    FrameOfDiscernment {
+        id: "truth_value_prior".to_string(),
+        hypotheses: vec!["true".to_string(), "false".to_string()],
+        version: 1,
     }
 }
 
@@ -106,8 +162,9 @@ impl BeliefInterval {
 ///   using Dempster's combination rule (mirrors the MCP framed path).
 /// - If `frame_id` is `None`, returns the cached DS columns from the claim row
 ///   (mirrors the MCP unframed path). When no DS write has ever populated those
-///   columns, falls back to reconstructing an interval from `truth_value`, reported
-///   with the same `source: "cached"`.
+///   columns, falls back to the least-committed interval whose BetP is
+///   `truth_value` ([`BeliefInterval::cached_from_truth`]), reported with the
+///   same `source: "cached"`.
 ///
 /// # Errors
 ///
@@ -186,7 +243,9 @@ pub async fn get_belief_conn(
 
     // No DS state has ever been written for this claim. Fall back to the truth_value
     // reconstruction rather than reporting zeros — a belief of 0.0 would make an
-    // unassessed claim indistinguishable from a refuted one.
+    // unassessed claim indistinguishable from a refuted one. The reconstruction is
+    // the least-committed BBA with BetP = truth_value (backlog 3c4ddac0), so BetP
+    // here equals the score the truth gates read for the same row.
     let claim = ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
         .await?
         .ok_or(BeliefQueryError::ClaimNotFound(claim_id))?;
@@ -1010,4 +1069,106 @@ async fn shadow_view(
             .await?
             .remove(&claim_id),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BeliefInterval;
+
+    const EPS: f64 = 1e-9;
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < EPS
+    }
+
+    /// Backlog 3c4ddac0: the no-DS fallback must be the interval of SOME
+    /// binary BBA. On {true, false}, BetP(true) = Bel + (Pl − Bel)/2, so
+    /// BetP is the midpoint of [Bel, Pl]. The old `{t, 1, t}` breaks this for
+    /// every t < 1 (its midpoint is (1+t)/2).
+    #[test]
+    fn cached_from_truth_is_the_interval_of_a_binary_bba() {
+        for i in 0..=100 {
+            let t = f64::from(i) / 100.0;
+            let b = BeliefInterval::cached_from_truth(t);
+            assert!(
+                b.belief <= b.pignistic_prob + EPS && b.pignistic_prob <= b.plausibility + EPS,
+                "t={t}: Bel {} <= BetP {} <= Pl {} must hold",
+                b.belief,
+                b.pignistic_prob,
+                b.plausibility
+            );
+            assert!(
+                near(b.pignistic_prob, (b.belief + b.plausibility) / 2.0),
+                "t={t}: on a binary frame BetP must be the midpoint of [Bel, Pl], \
+                 got Bel {} Pl {} BetP {} — no BBA has this interval",
+                b.belief,
+                b.plausibility,
+                b.pignistic_prob
+            );
+        }
+    }
+
+    /// The fallback is the LEAST-committed BBA with BetP = t (the
+    /// `from_pignistic_prior` shape), spelled here independently in closed
+    /// form: Bel = max(0, 2t−1), Pl = min(1, 2t), BetP = t. BetP staying t is
+    /// what keeps `get_belief` in agreement with the gates'
+    /// `EFFECTIVE_BELIEF_SCORE_SQL` no-DS arm (`truth_value`).
+    #[test]
+    fn cached_from_truth_matches_the_least_committed_closed_form() {
+        for i in 0..=100 {
+            let t = f64::from(i) / 100.0;
+            let b = BeliefInterval::cached_from_truth(t);
+            let (bel, pl) = ((2.0 * t - 1.0).max(0.0), (2.0 * t).min(1.0));
+            assert!(
+                near(b.belief, bel) && near(b.plausibility, pl) && near(b.pignistic_prob, t),
+                "t={t}: want (Bel {bel}, Pl {pl}, BetP {t}), got ({}, {}, {})",
+                b.belief,
+                b.plausibility,
+                b.pignistic_prob
+            );
+            assert!(!b.framed);
+            assert_eq!(b.source, "cached");
+            assert!(near(b.mass_on_conflict, 0.0) && near(b.mass_on_missing, 0.0));
+        }
+    }
+
+    /// Named points, both sides of ½ and both dogmatic ends.
+    #[test]
+    fn cached_from_truth_named_points() {
+        for (t, bel, pl) in [
+            (0.73, 0.46, 1.0),
+            (0.3, 0.0, 0.6),
+            (0.5, 0.0, 1.0),
+            (1.0, 1.0, 1.0),
+            (0.0, 0.0, 0.0),
+        ] {
+            let b = BeliefInterval::cached_from_truth(t);
+            assert!(
+                near(b.belief, bel) && near(b.plausibility, pl) && near(b.pignistic_prob, t),
+                "t={t}: want ({bel}, {pl}, {t}), got ({}, {}, {})",
+                b.belief,
+                b.plausibility,
+                b.pignistic_prob
+            );
+        }
+    }
+
+    /// `cached_from_truth` is public and takes a bare f64: an out-of-range
+    /// value clamps to the dogmatic end, and a NaN reads as total ignorance
+    /// rather than leaking into the interval.
+    #[test]
+    fn cached_from_truth_out_of_range_and_nan() {
+        let hi = BeliefInterval::cached_from_truth(1.7);
+        assert!(near(hi.belief, 1.0) && near(hi.plausibility, 1.0) && near(hi.pignistic_prob, 1.0));
+        let lo = BeliefInterval::cached_from_truth(-0.2);
+        assert!(near(lo.belief, 0.0) && near(lo.plausibility, 0.0) && near(lo.pignistic_prob, 0.0));
+        let nan = BeliefInterval::cached_from_truth(f64::NAN);
+        assert!(
+            near(nan.belief, 0.0) && near(nan.plausibility, 1.0) && near(nan.pignistic_prob, 0.5),
+            "NaN must read as vacuous, got ({}, {}, {})",
+            nan.belief,
+            nan.plausibility,
+            nan.pignistic_prob
+        );
+    }
 }

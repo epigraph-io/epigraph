@@ -1566,7 +1566,7 @@ pub struct GetBeliefParams {
     pub claim_id: String,
 
     #[schemars(
-        description = "Optional frame UUID. If provided, recomputes Bel/Pl/BetP from stored BBAs. If omitted, returns cached DS columns."
+        description = "Optional frame UUID. If provided, recomputes Bel/Pl/BetP from stored BBAs. If omitted, returns cached DS columns; a claim with no DS state reads as the least-committed interval whose BetP is its truth_value (Bel = max(0, 2t-1), Pl = min(1, 2t))."
     )]
     pub frame_id: Option<String>,
 
