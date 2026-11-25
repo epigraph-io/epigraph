@@ -4593,7 +4593,14 @@ restart.
   and leaves and counts one that would need three groups (NOTICE). Refuses (55000) unless the
   four bodies are exactly 120's, 258's and 242's two (md5 of `prosrc`), and (42501) unless run
   as the maintenance role or a superuser. Not changed: the Rust privatization re-meet (same
-  rule; pinned to agree), 260's recording trigger, the operator CLI's cascade models. Pinned by
+  rule; pinned to agree), 260's recording trigger, the operator CLI's cascade models. Those
+  models still predict a moved claim's edge as its plain meet, so in one stacked case (a
+  declared `('group', H)` edge whose other endpoint is already in H, its first endpoint
+  restricted into G) the trigger writes `(H, co G)` where the model expects `(G, co H)`: the
+  same readers, but owner and co-owner differ in write rights, so `restrict-claims` (and
+  likely `regroup-claims`) now rolls such a batch back where it used to succeed (fail-closed;
+  nothing is exposed; making the models read the declaration is a follow-up). The repair's
+  NOTICE counts `unmet` among the edges it changed only. Pinned by
   `epigraph-db/tests/declared_edge_remeet.rs` (re-tenant, publicize and share on the
   application role, re-point, agreement with the privatization re-meet, the rule's cases, the
   repair across an upgrade from 283, the refusal, the undo). Undo: `docs/runbooks/284-undo.sql`

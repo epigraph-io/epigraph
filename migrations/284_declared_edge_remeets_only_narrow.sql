@@ -68,10 +68,20 @@
 --
 -- NOT changed: 260's recording trigger and owner guard; the Rust
 -- privatization re-meet; the operator CLI's models of the cascade
--- (`restrict-claims`, `regroup-claims`), which predict an edge on a moved
--- claim as its meet and hold a claim whose declared edge that meet would
--- widen (fail-closed, as before; with this file the trigger only narrows
--- such an edge, so a hold there is now conservative).
+-- (`restrict-claims`, and likely `regroup-claims`), which predict an edge on
+-- a moved claim as its plain meet and hold a claim whose declared edge that
+-- meet would widen (fail-closed, as before; with this file the trigger only
+-- narrows such an edge, so such a hold is now conservative).
+--
+-- BEHAVIOUR CHANGE for those CLI models: in one stacked case the trigger now
+-- writes a tuple the model does not predict, and the CLI's post-batch check
+-- rolls the whole batch back where it used to succeed. Example: an edge A->B
+-- declared ('group', H) whose B was later moved into H sits at (H); moving A
+-- into G with `restrict-claims` is predicted as (G, co H), but the trigger
+-- writes (H, co G). The readers are the same, but owner and co-owner have
+-- different write rights (`edges_update_owner`), so the check is right to
+-- flag it. No edge is exposed: the batch aborts and nothing moves. Making
+-- the CLI models read the declaration is a follow-up.
 --
 -- ===================================================================
 -- 2. DEPLOY AND UNDO
