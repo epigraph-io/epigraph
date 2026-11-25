@@ -4609,6 +4609,30 @@ restart.
   (same definer signature and answer). A tool that marked rows directly on the maintenance
   DSN is refused after it; none in this repository does. **Applied to throwaway databases
   only, NOT to any deployed database.**
+- **275**: public `membership_helper_row_estimates` (backlog 8377cf18). `ALTER FUNCTION
+  public.epigraph_operator_actor(uuid) ROWS 1`, nothing else. The function reads
+  `operator_links` by its primary key (`agent_id`), so one row is exact; with the default
+  1000, `epigraph_role_derived_memberships`' `candidates` CTE was estimated at 1,002 rows
+  instead of 3 and its body planned above `jit_above_cost`, so every
+  `epigraph_live_memberships` call JIT-compiled (about 1 s per call). On a production-sized
+  test shape the body's generic plan costs 334 times less (8.9M before, 26.7k after at 40 live
+  role bindings). `epigraph_allowlisted_operator` is scalar (already one row) and is not
+  touched; the three membership set-returning functions keep 1000 (see the header). Only
+  `prorows` moves: no body, owner, ACL or path. A later `CREATE OR REPLACE` of
+  `epigraph_operator_actor` must restate `ROWS 1`. Pinned by
+  `epigraph-db/tests/membership_planner_estimates.rs` (the body's generic-plan cost on the
+  seeded shape is under 100000; the catalog estimate is 1 and `operator_links` is still keyed
+  on `agent_id`); both fail below 275. Undo: `docs/runbooks/275-undo.sql`. **Deploy order:**
+  none against the binaries; apply whenever. 275 lowers the estimate but does not by itself
+  clear a database-wide `jit = off` mitigation: the body's cost after 275 still grows linearly
+  with the live role bindings (315k at 300 bindings on the test shape), and the calling query
+  or another body in the chain can still cross the threshold. Before turning JIT back on, in
+  order: (1) `EXPLAIN (GENERIC_PLAN)` the role-derived body on the target database, as the
+  test does (independent of the `jit` setting); (2) in one maintenance or superuser session
+  (236 answers `epigraph_live_memberships` only for the session principal, maintenance or a
+  superuser), time `SELECT * FROM public.epigraph_live_memberships('<agent>')` once with
+  `SET jit = on` and once with `SET jit = off`; (3) reset the database-wide `jit = off` only
+  when the call with JIT on takes under 50 ms.
 
 ## `-- no-transaction` migrations
 
