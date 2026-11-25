@@ -27,10 +27,11 @@
 //!   says, exactly as 166's ROL01 is);
 //! * CONTROLS: the same human under READ COMMITTED writes through the arm,
 //!   and is refused at the first statement after the end (the per-statement
-//!   snapshot); the same REPEATABLE READ transaction writes into the human's
-//!   own personal group (122's direct arm is untouched); a privileged session
-//!   is exempt as before;
-//! * the undo runbook restores 166's body byte for byte, twice.
+//!   snapshot); a privileged session is exempt as before. (Under
+//!   REPEATABLE READ the human's own personal group, 122's direct arm, is
+//!   refused too since 310: `direct_writer_scope_read_committed.rs`.)
+//! * the undo runbook restores 166's body byte for byte, twice (after
+//!   310's undo, which restores 256's body first).
 //!
 //! Every write that matters runs on a session whose `session_user` is the
 //! deployed application role (`SET SESSION AUTHORIZATION`), never the harness
@@ -52,6 +53,9 @@ const ROL01: &str = "ROL01";
 /// The words of 256's refusal, which no other OPL02 carries.
 const DERIVED_ONLY_UNDER_RC: &str = "a write through a role binding is admitted only under READ \
                                      COMMITTED";
+/// The words of 310's direct-arm refusal.
+const DIRECT_ONLY_UNDER_RC: &str = "a write through a direct membership is admitted only under \
+                                    READ COMMITTED";
 /// The words of 122/123's human OPL02 refusal.
 const HUMAN_SCOPE: &str = "a human writes only where it writes";
 
@@ -399,10 +403,11 @@ async fn armed_an_end_committed_mid_transaction_refuses_the_rr_and_serializable_
 /// the level, because an older snapshot cannot tell a live row from one
 /// ended since (166's ROL01 rule for agents, applied to the arm).
 /// CONTROLS, each the same shape with the refused condition absent: the same
-/// holder under READ COMMITTED writes through the arm; under REPEATABLE READ
-/// it writes into its own personal group (122's direct arm); a privileged
-/// session stamped as the holder is exempt; and an agent of the holder under
-/// REPEATABLE READ was already refused ROL01 before 256 reached it.
+/// holder under READ COMMITTED writes through the arm and into its own
+/// personal group (122's direct arm, which since 310 admits only under READ
+/// COMMITTED too, refused with its own words); a privileged session stamped
+/// as the holder is exempt; and an agent of the holder under REPEATABLE READ
+/// was already refused ROL01 before 256 reached it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn armed_the_derived_arm_admits_only_under_read_committed(pool: PgPool) {
     define_role(&pool).await;
@@ -412,6 +417,9 @@ async fn armed_the_derived_arm_admits_only_under_read_committed(pool: PgPool) {
     write_across_an_end(&pool, h.human, RC, None, Ending::Nothing, h.group)
         .await
         .expect("CONTROL: READ COMMITTED, the holder writes through its binding");
+    write_across_an_end(&pool, h.human, RC, None, Ending::Nothing, h.personal)
+        .await
+        .expect("CONTROL: READ COMMITTED, the holder writes its own personal group");
     for isolation in [RR, SER] {
         let r =
             write_across_an_end(&pool, h.human, isolation, None, Ending::Nothing, h.group).await;
@@ -421,11 +429,16 @@ async fn armed_the_derived_arm_admits_only_under_read_committed(pool: PgPool) {
             DERIVED_ONLY_UNDER_RC,
             &format!("{isolation}, nothing ended"),
         );
-        write_across_an_end(&pool, h.human, isolation, None, Ending::Nothing, h.personal)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("CONTROL: {isolation}, the holder writes its own personal group: {e}")
-            });
+        // 310: the direct arm (the personal group) is refused under this
+        // level as well, by its own refusal, not the derived arm's.
+        let r =
+            write_across_an_end(&pool, h.human, isolation, None, Ending::Nothing, h.personal).await;
+        assert_refused(
+            &r,
+            OPL02,
+            DIRECT_ONLY_UNDER_RC,
+            &format!("{isolation}, the holder's own personal group (310)"),
+        );
     }
 
     // A privileged session (the maintenance role) stamped as the holder is
@@ -499,6 +512,8 @@ async fn writer_scope_catalog(
     .expect("catalog row")
 }
 
+/// After `docs/runbooks/310-undo.sql` puts 256's body back (310 re-states
+/// the function over 256's),
 /// `docs/runbooks/256-undo.sql` restores 166's body byte for byte (owner,
 /// volatility, grants and search path kept), and a second run changes
 /// nothing. On the restored body the defect is back: a REPEATABLE READ or
@@ -509,6 +524,10 @@ async fn writer_scope_catalog(
 async fn the_256_undo_restores_166s_writer_scope(pool: PgPool) {
     let undo = repo_text("docs/runbooks/256-undo.sql");
     let migration = repo_text("migrations/256_derived_writer_scope_read_committed.sql");
+    sqlx::raw_sql(&repo_text("docs/runbooks/310-undo.sql"))
+        .execute(&pool)
+        .await
+        .expect("310's undo applies first");
     let at_256 = writer_scope_md5(&pool).await;
     assert_ne!(
         at_256, BODY_166,

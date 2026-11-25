@@ -4732,6 +4732,33 @@ restart.
   software policy served). If any is a person's only passkey, enroll an attested passkey for that
   person through a maintenance enrollment (`passkey-enroll`) first. Under the software policy
   nothing changes.
+- **310**: `direct_writer_scope_read_committed` (backlog e39af056). Re-states 256's
+  `epigraph_require_writer_scope` (an md5 precondition refuses to apply over any other body)
+  so that 122's DIRECT-membership writer arm admits a write only under READ COMMITTED, closing
+  the residual 256 recorded. Under REPEATABLE READ or SERIALIZABLE the arm read
+  `group_memberships` (and the human registration and link behind `epigraph_human_of`) through
+  the transaction's first snapshot, so a membership revoked or demoted to reader by another
+  session after it still read as a live writer row and the writer kept writing into the group.
+  Now, under any level other than READ COMMITTED, a write the direct arm would admit is refused
+  OPL02 ("a write through a direct membership is admitted only under READ COMMITTED"), after the
+  privileged-session exemption (the maintenance DSN's REPEATABLE READ tools are unaffected); an
+  unbound principal, 256's derived-arm refusal and both of 122's OPL02 refusals are unchanged.
+  Same signature, STABLE, owner, grants and search path (`public, pg_temp`). The custodian half
+  of the backlog item needed no change: 123 re-bodied `epigraph_operator_scope_exempt` to
+  `epigraph_bypass()` alone, so holding role:platform-custodian relieves nothing here, live,
+  ended or elapsed. Pinned by `epigraph-db/tests/direct_writer_scope_read_committed.rs` (a
+  membership revoked or demoted from a second session mid-transaction: the REPEATABLE READ and
+  SERIALIZABLE writer is refused and lands on 256's body; READ COMMITTED, unarmed and privileged
+  controls; a custodian ended or elapsed mid-transaction is refused at all three levels, and
+  writes with 122's exemption restored; the undo, twice, and both refusals over a foreign body),
+  `derived_writer_scope_read_committed.rs` (its REPEATABLE READ personal-group control is now
+  refused; its undo test runs 310's undo first) and
+  `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
+  `docs/runbooks/310-undo.sql` (run it before `256-undo.sql`). **Deploy order:** none; no binary
+  depends on it. Before applying, measure that no login writing claims on the application role
+  has a non-default `default_transaction_isolation` (`pg_db_role_setting`): such a write by a
+  bound principal is refused after 310. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
