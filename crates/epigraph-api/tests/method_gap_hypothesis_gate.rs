@@ -180,6 +180,17 @@ async fn a_public_hypothesis_of_another_group_is_analysed_for_a_reader(pool: PgP
 /// through one paper that `asserts` it, so a gap analysis that asks for the
 /// capability finds the method AND reads its source paper.
 async fn seed_method_with_capability(pool: &PgPool, capability: &str, claim: Uuid) {
+    seed_ranked_method(pool, capability, claim, 1).await;
+}
+
+/// [`seed_method_with_capability`] with a chosen `evidence_count`, the rank
+/// the per-capability bound keeps the highest of. Returns the method id.
+async fn seed_ranked_method(
+    pool: &PgPool,
+    capability: &str,
+    claim: Uuid,
+    evidence_count: i32,
+) -> Uuid {
     let method: Uuid = sqlx::query_scalar(
         "INSERT INTO methods (id, name, canonical_name, technique_type, source_claim_ids) \
          VALUES (gen_random_uuid(), $1, $1, 'measurement', $2) RETURNING id",
@@ -191,10 +202,11 @@ async fn seed_method_with_capability(pool: &PgPool, capability: &str, claim: Uui
     .expect("seed method");
     sqlx::query(
         "INSERT INTO method_capabilities (method_id, capability, specificity, evidence_count) \
-         VALUES ($1, $2, 1, 1)",
+         VALUES ($1, $2, 1, $3)",
     )
     .bind(method)
     .bind(capability)
+    .bind(evidence_count)
     .execute(pool)
     .await
     .expect("seed method capability");
@@ -216,6 +228,7 @@ async fn seed_method_with_capability(pool: &PgPool, capability: &str, claim: Uui
     .execute(pool)
     .await
     .expect("seed asserts edge");
+    method
 }
 
 fn uri_with_capabilities(hypothesis: Uuid, encoded: &str) -> String {
@@ -277,6 +290,10 @@ async fn two_capabilities_are_each_analysed(pool: PgPool) {
     assert_eq!(
         caps[0]["methods_found"][0]["source_count"], 1,
         "and reads the paper that grounds it: {body}"
+    );
+    assert_eq!(
+        caps[0]["methods_truncated"], false,
+        "one method is under the per-capability bound: {body}"
     );
     assert_eq!(caps[1]["capability"], missing.as_str(), "trimmed: {body}");
     assert_eq!(
@@ -393,4 +410,134 @@ async fn a_repeated_capabilities_key_is_a_400(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// A public hypothesis and a public claim the seeded methods are grounded in.
+async fn bound_fixture(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+    let (owner, _) = viewer_fixture::seed_agent_with_group(pool, "9738-owner").await;
+    let hypothesis = viewer_fixture::seed_public_claim(
+        pool,
+        owner,
+        &format!("97381982 bounded hypothesis {}", Uuid::new_v4()),
+    )
+    .await;
+    let grounding = viewer_fixture::seed_public_claim(
+        pool,
+        owner,
+        &format!("97381982 bounded grounding {}", Uuid::new_v4()),
+    )
+    .await;
+    (owner, hypothesis, grounding)
+}
+
+/// A capability more than `MAX_METHODS_PER_CAPABILITY` methods match analyses
+/// exactly that many, the highest evidence counts, and says it cut the list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_capability_analyses_at_most_the_bound_of_methods_and_says_so(pool: PgPool) {
+    let (owner, hypothesis, grounding) = bound_fixture(&pool).await;
+    let max = epigraph_api::routes::experiments::MAX_METHODS_PER_CAPABILITY;
+    // `max + 2` methods share the prefix, evidence counts 1..=max+2, so the
+    // two lowest (1 and 2) are the ones the bound must drop.
+    let prefix = format!("capbound-{}", Uuid::new_v4().simple());
+    let mut by_rank = Vec::new();
+    for rank in 1..=(max + 2) {
+        let rank = i32::try_from(rank).expect("small");
+        let m = seed_ranked_method(&pool, &format!("{prefix}-{rank}"), grounding, rank).await;
+        by_rank.push((rank, m));
+    }
+    let app = app_role_router(&pool).await;
+
+    let (status, body) = gaps(app, owner, &uri_with_capabilities(hypothesis, &prefix)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("JSON");
+    let found = v["required_capabilities"][0]["methods_found"]
+        .as_array()
+        .expect("methods_found");
+    assert_eq!(found.len(), max, "bounded per capability: {body}");
+    assert_eq!(
+        v["required_capabilities"][0]["methods_truncated"], true,
+        "{body}"
+    );
+    let got: std::collections::BTreeSet<String> = found
+        .iter()
+        .map(|m| m["method_id"].as_str().expect("id").to_string())
+        .collect();
+    for (rank, m) in &by_rank {
+        assert_eq!(
+            got.contains(&m.to_string()),
+            *rank > 2,
+            "rank {rank} kept iff it is among the top {max}: {body}"
+        );
+    }
+}
+
+/// An entry is a LITERAL substring: `%` and `_` match only themselves. No
+/// seeded capability contains either, so each is a gap, although as `ILIKE`
+/// wildcards both would match every seeded method.
+#[sqlx::test(migrations = "../../migrations")]
+async fn like_metacharacters_in_a_capability_match_only_themselves(pool: PgPool) {
+    let (owner, hypothesis, grounding) = bound_fixture(&pool).await;
+    for i in 0..3 {
+        seed_method_with_capability(&pool, &format!("capliteral-{i}"), grounding).await;
+    }
+    let app = app_role_router(&pool).await;
+
+    // Calibration: a real substring of the seeded names does match.
+    let (status, body) = gaps(
+        app.clone(),
+        owner,
+        &uri_with_capabilities(hypothesis, "capliteral"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(
+        v["required_capabilities"][0]["methods_found"]
+            .as_array()
+            .map(Vec::len),
+        Some(3),
+        "calibration: {body}"
+    );
+
+    for (entry, encoded) in [("%", "%25"), ("_", "_")] {
+        let (status, body) = gaps(
+            app.clone(),
+            owner,
+            &uri_with_capabilities(hypothesis, encoded),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{entry}: {body}");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(v["required_capabilities"][0]["capability"], entry, "{body}");
+        assert_eq!(
+            v["required_capabilities"][0]["gap_flags"],
+            serde_json::json!(["no_method"]),
+            "`{entry}` matched as a wildcard: {body}"
+        );
+    }
+}
+
+/// A repeated entry is one capability, analysed once, in first-seen order.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_repeated_capability_entry_is_analysed_once(pool: PgPool) {
+    let (owner, hypothesis, grounding) = bound_fixture(&pool).await;
+    let a = format!("caprepeat-a-{}", Uuid::new_v4().simple());
+    let b = format!("caprepeat-b-{}", Uuid::new_v4().simple());
+    seed_method_with_capability(&pool, &a, grounding).await;
+    let app = app_role_router(&pool).await;
+
+    let (status, body) = gaps(
+        app,
+        owner,
+        &uri_with_capabilities(hypothesis, &format!("{a},{b},{a},%20{a},{b}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(v["summary"]["total_capabilities"], 2, "{body}");
+    let caps = v["required_capabilities"].as_array().expect("array");
+    assert_eq!(caps.len(), 2, "{body}");
+    assert_eq!(caps[0]["capability"], a.as_str(), "{body}");
+    assert_eq!(caps[1]["capability"], b.as_str(), "{body}");
+    assert_eq!(v["summary"]["gaps"], 1, "{body}");
 }

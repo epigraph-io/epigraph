@@ -16,7 +16,8 @@
 //! connection from [`AppState::read_as`], reborrowed per statement inside its
 //! two nested loops. Holding one connection for a whole handler makes the work
 //! done on it a function of the request's input, so that input is bounded above
-//! the acquire — see [`MAX_REQUIRED_CAPABILITIES`].
+//! the acquire — see [`MAX_REQUIRED_CAPABILITIES`] and
+//! [`MAX_METHODS_PER_CAPABILITY`].
 //!
 //! Of those three, TWO narrow — `MethodRepository::{get_evidence_strength,
 //! get_source_papers}` reach `claims` and `edges` and splice the viewer — and
@@ -87,8 +88,12 @@ pub struct FindMethodsQuery {
 pub struct MethodGapQuery {
     pub hypothesis_id: Uuid,
     /// The capabilities to analyse, as ONE comma-separated value:
-    /// `?required_capabilities=xps,afm`. Each entry is trimmed and empty
-    /// entries are dropped; read it through [`Self::capabilities`].
+    /// `?required_capabilities=xps,afm`. Each entry is trimmed, empty entries
+    /// are dropped and a repeated entry is analysed once; read it through
+    /// [`Self::capabilities`]. A `,` always separates entries, so a capability
+    /// name cannot itself contain one (there is no quoting). Each entry is
+    /// matched as a literal, case-insensitive substring of the stored
+    /// capability names (`%` and `_` are not wildcards).
     ///
     /// A `String`, not a `Vec<String>` (backlog 97381982): axum's `Query`
     /// decodes with `serde_urlencoded`, which takes no sequence, so a
@@ -103,15 +108,17 @@ pub struct MethodGapQuery {
 #[cfg(feature = "db")]
 impl MethodGapQuery {
     /// [`Self::required_capabilities`] split on `,`, each entry trimmed, empty
-    /// entries dropped. Absent, empty or all-blank is the empty list.
+    /// entries dropped, repeats dropped (first occurrence kept, so the answer
+    /// is in request order). Absent, empty or all-blank is the empty list.
     #[must_use]
     pub fn capabilities(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
         self.required_capabilities
             .as_deref()
             .unwrap_or_default()
             .split(',')
             .map(str::trim)
-            .filter(|c| !c.is_empty())
+            .filter(|c| !c.is_empty() && seen.insert(*c))
             .map(str::to_string)
             .collect()
     }
@@ -131,6 +138,15 @@ impl MethodGapQuery {
 /// workspace's fixtures or docs is single-digit, so 32 leaves an order of
 /// magnitude of headroom over any real use while still being a bound.
 pub const MAX_REQUIRED_CAPABILITIES: usize = 32;
+
+/// Upper bound on the methods analysed per capability in
+/// `method_gap_analysis`: the `MAX_METHODS_PER_CAPABILITY` with the highest
+/// evidence count. Each analysed method costs two further statements on the
+/// held connection, so this and [`MAX_REQUIRED_CAPABILITIES`] together bound
+/// the whole analysis. When a capability matches more, its entry in the answer
+/// says so with `"methods_truncated": true`, rather than silently presenting
+/// the first ones as the full set.
+pub const MAX_METHODS_PER_CAPABILITY: usize = 10;
 
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
@@ -589,17 +605,27 @@ pub async fn method_gap_analysis(
         // in which every REMAINING capability reports as a gap — a wrong answer
         // that looks like a finding. Before the conversion each statement had
         // its own checkout and a failure was isolated to it.
-        let methods = epigraph_db::MethodRepository::get_methods_for_capability(&mut *read, cap)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("{e}"),
-            })?;
+        //
+        // One row past the bound is fetched only to learn whether the bound cut
+        // anything; it is dropped before any per-method statement runs.
+        let mut methods = epigraph_db::MethodRepository::get_methods_for_capability(
+            &mut *read,
+            cap,
+            MAX_METHODS_PER_CAPABILITY as i64 + 1,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{e}"),
+        })?;
+        let methods_truncated = methods.len() > MAX_METHODS_PER_CAPABILITY;
+        methods.truncate(MAX_METHODS_PER_CAPABILITY);
 
         if methods.is_empty() {
             gaps += 1;
             cap_results.push(serde_json::json!({
                 "capability": cap,
                 "methods_found": [],
+                "methods_truncated": false,
                 "gap_flags": ["no_method"],
             }));
             continue;
@@ -680,6 +706,7 @@ pub async fn method_gap_analysis(
         cap_results.push(serde_json::json!({
             "capability": cap,
             "methods_found": method_infos,
+            "methods_truncated": methods_truncated,
             "gap_flags": cap_flags,
         }));
     }

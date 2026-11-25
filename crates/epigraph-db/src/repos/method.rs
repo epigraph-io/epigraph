@@ -389,20 +389,32 @@ impl MethodRepository {
     /// It takes no `Viewer` because neither relation in its FROM has anything for
     /// one to filter — see this function's row in
     /// `epigraph-db/tests/visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    ///
+    /// # Matching and limit
+    ///
+    /// `capability` is matched as a case-insensitive LITERAL substring of
+    /// `method_capabilities.capability`: `\`, `%` and `_` in it are escaped,
+    /// so they match themselves and are not `ILIKE` wildcards. At most `limit`
+    /// rows are returned, the highest `evidence_count` first (ties by method
+    /// id, so the cut is deterministic). A caller that wants to know whether
+    /// the cut removed anything asks for one more row than it keeps.
     pub async fn get_methods_for_capability<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
-        capability_pattern: &str,
+        capability: &str,
+        limit: i64,
     ) -> Result<Vec<MethodForCapability>, sqlx::Error> {
-        let like = format!("%{capability_pattern}%");
+        let like = format!("%{}%", escape_like(capability));
         let rows: Vec<MethodForCapabilityRow> = sqlx::query_as(
             "SELECT m.id, m.name, m.canonical_name, m.technique_type, \
                     mc.capability, mc.specificity, mc.evidence_count \
              FROM methods m \
              JOIN method_capabilities mc ON mc.method_id = m.id \
-             WHERE mc.capability ILIKE $1 \
-             ORDER BY mc.evidence_count DESC",
+             WHERE mc.capability ILIKE $1 ESCAPE '\\' \
+             ORDER BY mc.evidence_count DESC, m.id \
+             LIMIT $2",
         )
         .bind(&like)
+        .bind(limit.max(0))
         .fetch_all(executor)
         .await?;
 
@@ -604,5 +616,33 @@ fn search_result_from_row(r: MethodSearchRow) -> MethodSearchResult {
         source_claim_ids: r.source_claim_ids.unwrap_or_default(),
         properties: r.properties,
         similarity: r.similarity,
+    }
+}
+
+/// `s` with the `LIKE`/`ILIKE` metacharacters (`\`, `%`, `_`) escaped by a
+/// backslash, for use under `ESCAPE '\'`, so it matches only itself.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod escape_like_tests {
+    use super::escape_like;
+
+    #[test]
+    fn metacharacters_are_escaped_and_nothing_else_is() {
+        assert_eq!(escape_like("xps"), "xps");
+        assert_eq!(escape_like("%"), "\\%");
+        assert_eq!(escape_like("_"), "\\_");
+        assert_eq!(escape_like("\\"), "\\\\");
+        assert_eq!(escape_like("a_b%c\\d"), "a\\_b\\%c\\\\d");
+        assert_eq!(escape_like("µ-raman"), "µ-raman");
     }
 }

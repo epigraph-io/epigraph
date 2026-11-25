@@ -3883,7 +3883,9 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          viewer-spliced `MethodRepository` reads it issues per method on ONE stamped connection. \
          The SQL, its bind and the projected row shape are unchanged. It has exactly one caller, \
          that handler, so reach and motivation coincide here -- unlike the `agent.rs` entry \
-         above, where they do not.",
+         above, where they do not. Backlog 97381982 later changed the SQL, not its FROM: the \
+         pattern is a literal substring (ILIKE metacharacters escaped) and the statement takes a \
+         LIMIT, so the argument above about the two relations is untouched.",
     ),
     (
         "workflow.rs",
