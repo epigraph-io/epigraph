@@ -345,7 +345,8 @@ async fn migration_313_stamps_existing_concepts_with_what_every_reader_saw(pool:
 /// `docs/runbooks/313-undo.sql` refuses while a concept is group-private (a
 /// pre-313 schema would publish it) and changes nothing; once no private
 /// concept is left it returns the table to its pre-313 shape: no tenancy
-/// columns, no row security, no 313 trigger or policy, rows kept.
+/// columns, no row security, no 313 trigger or policy, rows kept. A second
+/// run is a no-op, not an error on the dropped column.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_313_undo_refuses_over_a_private_concept_then_restores_the_old_shape(pool: PgPool) {
     use sqlx::Executor;
@@ -382,6 +383,9 @@ async fn the_313_undo_refuses_over_a_private_concept_then_restores_the_old_shape
         .await
         .expect("remove the private concept");
     pool.execute(UNDO).await.expect("the undo applies");
+    pool.execute(UNDO)
+        .await
+        .expect("a second run of the undo changes nothing and does not fail");
 
     assert!(!has_tenancy_columns(&pool).await, "the columns are gone");
     let (rls, forced): (bool, bool) = sqlx::query_as(
@@ -410,4 +414,97 @@ async fn the_313_undo_refuses_over_a_private_concept_then_restores_the_old_shape
             .await
             .expect("count kept rows");
     assert_eq!(kept, 1, "the undo keeps the rows");
+}
+
+/// The undo refuses a session that cannot read every concept, even the
+/// table's OWNER. The table is FORCEd, so an owner that is neither the
+/// maintenance role nor a superuser/BYPASSRLS login, and holds the
+/// application role's function grants, counts only public rows: it would find
+/// no private concept, pass the private-row refusal, drop the columns and
+/// publish every other group's concept. The runbook must refuse it first
+/// (42501) and change nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_313_undo_refuses_an_owner_that_cannot_read_every_concept(pool: PgPool) {
+    use sqlx::Executor;
+    const UNDO: &str = include_str!("../../../docs/runbooks/313-undo.sql");
+    let (_a, group_a) = fixture::seed_agent_with_group(&pool, "hec-undo-owner").await;
+    let private = seed_concept(&pool, group_a, "group").await;
+
+    let owner_before: String = sqlx::query_scalar(
+        "SELECT tableowner::text FROM pg_tables \
+          WHERE schemaname = 'public' AND tablename = 'harvester_enriched_concepts'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("table owner");
+    // Roles are cluster-wide: a unique name, dropped again below.
+    let migrator = format!("hec_migrator_{}", Uuid::new_v4().simple());
+    pool.execute(
+        format!(
+            "CREATE ROLE {migrator} NOLOGIN NOSUPERUSER NOBYPASSRLS INHERIT IN ROLE epigraph_app"
+        )
+        .as_str(),
+    )
+    .await
+    .expect("create the owner role");
+    pool.execute(
+        format!("ALTER TABLE public.harvester_enriched_concepts OWNER TO {migrator}").as_str(),
+    )
+    .await
+    .expect("hand the table to the owner role");
+
+    let (seen, outcome) = fixture::as_role(&pool, &migrator, |mut conn| async move {
+        let seen: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM harvester_enriched_concepts WHERE visibility = 'group'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count private concepts as the owner");
+        let outcome = (&mut *conn).execute(UNDO).await;
+        if outcome.is_err() {
+            (&mut *conn)
+                .execute("ROLLBACK")
+                .await
+                .expect("end the refused transaction");
+        }
+        (conn, (seen, outcome.err()))
+    })
+    .await;
+
+    pool.execute(
+        format!("ALTER TABLE public.harvester_enriched_concepts OWNER TO \"{owner_before}\"")
+            .as_str(),
+    )
+    .await
+    .expect("restore the table owner");
+    pool.execute(format!("DROP ROLE {migrator}").as_str())
+        .await
+        .expect("drop the owner role");
+
+    // Control: the owner really is blind to the private concept, so the
+    // private-row refusal alone could not have caught this session.
+    assert_eq!(
+        seen, 0,
+        "the FORCEd table hides the private concept from its owner"
+    );
+    let err = outcome.expect("the undo must refuse a session that cannot read every concept");
+    let db = err.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("42501"), "{err}");
+    assert!(
+        db.message()
+            .contains("313-undo: run as the maintenance role or a superuser"),
+        "refused by the runbook's own guard, not by a missing privilege: {err}"
+    );
+    assert!(
+        has_tenancy_columns(&pool).await,
+        "a refused undo changes nothing"
+    );
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM harvester_enriched_concepts WHERE id = $1 AND visibility = 'group'",
+    )
+    .bind(private)
+    .fetch_one(&pool)
+    .await
+    .expect("count the private concept");
+    assert_eq!(kept, 1, "the private concept is still private");
 }
