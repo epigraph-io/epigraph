@@ -428,7 +428,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // gated (`write_target_of`, for every caller since backlog 4073bbb6: the
     // unfiltered `sqlx::query_scalar(SELECT)` owner read is gone) then write;
     // the in-transaction viewer re-fetch still re-checks it
-    // (F-write-authz-reads-unfiltered).
+    // (F-write-authz-reads-unfiltered). Every write is on the caller's
+    // `AppState::write_as` transaction since backlog 7c2a0b36 (the non-admin
+    // branch's `db_pool.begin` is gone).
     (
         "claims.rs",
         "patch_claim",
@@ -436,7 +438,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::admin_patch_claim_conn",
             "ClaimRepository::patch_claim_atomic_conn",
             "ProvenanceRepository::append_conn",
-            "db_pool.begin",
         ],
     ),
     // gated (`ClaimRepository::get_by_id`) then write.
@@ -1100,10 +1101,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "abort_plan",
         &[
             "Connection::begin",
-            "PrivatizationRepository::record_plan_audit_conn",
-            "PrivatizationRepository::transition_plan_conn",
             "lifecycle_served",
             "maintenance",
+            "privatization::abort_plan_conn",
             "record_custodial_act",
             "require_plan_authority",
         ],

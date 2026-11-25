@@ -671,11 +671,42 @@ async fn migration_251_refuses_another_retract_guard_body_on_the_interim_path(po
 /// writes a grant again: the residual is back, which is what undoing means),
 /// the helper's maintenance ownership, and drops 251's three new functions;
 /// it runs twice, over a ledger holding rows 194's key could not hold; and
-/// 251's own text then applies again over the undone state.
+/// 251's own text then applies again over the undone state. At head 274 is
+/// applied, whose retract definer writes through the grant function this
+/// undo drops: the undo refuses (55000, nothing changed) until
+/// `274-undo.sql` has run, and after both the definer no longer calls it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_251_undo_restores_the_bodies_and_the_grant_table(pool: PgPool) {
     let undo = repo_file("docs/runbooks/251-undo.sql");
     let m251 = repo_file("migrations/251_retracted_bba_guard_owner.sql");
+
+    // Undo order: 251's undo refuses while 274's retract definer depends on
+    // the grant function it drops (else every retraction fails, 42883).
+    let mut conn = pool.acquire().await.expect("acquire");
+    let refused = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("ROLLBACK");
+    drop(conn);
+    let e = refused.expect_err("251's undo refuses while 274 is applied");
+    assert_eq!(
+        e.as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string()))
+            .as_deref(),
+        Some("55000"),
+        "{e}"
+    );
+    assert!(e.to_string().contains("274"), "{e}");
+    assert_eq!(faults(&pool).await, Vec::<String>::new(), "nothing changed");
+    assert!(
+        ledger_has_kind(&pool).await,
+        "nothing changed: 251's ledger"
+    );
+    sqlx::raw_sql(&repo_file("docs/runbooks/274-undo.sql"))
+        .execute(&pool)
+        .await
+        .expect("274's undo runs first");
 
     // Two grants of one id in one transaction and an unretract grant: rows
     // 194's (mf_id, xact_id) key cannot hold.
@@ -766,6 +797,15 @@ async fn the_251_undo_restores_the_bodies_and_the_grant_table(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(kept, 1, "one purge grant per (id, transaction) is kept");
+    let (_, _, retract_src, _, _) = facts(
+        &pool,
+        "public.epigraph_retract_mass_function(uuid, text, uuid, uuid)",
+    )
+    .await;
+    assert!(
+        !retract_src.contains("epigraph_mf_guard_grant"),
+        "after 274's and 251's undos the retract definer calls no dropped function"
+    );
 
     let (role, login) = login::maintenance_login(&pool, "t63undo").await;
     let mut tx = login.begin().await.unwrap();

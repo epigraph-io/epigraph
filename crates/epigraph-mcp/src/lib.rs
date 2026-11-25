@@ -25,6 +25,8 @@ pub mod write_identity;
 
 pub use server::{EpiGraphMcpFull, SessionFactory};
 
+use std::time::Duration;
+
 /// Return all registered MCP tools as a JSON value.
 ///
 /// Calls the static tool router (no database access) so callers don't need a
@@ -83,7 +85,7 @@ pub fn is_unix_listener(listen: &str) -> bool {
 /// counts as a unix listener.
 pub const UNIX_LISTEN_PREFIX: &str = "unix:";
 
-/// Serve `router` on the given `listen` spec.
+/// Serve `router` on the given `listen` spec, until the process is killed.
 ///
 /// Accepts either a `host:port` TCP address or a `unix:/abs/path` Unix socket spec.
 /// For Unix sockets, the file is removed if stale, then created with `0o660`
@@ -92,12 +94,122 @@ pub const UNIX_LISTEN_PREFIX: &str = "unix:";
 ///
 /// The router is passed in (rather than built here) because the production
 /// router depends on a DB pool, signer, and embedder; tests can pass a trivial
-/// `axum::Router::new()` to exercise only the listener-binding logic.
+/// `axum::Router::new()` to exercise only the listener-binding logic. The
+/// production listener stops on a signal instead
+/// ([`serve_with_listener_until`]).
+///
+/// # Errors
+/// Returns the underlying I/O error from `bind`, `set_permissions`, or `axum::serve`.
+pub async fn serve_with_listener(listen: &str, router: axum::Router) -> std::io::Result<()> {
+    serve_with_listener_until(
+        listen,
+        router,
+        std::future::pending::<()>(),
+        GracefulShutdown::new(background::BackgroundTasks::default(), Duration::ZERO),
+    )
+    .await
+}
+
+/// How long, at most, a stopping HTTP listener waits for its open requests
+/// before it ends the MCP sessions under them ([`serve_with_listener_until`]),
+/// within the whole drain bound.
+pub const HTTP_REQUEST_GRACE: Duration = Duration::from_secs(10);
+
+/// How long, at most, a stopping HTTP listener waits for its connections to
+/// close once it has ended the MCP sessions under them.
+pub const HTTP_SESSION_END_GRACE: Duration = Duration::from_secs(5);
+
+/// What a stopping HTTP listener does after its shutdown signal (backlog
+/// 526f7508): wait for its open requests, end the MCP sessions still open,
+/// then wait for the detached work its tools spawned, all within `drain` of
+/// the signal.
+pub struct GracefulShutdown {
+    background: background::BackgroundTasks,
+    drain: Duration,
+    end_sessions: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl GracefulShutdown {
+    /// Wait for `background` (the server template's tracker, which every
+    /// session clone shares), and for everything else, at most `drain` from
+    /// the signal ([`background::exit_drain_timeout`] in production).
+    #[must_use]
+    pub fn new(background: background::BackgroundTasks, drain: Duration) -> Self {
+        Self {
+            background,
+            drain,
+            end_sessions: None,
+        }
+    }
+
+    /// Run `end` once open requests have had [`HTTP_REQUEST_GRACE`]: it ends
+    /// the MCP sessions (rmcp's cancellation token,
+    /// [`http_listener::McpHttpListener::end_sessions`]). Without it, one open
+    /// SSE stream keeps the listener's graceful wait open for the whole drain.
+    #[must_use]
+    pub fn ending_sessions_with(mut self, end: impl FnOnce() + Send + 'static) -> Self {
+        self.end_sessions = Some(Box::new(end));
+        self
+    }
+}
+
+/// Resolves when the process receives SIGTERM (systemd's stop) or SIGINT
+/// (Ctrl-C), logging which. A signal whose handler cannot be installed is not
+/// waited for (logged); the process then stops on the other, or by being
+/// killed, as it did before this existed.
+pub async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "cannot listen for SIGINT");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => tracing::info!("SIGINT received: stopping the MCP HTTP listener"),
+        () = terminate => tracing::info!("SIGTERM received: stopping the MCP HTTP listener"),
+    }
+}
+
+/// [`serve_with_listener`] until `shutdown` resolves, then stop gracefully
+/// (backlog 526f7508): stop accepting connections, let open requests finish
+/// for at most [`HTTP_REQUEST_GRACE`], end the MCP sessions still open, and
+/// wait for the detached work the tools spawned (a queued ingest walk,
+/// post-commit embedding, a recall audit row) until `plan`'s drain bound from
+/// the signal, logging what is abandoned. Returning drops the runtime, which
+/// cancels whatever is still running on it, so the wait is what lets that
+/// work finish.
 ///
 /// # Errors
 /// Returns the underlying I/O error from `bind`, `set_permissions`, or `axum::serve`.
 #[allow(clippy::missing_panics_doc)]
-pub async fn serve_with_listener(listen: &str, router: axum::Router) -> std::io::Result<()> {
+pub async fn serve_with_listener_until<F>(
+    listen: &str,
+    router: axum::Router,
+    shutdown: F,
+    plan: GracefulShutdown,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let graceful = async move {
+        shutdown.await;
+        let _ = signalled_tx.send(());
+    };
     #[cfg(unix)]
     if let Some(path) = listen.strip_prefix(UNIX_LISTEN_PREFIX) {
         // Best-effort cleanup of a stale socket from a previous run.
@@ -112,10 +224,81 @@ pub async fn serve_with_listener(listen: &str, router: axum::Router) -> std::io:
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
         tracing::info!("EpiGraph MCP server listening on unix:{path} (HTTP path: /mcp)");
-        return axum::serve(listener, router).await;
+        let serve = std::future::IntoFuture::into_future(
+            axum::serve(listener, router).with_graceful_shutdown(graceful),
+        );
+        return stop_gracefully(serve, signalled_rx, plan).await;
     }
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!("EpiGraph MCP server listening on http://{listen}/mcp");
-    axum::serve(listener, router).await
+    let serve = std::future::IntoFuture::into_future(
+        axum::serve(listener, router).with_graceful_shutdown(graceful),
+    );
+    stop_gracefully(serve, signalled_rx, plan).await
+}
+
+/// The part of [`serve_with_listener_until`] after the bind: `serve` is the
+/// listener in graceful-shutdown mode, `signalled` fires with its signal.
+async fn stop_gracefully(
+    serve: impl std::future::Future<Output = std::io::Result<()>>,
+    signalled: tokio::sync::oneshot::Receiver<()>,
+    plan: GracefulShutdown,
+) -> std::io::Result<()> {
+    tokio::pin!(serve);
+    // `biased`, signal first: the graceful future sends on `signalled` before
+    // it lets `serve` finish, so once the signal came both are ready, and
+    // taking `serve`'s result as "stopped without a signal" would skip the
+    // drain below.
+    tokio::select! {
+        biased;
+        _ = signalled => {}
+        served = &mut serve => return served,
+    }
+    let GracefulShutdown {
+        background,
+        drain,
+        end_sessions,
+    } = plan;
+    let deadline = tokio::time::Instant::now() + drain;
+    let requests = std::cmp::min(tokio::time::Instant::now() + HTTP_REQUEST_GRACE, deadline);
+    let served = match tokio::time::timeout_at(requests, &mut serve).await {
+        Ok(served) => Some(served),
+        Err(_) => {
+            if let Some(end) = end_sessions {
+                tracing::info!("ending the MCP sessions still open");
+                end();
+            }
+            let sessions = std::cmp::min(
+                tokio::time::Instant::now() + HTTP_SESSION_END_GRACE,
+                deadline,
+            );
+            tokio::time::timeout_at(sessions, &mut serve).await.ok()
+        }
+    };
+    match &served {
+        Some(Ok(())) => tracing::info!("MCP HTTP listener stopped: no connection left open"),
+        Some(Err(e)) => tracing::warn!(error = %e, "MCP HTTP listener stopped with an error"),
+        None => tracing::warn!(
+            "MCP HTTP listener stopping with connections still open; their requests are cut off"
+        ),
+    }
+    let pending = background.active();
+    if pending > 0 {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tracing::info!(
+            pending,
+            timeout_secs = left.as_secs(),
+            "waiting for background work to finish before exiting"
+        );
+        if !background.wait_idle(left).await {
+            tracing::warn!(
+                unfinished = background.active(),
+                timeout_secs = drain.as_secs(),
+                "exiting with background work unfinished: a queued ingest may have written \
+                 nothing, and committed claims may have no embedding until a backfill"
+            );
+        }
+    }
+    served.unwrap_or(Ok(()))
 }

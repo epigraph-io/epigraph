@@ -4573,6 +4573,168 @@ restart.
   the agent routes, the agent search and `find_agent` / `get_agent` decide profile details
   through 286's `epigraph_agent_disclosure`, whose 320 body applies the same 164 / 235 lapse
   rules; `GET /api/v1/groups/:id` still calls 273.)
+- **274**: public `retract_mark_grant` (backlog 03d444a9). Closes the residual 251 recorded:
+  184's retract guard MARK arm (an UPDATE that sets or changes the retract columns to a
+  retracted state, or an INSERT of a row that arrives retracted) admitted any privileged
+  session (`epigraph_bypass() OR epigraph_definer_bypass()`), so a maintenance login could
+  mark a live BBA retracted directly, with no audit row and a `retracted_by` of its choosing.
+  251's ledger takes a third kind, `retract`; `epigraph_mf_guard_grant` accepts it and
+  `epigraph_mf_guard_consume` consumes a `retract` grant only for a row whose
+  `retracted_by` is the grant's (non-NULL) `granted_by`, whose `retract_reason` is the
+  grant's `reason` and whose `retracted_at` is the transaction's `now()` (both stay `epigraph_bba_guard_owner`'s, SECURITY DEFINER on
+  `pg_catalog, pg_temp`, naming no public object but the ledger). The mark arm admits only
+  by consuming a `retract` grant with `to_jsonb(NEW)`, or on a SUPERUSER session
+  (`session_user` a superuser, who may disable the trigger anyway; test harnesses mark rows
+  directly that way). 184's `epigraph_retract_mass_function` writes that grant (its
+  principal, its trimmed reason) just before its UPDATE; every other line is 184's, on 190's
+  path. What is closed is the UNAUDITED mark. Residual (as 251's; backlog 03d444a9 stays
+  open for it): a maintenance login may call the grant function itself and then mark with a
+  direct UPDATE, naming any retractor in its own grant, with no `security_events` row and no
+  clearing of the stored folds; the ledger keeps a row it cannot remove naming its login, the
+  retractor, the reason and the row as stored. Binding the mark to the definer needs the
+  definer's privileged frame isolated first (251 section 0).
+  Preconditions (`55000`, nothing changed): the md5 and `proconfig` of the four bodies it
+  re-states are those at 271, and `epigraph_bba_guard_owner_faults()` is `{}` before and
+  after; a non-superuser runner is refused `42501`. Pinned by
+  `epigraph-db/tests/bba_retract.rs` (a real maintenance login and the maintenance role
+  refused RT06 on UPDATE and INSERT while the definer on the same login still retracts,
+  audits once and leaves one consumed `retract` grant; a self-granted mark admitted only
+  with the grant's retractor and reason; the superuser admission) and
+  `retract_mark_grant_migration.rs` (the bodies before 274, what is at head, the refusal
+  over another body, the undo and re-apply); `mass_function_purge_guard.rs`,
+  `bba_retract.rs` and `epigraph-cli`'s `operator_delete_frames.rs` now discount the
+  fixture retraction's `retract` grant where they count ledger rows. Undo:
+  `docs/runbooks/274-undo.sql` (restores the four bodies; keeps the widened CHECK and every
+  `retract` row; undo 274 BEFORE 251 or 194, whose undos drop what 274's definer writes;
+  `251-undo.sql` and `194-undo.sql` refuse, 55000, while 274's definer is in place).
+  Slot assigned by the 2026-11-24 backlog triage; checked before claiming: no migration on
+  main or any origin branch carries a `274`. **Deploy order:** none against the binaries
+  (same definer signature and answer). A tool that marked rows directly on the maintenance
+  DSN is refused after it; none in this repository does. **Applied to throwaway databases
+  only, NOT to any deployed database.**
+- **275**: public `membership_helper_row_estimates` (backlog 8377cf18). `ALTER FUNCTION
+  public.epigraph_operator_actor(uuid) ROWS 1`, nothing else. The function reads
+  `operator_links` by its primary key (`agent_id`), so one row is exact; with the default
+  1000, `epigraph_role_derived_memberships`' `candidates` CTE was estimated at 1,002 rows
+  instead of 3 and its body planned above `jit_above_cost`, so every
+  `epigraph_live_memberships` call JIT-compiled (about 1 s per call). On a production-sized
+  test shape the body's generic plan costs 334 times less (8.9M before, 26.7k after at 40 live
+  role bindings). `epigraph_allowlisted_operator` is scalar (already one row) and is not
+  touched; the three membership set-returning functions keep 1000 (see the header). Only
+  `prorows` moves: no body, owner, ACL or path. A later `CREATE OR REPLACE` of
+  `epigraph_operator_actor` must restate `ROWS 1`. Pinned by
+  `epigraph-db/tests/membership_planner_estimates.rs` (the body's generic-plan cost on the
+  seeded shape is under 100000; the catalog estimate is 1 and `operator_links` is still keyed
+  on `agent_id`); both fail below 275. Undo: `docs/runbooks/275-undo.sql`. **Deploy order:**
+  none against the binaries; apply whenever. 275 lowers the estimate but does not by itself
+  clear a database-wide `jit = off` mitigation: the body's cost after 275 still grows linearly
+  with the live role bindings (315k at 300 bindings on the test shape), and the calling query
+  or another body in the chain can still cross the threshold. Before turning JIT back on, in
+  order: (1) `EXPLAIN (GENERIC_PLAN)` the role-derived body on the target database, as the
+  test does (independent of the `jit` setting); (2) in one maintenance or superuser session
+  (236 answers `epigraph_live_memberships` only for the session principal, maintenance or a
+  superuser), time `SELECT * FROM public.epigraph_live_memberships('<agent>')` once with
+  `SET jit = on` and once with `SET jit = off`; (3) reset the database-wide `jit = off` only
+  when the call with JIT on takes under 50 ms.
+- **276**: public `agent_prompt_history_blob` (backlog aaaf3cad). Adds the SECURITY DEFINER
+  `epigraph_agent_prompt_history_blob(agent, blob_hash) RETURNS TABLE(content bytea)`:
+  161's prompt-history gate (its admin assignment and refusal token for token, AID06 for a
+  refused caller, checked BEFORE the key is looked at; 22004 for a NULL agent or key), 161's
+  64-generation walk reduced to its members, and 161's per-member `readable` mark; it returns
+  the one stored zstd frame for the key when a readable member's snapshot names it (fetched
+  by primary key, no other blob read), else no row. Owned by `epigraph_maintenance` on
+  `pg_catalog, pg_temp`, EXECUTE granted to `epigraph_app` and `epigraph_maintenance`
+  (guarded). GET /api/v1/agents/:id/prompt-history/blobs/:hash reads through it instead of
+  161's whole-lineage `epigraph_agent_prompt_history`, which fetched every file of the
+  lineage for one (six blob rows for one file of a four-file, three-generation lineage; now
+  one). 161's definer is unchanged. Pinned by `epigraph-db/tests/prompt_history_blob_definer.rs`
+  (blob rows fetched per read, counted in `pg_stat_xact_user_tables` and calibrated against
+  161; catalog shape; gate, mark and walk-bound text and caller parity with 161; every key
+  answered as 161 answers it; NULL refusals; the undo) and
+  `epigraph-api/tests/agent_prompt_history_route.rs`. Undo: `docs/runbooks/276-undo.sql`.
+  **Deploy order:** migrate BEFORE the binary that reads files through it (without it every
+  file read is a 500, 42883); an older binary ignores it.
+- **284**: `declared_edge_remeets_only_narrow` (backlog 49044d29). 260 recorded an edge's
+  declared tenancy and taught only the privatization re-meet to honour it; the propagation
+  trigger, 206's publicize and share re-meets (242's bodies) and a re-point (120's
+  `epigraph_edges_tenancy` on `UPDATE OF source_id, target_id`) still treated a declared edge
+  as derived: a claim re-tenanted into G outside the privatization re-owned a declared
+  `('group', H)` edge to G, publicize widened one to the world, share re-owned one on a moved
+  claim's evidence to the team, and a re-point onto a private endpoint dropped the declared
+  owner. Adds `epigraph_edge_declared_meet(dg, dco, mv, mg, mco)`, the privatization re-meet's
+  rule as one IMMUTABLE SQL function (SECURITY INVOKER, 172's path, owned by
+  `epigraph_maintenance`, no PUBLIC EXECUTE; `tenancy_backfill`'s `INVOKER_EXEMPT` lists it),
+  and re-states the four bodies so each passes a declared edge through it: the intersection of
+  the declaration and the endpoints' meet where one owner plus one co-owner expresses it, the
+  meet (declared owner kept where it can be) where not, the exact declaration when the meet is
+  public. The re-point reads the declaration from OLD (a bound value never counts); the
+  propagation still writes only where the meet is `group`; publicize and share also re-meet
+  every declared edge incident to the moved claims (publicize) or their evidence (both), on or
+  off its meet, and their audit rows add `declared_edges_held` /
+  `declared_evidence_edges_held` and say `migration: 284`. A one-time repair gives every
+  declared edge whose tuple is not the rule's the rule's owner plus, as co-owner, the one other
+  group the rule's tuple and its current tuple require together (no session gains an edge),
+  and leaves and counts one that would need three groups (NOTICE). Refuses (55000) unless the
+  four bodies are exactly 120's, 258's and 242's two (md5 of `prosrc`), and (42501) unless run
+  as the maintenance role or a superuser. Not changed: the Rust privatization re-meet (same
+  rule; pinned to agree), 260's recording trigger, the operator CLI's cascade models. Those
+  models still predict a moved claim's edge as its plain meet, so in one stacked case (a
+  declared `('group', H)` edge whose other endpoint is already in H, its first endpoint
+  restricted into G) the trigger writes `(H, co G)` where the model expects `(G, co H)`: the
+  same readers, but owner and co-owner differ in write rights, so `restrict-claims` (and
+  likely `regroup-claims`) now rolls such a batch back where it used to succeed (fail-closed;
+  nothing is exposed; making the models read the declaration is a follow-up). The repair's
+  NOTICE counts `unmet` among the edges it changed only. Pinned by
+  `epigraph-db/tests/declared_edge_remeet.rs` (re-tenant, publicize and share on the
+  application role, re-point, agreement with the privatization re-meet, the rule's cases, the
+  repair across an upgrade from 283, the refusal, the undo). Undo: `docs/runbooks/284-undo.sql`
+  (re-states the four predecessor bodies, drops the rule; tested twice-run to the catalog below
+  284; repaired edges stay narrowed). Run it BEFORE `258-undo.sql` (refuses over 284's
+  propagation body), `242-undo.sql` (unguarded: it would silently put 242's publicize and share
+  back) or `260-undo.sql` (drops the columns the four bodies read). **Deploy order:** none
+  against the binaries. Measure first:
+  `SELECT count(*) FROM edges WHERE declared_owner_group_id IS NOT NULL`.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **285**: `passkey_anchor_standing` (backlog 09ca9ab0). An anchored (`none`) passkey's row
+  records the passkey that ADMITTED it, the ceremony readers serve it, and every refusal of an
+  assertion on attestation standing is audited. Adds `person_authenticators.anchor_authenticator_id`
+  (FK to the same table, ON DELETE RESTRICT; CHECKs: only a `none` row carries one, never itself),
+  set by a BEFORE INSERT trigger (`person_authenticators_record_anchor`, after 124's and 200's
+  insert guards) to the confirming passkey of the enrollment's act for a `none` passkey enrolled on
+  an act, NULL otherwise, overwriting any inserted value; a BEFORE UPDATE trigger
+  (`person_authenticators_keep_anchor`) refuses changing it (ELV03). BACKFILLED from 200's
+  enrollment -> act -> confirming-passkey step for every existing `none` act-enrolled row, revoked
+  ones included, with row security OFF and 124's update guard disabled for that one statement (the
+  same transaction; the ADD COLUMN's ACCESS EXCLUSIVE lock leaves no gap for an in-flight
+  completion). Re-creates 125's `epigraph_passkeys_for_ticket` and 130's
+  `epigraph_passkeys_for_act` with the extra column (same rows, gate, owner and grants; now 172's
+  form). Adds `epigraph_record_passkey_standing_refusal(ceremony, id, authenticator, code, reason)
+  -> uuid` (app-callable, 172's form): one `platform.passkey_standing_refused` `security_events`
+  row (success false) for a LIVE ticket (`elevation`, else ELV06) or act (`admin_act`, else ELV08),
+  naming a LIVE passkey of its person (else ELV02), one of the two API codes (else 22023), reason
+  at most 2000 characters (else 22001); person, credential, format and anchor come from the rows.
+  WHY `security_events`, not a new table: it is already the append-only audit of every other
+  elevation refusal. The API (`routes/elevate.rs`) finds a `none` passkey's anchor among the same
+  ceremony's served live passkeys and holds it to that anchor's standing at every assertion
+  (`epigraph_passkey::Passkeys::assertion_standing`: an anchor whose Android certificate is listed
+  on a fresh status list refuses the anchored passkey, a stale list refuses it 503, no live anchor
+  refuses it; only the anchor's own certificate, not the lineage above it), and audits each
+  standing refusal before answering it (unless the ticket or act ends, or the passkey is revoked,
+  in between: then the definer refuses the row and the API answers 500, unaudited). Registered in
+  `tenancy_backfill` (deferred definers at 285, the grant register, the exempt trigger) and
+  `definer_search_path_ratchet` (the two readers leave the `public` path register). Pinned by
+  `epigraph-db/tests/passkey_anchor_standing.rs` (the trigger, the backfill from below 285, the
+  audit definer's gates, the undo) and `epigraph-api/tests/elevation_ceremony.rs`. Undo:
+  `docs/runbooks/285-undo.sql` (restores 125's and 130's readers verbatim, drops the column and
+  every recorded anchor; audit rows stay). **Deploy order:** migrate BEFORE the API binary of this
+  change (it selects the readers' new column, 42703, and calls the definer, 42883); an older API
+  runs on 285 unchanged. **After applying 285 and before deploying the API binary, measure** live
+  `none` passkeys with NO recorded anchor after the backfill (`SELECT count(*) FROM person_authenticators WHERE revoked_at IS NULL AND
+  attestation_format = 'none' AND anchor_authenticator_id IS NULL`): under the attested policy each
+  is refused at its next assertion (they hold through nothing; e.g. a passkey registered while the
+  software policy served). If any is a person's only passkey, enroll an attested passkey for that
+  person through a maintenance enrollment (`passkey-enroll`) first. Under the software policy
+  nothing changes.
 - **286**: `human_identity_disclosure` (spec
   `docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md` sections 3, 4 and
   6.1). Adds the ONE predicate deciding whether a human principal's name is shown to a viewer;

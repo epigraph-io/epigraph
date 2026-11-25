@@ -1508,6 +1508,321 @@ async fn claim_panel_falls_back_to_get_claim_when_context_fails() {
     app.upstream.verify().await;
 }
 
+/// The kernel's `authored_by` block for a claim a document's ingest
+/// created, with a pending and an added author, a hidden prompt snapshot and
+/// a non-DOI corroborating document.
+fn literature_claim_json() -> Value {
+    let author = |id: &str, name: &str| {
+        json!({"id": id, "display_name": name, "position": 0, "role": "author",
+               "affiliations": ["Somewhere"], "pending_countersign": false,
+               "named_by": null, "added_by": null})
+    };
+    json!({
+        "id": C1, "content": "The centre claim.", "truth_value": 0.72, "agent_id": AGENT,
+        "trace_id": null, "created_at": "2026-11-01T10:00:00Z", "labels": [],
+        "authored_by": {
+            "source": "literature",
+            "paper": {"paper": {"id": PAPER, "doi": "10.1234/abc(1)", "title": "A paper"},
+                      "authors": [author(H, "Ada Primary")],
+                      "pending_authors": [author(C4, "Pending Person")],
+                      "added_authors": [author(C5, "Added Person")],
+                      "authors_truncated": false},
+            "ingested_by": {"agent": {"id": AGENT, "display_name": "ingest-bot"},
+                            "human": {"id": H, "display_name": "Ada Primary"},
+                            "prompt_snapshot": null},
+            "corroborated_by": [{"paper": {"id": P, "doi": "urn:epigraph:doc:k1", "title": null},
+                                 "authors": [], "pending_authors": [], "added_authors": [],
+                                 "authors_truncated": false}],
+            "corroborated_by_truncated": false,
+            "ingesters": [{"agent": {"id": AGENT, "display_name": "ingest-bot"}, "human": null,
+                           "paper_id": PAPER, "created_claim": true,
+                           "recorded_at": "2026-11-01T09:59:00Z"}],
+            "ingesters_truncated": false
+        }
+    })
+}
+
+#[tokio::test]
+async fn claim_panel_carries_provenance_from_the_claim_read() {
+    let app = spawn().await;
+    mount_dir(&app, "tok", dir_default()).await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/context"),
+        ok(context_json()),
+    )
+    .await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/placement"),
+        ok(placement_json(C1, Some(T), shared_layout())),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{C1}")))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(ok(literature_claim_json()))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/bff/atlas/claim/{C1}"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_private(&res, "claim panel");
+    let b = res.json();
+    assert_eq!(b["ring"]["status"], "ok", "the ring is unchanged");
+    assert_eq!(b["provenance"]["status"], "ok", "{}", b["provenance"]);
+    let p = &b["provenance"]["data"];
+    assert_eq!(p["source"], "literature");
+    assert_eq!(p["filed_at"], "2026-11-01T10:00:00Z");
+    assert_eq!(p["ingested_at"], "2026-11-01T09:59:00Z");
+    let authors: Vec<&str> = p["paper"]["authors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        authors,
+        vec![H],
+        "pending and added authors are never primary"
+    );
+    assert_eq!(p["paper"]["pending_authors"][0]["id"], C4);
+    assert_eq!(p["paper"]["added_authors"][0]["id"], C5);
+    assert_eq!(p["paper"]["doi_href"], "https://doi.org/10.1234/abc(1)");
+    assert_eq!(
+        p["paper"]["authors"][0]["href"],
+        format!("/explorer/agent/{H}")
+    );
+    assert_eq!(
+        p["ingested_by"]["agent"]["href"],
+        format!("/explorer/agent/{AGENT}")
+    );
+    assert_eq!(p["ingested_by"]["human"]["name"], "Ada Primary");
+    assert_eq!(
+        p["ingested_by"]["model"],
+        Value::Null,
+        "a hidden snapshot names no model"
+    );
+    assert_eq!(p["ingested_by"]["prompt_snapshot_id"], Value::Null);
+    assert_eq!(p["corroborated_by"][0]["doi"], "urn:epigraph:doc:k1");
+    assert_eq!(
+        p["corroborated_by"][0]["doi_href"],
+        Value::Null,
+        "a non-DOI key is not linked"
+    );
+    assert_no_belief_keys(&b);
+    app.upstream.verify().await;
+}
+
+#[tokio::test]
+async fn claim_panel_provenance_degrades_alone() {
+    // An API whose claim read predates `authored_by`, then one that fails.
+    for (claim_read, want) in [
+        (
+            ok(
+                json!({"id": C1, "content": "The centre claim.", "created_at": "2026-11-01T10:00:00Z"}),
+            ),
+            "Who filed this claim is not available from this EpiGraph API yet.",
+        ),
+        (text_plain(500, "boom"), ""),
+        // The context read already showed the claim readable; a 403 or 404
+        // on this second read degrades the section alone and says nothing
+        // of the upstream message.
+        (forbidden(), ""),
+        (not_found("Claim", C1), ""),
+    ] {
+        let app = spawn().await;
+        mount_dir(&app, "tok", dir_default()).await;
+        mount_get(
+            &app,
+            &format!("/api/v1/claims/{C1}/context"),
+            ok(context_json()),
+        )
+        .await;
+        mount_get(
+            &app,
+            &format!("/api/v1/claims/{C1}/placement"),
+            ok(placement_json(C1, Some(T), shared_layout())),
+        )
+        .await;
+        mount_get(&app, &format!("/api/v1/claims/{C1}"), claim_read).await;
+        let sid = app.sign_in("tok");
+        let res = app
+            .get_as(&format!("/explorer/bff/atlas/claim/{C1}"), &sid)
+            .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        let b = res.json();
+        assert_eq!(b["ring"]["status"], "ok");
+        assert_eq!(b["claim"]["content"], "The centre claim.");
+        assert_eq!(b["provenance"]["status"], "unavailable");
+        let reason = b["provenance"]["reason"].as_str().unwrap();
+        assert!(
+            !reason.is_empty()
+                && !reason.contains("boom")
+                && !reason.contains("not a member")
+                && !reason.contains("with ID"),
+            "{reason}"
+        );
+        if !want.is_empty() {
+            assert_eq!(reason, want);
+        }
+    }
+
+    // A session the provenance read finds ended still ends the request.
+    let app = spawn().await;
+    mount_dir(&app, "tok", dir_default()).await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/context"),
+        ok(context_json()),
+    )
+    .await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/placement"),
+        ok(placement_json(C1, Some(T), shared_layout())),
+    )
+    .await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}"),
+        ResponseTemplate::new(401)
+            .set_body_json(json!({"error": "Unauthorized", "message": "expired"})),
+    )
+    .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/bff/atlas/claim/{C1}"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+    assert_eq!(res.json()["error"], "session_expired");
+}
+
+/// An author at every clip length, of control characters (each escaped to
+/// six bytes in JSON).
+fn heavy_author(i: usize) -> Value {
+    let label = "\u{1}".repeat(160);
+    json!({"id": format!("00000000-0000-0000-0000-{i:012}"), "display_name": label,
+           "role": "\u{1}".repeat(40), "affiliations": [label, label, label], "position": 0,
+           "pending_countersign": false, "named_by": null, "added_by": null})
+}
+
+/// A document with 50 heavy authors (the kernel's limit) in its primary list
+/// and, when `all_lists`, 50 more in each of its pending and added lists.
+fn heavy_document(i: usize, all_lists: bool) -> Value {
+    let list = |from: usize| -> Vec<Value> {
+        (0..50).map(|j| heavy_author(i * 1000 + from + j)).collect()
+    };
+    let more = |from: usize| if all_lists { list(from) } else { vec![] };
+    json!({"paper": {"id": format!("00000000-0000-0000-0000-{:012}", 900_000 + i),
+                     "doi": "10.1/x", "title": "\u{1}".repeat(300)},
+           "authors": list(0), "pending_authors": more(100),
+           "added_authors": more(200), "authors_truncated": all_lists})
+}
+
+#[tokio::test]
+async fn claim_panel_survives_a_worst_case_provenance_block() {
+    // Ten corroborating documents, each with the kernel's 50 authors whose
+    // names escape to six bytes a character: carried whole, they push the
+    // panel over the atlas body cap and fail it for every viewer.
+    let app = spawn().await;
+    mount_dir(&app, "tok", dir_default()).await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/context"),
+        ok(context_json()),
+    )
+    .await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/placement"),
+        ok(placement_json(C1, Some(T), shared_layout())),
+    )
+    .await;
+    let docs: Vec<Value> = (1..=10).map(|i| heavy_document(i, false)).collect();
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}"),
+        ok(json!({
+            "id": C1, "content": "The centre claim.", "created_at": "2026-11-01T10:00:00Z",
+            "authored_by": {
+                "source": "literature",
+                "paper": heavy_document(0, true),
+                "ingested_by": {"agent": {"id": AGENT, "display_name": "ingest-bot"},
+                                "human": null, "prompt_snapshot": null},
+                "corroborated_by": docs, "corroborated_by_truncated": false,
+                "ingesters": [], "ingesters_truncated": false
+            }
+        })),
+    )
+    .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/bff/atlas/claim/{C1}"), &sid)
+        .await;
+    let head: String = res.body.chars().take(300).collect();
+    assert_eq!(res.status, StatusCode::OK, "{head}");
+    let b = res.json();
+    assert_eq!(b["ring"]["status"], "ok");
+    assert_eq!(
+        b["provenance"]["status"], "ok",
+        "the section fits its budget"
+    );
+    let p = &b["provenance"]["data"];
+    let names: usize = ["authors", "pending_authors", "added_authors"]
+        .iter()
+        .map(|k| p["paper"][k].as_array().unwrap().len())
+        .sum();
+    assert_eq!(names, 50, "the creating document carries 50 names in all");
+    assert_eq!(
+        p["paper"]["authors"].as_array().unwrap().len(),
+        50,
+        "primary first"
+    );
+    assert_eq!(p["paper"]["authors_truncated"], true);
+    for d in p["corroborated_by"].as_array().unwrap() {
+        assert!(d.get("authors").is_none(), "{d}");
+        assert!(d.get("pending_authors").is_none(), "{d}");
+    }
+}
+
+#[tokio::test]
+async fn claim_panel_fallback_reuses_its_claim_read_for_provenance() {
+    let app = spawn().await;
+    mount_dir(&app, "tok", dir_default()).await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/context"),
+        text_plain(500, "boom"),
+    )
+    .await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/placement"),
+        ok(placement_json(C1, Some(T), Value::Null)),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{C1}")))
+        .respond_with(ok(literature_claim_json()))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/bff/atlas/claim/{C1}"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let b = res.json();
+    assert_eq!(b["ring"]["status"], "unavailable");
+    assert_eq!(b["provenance"]["status"], "ok", "{}", b["provenance"]);
+    assert_eq!(b["provenance"]["data"]["paper"]["authors"][0]["id"], H);
+    app.upstream.verify().await;
+}
+
 #[tokio::test]
 async fn claim_panel_404_is_identical_for_absent_unreadable_and_forbidden_claims() {
     let app = spawn().await;
@@ -2743,6 +3058,45 @@ fn atlas_js_cold_claim_link_asks_the_claim_leaf_route() {
         let body = &js[js.find(f).expect(f)..];
         assert!(body[..body.find("\n  }\n").unwrap()].contains("await goToResolved(res)"));
     }
+}
+
+/// The claim panel shows the BFF's provenance section through the pure rows
+/// of `atlas_views.js`, and links only through the checked helpers.
+#[test]
+fn atlas_js_claim_panel_shows_provenance() {
+    let js = include_str!("../static/atlas.js");
+    let body = |name: &str| -> &str {
+        let start = js.find(name).unwrap_or_else(|| panic!("{name}"));
+        &js[start..start + js[start..].find("\n  }\n").expect("its end")]
+    };
+    let panel = body("function showClaimPanel(");
+    let prov = panel
+        .find("if (body.provenance) provenanceSection(body.provenance);")
+        .expect("the claim panel draws the provenance section");
+    assert!(
+        prov < panel.find("section('Linked claims')").unwrap(),
+        "provenance sits above the linked claims"
+    );
+    let section = body("function provenanceSection(");
+    for needed in [
+        "if (prov.status !== 'ok') {",
+        "unavailable(box, prov.reason, null);",
+        "VIEWS ? VIEWS.provenanceRows(prov.data) : null",
+        "const href = doiHref(part.href);",
+        "p.appendChild(link(part.href, part.text));",
+        "document.createTextNode(part.text)",
+    ] {
+        assert!(section.contains(needed), "provenanceSection: {needed}");
+    }
+    for banned in ["innerHTML", ".style", "insertAdjacentHTML", "outerHTML"] {
+        assert!(!section.contains(banned), "provenanceSection uses {banned}");
+    }
+    assert_eq!(js.matches("VIEWS.provenanceRows(").count(), 1);
+    let views = include_str!("../static/atlas_views.js");
+    assert!(
+        views.contains("    provenanceRows,\n"),
+        "atlas_views.js exports provenanceRows"
+    );
 }
 
 /// A theme's panel offers Sources and Timeline (P3b, P3c) from the page's

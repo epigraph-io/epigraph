@@ -13,7 +13,8 @@
 //! after answering is the same shape: a session that recalls and closes at
 //! once lost its last `recall_events` row (backlog 8a23217d).
 //!
-//! [`BackgroundTasks`] counts such tasks so the stdio entry point can wait for
+//! [`BackgroundTasks`] counts such tasks so the stdio entry point, and the
+//! HTTP listener once it is signalled to stop (backlog 526f7508), can wait for
 //! them, with a bound, before it returns. It is a counter and a `Notify`
 //! rather than a `JoinSet`: the tasks are spawned from `&self` tool handlers on
 //! clones of the server, and nothing needs their results, only to know when
@@ -97,9 +98,12 @@ impl BackgroundTasks {
 /// How long a process waits, before it exits, for the tracked tasks still
 /// running: `EPIGRAPH_MCP_STDIO_DRAIN_SECS`, default 120. An unparseable value
 /// keeps the default; `0` waits not at all (the behaviour before the wait
-/// existed). Read by the stdio entry point after its client disconnects and
-/// by the operator `ingest-document` CLI after its walk returns with the
-/// embedding loop still running.
+/// existed). Read by the stdio entry point after its client disconnects, by
+/// the HTTP listener after SIGTERM / SIGINT (where it bounds the whole stop,
+/// open requests included, from the signal: `crate::serve_with_listener_until`),
+/// and by the operator `ingest-document` CLI after its walk returns with the
+/// embedding loop still running. The name predates the HTTP use and is kept
+/// so existing deployments keep their setting.
 #[must_use]
 pub fn exit_drain_timeout() -> Duration {
     Duration::from_secs(

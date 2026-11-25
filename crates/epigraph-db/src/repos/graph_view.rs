@@ -1432,4 +1432,69 @@ impl GraphViewRepository {
         }
         Ok(q.fetch_all(executor).await?)
     }
+
+    /// The claim ids within `max_depth` hops of `center` over the epistemic
+    /// relationships (`supports`, `refutes`, `contradicts`, `corroborates`,
+    /// `elaborates`, `specializes`, `generalizes`), walking only what `viewer`
+    /// can read. `center` itself is always in the result.
+    ///
+    /// Backs `POST /api/v1/graph/compose` (backlog 52b96600). The statement
+    /// lived inline in `routes/computation.rs` and ran on the raw pool with no
+    /// viewer, so the counts and the boundary inconsistency it fed were
+    /// computed over other groups' claims and edges. Each hop now:
+    ///
+    /// * crosses only an edge the viewer can read (`{EDGE_VISIBILITY:e}`);
+    /// * steps only ONTO a claim the viewer can read (`{VISIBILITY:t}`), which
+    ///   the edge predicate alone does not give: an edge's own tenancy columns
+    ///   can be public while an endpoint is not;
+    /// * steps only FROM a claim the viewer can read (`{VISIBILITY:f}`). Every
+    ///   node after the seed already is one, so this only constrains the seed:
+    ///   a `center` the viewer cannot read is not expanded and answers exactly
+    ///   as an id that names no claim (`[center]`), so the result is not an
+    ///   oracle for whether a hidden claim exists.
+    ///
+    /// All three markers resolve to the one group bind (`$3`).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn claim_neighborhood_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        center: Uuid,
+        max_depth: i32,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            "WITH RECURSIVE neighborhood AS ( \
+                 SELECT $1::uuid AS node_id, 0 AS depth \
+                 UNION \
+                 SELECT CASE WHEN e.source_id = n.node_id THEN e.target_id \
+                             ELSE e.source_id END, \
+                        n.depth + 1 \
+                   FROM neighborhood n \
+                   JOIN edges e ON (e.source_id = n.node_id OR e.target_id = n.node_id) \
+                  WHERE n.depth < $2 \
+                    AND e.source_type = 'claim' AND e.target_type = 'claim' \
+                    AND e.relationship IN ('supports', 'refutes', 'contradicts', \
+                                           'corroborates', 'elaborates', 'specializes', \
+                                           'generalizes') \
+                    /* {EDGE_VISIBILITY:e} */ \
+                    AND EXISTS (SELECT 1 FROM claims f \
+                                 WHERE f.id = n.node_id /* {VISIBILITY:f} */) \
+                    AND EXISTS (SELECT 1 FROM claims t \
+                                 WHERE t.id = CASE WHEN e.source_id = n.node_id \
+                                                   THEN e.target_id ELSE e.source_id END \
+                                   /* {VISIBILITY:t} */) \
+             ) \
+             SELECT DISTINCT node_id FROM neighborhood",
+            3,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(center)
+            .bind(max_depth);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
 }

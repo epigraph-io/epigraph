@@ -174,11 +174,11 @@ pub use authored_by::{
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
     carries_dedup_identity_key, reserved_edge_property_refusal, AdminClaimAction, AdminClaimWrite,
-    AdminToken, BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute,
-    ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository,
-    ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult,
-    CreatedWindow, DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy,
-    EmbeddingSeedScope, EvolveStepResult, FlatPage, FlatRanking, FrameClaimBeliefHit,
+    AdminToken, BeliefBoundedClaimHit, BeliefSort, BetaTrackInput, ClaimBeliefColumns,
+    ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance,
+    ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode,
+    ConsolidateResult, CreatedWindow, DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance,
+    EdgeTenancy, EmbeddingSeedScope, EvolveStepResult, FlatPage, FlatRanking, FrameClaimBeliefHit,
     GraphExpansionHit, GroundedNeighbor, HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType,
     LineageHead, MarkedDuplicateRow, MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff,
     PatchClaimInput, PromotionStanding, SemanticFlatPage, SemanticSelectedClaim, SortDirection,
@@ -227,8 +227,8 @@ pub use edge::EdgeRepository;
 pub use ego::{EgoEdgeRow, EgoEdges, EgoEntity, EgoRepository};
 pub use elevated_access::ElevatedAccess;
 pub use elevation_ceremony::{
-    AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
-    Redemption, TicketMode, TicketPasskey,
+    record_standing_refusal, AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony,
+    EndReason, LiveElevation, Redemption, StandingCeremony, TicketMode, TicketPasskey,
 };
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};

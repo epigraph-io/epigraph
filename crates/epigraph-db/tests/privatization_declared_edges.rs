@@ -548,10 +548,10 @@ async fn two_stacked_plans_never_let_the_declaration_outread_the_meet(pool: PgPo
 }
 
 /// A declared edge re-tenanted OUTSIDE the privatization re-meet (a claim
-/// UPDATE whose propagation trigger re-owns the edge to `('group', G)`; the
-/// recorded declaration H stays) and then re-met by a plan moving its other
-/// endpoint into G2: the stale record must not be written back over the
-/// meet. No H-only reader reads it.
+/// UPDATE whose propagation trigger, since migration 284, narrows the edge to
+/// `(H, co G)`; below 284 it re-owned it to `('group', G)`) and then re-met
+/// by a plan moving its other endpoint into G2: the recorded declaration must
+/// not be written back over the meet. No H-only reader reads it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_declaration_re_owned_by_a_sibling_path_is_still_bounded_by_the_meet(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
@@ -570,8 +570,8 @@ async fn a_declaration_re_owned_by_a_sibling_path_is_still_bounded_by_the_meet(p
     tx.commit().await.expect("commit");
     assert_eq!(
         tuple(&pool, edge).await,
-        t(g, "group", None),
-        "CALIBRATION: the propagation trigger re-owned the declared edge to G"
+        t(h, "group", Some(g)),
+        "CALIBRATION: the propagation trigger narrowed the declared edge to H AND G (284)"
     );
     assert!(
         !reads(&pool, &[h], edge).await,

@@ -115,8 +115,10 @@
 //!   evidence` row must be re-oriented before its `exact` basis applies;
 //! * **relationship spelling**: the contract requires `^[A-Za-z][A-Za-z0-9_]*$`
 //!   and at most 32 characters, while `edges.relationship` is `varchar(100)`
-//!   with only a non-empty check; the name is passed through unchecked, so a
-//!   name outside the pattern must be dropped or mapped before validation.
+//!   with only a non-empty check; the name is passed through unchecked, and
+//!   the builder of the served document maps a name outside the pattern
+//!   before validation (`epigraph_cli::atlas_nightly::leaves::contract_edges`,
+//!   backlog 9de2ebad).
 //!
 //! The contract's **edge limit** ([`ATLAS_LEAF_EDGE_CAP`], 1,024 per leaf)
 //! IS enforced, as a second split reason (Atlas W9): a leaf of two or more

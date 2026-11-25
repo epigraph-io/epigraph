@@ -1712,7 +1712,13 @@ async fn a_maintenance_login_cannot_clear_a_retraction_but_the_definer_still_can
     let audit = unretract_rows(&pool, id).await;
     assert_eq!(audit.len(), 1, "the definer audits once: {audit:#?}");
     assert_eq!(audit[0].1["reason"], "maintenance un-retract");
-    let ledger = ledger_rows(&pool, id).await;
+    // Since 274 the owner's retraction above left a consumed `retract` grant
+    // too; this arm is about the un-retraction's.
+    let ledger: Vec<_> = ledger_rows(&pool, id)
+        .await
+        .into_iter()
+        .filter(|(kind, ..)| kind != "retract")
+        .collect();
     assert_eq!(ledger.len(), 1, "one ledger grant: {ledger:#?}");
     let (kind, granted_by, consumed_by, row) = &ledger[0];
     assert_eq!(kind, "unretract");
@@ -1740,6 +1746,254 @@ async fn ledger_rows(
     .fetch_all(pool)
     .await
     .expect("read the ledger")
+}
+
+// ---------------------------------------------------------------------------
+// Backlog 03d444a9 (migration 274): the mark arm consumes a retract grant
+// ---------------------------------------------------------------------------
+
+/// Mark `id` retracted by a direct UPDATE on `e`, naming `by` and `reason`.
+async fn mark_directly<'e, E>(e: E, id: Uuid, by: Uuid, reason: &str) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(
+        "UPDATE mass_functions \
+            SET retracted_at = now(), retracted_by = $2, retract_reason = $3 \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(by)
+    .bind(reason)
+    .execute(e)
+    .await
+    .map(|r| r.rows_affected())
+}
+
+/// Backlog 03d444a9 (migration 274): a MAINTENANCE session cannot mark a live
+/// BBA retracted outside the retract definer. Before 274 the mark arm admitted
+/// any privileged session (`epigraph_bypass()`), and a maintenance login is
+/// one, so it could set the three retract columns directly: the row left every
+/// fold, no audit row was written, and `retracted_by` was whoever it named.
+/// Since 274 a mark is admitted only by consuming a `retract` grant of the
+/// ledger. Checked on a REAL NOSUPERUSER login connected with its own
+/// password (an UPDATE, and an INSERT of a row that arrives retracted), and on
+/// the maintenance role itself; then the same login retracts through the
+/// definer (stamped as the owner), which still works, writes its one audit
+/// row, and leaves one consumed `retract` grant naming the login, the
+/// retractor and the row as stored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_login_cannot_mark_a_bba_retracted_but_the_definer_still_can(pool: PgPool) {
+    let w = world(&pool).await;
+    let id = w.owner_bba;
+    let frame = seed_frame(&pool, "maint-insert").await;
+    let (role, login) = login::maintenance_login(&pool, "t274m").await;
+
+    // The forged mark, on the login, naming a stranger as the retractor.
+    let forged = mark_directly(&login, id, w.stranger, "no audit").await;
+    // A new row that arrives retracted, on the login.
+    let forged_insert = sqlx::query(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, \
+                                     retracted_at, retracted_by, retract_reason) \
+         VALUES ($1, $2, $3, '{\"0\": 0.5, \"0,1\": 0.5}'::jsonb, now(), $4, 'no audit')",
+    )
+    .bind(w.claim)
+    .bind(frame)
+    .bind(w.owner)
+    .bind(w.stranger)
+    .execute(&login)
+    .await;
+    // The same mark on the maintenance role itself.
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let forged_role = mark_directly(&maint, id, w.stranger, "no audit").await;
+    maint.close().await;
+
+    let state_after_forgery = retract_columns(&pool, id).await;
+    let audits_after_forgery = audit_rows(&pool, id).await.len();
+    let ledger_after_forgery = ledger_rows(&pool, id).await.len();
+    let inserted_retracted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE frame_id = $1 AND retracted_at IS NOT NULL",
+    )
+    .bind(frame)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+
+    // The definer, on the same login, stamped as the BBA's owner.
+    let mut conn = login.acquire().await.expect("acquire");
+    stamp(&mut conn, &pool, w.owner).await;
+    let retracted =
+        MassFunctionRepository::retract_conn(&mut conn, id, "maintenance retract", None).await;
+    drop(conn);
+    login::drop_login(&pool, &role, login).await;
+
+    for (who, r) in [
+        ("a maintenance login", forged),
+        ("the maintenance role", forged_role),
+    ] {
+        let (code, message) = db_message(r, &format!("{who} cannot forge the mark"));
+        assert_eq!(code, "42501", "{who}: {message}");
+        assert!(message.contains("RT06"), "{who}: {message}");
+    }
+    let (code, message) = db_message(
+        forged_insert,
+        "a maintenance login cannot insert a row that arrives retracted",
+    );
+    assert_eq!(code, "42501", "{message}");
+    assert!(message.contains("RT06"), "refused by the guard: {message}");
+    assert_eq!(
+        state_after_forgery,
+        (false, None, None),
+        "the forged marks changed nothing"
+    );
+    assert_eq!(inserted_retracted, 0, "no forged retracted row exists");
+    assert_eq!(audits_after_forgery, 0);
+    assert_eq!(ledger_after_forgery, 0);
+
+    let retracted = retracted.expect("the retract definer works on a maintenance login");
+    assert_eq!(retracted.status, BbaRetractStatus::Retracted);
+    assert_eq!(retracted.arm, BbaRetractArm::Owner);
+    assert_eq!(
+        retract_columns(&pool, id).await,
+        (true, Some(w.owner), Some("maintenance retract".to_string())),
+        "the definer records the session principal as the retractor"
+    );
+    let audit = audit_rows(&pool, id).await;
+    assert_eq!(audit.len(), 1, "the definer audits once: {audit:#?}");
+    assert_eq!(audit[0].0, Some(w.owner));
+    assert_eq!(audit[0].1["reason"], "maintenance retract");
+    let ledger = ledger_rows(&pool, id).await;
+    assert_eq!(ledger.len(), 1, "one ledger grant: {ledger:#?}");
+    let (kind, granted_by, consumed_by, row) = &ledger[0];
+    assert_eq!(kind, "retract");
+    assert_eq!(granted_by, &role, "the grant names the login");
+    assert_eq!(consumed_by.as_deref(), Some(role.as_str()));
+    let row = row.as_ref().expect("the guard recorded the row");
+    assert_eq!(row["id"], id.to_string());
+    assert_eq!(
+        row["retracted_by"],
+        w.owner.to_string(),
+        "the row as stored: {row}"
+    );
+    assert_eq!(row["retract_reason"], "maintenance retract");
+}
+
+/// Backlog 03d444a9 (migration 274), the residual it leaves and what it
+/// binds: a maintenance login may call `epigraph_mf_guard_grant` itself (the
+/// maintenance-owned definer must), but the grant admits only the mark that
+/// carries the retractor and the reason the grant names, and the ledger keeps
+/// a row naming the login. A mark naming another retractor, or another reason,
+/// than the login's own grant, or one backdated before the transaction, is
+/// refused (RT06) and changes nothing. (The retractor itself is still the
+/// login's choice: 03d444a9's residual, pinned by the CALIBRATION.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_self_granted_mark_carries_exactly_the_retractor_and_reason_its_grant_names(
+    pool: PgPool,
+) {
+    let w = world(&pool).await;
+    let id = w.owner_bba;
+    let (role, login) = login::maintenance_login(&pool, "t274g").await;
+
+    const GRANT: &str =
+        "SELECT public.epigraph_mf_guard_grant('retract', ARRAY[$1]::uuid[], $2, $3)";
+    let mut attempts = Vec::new();
+    for (by, reason) in [(w.stranger, "granted"), (w.owner, "another reason")] {
+        let mut tx = login.begin().await.expect("begin");
+        sqlx::query(GRANT)
+            .bind(id)
+            .bind("granted")
+            .bind(w.owner)
+            .execute(&mut *tx)
+            .await
+            .expect("the maintenance role executes the ledger's grant function");
+        attempts.push(mark_directly(&mut *tx, id, by, reason).await);
+        drop(tx);
+    }
+    // The retractor and reason the grant names, but backdated: the mark must
+    // carry the transaction's own timestamp.
+    {
+        let mut tx = login.begin().await.expect("begin");
+        sqlx::query(GRANT)
+            .bind(id)
+            .bind("granted")
+            .bind(w.owner)
+            .execute(&mut *tx)
+            .await
+            .expect("grant");
+        attempts.push(
+            sqlx::query(
+                "UPDATE mass_functions \
+                    SET retracted_at = now() - interval '30 days', retracted_by = $2, \
+                        retract_reason = 'granted' \
+                  WHERE id = $1",
+            )
+            .bind(id)
+            .bind(w.owner)
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected()),
+        );
+        drop(tx);
+    }
+    let state_after_mismatches = retract_columns(&pool, id).await;
+
+    let mut tx = login.begin().await.expect("begin");
+    sqlx::query(GRANT)
+        .bind(id)
+        .bind("granted")
+        .bind(w.owner)
+        .execute(&mut *tx)
+        .await
+        .expect("grant");
+    let matched = mark_directly(&mut *tx, id, w.owner, "granted").await;
+    tx.commit().await.expect("commit");
+    login::drop_login(&pool, &role, login).await;
+
+    for (i, r) in attempts.into_iter().enumerate() {
+        let (code, message) = db_message(r, &format!("mismatched mark {i} is refused"));
+        assert_eq!(code, "42501", "{i}: {message}");
+        assert!(message.contains("RT06"), "{i}: {message}");
+    }
+    assert_eq!(state_after_mismatches, (false, None, None));
+    assert_eq!(
+        matched.expect("CALIBRATION: the mark the grant names is admitted"),
+        1
+    );
+    assert_eq!(
+        retract_columns(&pool, id).await,
+        (true, Some(w.owner), Some("granted".to_string()))
+    );
+    let ledger = ledger_rows(&pool, id).await;
+    assert_eq!(
+        ledger.len(),
+        1,
+        "only the committed grant is kept: {ledger:#?}"
+    );
+    assert_eq!(ledger[0].0, "retract");
+    assert_eq!(ledger[0].1, role, "the ledger names the login that granted");
+    assert_eq!(ledger[0].2.as_deref(), Some(role.as_str()));
+}
+
+/// Migration 274 keeps one admission besides the grant: a SUPERUSER session
+/// (which may disable the trigger anyway). The harness connection is one, and
+/// the fixtures of several crates mark rows on it. The same statement on the
+/// maintenance role is refused, so the admission is the superuser's alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_superuser_session_marks_directly_without_a_grant(pool: PgPool) {
+    let w = world(&pool).await;
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let refused = mark_directly(&maint, w.other_bba, w.stranger, "fixture").await;
+    maint.close().await;
+    let (code, message) = db_message(refused, "the maintenance role is refused");
+    assert_eq!(code, "42501", "{message}");
+    assert!(message.contains("RT06"), "{message}");
+
+    mark_retracted_directly(&pool, w.other_bba, w.stranger).await;
+    assert_eq!(
+        retract_columns(&pool, w.other_bba).await,
+        (true, Some(w.stranger), Some("fixture".to_string()))
+    );
+    assert!(ledger_rows(&pool, w.other_bba).await.is_empty());
 }
 
 // ---------------------------------------------------------------------------

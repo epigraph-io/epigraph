@@ -199,7 +199,7 @@ impl AdminActCeremony {
     ) -> Result<Vec<TicketPasskey>, DbError> {
         let rows = sqlx::query_as::<_, TicketPasskey>(
             "SELECT authenticator_id, credential_id, passkey, sign_count, backup_eligible, \
-                    attestation_format \
+                    attestation_format, anchor_authenticator_id \
                FROM public.epigraph_passkeys_for_act($1)",
         )
         .bind(act)
