@@ -151,20 +151,26 @@ async fn a_siblings_row_folds_cautiously_with_the_owners_assessment(pool: PgPool
         (single - cache_single).abs() < 1e-9,
         "the single-call response must be the cached value: {single} vs {cache_single}"
     );
-    // The stored global scoped belief is this response's fold. The latest
-    // one: the table's UNIQUE (frame, claim, scope_type, scope_id) key treats
-    // the global scope's NULL scope_id as distinct, so every write of it
-    // inserts a row and the upsert never conflicts.
-    let global: Option<f64> = sqlx::query_scalar(
+    // The stored global scoped belief is this response's fold. Since
+    // migration 308 the table's (frame, claim, scope_type, scope_id) key is
+    // NULLS NOT DISTINCT, so the global scope holds one row per (frame,
+    // claim) and each write replaces it: this claim was assessed more than
+    // once, and exactly one global row must be left.
+    let globals: Vec<Option<f64>> = sqlx::query_scalar(
         "SELECT pignistic_prob FROM ds_combined_beliefs \
-          WHERE claim_id = $1 AND frame_id = $2 AND scope_type = 'global' \
-          ORDER BY computed_at DESC LIMIT 1",
+          WHERE claim_id = $1 AND frame_id = $2 AND scope_type = 'global'",
     )
     .bind(claim)
     .bind(again.frame_id)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .expect("global scoped belief");
+    assert_eq!(
+        globals.len(),
+        1,
+        "one global scoped belief per (frame, claim): {globals:?}"
+    );
+    let global = globals[0];
     assert!(
         global.is_some_and(|g| (g - folded).abs() < 1e-9),
         "the stored global scoped belief must hold the response's fold: {global:?} vs {folded}"
