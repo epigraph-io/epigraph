@@ -221,6 +221,11 @@ impl MaintenancePool {
         )
         .await?;
         epigraph_db::assert_maintenance_privilege(scoped.inner(), source, context).await?;
+        // The whole pool IS the vetted maintenance DSN, so it is attached as
+        // the maintenance pool explicitly: `ScopedPool::unscoped_for_maintenance`
+        // never falls back to an unattached pool (backlog e27ad9b6).
+        let maintenance = scoped.inner().clone();
+        let scoped = scoped.with_maintenance_pool(maintenance);
         Ok(Self { scoped, source })
     }
 

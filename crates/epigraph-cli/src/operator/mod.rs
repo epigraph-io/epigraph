@@ -298,8 +298,12 @@ pub async fn connect() -> anyhow::Result<OperatorDb> {
     let mut conn = scoped.inner().acquire().await?;
     let session_user = refuse_non_maintenance(&mut conn).await?;
     drop(conn);
+    // Vetted as a maintenance login above, so the whole pool is attached as
+    // the maintenance pool: `ScopedPool::unscoped_for_maintenance` never falls
+    // back to an unattached pool (backlog e27ad9b6).
+    let maintenance = scoped.inner().clone();
     Ok(OperatorDb {
-        scoped,
+        scoped: scoped.with_maintenance_pool(maintenance),
         session_user,
     })
 }

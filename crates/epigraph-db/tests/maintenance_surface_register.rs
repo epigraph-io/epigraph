@@ -105,6 +105,13 @@ const ALLOWED: &[(&str, &str, usize)] = &[
         "PostgresJobQueue::new",
         1,
     ),
+    // ...and attaches that vetted pool as its maintenance pool, so the job
+    // handlers' leases are drawn from it (an unattached pool refuses).
+    (
+        "crates/epigraph-api/src/bin/drain_jobs.rs",
+        "with_maintenance_pool(",
+        1,
+    ),
     // The ONE registration of the job handlers, called only by drain_jobs.
     ("crates/epigraph-api/src/jobs_drain.rs", "JobRunner::new", 1),
     // `build_app_for_tests_with_admin_cascade`: a test harness that exercises
