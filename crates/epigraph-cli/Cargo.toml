@@ -236,6 +236,13 @@ name = "dekg_create_frames_assign"
 path = "tests/dekg_create_frames_assign.rs"
 required-features = ["db"]
 
+# Backlog 06385b31: `dekg migrate create-frames` and `validate` end to end
+# through the binary (frames.hypotheses is text[], not jsonb).
+[[test]]
+name = "dekg_migrate_verbs"
+path = "tests/dekg_migrate_verbs.rs"
+required-features = ["db"]
+
 [[test]]
 name = "cross_source_sweep_smoke"
 path = "tests/cross_source_sweep_smoke.rs"
