@@ -1088,6 +1088,41 @@ mod tests {
         });
     }
 
+    /// A maintenance lease refused for want of a maintenance pool (backlog
+    /// e27ad9b6) is a server fault: a 500 with a fixed body that names no
+    /// maintenance reason, and an error line on the `tenancy.maintenance`
+    /// target that does, so an operator can find the unwired path.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_missing_maintenance_pool_is_a_logged_500_naming_no_reason() {
+        let (status, body) = rendered(ApiError::from(DbError::MaintenancePoolNotAttached {
+            reason: "belief_recomputation",
+        }))
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body.contains("holds no maintenance connection"),
+            "the fixed body reaches the caller: {body}"
+        );
+        assert!(
+            !body.contains("belief_recomputation"),
+            "the maintenance reason stays in the log: {body}"
+        );
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|l| {
+                    l.contains("ERROR")
+                        && l.contains("tenancy.maintenance")
+                        && l.contains("maintenance connection refused")
+                        && l.contains("belief_recomputation")
+                })
+                .then_some(())
+                .ok_or_else(|| "no error line names the refused maintenance reason".to_string())
+        });
+    }
+
     /// Migration 122's OPL01 is a DENIAL (403), not a server fault, and its
     /// body carries the stable code and the fix; the database's text (which
     /// names the agent) stays in the log.
