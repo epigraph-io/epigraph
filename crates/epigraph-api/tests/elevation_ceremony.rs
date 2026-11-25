@@ -4255,6 +4255,18 @@ async fn standing_audits(pool: &PgPool, key: &str, id: Uuid) -> Vec<(Uuid, Value
     .expect("standing audits")
 }
 
+/// How many `platform.passkey_standing_refused` rows name `person`.
+async fn standing_audits_of(pool: &PgPool, person: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'platform.passkey_standing_refused' AND agent_id = $1",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("standing audit count")
+}
+
 /// `path` rewritten with `list`, modified `age` ago.
 fn rewrite_status(path: &std::path::Path, list: &str, age: std::time::Duration) {
     std::fs::write(path, list).expect("rewrite the status list");
@@ -4438,7 +4450,8 @@ async fn a_revoked_android_attestation_neither_elevates_nor_confirms_an_act(pool
 /// (`standing_anchor` answering `None`) -> the calibration act is refused;
 /// the `none` arm of `assertion_standing` answering Ok (the code before
 /// 09ca9ab0) -> the listed act and ticket confirm; the audit call removed ->
-/// no rows.
+/// no rows; a standing audit written on success too -> the zero count after
+/// the calibration act.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_anchored_passkey_stands_as_its_anchor_stands_and_each_refusal_is_audited(pool: PgPool) {
     use support::{android_status, AndroidKeyOpts};
@@ -4524,6 +4537,11 @@ async fn an_anchored_passkey_stands_as_its_anchor_stands_and_each_refusal_is_aud
         StatusCode::OK,
         "CALIBRATION: in good standing: {body}"
     );
+    assert_eq!(
+        standing_audits_of(&pool, p.person).await,
+        0,
+        "an assertion in good standing (the phone's elevation and act, the synced act) is not audited"
+    );
 
     // Google lists the phone's leaf. Nobody revokes the phone's row.
     rewrite_status(
@@ -4602,4 +4620,9 @@ async fn an_anchored_passkey_stands_as_its_anchor_stands_and_each_refusal_is_aud
     let (status, body) = s.ceremony(second, &mut synced).await;
     assert_eq!(status, StatusCode::OK, "CALIBRATION: {body}");
     assert!(ticket_row(&pool, second).await.2.is_some(), "a session");
+    assert_eq!(
+        standing_audits_of(&pool, p.person).await,
+        3,
+        "the three refusals only: the confirmation in good standing adds no row"
+    );
 }

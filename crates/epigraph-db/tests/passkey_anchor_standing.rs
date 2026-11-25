@@ -6,6 +6,8 @@
 //!   on a `passkey.register` act records the act's confirming passkey; an
 //!   attested one on an act, and a maintenance-enrolled one, record none; no
 //!   login changes it afterwards (ELV03); both readers serve it.
+//! * `a_written_anchor_is_replaced_by_the_enrollments_own`: an anchor named
+//!   by a direct INSERT is overwritten with the enrollment's own.
 //! * `the_285_backfill_records_the_anchor_of_every_anchored_row`: rows
 //!   written below 285 (revoked ones included) get theirs from the
 //!   enrollment's act, the attested and maintenance rows stay NULL, and 124's
@@ -438,6 +440,118 @@ async fn an_anchored_passkey_records_its_anchor_once(pool: PgPool) {
     let expected = vec![(p.passkey, None), (synced, Some(p.passkey)), (backup, None)];
     assert_eq!(by_ticket, expected);
     assert_eq!(by_act, expected);
+}
+
+/// A live, started enrollment of `person` (on `act` when given; a
+/// maintenance enrollment otherwise), its challenge stored by the app.
+async fn started_enrollment(pool: &PgPool, person: Uuid, act: Option<Uuid>) -> Uuid {
+    let e: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let e = match act {
+            Some(act) => sqlx::query_scalar(
+                "SELECT public.epigraph_create_passkey_enrollment($1, 'a second key', 'key 2', $2)",
+            )
+            .bind(person)
+            .bind(act)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the act's enrollment"),
+            None => sqlx::query_scalar(
+                "SELECT public.epigraph_create_passkey_enrollment($1, 'written', 'key w')",
+            )
+            .bind(person)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("a maintenance enrollment"),
+        };
+        (conn, e)
+    })
+    .await;
+    as_app(pool, None, "", "", |mut conn| async move {
+        sqlx::query(
+            "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+        )
+        .bind(e)
+        .execute(&mut *conn)
+        .await
+        .expect("enrollment challenge");
+        (conn, ())
+    })
+    .await;
+    e
+}
+
+/// `person`'s passkey n of attestation `format` on `enrollment`, by a direct
+/// INSERT on a privileged session that NAMES `named` as its anchor; its id.
+async fn insert_naming_anchor(
+    pool: &PgPool,
+    person: Uuid,
+    enrollment: Uuid,
+    n: u8,
+    format: &str,
+    named: Uuid,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO person_authenticators (person_agent_id, credential_id, passkey, \
+             aaguid, attestation_format, user_verified, backup_eligible, enrollment_id, \
+             anchor_authenticator_id) \
+         VALUES ($1, $2, '{}'::jsonb, gen_random_uuid(), $3, true, true, $4, $5) \
+         RETURNING id",
+    )
+    .bind(person)
+    .bind(credential(n))
+    .bind(format)
+    .bind(enrollment)
+    .bind(named)
+    .fetch_one(pool)
+    .await
+    .expect("a direct insert")
+}
+
+/// A writer cannot supply the anchor: a privileged direct INSERT (past 124's
+/// completion definer, which never names the column) that NAMES an anchor
+/// has it replaced by the enrollment's own: NULL for a `none` passkey on a
+/// maintenance enrollment (a person's first passkey; 124 opens one only for
+/// a person with no live passkey), though the named anchor is a live
+/// attested passkey (which both CHECKs admit); the act's confirming passkey
+/// for a `none` passkey on an act's enrollment, not the one named; and NULL
+/// for an attested passkey on an act's enrollment (cleared, not refused by
+/// the only-`none` CHECK).
+/// Mutations: the trigger keeping a supplied anchor (`IF ... AND
+/// NEW.anchor_authenticator_id IS NULL`) -> the maintenance row keeps the
+/// one it named; the trigger's `NEW.anchor_authenticator_id := NULL` removed
+/// -> the attested insert fails the CHECK (23514).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_written_anchor_is_replaced_by_the_enrollments_own(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let act = register_act(&pool, &p, &p.cred).await;
+    let backup = passkey_on_act(&pool, p.person, act, 2, "packed").await;
+
+    let (first, _) = human(&pool, "first passkey").await;
+    let maintenance = started_enrollment(&pool, first, None).await;
+    let written = insert_naming_anchor(&pool, first, maintenance, 3, "none", backup).await;
+    assert_eq!(
+        anchor_of(&pool, written).await,
+        None,
+        "a maintenance enrollment records no anchor, whatever was written"
+    );
+
+    let act2 = register_act(&pool, &p, &p.cred).await;
+    let on_act = started_enrollment(&pool, p.person, Some(act2)).await;
+    let written = insert_naming_anchor(&pool, p.person, on_act, 4, "none", backup).await;
+    assert_eq!(
+        anchor_of(&pool, written).await,
+        Some(p.passkey),
+        "an act's enrollment records the act's confirming passkey, not the one written"
+    );
+
+    let act3 = register_act(&pool, &p, &p.cred).await;
+    let attested = started_enrollment(&pool, p.person, Some(act3)).await;
+    let written = insert_naming_anchor(&pool, p.person, attested, 5, "packed", backup).await;
+    assert_eq!(
+        anchor_of(&pool, written).await,
+        None,
+        "an attested passkey records no anchor, whatever was written"
+    );
 }
 
 fn grant_args(holder: Uuid) -> String {
