@@ -94,10 +94,38 @@ pub(crate) async fn begin_iterative_hnsw(
 }
 
 /// Open a transaction on `conn` (a savepoint when `conn` is already in one)
+/// that runs the next statement as a pgvector ITERATIVE IVFFlat scan: sets,
+/// transaction-local, `ivfflat.iterative_scan = relaxed_order`.
+///
+/// Backlog b00aa40e. A plain IVFFlat scan reads only the `ivfflat.probes`
+/// lists (pgvector default 1) nearest the query, BEFORE the predicates the
+/// index does not encode (the visibility splice among them) run, so rows a
+/// viewer cannot read filling those lists displace the viewer's own rows from
+/// the result. The iterative scan probes further lists until `LIMIT` matching
+/// rows are found (bounded by `ivfflat.max_probes`). IVFFlat offers only
+/// `relaxed_order`: rows from a later batch of lists can be nearer than rows
+/// already returned, so the caller re-orders the page by distance (a
+/// MATERIALIZED CTE), and retries an exact scan when the page comes back
+/// short ([`exact_retry_or_first_pass`]).
+///
+/// The caller MUST roll the returned transaction back, never commit it.
+///
+/// Requires pgvector >= 0.8.0 (`ivfflat.iterative_scan`).
+pub(crate) async fn begin_iterative_ivfflat(
+    conn: &mut sqlx::PgConnection,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, DbError> {
+    let mut tx = sqlx::Connection::begin(conn).await?;
+    sqlx::query("SELECT set_config('ivfflat.iterative_scan', 'relaxed_order', true)")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// Open a transaction on `conn` (a savepoint when `conn` is already in one)
 /// that runs the next statement as an EXACT scan: transaction-local
-/// `enable_indexscan = off`, so no ordering-operator index (HNSW serves only
-/// those; it has no bitmap or index-only scan) can serve the `ORDER BY`
-/// distance, and `enable_seqscan`, `enable_bitmapscan` and `enable_sort = on`,
+/// `enable_indexscan = off`, so no ordering-operator index (HNSW and IVFFlat
+/// serve only those; neither has a bitmap or index-only scan) can serve the
+/// `ORDER BY` distance, and `enable_seqscan`, `enable_bitmapscan` and `enable_sort = on`,
 /// so a session that turned those off (as the HNSW tests do) cannot leave the
 /// planner with nothing but the index it was told to avoid. Bitmap scans stay
 /// available, so a selective scope predicate with its own index (a label GIN,

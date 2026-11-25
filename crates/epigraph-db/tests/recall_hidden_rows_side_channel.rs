@@ -22,11 +22,11 @@
 //! Scope: the five legs pinned below, which serve `recall`,
 //! `recall_with_context`'s flat seeds, the library `recall`, and the diverse
 //! pipeline's theme-coverage probe and theme candidate query (MCP
-//! `recall_with_context diverse=true` and REST `search/semantic?diverse=true`),
-//! and the write-side novelty gate (`nearest_by_embedding`, backlog b00aa40e).
-//! NOT covered here: the opt-in workflows leg of `recall`
-//! (`search_by_goal_embedding_since`, served by an IVFFlat index, whose
-//! truncation knobs differ).
+//! `recall_with_context diverse=true` and REST `search/semantic?diverse=true`);
+//! the write-side novelty gate (`nearest_by_embedding`, backlog b00aa40e); and,
+//! at the end of this file, the opt-in workflows leg of `recall`
+//! (`search_by_goal_embedding_since`), which an IVFFlat index serves, so its
+//! truncation is the `ivfflat.probes` window rather than `hnsw.ef_search`.
 //!
 //! Each test measures the viewer's page BEFORE and AFTER seeding the hidden
 //! rows, on one connection forced onto the HNSW plan (seq scans and explicit
@@ -883,4 +883,242 @@ async fn novelty_gate_neighbours_fill_past_max_scan_tuples(pool: PgPool) {
         });
     let own = before.iter().filter(|(id, _)| visible.contains(id)).count();
     assert_full_page_past_the_bound("nearest_by_embedding", &before, &after, own);
+}
+
+// ---------------------------------------------------------------------------
+// The workflows leg: `search_by_goal_embedding_since` (backlog b00aa40e)
+// ---------------------------------------------------------------------------
+//
+// `workflows.goal_embedding` is served by an IVFFlat index (migration 040,
+// `lists = 10`), not HNSW. A plain IVFFlat scan reads only the
+// `ivfflat.probes` lists (pgvector default 1) whose centroids lie nearest
+// the query, and the visibility predicate runs after it, so a viewer whose
+// workflows sit in other lists than the foreign rows nearest the query got a
+// short page, or none. These tests rebuild the index over the seeded rows (so
+// its lists are k-means clusters of them, as on a populated table), force the
+// index plan, and prove on the test connection that a scan at the default
+// probes really falls short for the viewer's own rows.
+
+/// The viewer's own workflows: far from the query (150°..155.5°), so the
+/// lists nearest the query hold only foreign rows.
+const WORKFLOWS_VISIBLE: usize = 12;
+/// Foreign workflows, all nearer the query (0°..19.75°).
+const WORKFLOWS_HIDDEN: usize = 80;
+
+/// One `visibility = 'group'` workflow owned by `group`, its goal embedded at
+/// `deg` degrees.
+async fn seed_goal_workflow(pool: &PgPool, group: Uuid, name: &str, deg: f64) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, goal, visibility, owner_group_id, \
+                                goal_embedding) \
+         VALUES ($1, $2, $3, 'group', $4, $5::vector)",
+    )
+    .bind(id)
+    .bind(format!("{name}-{id}"))
+    .bind(format!("goal of {name}"))
+    .bind(group)
+    .bind(vec_angle(deg))
+    .execute(pool)
+    .await
+    .expect("seed workflow");
+    id
+}
+
+/// The viewer and its own workflows (nearest first), then the foreign
+/// group's, and the index rebuilt over all of them.
+async fn workflow_world(pool: &PgPool) -> (Viewer, Uuid, Vec<Uuid>) {
+    let (agent, group) = fixture::seed_agent_with_group(pool, "goal-viewer").await;
+    let (_, foreign_group) = fixture::seed_agent_with_group(pool, "goal-foreign").await;
+    let viewer = Viewer::resolve(pool, agent).await.expect("resolve viewer");
+    let mut visible = Vec::with_capacity(WORKFLOWS_VISIBLE);
+    for i in 0..WORKFLOWS_VISIBLE {
+        visible.push(
+            seed_goal_workflow(pool, group, &format!("own-{i}"), 150.0 + 0.5 * i as f64).await,
+        );
+    }
+    for i in 0..WORKFLOWS_HIDDEN {
+        seed_goal_workflow(
+            pool,
+            foreign_group,
+            &format!("foreign-{i}"),
+            0.25 * i as f64,
+        )
+        .await;
+    }
+    sqlx::query("REINDEX INDEX idx_workflows_goal_embedding")
+        .execute(pool)
+        .await
+        .expect("rebuild the goal index over the seeded rows");
+    (viewer, group, visible)
+}
+
+/// Index scans this transaction has made on `idx_workflows_goal_embedding`.
+async fn goal_index_scans(conn: &mut sqlx::PgConnection) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(sum(pg_stat_get_xact_numscans(i.indexrelid)), 0)::bigint \
+         FROM pg_index i JOIN pg_class ix ON ix.oid = i.indexrelid \
+         WHERE i.indrelid = 'workflows'::regclass \
+           AND ix.relname = 'idx_workflows_goal_embedding'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("pg_stat_get_xact_numscans")
+}
+
+/// Calibrations on the forced-index connection: a plain scan at the default
+/// `ivfflat.probes`, restricted to the viewer's own group, returns FEWER than
+/// `LIMIT` rows (so a full page below can only come from the read itself),
+/// and the IVFFlat knobs are pgvector's defaults (so a green cannot come from
+/// a role- or database-level setting the code under test did not make).
+async fn assert_probes_cut_a_plain_goal_scan(conn: &mut sqlx::PgConnection, group: Uuid) {
+    let reached: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM (SELECT w.id FROM workflows w \
+         WHERE w.goal_embedding IS NOT NULL AND w.owner_group_id = $1 \
+         ORDER BY w.goal_embedding <=> '{}'::vector LIMIT {LIMIT}) s",
+        vec_angle(0.0)
+    ))
+    .bind(group)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("plain goal probe");
+    let (probes, iterative): (String, String) = sqlx::query_as(
+        "SELECT current_setting('ivfflat.probes'), current_setting('ivfflat.iterative_scan')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("read ivfflat settings");
+    assert_eq!(
+        (probes.as_str(), iterative.as_str()),
+        ("1", "off"),
+        "calibration: ivfflat knobs not at pgvector defaults on the test connection"
+    );
+    assert!(
+        reached < LIMIT,
+        "calibration: a plain IVFFlat scan at probes = 1 reached {reached} of the viewer's \
+         {WORKFLOWS_VISIBLE} workflows, so this test cannot tell a filled page from the plain \
+         scan"
+    );
+}
+
+/// A viewer whose workflows lie in other IVFFlat lists than the foreign rows
+/// nearest the query (a rare scope) still fills its page with its own
+/// workflows, nearest first. Before the fix the read was a plain scan of the
+/// one nearest list, all foreign, and returned nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rare_scope_viewer_fills_its_workflow_goal_page(pool: PgPool) {
+    use sqlx::Connection;
+    let (viewer, group, visible) = workflow_world(&pool).await;
+    let mut pooled = pool.acquire().await.expect("acquire");
+    force_index_plans(&mut pooled).await;
+    assert_probes_cut_a_plain_goal_scan(&mut pooled, group).await;
+
+    let mut tx = pooled.begin().await.expect("BEGIN");
+    let before = goal_index_scans(&mut tx).await;
+    let hits = epigraph_db::WorkflowRepository::search_by_goal_embedding_since(
+        &mut tx,
+        &viewer,
+        &vec_angle(0.0),
+        LIMIT,
+        None,
+    )
+    .await
+    .expect("search_by_goal_embedding_since");
+    let after = goal_index_scans(&mut tx).await;
+    // The call's settings are transaction-local to a savepoint it rolls back.
+    let (probes, iterative): (String, String) = sqlx::query_as(
+        "SELECT current_setting('ivfflat.probes'), current_setting('ivfflat.iterative_scan')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read ivfflat settings after the call");
+    tx.rollback().await.expect("ROLLBACK");
+
+    assert!(
+        after > before,
+        "calibration: the goal kNN was not served by idx_workflows_goal_embedding"
+    );
+    assert_eq!(
+        (probes.as_str(), iterative.as_str()),
+        ("1", "off"),
+        "the read's IVFFlat settings leaked into the caller's transaction"
+    );
+    let got: Vec<Uuid> = hits.iter().map(|h| h.workflow_id).collect();
+    assert_eq!(
+        got,
+        visible[..LIMIT as usize].to_vec(),
+        "a viewer whose workflows sit in other IVFFlat lists than the {WORKFLOWS_HIDDEN} \
+         foreign rows nearest the query must get its own {LIMIT} nearest workflows, in \
+         distance order; it got {} rows",
+        got.len()
+    );
+    assert!(
+        hits.windows(2).all(|p| p[0].similarity >= p[1].similarity),
+        "the page is in distance order: {:?}",
+        hits.iter().map(|h| h.similarity).collect::<Vec<_>>()
+    );
+}
+
+/// The iterative IVFFlat scan stops at `ivfflat.max_probes` lists. With that
+/// bound set to 1 on the session (so the iterative pass reads only the one
+/// list nearest the query, all foreign, and comes back empty), the read still
+/// fills the viewer's page, nearest first: its exact retry (`vector_scan`
+/// module doc) is what serves a viewer for whom the bound cut the scan.
+#[sqlx::test(migrations = "../../migrations")]
+async fn workflow_goal_page_fills_past_ivfflat_max_probes(pool: PgPool) {
+    let (viewer, group, visible) = workflow_world(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    force_index_plans(&mut conn).await;
+    sqlx::query("SET ivfflat.max_probes = 1")
+        .execute(&mut *conn)
+        .await
+        .expect("bound the iterative IVFFlat scan");
+
+    // Calibration: an iterative scan under that bound, restricted to the
+    // viewer's own group, really falls short.
+    let reached: i64 = {
+        use sqlx::Connection;
+        let mut tx = conn.begin().await.expect("BEGIN");
+        sqlx::query("SET LOCAL ivfflat.iterative_scan = relaxed_order")
+            .execute(&mut *tx)
+            .await
+            .expect("iterative scan");
+        let n = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM (SELECT w.id FROM workflows w \
+             WHERE w.goal_embedding IS NOT NULL AND w.owner_group_id = $1 \
+             ORDER BY w.goal_embedding <=> '{}'::vector LIMIT {LIMIT}) s",
+            vec_angle(0.0)
+        ))
+        .bind(group)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("bounded iterative goal probe");
+        tx.rollback().await.expect("ROLLBACK");
+        n
+    };
+    assert!(
+        reached < LIMIT,
+        "calibration: an iterative IVFFlat scan at max_probes = 1 reached {reached} of the \
+         viewer's {WORKFLOWS_VISIBLE} workflows, so this test cannot tell the exact retry \
+         from the iterative pass"
+    );
+
+    let hits = epigraph_db::WorkflowRepository::search_by_goal_embedding_since(
+        &mut conn,
+        &viewer,
+        &vec_angle(0.0),
+        LIMIT,
+        None,
+    )
+    .await
+    .expect("search_by_goal_embedding_since");
+    let got: Vec<Uuid> = hits.iter().map(|h| h.workflow_id).collect();
+    assert_eq!(
+        got,
+        visible[..LIMIT as usize].to_vec(),
+        "with the iterative scan bounded short of the viewer's lists, the read must still \
+         return its own {LIMIT} nearest workflows, in distance order (the exact retry); it \
+         got {} rows",
+        got.len()
+    );
 }

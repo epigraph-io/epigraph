@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 use crate::errors::DbError;
 use crate::repos::claim::{ClaimRepository, LineageHead};
+use crate::repos::vector_scan::{
+    begin_exact_vector_scan, begin_iterative_ivfflat, exact_retry_or_first_pass,
+};
 
 /// Workflow recall result (semantic or text search).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2466,21 +2469,15 @@ impl WorkflowRepository {
     /// today's behaviour.
     ///
     /// # Errors
-    /// Returns `sqlx::Error` if the database query fails.
-    pub async fn search_by_goal_embedding<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    pub async fn search_by_goal_embedding(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
-    ) -> Result<Vec<WorkflowGoalEmbeddingHit>, sqlx::Error> {
-        Self::search_by_goal_embedding_since(
-            executor,
-            viewer,
-            query_embedding_pgvector,
-            limit,
-            None,
-        )
-        .await
+    ) -> Result<Vec<WorkflowGoalEmbeddingHit>, DbError> {
+        Self::search_by_goal_embedding_since(conn, viewer, query_embedding_pgvector, limit, None)
+            .await
     }
 
     /// [`Self::search_by_goal_embedding`] plus an optional
@@ -2497,35 +2494,78 @@ impl WorkflowRepository {
     /// connection, so a member finds its group's workflows and nobody else
     /// does.
     ///
+    /// # Iterative IVFFlat scan, then exact (backlog b00aa40e)
+    ///
+    /// `idx_workflows_goal_embedding` is an IVFFlat index (migration 040). A
+    /// plain IVFFlat scan reads only the `ivfflat.probes` lists (pgvector
+    /// default 1) whose centroids lie nearest the query, and the time window
+    /// and the visibility splice run AFTER it, so a caller whose workflows sit
+    /// in other lists than the rows it cannot read got a short page or none,
+    /// and the shortfall told it that foreign workflows sit near its query.
+    /// So the statement runs as an iterative scan
+    /// ([`begin_iterative_ivfflat`]: probe further lists until `LIMIT`
+    /// matching rows are found), retried as an exact scan when it still comes
+    /// back short ([`exact_retry_or_first_pass`], as the claim kNN reads do;
+    /// `vector_scan` module doc). An iterative IVFFlat scan only runs in
+    /// relaxed order, so the page is taken in a MATERIALIZED CTE and
+    /// re-ordered by distance outside it. Both passes run in transactions
+    /// rolled back, so the settings never reach the caller's later reads.
+    ///
+    /// Takes a connection rather than an executor because the settings need
+    /// a transaction (a savepoint on a caller's own transaction).
+    ///
     /// # Errors
-    /// Returns `sqlx::Error` if the database query fails.
-    pub async fn search_by_goal_embedding_since<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    pub async fn search_by_goal_embedding_since(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
         since: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Vec<WorkflowGoalEmbeddingHit>, sqlx::Error> {
+    ) -> Result<Vec<WorkflowGoalEmbeddingHit>, DbError> {
         let sql = viewer.splice(
-            "SELECT w.id AS workflow_id, w.goal AS content, w.truth_value, \
-                    (1 - (w.goal_embedding <=> $1::vector))::float8 AS similarity, \
-                    w.created_at \
-             FROM workflows w \
-             WHERE w.goal_embedding IS NOT NULL \
-               AND ($3::timestamptz IS NULL OR w.created_at >= $3::timestamptz) \
-               /* {VISIBILITY:w} */ \
-             ORDER BY w.goal_embedding <=> $1::vector \
-             LIMIT $2",
+            "WITH page AS MATERIALIZED ( \
+                 SELECT w.id AS workflow_id, w.goal AS content, w.truth_value, \
+                        (w.goal_embedding <=> $1::vector)::float8 AS distance, \
+                        w.created_at \
+                   FROM workflows w \
+                  WHERE w.goal_embedding IS NOT NULL \
+                    AND ($3::timestamptz IS NULL OR w.created_at >= $3::timestamptz) \
+                    /* {VISIBILITY:w} */ \
+                  ORDER BY w.goal_embedding <=> $1::vector \
+                  LIMIT $2) \
+             SELECT workflow_id, content, truth_value, \
+                    (1 - distance)::float8 AS similarity, created_at \
+               FROM page \
+              ORDER BY distance, workflow_id",
             4,
         );
-        let mut q = sqlx::query_as::<_, WorkflowGoalEmbeddingHit>(&sql)
-            .bind(query_embedding_pgvector)
-            .bind(limit)
-            .bind(since);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+        // A macro, not a closure: a closure returning a query that borrows its
+        // captures, held across `.await`, makes the future not `Send`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query_as::<_, WorkflowGoalEmbeddingHit>(&sql)
+                    .bind(query_embedding_pgvector)
+                    .bind(limit)
+                    .bind(since);
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q
+            }};
         }
-        q.fetch_all(executor).await
+
+        let mut tx = begin_iterative_ivfflat(&mut *conn).await?;
+        let fetched = build!().fetch_all(&mut *tx).await;
+        tx.rollback().await?;
+        let rows = fetched?;
+        if (rows.len() as i64) < limit {
+            let mut tx = begin_exact_vector_scan(&mut *conn).await?;
+            let retried = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            return exact_retry_or_first_pass(retried, rows, "search_by_goal_embedding_since");
+        }
+        Ok(rows)
     }
 
     /// Cosine-similarity search over `workflows.goal_embedding` that keeps BOTH
