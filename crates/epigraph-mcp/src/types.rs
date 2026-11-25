@@ -3773,7 +3773,7 @@ pub struct SetDefaultGroupParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetProfileVisibilityParams {
     #[schemars(
-        description = "\"public\": your name is shown to everyone. \"group\": your name is shown only to people who share a team or community with you, and to anyone who can read a claim you or one of your agents filed. If you, or any agent ever bound to you, filed a PUBLIC claim, your name is shown to everyone whatever this setting says. Your id is always shown."
+        description = "\"public\": your name is shown to everyone. \"group\": your name is shown only to people who share a team or community with you, and to anyone who can read a claim you, or one of your agents while bound to you, filed. If you, or an agent while bound to you, made a PUBLIC assertion (a claim, evidence, a challenge, a belief mass assignment or a document ingest), your name is shown to everyone whatever this setting says; and once you, or such an agent, countersigned an authorship, everyone who can read that paper sees your name. Your id is always shown."
     )]
     pub visibility: String,
 }

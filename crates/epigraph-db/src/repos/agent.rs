@@ -250,8 +250,8 @@ pub enum ProfileVisibility {
     /// The name is shown to everyone.
     Public,
     /// The name is shown only to the readers 272's rule admits (teammates,
-    /// readers of the person's claims, and everyone once an agent ever bound
-    /// to the person filed a public claim).
+    /// readers of the person's claims, and everyone once the person or an
+    /// agent bound to it made a public assertion while bound; 288, 295, 297).
     Group,
 }
 
