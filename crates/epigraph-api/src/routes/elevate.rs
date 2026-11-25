@@ -44,8 +44,9 @@
 //! ANCHORED it, recorded on its row since migration 285 and found among the
 //! same person's live passkeys the definer serves, is itself in good
 //! standing); one that is not is refused here (403, or 503 when the list
-//! cannot be checked) with the ticket left live, and that refusal is logged,
-//! not audited in the database. The
+//! cannot be checked) with the ticket left live, and every such refusal is
+//! audited (`platform.passkey_standing_refused`, through migration 285's
+//! `epigraph_record_passkey_standing_refusal`) before it is answered. The
 //! signature counter is the definer's to check (under its row lock, with an
 //! audit row), not the library's: the challenge is started with
 //! `Passkeys::start_authentication_deferring_counter`.
@@ -121,9 +122,9 @@ use axum::{
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use epigraph_db::{
-    ActConfirmation, AdminActCeremony, AssertedCredential, CeremonyAct, CeremonyEnrollment,
-    CeremonyTicket, Confirmation, DbError, ElevationCeremony, EnrollmentAnchor, PasskeyCeremony,
-    TicketPasskey, VerifiedPasskey,
+    record_standing_refusal, ActConfirmation, AdminActCeremony, AssertedCredential, CeremonyAct,
+    CeremonyEnrollment, CeremonyTicket, Confirmation, DbError, ElevationCeremony, EnrollmentAnchor,
+    PasskeyCeremony, StandingCeremony, TicketPasskey, VerifiedPasskey,
 };
 use epigraph_passkey::{
     act_challenge as act_challenge_of, ActAnchor, AuthenticationState, LineagePasskey,
@@ -171,6 +172,58 @@ fn standing_anchor<'a>(keys: &'a [TicketPasskey], k: &TicketPasskey) -> Option<S
             passkey: &a.passkey,
             attestation_format: &a.attestation_format,
         })
+}
+
+/// The longest reason the audit definer takes, in characters.
+const STANDING_REASON_MAX: usize = 2000;
+
+/// Audit a standing refusal of `k`'s assertion in the live `ceremony` `id`
+/// (`platform.passkey_standing_refused`), then answer it
+/// ([`standing_refused`]). The audit row carries the refusal's code, and its
+/// reason only for a listed certificate (the 403's own detail): an unknown
+/// standing's reason names server paths and settings and stays in the log.
+/// An audit that cannot be written answers 500: still a refusal, the
+/// ceremony left live, and the error logged.
+async fn audited_standing_refusal(
+    conn: &mut sqlx::PgConnection,
+    ceremony: StandingCeremony,
+    id: Uuid,
+    k: &TicketPasskey,
+    refusal: &StandingRefusal,
+) -> Response {
+    let reason: Option<String> = match refusal {
+        StandingRefusal::NotInGoodStanding(why) => {
+            Some(why.chars().take(STANDING_REASON_MAX).collect())
+        }
+        StandingRefusal::Unknown(_) => None,
+    };
+    match record_standing_refusal(
+        conn,
+        ceremony,
+        id,
+        k.authenticator_id,
+        refusal.code(),
+        reason.as_deref(),
+    )
+    .await
+    {
+        Ok(_) => standing_refused(refusal),
+        Err(e) => {
+            tracing::error!(
+                target: "elevate",
+                ceremony = ceremony.as_str(),
+                id = %id,
+                code = refusal.code(),
+                error = %e,
+                "a standing refusal could not be audited; the assertion is refused"
+            );
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "the assertion was refused and the refusal could not be recorded",
+            )
+        }
+    }
 }
 
 /// The refusal of an assertion the library verified for a credential that is
@@ -924,7 +977,14 @@ pub async fn ticket_assert(
                 reason = %refusal,
                 "assertion refused: the passkey's attestation is not in good standing"
             );
-            return standing_refused(&refusal);
+            return audited_standing_refusal(
+                &mut conn,
+                StandingCeremony::Elevation,
+                id,
+                k,
+                &refusal,
+            )
+            .await;
         }
         let asserted = AssertedCredential {
             credential_id: &a.credential_id,
@@ -1370,7 +1430,14 @@ pub async fn act_assert(
                 reason = %refusal,
                 "act assertion refused: the passkey's attestation is not in good standing"
             );
-            return standing_refused(&refusal);
+            return audited_standing_refusal(
+                &mut conn,
+                StandingCeremony::AdminAct,
+                id,
+                k,
+                &refusal,
+            )
+            .await;
         }
         let asserted = AssertedCredential {
             credential_id: &a.credential_id,
