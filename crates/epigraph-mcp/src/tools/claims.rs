@@ -1994,9 +1994,12 @@ pub async fn update_with_evidence(
 
 /// Per-row authorization for MCP tools that mutate an existing claim.
 ///
-/// Mirrors `epigraph_api::middleware::scopes::require_owner_or_admin`
-/// (the HTTP layer's check on PATCH `/api/v1/claims/:id/labels`) but
-/// scoped to the MCP entry path. Two callers, two policies:
+/// The MCP counterpart of `epigraph_api::middleware::scopes::require_owner_or_admin`
+/// (the HTTP layer's check on PATCH `/api/v1/claims/:id/labels`), but it no
+/// longer mirrors it: since backlog a2d3e945 the REST gate admits only
+/// `claims:admin` or `auth.agent_id` authorship, while the arms below keep the
+/// `owner_id`/`client_id` comparison (backlog 8d878778) and the operator and
+/// delegate arms (whose reach is an open ruling). Two callers, two policies:
 ///
 /// `caller` is the request's [`crate::write_identity::WriteIdentity`] — the
 /// same principal the write that follows authors and stamps as (batch H-b,
