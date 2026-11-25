@@ -8,8 +8,9 @@
 //!
 //! The team lists (1c5edc26):
 //! * the operator arm of `epigraph_writable_teams`: a live human operator
-//!   with a live link reads its agent's list; a retired link and an unrelated
-//!   human read nothing; `epigraph_readable_teams` has no such arm;
+//!   with a live link reads its agent's list; a retired link, an unrelated
+//!   human and a human whose registration is revoked (its link still live)
+//!   read nothing; `epigraph_readable_teams` has no such arm;
 //! * 209's `epigraph_set_agent_default_group` still lets an operator set its
 //!   agent's team default on the application role (its VIS02 check asks the
 //!   AGENT's list with the operator stamped);
@@ -224,6 +225,34 @@ async fn the_writable_list_answers_the_live_operator_and_no_one_else(pool: PgPoo
             .await
             .is_empty(),
         "an unstamped application session reads nothing"
+    );
+
+    // The arm needs a LIVE human registration as well as the live link: once
+    // the human's registration is revoked (its link stays live, its team row
+    // is not verb-made and stays live), it reads nothing of the agent's list,
+    // not even the team the agent writes on its own. Mutation caught: the
+    // `epigraph_is_human_operator(epigraph_principal_id())` conjunct replaced
+    // with `true` (review finding 2).
+    let own_team = team_with(&pool, w.agent, "writer", "op-arm-agent-own").await;
+    let own_row = (own_team, "own".to_string());
+    assert!(
+        teams_as(&pool, "epigraph_app", Some(w.human), WRITABLE, w.agent)
+            .await
+            .contains(&own_row),
+        "POSITIVE CONTROL: before the revoke the live operator reads the agent's own team"
+    );
+    fixture::revoke_human_operator(&pool, w.human).await;
+    assert!(
+        super_teams(&pool, WRITABLE, w.agent)
+            .await
+            .contains(&own_row),
+        "CALIBRATION: the agent still writes its own team after its human's revoke"
+    );
+    assert!(
+        teams_as(&pool, "epigraph_app", Some(w.human), WRITABLE, w.agent)
+            .await
+            .is_empty(),
+        "a revoked human reads nothing of its agent's list, though the link is live"
     );
 }
 
