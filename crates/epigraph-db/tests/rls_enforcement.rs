@@ -1647,6 +1647,17 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_set_paper_licence` definer.",
         ),
         (
+            "agents_consent_stamp_definer_only",
+            "profile_public_consented_at IS NULL",
+            "309's RESTRICTIVE insert policy: its row-only arm (`profile_public_consented_at \
+             IS NULL`) says WHICH rows the restriction applies to (an unstamped row), and \
+             grants nothing. A restrictive policy is AND-ed with the permissive \
+             `agents_provision`, so every unstamped row is still decided by 077's arms alone; a \
+             row stamped as consented needs one of the two session arms beside it \
+             (`epigraph_bypass()` / `epigraph_definer_bypass()`), i.e. the maintenance session \
+             or a definer frame (285's setter stamps by UPDATE, not INSERT).",
+        ),
+        (
             "workflow_outcome_reports_read",
             "workflow_outcome_reports.workflow_id",
             "221's read policy: its arm `EXISTS (SELECT 1 FROM workflows w WHERE w.id = \
