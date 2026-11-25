@@ -17,8 +17,16 @@ name: Scale (advisory)
 # so a budget failure here is first a question about the runner, then about
 # the plan. The plan-shape assertions do not depend on the runner.
 #
-# `crates/epigraph-core/tests/ignored_tests_have_a_lane.rs` fails if this step
-# stops running `--ignored` for that target.
+# `crates/epigraph-db/tests/human_identity_visibility_perf.rs` is the
+# disclosure predicate's measurement harness (spec
+# docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md,
+# section 11): it bulk-loads ~2.2M claims, asserts the plan shape it can state
+# exactly (each probe uses its per-agent partial index; no plan scans a whole
+# `claims` partition) and prints the timings it does not assert. It is the
+# job's second step and runs even when the backfill step fails.
+#
+# `crates/epigraph-core/tests/ignored_tests_have_a_lane.rs` fails if either
+# step stops running `--ignored` for its target.
 on:
   schedule:
     # Mondays 09:17 UTC.
@@ -37,9 +45,10 @@ concurrency:
 # pinning by SHA defeats, so the channel stays explicit via `toolchain`.
 jobs:
   backfill-ingest-markers-scale:
-    name: backfill-ingest-markers at production scale
+    name: production-scale and measurement tests
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Two bulk-loading steps share this budget; GitHub's cap is 360.
+    timeout-minutes: 240
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -102,4 +111,11 @@ jobs:
         run: >-
           cargo test -p epigraph-cli --locked --no-fail-fast
           --test operator_backfill_ingest_markers_scale
+          -- --ignored --nocapture --test-threads=1
+      - name: human_identity_visibility_perf (measurement harness)
+        # Its own signal: run it even when the backfill step above failed.
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo test -p epigraph-db --locked --no-fail-fast
+          --test human_identity_visibility_perf
           -- --ignored --nocapture --test-threads=1
