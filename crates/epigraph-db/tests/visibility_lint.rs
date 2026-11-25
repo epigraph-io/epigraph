@@ -3763,6 +3763,20 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          reason the SQL/executor split above is stated: so a reader does not mistake the \
          motivation for the inventory.",
     ),
+    // Both `ExperimentRepository::update_status` and
+    // `ExperimentResultRepository::update_status` (one row: the lint keys on
+    // file and name).
+    (
+        "experiment.rs",
+        "update_status",
+        "Writes `status` (and the experiment's start/completion times) on one `experiments` or \
+         `experiment_results` row by id. Neither relation carries a `visibility` or \
+         `owner_group_id` column (see `get_for_hypothesis` below), so a `&Viewer` would be a \
+         parameter the statement could not spend; the API's callers gate on the hypothesis first. \
+         Widened from `&PgPool` so `bin/experiment.rs::analyze` marks the result and the \
+         experiment complete on the transaction that files the analysis and its BBA \
+         (backlog 2e64b8a2). The SQL is unchanged; every `&PgPool` caller is unchanged.",
+    ),
     (
         "experiment.rs",
         "get_for_hypothesis",
