@@ -57,6 +57,7 @@ pub mod operator_binding;
 pub mod pool;
 pub mod refusal_codes;
 pub mod repos;
+pub mod signer_admission;
 pub mod vector_literal;
 pub mod visibility;
 
