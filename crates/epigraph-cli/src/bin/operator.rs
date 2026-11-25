@@ -136,7 +136,8 @@
 //!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
 //!     epigraph-operator approve-client (--client <uuid> | --client-id <string>) \
-//!         --scope S [--scope S ...] [--approved-by <uuid>] --reason TEXT [--apply]
+//!         --scope S [--scope S ...] [--approved-by <uuid>] [--owner <uuid>] --reason TEXT [--apply]
+//!         (--owner is required for an agent client: migration 312)
 //!     epigraph-operator suspend-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator set-default-group --operator <uuid> --agent <uuid> [--agent <uuid> ...] \
@@ -739,6 +740,12 @@ enum Command {
         /// as the client's `created_by` (the prior value is in the audit row).
         #[arg(long)]
         approved_by: Option<Uuid>,
+        /// The `oauth_clients.id` of the client that answers for this one,
+        /// written as its `owner_id` (migration 312). REQUIRED for an `agent`
+        /// client (`/oauth/register` gives it none); optional otherwise, and
+        /// absent the row keeps its owner. Must be another, active client.
+        #[arg(long)]
+        owner: Option<Uuid>,
         /// Recorded in the audit row. Required, not blank.
         #[arg(long)]
         reason: String,
@@ -2768,6 +2775,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             client_id,
             scopes,
             approved_by,
+            owner,
             reason,
             apply,
         } => {
@@ -2782,6 +2790,7 @@ async fn main_inner() -> anyhow::Result<i32> {
                 &which,
                 &scopes,
                 approved_by,
+                owner,
                 &reason,
                 apply,
                 &who,
