@@ -25,6 +25,14 @@
 //! * CONTROLS: the same human under READ COMMITTED writes through the arm,
 //!   and is refused at the first statement after the revoke or the demotion;
 //!   a privileged session is exempt at every level; unarmed, nothing changes;
+//! * the CUSTODIAN half of e39af056: a principal holding
+//!   role:platform-custodian whose assignment is ENDED, or whose `valid_to`
+//!   ELAPSES, mid-transaction is refused its next cross-group write under
+//!   each of the three levels, because 123's exemption is the privileged
+//!   session alone. The same test re-bodies the exemption to 122's form (the
+//!   custodian principal arm, `epigraph_is_instance_admin` at `now()`) and
+//!   measures that the ended / elapsed custodian then WRITES, so the pin
+//!   discriminates;
 //! * the undo runbook restores 256's body byte for byte, twice.
 //!
 //! Every write that matters runs on a session whose `session_user` is the
@@ -36,9 +44,11 @@ mod fixture;
 
 use epigraph_db::Viewer;
 use sqlx::{Executor, PgPool};
+use std::time::Duration;
 use uuid::Uuid;
 
 const OPL02: &str = "OPL02";
+const CUSTODIAN: &str = "role:platform-custodian";
 
 /// The words of 310's refusal, which no other OPL02 carries.
 const DIRECT_ONLY_UNDER_RC: &str = "a write through a direct membership is admitted only under \
@@ -145,7 +155,7 @@ async fn arm(pool: &PgPool) {
 }
 
 /// What another session changes, and commits, while the writer's
-/// transaction is open.
+/// transaction is open (or, for `Elapse`, what the clock does).
 #[derive(Clone, Copy, Debug)]
 enum Change {
     Nothing,
@@ -153,6 +163,11 @@ enum Change {
     Revoke(Uuid, Uuid),
     /// `group-member set-role` of `(group, agent)` to `reader`.
     Demote(Uuid, Uuid),
+    /// `epigraph_end_role_assignment` of the assignment.
+    EndAssignment(Uuid),
+    /// Wait until the statement clock is past this many milliseconds from
+    /// the change point (a bounded assignment's `valid_to` elapses).
+    Elapse(u64),
 }
 
 /// Apply it on a maintenance session (its own transaction, committed).
@@ -191,6 +206,19 @@ async fn apply(pool: &PgPool, change: Change) {
             assert!(applied, "PREMISE: the membership was demoted");
             assert_eq!(prior.as_deref(), Some("writer"), "PREMISE: it was a writer");
         }
+        Change::EndAssignment(id) => {
+            let mut c = maint(pool).await;
+            let ended: bool =
+                sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, $2)")
+                    .bind(id)
+                    .bind("direct writer scope test end")
+                    .fetch_one(&mut *c)
+                    .await
+                    .expect("end the assignment");
+            reset(c).await;
+            assert!(ended, "PREMISE: the assignment was live and is ended now");
+        }
+        Change::Elapse(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
     }
 }
 
@@ -422,6 +450,125 @@ async fn armed_the_direct_arm_admits_only_under_read_committed(pool: PgPool) {
             });
         c.execute("ROLLBACK").await.expect("rollback");
         reset(c).await;
+    }
+}
+
+/// Grant `role:platform-custodian` to `holder` with no grantor (the fixture
+/// keeps at most one live custodian at a time, so the 123 grantor rule
+/// admits it), from 30 s ago until `valid_to_ms` milliseconds from now on
+/// the statement clock, or open-ended.
+async fn grant_custodian(pool: &PgPool, holder: Uuid, valid_to_ms: Option<i64>) -> Uuid {
+    let mut c = maint(pool).await;
+    let id: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role($1, $2, now() - interval '30 seconds', \
+                CASE WHEN $3::bigint IS NULL THEN NULL \
+                     ELSE clock_timestamp() + $3::bigint * interval '1 millisecond' END, \
+                NULL, 'direct writer scope custodian test')",
+    )
+    .bind(CUSTODIAN)
+    .bind(holder)
+    .bind(valid_to_ms)
+    .fetch_one(&mut *c)
+    .await
+    .expect("grant role:platform-custodian");
+    reset(c).await;
+    id
+}
+
+/// The custodian half of e39af056. Each case: a fresh human K granted
+/// role:platform-custodian, and another human's personal group G that K
+/// holds no membership in. On an `epigraph_app` session stamped as K (G in
+/// its stamped sets), one transaction at the level takes its snapshot while
+/// K's assignment is live; then the assignment is ENDED on another session
+/// (committed), or its `valid_to` ELAPSES; K's next write into G is refused
+/// OPL02 by the human refusal, under READ COMMITTED, REPEATABLE READ and
+/// SERIALIZABLE alike. 123's exemption is `epigraph_bypass()` alone, so
+/// holding the role relieves nothing, ended or not.
+///
+/// THE PIN DISCRIMINATES: the exemption re-bodied to 122's form (a
+/// privileged session OR `epigraph_is_instance_admin(principal)`, which
+/// reads the assignment through the snapshot at `now()`), the ended
+/// REPEATABLE READ / SERIALIZABLE custodian and the elapsed READ COMMITTED
+/// custodian each WRITE.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_custodian_ended_or_elapsed_mid_transaction_is_relieved_of_nothing(pool: PgPool) {
+    let (_, foreign) = fixture::seed_human_operator(&pool, "custodian-foreign").await;
+    arm(&pool).await;
+
+    // `Some(ms)` = bounded, elapsing `ms` after the grant; `None` = ended.
+    let run = |label: String, isolation: &'static str, elapse: Option<u64>| {
+        let pool = pool.clone();
+        async move {
+            let (k, _) = fixture::seed_human_operator(&pool, &label).await;
+            let (assignment, change) = match elapse {
+                None => {
+                    let a = grant_custodian(&pool, k, None).await;
+                    (a, Change::EndAssignment(a))
+                }
+                Some(ms) => {
+                    let a = grant_custodian(&pool, k, Some(i64::try_from(ms).unwrap())).await;
+                    (a, Change::Elapse(ms + 500))
+                }
+            };
+            let live: bool = sqlx::query_scalar(
+                "SELECT public.epigraph_live_role_assignment($1, $2, clock_timestamp()) = $3",
+            )
+            .bind(k)
+            .bind(CUSTODIAN)
+            .bind(assignment)
+            .fetch_one(&pool)
+            .await
+            .expect("live");
+            assert!(live, "PREMISE: K holds the custodian role when it begins");
+            let r = write_across(&pool, k, isolation, None, change, foreign).await;
+            if elapse.is_none() {
+                return r;
+            }
+            // Bounded: confirm it did elapse, and end nothing else (the
+            // next case grants with no grantor, so no custodian may be live).
+            let still: Option<Uuid> = sqlx::query_scalar(
+                "SELECT public.epigraph_live_role_assignment($1, $2, clock_timestamp())",
+            )
+            .bind(k)
+            .bind(CUSTODIAN)
+            .fetch_one(&pool)
+            .await
+            .expect("live after");
+            assert_eq!(still, None, "PREMISE: the assignment elapsed");
+            r
+        }
+    };
+
+    for isolation in [RC, RR, SER] {
+        for elapse in [None, Some(1500)] {
+            let what = format!(
+                "{isolation}, custodian {} mid-transaction",
+                if elapse.is_some() { "elapsed" } else { "ended" }
+            );
+            let r = run(format!("k-{isolation}-{elapse:?}"), isolation, elapse).await;
+            assert_refused(&r, OPL02, HUMAN_SCOPE, &what);
+        }
+    }
+
+    // The mutation: 122's exemption (the custodian principal arm).
+    sqlx::raw_sql(
+        "CREATE OR REPLACE FUNCTION public.epigraph_operator_scope_exempt() \
+         RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER \
+         SET search_path = public, pg_temp AS $$ \
+             SELECT public.epigraph_bypass() \
+                 OR public.epigraph_is_instance_admin(public.epigraph_principal_id()) $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-body the exemption to 122's form");
+    for (isolation, elapse) in [(RR, None), (SER, None), (RC, Some(1500))] {
+        let r = run(format!("m-{isolation}-{elapse:?}"), isolation, elapse).await;
+        assert!(
+            r.is_ok(),
+            "MUTATION: with 122's exemption the {isolation} custodian {} mid-transaction \
+             writes (so the pin above discriminates): {r:?}",
+            if elapse.is_some() { "elapsed" } else { "ended" }
+        );
     }
 }
 
