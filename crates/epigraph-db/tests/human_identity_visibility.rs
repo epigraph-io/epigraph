@@ -662,6 +662,43 @@ async fn the_consent_stamp_is_the_setters_alone(pool: PgPool) {
         Some("23514"),
         "a consent stamp on a 'group' profile"
     );
+
+    // review2 leaks#5: nor on INSERT. 077's table-level INSERT grant reaches
+    // every column, and 077's `agents_provision` refuses only `derived`, so
+    // before 307 an application session could insert a non-derived row that
+    // reads as "consented" should it later gain human evidence.
+    let insert = |stamp: bool| {
+        let id = Uuid::new_v4();
+        let pk: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+        (id, pk, stamp)
+    };
+    for (id, pk, stamp) in [insert(true), insert(false)] {
+        let mut tx = scoped.begin_as(&v).await.expect("begin_as");
+        let r = sqlx::query(
+            "INSERT INTO agents (id, public_key, agent_type, profile_visibility, \
+                                 profile_public_consented_at) \
+             VALUES ($1, $2, 'system', 'public', CASE WHEN $3 THEN now() END)",
+        )
+        .bind(id)
+        .bind(&pk)
+        .bind(stamp)
+        .execute(&mut *tx)
+        .await;
+        drop(tx);
+        if stamp {
+            let code = match r {
+                Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()),
+                other => panic!("expected a refusal of a stamped insert, got {other:?}"),
+            };
+            assert_eq!(
+                code.as_deref(),
+                Some("42501"),
+                "an application INSERT carrying a consent stamp is refused"
+            );
+        } else {
+            r.expect("CALIBRATION: the same insert with no stamp is admitted");
+        }
+    }
 }
 
 // ─── T2, T6: the public-claim arm ────────────────────────────────────────

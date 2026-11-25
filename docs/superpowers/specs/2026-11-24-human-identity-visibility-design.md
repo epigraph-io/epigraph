@@ -955,6 +955,8 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
 - **M28 `306_disclosure_details_live_rows_only.sql`** (review 2, correctness#3, transactional):
   precondition LRD01 (302's core md5); the details rule's membership EXISTS applies 164's and
   235's lapse rules (§6.1). Undo: `docs/runbooks/306-undo.sql`.
+- **M29 `307_agents_consent_stamp_insert_definer_only.sql`** (review 2, leaks#5,
+  transactional): RESTRICTIVE INSERT policy `agents_consent_stamp_definer_only` (§16.R C11).
 
 Every index file is registered in `tenancy_migration_shape.rs` (validity, one statement), and
 `::the_partial_tenancy_indexes_serve_an_explicit_visibility_qual` pins, by EXPLAIN, that each probe reaches its index with the
@@ -1733,9 +1735,11 @@ stays open.
   cleared on opt-out; the opt-in arm requires `profile_visibility = 'public' AND
   consented_at IS NOT NULL`; backfill nothing (no one has consented yet). Implemented:
   migration 283; the same consent term also gates a human's details rule, and a CHECK keeps
-  a stamp only on a `'public'` profile. Pinned by
-  `human_identity_visibility.rs::a_public_profile_without_recorded_consent_names_no_one` and
-  `::the_consent_stamp_is_the_setters_alone`.
+  a stamp only on a `'public'` profile. Migration 307 (review 2, leaks#5) extends "only the
+  setter writes it" to INSERT: a RESTRICTIVE policy refuses an application INSERT that carries a
+  stamp (077's table-level INSERT grant reached the column; 118 had narrowed UPDATE only).
+  Pinned by `human_identity_visibility.rs::a_public_profile_without_recorded_consent_names_no_one`
+  and `::the_consent_stamp_is_the_setters_alone` (UPDATE and INSERT).
 - **C2. A countersigned authorship** (§15.R3). Ruled: yes: a countersigned authorship (H's
   own act) of a paper the viewer can read names H, like a claim. Implemented: migration 297
   (296's index), read from 208's `authorship.countersigned` audit row (caller, time) so it is

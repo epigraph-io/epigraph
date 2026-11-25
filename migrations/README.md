@@ -4747,6 +4747,12 @@ restart.
   this core and may express the rule through that function. Pinned by
   `human_identity_visibility.rs::a_lapsed_membership_row_shares_no_details` (red before) and the
   LRD01 refusal. Undo: `docs/runbooks/306-undo.sql`.
+- **307**: `agents_consent_stamp_insert_definer_only` (review 2, leaks#5). A RESTRICTIVE INSERT
+  policy on `agents` refuses a non-NULL `profile_public_consented_at` unless the session is
+  maintenance or a definer frame, so 283's "only the setter writes it" holds for INSERT as well
+  as UPDATE (077's table-level INSERT grant reached the column). Pinned by
+  `human_identity_visibility.rs::the_consent_stamp_is_the_setters_alone` (the INSERT case, red
+  before). Undo: `DROP POLICY IF EXISTS agents_consent_stamp_definer_only ON public.agents`.
 
 ## `-- no-transaction` migrations
 
