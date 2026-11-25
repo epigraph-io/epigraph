@@ -1894,8 +1894,10 @@ Each item states the behaviour implemented until the operator rules.
   version (`below(N)`, refusal tests). The standing rule forbids editing 272-282 on this branch,
   so the rename needs an explicit ruling. The md5 preconditions hash `prosrc`, not file names,
   and survive the rename. Main's 272/273 re-body none of the functions this branch pins.
-- **C17. (Open, 2026-11-25: merge order, for the orchestrator / operator.) Open pull
-  requests already claim versions in 274-309.** The C15 renumber satisfies its ruling (above
+- **C17. ([RULED] 2026-11-25: option (a). Land the triage pull requests first, then re-run the
+  mechanical renumber above main's head immediately before this branch merges; no renumber
+  now for numbers claimed only by open pull requests.) Open pull requests already claim
+  versions in 274-309.** The C15 renumber satisfies its ruling (above
   origin/main's head, 273), but five open triage pull requests (#1079, #1083, #1086, #1090,
   #1095, staged together in #1089 and #1096) add migrations numbered 274, 275, 276, 284 and
   285. The file names differ, so git reports no conflict: whichever side reaches `main`
@@ -1904,7 +1906,9 @@ Each item states the behaviour implemented until the operator rules.
   the second merge's CI goes red instead of a database. Options: (a) land those pull requests
   first and renumber this branch above main's head again (the renumber tooling reruns
   mechanically); (b) land this branch first and renumber theirs; (c) renumber this branch now
-  above the highest number claimed on origin. Not changed without a ruling.
+  above the highest number claimed on origin. Ruled (a): the renumber is a blocking step
+  before merge; once `main` carries those migrations, the guard above fails this branch's
+  CI until it is done.
 - **C16. ([RULED] 2026-11-25, §16.R2: accepted; marker table is §15.F8.) Cost not ruled on.** The C6/C2 arms' share of
   the worst case (§11.2; three arms plus the countersign act since 304) and the unmeasured name
   search cost of §15.R16's placeholder rows. C12 accepted only the readable-claim arm.
@@ -2164,3 +2168,21 @@ migrations, tests) raised 16 findings, 4 blocking. Dispositions:
 | leaks#5 consent stamp writable on INSERT | Fixed: migration 309 (RESTRICTIVE INSERT policy) | §10 M29, §16.R C11 |
 | leaks#6 lint saw one fallback spelling | Fixed: structural CASE scan plus a Rust-side check, planted self-tests | §14 |
 | leaks#7 H-vs-N gaps | Fixed for the paper-author listing and the edge listing; the rest recorded with the reason they are not reachable for an unnamed H | §16a |
+
+## 21. Verification of the renumber and the merge (round 4, after ruling C15)
+
+Two audits of the renumber (274-309) and the merge of origin/main (272, 273) raised 20
+findings, 2 blocking. Dispositions (findings that passed are listed once, as passed):
+
+| Finding | Disposition | Where |
+|---|---|---|
+| Merge 9 (BLOCKING) `rls_enforcement::no_policy_arm_is_session_independent` red on 309's RESTRICTIVE INSERT arm | Fixed: a `ROW_ONLY_BY_DESIGN` entry for that one arm (it says which rows the restriction applies to and grants nothing); the target joins the gate | §10 M29 |
+| Migrations 1 (BLOCKING) PR body in the old numbers | Rewritten in the new numbers for the push; C15 recorded as ruled | PR body |
+| Migrations 2 (HIGH) open pull requests claim 274-276, 284, 285 | **[RULED] C17 (a)**: renumber again immediately before merge; guard `migration_version_unique.rs` | §16.C C17 |
+| Migrations 3 a comment said 302 where the code makes 300 | Fixed | - |
+| Migrations 4 twenty test names kept the old numbers | Renamed by +2 in one pass, with the 304 / 308 header comments and the §15 citation | §16.R2 C15 |
+| Migrations 5 the C15 deploy note named only the old 272/273 | Widened to every old 272-307 | §16.R2 C15 |
+| Merge 7 308's copy of the lapse rules was not pinned | Pinned row by row against main's roster, plus md5s of 236's twin and 273's roster; 164 and 235 mutation probes killed | §6.1 |
+| Merge 8 tenancy.md and the 273 runbook named 273 as the agent surfaces' reader | Corrected (the runbook states both builds) | - |
+| Merge 1-6, migrations 6-10 | Passed: no hunk lost; every resolution justified; numbering, preconditions, fresh-database migration and §17 consistent | - |
+| Migrations 11a-11d | Information only; no change (11b: documents outside the repository keep the old numbers on purpose) | - |
