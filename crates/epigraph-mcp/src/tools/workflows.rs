@@ -676,7 +676,7 @@ async fn find_workflow_post_embed(
     // than blanking the whole tool.
     let hierarchical_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
         WorkflowRepository::search_hierarchical_by_embedding_scored(
-            &mut *read,
+            &mut read,
             viewer,
             pgvec,
             min_truth,

@@ -5512,6 +5512,18 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "begin_iterative_ivfflat",
         ],
     ),
+    // session: as `search_by_goal_embedding_since` (above): MCP `find_workflow`'s hierarchical
+    // leg and the store-time workflow match (backlog b00aa40e).
+    (
+        "workflow.rs",
+        "search_hierarchical_by_embedding_scored",
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_ivfflat",
+        ],
+    ),
 ];
 
 fn measure_repos() -> (Measured, usize, usize, Population) {

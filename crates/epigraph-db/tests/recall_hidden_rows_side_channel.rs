@@ -1122,3 +1122,162 @@ async fn workflow_goal_page_fills_past_ivfflat_max_probes(pool: PgPool) {
         got.len()
     );
 }
+
+/// The query of the hierarchical goal reads as `&[f32]`: `vec_angle(0.0)`.
+fn goal_query() -> Vec<f32> {
+    let mut v = vec![0.0f32; 1536];
+    v[0] = 1.0;
+    v
+}
+
+/// MCP `find_workflow`'s hierarchical leg and the store-time workflow match
+/// (`search_hierarchical_by_embedding_scored`) read the same IVFFlat index
+/// with the visibility splice after it (backlog b00aa40e). A rare-scope
+/// viewer still fills its page with its own workflows, nearest first. Before
+/// the fix the read was a plain scan of the one nearest list, all foreign, and
+/// returned nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rare_scope_viewer_fills_its_scored_hierarchical_workflow_page(pool: PgPool) {
+    use sqlx::Connection;
+    let (viewer, group, visible) = workflow_world(&pool).await;
+    let mut pooled = pool.acquire().await.expect("acquire");
+    force_index_plans(&mut pooled).await;
+    assert_probes_cut_a_plain_goal_scan(&mut pooled, group).await;
+
+    let mut tx = pooled.begin().await.expect("BEGIN");
+    let before = goal_index_scans(&mut tx).await;
+    let hits = epigraph_db::WorkflowRepository::search_hierarchical_by_embedding_scored(
+        &mut tx,
+        &viewer,
+        &vec_angle(0.0),
+        0.0,
+        LIMIT,
+    )
+    .await
+    .expect("search_hierarchical_by_embedding_scored");
+    let after = goal_index_scans(&mut tx).await;
+    let (probes, iterative): (String, String) = sqlx::query_as(
+        "SELECT current_setting('ivfflat.probes'), current_setting('ivfflat.iterative_scan')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read ivfflat settings after the call");
+    tx.rollback().await.expect("ROLLBACK");
+
+    assert!(
+        after > before,
+        "calibration: the scored goal kNN was not served by idx_workflows_goal_embedding"
+    );
+    assert_eq!(
+        (probes.as_str(), iterative.as_str()),
+        ("1", "off"),
+        "the read's IVFFlat settings leaked into the caller's transaction"
+    );
+    let got: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
+    assert_eq!(
+        got,
+        visible[..LIMIT as usize].to_vec(),
+        "a viewer whose workflows sit in other IVFFlat lists than the {WORKFLOWS_HIDDEN} \
+         foreign rows nearest the query must get its own {LIMIT} nearest workflows from the \
+         scored hierarchical read, in distance order; it got {} rows",
+        got.len()
+    );
+}
+
+/// `find_hierarchical_by_embedding` (MCP and REST `find_workflow_hierarchical`)
+/// takes no viewer: row security on the caller's stamped read scopes it, and
+/// row security, like the splice, filters after a vector index scan. It is
+/// safe only because its ORDER BY (distance plus tiebreak columns) keeps the
+/// IVFFlat index from serving it (backlog b00aa40e; the function's doc). This
+/// pins both halves on an application-role read stamped as a rare-scope
+/// member, in both result shapes: the statement makes no scan of
+/// `idx_workflows_goal_embedding` even with sequential scans and sorts
+/// penalised, and the member gets its own nearest workflows in distance
+/// order. Dropping the tiebreaks (so the index serves the statement) fails
+/// both assertions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hierarchical_embedding_search_stays_exact_and_fills_a_rare_scope_page(pool: PgPool) {
+    let (viewer, group, visible) = workflow_world(&pool).await;
+    let url = fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+
+    for resolve_to_latest in [false, true] {
+        let mut read = scoped.read_as(&viewer).await.expect("stamped read");
+        force_index_plans(&mut read).await;
+        assert_probes_cut_a_plain_goal_scan(&mut read, group).await;
+        // In a transaction: the per-transaction scan counter resets at every
+        // autocommit statement.
+        let mut tx = sqlx::Connection::begin(&mut *read).await.expect("BEGIN");
+        // Calibration: on this connection a distance-only ORDER BY IS served
+        // by the goal index, so a zero below is the statement's own plan.
+        let probe_before = goal_index_scans(&mut tx).await;
+        sqlx::query(&format!(
+            "SELECT w.id FROM workflows w WHERE w.goal_embedding IS NOT NULL \
+             ORDER BY w.goal_embedding <=> '{}'::vector LIMIT {LIMIT}",
+            vec_angle(0.0)
+        ))
+        .fetch_all(&mut *tx)
+        .await
+        .expect("distance-only probe");
+        let probe_after = goal_index_scans(&mut tx).await;
+        let before = goal_index_scans(&mut tx).await;
+        let rows = epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
+            &mut *tx,
+            &goal_query(),
+            -1.0,
+            0.0,
+            LIMIT,
+            resolve_to_latest,
+        )
+        .await
+        .expect("find_hierarchical_by_embedding");
+        let after = goal_index_scans(&mut tx).await;
+        // Calibration: the stamped session reads none of the foreign rows.
+        let foreign_seen: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE owner_group_id <> $1")
+                .bind(group)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("count foreign rows on the stamped read");
+        tx.rollback().await.expect("ROLLBACK");
+        for s in [
+            "RESET enable_seqscan",
+            "RESET enable_bitmapscan",
+            "RESET enable_sort",
+        ] {
+            sqlx::query(s).execute(&mut *read).await.expect(s);
+        }
+        read.commit().await.expect("close read");
+
+        assert_eq!(
+            foreign_seen, 0,
+            "calibration: row security must hide the foreign group's workflows"
+        );
+        assert!(
+            probe_after > probe_before,
+            "calibration: a distance-only goal kNN on this connection must use \
+             idx_workflows_goal_embedding"
+        );
+        assert_eq!(
+            after, before,
+            "resolve_to_latest = {resolve_to_latest}: the statement was served by \
+             idx_workflows_goal_embedding, so row security now filters after a capped IVFFlat \
+             scan; give it the iterative scan and exact retry of search_by_goal_embedding_since"
+        );
+        let got: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(
+            got,
+            visible[..LIMIT as usize].to_vec(),
+            "resolve_to_latest = {resolve_to_latest}: a member whose workflows sit in other \
+             IVFFlat lists than the {WORKFLOWS_HIDDEN} foreign rows nearest the query must get \
+             its own {LIMIT} nearest workflows, in distance order; it got {} rows",
+            got.len()
+        );
+    }
+}
