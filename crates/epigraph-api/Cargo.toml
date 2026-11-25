@@ -14,6 +14,13 @@ genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPI
 integration = []
 tls = ["axum-server", "dep:rustls"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# A throwaway, database-free belief graph (`src/scratch/`, the
+# `epigraph-scratch` stdio binary), acting on operator ruling 9854c563.
+# epigraph-db is named for its plain types only: no `db` code, route table,
+# pool or DSN read is compiled into the scratch path, and the binary never
+# connects to anything (`tests/scratch_no_db.rs`). This is a carve-out, not a
+# reversal, of R-39: `server` stays `required-features = ["db"]`.
+scratch = ["dep:epigraph-db"]
 
 # Operator ruling R-39: the `not(feature = "db")` build is CHECK-ONLY (CI runs
 # `cargo check -p epigraph-api --no-default-features --locked`). The server is
@@ -292,6 +299,16 @@ required-features = ["tls"]
 name = "boot_tls_served"
 path = "tests/boot_tls_served.rs"
 required-features = ["tls"]
+
+# The scratch graph's tests (feature `scratch`). Run them by name, never as a
+# whole-package no-db test (most of this crate's tests need `db`):
+# `cargo test -p epigraph-api --no-default-features --features scratch --locked
+#  --lib --test scratch_store --test scratch_snapshot --test scratch_protocol
+#  --test scratch_no_db`.
+[[test]]
+name = "scratch_store"
+path = "tests/scratch_store.rs"
+required-features = ["scratch"]
 
 [lints]
 workspace = true
