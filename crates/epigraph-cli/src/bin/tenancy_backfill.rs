@@ -2859,6 +2859,16 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // no allowance, so a lapsed allowlisted row may count again: the owner is
     // load-bearing.
     ("epigraph_group_live_roster", 273),
+    // 309, 077's group-admin predicate re-bodied over 236's bound
+    // `epigraph_live_memberships(principal)`. It is the WITH CHECK of 077's
+    // `group_memberships_tenancy` and an arm of the privatization plan
+    // policies, and 181's re-key mark asks it. Its body reads no table
+    // itself: it calls the bound read, a maintenance-owned definer, so its
+    // answer does not depend on its own owner's row visibility. Under an
+    // owner that may not EXECUTE the bound read every call raises 42501 (every
+    // roster write refused: loud, fail-closed). Registered so the pre-flight
+    // sees an owner the guarded `OWNER TO` failed to set.
+    ("epigraph_is_group_admin", 309),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4064,6 +4074,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "public.epigraph_group_live_roster(uuid)",
         true,
     ),
+    // 309: 077's RLS policies on `group_memberships` and the privatization
+    // plans call it on the request DSN (policy expressions run with the
+    // invoker's privileges); without the grant every roster write is 42501.
+    (
+        "epigraph_is_group_admin",
+        "public.epigraph_is_group_admin(uuid)",
+        true,
+    ),
     // 268: the prompt-history listing calls it on the request DSN; without
     // the grant every listing is 42501.
     (
@@ -4918,7 +4936,8 @@ mod definer_register_tests {
         // both, never added to either.
         "epigraph_derived_require_tenancy",
         "epigraph_root_require_tenancy",
-        "epigraph_is_group_admin",
+        // epigraph_is_group_admin: re-stated and re-owned by 309 (moved to
+        // DEFERRED_DEFINER_FUNCTIONS with its stake).
         // epigraph_live_memberships: re-stated and re-owned by 164 (moved to
         // DEFINER_FUNCTIONS with its stake).
         "epigraph_is_group_creator",

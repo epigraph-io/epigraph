@@ -4570,6 +4570,37 @@ restart.
   binaries: a binary built with 273 calls it from `GET /api/v1/groups/:id`, `GET
   /api/v1/agents`, `GET /api/v1/agents/:id`, `GET /api/v1/agents/search` and MCP `find_agent` /
   `get_agent`, and answers 42883 there without it.
+- **309**: `membership_definers_principal_bound` (backlogs 1c5edc26, a91d957d). Two decisions in
+  one wave, both re-stating membership definers. (1) 236's `epigraph_writable_teams(agent)` and
+  `epigraph_readable_teams(agent)` answer only for the session principal, a maintenance session
+  or a superuser session, and no rows for anyone else: an application session no longer lists
+  another agent's TEAM groups by naming its id (the residual 236 recorded). The writable list
+  also answers the live human operator holding a live, not retired, operator link to the agent
+  (exactly 209's 'operator' admission to `epigraph_set_agent_default_group`, whose VIS02 check
+  asks the AGENT's list with the operator stamped; the set-default routes read the same list for
+  their response). (2) 077's `epigraph_is_group_admin(group)` is re-bodied over 236's bound
+  `epigraph_live_memberships(principal)` with `role = 'admin'`, so a lapsed admin (164's and
+  235's rules) is no longer an admin for 077's `group_memberships_tenancy` WITH CHECK, the
+  privatization plan policies or 181's re-key mark; derived memberships are never `admin`, so
+  no one gains. On 172's path (the `public` path register shrinks by one); re-owned, so it moves
+  to `tenancy_backfill`'s deferred register with its EXECUTE expectation. The privatization
+  checks about an agent other than the principal (`privatization_authority`'s other-admin count
+  and own-admin row, `is_live_group_admin_conn`) move onto 273's roster in the same change. An
+  md5 precondition refuses to apply over any other body of the three (55000). The binaries stamp
+  the principal they ask about: `list_operator_readable_teams` for its one statement,
+  `resolve_visibility_choice` (the write's author) inside a savepoint it rolls back. Not
+  changed: 081's privatization triggers still count raw admin rows (the API and job checks now
+  refuse a lapsed admin first). Pinned by `epigraph-db/tests/membership_definers_bound.rs` (the
+  operator arm, 209 on the app role, the viewer resolve and the visibility resolution on the
+  app role, the lapsed admin's predicate, re-key mark and privatization checks, the undo and
+  the precondition) and `live_memberships_principal_bound.rs` (the flipped residual test, the
+  caller list). Undo: `docs/runbooks/309-undo.sql`. **Deploy order: BINARIES FIRST**, as 236: a
+  binary that predates 309 asks both lists on an unstamped pool and gets no rows, so an
+  operated agent stops reading its human's teams and a write that names no visibility lands
+  private (silent, fail-closed). That includes every service linking an older `epigraph-db`
+  (bump its pin first). Unset `EPIGRAPH_MIGRATE_ON_BOOT` for this rollout and apply 309 with
+  `epigraph-migrate` once every such binary is upgraded. **Applied to throwaway databases only,
+  NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

@@ -13,8 +13,8 @@
 //! `Viewer::resolve` on an unstamped application pool (which now stamps the
 //! principal for its one statement and must leave nothing on the connection),
 //! the definer callers that ask about another agent (`epigraph_writable_teams`,
-//! `epigraph_readable_teams`, re-pointed at the unbound twin), and a
-//! maintenance session.
+//! `epigraph_readable_teams`, re-pointed at the unbound twin, and bound to the
+//! principal themselves since migration 309), and a maintenance session.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -304,37 +304,69 @@ async fn viewer_resolve_stamps_its_principal_for_one_statement_only(pool: PgPool
     );
 }
 
-/// The definers that ask about an agent other than the session principal go
-/// through the unbound twin, so they answer exactly as before on an unstamped
-/// application session: `epigraph_writable_teams(B)` and
-/// `epigraph_readable_teams(B)` both still name B's team (`own`).
-///
-/// KNOWN RESIDUAL, pinned on purpose: these two lists still answer B's teams
-/// (role-derived ones included) to any application session. Binding them is
-/// a separate change, which must flip this test (and `epigraph_writable_teams`
-/// then needs an arm for an agent the principal operates).
+/// The team lists ask the unbound twin for the agent they are given, and since
+/// migration 309 (backlog 1c5edc26) they are bound themselves: on an
+/// application session, unstamped or stamped as another agent A,
+/// `epigraph_writable_teams(B)` and `epigraph_readable_teams(B)` answer no
+/// rows; stamped as B they name B's team (`own`), and so does a maintenance
+/// session. Before 309 every application session read B's team here (236
+/// pinned that residual in this test).
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_team_definers_still_answer_on_an_unstamped_app_session(pool: PgPool) {
+async fn the_team_definers_answer_only_the_principal_on_an_app_session(pool: PgPool) {
+    let (a, _) = agent_with_team(&pool, "teams-a").await;
     let (b, team) = agent_with_team(&pool, "teams-b").await;
     fixture::grant_app_privileges(&pool, "epigraph_app").await;
-    let (writable, readable) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        let w: Vec<(Uuid, String)> =
-            sqlx::query_as("SELECT group_id, via FROM public.epigraph_writable_teams($1)")
-                .bind(b)
-                .fetch_all(&mut *conn)
-                .await
-                .expect("writable teams");
-        let r: Vec<(Uuid, String)> =
-            sqlx::query_as("SELECT group_id, via FROM public.epigraph_readable_teams($1)")
-                .bind(b)
-                .fetch_all(&mut *conn)
-                .await
-                .expect("readable teams");
-        (conn, (w, r))
-    })
-    .await;
-    assert_eq!(writable, vec![(team, "own".to_string())]);
-    assert_eq!(readable, vec![(team, "own".to_string())]);
+    let teams = |role: &'static str, principal: String| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, role, |mut conn| async move {
+                sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+                    .bind(&principal)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("stamp the principal");
+                let w: Vec<(Uuid, String)> =
+                    sqlx::query_as("SELECT group_id, via FROM public.epigraph_writable_teams($1)")
+                        .bind(b)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .expect("writable teams");
+                let r: Vec<(Uuid, String)> =
+                    sqlx::query_as("SELECT group_id, via FROM public.epigraph_readable_teams($1)")
+                        .bind(b)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .expect("readable teams");
+                sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("clear the principal");
+                (conn, (w, r))
+            })
+            .await
+        }
+    };
+    let own = vec![(team, "own".to_string())];
+    assert_eq!(
+        teams("epigraph_app", b.to_string()).await,
+        (own.clone(), own.clone()),
+        "POSITIVE CONTROL: stamped as B, B's own team in both lists"
+    );
+    assert_eq!(
+        teams("epigraph_maintenance", String::new()).await,
+        (own.clone(), own),
+        "a maintenance session answers for any agent"
+    );
+    assert_eq!(
+        teams("epigraph_app", String::new()).await,
+        (vec![], vec![]),
+        "an unstamped application session reads none of B's teams"
+    );
+    assert_eq!(
+        teams("epigraph_app", a.to_string()).await,
+        (vec![], vec![]),
+        "a session stamped as A reads none of B's teams"
+    );
 }
 
 /// The catalog half. The unbound twin is a maintenance-owned SECURITY DEFINER
@@ -398,6 +430,8 @@ async fn the_unbound_twin_is_maintenance_only_and_every_caller_is_listed(pool: P
     assert_eq!(
         callers("%epigraph\\_live\\_memberships(%").await,
         vec![
+            // 309: the principal's live admin rows.
+            "epigraph_is_group_admin(uuid)".to_string(),
             // 263: the caller's own groups, read for epigraph_principal_id().
             "epigraph_my_groups()".to_string(),
             "epigraph_publicize_claims(uuid[],text)".to_string(),

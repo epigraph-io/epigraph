@@ -1959,9 +1959,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "writable_teams",
         "READ through migration 206's app-callable definer `epigraph_writable_teams(agent)`: \
          the TEAM groups one agent may write into (own writer/admin membership or its live \
-         human's, D-V3). Group ids about the agent, no corpus row and no `visibility` column; \
-         the definer answers the same on any connection, so there is nothing for a viewer to \
-         narrow.",
+         human's, D-V3). Group ids about the agent, no corpus row and no `visibility` column. \
+         Since migration 309 the definer answers only the connection's principal (the agent \
+         itself or its live operator) or a maintenance session; that gate, not a viewer, is \
+         the control.",
     ),
     (
         "claim_visibility.rs",
