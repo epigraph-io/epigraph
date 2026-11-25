@@ -1153,10 +1153,14 @@ impl AtlasLeafRepository {
     }
 
     /// The raw label text of a leaf's agent and evidence nodes (Atlas W9's
-    /// real leaves): each agent's `display_name`, and each evidence row's
-    /// `raw_content`, else its `evidence_type`, for the rows `map` may draw.
-    /// An agent with no display name, and an evidence id the map may not
-    /// draw, are absent; the caller supplies a fallback label. Text is
+    /// real leaves): each agent's `display_name` as the MAP's audience may see
+    /// it (migration 286; an unnamed human is labelled by its
+    /// `oauth:<client row id>` placeholder, as a nameless service principal
+    /// is, operator ruling C7), and each evidence row's `raw_content`, else its `evidence_type`,
+    /// for the rows `map` may draw. Run it on the maintenance session (the
+    /// explicit-audience core is maintenance-only). An agent with no visible
+    /// display name, and an evidence id the map may not draw, are absent; the
+    /// caller supplies a fallback label. Text is
     /// returned as stored: clipping to the contract's label length is the
     /// document builder's.
     ///
@@ -1173,19 +1177,18 @@ impl AtlasLeafRepository {
         agent_ids: &[Uuid],
         evidence_ids: &[Uuid],
     ) -> Result<(BTreeMap<Uuid, String>, BTreeMap<Uuid, String>), DbError> {
-        let agents: BTreeMap<Uuid, String> = if agent_ids.is_empty() {
-            BTreeMap::new()
-        } else {
-            sqlx::query_as::<_, (Uuid, String)>(
-                "SELECT a.id, a.display_name FROM agents a \
-                  WHERE a.id = ANY($1) AND a.display_name IS NOT NULL",
+        // The stored document is served to the MAP's whole audience, not to
+        // the maintenance session building it (which is privileged and would
+        // name every human): names are decided for that audience by
+        // migration 286's explicit-audience core (spec 7 row H3).
+        let agents: BTreeMap<Uuid, String> =
+            crate::repos::agent_disclosure::AgentDisclosureRepository::names_for_audience(
+                &mut *conn, agent_ids, map,
             )
-            .bind(agent_ids)
-            .fetch_all(&mut *conn)
             .await?
             .into_iter()
-            .collect()
-        };
+            .filter_map(|(id, name)| name.map(|n| (id, n)))
+            .collect();
         if evidence_ids.is_empty() {
             return Ok((agents, BTreeMap::new()));
         }

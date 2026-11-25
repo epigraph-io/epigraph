@@ -14,8 +14,8 @@
 mod fixture;
 
 use epigraph_db::{
-    AgentRepository, ClaimRepository, ConsolidateMode, DbError, GroupMembershipRepository,
-    GroupRepository, RevokeOutcome, ScopedPool, SessionGucMode, Viewer,
+    AgentDisclosureRepository, AgentRepository, ClaimRepository, ConsolidateMode, DbError,
+    GroupMembershipRepository, GroupRepository, RevokeOutcome, ScopedPool, SessionGucMode, Viewer,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -242,8 +242,9 @@ async fn group_only_profile(pool: &PgPool, agent: Uuid) -> String {
     orcid
 }
 
-/// The profile detail rule (`get_public_profile`, `profile_details_visible`,
-/// and the agent-lookup copies held to one text by `visibility_lint.rs`)
+/// The profile detail rule (`get_public_profile` and the whole-row routes'
+/// `AgentDisclosureRepository::disclosure`, both migration 286's disclosure
+/// core, which no repo statement may re-spell: `visibility_lint.rs`)
 /// shows a group-only profile's details to a viewer that shares a group with
 /// the agent only while the agent's row there still COUNTS: the direct writer
 /// yes, the lapsed admin no (the raw roster read showed it). A role-derived
@@ -272,11 +273,22 @@ async fn a_profile_shows_details_to_a_live_explicit_groupmate_only(pool: PgPool)
     ];
     let mut read = scoped.read_as(&v).await.expect("read_as");
     for (who, agent, want) in cases {
-        let profile = AgentRepository::get_public_profile(&mut *read, &v, agent)
+        let profile = AgentRepository::get_public_profile(&mut *read, agent)
             .await
             .expect("get_public_profile")
             .expect("the agent exists");
-        assert_eq!(profile.properties.is_some(), want, "properties: {who}");
+        // Details are the row's `properties` (here `full_name`). Since the
+        // human-identity merge an UNNAMED human reads `properties = {}`, as a
+        // nameless service principal does (operator ruling C7), not `None`, so
+        // the withheld detail is the absent `full_name`, whichever shape.
+        assert_eq!(
+            profile
+                .properties
+                .as_ref()
+                .is_some_and(|p| p.get("full_name").is_some()),
+            want,
+            "properties: {who}"
+        );
         assert_eq!(
             profile.orcid.as_deref(),
             want.then_some(orcids[&agent].as_str()),
@@ -284,14 +296,17 @@ async fn a_profile_shows_details_to_a_live_explicit_groupmate_only(pool: PgPool)
         );
     }
     let ids: Vec<Uuid> = cases.iter().map(|c| c.1).collect();
-    let visible = AgentRepository::profile_details_visible(&mut *read, &v, &ids)
+    // The whole-row routes' detail decision (`GET /api/v1/agents`,
+    // `/api/v1/agents/:id`): `profile_details_visible` was folded into
+    // migration 286's disclosure (`details`) by the human-identity change.
+    let visible = AgentDisclosureRepository::disclosure(&mut read, &ids)
         .await
-        .expect("profile_details_visible");
+        .expect("disclosure");
     for (who, agent, want) in cases {
         assert_eq!(
-            visible.contains(&agent),
+            visible.get(&agent).is_some_and(|d| d.details),
             want,
-            "profile_details_visible: {who}"
+            "disclosure details: {who}"
         );
     }
 }

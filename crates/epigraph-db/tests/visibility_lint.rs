@@ -224,6 +224,63 @@ fn spends_viewer(body: &str) -> bool {
     })
 }
 
+/// Viewer-taking repo fns whose agent-identity statement is filtered by
+/// migration 286's `epigraph_agent_disclosure` on the caller's STAMPED
+/// session rather than by a predicate over the viewer's binds, as
+/// `(file, fn)`: an exact register, not a marker any fn may cite.
+///
+/// The disclosure rule (spec 2026-11-24-human-identity-visibility-design.md,
+/// section 6) reads the session settings `read_as` / `begin_as` stamp from
+/// the caller's viewer; an application-callable form taking the audience as
+/// binds would be a membership oracle, so it is maintenance-only, and these
+/// statements cannot spell the predicate over `$N` binds. A fn here passes
+/// the spend check only while its body carries the disclosure call
+/// ([`spends_through_disclosure`]) AND it is registered, so a new site is a
+/// visible diff, and a registered site that drops the call fails.
+const DISCLOSURE_SITES: &[(&str, &str)] = &[("agent_lookup.rs", "cards_inner")];
+
+/// The spellings of the disclosure call: the SQL function, or the Rust helper
+/// that writes its lateral.
+const DISCLOSURE_CALL_MARKERS: &[&str] = &["epigraph_agent_disclosure(", "disclosure_lateral_sql("];
+
+fn spends_through_disclosure(f: &ViewerFn) -> bool {
+    let (code, live_sql) = spend_views(&f.body);
+    DISCLOSURE_SITES
+        .iter()
+        .any(|(file, name)| f.file == *file && f.name == *name)
+        && DISCLOSURE_CALL_MARKERS
+            .iter()
+            .any(|m| live_sql.contains(m) || code.contains(m))
+}
+
+/// The disclosure register is exactly the viewer-taking fns that rely on it:
+/// each registered fn carries the call and spends its viewer no other way.
+#[test]
+fn the_disclosure_register_is_exactly_the_sites_that_rely_on_it() {
+    let fns = viewer_taking_fns();
+    let mut relying: Vec<(String, String)> = fns
+        .iter()
+        .filter(|f| {
+            (f.body.contains("sqlx::query") || f.body.contains("sqlx::raw_sql"))
+                && !spends_viewer(&f.body)
+                && !f.body.contains(EXEMPT_MARKER)
+                && spends_through_disclosure(f)
+        })
+        .map(|f| (f.file.clone(), f.name.clone()))
+        .collect();
+    relying.sort();
+    let mut want: Vec<(String, String)> = DISCLOSURE_SITES
+        .iter()
+        .map(|(f, n)| ((*f).to_string(), (*n).to_string()))
+        .collect();
+    want.sort();
+    assert_eq!(
+        relying, want,
+        "DISCLOSURE_SITES must name exactly the viewer-taking fns whose only spend is the \
+         stamped disclosure call"
+    );
+}
+
 /// One line per viewer-taking fn that runs SQL, does not spend its viewer and
 /// carries no [`EXEMPT_MARKER`] — the verdict
 /// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] asserts empty.
@@ -234,7 +291,7 @@ fn unspent_offenders(fns: &[ViewerFn]) -> Vec<String> {
             // Delegating wrapper: the callee is subject to this same lint.
             continue;
         }
-        let spends = spends_viewer(&f.body);
+        let spends = spends_viewer(&f.body) || spends_through_disclosure(f);
         let exempt = f.body.contains(EXEMPT_MARKER);
         if !spends && !exempt {
             offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
@@ -2073,6 +2130,42 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          is spent on the stamp.",
     ),
     (
+        "agent_disclosure.rs",
+        "disclosure",
+        "untenanted `agents` (077 `agents_identity` USING (true)); the decision is migration \
+         286's `epigraph_agent_disclosure`, which reads the STAMPED session (principal, groups, \
+         bypass, elevation) as its audience. A viewer argument would only invite a call on a \
+         connection stamped from someone else; an unstamped call is the anonymous outsider.",
+    ),
+    (
+        "agent_disclosure.rs",
+        "names",
+        "untenanted `agents`; the name leaves the database only through `CASE WHEN d.named`, \
+         decided by migration 286's `epigraph_agent_disclosure` on the STAMPED session. The \
+         one output reader of another agent's `display_name`; an unstamped call hides more.",
+    ),
+    (
+        "agent_disclosure.rs",
+        "redact_authored_edges",
+        "reads no table: strips the spelling of a name from every agent `authored` edge the \
+         caller already read under its viewer's splice, unless the STAMPED session is \
+         privileged (`epigraph_bypass()` / `epigraph_is_elevated()`); reads no edge itself.",
+    ),
+    (
+        "agent_disclosure.rs",
+        "names_for_audience",
+        "untenanted `agents`; for a stored Atlas document the audience is the MAP's (the public \
+         outsider, or one team's members), passed to 286's explicit-audience core, which only \
+         the maintenance session the builder holds may EXECUTE. Never the building session.",
+    ),
+    (
+        "agent.rs",
+        "set_profile_visibility_conn",
+        "WRITE through 287's definer `epigraph_set_profile_visibility` on a STAMPED \
+         transaction: the session principal's OWN `profile_visibility`, never an argument's; \
+         only a human principal may (PVS01 / PVS05), audited. The viewer is spent on the stamp.",
+    ),
+    (
         "claim_visibility.rs",
         "publicize_conn",
         "WRITE through 206's definer `epigraph_publicize_claims` on a STAMPED transaction: the \
@@ -2333,10 +2426,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent_lookup.rs",
         "author_nodes",
-        "READ of `agents` identity columns (id, display_name, agent_type, public_key) by id for \
-         the document ingest's explicit-author check, plus migration 148's `system_agents` \
-         registry (no row security, app-readable). `agents_identity` is USING (true) and \
-         GET /api/v1/agents/:id answers for any id: no tenancy columns, nothing to filter.",
+        "READ of `agents` (id, agent_type, public_key; display_name only where migration 286's \
+         `epigraph_agent_disclosure` admits the STAMPED ingest session) by id for the document \
+         ingest's explicit-author check, plus migration 148's `system_agents` registry (no row \
+         security). No tenancy columns; the name's audience is the session, not a viewer bind.",
     ),
     (
         "agent_lookup.rs",
@@ -2361,10 +2454,25 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "agent_lookup.rs",
         "exact_name_candidates",
         "READ of `agents` (id, display_name, created_at, agent_type, public_key) by folded-name \
-         equality, excluding migration 148's `system_agents` rows (no row security): the \
-         document ingest's same-name author candidates. `agents_identity` is USING (true), only \
-         the public identity columns are returned and no ORCID / ROR tier is used, so no fact \
-         depends on the caller and there is nothing for a Viewer to add.",
+         equality, excluding migration 148's `system_agents` rows: the document ingest's \
+         same-name author candidates. A match the STAMPED ingest session may not name (migration \
+         286's `epigraph_human_named_to_viewer`) is dropped before it is ranked or counted; no \
+         tenancy columns, and the audience is the session, so there is no Viewer to add.",
+    ),
+    (
+        "agent_lookup.rs",
+        "match_by_name",
+        "delegates to `match_ranked` (below): the name matcher over `agents`, which has no \
+         tenancy columns; whether a candidate's name or ORCID / ROR may match is decided by \
+         migration 286's `epigraph_agent_disclosure` on the STAMPED session the caller passes.",
+    ),
+    (
+        "agent_lookup.rs",
+        "match_ranked",
+        "READ of `agents` by folded name / ORCID / ROR: untenanted (077 `agents_identity` USING \
+         (true)); each raw match is kept only on a tier migration 286's `epigraph_agent_disclosure` \
+         admits on the STAMPED session (`named` for the name tiers, `details` for ORCID / ROR), \
+         before the LIMIT. The audience is the session; a viewer bind would be a second source.",
     ),
     (
         "system_agent.rs",
@@ -3273,14 +3381,6 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `p_open = true` to read only the attested model for the run-token grant, which never \
          returns it; a change to the audience ruling must re-check it.)",
     ),
-    (
-        "authored_by.rs",
-        "display_names",
-        "READ of `id, display_name` from the untenanted `agents` table (077's `agents_identity` \
-         policy shows every session every row; no `visibility` / `owner_group_id`), the two \
-         fields `GET /api/v1/agents/:id` answers for any id. Private; called only with ids its \
-         viewer-taking callers already resolved.",
-    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
@@ -3832,8 +3932,9 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          That migration names `AgentRepository::get_by_id` EXPLICITLY among the functions which \
          `take no Viewer and return the full row`, and points at the compensating projection -- \
          `profile_visibility` gating `properties`/`orcid`/`ror_id` -- implemented in \
-         `agent.rs::get_public_profile` (and spelled again in `agent_lookup.rs`'s card and \
-         matcher, pinned one text by `the_agent_profile_rule_is_one_text_at_every_site`). The residual that leaves is already on record \
+         `agent.rs::get_public_profile` (since the human-identity change, migration 286's \
+         `epigraph_agent_disclosure`, the one rule every identity reader calls; \
+         `agent_name_disclosure_lint.rs` reviews this fetcher's callers). The residual that leaves is already on record \
          as `D-PR17-agent-projection-enforced-at-one-call-site`; this entry does not discharge \
          it and does not re-derive it. SCOPE: conversion shard 5 widened the executor ONLY, so \
          that the five `routes/political.rs` handlers calling this beside a viewer-spliced \
@@ -4191,6 +4292,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     // transaction. The SQL of each is unchanged. Writes rest on the
     // `trace.rs::create` argument above (the control is the stamped
     // connection's `WITH CHECK`); reads say what they read.
+    (
+        "agent.rs",
+        "get_public_profile",
+        "READ of one `agents` row's Tier-B projection: untenanted (077 `agents_identity` USING \
+         (true)); the name and every detail leave the database only through migration 286's \
+         `epigraph_agent_disclosure`, which decides on the STAMPED session the executor carries \
+         (a definer that applies its own audience). An unstamped call reads as the outsider.",
+    ),
     (
         "agent.rs",
         "get_by_public_key",
@@ -5185,47 +5294,24 @@ fn call_spends_viewer(region: &str) -> bool {
 /// No entry reads content into a response without the viewer: the review
 /// found nothing to fix. Do not add an entry to make the build pass.
 const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
-    // untenanted: `agents` has no tenancy columns (`agents_identity` is USING (true)). The
-    // profile details (`profile_visibility`, ORCID, ROR, properties) are gated IN the
-    // statement by `may_see_details`, computed from the viewer's principal, groups and
-    // bypass binds: a hidden detail never leaves the database. That gate sits in a
-    // projection, not a filter, so the per-call marker (rightly) does not count it.
-    (
-        "agent.rs",
-        "get_public_profile",
-        &["sqlx::query_as(SELECT).fetch_optional"],
-    ),
-    // untenanted: as `get_public_profile`; returns which of the given `agents` ids the viewer
-    // may see the details of, the gate (`profile_visibility`, self, a shared live membership,
-    // bypass) computed IN the statement from the viewer's principal, groups and bypass binds.
-    // It returns ids it was handed, never a detail.
-    (
-        "agent.rs",
-        "profile_details_visible",
-        &["sqlx::query_as(SELECT).fetch_all"],
-    ),
-    // untenanted: the card rows (`agents`, gated per detail by `details_ok`, computed from the
-    // viewer's principal, groups and bypass binds, as in `get_public_profile`),
-    // `disclosed_roles` (the role-assignment definer), `disclosed_attachments` (269's
-    // role-attachment definer, which decides on the session in its body) and the operator
-    // humans' `agents` display names, for the carded agents.
+    // untenanted: the name matcher over `agents`, whose tiers migration 286's
+    // `epigraph_agent_disclosure` (a definer that applies its own audience) gates on the
+    // STAMPED session `find` reads on; the viewer reaches the cards and counts it calls next.
+    ("agent_lookup.rs", "find", &["Self::match_ranked"]),
+    // untenanted: the card rows (`agents`, the name gated by `named` and each detail by
+    // `details`, both from migration 286's `epigraph_agent_disclosure` on the STAMPED session,
+    // a definer that applies its own audience), `disclosed_roles` (the role-assignment
+    // definer), `disclosed_attachments` (269's role-attachment definer, which decides on the
+    // session in its body) and the operator humans' names through the one disclosure reader.
     (
         "agent_lookup.rs",
         "cards_inner",
         &[
+            "AgentDisclosureRepository::names",
             "Self::disclosed_attachments",
             "Self::disclosed_roles",
             "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_all",
         ],
-    ),
-    // untenanted: ranks `agents` by name, returning only the public identity columns (id,
-    // display name, created_at); the ORCID / ROR tiers match only where `details_ok`
-    // (viewer's principal, groups and bypass binds) admits the agent's details.
-    (
-        "agent_lookup.rs",
-        "match_ranked",
-        &["sqlx::query_as(WITH).fetch_all"],
     ),
     // untenanted: `atlas_layout_regions` and the region bundle rows; each is kept only where
     // `visible_themes` (spliced) admits a theme.
@@ -5261,11 +5347,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: `claim_themes` labels for the themes `visible_themes` admitted.
     ("atlas_layout.rs", "unplaced_themes", &["Self::theme_rows"]),
-    // untenanted: `agents` display names; the evidence labels are spliced.
+    // untenanted: `agents` display names, decided for the MAP's audience by migration
+    // 286's explicit-audience core (a definer that applies its own audience; the builder's
+    // privileged session is deliberately not the audience); the evidence labels are spliced.
     (
         "atlas_leaf.rs",
         "node_labels",
-        &["sqlx::query_as(SELECT).fetch_all"],
+        &["AgentDisclosureRepository::names_for_audience"],
     ),
     // untenanted: which of the agent ids the spliced claim and edge reads produced exist in
     // `agents`.
@@ -5293,13 +5381,21 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     (
         "authored_by.rs",
         "for_claim",
-        &["Self::bound_at", "Self::display_names", "Self::snapshot_at"],
+        &[
+            "AgentDisclosureRepository::names",
+            "Self::bound_at",
+            "Self::snapshot_at",
+        ],
     ),
     // untenanted: as `for_claim`.
     (
         "authored_by.rs",
         "for_paper_ingests",
-        &["Self::bound_at", "Self::display_names", "Self::snapshot_at"],
+        &[
+            "AgentDisclosureRepository::names",
+            "Self::bound_at",
+            "Self::snapshot_at",
+        ],
     ),
     // write: the advisory lock on (content hash, agent) and the strict insert; the existing-row
     // probe takes the viewer.
@@ -5470,7 +5566,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ("ego.rs", "edges", &["Self::untenanted_entity_types"]),
     // untenanted: `agents` display names; the claim, evidence, trace and (since migration 246
     // gave `papers` tenancy) paper reads are spliced.
-    ("ego.rs", "hydrate", &["sqlx::query_as(SELECT).fetch_all"]),
+    // untenanted / stamped: the agent nodes' names through migration 286's
+    // disclosure on the caller's stamped connection (a definer that applies
+    // its own audience).
+    ("ego.rs", "hydrate", &["AgentDisclosureRepository::names"]),
     // exempt: a write path in EXPECTED_EXEMPTIONS.
     ("evidence.rs", "delete", &["sqlx::query!(WITH).fetch_one"]),
     // write: the evidence insert, its tenancy dedup probe and its link edge, all for a parent
@@ -5963,120 +6062,70 @@ pub async fn spliced(conn: &mut PgConnection, viewer: &Viewer) -> R {
 }
 
 // ---------------------------------------------------------------------------
-// The agent public-profile rule, spelled in four statements (backlog 0e419970)
+// The agent public-profile rule lives in ONE place (backlog 0e419970)
 // ---------------------------------------------------------------------------
 
-/// The statements that spell the agent public-profile rule
-/// (`AgentRepository::get_public_profile`: the profile is public, the caller
-/// IS the agent, or shares a live group with it; or an admin), as `(file, fn)`.
-///
-/// It cannot live in one place: each of these functions takes a `&Viewer`,
-/// and [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`]
-/// requires its predicate TEXT in the function's own live SQL (a shared Rust
-/// helper returning the text would read as an unspent viewer). So the copies
-/// are pinned instead, by
-/// [`the_agent_profile_rule_is_one_text_at_every_site`].
-const PROFILE_RULE_SITES: &[(&str, &str)] = &[
-    ("agent.rs", "get_public_profile"),
-    // Backlog 761c2b05: the ORCID / ROR redaction of `GET /api/v1/agents`
-    // and `GET /api/v1/agents/:id`.
-    ("agent.rs", "profile_details_visible"),
-    ("agent_lookup.rs", "cards_inner"),
-    ("agent_lookup.rs", "match_ranked"),
-];
-
-/// The one text of the rule, over the agent alias `a`, binding the caller's
-/// principal at `$2`, its group array at `$3` and the admin bit at `$4`.
-/// Compared with every space and `\` removed, so line wrapping and Rust line
-/// continuations do not count as drift. `cards_inner` wraps it in
-/// `COALESCE(..., false)`: harmless, because every operand is non-NULL
-/// (`$4` is a bound bool, `agents.profile_visibility` is NOT NULL since
-/// migration 062, `$2::uuid IS NOT NULL AND ...` is false for a NULL
-/// principal and the `IN` is never NULL: the roster's `agent_id` is a NOT
-/// NULL column). The groupmate arm reads migration 273's live roster of each
-/// of the caller's groups (backlog f712db53), not the raw roster, so a lapsed
-/// row is not a groupmate.
-const PROFILE_RULE: &str = "($4::bool OR a.profile_visibility = 'public' \
-     OR ($2::uuid IS NOT NULL AND a.id = $2::uuid) \
-     OR a.id IN (SELECT r.agent_id FROM unnest($3::uuid[]) vg(id) \
-                 CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r))";
-
-/// The binds that give [`PROFILE_RULE`]'s placeholders their meaning, in
-/// order, right after the statement's one other bind (`$1`).
-const PROFILE_RULE_BINDS: &str = ".bind(viewer.principal()) \
-     .bind(viewer.group_bind().unwrap_or(&[])) \
-     .bind(viewer.bypass_bind())";
-
-fn squash(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_whitespace() && *c != '\\')
-        .collect()
+/// The agent public-profile rule (the profile is public, the caller IS the
+/// agent, or shares a live group with it; or an admin) used to be spelled in
+/// four repo statements, pinned one text by a test here. Since the
+/// human-identity change it lives in one place, migration 286's
+/// `epigraph_agent_disclosure`, which every identity reader calls
+/// (`agent_name_disclosure_lint.rs` keeps that list). No repo statement may
+/// spell it again: any live-SQL `profile_visibility = 'public'` is a copy.
+/// Does this function body's LIVE SQL spell the profile rule's public arm?
+fn spells_profile_rule(body: &str) -> bool {
+    let probe: String = "profile_visibility = 'public'"
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let (_, live_sql) = spend_views(body);
+    let sql: String = live_sql.chars().filter(|c| !c.is_whitespace()).collect();
+    sql.contains(&probe)
 }
 
-/// The copies of the agent public-profile rule are one text with one
-/// bind order, and no fourth copy exists. Editing any one copy (an arm
-/// dropped or added, a placeholder moved, a bind reordered), or spelling the
-/// rule in a new statement without registering it in [`PROFILE_RULE_SITES`],
-/// fails here.
 #[test]
-fn the_agent_profile_rule_is_one_text_at_every_site() {
-    let rule = squash(PROFILE_RULE);
-    let binds = squash(PROFILE_RULE_BINDS);
-    // Any live-SQL mention of the column's public arm is a copy of the rule.
-    let probe = squash("profile_visibility = 'public'");
-
-    let mut found: Vec<(String, String)> = Vec::new();
-    for f in repo_fns() {
-        let (code, live_sql) = spend_views(&f.body);
-        let sql = squash(&live_sql);
-        if !sql.contains(&probe) {
-            continue;
-        }
-        found.push((f.file.clone(), f.name.clone()));
-        assert_eq!(
-            sql.matches(&rule).count(),
-            1,
-            "{}::{} spells the agent public-profile rule differently from PROFILE_RULE \
-             (or more than once): the copies must stay one text",
-            f.file,
-            f.name
-        );
-        assert_eq!(
-            sql.matches(&probe).count(),
-            1,
-            "{}::{} names `profile_visibility = 'public'` outside the rule",
-            f.file,
-            f.name
-        );
-        let code = squash(&code);
-        assert_eq!(
-            code.matches(&binds).count(),
-            1,
-            "{}::{} does not bind principal, groups, admin as $2, $3, $4",
-            f.file,
-            f.name
-        );
-        let at = code.find(&binds).expect("just counted");
-        let ctor = code[..at]
-            .rfind("query_as")
-            .unwrap_or_else(|| panic!("{}::{}: no query_as before the binds", f.file, f.name));
-        assert_eq!(
-            code[ctor..at].matches(".bind(").count(),
-            1,
-            "{}::{}: the rule's binds must be $2..$4 (exactly one bind before them)",
-            f.file,
-            f.name
-        );
-    }
-    found.sort();
-    let mut want: Vec<(String, String)> = PROFILE_RULE_SITES
-        .iter()
-        .map(|(f, n)| ((*f).to_string(), (*n).to_string()))
-        .collect();
-    want.sort();
-    assert_eq!(
-        found, want,
-        "the statements spelling the agent public-profile rule changed: keep them one text \
-         and update PROFILE_RULE_SITES"
+fn no_repo_statement_spells_the_agent_profile_rule() {
+    let fns = repo_fns();
+    // CALIBRATION (review finding tests#8b): the scan reaches the repo layer,
+    // including the disclosure reader this rule moved into, so an empty
+    // result is not a scanner that matched nothing.
+    assert!(
+        fns.len() > 200,
+        "repo_fns() found only {} functions: the scan is not reaching the repo layer",
+        fns.len()
     );
+    assert!(
+        fns.iter().any(|f| f.name == "cards_inner"),
+        "CALIBRATION: repo_fns() reaches agent_lookup.rs::cards_inner"
+    );
+    let mut copies: Vec<String> = Vec::new();
+    for f in fns {
+        if spells_profile_rule(&f.body) {
+            copies.push(format!("{}::{}", f.file, f.name));
+        }
+    }
+    copies.sort();
+    copies.dedup();
+    assert!(
+        copies.is_empty(),
+        "these repo statements spell the agent profile rule instead of calling migration \
+         286's `epigraph_agent_disclosure`: {copies:?}"
+    );
+}
+
+/// The probe of [`no_repo_statement_spells_the_agent_profile_rule`] is not
+/// vacuous (review finding tests#8b): a planted copy, in any whitespace, is
+/// found through the same `spend_views` + probe path; the same text in a
+/// Rust comment is not live SQL and is not.
+#[test]
+fn the_profile_rule_probe_finds_a_planted_copy() {
+    assert!(spells_profile_rule(
+        r#"{ sqlx::query("SELECT a.id FROM agents a WHERE a.profile_visibility   =  'public' OR $1") }"#
+    ));
+    assert!(spells_profile_rule(
+        "{ sqlx::query(\"SELECT 1 FROM agents a WHERE a.profile_visibility='public'\") }"
+    ));
+    assert!(!spells_profile_rule(
+        "{ // profile_visibility = 'public' was the old rule\n sqlx::query(\"SELECT 1\") }"
+    ));
 }

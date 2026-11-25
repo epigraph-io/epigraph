@@ -844,7 +844,9 @@ fn repo_file(rel: &str) -> String {
 async fn the_285_undo_returns_the_catalog_below_285(pool: PgPool) {
     migrate(&pool, &up_to(284)).await;
     let before = catalog(&pool).await;
-    migrate(&pool, &MIGRATOR).await;
+    // Through 285 only, not the head: a later migration's objects are not
+    // 285's to undo, and would show up as a difference from "below 285".
+    migrate(&pool, &up_to(285)).await;
     let through = catalog(&pool).await;
     let added: BTreeSet<&String> = through.difference(&before).collect();
     for name in [

@@ -350,12 +350,16 @@ pub async fn epistemic_profile(
     })?;
 
     // Verify agent exists
-    let agent = AgentRepository::get_by_id(&mut *read, agent_id)
+    let mut agent = AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
+    // The name as the caller may see it (migration 286, on this stamped
+    // connection; spec 7 row F1).
+    let d = epigraph_db::AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
+    epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());
 
     // Fetch claims
     let claims = PoliticalRepository::get_agent_profile_claims(&mut *read, &viewer, id).await?;
@@ -501,10 +505,13 @@ pub async fn compare_agents(
     for id in ids {
         let agent_id = AgentId::from_uuid(id);
 
-        let agent = match AgentRepository::get_by_id(&mut *read, agent_id).await? {
+        let mut agent = match AgentRepository::get_by_id(&mut *read, agent_id).await? {
             Some(a) => a,
             None => continue, // Skip missing agents
         };
+        // As `epistemic_profile` (spec 7 row F2).
+        let d = epigraph_db::AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
+        epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());
 
         let claims = PoliticalRepository::get_agent_profile_claims(&mut *read, &viewer, id).await?;
         let claim_count = claims.len();

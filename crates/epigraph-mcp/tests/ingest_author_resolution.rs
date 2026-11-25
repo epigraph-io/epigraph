@@ -85,15 +85,23 @@ async fn superuser_server(pool: &PgPool) -> EpiGraphMcpFull {
         .with_scoped_pool(scoped)
 }
 
-/// A registered human operator with `display_name = name`.
+/// A registered human operator with `display_name = name`, opted in to a
+/// public profile as the self-service setter records it (`'public'` plus a
+/// consent stamp): these tests resolve an author by name as a stranger, which
+/// the disclosure rule admits only for a NAMED person. Before migration 297
+/// (operator ruling C11) the shared fixture's column default `'public'` was
+/// read as that opt-in; it never was consent, and now names no one.
 async fn human_named(pool: &PgPool, name: &str) -> Uuid {
     let (h, _) = fixture::seed_human_operator(pool, "author-resolution").await;
-    sqlx::query("UPDATE agents SET display_name = $2 WHERE id = $1")
-        .bind(h)
-        .bind(name)
-        .execute(pool)
-        .await
-        .expect("name the human");
+    sqlx::query(
+        "UPDATE agents SET display_name = $2, profile_visibility = 'public', \
+                profile_public_consented_at = now() WHERE id = $1",
+    )
+    .bind(h)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("name the human");
     h
 }
 
@@ -2554,4 +2562,84 @@ async fn a_trace_less_claim_the_ingester_filed_itself_is_found_never_created(poo
         "the ingest found the claim; it did not create it"
     );
     assert_eq!(creator_doi(&pool, id).await, None);
+}
+
+/// Row A6 (finding L3): a stranger's name-only re-ingest that spells an
+/// UNNAMED person's name exactly is not told which id an earlier ingester
+/// attached under that spelling: the same-spelling half of
+/// `also_at_position` lists only agents named to the re-ingester. The
+/// person's authorship sits at ANOTHER position, so the same-position half
+/// (the accepted DOI-plus-position exposure) cannot list it either way.
+/// CALIBRATION: once the person opts in, the same re-ingest lists it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_name_only_reingest_cannot_find_an_unnamed_person_by_spelling(pool: PgPool) {
+    let attacher = app_role_server(&pool).await;
+    let name = "Philippa Unlisted";
+    let person = human_named(&pool, name).await;
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'group', profile_public_consented_at = NULL \
+          WHERE id = $1",
+    )
+    .bind(person)
+    .execute(&pool)
+    .await
+    .expect("group profile");
+    let reingest = |doi: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let viewer = fixture::public_viewer(&pool).await;
+            let stranger = app_role_server(&pool).await;
+            let json = text(
+                &tools::ingestion::do_ingest_document(
+                    &stranger,
+                    &viewer,
+                    &doc(doi, json!([{"name": name}])),
+                    None,
+                    epigraph_core::VisibilityChoice::Public,
+                )
+                .await
+                .expect("the stranger's re-ingest"),
+            );
+            json["authors"][0]["also_at_position"].clone()
+        }
+    };
+
+    let doi = "10.9999/unnamed-by-spelling";
+    ingest_wait(
+        &attacher,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "Someone Else"}, {"name": name, "agent_id": person.to_string()}]),
+        ),
+    )
+    .await;
+    let also = reingest(doi).await;
+    assert!(
+        !also
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|v| v == &json!(person.to_string())),
+        "the spelling found the unnamed person: {also}"
+    );
+
+    // The opt-in as the self-service setter writes it: 'public' with a
+    // consent stamp (migration 297, operator ruling C11).
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'public', profile_public_consented_at = now() \
+          WHERE id = $1",
+    )
+    .bind(person)
+    .execute(&pool)
+    .await
+    .expect("opt in");
+    let also = reingest(doi).await;
+    assert!(
+        also.as_array()
+            .into_iter()
+            .flatten()
+            .any(|v| v == &json!(person.to_string())),
+        "CALIBRATION: a named person is reported by spelling: {also}"
+    );
 }

@@ -3536,7 +3536,7 @@ pub struct InviteToGroupParams {
     #[schemars(description = "UUID of the team group (you must be a live admin of it).")]
     pub group_id: String,
     #[schemars(
-        description = "UUID of the Person to invite: a registered human operator's own agent id, not an agent they operate."
+        description = "UUID of the Person to invite: their own agent id, not an agent they operate. The invite does not check that it is a person; only a registered Person can accept."
     )]
     pub agent_id: String,
     #[schemars(
@@ -3768,6 +3768,14 @@ pub struct SetDefaultGroupParams {
     )]
     #[serde(default)]
     pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetProfileVisibilityParams {
+    #[schemars(
+        description = "\"public\": your name is shown to everyone. \"group\": your name is shown only to people who share a team or community with you, and to anyone who can read a claim you, or one of your agents while bound to you, filed. If you, or an agent while bound to you, made a PUBLIC assertion (a claim, a challenge, an assessment of a claim or a document ingest), your name is shown to everyone whatever this setting says; and once you, or such an agent, countersigned an authorship, everyone who can read that paper sees your name. Your id is always shown."
+    )]
+    pub visibility: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -12,6 +12,8 @@
 //! * a freshly registered `client_type:"agent"` client is `pending` with zero
 //!   granted scopes and cannot obtain a token at all.
 
+mod viewer_fixture;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -985,4 +987,254 @@ async fn a_revoked_author_packet_is_a_403_that_leaks_no_ids(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(live, 0, "the revocation must stand");
+}
+
+// =============================================================================
+// REAL NAMES AT PROVISIONING (human-identity visibility spec, section 9; T7)
+// =============================================================================
+
+/// Insert an unlinked OAuth client of `client_type` with `client_id`,
+/// `client_name` and `legal_contact_email`, as its creator would. Returns the
+/// row id.
+async fn seed_client(
+    pool: &PgPool,
+    client_id: &str,
+    client_type: &str,
+    client_name: &str,
+    email: Option<&str>,
+) -> Uuid {
+    let legal_name = (client_type == "service").then_some("Fixture Org");
+    sqlx::query_scalar(
+        r#"INSERT INTO oauth_clients
+            (client_id, client_name, client_type, allowed_scopes, granted_scopes, status,
+             agent_id, legal_entity_name, legal_contact_email)
+           VALUES ($1, $2, $3, ARRAY['claims:read'], ARRAY['claims:read'], 'active', NULL, $4, $5)
+           RETURNING id"#,
+    )
+    .bind(client_id)
+    .bind(client_name)
+    .bind(client_type)
+    .bind(legal_name)
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .expect("seed oauth client")
+}
+
+/// Materialise the client's principal through the real
+/// `AgentRepository::ensure_for_client` and return the new row's
+/// `(display_name, profile_visibility)`.
+async fn mint(pool: &PgPool, row: Uuid) -> (Option<String>, String) {
+    let mut tx = pool.begin().await.expect("begin");
+    let agent = epigraph_db::AgentRepository::ensure_for_client(&mut tx, row)
+        .await
+        .expect("ensure_for_client");
+    tx.commit().await.expect("commit");
+    sqlx::query_as("SELECT display_name, profile_visibility FROM agents WHERE id = $1")
+        .bind(agent.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("agent row")
+}
+
+fn placeholder(row: Uuid) -> Option<String> {
+    Some(format!("oauth:{row}"))
+}
+
+/// Operator ruling 1: a provider-provisioned person (`<provider>:<subject>`
+/// client id, the shape only `provision_external_user_client` mints) gets the
+/// name the provider asserted, and starts as `'group'` (not consented).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_provider_human_principal_is_named_as_the_provider_asserted(pool: PgPool) {
+    let row = seed_client(
+        &pool,
+        "google:subject-ada",
+        "human",
+        "Ada Example",
+        Some("ada.example@example.test"),
+    )
+    .await;
+    let (name, profile) = mint(&pool, row).await;
+    assert_eq!(name.as_deref(), Some("Ada Example"));
+    assert_eq!(profile, "group", "a new human principal is not opted in");
+
+    // Finding L14: the real name never reaches the world-readable events log.
+    let leaked: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE payload::text LIKE '%Ada Example%'")
+            .fetch_one(&pool)
+            .await
+            .expect("events");
+    assert_eq!(
+        leaked, 0,
+        "provisioning wrote the person's name into an event"
+    );
+}
+
+/// Production mints on the APPLICATION role (`oauth/token.rs` on the request
+/// DSN), not on the harness superuser: the name read must work there, or
+/// every first sign-in of a person fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_provider_human_is_named_when_minted_on_the_application_role(pool: PgPool) {
+    let row = seed_client(
+        &pool,
+        "google:subject-app-role",
+        "human",
+        "Cora Approle",
+        Some("cora.approle@example.test"),
+    )
+    .await;
+    let app = viewer_fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let mut tx = app.begin().await.expect("begin");
+    let who: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("session_user");
+    assert_eq!(who, "epigraph_app", "CALIBRATION: minted on the app role");
+    let agent = epigraph_db::AgentRepository::ensure_for_client(&mut tx, row)
+        .await
+        .expect("ensure_for_client on the application role");
+    tx.commit().await.expect("commit");
+    let (name, profile): (Option<String>, String) =
+        sqlx::query_as("SELECT display_name, profile_visibility FROM agents WHERE id = $1")
+            .bind(agent.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("agent row");
+    assert_eq!(name.as_deref(), Some("Cora Approle"));
+    assert_eq!(profile, "group");
+}
+
+/// The email guard: `provision.rs` stores `identity.name.unwrap_or(email)` as
+/// `client_name`, so a provider client with no asserted name carries the
+/// EMAIL there. An email (any letter case), a name with an `@`, and a
+/// spoofable name (bidi override) never become `display_name`: the placeholder
+/// stays.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_provider_client_without_a_usable_name_keeps_the_placeholder(pool: PgPool) {
+    let email = "ben.example@example.test";
+    for (i, client_name) in [
+        email,
+        "BEN.EXAMPLE@EXAMPLE.TEST",
+        "ben at example@x.test",
+        "Ben\u{202E}elpmaxE",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = seed_client(
+            &pool,
+            &format!("google:subject-ben-{i}"),
+            "human",
+            client_name,
+            Some(email),
+        )
+        .await;
+        let (name, profile) = mint(&pool, row).await;
+        assert_eq!(
+            name,
+            placeholder(row),
+            "{client_name:?} must not be the name"
+        );
+        assert_eq!(profile, "group");
+    }
+}
+
+/// A DCR or legacy human registration chooses its own `client_name`, so it
+/// is never a provider-asserted name; a service keeps today's behaviour,
+/// including the `'public'` profile of a non-human.
+#[sqlx::test(migrations = "../../migrations")]
+async fn registered_humans_and_services_keep_the_placeholder(pool: PgPool) {
+    let dcr = seed_client(
+        &pool,
+        "epigraph_0123456789abcdef0123456789abcdef",
+        "human",
+        "Ada Example",
+        None,
+    )
+    .await;
+    let (name, profile) = mint(&pool, dcr).await;
+    assert_eq!(
+        name,
+        placeholder(dcr),
+        "a self-registered human chose that name"
+    );
+    assert_eq!(profile, "group", "it is still a human principal");
+
+    let svc = seed_client(
+        &pool,
+        "epigraph_fedcba9876543210fedcba9876543210",
+        "service",
+        "Ada Example",
+        Some("ops@example.test"),
+    )
+    .await;
+    let (name, profile) = mint(&pool, svc).await;
+    assert_eq!(name, placeholder(svc));
+    assert_eq!(profile, "public", "a non-human keeps the public default");
+}
+
+/// The discriminator (spec section 9.2) is "the client id contains `:`",
+/// which only provider provisioning mints. Pins every production creator of
+/// `oauth_clients` rows and how each forms its id, so a new creator, or one
+/// that starts minting `:` ids, fails here instead of silently naming
+/// self-registered clients after their chosen `client_name`.
+#[test]
+fn only_provider_provisioning_mints_a_colon_client_id() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    };
+    let mut creators = Vec::new();
+    for dir in [
+        "epigraph-api/src",
+        "epigraph-cli/src",
+        "epigraph-db/src",
+        "epigraph-mcp/src",
+    ] {
+        let mut stack = vec![root.join(dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("read_dir").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let src = std::fs::read_to_string(&p).expect("read");
+                    if src.contains("OAuthClientRepository::create(") {
+                        let rel = p
+                            .strip_prefix(&root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned();
+                        creators.push(rel);
+                    }
+                }
+            }
+        }
+    }
+    creators.sort();
+    assert_eq!(
+        creators,
+        [
+            "epigraph-api/src/oauth/providers/provision.rs",
+            "epigraph-api/src/oauth/register.rs",
+            "epigraph-api/src/routes/agents.rs",
+            "epigraph-cli/src/bootstrap.rs",
+        ],
+        "the production creators of oauth_clients rows changed: review how the new one forms \
+         its client_id against AgentRepository::ensure_for_client's ':' discriminator"
+    );
+    assert!(read("epigraph-api/src/oauth/providers/provision.rs")
+        .contains(r#"format!("{}:{}", provider.name(), identity.subject)"#));
+    for rel in [
+        "epigraph-api/src/oauth/register.rs",
+        "epigraph-cli/src/bootstrap.rs",
+    ] {
+        let src = read(rel);
+        assert!(
+            src.contains(r#"format!("epigraph_{}", hex::encode(rng.gen::<[u8; 16]>()))"#),
+            "{rel} must keep minting epigraph_<hex> ids"
+        );
+    }
+    // routes/agents.rs creates `agent` clients, whose id is the hex public key.
+    assert!(read("epigraph-api/src/routes/agents.rs").contains("\"agent\","));
 }

@@ -25,9 +25,11 @@
 //!   `&PgPool` and read only `agents`, which is `USING (true)`, so stamping
 //!   them would narrow nothing. Since backlog 761c2b05 both `get_agent` and
 //!   `list_agents` take a `Viewer` and null `orcid` / `ror_id` for a profile
-//!   the caller may not see, through
-//!   `AgentRepository::profile_details_visible` on a [`AppState::read_as`]
-//!   connection; `get_agent`'s one row read moved onto that connection too.
+//!   the caller may not see and, since the human-identity rule (migration
+//!   286), `display_name` for a human the caller may not see named, through
+//!   `epigraph_db::AgentDisclosureRepository::disclosure` on a
+//!   [`AppState::read_as`] connection (the decision reads the stamp);
+//!   `get_agent`'s one row read moved onto that connection too.
 //!   `list_agents`' `?public_key=` lookup (backlog 8946be59) reads its one row
 //!   on that connection as well and applies the same profile redaction.
 //!
@@ -43,7 +45,10 @@ use axum::{
 };
 use epigraph_core::{Agent, AgentId};
 #[cfg(feature = "db")]
-use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, OAuthClientRepository};
+use epigraph_db::{
+    AgentDisclosureRepository, AgentRepository, ClaimRepository, EdgeRepository,
+    OAuthClientRepository,
+};
 #[cfg(feature = "db")]
 use epigraph_engine::reputation::{ClaimOutcome, ReputationCalculator};
 use serde::{Deserialize, Serialize};
@@ -253,6 +258,7 @@ fn check_key_kind_proof(
 pub async fn create_agent(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): ViewerExtractor,
     Json(request): Json<CreateAgentRequest>,
 ) -> Result<Json<AgentResponse>, ApiError> {
     // Enforce scope unconditionally: a request with no AuthContext is refused
@@ -390,6 +396,23 @@ pub async fn create_agent(
     // `claims:admin` sees them; everyone else gets null, even for a public
     // profile, whose detail `GET /api/v1/agents/:id` still serves. A newly
     // created row echoes what this caller just supplied.
+    //
+    // The NAME of an existing human principal is gated the same way the agent
+    // routes gate it (migration 286's disclosure, on a connection stamped from
+    // the caller's viewer): a find-hit must not read back a name
+    // `GET /api/v1/agents/:id` would null.
+    let mut created_agent = created_agent;
+    if !was_created {
+        let mut read = scoped_read(&state, &viewer, "create_agent").await?;
+        let d = AgentDisclosureRepository::disclosure(&mut read, &[new_agent_id])
+            .await?
+            .remove(&new_agent_id)
+            .unwrap_or_default();
+        if !d.named {
+            // Shown as a nameless service principal is (operator ruling C7).
+            created_agent.display_name = d.unnamed_as;
+        }
+    }
     let mut response: AgentResponse = created_agent.into();
     if !was_created
         && auth.agent_id != Some(new_agent_id)
@@ -431,11 +454,15 @@ pub async fn create_agent(
 ///
 /// GET /agents/:id
 ///
-/// Returns agent information including their public key. `orcid` and `ror_id`
-/// are profile DETAILS: null unless the caller may see the agent's profile
-/// (backlog 761c2b05; [`AgentRepository::profile_details_visible`], the rule
-/// `get_public_profile` and `find_agent` apply), so a private profile's ORCID
-/// is not disclosed to every authenticated caller.
+/// Returns agent information including their public key. `display_name` is,
+/// for a human principal the caller may not see named, the `oauth:<client
+/// row id>` placeholder a nameless service principal carries (operator
+/// ruling C7), and `orcid` /
+/// `ror_id` are profile DETAILS, null unless the caller may see the agent's
+/// profile: both decided by migration 286's `epigraph_agent_disclosure` on the
+/// caller's stamped connection (`epigraph_db::AgentDisclosureRepository`, the
+/// rule `get_public_profile` and `find_agent` apply). An unnamed human
+/// answers 200 like any agent; its id is never withheld.
 #[cfg(feature = "db")]
 pub async fn get_agent(
     State(state): State<AppState>,
@@ -453,9 +480,9 @@ pub async fn get_agent(
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
-    let visible = AgentRepository::profile_details_visible(&mut *read, &viewer, &[id]).await?;
+    let d = AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
 
-    Ok(Json(redact_profile(agent.into(), &visible)))
+    Ok(Json(redact_profile(agent, &d)))
 }
 
 /// A viewer-stamped connection for `handler`, or the 500 every scoped read in
@@ -479,18 +506,19 @@ async fn scoped_read<'s>(
     })
 }
 
-/// Null `orcid` and `ror_id` unless the agent's profile is in `visible`
-/// (backlog 761c2b05).
+/// The agent as the caller may see it: `display_name` replaced by the
+/// placeholder a nameless service principal carries when not `named`
+/// (operator ruling C7), `orcid` / `ror_id` nulled when not `details`. An id
+/// missing from `d` (never true for a row just read) is treated as fully
+/// hidden: the fail direction is closed.
 #[cfg(feature = "db")]
 fn redact_profile(
-    mut response: AgentResponse,
-    visible: &std::collections::HashSet<Uuid>,
+    mut agent: Agent,
+    d: &std::collections::HashMap<Uuid, epigraph_db::Disclosure>,
 ) -> AgentResponse {
-    if !visible.contains(&response.id) {
-        response.orcid = None;
-        response.ror_id = None;
-    }
-    response
+    let disclosure = d.get(&Uuid::from(agent.id)).cloned().unwrap_or_default();
+    epigraph_db::redact_agent(&mut agent, disclosure);
+    agent.into()
 }
 
 /// Get an agent by ID (placeholder - no database)
@@ -577,12 +605,12 @@ pub async fn list_agents(
         // 761c2b05): a key lookup must not disclose an ORCID / ROR id the
         // list would null.
         let ids: Vec<Uuid> = found.iter().map(|a| Uuid::from(a.id)).collect();
-        let visible = AgentRepository::profile_details_visible(&mut *read, &viewer, &ids).await?;
+        let d = AgentDisclosureRepository::disclosure(&mut read, &ids).await?;
         // One match at most, so `offset` past it pages to nothing.
         let items: Vec<AgentResponse> = found
             .into_iter()
             .skip(usize::try_from(offset).unwrap_or(usize::MAX))
-            .map(|a| redact_profile(a.into(), &visible))
+            .map(|a| redact_profile(a, &d))
             .collect();
         return Ok(Json(PaginatedResponse {
             items,
@@ -608,11 +636,8 @@ pub async fn list_agents(
     // cannot skip it.
     let ids: Vec<Uuid> = agents.iter().map(|a| Uuid::from(a.id)).collect();
     let mut read = scoped_read(&state, &viewer, "list_agents").await?;
-    let visible = AgentRepository::profile_details_visible(&mut *read, &viewer, &ids).await?;
-    let items: Vec<AgentResponse> = agents
-        .into_iter()
-        .map(|a| redact_profile(a.into(), &visible))
-        .collect();
+    let d = AgentDisclosureRepository::disclosure(&mut read, &ids).await?;
+    let items: Vec<AgentResponse> = agents.into_iter().map(|a| redact_profile(a, &d)).collect();
 
     Ok(Json(PaginatedResponse {
         items,
@@ -765,6 +790,13 @@ pub async fn get_agent_reputation(
     // 2. Fetch all claims by this agent. THIS is the read the stamp bears on:
     // `claims` is FORCEd and `get_by_agent` splices the viewer.
     let claims = ClaimRepository::get_by_agent(&mut *read, &viewer, agent_id).await?;
+
+    // The name as the caller may see it (migration 286, on this stamped
+    // connection): an unnamed human's reputation reads as a nameless service
+    // principal's (its `oauth:<client row id>` placeholder, ruling C7).
+    let mut agent = agent;
+    let d = AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
+    epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());
 
     // 3. Convert claims into ClaimOutcome structs
     let now = chrono::Utc::now();
@@ -999,6 +1031,13 @@ pub struct UpdateAgentRequest {
     pub ror_id: Option<String>,
     /// Reserved for future use
     pub properties: Option<serde_json::Value>,
+    /// Whether the caller's OWN name is shown to everyone: `"public"` or
+    /// `"group"` (migration 287, human-identity visibility spec section 8).
+    /// Accepted only on the caller's own record, `claims:admin` included, and
+    /// only from a person (a human principal); written through the audited
+    /// self-service definer on a viewer-stamped transaction.
+    #[serde(default)]
+    pub profile_visibility: Option<String>,
 }
 
 /// Update an existing agent
@@ -1013,9 +1052,15 @@ pub struct UpdateAgentRequest {
 /// - 401 Unauthorized: Missing or invalid Bearer token
 /// - 403 Forbidden: Missing scope or caller is not the target agent
 /// - 404 Not Found: Agent does not exist
+///
+/// `profile_visibility` (`"public"` | `"group"`) is self only: 403 when `:id`
+/// is not the caller, even for `claims:admin`, and 403 (PVS05) when the caller
+/// is not a person; 400 for another value. A request carrying only that field
+/// writes nothing else.
 #[cfg(feature = "db")]
 pub async fn update_agent(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateAgentRequest>,
@@ -1031,6 +1076,41 @@ pub async fn update_agent(
     if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
         return Err(ApiError::Forbidden {
             reason: "can only mutate your own agent record".into(),
+        });
+    }
+
+    // The profile opt-in is the person's own act ("set BY H"): no admin arm.
+    // Checked before anything is written.
+    let profile = match request.profile_visibility.as_deref() {
+        None => None,
+        Some(_) if auth.agent_id != Some(id) => {
+            return Err(ApiError::Forbidden {
+                reason: "profile_visibility is set only on your own record, by you".into(),
+            });
+        }
+        Some(raw) => Some(epigraph_db::ProfileVisibility::parse(raw).ok_or_else(|| {
+            ApiError::ValidationError {
+                field: "profile_visibility".to_string(),
+                reason: format!("{raw:?} is neither 'public' nor 'group'"),
+            }
+        })?),
+    };
+
+    // The opt-in is its own act, never mixed with a profile edit: the edit
+    // and the opt-in run on different connections (the edit on the request
+    // pool, the opt-in through 287's definer on a stamped transaction), so a
+    // mixed body could commit the edit and then have the opt-in refused
+    // (review finding correctness#7). Refused before anything is written.
+    let profile_only = profile.is_some();
+    if profile_only
+        && (request.display_name.is_some()
+            || request.labels.is_some()
+            || request.orcid.is_some()
+            || request.ror_id.is_some())
+    {
+        return Err(ApiError::ValidationError {
+            field: "profile_visibility".to_string(),
+            reason: "set profile_visibility in a request of its own, with no other field".into(),
         });
     }
 
@@ -1058,7 +1138,21 @@ pub async fn update_agent(
         agent.ror_id = Some(ror_id);
     }
 
-    let updated = AgentRepository::update(&state.db_pool, &agent).await?;
+    let updated = if profile_only {
+        agent
+    } else {
+        AgentRepository::update(&state.db_pool, &agent).await?
+    };
+
+    // Migration 287's definer, on a transaction stamped from the caller: the
+    // target is the stamped principal, which is `id` (checked above).
+    if let Some(visibility) = profile {
+        let mut tx = state.write_as(&viewer, "update_agent").await?;
+        AgentRepository::set_profile_visibility_conn(&mut tx, visibility).await?;
+        tx.commit().await.map_err(|e| ApiError::InternalError {
+            message: format!("Failed to commit the profile visibility: {e}"),
+        })?;
+    }
 
     // Record provenance when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {
@@ -1079,7 +1173,13 @@ pub async fn update_agent(
         }
     }
 
-    Ok(Json(updated.into()))
+    // The response is redacted by the rule on the caller's stamped read, as
+    // `get_agent` is (review findings correctness#7, leaks#4a, tests#2): a
+    // `claims:admin` caller editing ANOTHER agent must not be handed a name
+    // the rule withholds from it, whatever the edit's own connection admits.
+    let mut read = scoped_read(&state, &viewer, "update_agent").await?;
+    let d = AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
+    Ok(Json(redact_profile(updated, &d)))
 }
 
 /// Update an existing agent (placeholder - no database)

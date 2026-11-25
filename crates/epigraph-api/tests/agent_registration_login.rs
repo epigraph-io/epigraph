@@ -16,6 +16,8 @@
 //! client with the provision scopes, so "no active client" below is the rule
 //! and not a fixture that could never provision one.
 
+mod viewer_fixture;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -212,7 +214,16 @@ async fn registering_an_agent_mints_no_login_without_an_admin_login_request(pool
 /// them, and a fresh registration echoes what its caller supplied.
 #[sqlx::test(migrations = "../../migrations")]
 async fn re_registering_an_existing_key_does_not_read_back_its_private_profile(pool: PgPool) {
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    // A find-hit's NAME is decided on a viewer-stamped connection (migration
+    // 286's disclosure, `create_agent`), so the state carries a ScopedPool as
+    // the server's does; `AppState::read_as` refuses without one.
+    let scoped = epigraph_db::ScopedPool::connect(
+        &viewer_fixture::database_url_for(&pool).await,
+        epigraph_db::SessionGucMode::Session,
+    )
+    .await
+    .expect("ScopedPool");
+    let state = AppState::with_scoped_pool(scoped, ApiConfig::default());
     let (writer_client, writer_agent) = caller(&pool, "outsider-writer").await;
     let writer = token(&state, writer_client, writer_agent, &["agents:write"]);
     let (admin_client, admin_agent) = caller(&pool, "admin").await;

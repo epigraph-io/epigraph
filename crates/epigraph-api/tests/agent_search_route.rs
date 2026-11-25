@@ -100,6 +100,19 @@ async fn the_route_serves_the_callers_view_with_the_operator_human_for_every_rea
     let outsider = named(&pool, "outsider").await;
     let human = named(&pool, "Talia Brennick").await;
     viewer_fixture::make_human_operator(&pool, human).await;
+    // The person opted in to a public profile, as the self-service setter
+    // records it, so every reader may see the NAME too (the id is shown to
+    // every reader whatever the profile). Before migration 297 (operator
+    // ruling C11) the fixture's column default 'public' was read as that
+    // opt-in; it never was consent.
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'public', profile_public_consented_at = now() \
+          WHERE id = $1",
+    )
+    .bind(human)
+    .execute(&pool)
+    .await
+    .expect("opt in");
     let linked = named(&pool, "helper-bot").await;
     let (with_note, note_group) = viewer_fixture::seed_agent_with_group(&pool, "helper-bot").await;
     sqlx::query("UPDATE agents SET display_name = 'helper-bot' WHERE id = $1")

@@ -233,3 +233,233 @@ async fn the_public_key_lookup_redacts_a_private_profile_like_the_list(pool: PgP
     );
     assert_eq!(row["ror_id"], "03yrm5c26", "the agent itself: {row}");
 }
+
+// ─── PUT /api/v1/agents/:id { profile_visibility } (migration 287) ───────
+
+async fn put(
+    state: &AppState,
+    caller: Uuid,
+    scopes: &[&str],
+    id: Uuid,
+    body: Value,
+) -> (StatusCode, Value) {
+    let token = common::mint_token_with_agent(scopes, caller);
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/v1/agents/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn profile_of(pool: &PgPool, agent: Uuid) -> String {
+    sqlx::query_scalar("SELECT profile_visibility FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("profile")
+}
+
+/// A person sets their own profile visibility with the PUT field alone; the
+/// set is audited. `claims:admin` does not let anyone else set it (self only,
+/// "set BY H"), a non-person caller is refused by the definer (PVS05), and a
+/// value other than public / group is a 400. No refusal changes anything.
+#[sqlx::test(migrations = "../../migrations")]
+async fn put_profile_visibility_is_self_service_for_a_person_only(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, _) = viewer_fixture::seed_human_operator(&pool, "put-person").await;
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(h)
+        .execute(&pool)
+        .await
+        .expect("start from group");
+
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], h.to_string(), "{body}");
+    assert_eq!(profile_of(&pool, h).await, "public");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'agent.profile_visibility_set' AND agent_id = $1",
+    )
+    .bind(h)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 1);
+
+    // An admin may edit other agents' records, but never this field.
+    let (admin, _) = viewer_fixture::seed_agent_with_group(&pool, "put-admin").await;
+    let (status, body) = put(
+        &state,
+        admin,
+        &["agents:write", "claims:admin"],
+        h,
+        serde_json::json!({"profile_visibility": "group"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        profile_of(&pool, h).await,
+        "public",
+        "an admin cannot set it"
+    );
+
+    // A non-person caller on its own record: the definer refuses (PVS05).
+    let (bot, _) = viewer_fixture::seed_agent_with_group(&pool, "put-bot").await;
+    let before = profile_of(&pool, bot).await;
+    let (status, body) = put(
+        &state,
+        bot,
+        &["agents:write"],
+        bot,
+        serde_json::json!({"profile_visibility": "group"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(profile_of(&pool, bot).await, before, "nothing changed");
+
+    // A value the column does not admit.
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "team"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(profile_of(&pool, h).await, "public", "nothing changed");
+}
+
+/// Review finding correctness#7: a body that mixes `profile_visibility` with a
+/// profile edit is refused 400 before anything is written (the edit and the
+/// opt-in run on different connections, so a mixed body could commit one and
+/// fail the other).
+#[sqlx::test(migrations = "../../migrations")]
+async fn put_profile_visibility_mixed_with_an_edit_is_refused_whole(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, _) = viewer_fixture::seed_human_operator(&pool, "put-mixed").await;
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'group', labels = ARRAY['before'] WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("start");
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "public", "labels": ["after"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        profile_of(&pool, h).await,
+        "group",
+        "the opt-in was not applied"
+    );
+    let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM agents WHERE id = $1")
+        .bind(h)
+        .fetch_one(&pool)
+        .await
+        .expect("labels");
+    assert_eq!(
+        labels,
+        vec!["before".to_string()],
+        "the edit was not applied"
+    );
+    // CALIBRATION: the field alone is accepted.
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Review findings correctness#7, leaks#4a, tests#2: a non-privileged
+/// `claims:admin` caller's edit of ANOTHER agent never answers with a name
+/// the rule withholds from it. Today the edit itself moves no row on the
+/// unstamped pool (spec R8) and answers 404; the response is also redacted
+/// on the caller's stamped read, so a later fix of R8 cannot start echoing
+/// the name. CALIBRATION: the admin's GET of the person shows only the
+/// `oauth:<client row id>` placeholder (operator ruling C7; the admin is not
+/// privileged), and the person's own PUT echoes its name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_edit_of_an_unnamed_person_answers_no_name(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, _) = viewer_fixture::seed_human_operator(&pool, "put-unnamed").await;
+    sqlx::query(
+        "UPDATE agents SET display_name = 'Quintessa Unseen', profile_visibility = 'group' \
+          WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("name the person");
+    let (admin, _) = viewer_fixture::seed_agent_with_group(&pool, "put-unnamed-admin").await;
+    let (status, body) = get(&state, admin, &format!("/api/v1/agents/{h}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let client: Uuid = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(h)
+        .fetch_one(&pool)
+        .await
+        .expect("the fixture's one client");
+    assert_eq!(
+        body["display_name"],
+        format!("oauth:{client}"),
+        "CALIBRATION: unnamed to the admin, shown under the placeholder (C7): {body}"
+    );
+
+    let (status, body) = put(
+        &state,
+        admin,
+        &["agents:write", "claims:admin"],
+        h,
+        serde_json::json!({"labels": ["edited-by-admin"]}),
+    )
+    .await;
+    assert!(
+        !body.to_string().contains("Quintessa"),
+        "an admin edit echoed a withheld name ({status}): {body}"
+    );
+
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "group"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["display_name"], "Quintessa Unseen",
+        "CALIBRATION: self sees it"
+    );
+}

@@ -821,3 +821,59 @@ async fn read_as_serves_an_elevated_viewer_read_only_in_transaction_mode(pool: P
     assert!(elevated);
     assert_eq!(insert_sqlstate(&mut r).await.as_deref(), Some("25006"));
 }
+
+/// Review finding tests#4 (human-identity visibility): the disclosure session
+/// wrapper derives its privileged arm from the STAMPED elevation, so a viewer
+/// resolved ELEVATED through a live session sees an unnamed human named on
+/// the application role, and the same principal's scoped viewer (no session
+/// claimed) does not. Before this, only the core with `p_privileged = true`
+/// was tested, so a wrapper that ignored elevation would have passed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_viewer_sees_an_unnamed_human_named(pool: PgPool) {
+    let p = holder(&pool, "named-p", 9).await;
+    let (h, _) = fixture::seed_human_operator(&pool, "unnamed-h").await;
+    sqlx::query(
+        "UPDATE agents SET display_name = 'Severine Unheard', profile_visibility = 'group' \
+          WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("an unnamed person");
+    let s = scoped(&pool, 2).await;
+    let app = app_scoped(&pool, SessionGucMode::Session).await;
+    let named_as = |v: Viewer| {
+        let s = &s;
+        async move {
+            let mut conn = s.acquire_as(&v).await.expect("acquire_as");
+            conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+                .await
+                .expect("as epigraph_app");
+            let named: bool =
+                sqlx::query_scalar("SELECT named FROM public.epigraph_agent_disclosure($1)")
+                    .bind(h)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .expect("disclosure");
+            conn.execute("RESET SESSION AUTHORIZATION")
+                .await
+                .expect("reset");
+            named
+        }
+    };
+
+    let plain = resolve(&app, p.person, None, Uuid::new_v4()).await;
+    assert_scoped(&plain, "no session claimed");
+    assert!(
+        !named_as(plain).await,
+        "CALIBRATION: the person is unnamed to the principal's scoped viewer"
+    );
+
+    let live = session(&pool, &p, "grant").await;
+    let v = resolve(&app, p.person, Some(live), p.family).await;
+    assert!(v.is_elevated(), "CALIBRATION: resolved elevated");
+    assert!(
+        named_as(v).await,
+        "an elevated session's stamped read names every human"
+    );
+}

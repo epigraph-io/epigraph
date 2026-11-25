@@ -47,11 +47,11 @@ use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::claims::submit_claim;
 use epigraph_mcp::tools::memory::memorize;
 use epigraph_mcp::tools::visibility::{
-    publicize_claims, set_default_group, share_claims_with_team,
+    publicize_claims, set_default_group, set_profile_visibility, share_claims_with_team,
 };
 use epigraph_mcp::types::{
-    MemorizeParams, PublicizeClaimsParams, SetDefaultGroupParams, ShareClaimsWithTeamParams,
-    SubmitClaimParams,
+    MemorizeParams, PublicizeClaimsParams, SetDefaultGroupParams, SetProfileVisibilityParams,
+    ShareClaimsWithTeamParams, SubmitClaimParams,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -1652,4 +1652,84 @@ async fn a_revoked_human_operator_cannot_set_its_agents_default(pool: PgPool) {
         .expect_err("a revoked human operator");
     assert!(err.message.contains("VIS05"), "{err:?}");
     assert_eq!(default_of(&pool, crew).await, (None, true), "unchanged");
+}
+
+// ─── set_profile_visibility (migration 287) ──────────────────────────────
+
+fn profile(value: &str) -> SetProfileVisibilityParams {
+    SetProfileVisibilityParams {
+        visibility: value.to_string(),
+    }
+}
+
+async fn profile_of(pool: &PgPool, agent: Uuid) -> String {
+    sqlx::query_scalar("SELECT profile_visibility FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("profile")
+}
+
+/// A person, on their own token over the app role, opts in and out; the
+/// answer carries the previous value and `named_to_everyone`, and each call
+/// is audited. An operated agent's token is refused (PVS05), and so is a
+/// value other than public / group, with nothing changed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_person_sets_their_own_profile_visibility_and_an_agent_cannot(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let (h, _) = fixture::seed_human_operator(&pool, "profile-person").await;
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(h)
+        .execute(&pool)
+        .await
+        .expect("start from group");
+    let hv = viewer(&pool, h).await;
+
+    let r = set_profile_visibility(&s.server, &hv, profile("public"), Some(&token(h)))
+        .await
+        .expect("a person opts in");
+    let body = first_text(&r);
+    assert_eq!(body["agent_id"], h.to_string(), "{body}");
+    assert_eq!(body["previous"], "group", "{body}");
+    assert_eq!(body["profile_visibility"], "public", "{body}");
+    assert_eq!(body["named_to_everyone"], true, "{body}");
+    assert_eq!(profile_of(&pool, h).await, "public");
+
+    let r = set_profile_visibility(&s.server, &hv, profile("group"), Some(&token(h)))
+        .await
+        .expect("a person opts out");
+    let body = first_text(&r);
+    assert_eq!(body["named_to_everyone"], false, "{body}");
+    assert_eq!(profile_of(&pool, h).await, "group");
+
+    let err = set_profile_visibility(&s.server, &hv, profile("team"), Some(&token(h)))
+        .await
+        .expect_err("not a profile value");
+    assert!(err.message.contains("neither"), "{err:?}");
+
+    // An operated agent, on its own token: not a person.
+    let (bot, _) = fixture::seed_agent_with_group(&pool, "profile-bot").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_operator(&mut conn, bot, h)
+        .await
+        .expect("link");
+    drop(conn);
+    let bv = viewer(&pool, bot).await;
+    let before = profile_of(&pool, bot).await;
+    let err = set_profile_visibility(&s.server, &bv, profile("group"), Some(&token(bot)))
+        .await
+        .expect_err("an agent acting for a person is refused");
+    assert!(err.message.contains("PVS05"), "{err:?}");
+    assert_eq!(profile_of(&pool, bot).await, before, "nothing changed");
+    assert_eq!(profile_of(&pool, h).await, "group", "nor on its human");
+
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'agent.profile_visibility_set' AND agent_id = $1",
+    )
+    .bind(h)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 2, "one audit row per successful call");
 }

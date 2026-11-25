@@ -2882,6 +2882,43 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // frame. Under a non-member owner it reads no live ticket or act (ELV06 /
     // ELV08, loud: the API answers 500 and the refusal still stands).
     ("epigraph_record_passkey_standing_refusal", 285),
+    // 286, the human-identity disclosure predicate. The core reads the FORCEd
+    // `operator_links`, `claims` and `group_memberships` through
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner it
+    // reads no binding, membership or group claim: a human is named only by
+    // its own public claim, self or opt-in (fail CLOSED, fewer names shown).
+    // The evidence helper reads `oauth_clients` (no policy) and
+    // `human_operators` (granted to maintenance): under a non-member owner
+    // without that grant it raises, which fails every read loudly. The two
+    // wrappers delegate to the core.
+    ("epigraph_is_human_principal", 286),
+    ("epigraph_agent_disclosure_for", 286),
+    ("epigraph_agent_disclosure", 286),
+    ("epigraph_human_named_to_viewer", 286),
+    // 287, the self-service profile setter. It reads `oauth_clients` and
+    // `human_operators` through 286's evidence helper and writes the
+    // principal's own `agents` row, admitted by `epigraph_definer_bypass()`
+    // (the owner). Under a non-member owner `agents_self_update` still admits
+    // the principal's own row; the helper's EXECUTE is what fails, loudly.
+    ("epigraph_set_profile_visibility", 287),
+    // 292, the team-only owner of a role's projection edges and the binding
+    // trigger that re-owns them. Both read the FORCEd `group_role_bindings`
+    // and `groups` and write the FORCEd `edges` (and, through 105's mint, the
+    // holder's personal group) through `epigraph_definer_bypass()` (the
+    // owner). Under a non-member owner the binding read sees no row, so every
+    // edge falls to the holder's personal group (fail CLOSED, narrower), and
+    // the edge UPDATE moves nothing (the binding change keeps the old owner:
+    // quiet, the stake this entry reports).
+    ("epigraph_role_edge_owner", 292),
+    ("epigraph_group_role_bindings_reown_role_edges", 292),
+    // 295, the re-own of a role's GENUINE projection edges (joined to their
+    // `role_assignments` row), called by the binding trigger above and by
+    // 295's reconcile pass. Reads the FORCEd `role_assignments` and writes the
+    // FORCEd `edges` through `epigraph_definer_bypass()` (the owner). Under a
+    // non-member owner the join sees no assignment and nothing is re-owned
+    // (quiet: a binding change keeps the old owner, the stake 292's entries
+    // already report).
+    ("epigraph_reown_role_projection_edges", 295),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4089,12 +4126,62 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "public.epigraph_record_passkey_standing_refusal(text, uuid, uuid, text, text)",
         true,
     ),
-    // 273: group info, the agent routes and `find_agent` / `get_agent` call it
-    // on the request DSN; without the grant each is 42501.
+    // 273: group info calls it on the request DSN; without the grant it is
+    // 42501. (The agent routes and `find_agent` / `get_agent` decide profile
+    // details through 286's disclosure instead, whose 320 body applies the
+    // same live-row rule.)
     (
         "epigraph_group_live_roster",
         "public.epigraph_group_live_roster(uuid)",
         true,
+    ),
+    // 286: the human-identity disclosure session wrappers, called on the
+    // request DSN by every surface that names an agent; without the grant
+    // every such read is 42501. The core and the evidence helper are
+    // maintenance-only: an application-callable explicit audience would be a
+    // membership oracle.
+    (
+        "epigraph_agent_disclosure",
+        "public.epigraph_agent_disclosure(uuid)",
+        true,
+    ),
+    (
+        "epigraph_human_named_to_viewer",
+        "public.epigraph_human_named_to_viewer(uuid)",
+        true,
+    ),
+    (
+        "epigraph_agent_disclosure_for",
+        "public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)",
+        false,
+    ),
+    (
+        "epigraph_is_human_principal",
+        "public.epigraph_is_human_principal(uuid)",
+        false,
+    ),
+    // 287: the MCP tool set_profile_visibility and PUT /api/v1/agents/:id call
+    // it on the request DSN; without the grant every opt-in is 42501.
+    (
+        "epigraph_set_profile_visibility",
+        "public.epigraph_set_profile_visibility(text)",
+        true,
+    ),
+    // 292: the role projection's owner rule is called only by the two
+    // maintenance-owned triggers; an application-callable one would answer
+    // "which group is role X bound to" (a binding oracle).
+    (
+        "epigraph_role_edge_owner",
+        "public.epigraph_role_edge_owner(text, uuid)",
+        false,
+    ),
+    // 295: the genuine-projection re-own is called only by the binding
+    // trigger; an application-callable one would let any session drive
+    // personal-group mints and re-own every role's projections.
+    (
+        "epigraph_reown_role_projection_edges",
+        "public.epigraph_reown_role_projection_edges(text)",
+        false,
     ),
     // 268: the prompt-history listing calls it on the request DSN; without
     // the grant every listing is 42501.
@@ -4948,6 +5035,20 @@ mod definer_register_tests {
         // trigger, propagation, publicize and share definers. EXECUTE is the
         // maintenance role's alone.
         "epigraph_edge_declared_meet",
+        // 296: the role projection edge guard. It MUST run as the caller: it
+        // admits a write when the session is a maintenance member or the
+        // current frame is a maintenance-owned definer, which a definer body
+        // would always be. Its owner is not what it reads.
+        "epigraph_role_projection_edges_guard",
+        // 299 (operator ruling C7): the placeholder name an unnamed human is
+        // shown under. It reads only `oauth_clients` (no row policy; the
+        // application and maintenance roles both SELECT it), as its caller;
+        // its owner changes no answer.
+        "epigraph_unnamed_agent_name",
+        // 312 (human-identity visibility, operator ruling C6): the LEAKPROOF
+        // accessor of an ingest record's ingester, `properties ->> 'ingested_by'`.
+        // It reads no table at all; its owner changes no answer.
+        "epigraph_ingest_record_ingester",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,
@@ -5878,6 +5979,8 @@ mod definer_register_tests {
         "epigraph_edges_record_declaration",
         // 285: an anchored passkey's anchor, recorded and kept.
         "epigraph_person_authenticators_anchor",
+        // 292: the binding trigger that re-owns a role's projection edges.
+        "epigraph_group_role_bindings_reown_role_edges",
     ];
 
     /// The function names [`OPERATOR_FUNCTION_GRANTS`] checks, read from each

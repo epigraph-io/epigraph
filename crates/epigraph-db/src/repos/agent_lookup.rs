@@ -10,27 +10,38 @@
 //!
 //! `agents` rows are readable by every session (migration 077 section 9:
 //! `agents_identity ... USING (true)`), and `GET /api/v1/agents/:id` answers
-//! for any id, so the EXISTENCE of an agent, its `display_name`, `public_key`
-//! and `created_at` are not secrets and name search reveals no hidden agent.
-//! Everything else on a card is computed under the caller's [`Viewer`], and
-//! every rule below makes a fact the caller may not see produce EXACTLY what
-//! an agent without that fact produces (never a distinguishable "hidden"):
+//! for any id, so the EXISTENCE of an agent, its `public_key` and
+//! `created_at` are not secrets. Its NAME is shown only when migration 286's
+//! `epigraph_agent_disclosure` admits the caller's stamped session (spec
+//! `docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md`):
+//! every non-human agent is named to everyone; a human principal only to
+//! itself, a privileged session, a teammate, everyone once it opted in or
+//! once it or an agent bound to it made a public assertion of any kind
+//! (claim, challenge, assessment BBA, ingest record; 316) from the binding's start,
+//! whoever can read a claim one of them filed while bound, and whoever can
+//! read a paper whose authorship one of them countersigned (migrations
+//! 302, 309, 311). Everything on a card is computed under that
+//! decision and the caller's [`Viewer`], and every rule below makes a fact
+//! the caller may not see produce EXACTLY what an agent without that fact
+//! produces (never a distinguishable "hidden"):
 //!
-//! * `orcid` / `ror_id`, and matching on them: only when the caller passes
-//!   [`AgentRepository::get_public_profile`]'s rule (profile public, the
-//!   caller is the agent, or shares a live group with it; or an admin),
-//!   spelled again in the matcher and the card statements (the visibility lint
-//!   needs each statement's own predicate text) and kept one text with
-//!   `get_public_profile`'s by `visibility_lint.rs`'s
-//!   `the_agent_profile_rule_is_one_text_at_every_site`. A
-//!   private ORCID never matches, so it is not an oracle. `properties`
-//!   (`full_name`, `email`, `affiliations`) is never matched and never
-//!   returned. `display_name` is matched as written, so a display name that
-//!   is itself an email address matches like any other name (every
-//!   `display_name` is already public through `GET /api/v1/agents`).
-//! * `operator_human` (the human the agent is currently bound to): shown to
-//!   EVERY reader, by design: who an agent acts for is public, like the
-//!   claims it files. It is read from the binding RECORD
+//! * `display_name`, and matching on it: only when `named`. An UNNAMED human
+//!   is never found by its name, prefix or trigram, never takes a candidate
+//!   slot by it and never moves `candidates_truncated`, and its card reads as
+//!   a nameless OAuth service principal's (operator ruling C7): shown, and
+//!   found, under its own `oauth:<client row id>` placeholder (migration
+//!   299), `kind: unknown`, no roles, no attachments. Its id is never
+//!   withheld.
+//! * `orcid` / `ror_id`, and matching on them: only when `details` (the
+//!   profile is public, the caller is the agent, or shares a live group with
+//!   it, or is privileged; and, for a human, it is `named`). A private ORCID
+//!   never matches, so it is not an oracle. `properties` (`full_name`,
+//!   `email`, `affiliations`) is never matched and never returned.
+//! * `operator_human` (the human the agent is currently bound to): its ID is
+//!   shown to EVERY reader, by design: who an agent acts for is public, like
+//!   the claims it files. Its NAME follows the disclosure rule (the operator
+//!   approved that an outsider then learns "this id is some human"). It is
+//!   read from the binding RECORD
 //!   (`operator_binding_sql`: the agent's LIVE operator link, else its
 //!   unrevoked client allowance); a retired link or a revoked allowance
 //!   names nobody. Never inferred from an `OPERATED_BY` edge, which any edge
@@ -45,9 +56,9 @@
 //!   one with no evidence (`unknown`). See [`AgentKind`]. One arm is the
 //!   reverse of `operator_human`: an agent some agent's binding names
 //!   (`operator_of_bound_agent`, [`bound_operator_sql`]) reads as a human to
-//!   every reader, because every reader already sees that binding on the
-//!   bound agent's card; it is derived from the same binding rule, so it
-//!   never disagrees with the forward field and reads no status.
+//!   every reader it is NAMED to (an unnamed human shows no human
+//!   evidence); it is derived from the same binding rule, so it never
+//!   disagrees with the forward field and reads no status.
 //! * `roles`: migration 198's `epigraph_disclosed_role_assignments`: for any
 //!   agent, the assignments of roles that neither elevate nor read the audit
 //!   trail whose window is open now (exactly what 123's public projection
@@ -130,7 +141,7 @@ pub const COUNT_CAP: i64 = 10_000;
 /// admits: never more.
 ///
 /// It gates an agent's PROMPT STATE (model, prompt snapshot, prompt text),
-/// never the agent's human: the human is shown to every reader (the card's
+/// never the agent's human: the human's id is shown to every reader (the card's
 /// `operator_human`). The card itself shows no prompt state and does not use
 /// this gate; it is the shared text for a surface that does.
 pub const D4_OPERATOR_GATE_SQL: &str = "($A::bool OR ($P::uuid IS NOT NULL \
@@ -187,6 +198,22 @@ fn ident_sql(expr: &str) -> String {
     )
 }
 
+/// The matcher's PLACEHOLDER candidates (operator ruling C7): every agent
+/// linked to a `human` OAuth client (each human principal; 122's registered
+/// operators are linked to one too), as `(id, display_name)` under the name it
+/// reads as when UNNAMED, migration 299's `epigraph_unnamed_agent_name`. A
+/// nameless service principal is found by its `oauth:<client row id>` name, so
+/// an unnamed human must be found by its own the same way, and only when it is
+/// unnamed: [`AgentLookupRepository::match_by_name`] and
+/// [`AgentLookupRepository::exact_name_candidates`] keep such a row exactly
+/// when the session may NOT see the real name, and the real-name row exactly
+/// when it may. `oauth_clients` carries no row policy and the application
+/// role SELECTs it (070), so this reads nothing a session could not.
+const UNNAMED_PLACEHOLDER_ROWS_SQL: &str =
+    "SELECT h.agent_id AS id, public.epigraph_unnamed_agent_name(h.agent_id) AS display_name \
+       FROM (SELECT DISTINCT c.agent_id FROM public.oauth_clients c \
+              WHERE c.client_type = 'human' AND c.agent_id IS NOT NULL) h";
+
 /// An ORCID iD's 16-character key, in SQL, or NULL when `expr` is not one:
 /// the resolver prefix (with or without a scheme) and every separator are
 /// dropped and the check character upper-cased, so `0000-0002-0000-000x`,
@@ -202,7 +229,7 @@ fn orcid_sql(expr: &str) -> String {
 
 /// The human an agent is CURRENTLY bound to, in SQL, read from the binding
 /// RECORD alone so that no client, registration or membership event moves it
-/// (it is shown to every reader): when the agent has an operator link (107's
+/// (its id is shown to every reader): when the agent has an operator link (107's
 /// `epigraph_operator_of_author`), that link's operator while the link is
 /// live, and nobody once it is retired; when it has no link, the operator its
 /// unrevoked migration-149 client allowance names. NULL for an unbound agent.
@@ -499,9 +526,9 @@ pub struct AgentCard {
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
     /// The human this agent is currently bound to (its live operator link,
-    /// else its unrevoked client allowance), shown to every reader; `None`
-    /// for an unbound agent, a retired link, a revoked allowance and a human
-    /// itself.
+    /// else its unrevoked client allowance): its id is shown to every
+    /// reader, its name under the disclosure rule. `None` for an unbound
+    /// agent, a retired link, a revoked allowance and a human itself.
     pub operator_human: Option<AgentRef>,
     pub created_at: DateTime<Utc>,
     pub counts: CardCounts,
@@ -616,30 +643,44 @@ impl AgentLookupRepository {
     /// Agents whose name (or visible ORCID / ROR id) matches `query`, ranked,
     /// at most `limit` (clamped to `1..=CANDIDATE_POOL`).
     ///
-    /// The reusable matcher: `find_agent` and the ingest author path both
-    /// call it. Runs on the caller's connection (a `read_as` connection or the
-    /// ingest's stamped transaction); `viewer` decides only whether ORCID /
-    /// ROR may match.
+    /// The reusable matcher. Runs on the caller's connection, which must be
+    /// stamped from the caller's viewer (a `read_as` connection or a stamped
+    /// transaction): migration 286's `epigraph_agent_disclosure` decides on
+    /// that session whether a candidate's name may match (`named`) and
+    /// whether its ORCID / ROR may (`details`). An unnamed human is never
+    /// found by name, prefix, trigram, ORCID or ROR, exactly as a nameless
+    /// agent is not.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the read fails.
     pub async fn match_by_name(
         conn: &mut PgConnection,
-        viewer: &Viewer,
         query: &str,
         limit: i64,
     ) -> Result<Vec<AgentNameMatch>, DbError> {
-        Self::match_ranked(conn, viewer, query, limit.clamp(1, CANDIDATE_POOL)).await
+        Self::match_ranked(conn, query, limit.clamp(1, CANDIDATE_POOL)).await
     }
 
     /// [`Self::match_by_name`] without the clamp (`find` asks for one more
     /// than the pool, to tell "exactly the pool" from "more").
     async fn match_ranked(
         conn: &mut PgConnection,
-        viewer: &Viewer,
         query: &str,
         limit: i64,
     ) -> Result<Vec<AgentNameMatch>, DbError> {
+        // `hit` is the raw match over every agent (name, prefix, trigram,
+        // identifier), MATERIALIZED so the disclosure predicate cannot be
+        // pushed below it into the scan of `agents`: it runs once per raw
+        // match, never once per agent. `ranked` then keeps a candidate only
+        // on a tier the session may see (`named` for the name tiers,
+        // `details` for ORCID / ROR), BEFORE the ORDER BY ... LIMIT, so a
+        // hidden candidate never takes a pool slot, never shifts a rank and
+        // is never counted by `find`'s `candidates_truncated` (spec 7, A1).
+        // `cand` also carries each human principal's PLACEHOLDER row (`alt`,
+        // operator ruling C7): kept exactly when the session may NOT see the
+        // real name (`d.named <> h.alt`), so an unnamed human is found by its
+        // `oauth:<client row id>` name as a nameless service principal is,
+        // and never by its real one.
         let sql = format!(
             "WITH q AS ( \
                  SELECT {fold_q} AS f, {ident_q} AS ident, {orcid_q} AS orcid_q \
@@ -651,51 +692,62 @@ impl AgentLookupRepository {
              ), cand AS ( \
                  SELECT a.id, a.display_name, a.created_at, \
                         {fold_name} AS fname, \
-                        ($4::bool OR a.profile_visibility = 'public' \
-                           OR ($2::uuid IS NOT NULL AND a.id = $2::uuid) \
-                           OR a.id IN (SELECT r.agent_id FROM unnest($3::uuid[]) vg(id) \
-                                CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r)) \
-                          AS details_ok, \
-                        {ident_orcid} AS orcid_k, {ident_ror} AS ror_k \
+                        {ident_orcid} AS orcid_k, {ident_ror} AS ror_k, false AS alt \
                    FROM agents a \
-             ), ranked AS ( \
-                 SELECT c.id, c.display_name, c.created_at, \
-                        CASE \
-                          WHEN c.details_ok AND c.orcid_k = q2.orcid_q THEN 'orcid' \
-                          WHEN c.details_ok AND q2.ident <> '' AND c.ror_k = q2.ident THEN 'ror' \
-                          WHEN c.fname = q2.f THEN 'exact' \
-                          WHEN c.fname LIKE q2.f_like || '%' \
-                            OR c.fname LIKE '% ' || q2.f_like || '%' THEN 'prefix' \
-                          ELSE 'trigram' \
-                        END AS tier, \
+                 UNION ALL \
+                 SELECT p.id, p.display_name, a.created_at, {fold_placeholder} AS fname, \
+                        NULL::text AS orcid_k, NULL::text AS ror_k, true AS alt \
+                   FROM ({placeholders}) p JOIN agents a ON a.id = p.id \
+                  WHERE p.display_name IS NOT NULL \
+             ), hit AS MATERIALIZED ( \
+                 SELECT c.id, c.display_name, c.created_at, c.alt, \
+                        COALESCE(c.orcid_k = q2.orcid_q, false) AS orcid_hit, \
+                        COALESCE(q2.ident <> '' AND c.ror_k = q2.ident, false) AS ror_hit, \
+                        COALESCE(c.fname = q2.f, false) AS exact_hit, \
+                        COALESCE(c.fname LIKE q2.f_like || '%' \
+                                 OR c.fname LIKE '% ' || q2.f_like || '%', false) AS prefix_hit, \
                         COALESCE(similarity(c.fname, q2.f), 0)::float8 AS score \
                    FROM cand c, q2 \
                   WHERE q2.f <> '' AND ( \
-                        (c.details_ok AND (c.orcid_k = q2.orcid_q \
-                                            OR (q2.ident <> '' AND c.ror_k = q2.ident))) \
+                        c.orcid_k = q2.orcid_q \
+                     OR (q2.ident <> '' AND c.ror_k = q2.ident) \
                      OR c.fname = q2.f \
                      OR c.fname LIKE q2.f_like || '%' \
                      OR c.fname LIKE '% ' || q2.f_like || '%' \
-                     OR similarity(c.fname, q2.f) >= $5) \
+                     OR similarity(c.fname, q2.f) >= $2) \
+             ), ranked AS ( \
+                 SELECT h.id, h.display_name, h.created_at, \
+                        CASE \
+                          WHEN NOT h.alt AND d.details AND h.orcid_hit THEN 'orcid' \
+                          WHEN NOT h.alt AND d.details AND h.ror_hit THEN 'ror' \
+                          WHEN h.exact_hit THEN 'exact' \
+                          WHEN h.prefix_hit THEN 'prefix' \
+                          ELSE 'trigram' \
+                        END AS tier, \
+                        h.score \
+                   FROM hit h \
+                  CROSS JOIN LATERAL public.epigraph_agent_disclosure(h.id) d \
+                  WHERE (NOT h.alt AND d.details AND (h.orcid_hit OR h.ror_hit)) \
+                     OR (d.named <> h.alt \
+                         AND (h.exact_hit OR h.prefix_hit OR h.score >= $2)) \
              ) \
              SELECT id, display_name, created_at, tier, score FROM ranked \
               ORDER BY CASE tier WHEN 'orcid' THEN 0 WHEN 'ror' THEN 0 WHEN 'exact' THEN 1 \
                                  WHEN 'prefix' THEN 2 ELSE 3 END, \
                        score DESC, created_at, id \
-              LIMIT $6",
+              LIMIT $3",
             fold_q = fold_sql("$1::text"),
             ident_q = ident_sql("$1::text"),
             orcid_q = orcid_sql("$1::text"),
             fold_name = fold_sql("a.display_name"),
             ident_orcid = orcid_sql("a.orcid"),
             ident_ror = ident_sql("a.ror_id"),
+            fold_placeholder = fold_sql("p.display_name"),
+            placeholders = UNNAMED_PLACEHOLDER_ROWS_SQL,
         );
         type MatchRow = (Uuid, Option<String>, DateTime<Utc>, String, f64);
         let rows: Vec<MatchRow> = sqlx::query_as(&sql)
             .bind(query)
-            .bind(viewer.principal())
-            .bind(viewer.group_bind().unwrap_or(&[]))
-            .bind(viewer.bypass_bind())
             .bind(TRIGRAM_THRESHOLD)
             .bind(limit)
             .fetch_all(&mut *conn)
@@ -749,31 +801,39 @@ impl AgentLookupRepository {
 
         // 1. The rows, and every evidence bit already narrowed IN SQL to what
         //    this caller may see (a hidden bit is computed as false/NULL, so
-        //    it never reaches Rust as a distinguishable value).
+        //    it never reaches Rust as a distinguishable value). Migration
+        //    286's `epigraph_agent_disclosure` decides, on the stamped
+        //    session, whether the name (`named`) and the profile details
+        //    (`details`: ORCID, ROR, an LLM model) may be shown. An UNNAMED
+        //    human carries no human evidence either: registration, the
+        //    reverse binding, roles and attachments are all withheld below,
+        //    and its name is the `oauth:<client row id>` placeholder
+        //    (migration 299), so its card reads as a nameless service
+        //    principal's (operator ruling C7).
         let sql = format!(
-            "SELECT a.id, a.display_name, a.created_at, a.public_key, \
+            "SELECT a.id, CASE WHEN d_a.named THEN a.display_name \
+                               ELSE public.epigraph_unnamed_agent_name(a.id) END AS display_name, \
+                    a.created_at, a.public_key, \
                     COALESCE(a.agent_type = 'role', false) AS is_role_node, \
                     EXISTS (SELECT 1 FROM public.system_agents sa WHERE sa.agent_id = a.id) \
                         AS is_system, \
-                    COALESCE(d.details_ok AND a.properties ? 'llm_model', false) AS llm_model_visible, \
-                    CASE WHEN d.details_ok THEN a.orcid END AS orcid, \
-                    CASE WHEN d.details_ok THEN a.ror_id END AS ror_id, \
-                    COALESCE(($4::bool OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)) \
+                    COALESCE(d_a.details AND a.properties ? 'llm_model', false) AS llm_model_visible, \
+                    CASE WHEN d_a.details THEN a.orcid END AS orcid, \
+                    CASE WHEN d_a.details THEN a.ror_id END AS ror_id, \
+                    COALESCE(d_a.named AND ($3::bool OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)) \
                       AND public.epigraph_is_human_operator(a.id), false) AS human_visible, \
                     CASE WHEN h.human IS DISTINCT FROM a.id THEN h.human END AS operator_human, \
-                    {bound_operator} AS operates_bound_agent, \
+                    COALESCE(d_a.named AND {bound_operator}, false) AS operates_bound_agent, \
+                    d_a.named, \
                     u.ord \
                FROM unnest($1::uuid[]) WITH ORDINALITY AS u(id, ord) \
                JOIN agents a ON a.id = u.id \
-              CROSS JOIN LATERAL (SELECT COALESCE(($4::bool OR a.profile_visibility = 'public' \
-                     OR ($2::uuid IS NOT NULL AND a.id = $2::uuid) \
-                     OR a.id IN (SELECT r.agent_id FROM unnest($3::uuid[]) vg(id) \
-                          CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r)), \
-                     false) AS details_ok) d \
+              {disclosure} \
               CROSS JOIN LATERAL (SELECT {binding} AS human) h \
               ORDER BY u.ord",
             binding = operator_binding_sql("a.id"),
             bound_operator = bound_operator_sql("a.id"),
+            disclosure = crate::repos::agent_disclosure::disclosure_lateral_sql("a"),
         );
         type Row = (
             Uuid,
@@ -788,12 +848,12 @@ impl AgentLookupRepository {
             bool,
             Option<Uuid>,
             bool,
+            bool,
             i64,
         );
         let rows: Vec<Row> = sqlx::query_as(&sql)
             .bind(&ids)
             .bind(viewer.principal())
-            .bind(viewer.group_bind().unwrap_or(&[]))
             .bind(viewer.bypass_bind())
             .fetch_all(&mut *conn)
             .await?;
@@ -803,20 +863,11 @@ impl AgentLookupRepository {
         let roles = Self::disclosed_roles(conn, &ids).await?;
         let attachments = Self::disclosed_attachments(conn, &ids).await?;
 
-        // 3. The bound humans' names (agents are public).
+        // 3. The bound humans' names, through the one disclosure reader: the
+        //    id is always shown, the name only when the session may see it.
         let humans: Vec<Uuid> = rows.iter().filter_map(|r| r.10).collect();
-        let human_names: HashMap<Uuid, Option<String>> = if humans.is_empty() {
-            HashMap::new()
-        } else {
-            sqlx::query_as::<_, (Uuid, Option<String>)>(
-                "SELECT id, display_name FROM agents WHERE id = ANY($1::uuid[])",
-            )
-            .bind(&humans)
-            .fetch_all(&mut *conn)
-            .await?
-            .into_iter()
-            .collect()
-        };
+        let human_names =
+            crate::repos::agent_disclosure::AgentDisclosureRepository::names(conn, &humans).await?;
 
         // 4. Counts under the caller's viewer.
         let counts = if with_counts {
@@ -839,10 +890,18 @@ impl AgentLookupRepository {
             human_visible,
             operator_human,
             operates_bound_agent,
+            named,
             _ord,
         ) in rows
         {
-            let roles = roles.get(&id).cloned().unwrap_or_default();
+            // An unnamed human's roles and attachments are human evidence
+            // (only registered people hold roles): withheld, as for an agent
+            // that holds none.
+            let roles = if named {
+                roles.get(&id).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let mut evidence: Vec<&'static str> = Vec::new();
             if is_role_node {
                 evidence.push("role_node");
@@ -880,7 +939,11 @@ impl AgentLookupRepository {
                 kind,
                 kind_evidence: evidence,
                 roles,
-                role_attachments: attachments.get(&id).cloned().unwrap_or_default(),
+                role_attachments: if named {
+                    attachments.get(&id).cloned().unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
                 orcid,
                 ror_id,
                 operator_human: operator_human.map(|h| AgentRef {
@@ -934,10 +997,17 @@ impl AgentLookupRepository {
             });
         }
         type Row = (Uuid, Option<String>, String, Vec<u8>, bool);
+        // The name is OUTPUT (the ingest report's `display_name`), so it goes
+        // through migration 286's disclosure on the ingest's stamped
+        // transaction; the internal checks read no name.
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT a.id, a.display_name, a.agent_type, a.public_key, \
+            "SELECT a.id, CASE WHEN d.named THEN a.display_name \
+                               ELSE public.epigraph_unnamed_agent_name(a.id) END, \
+                    a.agent_type, a.public_key, \
                     EXISTS (SELECT 1 FROM system_agents s WHERE s.agent_id = a.id) \
-               FROM agents a WHERE a.id = ANY($1::uuid[])",
+               FROM agents a \
+              CROSS JOIN LATERAL public.epigraph_agent_disclosure(a.id) d \
+              WHERE a.id = ANY($1::uuid[])",
         )
         .bind(ids)
         .fetch_all(&mut *conn)
@@ -976,9 +1046,17 @@ impl AgentLookupRepository {
     /// One statement for the whole author list, so the folded name of each
     /// agent is computed once per document rather than once per author
     /// (MEASURED, 7,600 agents, debug build: a 50-author document spent ~12 s
-    /// in a per-author matcher call). The matches carry only public fields
-    /// (id, `display_name`, `created_at`); the ORCID / ROR tiers never apply,
-    /// so nothing here depends on the caller's viewer.
+    /// in a per-author matcher call). The matches carry id, `display_name`
+    /// and `created_at`; the ORCID / ROR tiers never apply. A match whose
+    /// name the session may not see (an unnamed human, migration 286's
+    /// `epigraph_human_named_to_viewer`) is dropped BEFORE it is ranked or
+    /// counted, so the total and the cut never reveal it, and such a human
+    /// matches under its `oauth:<client row id>` placeholder instead, as a
+    /// nameless service principal does (operator ruling C7): the result
+    /// depends on the session `conn` is stamped as (the ingest's stamped
+    /// transaction), and an unstamped call sees only what an outsider sees.
+    /// The equal-name join is MATERIALIZED so the predicate runs once per
+    /// match, never once per agent.
     ///
     /// # Errors
     /// `DbError::InvalidData` when `names` and `attached` differ in length;
@@ -1007,22 +1085,35 @@ impl AgentLookupRepository {
                  SELECT u.ord, {fold_q} AS f, u.attached \
                    FROM unnest($1::text[], $2::uuid[]) WITH ORDINALITY AS u(name, attached, ord) \
              ), c AS ( \
-                 SELECT a.id, a.display_name, a.created_at, a.public_key, {fold_name} AS fname \
+                 SELECT a.id, a.display_name, a.created_at, a.public_key, {fold_name} AS fname, \
+                        false AS alt \
                    FROM agents a \
                   WHERE a.agent_type <> 'role' \
                     AND NOT EXISTS (SELECT 1 FROM system_agents s WHERE s.agent_id = a.id) \
-             ), m AS ( \
-                 SELECT q.ord, c.id, c.display_name, c.created_at, c.public_key, \
-                        pg_catalog.row_number() OVER (PARTITION BY q.ord \
-                                                      ORDER BY c.created_at, c.id) AS rn, \
-                        pg_catalog.count(*) OVER (PARTITION BY q.ord) AS n \
+                 UNION ALL \
+                 SELECT p.id, p.display_name, a.created_at, a.public_key, \
+                        {fold_placeholder} AS fname, true AS alt \
+                   FROM ({placeholders}) p JOIN agents a ON a.id = p.id \
+                  WHERE p.display_name IS NOT NULL AND a.agent_type <> 'role' \
+                    AND NOT EXISTS (SELECT 1 FROM system_agents s WHERE s.agent_id = a.id) \
+             ), j AS MATERIALIZED ( \
+                 SELECT q.ord, c.id, c.display_name, c.created_at, c.public_key, c.alt \
                    FROM q JOIN c ON c.fname = q.f \
                   WHERE q.f <> '' AND c.id <> q.attached \
+             ), m AS ( \
+                 SELECT j.ord, j.id, j.display_name, j.created_at, j.public_key, \
+                        pg_catalog.row_number() OVER (PARTITION BY j.ord \
+                                                      ORDER BY j.created_at, j.id) AS rn, \
+                        pg_catalog.count(*) OVER (PARTITION BY j.ord) AS n \
+                   FROM j \
+                  WHERE public.epigraph_human_named_to_viewer(j.id) <> j.alt \
              ) \
              SELECT ord, id, display_name, created_at, public_key, n FROM m \
               WHERE rn <= $3 + $4 ORDER BY ord, rn",
             fold_q = fold_sql("u.name"),
             fold_name = fold_sql("a.display_name"),
+            fold_placeholder = fold_sql("p.display_name"),
+            placeholders = UNNAMED_PLACEHOLDER_ROWS_SQL,
         );
         type Row = (i64, Uuid, Option<String>, DateTime<Utc>, Vec<u8>, i64);
         let limit = limit.max(1);
@@ -1075,7 +1166,7 @@ impl AgentLookupRepository {
         query: &FindAgentQuery,
     ) -> Result<FindAgentResult, DbError> {
         // One more than the pool, to tell "exactly the pool" from "more".
-        let mut matches = Self::match_ranked(conn, viewer, &query.name, CANDIDATE_POOL + 1).await?;
+        let mut matches = Self::match_ranked(conn, &query.name, CANDIDATE_POOL + 1).await?;
         let pool = usize::try_from(CANDIDATE_POOL).unwrap_or(200);
         let candidates_truncated = matches.len() > pool;
         matches.truncate(pool);

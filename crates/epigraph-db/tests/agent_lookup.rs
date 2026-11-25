@@ -60,11 +60,32 @@ async fn named(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     (a, g)
 }
 
-/// A registered human operator with a display name.
+/// A registered human operator with a display name, its profile `'group'` as
+/// provisioning writes it since migration 288: a fixture left at the column
+/// default `'public'` would count as the person's opt-in, and every
+/// name-visibility assertion below would pass by consent instead of by the
+/// rule under test.
 async fn named_human(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     let (a, g) = named(pool, name).await;
     fixture::make_human_operator(pool, a).await;
+    set_profile(pool, a, "group").await;
     (a, g)
+}
+
+/// Set `agent`'s profile as the self-service setter leaves it: `'public'`
+/// with a consent stamp (migration 297, operator ruling C11: the opt-in arm
+/// requires one), `'group'` with none.
+async fn set_profile(pool: &PgPool, agent: Uuid, profile: &str) {
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = $2, \
+                profile_public_consented_at = CASE WHEN $2 = 'public' THEN now() END \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .bind(profile)
+    .execute(pool)
+    .await
+    .expect("profile");
 }
 
 async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) {
@@ -126,6 +147,19 @@ fn shape(card: &AgentCard) -> serde_json::Value {
     o.remove("display_name");
     o.remove("created_at");
     v
+}
+
+/// The name an unnamed human is shown under (operator ruling C7): the
+/// `oauth:<client row id>` placeholder of the ONE client
+/// `fixture::make_human_operator` links to it, read from the link.
+async fn placeholder(pool: &PgPool, human: Uuid) -> String {
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(human)
+        .fetch_all(pool)
+        .await
+        .expect("linked clients");
+    assert_eq!(rows.len(), 1, "the fixture links one client");
+    format!("oauth:{}", rows[0])
 }
 
 fn ids(r: &epigraph_db::FindAgentResult) -> Vec<Uuid> {
@@ -453,10 +487,20 @@ async fn kind_is_derived_from_evidence_not_agent_type(pool: PgPool) {
 // Privacy: differential pairs
 // ---------------------------------------------------------------------------
 
+/// The operator human's ID is on every reader's card of the bound agent
+/// (who an agent acts for is public); its NAME follows the disclosure rule
+/// (migration 286): an outsider gets `display_name: null`; the human itself,
+/// a teammate, and the bound agent (which reads its operator's teams through
+/// migration 234, so the team arm holds) get the name. Was
+/// `the_operator_human_is_shown_to_every_reader`, which pinned the name to
+/// every reader before the operator's ruling that a human is named only to
+/// those the rule admits.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_operator_human_is_shown_to_every_reader(pool: PgPool) {
+async fn the_operator_humans_id_is_shown_to_every_reader_and_its_name_by_the_rule(pool: PgPool) {
     let (outsider, _) = named(&pool, "outsider").await;
     let (human, _) = named_human(&pool, "Talia Brennick").await;
+    let (teammate, _) = named(&pool, "brennick-teammate").await;
+    team_of(&pool, &[human, teammate]).await;
     let (linked, _) = named(&pool, "helper-bot").await;
     let (unlinked, _) = named(&pool, "helper-bot").await;
     link(&pool, linked, human).await;
@@ -466,12 +510,21 @@ async fn the_operator_human_is_shown_to_every_reader(pool: PgPool) {
         "CALIBRATION: the card names the binding epigraph_human_of names"
     );
 
-    // Every reader: an outsider, the agent itself, the human.
-    for who in [outsider, linked, human] {
+    // An outsider sees the human under the placeholder a nameless service
+    // principal carries (operator ruling C7), never its name.
+    let hidden = placeholder(&pool, human).await;
+    for (who, name) in [
+        (outsider, hidden.as_str()),
+        // The bound agent reads its operator's teams (migration 234), so the
+        // team arm names the human to it once the human has a team.
+        (linked, "Talia Brennick"),
+        (human, "Talia Brennick"),
+        (teammate, "Talia Brennick"),
+    ] {
         let c = card_as(&pool, who, linked).await;
         let h = c.operator_human.as_ref().expect("operator_human shown");
-        assert_eq!(h.id, human);
-        assert_eq!(h.display_name.as_deref(), Some("Talia Brennick"));
+        assert_eq!(h.id, human, "{who}: the id is never withheld");
+        assert_eq!(h.display_name.as_deref(), Some(name), "{who}");
         assert_eq!(c.kind, AgentKind::LlmAgent);
         assert!(c.kind_evidence.contains(&"bound_to_visible_human"));
     }
@@ -513,6 +566,12 @@ async fn the_operator_human_does_not_move_with_client_or_registration_status(poo
     let (dual, _) = named(&pool, "dual-principal").await;
     link(&pool, dual, o3).await;
     fixture::make_human_operator(&pool, dual).await;
+    // The operators opted in, so the outsider's cards carry their names and
+    // the reverse evidence at all (an unnamed human shows neither); the
+    // opt-in arm reads no status, so the property under test is unchanged.
+    for h in [h1, h2, o3] {
+        set_profile(&pool, h, "public").await;
+    }
 
     // Where both agree, the card equals epigraph_human_of.
     assert_eq!(human_of(&pool, linked).await, Some(h1));
@@ -604,11 +663,20 @@ async fn an_operated_agent_sees_its_human_exactly_as_an_outsider_does(pool: PgPo
     let (bot, _) = named(&pool, "voss-bot").await;
     link(&pool, bot, h1).await;
 
+    // Neither finds an unnamed human by its name (both humans keep the
+    // 'group' profile and share no team with either reader); the human
+    // itself does (CALIBRATION: the rule's self arm).
     for q in ["sable voss", "sa"] {
         let as_bot = find_as(&pool, bot, q, Some("human"), None, Some(25)).await;
         let as_out = find_as(&pool, outsider, q, Some("human"), None, Some(25)).await;
         assert_eq!(ids(&as_bot), ids(&as_out), "{q}");
-        assert_eq!(ids(&as_bot), vec![h1], "{q}: only the bound human");
+        assert_eq!(
+            ids(&as_bot),
+            Vec::<Uuid>::new(),
+            "{q}: no unnamed human is found"
+        );
+        let as_self = find_as(&pool, h1, q, Some("human"), None, Some(25)).await;
+        assert_eq!(ids(&as_self), vec![h1], "{q}: CALIBRATION");
     }
     assert_eq!(
         whole(&cards_as(&pool, bot, &[h1, h2]).await),
@@ -684,8 +752,18 @@ async fn human_operator_status_is_shown_only_to_those_who_may_know_it(pool: PgPo
         "registration is hidden from an outsider"
     );
     assert_eq!(out[0].kind, AgentKind::Unknown);
-    assert_eq!(out[2].kind, AgentKind::Human);
-    assert_eq!(out[2].kind_evidence, vec!["operator_of_bound_agent"]);
+    // The bound human is UNNAMED to an outsider (no arm of migration 286
+    // holds), so the binding's reverse evidence is withheld with its name:
+    // it reads as the unregistered look-alike. Before the human-identity
+    // rule this asserted `human` via `operator_of_bound_agent`.
+    assert_eq!(out[2].kind, AgentKind::Unknown);
+    assert_eq!(shape(&out[2]), shape(&out[1]));
+    // CALIBRATION: once the human opts in, the binding says human to anyone.
+    set_profile(&pool, human, "public").await;
+    let opted = card_as(&pool, outsider, human).await;
+    assert_eq!(opted.kind, AgentKind::Human);
+    assert_eq!(opted.kind_evidence, vec!["operator_of_bound_agent"]);
+    set_profile(&pool, human, "group").await;
 
     for h in [lone, human] {
         let own = card_as(&pool, h, h).await;
@@ -942,6 +1020,11 @@ async fn roles_show_disclosed_assignments_and_never_the_admin_roster(pool: PgPoo
     let (member, _) = named_human(&pool, "Juno Marsh").await;
     let (non_member, _) = named_human(&pool, "Juno Marsh").await;
     grant(&pool, "role:test-members", member).await;
+    // The roster is read from a NAMED holder (it opted in): an unnamed
+    // holder's roles are withheld with its name (asserted below).
+    set_profile(&pool, member, "public").await;
+    let (hidden_member, _) = named_human(&pool, "Juno Marsh").await;
+    grant(&pool, "role:test-members", hidden_member).await;
     // Custodian after the member grant: a live custodian makes every later
     // grant name a grantor (CUS03).
     let (custodian, _) = named_human(&pool, "Kit Arlow").await;
@@ -969,6 +1052,20 @@ async fn roles_show_disclosed_assignments_and_never_the_admin_roster(pool: PgPoo
         shape(&out[2]),
         shape(&out[3]),
         "the custodian roster is not disclosed to an outsider"
+    );
+    // An UNNAMED holder of the same disclosed role reads to an outsider as
+    // the non-member does: roles are human evidence (only registered people
+    // hold them), so they go with the name (spec 5).
+    let hidden = card_as(&pool, outsider, hidden_member).await;
+    assert!(hidden.roles.is_empty(), "{hidden:?}");
+    assert_eq!(shape(&hidden), shape(&out[1]));
+    assert_eq!(
+        card_as(&pool, hidden_member, hidden_member)
+            .await
+            .roles
+            .len(),
+        1,
+        "CALIBRATION: the holder sees its own"
     );
 
     // The holder of an elevating role sees its own.
@@ -1044,6 +1141,9 @@ async fn a_disclosed_role_does_not_move_with_client_or_registration_status(pool:
     let (outsider, _) = named(&pool, "outsider").await;
     let (member, _) = named_human(&pool, "Juno Marsh").await;
     grant(&pool, "role:test-members", member).await;
+    // Opted in, so the outsider sees the role at all (an unnamed holder's
+    // roles are withheld); the opt-in arm reads no status either.
+    set_profile(&pool, member, "public").await;
 
     let before = whole(&cards_as(&pool, outsider, &[member]).await);
     assert_eq!(before[0]["kind"], "human");
@@ -1717,11 +1817,18 @@ async fn a_pending_authorship_is_reported_apart_and_backs_no_claim(pool: PgPool)
     )
     .await;
 
-    for who in [outsider, human, stranger] {
+    // Every reader sees the pending naming, the person unnamed to it
+    // included. A pending authorship is an ingester's word about ANY agent
+    // (`check_explicit_author_ids` has no human gate), so it is not human
+    // evidence; withholding it from an unnamed person only (the branch's
+    // first cut, `hide_pending`) made `0` a hidden-human marker (review
+    // findings leaks#2 / correctness#2). The H-vs-N comparison is
+    // `human_identity_visibility.rs::a_pending_naming_reads_the_same_on_an_unnamed_human_and_a_nameless_agent`.
+    for (who, pending) in [(human, 1), (outsider, 1), (stranger, 1)] {
         let card = card_as(&pool, who, human).await;
         let k = counts_json(&card);
         assert_eq!(k["authored_papers"], 0, "{who}: {k}");
-        assert_eq!(k["pending_authored_papers"], 1, "{who}: {k}");
+        assert_eq!(k["pending_authored_papers"], pending, "{who}: {k}");
         assert_eq!(k["asserted_claims"], 0, "{who}: {k}");
     }
 
@@ -1966,6 +2073,9 @@ async fn a_persons_own_authorship_outranks_a_strangers_pending_naming(pool: PgPo
         })),
     )
     .await;
+    // Read by an outsider the person is not named to: the pending count is
+    // the ingester's word and is shown to every reader (no hidden-human
+    // marker; review findings leaks#2 / correctness#2).
     let k = card_as(&pool, outsider, human).await.counts;
     assert_eq!(
         (k.authored_papers, k.pending_authored_papers),
@@ -2023,7 +2133,7 @@ async fn profile_decisions(
     subject: Uuid,
     orcid: &str,
 ) -> [bool; 3] {
-    let profile = epigraph_db::AgentRepository::get_public_profile(&mut *conn, viewer, subject)
+    let profile = epigraph_db::AgentRepository::get_public_profile(&mut *conn, subject)
         .await
         .expect("get_public_profile")
         .expect("subject exists");
@@ -2031,7 +2141,7 @@ async fn profile_decisions(
         .await
         .expect("card")
         .expect("subject exists");
-    let matched = AgentLookupRepository::match_by_name(&mut *conn, viewer, orcid, 25)
+    let matched = AgentLookupRepository::match_by_name(&mut *conn, orcid, 25)
         .await
         .expect("match_by_name")
         .iter()
@@ -2121,7 +2231,9 @@ async fn the_three_copies_of_the_profile_rule_decide_alike(pool: PgPool) {
 /// status, so a retired link, a revoked allowance and an allowance on an
 /// agent that also has a link name nobody, in either direction.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_human_some_agent_is_bound_to_reads_as_human_to_every_reader(pool: PgPool) {
+async fn a_human_some_agent_is_bound_to_reads_as_human_to_every_reader_it_is_named_to(
+    pool: PgPool,
+) {
     let (outsider, _) = named(&pool, "outsider").await;
     // Bound by a live link.
     let (h_link, _) = named_human(&pool, "Wenna Calloway").await;
@@ -2161,6 +2273,14 @@ async fn a_human_some_agent_is_bound_to_reads_as_human_to_every_reader(pool: PgP
     // A registered human no agent is bound to.
     let (h_lone, _) = named_human(&pool, "Ilka Dorne").await;
     let (plain, _) = named(&pool, "Ilka Dorne").await;
+    // Every human above opted in: this test pins the binding's reverse
+    // evidence to readers the human is NAMED to. An unnamed human shows no
+    // human evidence at all (asserted at the end).
+    for h in [
+        h_link, h_allow, h_retired, h_revoked, h_shadowed, h_other, h_lone,
+    ] {
+        set_profile(&pool, h, "public").await;
+    }
 
     let everyone = [
         outsider, h_link, bot, h_allow, svc, h_retired, old_bot, h_revoked, gone_svc, h_shadowed,
@@ -2215,6 +2335,23 @@ async fn a_human_some_agent_is_bound_to_reads_as_human_to_every_reader(pool: PgP
     assert_eq!(ids(&r), vec![h_link]);
     let r = find_as(&pool, outsider, "odile varga", Some("human"), None, None).await;
     assert!(ids(&r).is_empty(), "a retired link's operator is no human");
+
+    // A bound human that did NOT opt in: to an outsider its card reads as the
+    // unregistered look-alike's, though its bot's card shows its id.
+    let (h_hidden, _) = named_human(&pool, "Ilka Dorne").await;
+    let (hidden_bot, _) = named(&pool, "dorne-bot").await;
+    link(&pool, hidden_bot, h_hidden).await;
+    let c = card_as(&pool, outsider, h_hidden).await;
+    assert_eq!(c.kind, AgentKind::Unknown, "{c:?}");
+    assert_eq!(shape(&c), shape(card(plain)));
+    assert_eq!(
+        card_as(&pool, outsider, hidden_bot)
+            .await
+            .operator_human
+            .map(|h| (h.id, h.display_name)),
+        Some((h_hidden, Some(placeholder(&pool, h_hidden).await))),
+        "the id, never the name: the placeholder (C7)"
+    );
 }
 
 /// Migration 269's definers: SECURITY DEFINER, maintenance-owned, on 172's
@@ -2423,4 +2560,79 @@ async fn migration_269_attachments_refuse_more_than_200_agents(pool: PgPool) {
         .await
         .expect("200 ids accepted");
     assert!(ok.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Paper author listings (spec 2026-11-24 human identity, row E1)
+// ---------------------------------------------------------------------------
+
+/// `PaperRepository::list_authors_by` (MCP `query_paper`, REST papers, the
+/// `authored_by` literature block, the sources paper kind) lists a human
+/// author a stranger's ingest named WITHOUT its name to an outsider, under the
+/// `oauth:<client row id>` placeholder a nameless service principal carries
+/// (operator ruling C7), and with its name to a teammate (CALIBRATION); role
+/// and affiliations are the ingester's edge data and show as for a nameless
+/// author node.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paper_lists_an_unnamed_human_author_without_its_name(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (human, _) = named_human(&pool, "Ysolde Authored").await;
+    let (mate, _) = named(&pool, "ysolde-teammate").await;
+    team_of(&pool, &[human, mate]).await;
+    // A nameless author node at the next position, for the comparison.
+    let (nameless, _) = named(&pool, "placeholder").await;
+    sqlx::query("UPDATE agents SET display_name = NULL WHERE id = $1")
+        .bind(nameless)
+        .execute(&pool)
+        .await
+        .expect("nameless");
+    let p = paper(&pool, "10.9999/lookup.unnamed-author.1").await;
+    for (who, pos) in [(human, 0), (nameless, 1)] {
+        assert!(
+            ingest_edge_as_any(
+                &pool,
+                stranger,
+                (who, "agent"),
+                (p, "paper"),
+                "authored",
+                Some(serde_json::json!({"position": pos, "role": "author"})),
+            )
+            .await
+        );
+    }
+    let list = |who: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let scoped = app_pool(&pool).await;
+            let v = viewer(&pool, who).await;
+            let mut read = scoped.read_as(&v).await.expect("read_as");
+            epigraph_db::PaperRepository::list_authors_by(&mut *read, &v, p, stranger, 10)
+                .await
+                .expect("list_authors_by")
+        }
+    };
+    let rows = list(outsider).await;
+    assert_eq!(rows.len(), 2, "both authorships listed: {rows:?}");
+    let h = rows.iter().find(|r| r.agent_id == human).expect("H listed");
+    let n = rows
+        .iter()
+        .find(|r| r.agent_id == nameless)
+        .expect("N listed");
+    assert_eq!(
+        h.display_name,
+        Some(placeholder(&pool, human).await),
+        "an outsider gets the placeholder a nameless service principal carries (C7), not the name"
+    );
+    assert_eq!(
+        (h.role.clone(), h.affiliations.clone()),
+        (n.role.clone(), n.affiliations.clone())
+    );
+    let rows = list(mate).await;
+    let h = rows.iter().find(|r| r.agent_id == human).expect("H listed");
+    assert_eq!(
+        h.display_name.as_deref(),
+        Some("Ysolde Authored"),
+        "CALIBRATION"
+    );
 }

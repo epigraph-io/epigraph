@@ -9,6 +9,7 @@ pub mod admin_act_ceremony;
 pub mod admin_cascade;
 pub mod admin_scope_enforcement;
 pub mod agent;
+pub mod agent_disclosure;
 pub mod agent_identity;
 pub mod agent_key;
 pub mod agent_lookup;
@@ -121,13 +122,16 @@ pub use admin_scope_enforcement::{
 };
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
-    CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
-    SpeaksFor,
+    CapabilityFilter, OperatorLink, OperatorLinkOutcome, ProfileVisibility, ProfileVisibilitySet,
+    RetiredLinkOutcome, RoleAgentRunGate, SpeaksFor,
 };
 pub use agent::{
     DelegationLive, RunTokens, SignerAgentType, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV,
 };
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
+pub use agent_disclosure::{
+    disclosure_lateral_sql, redact_agent, AgentDisclosureRepository, Disclosure,
+};
 pub use agent_identity::{
     AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptBlobRead,
     PromptFile, PromptHistoryCursor, PromptHistoryEntry, PromptHistoryIndexEntry,

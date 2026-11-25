@@ -620,11 +620,26 @@ async fn a_real_human_with_the_legacy_shape_is_still_refused_aid03(pool: PgPool)
     .execute(&pool)
     .await
     .expect("revoke the human operator");
-    sqlx::query("UPDATE oauth_clients SET agent_id = NULL WHERE agent_id = $1")
-        .bind(registry_only)
-        .execute(&pool)
-        .await
-        .expect("re-point its client");
+    // Migration 294's HEV01 now refuses re-pointing a linked human client, so
+    // the out-of-band state this case simulates is reached with triggers off
+    // (`session_replication_role = replica`) on one connection: the state can
+    // still exist on a database that predates 294.
+    {
+        let mut c = pool.acquire().await.expect("acquire");
+        sqlx::query("SET session_replication_role = replica")
+            .execute(&mut *c)
+            .await
+            .expect("replica");
+        sqlx::query("UPDATE oauth_clients SET agent_id = NULL WHERE agent_id = $1")
+            .bind(registry_only)
+            .execute(&mut *c)
+            .await
+            .expect("re-point its client");
+        sqlx::query("SET session_replication_role = origin")
+            .execute(&mut *c)
+            .await
+            .expect("origin");
+    }
 
     // A keyless human: the OAuth placeholder's `derived` key.
     let keyless = legacy_fleet_row(&pool).await;
