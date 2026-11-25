@@ -140,6 +140,13 @@ WALKERS = {
     # The API's error texts, and the engine error collections it serves.
     "crates/epigraph-api/tests/error_text_ratchet.rs": ("crates/*/src/*",),
     "crates/epigraph-api/tests/guest_public_reads.rs": ("crates/*/src/*",),
+    # Only provider provisioning may mint a `<provider>:<subject>` client id:
+    # every `OAuthClientRepository::create(` caller under these crates' src.
+    "crates/epigraph-api/tests/identity_provisioning.rs": (
+        "crates/epigraph-cli/src/*",
+        "crates/epigraph-db/src/*",
+        "crates/epigraph-mcp/src/*",
+    ),
     "crates/epigraph-api/tests/no_redaction_sentinel.rs": ("crates/*/src/*",),
     # README.md, docs/README.md, docs/intro/*.md and the names under docs/,
     # docs/architecture and docs/audits (the index must link every entry under
@@ -157,6 +164,8 @@ WALKERS = {
     # Every member's manifest: crates/ and tests/engine-integration.
     "crates/epigraph-core/tests/workspace_layout.rs": ("crates/*/Cargo.toml", "tests/*/Cargo.toml"),
     "crates/epigraph-crypto/tests/entity_signing_sites.rs": ("crates/*/src/*",),
+    # Every read of agent identity columns in every crate's src.
+    "crates/epigraph-db/tests/agent_name_disclosure_lint.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/belief_lint/mod.rs": ("crates/*/src/*", "scripts/*"),
     "crates/epigraph-db/tests/custodian_role.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/edge_writer_signing_ratchet.rs": ("crates/*/src/*",),
