@@ -36,8 +36,11 @@
 --    as 236's direct arm writes them with the target in place of the
 --    parameter. This is a THIRD copy of that arm (236's, main's roster
 --    read): whoever merges main should express it through
---    `epigraph_group_live_roster`'s counting rule, and main's
---    `group_live_roster.rs` md5 pin on 236's twin keeps the copies honest.
+--    `epigraph_group_live_roster`'s counting rule. Main's
+--    `group_live_roster.rs` pins only 236's twin against the roster; this
+--    copy is pinned by
+--    `human_identity_visibility.rs::the_details_rule_shares_exactly_the_live_roster`
+--    (row-by-row parity with the roster, plus md5s of the twin and the roster).
 --    Every arm, its answer and the order are 304's.
 --
 -- Pinned by `human_identity_visibility.rs::a_lapsed_membership_row_shares_no_details`

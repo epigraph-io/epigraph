@@ -396,7 +396,15 @@ The core's body, in order (the decision is made in SQL; the Rust side only redac
      fixed the same rule in its hand-copied predicates (`epigraph_group_live_roster`, backlog
      f712db53); here it is the core's, so a merge of main must keep the core's version on every
      conflicting Rust site. It is a third copy of 236's direct arm: the merge may express it
-     through main's roster function's counting rule.
+     through main's roster function's counting rule. The merge kept the copy (re-stating the
+     core only to call the roster would be a new migration over a body that is correct
+     today), so the copy is pinned instead:
+     `human_identity_visibility.rs::the_details_rule_shares_exactly_the_live_roster` compares
+     the details rule with `epigraph_group_live_roster` row by row (live and lapsed rows under
+     164, including non-human rows, where 164 decides the details rule alone, and under 235)
+     and pins the md5 of 236's twin and of the roster, so re-stating either fails until the
+     core is re-stated with it. Dropping 164's or 235's conjunct from the details rule each
+     fail it (mutation probes).
 
    This text replaces the four copies that exist today (§7, rows A1, A2, B1, B2; the brief
    said three, but `profile_details_visible` is a fourth). Part A creates the core; part B

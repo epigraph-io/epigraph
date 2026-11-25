@@ -557,6 +557,209 @@ async fn a_lapsed_membership_row_shares_no_details(pool: PgPool) {
     );
 }
 
+/// 236's `epigraph_live_memberships_unbound` body, whose direct arm 308's
+/// details rule (and main's 273 roster) restate.
+const LIVE_TWIN_MD5: &str = "7648baee271b2163a52c28db1b4a74b6";
+/// 273's `epigraph_group_live_roster` body, the same counting rule main reads.
+const LIVE_ROSTER_MD5: &str = "67e34c0761883326dfa6090e0ef1659e";
+
+/// 308's details rule is a THIRD copy of 236's direct-arm lapse rules (164,
+/// 235), beside main's `epigraph_group_live_roster` (273). Main's
+/// `group_live_roster.rs` pins only 236 against 273, so nothing kept 308's
+/// copy in step (merge audit, finding 7). Differential pin: for every
+/// unrevoked row of a verb-made team (a live and a lapsed human, 164), a
+/// keyed team made outside the verbs (no lapse rule) and a personal group
+/// (its owner's row, and an allowlisted agent's row whose allowance was
+/// revoked, lapsed by 235), the core shares details with a stranger holding
+/// exactly that group iff the roster lists the row's agent. Every target's
+/// profile is `'group'`, so only the shared-group arm can answer `details`;
+/// the verb team also holds two non-human rows (a bot whose human is live,
+/// and one whose link was retired), the only rows on which 164's conjunct in
+/// the details rule decides alone (a human target is also gated by being
+/// named). Mutation probes: dropping 164's or 235's conjunct from the details
+/// rule each fail this test.
+/// The md5 half fails when the twin or the roster is re-stated, so whoever
+/// changes the lapse rule there is sent to re-state the core's copy too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_details_rule_shares_exactly_the_live_roster(pool: PgPool) {
+    let (owner, _) = fixture::seed_human_operator(&pool, "details-parity-owner").await;
+    let (live, _) = fixture::seed_human_operator(&pool, "details-parity-live").await;
+    let (lapsed, _) = fixture::seed_human_operator(&pool, "details-parity-lapsed").await;
+    let (plain, personal) = fixture::seed_agent_with_group(&pool, "details-parity-plain").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "details-parity-stranger").await;
+    let verb = fixture::verb_team_group(&pool, "Synthetic Details Parity Team", owner).await;
+    fixture::verb_team_group_add(&pool, verb, live, "writer").await;
+    fixture::verb_team_group_add(&pool, verb, lapsed, "reader").await;
+    fixture::revoke_human_operator(&pool, lapsed).await;
+    // A human target's details also need it NAMED (an unnamed human answers
+    // `(false, false)`), and the team arm carries 164 itself, so the verb
+    // team's lapse reaches the details rule alone only through NON-human
+    // rows: a bot whose human is live, and one whose link was retired.
+    let (bot_live, _) = fixture::seed_agent_with_group(&pool, "details-parity-bot-live").await;
+    let (bot_lapsed, _) = fixture::seed_agent_with_group(&pool, "details-parity-bot-lapsed").await;
+    link(&pool, bot_live, live).await;
+    link(&pool, bot_lapsed, owner).await;
+    for bot in [bot_live, bot_lapsed] {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'reader')",
+        )
+        .bind(verb)
+        .bind(bot)
+        .execute(&pool)
+        .await
+        .expect("a bot's verb-team row");
+    }
+    retire_link(&pool, bot_lapsed).await;
+    let keyed: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('Synthetic Details Keyed Team', \
+                 'did:key:details-parity-' || gen_random_uuid()::text, $1, 'team', $2) \
+         RETURNING id",
+    )
+    .bind(
+        blake3::hash(b"details parity keyed team")
+            .as_bytes()
+            .as_slice(),
+    )
+    .bind(owner)
+    .fetch_one(&pool)
+    .await
+    .expect("keyed team");
+    for (agent, role) in [(owner, "admin"), (lapsed, "writer"), (plain, "reader")] {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, $3)",
+        )
+        .bind(keyed)
+        .bind(agent)
+        .bind(role)
+        .execute(&pool)
+        .await
+        .expect("keyed team row");
+    }
+
+    // 235's shape, planted as `group_live_roster.rs` plants it: a writer row
+    // in `plain`'s personal group, and a REVOKED allowance naming `plain`.
+    let (allowlisted, _) =
+        fixture::seed_agent_with_group(&pool, "details-parity-allowlisted").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(personal)
+    .bind(allowlisted)
+    .execute(&pool)
+    .await
+    .expect("the allowlisted agent's personal-group row");
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'fixture allowlisted service', 'service', ARRAY['claims:write'], \
+                 'active', $2, 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("fixture-details-parity-{allowlisted}"))
+    .bind(allowlisted)
+    .fetch_one(&pool)
+    .await
+    .expect("the allowlisted agent's client");
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "INSERT INTO author_binding_clients (client_id, agent_id, operator_id, reason, \
+                                             revoked_at, revoked_by, revoked_reason) \
+         VALUES ($1, $2, $3, 'planted', now(), 'planted', 'planted')",
+    )
+    .bind(client)
+    .bind(allowlisted)
+    .bind(plain)
+    .execute(&mut *tx)
+    .await
+    .expect("plant a revoked allowance");
+    tx.commit().await.expect("commit");
+
+    let targets = vec![
+        owner,
+        live,
+        lapsed,
+        plain,
+        allowlisted,
+        bot_live,
+        bot_lapsed,
+        stranger,
+    ];
+    for agent in &targets {
+        set_profile(&pool, *agent, "group").await;
+    }
+    let not_group: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agents WHERE id = ANY($1) AND profile_visibility <> 'group'",
+    )
+    .bind(&targets)
+    .fetch_one(&pool)
+    .await
+    .expect("profiles");
+    assert_eq!(not_group, 0, "PREMISE: every target's profile is 'group'");
+
+    let (mut shared_seen, mut lapsed_seen) = (false, false);
+    for group in [verb, keyed, personal] {
+        let rows: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT agent_id FROM group_memberships WHERE group_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(group)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        assert!(!rows.is_empty(), "PREMISE: group {group} has rows");
+        let roster: Vec<Uuid> =
+            sqlx::query_scalar("SELECT agent_id FROM public.epigraph_group_live_roster($1)")
+                .bind(group)
+                .fetch_all(&pool)
+                .await
+                .expect("roster");
+        for agent in rows {
+            let details: bool = sqlx::query_scalar(
+                "SELECT details FROM public.epigraph_agent_disclosure_for($1, $2, $3, false)",
+            )
+            .bind(agent)
+            .bind(stranger)
+            .bind(vec![group])
+            .fetch_one(&pool)
+            .await
+            .expect("core");
+            let listed = roster.contains(&agent);
+            shared_seen |= listed;
+            lapsed_seen |= !listed;
+            assert_eq!(
+                details, listed,
+                "group {group}, agent {agent}: the core's details rule and the live roster \
+                 disagree"
+            );
+        }
+    }
+    assert!(shared_seen, "CALIBRATION: at least one row counts");
+    assert!(lapsed_seen, "CALIBRATION: at least one row is lapsed");
+
+    let (twin, roster): (String, String) = sqlx::query_as(
+        "SELECT (SELECT md5(prosrc) FROM pg_proc WHERE oid = \
+                 to_regprocedure('public.epigraph_live_memberships_unbound(uuid)')), \
+                (SELECT md5(prosrc) FROM pg_proc WHERE oid = \
+                 to_regprocedure('public.epigraph_group_live_roster(uuid)'))",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("bodies");
+    assert_eq!(
+        (twin.as_str(), roster.as_str()),
+        (LIVE_TWIN_MD5, LIVE_ROSTER_MD5),
+        "236's twin or 273's roster was re-stated: re-state the details rule of \
+         epigraph_agent_disclosure_for (308's copy of the same lapse rules) with the same \
+         delta, extend this test's rows to the new rule, then update these md5s"
+    );
+}
+
 // ─── T5 (rule half): the opt-in arm ──────────────────────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
