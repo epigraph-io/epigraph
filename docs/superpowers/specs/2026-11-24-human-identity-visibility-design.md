@@ -173,7 +173,7 @@ Consequences that follow directly from the rule and that the PR must state in it
   Consequences, recorded:
   - after a 149 allowance is revoked and the agent's other client is allowed for a second
     human, the agent's later public claims (made for the second human) still name H (there
-    is no end bound, as ruled);
+    is no end bound, as built; the `[start, end)` reading is open item C14, §16.C);
   - a legacy-linked author's pre-link public claims no longer name its human (§15.R17, §17);
   - the window reads `created_at`, which every application write path sets to `now()`; a
     direct database write can set it, the trust class of **[RULED] C13**.
@@ -1203,6 +1203,24 @@ additional C6/C2 cost is the same kind (|B(H)| index probes per arm, no scans) a
 recorded here for the operator, not decided by this PR. The marker-table fallback (C9)
 remains the one structural remedy.
 
+**After review 2 (correctness#8, correctness#9), not re-measured in this round.**
+- 302 removed the evidence probe and narrowed the BBA probe to assessment slots (303's
+  index), so the extra C6/C2 cost is now three per-bound-agent arms plus the countersign act,
+  not five; the harness (`human_identity_visibility_perf.rs`) is updated to 302's arms but was
+  not re-run, so the numbers above are 300's and an upper bound for 302's.
+- The EXPLAIN pins (`tenancy_migration_shape.rs::the_disclosure_probes_reach_their_indexes_under_the_cores_row_security`)
+  run on an EMPTY database. On the harness shape the countersign probe planned on 001's
+  `idx_security_events_agent` with `event_type` / `created_at` as row filters, not 296's
+  partial index, and a real agent's audit trail is far longer than the 2 events per agent the
+  harness seeded. Open: re-measure with a realistic per-agent `security_events` volume and pin
+  the plan observed at scale, or make 296 the only fitting index (as 287's three-column key did
+  for the readable-claim arm). Until then 296 may be pure write cost. (The evidence half of
+  the finding is moot: 305 drops 291's index with the probe.)
+- §15.R16's placeholder rows (an `epigraph_unnamed_agent_name` per human principal in every name
+  search) are not measured against the §11 budget. Open: measure on the harness's 21,507
+  agents before the PR is called ready.
+Both cost items are listed for the operator in the PR body, beside C8 (§16.C, C16).
+
 ## 12. Test plan
 
 All new tests go in `epigraph-db/tests/human_identity_visibility.rs`, plus route and tool tests
@@ -1791,6 +1809,27 @@ Each item states the behaviour implemented until the operator rules.
 
 - **C1. (Closed in revision 2.)** E2 is redacted in this PR, `replaces` included (finding L2).
 - **C2, C5, C6.** Ruled (§16.R).
+- **C14. (New, review round 2, leaks#4.) An END bound on the binding window.** C5 is built as
+  a START bound only, per agent the earliest start of its bindings to H, with no end. So an
+  agent bound to H1 (allowance revoked) and later to H2 names H1 by the public assertions it
+  makes for H2, even when H1 was never named while bound. The ruling's text ("it stays
+  counted after the binding is retired/revoked (sticky)") is satisfied equally by a
+  `[start, end)` window: an assertion made while bound stays counted, later ones belong to
+  someone else. Implemented: start only, as built; the `[start, end)` reading is put to the
+  operator, not changed without a ruling.
+- **C15. (New, review round 2, correctness#1; orchestrator / operator.) Migration numbering.**
+  origin/main now carries `272_bug_report_intake_marker.sql` and `273_group_live_roster.sql`,
+  colliding with this branch's 272 and 273 (sqlx keys migrations by version), and conflicts in
+  `tenancy_backfill.rs`, `agent.rs`, `agent_lookup.rs`, `visibility_lint.rs`,
+  `migrations/README.md` and the 272/273 undo runbooks. The branch's range (272-307) must be
+  renumbered above main's head at merge time, touching file names, in-file cross-references,
+  the runbooks, the `tenancy_backfill` registers, this spec and every test that names a
+  version (`below(N)`, refusal tests). The standing rule forbids editing 272-282 on this branch,
+  so the rename needs an explicit ruling. The md5 preconditions hash `prosrc`, not file names,
+  and survive the rename. Main's 272/273 re-body none of the functions this branch pins.
+- **C16. (New, review round 2, correctness#9.) Cost not ruled on.** The C6/C2 arms' share of
+  the worst case (§11.2; three arms plus the countersign act since 302) and the unmeasured name
+  search cost of §15.R16's placeholder rows. C12 accepted only the readable-claim arm.
 - **C6a. (New, review round 2.)** Addendum 5 narrowed C6 (migration 302): evidence and every
   BBA except an assessment no longer name H by themselves, because no column records which
   identity wrote them. Implemented: narrowed. Alternative for the operator: a write-once
@@ -1936,7 +1975,16 @@ Not covered by part B (open):
   names FEWER: a human named only by evidence, or by a non-assessment BBA, of a bound agent
   becomes unnamed. Nothing is deployed yet, so no one is named today by those arms.
 - 298 declares a LEAKPROOF function, which needs a SUPERUSER migration runner (as 212 / 238
-  already assume); on another runner it refuses (LKP01) with nothing changed. Without 298-301,
+  already assume); on another runner it refuses (LKP01) with nothing changed. **Deploy
+  pre-check, NOT measured (review 2, correctness#6):** no earlier migration requires a
+  superuser (060 falls back without one, 067 declined LEAKPROOF for that reason, 274 was written
+  for a non-superuser runner), and this branch's reviewers cannot read production. On the DSN
+  that applies migrations in production, before deploying, run
+  `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`. If it is false, boot stops at
+  298 after 283-297 committed (one transaction per migration), leaving 295's slow ingest probe
+  live: either apply 298 out of band as a superuser first, or replace the accessor with a
+  generated, indexed `uuid` column on `edges` set by the ingest walk (compared `uuid = uuid`,
+  leakproof without a declaration) in a new migration. Record the measured answer here. Without 298-301,
   295's ingest-record probe scans `edges` by `created_at` on every human evaluation (198 s on
   the §11.2 shape), so 295 must never be deployed without them.
 
@@ -2015,3 +2063,26 @@ raised 25 findings. Dispositions; none was rejected outright.
 | tests#9 pinned-test audit | No defect; the MCP fixture asymmetry is commented | - |
 | Security review of 278, finding 1: re-own / backfill / OCC02 act on forgeable rows | Fixed: migration 281, genuine-projection predicate (marker plus `role_assignments` join) on bind, unbind and the reconcile pass; 278's own backfill covered by a deploy pre-check | §7 K1, §10 M10, §15.R1, §17 |
 | Security review of 278, finding 2: owner-writable projection | Fixed: migration 282, INVOKER guard on INSERT / UPDATE / DELETE of a marked row, maintenance and definer frames only (OCC05) | §7 K1, §10 M11, §15.R1, §16.A4 |
+
+## 20. Review resolution (round 3, after the operator's rulings C2-C13)
+
+Two reviews of commits 3e1655cdd..511e7465f (leaks / indistinguishability; correctness,
+migrations, tests) raised 16 findings, 4 blocking. Dispositions:
+
+| Finding | Disposition | Where |
+|---|---|---|
+| leaks#1, correctness#2 (BLOCKING) C6 counted rows another writer made (Addendum 5) | Fixed: migration 302 drops evidence and counts a BBA only on an assessment slot; 303 indexes it, 304/305 drop 293/291. Narrowing listed for the operator (C6a) | §4, §10 M26-M27, §16.R C6, §16.C C6a |
+| leaks#2 (BLOCKING) explicit `authored` edge marker | Fixed: the spelling is withheld from every agent's authored edge for every non-privileged reader; H-vs-N edge test | §7 E2 |
+| correctness#1 (BLOCKING) migrations 272/273 collide with origin/main | Open, needs an orchestrator / operator ruling (renumber at merge; the standing rule forbids editing 272-282) | §16.C C15 |
+| correctness#3 (MAJOR) main's live-roster fix vs the core's details rule | Fixed now in the core: migration 306 | §6.1, §10 M28 |
+| correctness#4 (MAJOR) C5 stickiness across two bindings untested | Fixed: pin test; kills mutation P1 on the final core | §12 |
+| correctness#5 (MAJOR) ingest marker equality untested | Fixed: unmarked and foreign-marked records in `only_an_agents_own_assertion_names_its_human`; kills mutation P4 on the final core | §4 |
+| correctness#6 (deploy pre-check) superuser runner for 298 | Recorded as a deploy pre-check with the fallback; not measurable from here | §17 |
+| correctness#7 tables with `visibility` not named | Recorded: each rejected table and why | §15.R19 |
+| correctness#8 EXPLAIN pins vs §11.2 plans | Evidence half moot (302/305); countersign half open (re-measure or make 296 the only fitting index) | §11.2 |
+| correctness#9 cost not ruled on | Recorded for the operator | §11.2, §16.C C16 |
+| leaks#3 inherited `public` on C6 rows (publicize, dedup move) | Recorded as the C4 analogue for C6 rows; PR-body item | §4 |
+| leaks#4 no END bound on the window | Put to the operator, not changed | §16.C C14 |
+| leaks#5 consent stamp writable on INSERT | Fixed: migration 307 (RESTRICTIVE INSERT policy) | §10 M29, §16.R C11 |
+| leaks#6 lint saw one fallback spelling | Fixed: structural CASE scan plus a Rust-side check, planted self-tests | §14 |
+| leaks#7 H-vs-N gaps | Fixed for the paper-author listing and the edge listing; the rest recorded with the reason they are not reachable for an unnamed H | §16a |
