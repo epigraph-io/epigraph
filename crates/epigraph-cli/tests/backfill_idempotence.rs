@@ -2121,6 +2121,28 @@ async fn verify_flags_a_registry_edge_off_its_meet_and_the_registry_arm_repairs_
     assert!(stderr.contains("need three groups"), "stderr:\n{stderr}");
 }
 
+/// Puts the database's function bodies back to "below 258" the way an
+/// operator rolls back: the runbooks of every later migration that re-stated
+/// one of 258's bodies first, newest first, then 258's own. 284 re-states
+/// 258's `epigraph_propagate_tenancy()`, and 258's undo REFUSES (55000) over a
+/// body that is neither 258's nor 246's; 284's own deploy notes say to run
+/// `284-undo.sql` before `258-undo.sql`. A later migration that re-states one
+/// of these bodies adds its runbook to the front of this list.
+async fn undo_to_below_258(pool: &PgPool) {
+    for runbook in ["284-undo.sql", "258-undo.sql"] {
+        let undo = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/runbooks")
+                .join(runbook),
+        )
+        .unwrap_or_else(|e| panic!("read the {runbook} runbook: {e}"));
+        sqlx::raw_sql(&undo)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("run the {runbook} runbook: {e}"));
+    }
+}
+
 /// Below migration 258 the registry-edge check is SKIPPED and says so: this
 /// pre-flight runs before a release's migrations, and on a database whose
 /// oracle still meets a registry row as public every edge onto a private one
@@ -2150,14 +2172,7 @@ async fn verify_skips_the_registry_edge_check_before_migration_258(pool: PgPool)
         "CALIBRATION: at head the stale edge fails; stderr:\n{stderr}"
     );
 
-    let undo = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/258-undo.sql"),
-    )
-    .expect("read 258's undo runbook");
-    sqlx::raw_sql(&undo)
-        .execute(&pool)
-        .await
-        .expect("undo 258's function bodies");
+    undo_to_below_258(&pool).await;
 
     let (code, stderr) = run_backfill(&pool, &["verify"]).await;
     assert_eq!(
@@ -2285,14 +2300,7 @@ async fn the_registry_arm_refuses_to_write_before_migration_258(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("force the pre-258 world-owned stamp");
-    let undo = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/258-undo.sql"),
-    )
-    .expect("read 258's undo runbook");
-    sqlx::raw_sql(&undo)
-        .execute(&pool)
-        .await
-        .expect("undo 258's function bodies");
+    undo_to_below_258(&pool).await;
 
     let (code, stdout, stderr) = run_backfill_out(
         &pool,
