@@ -1021,8 +1021,10 @@ async fn write_in_txn(
 /// agent that COULD be attached (any agent: not a human, not a role node)
 /// writes only under READ COMMITTED, attached or not (as 123's CUS06 refuses
 /// a grant under REPEATABLE READ). POSITIVE CONTROLS: the attached agent
-/// writes under READ COMMITTED, and a human (never attached) writes under
-/// REPEATABLE READ and SERIALIZABLE.
+/// and a human write under READ COMMITTED; under REPEATABLE READ and
+/// SERIALIZABLE a human (never attached) passes ROL01 and is refused only by
+/// the writer scope's own READ COMMITTED rule for its direct membership
+/// (OPL02, migration 310), so ROL01's test stays on attachability.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
     seed_role(&pool, ROLE).await;
@@ -1036,10 +1038,20 @@ async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
     write_in_txn(&pool, attached, h_group, "READ COMMITTED", Between::Nothing)
         .await
         .expect("CONTROL: the holder's agent writes under READ COMMITTED");
+    write_in_txn(&pool, h, h_group, "READ COMMITTED", Between::Nothing)
+        .await
+        .expect("CONTROL: the human writes under READ COMMITTED");
     for level in ["REPEATABLE READ", "SERIALIZABLE"] {
-        write_in_txn(&pool, h, h_group, level, Between::Nothing)
-            .await
-            .unwrap_or_else(|e| panic!("CONTROL: a human writes under {level}: {e}"));
+        let r = write_in_txn(&pool, h, h_group, level, Between::Nothing).await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some("OPL02"),
+            "CONTROL: a human under {level} is not refused ROL01: {r:?}"
+        );
+        assert!(
+            format!("{r:?}").contains("a write through a direct membership is admitted only"),
+            "CONTROL: a human under {level} is refused by 310's direct-arm rule: {r:?}"
+        );
         assert_rol01(
             &write_in_txn(&pool, attached, h_group, level, Between::Nothing).await,
             &format!("an attached agent under {level}"),
