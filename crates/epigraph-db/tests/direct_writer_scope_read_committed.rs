@@ -64,6 +64,12 @@ const RR: &str = "REPEATABLE READ";
 const SER: &str = "SERIALIZABLE";
 const RC: &str = "READ COMMITTED";
 
+/// How long a bounded custodian assignment lives after its grant: wide
+/// enough that the writer's snapshot is always taken inside the window on a
+/// loaded test host (the mutation case needs the assignment live at the
+/// transaction's `now()`), short enough to keep the test quick.
+const ELAPSE_MS: u64 = 4000;
+
 fn sqlstate(e: &sqlx::Error) -> Option<String> {
     e.as_database_error()
         .and_then(sqlx::error::DatabaseError::code)
@@ -540,7 +546,7 @@ async fn a_custodian_ended_or_elapsed_mid_transaction_is_relieved_of_nothing(poo
     };
 
     for isolation in [RC, RR, SER] {
-        for elapse in [None, Some(1500)] {
+        for elapse in [None, Some(ELAPSE_MS)] {
             let what = format!(
                 "{isolation}, custodian {} mid-transaction",
                 if elapse.is_some() { "elapsed" } else { "ended" }
@@ -561,7 +567,7 @@ async fn a_custodian_ended_or_elapsed_mid_transaction_is_relieved_of_nothing(poo
     .execute(&pool)
     .await
     .expect("re-body the exemption to 122's form");
-    for (isolation, elapse) in [(RR, None), (SER, None), (RC, Some(1500))] {
+    for (isolation, elapse) in [(RR, None), (SER, None), (RC, Some(ELAPSE_MS))] {
         let r = run(format!("m-{isolation}-{elapse:?}"), isolation, elapse).await;
         assert!(
             r.is_ok(),
