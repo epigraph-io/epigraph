@@ -8,9 +8,16 @@ use crate::middleware::bearer::AuthContext;
 /// Verify the caller holds a live `role='admin'` membership in the given
 /// group, reading it on the caller's own connection.
 ///
-/// Uses `GroupMembershipRepository::get_member_role_conn`, whose `LIMIT 1` is
-/// made deterministic by the `group_memberships_one_live` partial unique index
-/// (migration 060).
+/// Uses `GroupMembershipRepository::get_member_role_conn`, which answers the
+/// caller's strongest LIVE role from `epigraph_live_memberships`, the definer
+/// `Viewer::resolve` reads (backlog 93ed2ec3). An unrevoked admin row that has
+/// LAPSED (its human is no longer a live human operator, migration 164; an
+/// allowlisted agent's allowance no longer names the owner, migration 235) is
+/// therefore refused here at once, as claim reads already are, rather than
+/// keeping group-admin authority until an operator revokes the row. A member
+/// derived from a role binding (migration 165) is never an admin. `conn` is
+/// stamped from the caller's own viewer, the only shape in which migration
+/// 236's principal-bound definer answers on the application role.
 ///
 /// This is a MEMBERSHIP check, not a scope check. The routes that call it
 /// require `groups:admin` at extractor time as well: scope AND membership.

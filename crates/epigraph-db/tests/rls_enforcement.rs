@@ -2112,6 +2112,12 @@ const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
 /// no SELECT, table- or column-level.
 const NO_APP_SELECT: &[(&str, &str)] = &[
     (
+        "bug_report_intake_marks",
+        "migration 272 (backlog e690866c): which agent filed which intake report; REVOKE ALL \
+         from epigraph_app (security_events shows an agent only its own rows), read only \
+         through the epigraph_my_bug_reports definer and by the maintenance-DSN theme scripts",
+    ),
+    (
         "mass_function_masses_writes",
         "migration 250 (backlog a278f16d): which transaction last wrote each mass function's \
          masses; REVOKE ALL from epigraph_app, written by the masses-write trigger definer and \

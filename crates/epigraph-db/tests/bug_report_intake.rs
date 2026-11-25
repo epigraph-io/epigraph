@@ -17,7 +17,11 @@
 //! * the reporter cannot read any of it back (row security, the viewer
 //!   predicate of the nearest-neighbour read the novelty gate uses);
 //! * the reporter's list holds only its own intake reports, not a claim it
-//!   authored in the intake group by another path;
+//!   authored in the intake group by another path; it is keyed on the marker
+//!   recorded at filing (272), so a report triage moved out of the intake
+//!   group, and one filed under an intake group the operator has since
+//!   replaced, stay listed; the application role can neither read nor forge
+//!   that marker;
 //! * the per-hour and per-day limits, counted per reporter;
 //! * an agent bound by a client allowance (149) files, with no membership of
 //!   any group; a linked agent whose acting row was revoked is refused;
@@ -527,8 +531,12 @@ async fn the_list_holds_only_the_callers_intake_reports(pool: PgPool) {
     let ids: Vec<Uuid> = mine.iter().map(|r| r.claim_id).collect();
     assert_eq!(ids, vec![b.claim_id, a.claim_id], "newest first, only mine");
     assert_eq!(mine[0].title.as_deref(), Some("second"));
-    assert!(mine[0].resolved && mine[0].is_current);
-    assert!(mine[1].labels.contains(&"bug".to_string()) && !mine[1].resolved);
+    assert_eq!(
+        (mine[0].resolved, mine[0].is_current),
+        (Some(true), Some(true))
+    );
+    assert!(mine[1].labels.contains(&"bug".to_string()));
+    assert_eq!(mine[1].resolved, Some(false));
 
     let theirs: Vec<Uuid> = list_as(&pool, other)
         .await
@@ -549,6 +557,288 @@ async fn the_list_holds_only_the_callers_intake_reports(pool: PgPool) {
         vec![o.claim_id],
         "a claim the member wrote into the group directly ({direct}) is not an intake report"
     );
+}
+
+/// The list is keyed on the intake marker recorded when the report was
+/// FILED, not on the intake group configured NOW (backlog e690866c): a report
+/// triage moved out of the intake group, and one filed under an intake group
+/// the operator has since replaced, both stay in their reporter's list.
+/// Neither the move nor the reconfiguration lets a claim that was not filed
+/// through the intake in: a claim the reporter authored by another path,
+/// moved INTO the intake group, stays out. (What each listed row SHOWS is
+/// pinned by `a_report_owned_outside_the_current_intake_shows_only_what_was_filed`.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn moved_and_earlier_intake_reports_stay_in_the_list(pool: PgPool) {
+    let w = world(&pool).await;
+    let triaged = team_group(&pool, w.ops, "bri-triaged").await;
+    let next_intake = team_group(&pool, w.ops, "bri-intake-2").await;
+
+    let moved = submit_as(&pool, w.reporter, &report("moved by triage"))
+        .await
+        .expect("moved");
+    let stays = submit_as(&pool, w.reporter, &report("left in the first intake"))
+        .await
+        .expect("stays");
+    let elsewhere =
+        fixture::seed_group_claim(&pool, w.reporter, w.home, "authored by another path").await;
+
+    // Triage moves one report to another team group, labelling it as it goes;
+    // the claim it moves into the intake group was never filed through it.
+    sqlx::query(
+        "UPDATE claims SET owner_group_id = $2, labels = labels || ARRAY['bug'] WHERE id = $1",
+    )
+    .bind(moved.claim_id)
+    .bind(triaged)
+    .execute(&pool)
+    .await
+    .expect("triage moves a report");
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(elsewhere)
+        .bind(next_intake)
+        .execute(&pool)
+        .await
+        .expect("a non-report lands in the next intake group");
+    // The operator names another intake group; the next report goes there.
+    configure(&pool, next_intake, 20, 200).await;
+    let later = submit_as(&pool, w.reporter, &report("filed under the new intake"))
+        .await
+        .expect("later");
+
+    let owners: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT owner_group_id FROM claims WHERE id = ANY($1) ORDER BY created_at",
+    )
+    .bind(vec![moved.claim_id, stays.claim_id, later.claim_id])
+    .fetch_all(&pool)
+    .await
+    .expect("owners");
+    assert_eq!(
+        owners,
+        vec![triaged, w.intake, next_intake],
+        "CALIBRATION: one report moved, one under the replaced intake group, one under the \
+         current one"
+    );
+
+    let mine = list_as(&pool, w.reporter).await.expect("list");
+    let ids: Vec<Uuid> = mine.iter().map(|r| r.claim_id).collect();
+    assert_eq!(
+        ids,
+        vec![later.claim_id, stays.claim_id, moved.claim_id],
+        "every report the reporter filed, newest first, and nothing else"
+    );
+    assert_eq!(mine[2].title.as_deref(), Some("moved by triage"));
+}
+
+/// A listed report shows the reporter nothing a later owner wrote or did
+/// (review of backlog e690866c: listing moved reports must not widen the
+/// disclosure). While the claim is owned by the CURRENT intake group the row
+/// shows its live title, labels, `resolved` and `is_current`, triage's
+/// included, as 207 did. Once another group owns it, whether triage moved it
+/// or the operator named a different intake group, the row shows only what
+/// was filed (title and the write's labels), with `resolved` and `is_current`
+/// `None`: never a label, title, resolution or supersession its new owner
+/// wrote.
+///
+/// Verified to fail: with the list's `resolved`/`is_current` arms put back to
+/// `'resolved' = ANY (c.labels)` / `c.is_current` for every row, `m.resolved`
+/// is `Some(true)` and `m.is_current` `Some(false)` below.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_report_owned_outside_the_current_intake_shows_only_what_was_filed(pool: PgPool) {
+    let w = world(&pool).await;
+    let triaged = team_group(&pool, w.ops, "bri-private-team").await;
+    let next_intake = team_group(&pool, w.ops, "bri-intake-next").await;
+    let filed: Vec<String> = [
+        "backlog",
+        "bug-report",
+        "intake",
+        "severity:major",
+        "component:mcp",
+    ]
+    .iter()
+    .map(|l| (*l).to_string())
+    .collect();
+
+    let in_intake = submit_as(&pool, w.reporter, &report("still in the intake"))
+        .await
+        .expect("in intake");
+    let moved = submit_as(&pool, w.reporter, &report("adopted by a private team"))
+        .await
+        .expect("moved");
+    let old_intake = submit_as(&pool, w.reporter, &report("left under the old intake"))
+        .await
+        .expect("old intake");
+
+    // Intake triage labels a report it keeps (shown while its group is the
+    // intake: see `current` below; this one's group is replaced later).
+    sqlx::query("UPDATE claims SET labels = labels || ARRAY['bug'] WHERE id = $1")
+        .bind(in_intake.claim_id)
+        .execute(&pool)
+        .await
+        .expect("intake triage labels");
+    // A private team adopts a report, labels it with an internal reference,
+    // rewrites its title, resolves it and retires it (as a supersession does).
+    sqlx::query(
+        "UPDATE claims SET owner_group_id = $2, \
+                labels = labels || ARRAY['dup-of:internal-ref', 'resolved'], \
+                properties = jsonb_set(properties, '{bug_report,title}', '\"internal title\"'), \
+                is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(moved.claim_id)
+    .bind(triaged)
+    .execute(&pool)
+    .await
+    .expect("a private team adopts a report");
+    // The operator names another intake group; the old one labels what it
+    // still holds.
+    configure(&pool, next_intake, 20, 200).await;
+    sqlx::query("UPDATE claims SET labels = labels || ARRAY['old-team-note'] WHERE id = $1")
+        .bind(old_intake.claim_id)
+        .execute(&pool)
+        .await
+        .expect("the old intake group labels its report");
+    // And one more report into the new intake, labelled by its triage.
+    let current = submit_as(&pool, w.reporter, &report("in the new intake"))
+        .await
+        .expect("current");
+    sqlx::query("UPDATE claims SET labels = labels || ARRAY['bug'] WHERE id = $1")
+        .bind(current.claim_id)
+        .execute(&pool)
+        .await
+        .expect("new intake triage labels");
+
+    let mine = list_as(&pool, w.reporter).await.expect("list");
+    let row = |id: Uuid| {
+        mine.iter()
+            .find(|r| r.claim_id == id)
+            .unwrap_or_else(|| panic!("{id} listed: {mine:?}"))
+    };
+
+    // CALIBRATION: in the current intake group the live labels are shown.
+    let cur = row(current.claim_id);
+    assert!(cur.labels.contains(&"bug".to_string()), "{:?}", cur.labels);
+    assert_eq!(cur.title.as_deref(), Some("in the new intake"));
+    assert_eq!((cur.resolved, cur.is_current), (Some(false), Some(true)));
+    // CALIBRATION: the moved claim really is resolved and retired.
+    let (live_labels, live_current): (Vec<String>, bool) =
+        sqlx::query_as("SELECT labels, is_current FROM claims WHERE id = $1")
+            .bind(moved.claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the moved claim");
+    assert!(live_labels.contains(&"resolved".to_string()) && !live_current);
+
+    // Moved to a private team: what was filed, nothing else.
+    let m = row(moved.claim_id);
+    assert_eq!(m.labels, filed, "the new owner's labels are not disclosed");
+    assert_eq!(
+        m.resolved, None,
+        "the new owner's resolution is not disclosed"
+    );
+    assert_eq!(
+        m.is_current, None,
+        "the new owner's supersession is not disclosed"
+    );
+    assert_eq!(
+        m.title.as_deref(),
+        Some("adopted by a private team"),
+        "the new owner's title is not disclosed"
+    );
+
+    // Under the replaced intake group: what was filed (207 listed none of
+    // these, so neither 'bug'-style triage nor the old group's later note).
+    for (id, title) in [
+        (old_intake.claim_id, "left under the old intake"),
+        (in_intake.claim_id, "still in the intake"),
+    ] {
+        let r = row(id);
+        assert_eq!(r.labels, filed, "{title}: only what was filed");
+        assert_eq!((r.resolved, r.is_current), (None, None), "{title}");
+        assert_eq!(r.title.as_deref(), Some(title));
+    }
+}
+
+/// A repro or evidence with nothing visible in it (zero-width, format, filler
+/// characters) is no repro / no evidence, by the same rule as the title and
+/// description (backlog 64584278 part 2), on both sides that compose the
+/// content: the stored claim has no `Repro:` section and `has_repro` false,
+/// and the evidence row holds the description, under the description's
+/// digest. A repro with one visible character is kept as given.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_invisible_only_repro_or_evidence_is_absent(pool: PgPool) {
+    let w = world(&pool).await;
+    let mut input = report("invisible extras");
+    input.repro = Some("\u{200B}\u{2060}\u{FEFF}".into());
+    input.evidence = Some("\u{3164}\u{200D}".into());
+    let r = submit_as(&pool, w.reporter, &input).await.expect("filed");
+    let (content, has_repro, has_evidence): (String, bool, bool) = sqlx::query_as(
+        "SELECT content, (properties #>> '{bug_report,has_repro}')::boolean, \
+                (properties #>> '{bug_report,has_evidence}')::boolean \
+           FROM claims WHERE id = $1",
+    )
+    .bind(r.claim_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the report");
+    assert_eq!(content, format!("{}\n\n{}", input.title, input.description));
+    assert!(!has_repro && !has_evidence, "{has_repro} {has_evidence}");
+    let (raw, hash): (Option<String>, Vec<u8>) =
+        sqlx::query_as("SELECT raw_content, content_hash FROM evidence WHERE claim_id = $1")
+            .bind(r.claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the evidence");
+    assert_eq!(raw.as_deref(), Some(input.description.as_str()));
+    assert_eq!(
+        hash,
+        epigraph_crypto::ContentHasher::hash(input.description.as_bytes()).to_vec(),
+        "the stored digest is the stored text's"
+    );
+
+    // The DEFINER's own rule, without the server's composition: the raw
+    // invisible-only repro and evidence are sent as given, with the content
+    // and digests composed WITHOUT them. The definer must compose the same
+    // content (else BUG05) and store the description as the evidence.
+    let viewer = Viewer::resolve(&pool, w.reporter).await.expect("resolve");
+    let scoped = app(&pool).await;
+    let mut tx = scoped.begin_as(&viewer).await.expect("stamped");
+    let (title, description) = ("raw", "raw: sent straight to the definer");
+    let content = format!("{title}\n\n{description}");
+    let raw_id: Uuid = sqlx::query_scalar(
+        "SELECT claim_id FROM public.epigraph_submit_bug_report( \
+             $1, $2, NULL, NULL, $3, $4, $5, $6, $7, NULL)",
+    )
+    .bind(title)
+    .bind(description)
+    .bind("\u{200B}\u{2060}")
+    .bind("\u{3164}\u{200D}")
+    .bind(&content)
+    .bind(epigraph_crypto::ContentHasher::hash(content.as_bytes()).to_vec())
+    .bind(epigraph_crypto::ContentHasher::hash(description.as_bytes()).to_vec())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the definer composes the content without the invisible repro");
+    tx.commit().await.expect("commit");
+    let (has_repro, raw): (bool, Option<String>) = sqlx::query_as(
+        "SELECT (c.properties #>> '{bug_report,has_repro}')::boolean, e.raw_content \
+           FROM claims c JOIN evidence e ON e.claim_id = c.id WHERE c.id = $1",
+    )
+    .bind(raw_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the raw report");
+    assert!(!has_repro);
+    assert_eq!(raw.as_deref(), Some(description), "the evidence fell back");
+
+    // CALIBRATION: one visible character makes it a repro, kept as given.
+    let mut kept = report("visible repro");
+    kept.repro = Some("\u{200B}x".into());
+    let k = submit_as(&pool, w.reporter, &kept).await.expect("filed");
+    let content: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
+        .bind(k.claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the report");
+    assert!(content.ends_with("\n\nRepro:\n\u{200B}x"), "{content:?}");
 }
 
 /// The application role cannot write the intake's marker, in any spelling,
@@ -577,6 +867,56 @@ async fn the_application_role_cannot_forge_a_marker(pool: PgPool) {
         assert_eq!(r.is_ok(), admitted, "{event_type:?}: {r:?}");
         tx.rollback().await.expect("rollback");
     }
+}
+
+/// The list's key, the intake marker (272), is the write definer's alone: the
+/// application role can neither read who reported what nor write a marker
+/// that would list a claim it authored by another path (42501 on both).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_application_role_cannot_read_or_forge_an_intake_marker(pool: PgPool) {
+    let w = world(&pool).await;
+    let filed = submit_as(&pool, w.reporter, &report("marked"))
+        .await
+        .expect("filed");
+    let own = fixture::seed_group_claim(&pool, w.reporter, w.home, "authored elsewhere").await;
+    let viewer = Viewer::resolve(&pool, w.reporter).await.expect("resolve");
+    let scoped = app(&pool).await;
+    for (what, sql) in [
+        (
+            "read",
+            "SELECT count(*)::bigint FROM bug_report_intake_marks WHERE claim_id = $1",
+        ),
+        (
+            "forge",
+            "WITH i AS (INSERT INTO bug_report_intake_marks \
+                            (claim_id, reporter_id, intake_group_id, submitted_at, \
+                             filed_labels) \
+                        SELECT $1, epigraph_principal_id(), $1, now(), '{}' RETURNING 1) \
+             SELECT count(*)::bigint FROM i",
+        ),
+    ] {
+        let mut tx = scoped.begin_as(&viewer).await.expect("stamped");
+        let id = if what == "read" { filed.claim_id } else { own };
+        let r: Result<i64, sqlx::Error> =
+            sqlx::query_scalar(sql).bind(id).fetch_one(&mut *tx).await;
+        tx.rollback().await.expect("rollback");
+        let e = r.expect_err(what);
+        assert_eq!(
+            e.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("42501"),
+            "{what}: {e}"
+        );
+    }
+    assert_eq!(
+        list_as(&pool, w.reporter)
+            .await
+            .expect("list")
+            .iter()
+            .map(|r| r.claim_id)
+            .collect::<Vec<_>>(),
+        vec![filed.claim_id],
+        "the claim authored elsewhere ({own}) is not listed"
+    );
 }
 
 // ─── limits, configuration, callers ─────────────────────────────────────

@@ -12,30 +12,20 @@
 //! `after_release` scrub. The comments are rewritten at the sites rather than
 //! deleted, so neither becomes a false claim.
 //!
-//! **FOUR converted sites, not six, and the two declines are SITE-level rather
-//! than HANDLER-level — the first of that kind in this series.** `get_claim` and
-//! `list_claims` each open with a
-//! `GroupMembershipRepository::is_member` AUTHORIZATION gate that runs to
-//! completion and returns 403 before any content read begins. Threading the
-//! stamped connection into it would require widening a concrete `&PgPool`
-//! signature and adding a `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER` row that
-//! no truthful wording fits, because `group_memberships` DOES carry a narrowing
-//! RLS policy; and the alternative — splicing a `Viewer` into a membership
-//! EXISTENCE check — would make an authorization answer a function of
-//! visibility. The full argument, including a hazard a reviewer will look for
-//! and which is NOT present, is written at the site.
-//!
-//! **THE SITE-LEVEL DECLINE HAS AN EXPIRY, AND IT IS NAMED RATHER THAN LEFT
-//! FOR A LATER READER TO REDISCOVER.** `is_member` still reads
-//! `group_memberships` through `state.db_pool` while every content statement
-//! moved to `read_as`. Migration 077's `group_memberships_tenancy` USING clause
-//! admits a row only via a bypass, a session-group match, a principal match or
-//! the group-creator predicate — none of which an UNSTAMPED session can satisfy
-//! if its role is subject to RLS. So the gate is correct today because
-//! `AppState.db_pool` runs as an RLS-exempt role, which is precisely the
-//! property this programme exists to remove. Downgrading `db_pool` turns the
-//! gate into a blanket 403 for legitimate group members — fail-closed, not a
-//! leak, but the decline must be revisited at that point rather than inherited.
+//! **The group-scoped membership gate runs on the same stamped connection.**
+//! `get_claim` and `list_claims` open with a
+//! `GroupMembershipRepository::is_member_conn` AUTHORIZATION gate (403 before
+//! any content read) when the caller names a `group_id`, and the encrypted
+//! submit in `create_claim_core` gates the same way. Until backlog f712db53
+//! those gates read `group_memberships` on the raw `state.db_pool`, which was
+//! correct only while that pool ran as an RLS-exempt role, refused a member
+//! derived from a role binding (migration 165, no row) and admitted a lapsed
+//! row (migrations 164, 235). They now ask `epigraph_live_memberships(caller)`
+//! (the definer `Viewer::resolve` builds the viewer from) on a connection
+//! stamped from the caller's own viewer, the only shape in which migration
+//! 236's principal-bound definer answers on the application role. The answer
+//! is the caller's live membership, not a visibility filter, so the gate is
+//! still not a function of visibility.
 //!
 //! **THE PROPAGATE-DON'T-DEFAULT RULE HAS A DELIBERATE EXEMPTION HERE, RECORDED
 //! SO IT IS A DECISION AND NOT AN OVERSIGHT.** `routes/workflows.rs` and
@@ -701,7 +691,8 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 ///
 /// For encrypted claims (privacy_tier == "fully_private"):
 /// - group_id, encrypted_content, and encryption_epoch are required
-/// - Agent must be a member of the specified group
+/// - Agent must be a live writer or admin of the specified group (a reader is
+///   refused 403)
 /// - encryption_epoch must match the group's current epoch
 /// - Claim + encryption metadata are written atomically in a transaction
 #[cfg(feature = "db")]
@@ -827,17 +818,48 @@ pub(crate) async fn create_claim_core(
         // Prefer agent_id, fall back to client_id (sub) for human clients
         let caller_agent_id = ctx.agent_id.unwrap_or(ctx.client_id);
 
-        // Verify caller is a member of the group
-        let is_member =
-            GroupMembershipRepository::is_member(&state.db_pool, group_id, caller_agent_id)
+        // Verify the caller is a LIVE member of the group that may WRITE into
+        // it (backlog f712db53), on a connection stamped from its own viewer:
+        // since migration 236 the live-membership definer answers only for the
+        // stamped principal, and on an RLS-subject raw pool the old raw read
+        // saw no row at all. The role is the caller's strongest live one: a
+        // member derived from a role binding counts, a lapsed row does not. A
+        // `reader` (explicit or derived) is refused here with a 403: it is not
+        // in the viewer's writable set, so the stamped insert below would only
+        // be refused by row security, which surfaced as a 500.
+        let live_role = {
+            let mut read = state.read_as(viewer).await.map_err(|e| {
+                tracing::error!(
+                    target: "tenancy.scoped_read",
+                    error = %e,
+                    handler = "create_claim_core",
+                    "could not acquire a viewer-stamped connection"
+                );
+                ApiError::InternalError {
+                    message: "Failed to acquire a scoped connection".to_string(),
+                }
+            })?;
+            GroupMembershipRepository::get_member_role_conn(&mut read, group_id, caller_agent_id)
                 .await
                 .map_err(|e| ApiError::DatabaseError {
                     message: format!("Failed to check group membership: {e}"),
-                })?;
-        if !is_member {
-            return Err(ApiError::Forbidden {
-                reason: "Agent is not a member of the specified group".to_string(),
-            });
+                })?
+        };
+        match live_role.as_deref() {
+            None => {
+                return Err(ApiError::Forbidden {
+                    reason: "Agent is not a member of the specified group".to_string(),
+                });
+            }
+            Some("admin" | "writer") => {}
+            Some(role) => {
+                return Err(ApiError::Forbidden {
+                    reason: format!(
+                        "Agent's role in the specified group is {role}; sealing a claim into \
+                         it needs writer or admin"
+                    ),
+                });
+            }
         }
 
         // Verify the claim is sealed under the group's CURRENT epoch, which is
@@ -1623,60 +1645,6 @@ pub async fn get_claim(
 ) -> Result<Json<ClaimResponse>, ApiError> {
     let claim_id = ClaimId::from_uuid(id);
 
-    // If group_id provided, verify caller is a member using authenticated identity
-    if let Some(group_id) = params.group_id {
-        // SECURITY: Use ONLY authenticated identity, never query-param agent_id
-        // Prefer agent_id, fall back to client_id (sub) for human clients
-        let caller_agent_id = auth_ctx
-            .as_ref()
-            .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-        if let Some(agent_id) = caller_agent_id {
-            let is_member =
-                GroupMembershipRepository::is_member(&state.db_pool, group_id, agent_id)
-                    .await
-                    .map_err(|e| ApiError::DatabaseError {
-                        message: format!("Failed to check group membership: {e}"),
-                    })?;
-            if !is_member {
-                return Err(ApiError::Forbidden {
-                    reason: "Agent is not a member of the specified group".to_string(),
-                });
-            }
-        } else {
-            return Err(ApiError::Forbidden {
-                reason: "Authentication required to access group-scoped claims".to_string(),
-            });
-        }
-    }
-
-    // THE MEMBERSHIP GATE ABOVE STAYS ON THE RAW POOL, AND THE DECLINE IS
-    // SITE-LEVEL RATHER THAN HANDLER-LEVEL.
-    //
-    // Conversion shard 7's rule is that a handler converts as a whole, because
-    // splitting one READ across two connections defeats the point. This is not
-    // that: `is_member` is an AUTHORIZATION gate that runs to completion and
-    // returns 403 before any content read begins, and the two content reads
-    // below — which ARE on one connection with each other — are the only
-    // ones the response is built from. Nothing that answers the request is
-    // split.
-    //
-    // `GroupMembershipRepository::is_member` takes a concrete `&PgPool`, so
-    // threading the stamped connection into it would mean widening it to
-    // `E: PgExecutor` and adding a `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`
-    // row. Every existing row in that register argues one of two things: the
-    // relation carries no RLS, or it carries RLS whose SELECT policy does not
-    // narrow. `group_memberships` is neither — migration 077 gives it a
-    // narrowing SELECT policy — so no truthful row exists in the register's
-    // current form, and the alternative (splicing a `Viewer` into a membership
-    // EXISTENCE check) would make an authorization answer a function of
-    // visibility. Both repairs are worse than leaving the gate where it is.
-    //
-    // A hazard a reviewer will look for and which is NOT present: the
-    // `.or(Some(ctx.client_id))` fallback above cannot diverge from the
-    // principal `read_as` stamps, because `middleware/bearer.rs`'s
-    // `ViewerExtractor` — which this handler carries — rejects with 401 when
-    // `auth.agent_id` is `None`, so that arm is unreachable on this route.
-
     // A VIEWER-STAMPED connection, replacing a bare `db_pool.begin()`. The
     // two statements below share one connection, and that
     // connection also carries the session GUCs migration 077's `claims` and
@@ -1702,6 +1670,32 @@ pub async fn get_claim(
             message: "Failed to acquire a scoped connection".to_string(),
         }
     })?;
+
+    // If group_id provided, verify the caller is a LIVE member of it
+    // (backlog f712db53), on this same stamped connection: see the module
+    // doc. SECURITY: the authenticated identity only, never a query-param
+    // agent_id. The `client_id` fallback cannot diverge from the principal
+    // `read_as` stamped: `ViewerExtractor` rejects a token with no agent.
+    if let Some(group_id) = params.group_id {
+        let caller_agent_id = auth_ctx
+            .as_ref()
+            .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+        let Some(agent_id) = caller_agent_id else {
+            return Err(ApiError::Forbidden {
+                reason: "Authentication required to access group-scoped claims".to_string(),
+            });
+        };
+        let is_member = GroupMembershipRepository::is_member_conn(&mut read, group_id, agent_id)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to check group membership: {e}"),
+            })?;
+        if !is_member {
+            return Err(ApiError::Forbidden {
+                reason: "Agent is not a member of the specified group".to_string(),
+            });
+        }
+    }
 
     // The row AND its labels in ONE spliced statement. Labels used to be a
     // second `SELECT unnest(labels) …` whose error was `.unwrap_or_default()`-ed
@@ -1853,42 +1847,6 @@ pub async fn list_claims(
 ) -> Result<Json<PaginatedResponse<ClaimResponse>>, ApiError> {
     let pagination = ValidatedPagination::from_params(&params);
 
-    // If group_id provided, verify caller is a member using authenticated identity
-    if let Some(group_id) = params.group_id {
-        // SECURITY: Use ONLY authenticated identity, never query-param agent_id
-        // Prefer agent_id, fall back to client_id (sub) for human clients
-        let caller_agent_id = auth_ctx
-            .as_ref()
-            .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-        if let Some(agent_id) = caller_agent_id {
-            let is_member =
-                GroupMembershipRepository::is_member(&state.db_pool, group_id, agent_id)
-                    .await
-                    .map_err(|e| ApiError::DatabaseError {
-                        message: format!("Failed to check group membership: {e}"),
-                    })?;
-            if !is_member {
-                return Err(ApiError::Forbidden {
-                    reason: "Agent is not a member of the specified group".to_string(),
-                });
-            }
-        } else {
-            return Err(ApiError::Forbidden {
-                reason: "Authentication required to access group-scoped claims".to_string(),
-            });
-        }
-    }
-
-    // THE MEMBERSHIP GATE ABOVE STAYS ON THE RAW POOL — the SITE-level decline
-    // documented at length on `get_claim`, which runs the identical gate. The
-    // short form: `is_member` is an authorization check that completes before
-    // any content read starts, so nothing is split across two connections;
-    // widening it to take the stamped connection would require an
-    // `EXECUTOR_WITHOUT_VIEWER` row no truthful wording fits, because
-    // `group_memberships` DOES carry a narrowing RLS policy; and splicing a
-    // `Viewer` into a membership existence check would make an authorization
-    // answer a function of visibility.
-
     // A VIEWER-STAMPED connection, replacing a bare `db_pool.begin()`. The
     // statements below still share one connection, and that connection now
     // carries the session GUCs migration 077's policies read, so the policy and
@@ -1911,6 +1869,32 @@ pub async fn list_claims(
             message: "Failed to acquire a scoped connection".to_string(),
         }
     })?;
+
+    // If group_id provided, verify the caller is a LIVE member of it
+    // (backlog f712db53), on this same stamped connection: see the module
+    // doc. SECURITY: the authenticated identity only, never a query-param
+    // agent_id. The `client_id` fallback cannot diverge from the principal
+    // `read_as` stamped: `ViewerExtractor` rejects a token with no agent.
+    if let Some(group_id) = params.group_id {
+        let caller_agent_id = auth_ctx
+            .as_ref()
+            .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+        let Some(agent_id) = caller_agent_id else {
+            return Err(ApiError::Forbidden {
+                reason: "Authentication required to access group-scoped claims".to_string(),
+            });
+        };
+        let is_member = GroupMembershipRepository::is_member_conn(&mut read, group_id, agent_id)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to check group membership: {e}"),
+            })?;
+        if !is_member {
+            return Err(ApiError::Forbidden {
+                reason: "Agent is not a member of the specified group".to_string(),
+            });
+        }
+    }
 
     let claims = ClaimRepository::list_conn(
         &mut read,

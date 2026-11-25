@@ -2791,6 +2791,14 @@ impl AgentRepository {
     /// it, or is privileged; for a human, also only when named). An unstamped
     /// application session reads as the anonymous outsider.
     ///
+    /// "Shares a live group" counts only a membership row that still COUNTS
+    /// (migration 308, backlog f712db53): an unrevoked row that has LAPSED by
+    /// the 164 or 235 rule does not, exactly as migration 273's
+    /// `epigraph_group_live_roster` counts; a member DERIVED from a role
+    /// binding (165) holds no row and so shares no details (it may still be
+    /// NAMED by the team arm). Pinned by
+    /// `live_membership_readers.rs::a_profile_shows_details_to_a_live_explicit_groupmate_only`.
+    ///
     /// An UNNAMED human reads exactly as a nameless OAuth service principal
     /// (operator ruling C7): such a principal's profile is `'public'` (276's
     /// mint) with the column default `{}` for properties and no ORCID / ROR,
