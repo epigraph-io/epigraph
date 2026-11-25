@@ -27,9 +27,13 @@
 --   (2) Deletes every row but the newest of each key, partitioned by ALL
 --       FOUR key columns (a PARTITION BY groups NULLs together, which is the
 --       grouping the new constraint enforces): latest `computed_at`, ties
---       broken by the larger `id`. The newest row is the one
---       `ScopedBeliefRepository::get` (`ORDER BY computed_at DESC LIMIT 1`)
---       already served, so a single-row reader sees no change. Only global
+--       broken by the larger `id`. When the timestamps differ, the kept row
+--       is the one `ScopedBeliefRepository::get` (`ORDER BY computed_at DESC
+--       LIMIT 1`) already served, so a single-row reader sees no change.
+--       `id` is a random UUID and `get` has no tie-break of its own, so
+--       between two rows written in one transaction (same `computed_at`) the
+--       pick is deterministic here but arbitrary in meaning; the next fold of
+--       the key rewrites the row either way. Only global
 --       rows can be duplicates under 001's key, unless a non-global row also
 --       carries a NULL `scope_id`; partitioning by the full key removes those
 --       too, so (3) cannot fail on them.
@@ -56,9 +60,14 @@
 -- ===================================================================
 -- 4. COST AND DEPLOY ORDER
 --
--- The DELETE scans the table once, and ADD CONSTRAINT builds a unique btree
--- under ACCESS EXCLUSIVE. `lock_timeout` 3 s refuses rather than queue
--- behind a live writer; re-run when it refuses. No binary changes with this
+-- The file first takes SHARE ROW EXCLUSIVE on the table (readers proceed,
+-- writers wait), so no concurrent global write can commit a new duplicate
+-- between the DELETE and ADD CONSTRAINT (which would fail the constraint
+-- with 23505 and roll the file back). The DELETE scans the table once, and
+-- ADD CONSTRAINT builds a unique btree under ACCESS EXCLUSIVE.
+-- `lock_timeout` 3 s refuses rather than queue behind a live writer; re-run
+-- when it refuses (prefer `epigraph-migrate` over migrate-on-boot, where a
+-- refusal fails the boot). No binary changes with this
 -- file, so it may be applied before or after any deploy. The operator
 -- measures the duplicate count before and after (the PR's deploy notes).
 --
@@ -69,6 +78,8 @@
 -- ===================================================================
 
 SET LOCAL lock_timeout = '3s';
+
+LOCK TABLE public.ds_combined_beliefs IN SHARE ROW EXCLUSIVE MODE;
 
 DO $$
 DECLARE
