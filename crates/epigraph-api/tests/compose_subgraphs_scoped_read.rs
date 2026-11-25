@@ -86,15 +86,8 @@ async fn app_role_router(pool: &PgPool) -> axum::Router {
     epigraph_api::routes::create_router(state)
 }
 
-/// `(total_nodes, left_boundary, left_interior)` of a compose call. The
-/// boundary is the raw shared-node count; `shared_boundary_size` counts only
-/// boundary nodes that carry a belief, and these seeded claims carry none.
-async fn compose(
-    router: &axum::Router,
-    agent: Uuid,
-    center_a: Uuid,
-    center_b: Uuid,
-) -> (u64, u64, u64) {
+/// The JSON body of a compose call, asserted 200.
+async fn compose_body(router: &axum::Router, agent: Uuid, center_a: Uuid, center_b: Uuid) -> Value {
     let token = common::mint_token_with_agent(&["claims:read"], agent);
     let body = json!({ "center_a": center_a, "center_b": center_b, "max_depth": 2 });
     let req = Request::builder()
@@ -110,12 +103,45 @@ async fn compose(
     let out: Value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
     assert_eq!(status, StatusCode::OK, "compose answered {status}: {out}");
-    let n = |k: &str| {
-        out[k]
-            .as_u64()
-            .unwrap_or_else(|| panic!("`{k}` missing: {out}"))
-    };
-    (n("total_nodes"), n("left_boundary"), n("left_interior"))
+    out
+}
+
+fn count(out: &Value, k: &str) -> u64 {
+    out[k]
+        .as_u64()
+        .unwrap_or_else(|| panic!("`{k}` missing: {out}"))
+}
+
+/// `(total_nodes, left_boundary, left_interior)` of a compose call. The
+/// boundary is the raw shared-node count; `shared_boundary_size` counts only
+/// boundary nodes that carry a belief, and the [`graph`] claims carry none.
+async fn compose(
+    router: &axum::Router,
+    agent: Uuid,
+    center_a: Uuid,
+    center_b: Uuid,
+) -> (u64, u64, u64) {
+    let out = compose_body(router, agent, center_a, center_b).await;
+    (
+        count(&out, "total_nodes"),
+        count(&out, "left_boundary"),
+        count(&out, "left_interior"),
+    )
+}
+
+/// `(shared_boundary_size, boundary_inconsistency)`: the two fields computed
+/// from the belief read rather than from the neighborhood walk.
+async fn compose_beliefs(
+    router: &axum::Router,
+    agent: Uuid,
+    center_a: Uuid,
+    center_b: Uuid,
+) -> (u64, f64) {
+    let out = compose_body(router, agent, center_a, center_b).await;
+    let inconsistency = out["boundary_inconsistency"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("`boundary_inconsistency` missing: {out}"));
+    (count(&out, "shared_boundary_size"), inconsistency)
 }
 
 struct Graph {
@@ -200,4 +226,41 @@ async fn on_the_app_role_a_member_composes_over_their_groups_claims(pool: PgPool
          stamped with their groups"
     );
     assert_eq!(compose(&router, w.outsider, w.p, w.q).await, (2, 0, 1));
+}
+
+/// The belief read is filtered too, not only the walk. Composing a hidden
+/// claim with itself puts that claim on the boundary of both sides (a center
+/// is always its own neighborhood), so only the belief read's viewer
+/// predicate keeps its stored belief out of `shared_boundary_size`. Without
+/// it the outsider would get 1 for a hidden claim that has a belief and 0 for
+/// an id that names no claim: an existence and belief oracle.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_claims_belief_does_not_reach_the_boundary(pool: PgPool) {
+    let w = graph(&pool).await;
+    sqlx::query("UPDATE claims SET pignistic_prob = 0.8 WHERE id = $1")
+        .bind(w.g)
+        .execute(&pool)
+        .await
+        .expect("give the group's claim a belief");
+    let router = superuser_router(&pool).await;
+
+    // CALIBRATION: for the member the hidden claim's belief is on the
+    // boundary, so the seeded belief is one the belief read can return.
+    assert_eq!(
+        compose_beliefs(&router, w.member, w.g, w.g).await.0,
+        1,
+        "CALIBRATION: the member's self-composition of g carries g's belief"
+    );
+
+    let hidden = compose_beliefs(&router, w.outsider, w.g, w.g).await;
+    let missing = {
+        let m = Uuid::new_v4();
+        compose_beliefs(&router, w.outsider, m, m).await
+    };
+    assert_eq!(
+        hidden, missing,
+        "the outsider's composition of a hidden claim with itself differs from that of no \
+         claim: the belief read returned a claim the outsider cannot read"
+    );
+    assert_eq!(hidden.0, 0, "no readable belief is on the boundary");
 }
