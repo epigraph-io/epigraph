@@ -125,7 +125,9 @@
 //!   which can still carry an input the new audience cannot read (a value a
 //!   propagation wrote); there is no admissible fold to replace it with here.
 //!   A claim at the deprecation marker keeps it (see "`truth_value`").
-//! * Claims moved by 206 before this ran keep the value folded then.
+//! * Claims moved by 206 before this ran keep the value folded then, and
+//!   claims moved before the Beta-track rebuild existed keep the track they
+//!   carried (see "The Beta track"): the rebuild runs only inside the act.
 //! * A `community` scoped row is not written afresh: its fold reads the
 //!   community's members and mass override on the raw pool. It stays absent
 //!   until the next computation that stores it.
