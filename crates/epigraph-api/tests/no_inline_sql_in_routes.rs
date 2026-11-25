@@ -107,7 +107,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("graph.rs", 8),
     ("graph_neighborhood.rs", 1),
     ("graph_query_utils.rs", 1),
-    ("hypothesis.rs", 11),
+    ("hypothesis.rs", 10),
     ("papers.rs", 4),
     ("policies.rs", 4),
     ("revoke_signature.rs", 6),
@@ -150,7 +150,10 @@ const REGISTER: &[(&str, usize)] = &[
 /// and belief read moved into `GraphViewRepository::claim_neighborhood_ids`
 /// and `FactorRepository::bp_priors`, both spending the caller's viewer
 /// (`computation.rs` 6 -> 4).
-const HIGH_WATER: usize = 82;
+/// Lowered to 81 by migration 311 (backlog 9a9d6850): the hypothesis
+/// promotion's factor move became `FactorRepository::promote_hypothesis_factors`
+/// (`hypothesis.rs` 11 -> 10).
+const HIGH_WATER: usize = 81;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
