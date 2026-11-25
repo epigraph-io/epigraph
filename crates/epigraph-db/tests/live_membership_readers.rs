@@ -243,7 +243,7 @@ async fn group_only_profile(pool: &PgPool, agent: Uuid) -> String {
 }
 
 /// The profile detail rule (`get_public_profile` and the whole-row routes'
-/// `AgentDisclosureRepository::disclosure`, both migration 274's disclosure
+/// `AgentDisclosureRepository::disclosure`, both migration 286's disclosure
 /// core, which no repo statement may re-spell: `visibility_lint.rs`)
 /// shows a group-only profile's details to a viewer that shares a group with
 /// the agent only while the agent's row there still COUNTS: the direct writer
@@ -298,7 +298,7 @@ async fn a_profile_shows_details_to_a_live_explicit_groupmate_only(pool: PgPool)
     let ids: Vec<Uuid> = cases.iter().map(|c| c.1).collect();
     // The whole-row routes' detail decision (`GET /api/v1/agents`,
     // `/api/v1/agents/:id`): `profile_details_visible` was folded into
-    // migration 274's disclosure (`details`) by the human-identity change.
+    // migration 286's disclosure (`details`) by the human-identity change.
     let visible = AgentDisclosureRepository::disclosure(&mut read, &ids)
         .await
         .expect("disclosure");

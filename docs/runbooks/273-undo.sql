@@ -7,9 +7,9 @@
 -- `GET /api/v1/groups/:id` (the member list and count), `GET /api/v1/agents`,
 -- `GET /api/v1/agents/:id` and `GET /api/v1/agents/search`, and MCP
 -- `find_agent` and `get_agent`, and answers each of them 42883 once it is
--- gone. That list is a build of main before migrations 274-309; a build that
+-- gone. That list is a build of main before migrations 286-321; a build that
 -- also carries them (the human-identity disclosure core) decides the agent
--- routes and tools through 274/308 and calls 273 only from
+-- routes and tools through 286/320 and calls 273 only from
 -- `GET /api/v1/groups/:id`.
 --
 -- WHAT IT DOES: drops the function. 273 changes nothing else (no table, no

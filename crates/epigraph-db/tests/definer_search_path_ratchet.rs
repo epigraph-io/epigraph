@@ -296,7 +296,7 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 // 190 -> 191: 250 registers `epigraph_prune_telemetry_events(integer)` (its
 // delete fires 001's INVOKER `cascade_delete_edges`); 192 -> 193 on its own
 // branch.
-// 191 -> 190: 276 re-states `epigraph_provision_oauth_agent` on 172's form.
+// 191 -> 190: 288 re-states `epigraph_provision_oauth_agent` on 172's form.
 const HIGH_WATER: usize = 190;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.

@@ -61,7 +61,7 @@ async fn named(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
 }
 
 /// A registered human operator with a display name, its profile `'group'` as
-/// provisioning writes it since migration 276: a fixture left at the column
+/// provisioning writes it since migration 288: a fixture left at the column
 /// default `'public'` would count as the person's opt-in, and every
 /// name-visibility assertion below would pass by consent instead of by the
 /// rule under test.
@@ -73,7 +73,7 @@ async fn named_human(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
 }
 
 /// Set `agent`'s profile as the self-service setter leaves it: `'public'`
-/// with a consent stamp (migration 285, operator ruling C11: the opt-in arm
+/// with a consent stamp (migration 297, operator ruling C11: the opt-in arm
 /// requires one), `'group'` with none.
 async fn set_profile(pool: &PgPool, agent: Uuid, profile: &str) {
     sqlx::query(
@@ -489,7 +489,7 @@ async fn kind_is_derived_from_evidence_not_agent_type(pool: PgPool) {
 
 /// The operator human's ID is on every reader's card of the bound agent
 /// (who an agent acts for is public); its NAME follows the disclosure rule
-/// (migration 274): an outsider gets `display_name: null`; the human itself,
+/// (migration 286): an outsider gets `display_name: null`; the human itself,
 /// a teammate, and the bound agent (which reads its operator's teams through
 /// migration 234, so the team arm holds) get the name. Was
 /// `the_operator_human_is_shown_to_every_reader`, which pinned the name to
@@ -752,7 +752,7 @@ async fn human_operator_status_is_shown_only_to_those_who_may_know_it(pool: PgPo
         "registration is hidden from an outsider"
     );
     assert_eq!(out[0].kind, AgentKind::Unknown);
-    // The bound human is UNNAMED to an outsider (no arm of migration 274
+    // The bound human is UNNAMED to an outsider (no arm of migration 286
     // holds), so the binding's reverse evidence is withheld with its name:
     // it reads as the unregistered look-alike. Before the human-identity
     // rule this asserted `human` via `operator_of_bound_agent`.

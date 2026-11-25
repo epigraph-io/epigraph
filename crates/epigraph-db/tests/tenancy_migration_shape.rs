@@ -50,60 +50,60 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
     ),
     // The two partial indexes the disclosure core's claim arms probe per bound
     // agent from its binding start (human-identity visibility spec, section
-    // 11; operator ruling C5). They supersede 277's and 278's, which 291 and
-    // 292 drop (`the_superseded_claim_arm_indexes_are_dropped`).
+    // 11; operator ruling C5). They supersede 289's and 290's, which 303 and
+    // 304 drop (`the_superseded_claim_arm_indexes_are_dropped`).
     (
-        "288_idx_claims_public_by_agent_since.sql",
+        "300_idx_claims_public_by_agent_since.sql",
         "idx_claims_public_by_agent_since",
     ),
     (
-        "289_idx_claims_group_by_agent_since.sql",
+        "301_idx_claims_group_by_agent_since.sql",
         "idx_claims_group_by_agent_since",
     ),
-    // The per-bound-agent probes of 297's arm for every other kind of public
-    // assertion (operator ruling C6), as 304 narrowed it to the agent's own
-    // assertions (Addendum 5): challenges, assessment-slot BBAs (305).
+    // The per-bound-agent probes of 309's arm for every other kind of public
+    // assertion (operator ruling C6), as 316 narrowed it to the agent's own
+    // assertions (Addendum 5): challenges, assessment-slot BBAs (317).
     (
-        "294_idx_challenges_public_by_challenger.sql",
+        "306_idx_challenges_public_by_challenger.sql",
         "idx_challenges_public_by_challenger",
     ),
     (
-        "305_idx_mass_functions_public_assessments_by_source.sql",
+        "317_idx_mass_functions_public_assessments_by_source.sql",
         "idx_mass_functions_public_assessments_by_source",
     ),
     (
-        "301_idx_edges_public_ingest_records_by_ingester_lp.sql",
+        "313_idx_edges_public_ingest_records_by_ingester_lp.sql",
         "idx_edges_public_ingest_records_by_ingester_lp",
     ),
-    // The per-bound-agent probe of 299's countersigned-authorship arm
+    // The per-bound-agent probe of 311's countersigned-authorship arm
     // (operator ruling C2).
     (
-        "298_idx_security_events_countersigned.sql",
+        "310_idx_security_events_countersigned.sql",
         "idx_security_events_countersigned",
     ),
 ];
 
-/// `-- no-transaction` index files whose index no longer exists at head: 277 and
-/// 278 created the claim-arm indexes 291 and 292 drop (superseded by 288 and
-/// 289, operator ruling C5). Each is still one CONCURRENTLY statement, so the
+/// `-- no-transaction` index files whose index no longer exists at head: 289 and
+/// 290 created the claim-arm indexes 303 and 304 drop (superseded by 300 and
+/// 301, operator ruling C5). Each is still one CONCURRENTLY statement, so the
 /// one-statement lint reads them; validity is not checked (there is no index).
 const DROPPED_INDEX_MIGRATIONS: &[&str] = &[
-    "277_idx_claims_public_by_agent.sql",
-    "278_idx_claims_group_by_agent.sql",
-    "291_drop_idx_claims_public_by_agent.sql",
-    "292_drop_idx_claims_group_by_agent.sql",
-    // 296's index on the bare `->>` could be no index condition under the
-    // core's row security; 301 (on 300's LEAKPROOF accessor) replaces it and
-    // 303 drops it.
-    "296_idx_edges_public_ingest_records_by_ingester.sql",
-    "303_drop_idx_edges_public_ingest_records_by_ingester.sql",
-    // 304 counts only an agent's own assertions (Addendum 5): evidence is no
-    // longer probed (307 drops 293's index) and a BBA only on an assessment
-    // slot (305's index; 306 drops 295's).
-    "293_idx_evidence_public_by_signer.sql",
-    "295_idx_mass_functions_public_by_source.sql",
-    "306_drop_idx_mass_functions_public_by_source.sql",
-    "307_drop_idx_evidence_public_by_signer.sql",
+    "289_idx_claims_public_by_agent.sql",
+    "290_idx_claims_group_by_agent.sql",
+    "303_drop_idx_claims_public_by_agent.sql",
+    "304_drop_idx_claims_group_by_agent.sql",
+    // 308's index on the bare `->>` could be no index condition under the
+    // core's row security; 313 (on 312's LEAKPROOF accessor) replaces it and
+    // 315 drops it.
+    "308_idx_edges_public_ingest_records_by_ingester.sql",
+    "315_drop_idx_edges_public_ingest_records_by_ingester.sql",
+    // 316 counts only an agent's own assertions (Addendum 5): evidence is no
+    // longer probed (319 drops 305's index) and a BBA only on an assessment
+    // slot (317's index; 318 drops 307's).
+    "305_idx_evidence_public_by_signer.sql",
+    "307_idx_mass_functions_public_by_source.sql",
+    "318_drop_idx_mass_functions_public_by_source.sql",
+    "319_drop_idx_evidence_public_by_signer.sql",
 ];
 
 /// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
@@ -200,7 +200,7 @@ async fn no_transaction_is_honoured_and_every_index_is_valid(pool: PgPool) {
     );
 }
 
-/// 291 and 292 drop 277's and 278's claim-arm indexes, which 288's and 289's
+/// 303 and 304 drop 289's and 290's claim-arm indexes, which 300's and 301's
 /// (the same predicates, `created_at` appended) supersede: only the windowed
 /// pair is left to maintain on every claim insert.
 #[sqlx::test(migrations = "../../migrations")]
@@ -211,7 +211,7 @@ async fn the_superseded_claim_arm_indexes_are_dropped(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("to_regclass");
-        assert_eq!(found, None, "{index} must be dropped (291 / 292)");
+        assert_eq!(found, None, "{index} must be dropped (303 / 304)");
     }
     for index in [
         "idx_evidence_public_by_signer",
@@ -222,7 +222,7 @@ async fn the_superseded_claim_arm_indexes_are_dropped(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("to_regclass");
-        assert_eq!(found, None, "{index} must be dropped (306 / 307)");
+        assert_eq!(found, None, "{index} must be dropped (318 / 319)");
     }
     for index in [
         "idx_claims_public_by_agent_since",
@@ -245,7 +245,7 @@ async fn the_superseded_claim_arm_indexes_are_dropped(pool: PgPool) {
 /// RLS, so in the definer frame each probe runs under its table's policy. A
 /// qual that is not leakproof (a jsonb `->>`, a uuid-to-text cast on a Var)
 /// cannot be evaluated ahead of the policy qual, so it can be no index
-/// condition: 299's ingest-record probe (`(r.properties ->> 'ingested_by') =
+/// condition: 311's ingest-record probe (`(r.properties ->> 'ingested_by') =
 /// b.agent_id::text`) fell back to `idx_edges_created_at` and took 198 s per
 /// evaluation on the harness shape. The pins in
 /// `the_partial_tenancy_indexes_serve_an_explicit_visibility_qual` run on the
@@ -281,7 +281,7 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
         |body: &str| format!("SELECT 1 FROM {rows_from} CROSS JOIN LATERAL ({body} LIMIT 1) x");
     for (label, sql, index) in [
         (
-            "public claim (290)",
+            "public claim (302)",
             lateral(
                 "SELECT 1 FROM public.claims c WHERE c.agent_id = b.agent_id \
                    AND c.visibility = 'public' AND c.created_at >= b.since",
@@ -289,7 +289,7 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
             "idx_claims_public_by_agent_since",
         ),
         (
-            "readable claim (290)",
+            "readable claim (302)",
             format!(
                 "SELECT 1 FROM {rows_from} \
                   CROSS JOIN pg_catalog.unnest(ARRAY['00000000-0000-0000-0000-00000000beef'::uuid]) \
@@ -303,7 +303,7 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
             "idx_claims_group_by_agent_since",
         ),
         (
-            "challenge (297)",
+            "challenge (309)",
             lateral(
                 "SELECT 1 FROM public.challenges ch WHERE ch.challenger_id = b.agent_id \
                    AND ch.visibility = 'public' AND ch.created_at >= b.since",
@@ -311,7 +311,7 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
             "idx_challenges_public_by_challenger",
         ),
         (
-            "assessment BBA (304)",
+            "assessment BBA (316)",
             lateral(
                 "SELECT 1 FROM public.mass_functions m WHERE m.source_agent_id = b.agent_id \
                    AND m.slot_kind = 'assessment' \
@@ -320,7 +320,7 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
             "idx_mass_functions_public_assessments_by_source",
         ),
         (
-            "ingest record (302)",
+            "ingest record (314)",
             format!(
                 "SELECT 1 FROM {text_rows_from} \
                   CROSS JOIN LATERAL (SELECT 1 FROM public.edges r \
@@ -336,7 +336,7 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
             "idx_edges_public_ingest_records_by_ingester_lp",
         ),
         (
-            "countersign act (302)",
+            "countersign act (314)",
             lateral(
                 "SELECT s.agent_id FROM public.security_events s WHERE s.agent_id = b.agent_id \
                    AND s.event_type = 'authorship.countersigned' AND s.created_at >= b.since",
@@ -373,7 +373,7 @@ async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(
         "the countersign arm must look its paper up by key under row security. Plan:\n{plan}"
     );
 
-    // CALIBRATION, and the record of why 302 exists: 299's spelling of the
+    // CALIBRATION, and the record of why 314 exists: 311's spelling of the
     // ingest-record probe reaches no ingester index under row security.
     let plan = explain(
         &mut conn,
@@ -463,7 +463,7 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
 
     // Reachable: an explicit `visibility = 'group'` qual.
     //
-    // 289's `idx_claims_group_by_agent_since (agent_id, owner_group_id,
+    // 301's `idx_claims_group_by_agent_since (agent_id, owner_group_id,
     // created_at) WHERE visibility <> 'public'` shares this predicate, so on an
     // EMPTY table (all costs near zero) the planner may pick it through a skip
     // scan on its second column, which says nothing about whether
@@ -477,7 +477,7 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
     sqlx::query("DROP INDEX idx_claims_group_by_agent_since")
         .execute(&mut *conn)
         .await
-        .expect("hide 289's index for this EXPLAIN");
+        .expect("hide 301's index for this EXPLAIN");
     let plan = explain(
         &mut conn,
         "SELECT id FROM claims WHERE visibility = 'group' \
@@ -494,8 +494,8 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
          (this is the D4/PR-18 shape the index exists for). Plan:\n{plan}"
     );
 
-    // 290's per-bound-agent probes, windowed from the binding start (C5),
-    // reach 288's and 289's indexes with created_at in the index condition.
+    // 302's per-bound-agent probes, windowed from the binding start (C5),
+    // reach 300's and 301's indexes with created_at in the index condition.
     let plan = explain(
         &mut conn,
         "SELECT 1 FROM claims c \
@@ -506,7 +506,7 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
     .await;
     assert!(
         plan.contains("idx_claims_public_by_agent_since") && plan.contains("created_at >="),
-        "290's public-claim probe must reach idx_claims_public_by_agent_since with the \
+        "302's public-claim probe must reach idx_claims_public_by_agent_since with the \
          binding start as an index bound. Plan:\n{plan}"
     );
     let plan = explain(
@@ -521,7 +521,7 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
     .await;
     assert!(
         plan.contains("idx_claims_group_by_agent_since") && plan.contains("created_at >="),
-        "290's readable-claim probe must reach idx_claims_group_by_agent_since with the \
+        "302's readable-claim probe must reach idx_claims_group_by_agent_since with the \
          binding start as an index bound. Plan:\n{plan}"
     );
 

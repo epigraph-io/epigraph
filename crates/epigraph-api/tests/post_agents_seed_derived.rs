@@ -55,7 +55,7 @@ async fn post(
     body: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
     // A find-hit's name is decided on a viewer-stamped connection (migration
-    // 274's disclosure), so the state carries a ScopedPool as the server's.
+    // 286's disclosure), so the state carries a ScopedPool as the server's.
     let scoped = epigraph_db::ScopedPool::connect(
         &viewer_fixture::database_url_for(pool).await,
         epigraph_db::SessionGucMode::Session,

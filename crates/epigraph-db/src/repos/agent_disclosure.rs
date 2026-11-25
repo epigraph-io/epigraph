@@ -3,7 +3,7 @@
 //! output (spec `docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md`,
 //! sections 4-6).
 //!
-//! The decision is made in SQL by migration 274's
+//! The decision is made in SQL by migration 286's
 //! `public.epigraph_agent_disclosure(target) -> (named, details)`:
 //!
 //! * a target that is not a human principal is `named` to everyone, and its
@@ -17,7 +17,7 @@
 //!
 //! An UNNAMED human must read exactly as a nameless OAuth service principal
 //! does (operator ruling C7): its name is that principal's placeholder,
-//! `oauth:<client row id>` of its own provisioning client (migration 287's
+//! `oauth:<client row id>` of its own provisioning client (migration 299's
 //! `epigraph_unnamed_agent_name`, called in the ELSE of every disclosure
 //! decision), ORCID / ROR null, no human evidence, never a distinguishable
 //! absence. The id is never withheld.
@@ -62,14 +62,14 @@ pub struct Disclosure {
     pub details: bool,
     /// When NOT `named`: the name the agent is shown under instead, the
     /// `oauth:<client row id>` placeholder a nameless service principal
-    /// carries (migration 287, operator ruling C7), or `None` for an agent
+    /// carries (migration 299, operator ruling C7), or `None` for an agent
     /// with no OAuth client. Always `None` when `named`.
     pub unnamed_as: Option<String>,
 }
 
 /// The `CROSS JOIN LATERAL` that decides disclosure for the agent row aliased
 /// `alias`, in the caller's statement, binding `d_{alias}.named` and
-/// `d_{alias}.details`. 274's core always returns exactly one row, so the
+/// `d_{alias}.details`. 286's core always returns exactly one row, so the
 /// lateral never drops the outer row.
 #[must_use]
 pub fn disclosure_lateral_sql(alias: &str) -> String {
@@ -81,7 +81,7 @@ pub fn disclosure_lateral_sql(alias: &str) -> String {
 /// a nameless service principal shows (`d.unnamed_as`, operator ruling C7),
 /// ORCID and ROR when not `details` become null. `labels` are not identity
 /// and are not redacted: an unnamed human and a nameless service principal
-/// carry the same provisioning label (`oauth-principal`, 276's mint).
+/// carry the same provisioning label (`oauth-principal`, 288's mint).
 pub fn redact_agent(agent: &mut epigraph_core::Agent, d: Disclosure) {
     if !d.named {
         agent.display_name = d.unnamed_as;
@@ -166,7 +166,7 @@ impl AgentDisclosureRepository {
     /// The name each of `ids` that names an agent is shown under, decided on
     /// the session `conn` is stamped as: its `display_name` when `named`,
     /// else (an unnamed human) the `oauth:<client row id>` placeholder a
-    /// nameless service principal carries (migration 287); `None` when it has
+    /// nameless service principal carries (migration 299); `None` when it has
     /// neither. Unknown ids are absent.
     ///
     /// # Errors
@@ -194,7 +194,7 @@ impl AgentDisclosureRepository {
     /// Remove [`AUTHORED_IDENTITY_KEYS`] from every agent `authored` edge in
     /// `edges`, in place, unless the session is privileged (a maintenance
     /// session or a live elevated viewer: the same privileged term migration
-    /// 274's session wrapper passes to the core). Not per agent: an explicit
+    /// 286's session wrapper passes to the core). Not per agent: an explicit
     /// edge reads alike whether its agent is a named person, an unnamed one or
     /// a nameless service principal, so the edge is no marker (operator ruling
     /// C7; review 2, leaks#2). The edge itself, its endpoints, `position`,
@@ -236,7 +236,7 @@ impl AgentDisclosureRepository {
     /// audience rather than to the session that builds it: the public map is
     /// read by the anonymous outsider, a team map by a member of that team
     /// (no principal, the team as its one group, never privileged). Calls
-    /// 274's explicit-audience core, which only the maintenance role may
+    /// 286's explicit-audience core, which only the maintenance role may
     /// EXECUTE: run it on the maintenance session the Atlas builder holds. A
     /// bypass session must never be the audience of a stored document; it
     /// would name every human in a public map.

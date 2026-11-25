@@ -1421,7 +1421,7 @@ database functions these commands call:
   there at once (member lists through migration 273's
   `epigraph_group_live_roster`, answered only to a session whose stamp holds
   the group; the profile detail check through the disclosure core, migration
-  308); a few readers still count the raw row until it is revoked: the
+  320); a few readers still count the raw row until it is revoked: the
   REST last-admin guard, the database-side admin checks, and the admin counts
   of instance administration and privatization approval. The roster itself
   stays closed to the REST routes;
@@ -1507,8 +1507,8 @@ Two consequences to know:
   `writer` only; a reader's sealed submit is refused 403). Readers that list
   OTHER members (group info's member list and `member_count`) read migration
   273's live EXPLICIT roster; a profile's detail check, agent search cards and
-  the ORCID/ROR matcher decide through the disclosure core (migrations 274 and
-  308), whose details rule counts the same live explicit rows. So a derived
+  the ORCID/ROR matcher decide through the disclosure core (migrations 286 and
+  320), whose details rule counts the same live explicit rows. So a derived
   member is not listed and is not a groupmate there. Use `group-roster` to
   see who holds a group through its
   bindings (`MEMBER` lines) next to its explicit rows (`DIRECT` lines);

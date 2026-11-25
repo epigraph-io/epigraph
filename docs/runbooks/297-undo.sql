@@ -1,7 +1,8 @@
--- Undo migration 297 (disclosure_every_public_assertion): restore 290's body of the
--- disclosure core (public claims only, windowed). Run on a maintenance connection.
--- CREATE OR REPLACE keeps the owner and ACL. Idempotent. 293-296's indexes may stay
--- (unused) or be dropped with DROP INDEX CONCURRENTLY.
+-- Undo migration 297 (profile_public_consent): restore 293's disclosure core and 287's
+-- profile setter (the opt-in arm reads 'public' alone again; the setter writes no stamp),
+-- then drop the CHECK and the column, in that order (the 297 bodies read the column). Run on
+-- a maintenance connection. No Rust code reads the column. CREATE OR REPLACE keeps the owner
+-- and ACL. A consent recorded since 297 is lost; profile values stay. Idempotent.
 CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for(
     p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean)
 RETURNS TABLE (named boolean, details boolean)
@@ -13,25 +14,14 @@ DECLARE
     v_privileged boolean := COALESCE(p_privileged, false);
     v_self       boolean := COALESCE(p_target = p_principal, false);
     v_profile    text;
-    v_consented  timestamptz;
-    v_human      boolean;
-    v_public     boolean;
     v_details    boolean;
     v_bound      uuid[];
-    v_since      timestamptz[];
 BEGIN
-    SELECT a.profile_visibility, a.profile_public_consented_at INTO v_profile, v_consented
-      FROM public.agents a WHERE a.id = p_target;
-
-    v_human := public.epigraph_is_human_principal(p_target);
-
-    -- 285 (C11): a human's 'public' counts only with the setter's consent.
-    v_public := COALESCE(v_profile = 'public' AND (NOT v_human OR v_consented IS NOT NULL),
-                         false);
+    SELECT a.profile_visibility INTO v_profile FROM public.agents a WHERE a.id = p_target;
 
     -- Today's details rule, for every agent.
     v_details := COALESCE(
-        v_privileged OR v_self OR v_public
+        v_privileged OR v_self OR v_profile = 'public'
         OR (pg_catalog.cardinality(v_groups) > 0
             AND EXISTS (SELECT 1 FROM public.group_memberships gm
                          WHERE gm.agent_id = p_target
@@ -39,45 +29,30 @@ BEGIN
                            AND gm.group_id = ANY (v_groups))),
         false);
 
-    IF NOT v_human THEN
+    IF NOT public.epigraph_is_human_principal(p_target) THEN
         RETURN QUERY SELECT true, v_details;
         RETURN;
     END IF;
 
     -- privileged, self, opt-in
-    IF v_privileged OR v_self OR v_public THEN
+    IF v_privileged OR v_self OR COALESCE(v_profile = 'public', false) THEN
         RETURN QUERY SELECT true, v_details;
         RETURN;
     END IF;
 
-    -- 290 (C5): B(H) with each agent's binding START. H's own assertions
-    -- have no binding to start ('-infinity'); a bound agent's count from the
-    -- EARLIEST start of any of its bindings to H (a link's created_at, an
-    -- allowance's added_at), and keep counting after the binding is retired
-    -- or revoked (no end bound). H first, then by binding start.
-    SELECT pg_catalog.array_agg(s.agent_id ORDER BY s.since, s.agent_id),
-           pg_catalog.array_agg(s.since ORDER BY s.since, s.agent_id)
-      INTO v_bound, v_since
-      FROM (SELECT b.agent_id, pg_catalog.min(b.since) AS since
-              FROM (SELECT p_target AS agent_id, '-infinity'::timestamptz AS since
-                    UNION ALL
-                    SELECT l.agent_id, l.created_at FROM public.operator_links l
-                     WHERE l.operator_id = p_target
-                    UNION ALL
-                    SELECT r.agent_id, r.added_at FROM public.author_binding_clients r
-                     WHERE r.operator_id = p_target) b
-             GROUP BY b.agent_id) s;
+    v_bound := ARRAY[p_target]
+            || ARRAY(SELECT l.agent_id FROM public.operator_links l
+                      WHERE l.operator_id = p_target)
+            || ARRAY(SELECT r.agent_id FROM public.author_binding_clients r
+                      WHERE r.operator_id = p_target);
 
-    -- public claim: one forced probe per bound agent (no viewer state), from
-    -- the agent's binding start (288's (agent_id, created_at) index)
+    -- public claim: one forced probe per bound agent (no viewer state)
     IF EXISTS (
         SELECT 1
-          FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
-               AS b(agent_id, since)
+          FROM pg_catalog.unnest(v_bound) b(agent_id)
          CROSS JOIN LATERAL (SELECT 1 FROM public.claims c
                               WHERE c.agent_id = b.agent_id
                                 AND c.visibility = 'public'
-                                AND c.created_at >= b.since
                               LIMIT 1) x)
     THEN
         RETURN QUERY SELECT true, v_details;
@@ -104,25 +79,23 @@ BEGIN
         END IF;
 
         -- readable claim: one forced probe per (bound agent, viewer group),
-        -- two equalities and the binding start, so 289's (agent_id,
-        -- owner_group_id, created_at) index is the only fitting one
+        -- two equalities, so 290's (agent_id, owner_group_id) index is the
+        -- only fitting one (section 2a)
         IF EXISTS (
             SELECT 1
-              FROM ROWS FROM (pg_catalog.unnest(v_bound), pg_catalog.unnest(v_since))
-                   AS b(agent_id, since)
+              FROM pg_catalog.unnest(v_bound) b(agent_id)
              CROSS JOIN pg_catalog.unnest(v_groups) vg(group_id)
              CROSS JOIN LATERAL (SELECT 1 FROM public.claims c
                                   WHERE c.agent_id = b.agent_id
                                     AND c.owner_group_id = vg.group_id
                                     AND c.visibility <> 'public'
-                                    AND c.created_at >= b.since
                                   LIMIT 1) x)
         THEN
             RETURN QUERY SELECT true, v_details;
             RETURN;
         END IF;
 
-        -- team, role-derived: only a bound group can be one. 281: LAST, and
+        -- team, role-derived: only a bound group can be one. 293: LAST, and
         -- 249's call only when its candidate set is wider than the target.
         IF EXISTS (SELECT 1 FROM public.group_role_bindings b
                     WHERE b.group_id = ANY (v_groups)) THEN
@@ -163,3 +136,56 @@ BEGIN
 
     RETURN QUERY SELECT false, false;
 END $$;
+
+CREATE OR REPLACE FUNCTION public.epigraph_set_profile_visibility(p_visibility text)
+RETURNS TABLE (previous text, profile_visibility text, named_to_everyone boolean)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+#variable_conflict use_column
+DECLARE
+    v_principal uuid := public.epigraph_principal_id();
+    v_prev      text;
+    v_moved     bigint := 0;
+    v_named     boolean;
+BEGIN
+    IF v_principal IS NULL THEN
+        RAISE EXCEPTION 'PVS01: setting a profile needs an authenticated principal; nothing was '
+                        'changed' USING ERRCODE = '42501';
+    END IF;
+    IF p_visibility IS NULL OR p_visibility NOT IN ('public', 'group') THEN
+        RAISE EXCEPTION 'PVS02: a profile is ''public'' or ''group''; nothing was changed'
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT public.epigraph_is_human_principal(v_principal) THEN
+        RAISE EXCEPTION 'PVS05: only a person (a human principal) sets whether their own name is '
+                        'shown; an agent acting for one, or a service, may not; nothing was '
+                        'changed' USING ERRCODE = '42501';
+    END IF;
+
+    SELECT a.profile_visibility INTO v_prev
+      FROM public.agents a WHERE a.id = v_principal FOR UPDATE;
+
+    UPDATE public.agents a
+       SET profile_visibility = p_visibility, updated_at = pg_catalog.now()
+     WHERE a.id = v_principal;
+    GET DIAGNOSTICS v_moved = ROW_COUNT;
+    IF v_moved <> 1 THEN
+        RAISE EXCEPTION 'PVS04: the profile was not changed (% rows); nothing was changed',
+                        v_moved USING ERRCODE = '55000';
+    END IF;
+
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('agent.profile_visibility_set', v_principal, true,
+            pg_catalog.jsonb_build_object('previous', v_prev,
+                                          'profile_visibility', p_visibility,
+                                          'migration', 287,
+                                          'session_user', session_user::text));
+
+    SELECT d.named INTO v_named
+      FROM public.epigraph_agent_disclosure_for(v_principal, NULL, ARRAY[]::uuid[], false) d;
+
+    RETURN QUERY SELECT v_prev, p_visibility, COALESCE(v_named, false);
+END $$;
+
+ALTER TABLE public.agents DROP CONSTRAINT IF EXISTS agents_profile_public_consent_check;
+ALTER TABLE public.agents DROP COLUMN IF EXISTS profile_public_consented_at;

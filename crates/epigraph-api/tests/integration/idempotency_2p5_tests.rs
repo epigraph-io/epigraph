@@ -151,7 +151,7 @@ async fn post_json(router: &Router, uri: &str, body: serde_json::Value) -> (Stat
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_agent_is_idempotent_on_public_key(pool: PgPool) {
     // The second POST is a find-hit, whose name `create_agent` decides on a
-    // viewer-stamped connection (migration 274's disclosure), so the state
+    // viewer-stamped connection (migration 286's disclosure), so the state
     // carries a ScopedPool as the server's does.
     let router = {
         let config = ApiConfig {

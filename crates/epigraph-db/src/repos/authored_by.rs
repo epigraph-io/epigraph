@@ -11,12 +11,12 @@
 //! * **`agent`** `{id, display_name}`: every reader of the claim. The id is
 //!   always shown; every NAME in this block (agent, human, ingesters,
 //!   `named_by`, `added_by`, paper authors) is read through
-//!   `AgentDisclosureRepository::names`, migration 274's rule on the stamped
+//!   `AgentDisclosureRepository::names`, migration 286's rule on the stamped
 //!   session: a human principal is named only to readers the rule admits,
 //!   and to anyone who can read a claim it (or an agent ever bound to it)
 //!   filed, so the filer of a claim the caller reads, and the filer's human,
 //!   are always named; an ingester that did not file it, or an author, may
-//!   read its `oauth:<client row id>` placeholder instead (migration 287,
+//!   read its `oauth:<client row id>` placeholder instead (migration 299,
 //!   operator ruling C7: as a nameless service principal reads).
 //! * **`human`** `{id, display_name}`: every reader of the claim. The human
 //!   the agent was BOUND to when it filed the claim (`created_at`), read from

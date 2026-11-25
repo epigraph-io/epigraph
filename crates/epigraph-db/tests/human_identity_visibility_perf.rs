@@ -1,4 +1,4 @@
-//! Performance measurement of migration 274's disclosure predicate (spec
+//! Performance measurement of migration 286's disclosure predicate (spec
 //! `docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md`,
 //! section 11). `#[ignore]`d: it bulk-loads millions of rows. Run it on a
 //! throwaway test database only:
@@ -25,15 +25,15 @@
 //!   evaluation, including one local round trip;
 //! * call counts (`track_functions = 'all'`) for a 200-card read and a
 //!   two-character-prefix name search;
-//! * the insert cost of the two windowed claim indexes (288, 289; they
-//!   replaced 277 and 278) and of 293's evidence index (dropped by 307; the
-//!   evidence rows below are kept as write load, no arm probes them since 304).
+//! * the insert cost of the two windowed claim indexes (300, 301; they
+//!   replaced 289 and 290) and of 305's evidence index (dropped by 319; the
+//!   evidence rows below are kept as write load, no arm probes them since 316).
 //!
-//! After operator rulings C5, C6 and C2 (migrations 288-299) the shape adds:
+//! After operator rulings C5, C6 and C2 (migrations 300-311) the shape adds:
 //! (e) PRE-BINDING rows, created a day before every bound agent's link: 150
 //! public claims per bound agent (225,000) and, per bound agent, 20 public
 //! evidence rows, challenges, BBAs and ingest records and 2 countersign acts,
-//! which the windowed probes must skip by index range (under 285 the first
+//! which the windowed probes must skip by index range (under 297 the first
 //! public claim named H at once); (f) 1,000,000 public evidence rows, 300,000
 //! challenges, BBAs and ingest records, and 100,000 countersign acts by another
 //! agent.
@@ -283,7 +283,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     .expect("skew links");
 
     // (e) pre-binding rows by the bound agents and (f) other agents' rows of
-    // every kind 297 / 299 probe. Replica mode: no FK or tenancy triggers, so
+    // every kind 309 / 311 probe. Replica mode: no FK or tenancy triggers, so
     // every row hangs off one claim, one frame and one paper.
     let any_claim: Uuid = sqlx::query_scalar("SELECT id FROM claims LIMIT 1")
         .fetch_one(&mut *c)
@@ -333,7 +333,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
             ),
             "mass_functions" => format!(
                 // 267's NULLS NOT DISTINCT key: one assessment slot per row
-                // (304 counts only assessment slots).
+                // (316 counts only assessment slots).
                 "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, \
                                              slot_kind, slot_id, created_at, visibility, \
                                              owner_group_id) \
@@ -467,7 +467,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     };
     exec(&mut c, "SET ROLE epigraph_maintenance").await;
     exec(&mut c, "SET plan_cache_mode = force_generic_plan").await;
-    // The statements of the core's body as 290 / 297 / 299 write them.
+    // The statements of the core's body as 302 / 309 / 311 write them.
     exec(
         &mut c,
         "PREPARE p_bound(uuid) AS \
@@ -521,7 +521,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
         ),
     )
     .await;
-    // 302's spelling: 300's LEAKPROOF accessor against the ids as text.
+    // 314's spelling: 312's LEAKPROOF accessor against the ids as text.
     exec(
         &mut c,
         "PREPARE p_ingest(text[], timestamptz[]) AS \
@@ -656,7 +656,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
         );
     }
     // Which index each probe chose is REPORTED, not asserted: the generic
-    // plan's choice between 278 and `idx_claims_agent_id` moved between runs
+    // plan's choice between 290 and `idx_claims_agent_id` moved between runs
     // of the same shape (statistics sampling), which is itself a finding.
     for (label, plan, _) in &other_plans {
         for table in [
@@ -748,7 +748,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     assert!(named, "CALIBRATION: a non-human is named");
     println!("core, non-human: p50 {p50n:.3} ms, max {maxn:.3} ms");
     // ── review correctness#3: a viewer group carries a role binding ───────
-    // The production shape (a role bound to a team): 281 runs the
+    // The production shape (a role bound to a team): 293 runs the
     // role-derived probe last, but a human no earlier arm names still pays
     // 249's call. Measured twice: H holding no bound role (a miss), and H
     // holding the role bound to the viewer's first group (named by it).
@@ -918,7 +918,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     );
     drop(read);
 
-    // ── insert cost of 288 / 289 ───────────────────────────────────────────
+    // ── insert cost of 300 / 301 ───────────────────────────────────────────
     let mut c = pool.acquire().await.expect("conn");
     let insert = |tag: &'static str| {
         format!(
@@ -941,7 +941,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     let without_ms = t.elapsed().as_secs_f64() * 1000.0;
     exec(&mut c, "SET session_replication_role = origin").await;
     println!(
-        "\ninsert of 20,000 group claims: {with_ms:.0} ms with 288/289, {without_ms:.0} ms \
-         without (triggers off, so the difference is 288/289's two indexes)"
+        "\ninsert of 20,000 group claims: {with_ms:.0} ms with 300/301, {without_ms:.0} ms \
+         without (triggers off, so the difference is 300/301's two indexes)"
     );
 }

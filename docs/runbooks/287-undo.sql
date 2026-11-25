@@ -1,5 +1,5 @@
--- Undo migration 287 (unnamed_agent_placeholder_name): drop the placeholder-name function.
--- Run on a maintenance connection, AFTER rolling back every binary built against 287: each
--- surface that names an agent calls it (in the ELSE of the disclosure decision) and fails
--- (SQLSTATE 42883) without it. No rows change. Idempotent.
-DROP FUNCTION IF EXISTS public.epigraph_unnamed_agent_name(uuid);
+-- Undo migration 287 (profile_visibility_setter): drop the self-service setter.
+-- Run on a maintenance connection, AFTER rolling back any binary built against 287: the MCP
+-- tool set_profile_visibility and PUT /api/v1/agents/:id's profile_visibility field call it
+-- and fail (SQLSTATE 42883) without it. Values already set stay as they are. Idempotent.
+DROP FUNCTION IF EXISTS public.epigraph_set_profile_visibility(text);
