@@ -3686,7 +3686,8 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
 /// the fragments follow the body, and the bind is pinned on the bound read.
 /// 256 re-states the writer scope (the derived arm admits only under READ
 /// COMMITTED); its fragment is pinned too. 310 re-states it again (the direct
-/// arm admits only under READ COMMITTED); its fragments are pinned too.
+/// arm admits only under READ COMMITTED); its fragments are pinned too, and so
+/// are those of 310's custodian answer (`epigraph_is_instance_admin`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
     for (signature, fragments) in [
@@ -3735,6 +3736,19 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
                 "p_role = 'writer'",
                 "v_binding = 'client_allowlist'",
                 "v_human = v_owner",
+            ][..],
+        ),
+        (
+            "public.epigraph_is_instance_admin(uuid)",
+            &[
+                // 123's subject binding.
+                "(p_agent = public.epigraph_principal_id() OR public.epigraph_bypass())",
+                // 310: the custodian answer at the statement's clock, and on
+                // an unprivileged read-write transaction only under READ
+                // COMMITTED.
+                "'role:platform-custodian', clock_timestamp()",
+                "current_setting('transaction_isolation') = 'read committed'",
+                "current_setting('transaction_read_only') = 'on'",
             ][..],
         ),
     ] {

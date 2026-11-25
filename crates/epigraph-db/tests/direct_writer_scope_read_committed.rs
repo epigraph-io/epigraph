@@ -1,6 +1,8 @@
 //! Migration 310: the DIRECT-membership arm of the claims-path writer scope
 //! (122's arm of `epigraph_require_writer_scope`, OPL02, armed only) admits a
-//! write only under READ COMMITTED (backlog e39af056).
+//! write only under READ COMMITTED, and the custodian answer
+//! (`epigraph_is_instance_admin`) is decided at the statement's clock and, on
+//! a read-write transaction, only under READ COMMITTED (backlog e39af056).
 //!
 //! The arm reads `group_memberships` (and the human registration and operator
 //! link behind `epigraph_human_of`) through the transaction's snapshot. Under
@@ -30,10 +32,17 @@
 //!   ELAPSES, mid-transaction is refused its next cross-group write under
 //!   each of the three levels, because 123's exemption is the privileged
 //!   session alone. The same test re-bodies the exemption to 122's form (the
-//!   custodian principal arm, `epigraph_is_instance_admin` at `now()`) and
-//!   measures that the ended / elapsed custodian then WRITES, so the pin
-//!   discriminates;
-//! * the undo runbook restores 256's body byte for byte, twice.
+//!   custodian principal arm): over 310's `epigraph_is_instance_admin` the
+//!   ended / elapsed custodian is still refused, and over 123's (at `now()`,
+//!   any level) it WRITES, so the pin discriminates;
+//! * where the custodian answer IS a write admission (239's AK03 admin arm,
+//!   admin-scope switch unarmed): a custodian ended or elapsed mid-
+//!   transaction changes no other agent's key at any level; a live one does
+//!   under READ COMMITTED, does not on a read-write REPEATABLE READ /
+//!   SERIALIZABLE transaction, and is still answered true on a read-only
+//!   one; on 123's body each refused case is admitted;
+//! * the undo runbook restores 256's writer scope and 123's custodian answer
+//!   byte for byte, twice.
 //!
 //! Every write that matters runs on a session whose `session_user` is the
 //! deployed application role (`SET SESSION AUTHORIZATION`), never the harness
@@ -556,7 +565,10 @@ async fn a_custodian_ended_or_elapsed_mid_transaction_is_relieved_of_nothing(poo
         }
     }
 
-    // The mutation: 122's exemption (the custodian principal arm).
+    // The mutation: 122's exemption (the custodian principal arm). Over
+    // 310's `epigraph_is_instance_admin` (the statement's clock, and READ
+    // COMMITTED or read-only) even that exemption relieves the ended or
+    // elapsed custodian of nothing.
     sqlx::raw_sql(
         "CREATE OR REPLACE FUNCTION public.epigraph_operator_scope_exempt() \
          RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER \
@@ -568,14 +580,311 @@ async fn a_custodian_ended_or_elapsed_mid_transaction_is_relieved_of_nothing(poo
     .await
     .expect("re-body the exemption to 122's form");
     for (isolation, elapse) in [(RR, None), (SER, None), (RC, Some(ELAPSE_MS))] {
+        let r = run(format!("e-{isolation}-{elapse:?}"), isolation, elapse).await;
+        assert_refused(
+            &r,
+            OPL02,
+            HUMAN_SCOPE,
+            &format!(
+                "122's exemption over 310's custodian answer, {isolation}, custodian {} \
+                 mid-transaction",
+                if elapse.is_some() { "elapsed" } else { "ended" }
+            ),
+        );
+    }
+    // And with 123's custodian answer (`now()`, any level) under it, the
+    // ended / elapsed custodian WRITES: the pin above discriminates.
+    sqlx::raw_sql(BODY_123_IS_INSTANCE_ADMIN)
+        .execute(&pool)
+        .await
+        .expect("re-body the custodian answer to 123's form");
+    for (isolation, elapse) in [(RR, None), (SER, None), (RC, Some(ELAPSE_MS))] {
         let r = run(format!("m-{isolation}-{elapse:?}"), isolation, elapse).await;
         assert!(
             r.is_ok(),
-            "MUTATION: with 122's exemption the {isolation} custodian {} mid-transaction \
-             writes (so the pin above discriminates): {r:?}",
+            "MUTATION: with 122's exemption over 123's custodian answer the {isolation} \
+             custodian {} mid-transaction writes (so the pin above discriminates): {r:?}",
             if elapse.is_some() { "elapsed" } else { "ended" }
         );
     }
+}
+
+/// 123's `epigraph_is_instance_admin`, byte for byte (the custodian answer at
+/// the transaction's `now()`, through its snapshot, at any level): the body
+/// 310 re-states, and the one `310-undo.sql` restores.
+const BODY_123_IS_INSTANCE_ADMIN: &str = "\
+CREATE OR REPLACE FUNCTION public.epigraph_is_instance_admin(p_agent uuid)
+RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT COALESCE(
+        p_agent IS NOT NULL
+        AND (p_agent = public.epigraph_principal_id() OR public.epigraph_bypass())
+        AND public.epigraph_holds_role(p_agent, 'role:platform-custodian', now()),
+        false)
+$$";
+
+/// md5 of 123's `prosrc` for `epigraph_is_instance_admin`.
+const ADMIN_123: &str = "e72b915989c3a98801e795d4eb53b769";
+
+async fn instance_admin_md5(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT md5(prosrc) FROM pg_proc \
+          WHERE oid = 'public.epigraph_is_instance_admin(uuid)'::regprocedure",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the custodian answer")
+}
+
+/// `(owner, provolatile, proacl, proconfig)` of `epigraph_is_instance_admin`.
+async fn instance_admin_catalog(
+    pool: &PgPool,
+) -> (String, String, Option<String>, Option<Vec<String>>) {
+    sqlx::query_as(
+        "SELECT r.rolname::text, p.provolatile::text, p.proacl::text, p.proconfig \
+           FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE p.oid = 'public.epigraph_is_instance_admin(uuid)'::regprocedure",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("catalog row")
+}
+
+const AK03: &str = "AK03";
+
+/// End `assignment` on a maintenance session if it is still live (the
+/// fixture grants with no grantor, which 123 admits only while no other
+/// custodian is live).
+async fn end_if_live(pool: &PgPool, holder: Uuid, assignment: Uuid) {
+    let live: Option<Uuid> = sqlx::query_scalar(
+        "SELECT public.epigraph_live_role_assignment($1, $2, clock_timestamp())",
+    )
+    .bind(holder)
+    .bind(CUSTODIAN)
+    .fetch_one(pool)
+    .await
+    .expect("live");
+    if live == Some(assignment) {
+        apply(pool, Change::EndAssignment(assignment)).await;
+    }
+}
+
+/// One active `encryption` key of a fresh software agent (not an attested
+/// key type, so 161's AK02 does not decide first), seeded on the harness.
+async fn foreign_key(pool: &PgPool) -> Uuid {
+    let owner = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'software_agent')",
+    )
+    .bind(owner)
+    .bind(Uuid::new_v4().as_bytes().repeat(2))
+    .execute(pool)
+    .await
+    .expect("seed the key's agent");
+    sqlx::query_scalar(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from) \
+         VALUES ($1, $2, 'encryption', 'active', now() - interval '1 day') RETURNING id",
+    )
+    .bind(owner)
+    .bind(Uuid::new_v4().as_bytes().repeat(2))
+    .fetch_one(pool)
+    .await
+    .expect("seed the key")
+}
+
+/// The custodian's run against 239's admin arm (AK03, admin-scope switch
+/// unarmed: `epigraph_is_instance_admin(principal)` decides). On one
+/// `epigraph_app` session stamped as `principal`, one transaction at
+/// `isolation` (`READ ONLY` appended when `read_only`):
+///
+/// 1. a plain read takes the transaction's snapshot;
+/// 2. `change` is applied and committed on ANOTHER session;
+/// 3. the probe: read-write, `epigraph_agent_key_set_status(key, 'revoked')`
+///    (another agent's key); read-only, `epigraph_is_instance_admin(principal)`,
+///    returned as `Ok(answer)`.
+///
+/// Rolled back. Read-write returns `Ok(true)` when the change was admitted.
+async fn key_change_across(
+    pool: &PgPool,
+    principal: Uuid,
+    isolation: &'static str,
+    read_only: bool,
+    change: Change,
+    key: Uuid,
+) -> Result<bool, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(principal.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp");
+        let mode = if read_only { " READ ONLY" } else { "" };
+        // Test-local literals, never caller data.
+        conn.execute(format!("BEGIN ISOLATION LEVEL {isolation}{mode}").as_str())
+            .await
+            .expect("begin");
+        let level: String = sqlx::query_scalar("SELECT current_setting('transaction_isolation')")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read the level (takes the snapshot)");
+        assert_eq!(
+            level.to_uppercase(),
+            isolation,
+            "PREMISE: the transaction runs at the level under test"
+        );
+        apply(pool, change).await;
+        let probe = if read_only {
+            sqlx::query_scalar::<_, bool>("SELECT public.epigraph_is_instance_admin($1)")
+                .bind(principal)
+                .fetch_one(&mut *conn)
+                .await
+        } else {
+            sqlx::query(
+                "SELECT * FROM public.epigraph_agent_key_set_status($1, 'revoked', 'test', NULL)",
+            )
+            .bind(key)
+            .fetch_all(&mut *conn)
+            .await
+            .map(|rows| !rows.is_empty())
+        };
+        conn.execute("ROLLBACK").await.expect("rollback");
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("unstamp");
+        (conn, probe)
+    })
+    .await
+}
+
+/// THE CUSTODIAN HALF, where it is a write admission (310 section 1b).
+/// While the admin-scope switch is unarmed, 239's key definer admits a
+/// change to ANOTHER agent's key for `epigraph_is_instance_admin(principal)`.
+/// Each case: a fresh human K granted role:platform-custodian, stamped on an
+/// `epigraph_app` session; one transaction takes its snapshot while K's
+/// assignment is live; the assignment is then ENDED on another session
+/// (committed), or its `valid_to` ELAPSES; K's key change is refused AK03
+/// under READ COMMITTED, REPEATABLE READ and SERIALIZABLE.
+///
+/// PINNED WITH IT: a LIVE custodian is admitted under READ COMMITTED (the
+/// control), refused on a read-write REPEATABLE READ / SERIALIZABLE
+/// transaction (the level decides, not the old snapshot), and still answered
+/// true on a REPEATABLE READ READ ONLY one (which can write nothing).
+///
+/// THE PIN DISCRIMINATES: with 123's body restored (`now()`, any level) the
+/// ended REPEATABLE READ / SERIALIZABLE custodian, the elapsed READ
+/// COMMITTED one and the live REPEATABLE READ one are each ADMITTED.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_custodian_ended_or_elapsed_mid_transaction_changes_no_foreign_key(pool: PgPool) {
+    let key = foreign_key(&pool).await;
+    let armed: bool = sqlx::query_scalar("SELECT public.epigraph_admin_scopes_armed()")
+        .fetch_one(&pool)
+        .await
+        .expect("the admin-scope switch");
+    assert!(!armed, "PREMISE: the admin-scope switch is unarmed");
+
+    // `None`: live throughout (no change); `Some(None)`: ended;
+    // `Some(Some(ms))`: bounded, elapsing `ms` after the grant.
+    let run =
+        |label: String, isolation: &'static str, read_only: bool, end: Option<Option<u64>>| {
+            let pool = pool.clone();
+            async move {
+                let (k, _) = fixture::seed_human_operator(&pool, &label).await;
+                let (assignment, change) = match end {
+                    None => (grant_custodian(&pool, k, None).await, Change::Nothing),
+                    Some(None) => {
+                        let a = grant_custodian(&pool, k, None).await;
+                        (a, Change::EndAssignment(a))
+                    }
+                    Some(Some(ms)) => {
+                        let a = grant_custodian(&pool, k, Some(i64::try_from(ms).unwrap())).await;
+                        (a, Change::Elapse(ms + 500))
+                    }
+                };
+                let r = key_change_across(&pool, k, isolation, read_only, change, key).await;
+                if let Some(Some(_)) = end {
+                    let still: Option<Uuid> = sqlx::query_scalar(
+                        "SELECT public.epigraph_live_role_assignment($1, $2, clock_timestamp())",
+                    )
+                    .bind(k)
+                    .bind(CUSTODIAN)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("live after");
+                    assert_eq!(still, None, "PREMISE: the assignment elapsed");
+                }
+                end_if_live(&pool, k, assignment).await;
+                r
+            }
+        };
+    let what = |end: Option<Option<u64>>| match end {
+        None => "live",
+        Some(None) => "ended",
+        Some(Some(_)) => "elapsed",
+    };
+
+    // The defect's cases, at every level: refused.
+    for isolation in [RC, RR, SER] {
+        for end in [Some(None), Some(Some(ELAPSE_MS))] {
+            let r = run(format!("ak-{isolation}-{end:?}"), isolation, false, end).await;
+            assert_refused(
+                &r,
+                "42501",
+                AK03,
+                &format!("{isolation}, custodian {} mid-transaction", what(end)),
+            );
+        }
+    }
+    // CONTROL: a live custodian under READ COMMITTED changes the key.
+    let r = run("ak-live-rc".into(), RC, false, None).await;
+    assert!(
+        matches!(r, Ok(true)),
+        "CONTROL: a live READ COMMITTED custodian changes another agent's key: {r:?}"
+    );
+    // A live custodian on a read-write REPEATABLE READ / SERIALIZABLE
+    // transaction: refused (the level decides).
+    for isolation in [RR, SER] {
+        let r = run(format!("ak-live-{isolation}"), isolation, false, None).await;
+        assert_refused(
+            &r,
+            "42501",
+            AK03,
+            &format!("{isolation} read-write, live custodian"),
+        );
+    }
+    // A read-only REPEATABLE READ transaction keeps the answer (it can write
+    // nothing; its reads are the snapshot's).
+    let r = run("ak-live-rr-ro".into(), RR, true, None).await;
+    assert!(
+        matches!(r, Ok(true)),
+        "a live custodian on a REPEATABLE READ READ ONLY transaction is an instance admin: {r:?}"
+    );
+
+    // The mutation: 123's body.
+    sqlx::raw_sql(BODY_123_IS_INSTANCE_ADMIN)
+        .execute(&pool)
+        .await
+        .expect("re-body the custodian answer to 123's form");
+    for (isolation, end) in [
+        (RR, Some(None)),
+        (SER, Some(None)),
+        (RC, Some(Some(ELAPSE_MS))),
+        (RR, None),
+    ] {
+        let r = run(format!("ak-m-{isolation}-{end:?}"), isolation, false, end).await;
+        assert!(
+            matches!(r, Ok(true)),
+            "MUTATION: on 123's body the {isolation} custodian {} mid-transaction changes \
+             another agent's key (so the pins above discriminate): {r:?}",
+            what(end)
+        );
+    }
+    let status: String = sqlx::query_scalar("SELECT status::text FROM agent_keys WHERE id = $1")
+        .bind(key)
+        .fetch_one(&pool)
+        .await
+        .expect("key status");
+    assert_eq!(status, "active", "every probe was rolled back");
 }
 
 fn repo_text(rel: &str) -> String {
@@ -612,9 +921,10 @@ async fn writer_scope_catalog(
     .expect("catalog row")
 }
 
-/// `docs/runbooks/310-undo.sql` restores 256's body byte for byte (owner,
-/// volatility, grants and search path kept), and a second run changes
-/// nothing. On the restored body the defect is back: a REPEATABLE READ or
+/// `docs/runbooks/310-undo.sql` restores 256's writer scope and 123's
+/// `epigraph_is_instance_admin` byte for byte (owner, volatility, grants and
+/// search path kept), and a second run changes nothing. (What 123's custodian
+/// answer admits is re-measured by the AK03 test's mutation.) On the restored body the defect is back: a REPEATABLE READ or
 /// SERIALIZABLE member whose membership is revoked, or demoted, mid-
 /// transaction WRITES (the measurement that 310 is what refuses it). Over a
 /// foreign body both 310 and its undo refuse 55000 and leave it.
@@ -628,6 +938,12 @@ async fn the_310_undo_restores_256s_writer_scope(pool: PgPool) {
         "CALIBRATION: 310 re-bodied the writer scope"
     );
     let catalog = writer_scope_catalog(&pool).await;
+    let admin_at_310 = instance_admin_md5(&pool).await;
+    assert_ne!(
+        admin_at_310, ADMIN_123,
+        "CALIBRATION: 310 re-bodied the custodian answer"
+    );
+    let admin_catalog = instance_admin_catalog(&pool).await;
 
     sqlx::raw_sql(&undo)
         .execute(&pool)
@@ -635,11 +951,18 @@ async fn the_310_undo_restores_256s_writer_scope(pool: PgPool) {
         .expect("the undo applies");
     assert_eq!(writer_scope_md5(&pool).await, BODY_256, "256's body");
     assert_eq!(writer_scope_catalog(&pool).await, catalog, "catalog kept");
+    assert_eq!(instance_admin_md5(&pool).await, ADMIN_123, "123's body");
+    assert_eq!(
+        instance_admin_catalog(&pool).await,
+        admin_catalog,
+        "custodian answer's catalog kept"
+    );
     sqlx::raw_sql(&undo)
         .execute(&pool)
         .await
         .expect("a second run applies");
     assert_eq!(writer_scope_md5(&pool).await, BODY_256, "idempotent");
+    assert_eq!(instance_admin_md5(&pool).await, ADMIN_123, "idempotent");
 
     arm(&pool).await;
     // Every case the first test refuses, measured on 256's body: each lands.
@@ -669,6 +992,11 @@ async fn the_310_undo_restores_256s_writer_scope(pool: PgPool) {
         .await
         .expect("310 re-applies over 256's body");
     assert_eq!(writer_scope_md5(&pool).await, at_310, "310's body again");
+    assert_eq!(
+        instance_admin_md5(&pool).await,
+        admin_at_310,
+        "310's custodian answer again"
+    );
     sqlx::raw_sql(
         "CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, \
                                                                     p_group uuid) \
