@@ -43,6 +43,14 @@ name = "drain_jobs"
 path = "src/bin/drain_jobs.rs"
 required-features = ["db"]
 
+# The scratch belief graph (feature `scratch`): a stdio child of the EpiClaw
+# agent-runner, never a server. `cargo build -p epigraph-api
+# --no-default-features --features scratch --bin epigraph-scratch`.
+[[bin]]
+name = "epigraph-scratch"
+path = "src/bin/epigraph-scratch.rs"
+required-features = ["scratch"]
+
 
 [dependencies]
 epigraph-auth = { workspace = true }
@@ -313,6 +321,11 @@ required-features = ["scratch"]
 [[test]]
 name = "scratch_snapshot"
 path = "tests/scratch_snapshot.rs"
+required-features = ["scratch"]
+
+[[test]]
+name = "scratch_protocol"
+path = "tests/scratch_protocol.rs"
 required-features = ["scratch"]
 
 [lints]
