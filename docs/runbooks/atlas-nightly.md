@@ -221,6 +221,51 @@ splits are W3's id-order fallback, not a clustering. A standalone
 `atlas_meaning apply --apply` is refused once a map has a links run (it
 would hide it).
 
+## After a theme-cap split (W1): required rebuilds
+
+`scripts/theme_cap_split.py apply` moves claims from each split parent to
+new parts. The rows derived from theme membership are built per run, so
+nothing in the apply updates them, and they stay wrong until rebuilt
+(backlog 30633061):
+- **graph neighbourhoods** (`graph_neighborhoods`, served from the newest
+  clustering run): the moved claims are still filed under the parent's
+  neighbourhoods, and the parts have none;
+- **the shared Atlas layout** (`atlas_layout_themes`, the newest layout run):
+  the parts have no position (the run reads `stale`) and the parent's sits
+  where its whole-theme centroid was.
+
+The rebuild is a new run of each: the maintenance role may not delete one
+theme's neighbourhood rows (they leave only with their run), so a split's
+neighbourhoods are rebuilt by a new `ClusterGraph` run, which covers every
+theme. Apply prints, and its manifest records, `touched_theme_ids` (every
+parent and every new part) and `rebuild_next`. Run these, in order, right
+after the apply, with the maintenance DSN in the environment (as in "Dry
+run" below):
+
+```bash
+enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique
+drain_jobs                                            # or wait for epigraph-jobs-drain.timer
+python3 scripts/label_themes_llm.py --neighborhoods   # the new run's rows carry placeholder labels
+atlas_layout --apply                                  # last: it records the newest clustering run
+```
+
+`--unique` enqueues nothing when a `ClusterGraph` is already pending; that
+job runs after the apply, so it rebuilds the split too. One that was already
+RUNNING when the apply committed read the old membership: enqueue another
+once it has finished. Check the drain's report for the job's `run_id` and that
+every id in `touched_theme_ids` has neighbourhoods in it
+(`SELECT theme_id, count(*) FROM graph_neighborhoods WHERE run_id = '<run_id>'
+AND theme_id = ANY('{<ids>}'::uuid[]) GROUP BY 1`; a part with no current
+member that is a leaf in the decomposition tree has none, which is correct).
+
+After `theme_cap_split.py reverse --manifest M`, run the same steps: the
+parts are gone, and the parent's neighbourhoods and position in the newest
+runs still lack the claims it got back.
+
+The nightly sees the parts as new themes of every map that draws them: one
+that does not fit a single leaf is `unbuilt` until an operator builds the map
+(above).
+
 ## Dry run
 
 Every command runs with the maintenance DSN in the environment, never on the

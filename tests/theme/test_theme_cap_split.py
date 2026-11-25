@@ -223,6 +223,60 @@ def test_apply_then_reverse_is_byte_identical(db, seed_agent, tmp_path):
     assert _snapshot(db) == before, "reverse must restore claim_themes and membership exactly"
 
 
+def _theme_ids(db):
+    with db.cursor() as cur:
+        cur.execute("SELECT id::text FROM claim_themes")
+        out = {r[0] for r in cur.fetchall()}
+    db.rollback()
+    return out
+
+
+def test_apply_and_reverse_name_every_theme_whose_derived_rows_are_stale(db, seed_agent,
+                                                                         tmp_path):
+    """Backlog 30633061: after an apply (and after its reverse) the graph
+    neighbourhoods and Atlas layout rows of every split parent and every new
+    part are stale. Both commands name exactly those themes, the manifest
+    records them, and the output carries the rebuild steps: a new ClusterGraph
+    run (enqueued, then drained), then a new layout run."""
+    big, _, _ = _theme(db, seed_agent, (30, 25, 20))
+    pair, _, _ = _theme(db, seed_agent, (25, 25), label="Second Theme", seed0=10)
+    small, _, _ = _theme(db, seed_agent, (12,), label="Small Theme", seed0=20)
+    themes_before = _theme_ids(db)
+    plan, manifest = tmp_path / "plan.json", tmp_path / "m.json"
+    _run(["plan", "--database-url", script_dsn(), "--cap", str(CAP), "--out", str(plan)])
+
+    out, _ = _run(["apply", "--database-url", script_dsn(), "--from", str(plan),
+                   "--manifest", str(manifest)])
+
+    new_parts = _theme_ids(db) - themes_before
+    assert len(new_parts) == 3, "CALIBRATION: the fixture splits into three new parts"
+    stale = sorted({big, pair} | new_parts)
+    applied = json.loads(out)
+    assert applied["touched_theme_ids"] == stale
+    assert small not in applied["touched_theme_ids"]
+    assert json.loads(manifest.read_text())["touched_theme_ids"] == stale
+    assert applied["rebuild_next"] == S.REBUILD_STEPS
+    steps = [step.split()[0] for step in S.REBUILD_STEPS]
+    assert steps.index("enqueue_job") < steps.index("drain_jobs") < steps.index("atlas_layout")
+    assert '"ClusterGraph"' in S.REBUILD_STEPS[steps.index("enqueue_job")]
+
+    out, _ = _run(["reverse", "--database-url", script_dsn(), "--manifest", str(manifest)])
+
+    reversed_ = json.loads(out)
+    assert _theme_ids(db) == themes_before, "CALIBRATION: the reverse deleted the parts"
+    assert reversed_["touched_theme_ids"] == stale
+    assert reversed_["rebuild_next"] == S.REBUILD_STEPS
+
+    # A second reverse of the same manifest changes nothing, so it must not
+    # ask for a whole-graph re-cluster.
+    out, _ = _run(["reverse", "--database-url", script_dsn(), "--manifest", str(manifest)])
+
+    again = json.loads(out)
+    assert {t["status"] for t in again["themes"]} == {"nothing to reverse"}, \
+        "CALIBRATION: the second reverse is a no-op"
+    assert again["rebuild_next"] == []
+
+
 def _intake_group(cur, agent_id):
     gid = str(uuid.uuid4())
     cur.execute(
