@@ -1,7 +1,7 @@
 -- 285: an anchored (`none`) passkey's row records the passkey that admitted
 -- it, the ceremony readers serve that anchor beside the person's live
--- passkeys, and every refusal of an assertion on standing is audited
--- (backlog 09ca9ab0).
+-- passkeys, and a refusal of an assertion on standing is audited while its
+-- ticket or act and its passkey are still live (backlog 09ca9ab0).
 --
 -- ===================================================================
 -- 1. WHY

@@ -4593,7 +4593,9 @@ restart.
   ceremony's served live passkeys and holds it to that anchor's standing at every assertion
   (`epigraph_passkey::Passkeys::assertion_standing`: an anchor whose Android certificate is listed
   on a fresh status list refuses the anchored passkey, a stale list refuses it 503, no live anchor
-  refuses it), and audits every standing refusal before answering it. Registered in
+  refuses it; only the anchor's own certificate, not the lineage above it), and audits each
+  standing refusal before answering it (unless the ticket or act ends, or the passkey is revoked,
+  in between: then the definer refuses the row and the API answers 500, unaudited). Registered in
   `tenancy_backfill` (deferred definers at 285, the grant register, the exempt trigger) and
   `definer_search_path_ratchet` (the two readers leave the `public` path register). Pinned by
   `epigraph-db/tests/passkey_anchor_standing.rs` (the trigger, the backfill from below 285, the
@@ -4605,7 +4607,9 @@ restart.
   after the backfill (`SELECT count(*) FROM person_authenticators WHERE revoked_at IS NULL AND
   attestation_format = 'none' AND anchor_authenticator_id IS NULL`): under the attested policy each
   is refused at its next assertion (they hold through nothing; e.g. a passkey registered while the
-  software policy served). Under the software policy nothing changes.
+  software policy served). If any is a person's only passkey, enroll an attested passkey for that
+  person through a maintenance enrollment (`passkey-enroll`) first. Under the software policy
+  nothing changes.
 
 ## `-- no-transaction` migrations
 

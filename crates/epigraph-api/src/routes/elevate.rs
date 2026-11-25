@@ -44,9 +44,15 @@
 //! ANCHORED it, recorded on its row since migration 285 and found among the
 //! same person's live passkeys the definer serves, is itself in good
 //! standing); one that is not is refused here (403, or 503 when the list
-//! cannot be checked) with the ticket left live, and every such refusal is
+//! cannot be checked) with the ticket left live, and such a refusal is
 //! audited (`platform.passkey_standing_refused`, through migration 285's
 //! `epigraph_record_passkey_standing_refusal`) before it is answered. The
+//! audit needs the ticket and the passkey still live: if the ticket expires
+//! or the passkey is revoked between the read and the audit, the definer
+//! refuses the row and the assertion is answered 500 (still a refusal),
+//! unaudited, with the error logged. Only the anchor's OWN standing is
+//! re-checked, not the lineage above it (200's `check_anchor` holds the
+//! whole lineage at registration only). The
 //! signature counter is the definer's to check (under its row lock, with an
 //! audit row), not the library's: the challenge is started with
 //! `Passkeys::start_authentication_deferring_counter`.

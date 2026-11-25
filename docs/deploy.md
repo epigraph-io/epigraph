@@ -3379,7 +3379,12 @@ The policy:
   registered while the software policy served) is refused under the
   attested policy: count them before switching policy or deploying 285
   (`attestation_format = 'none' AND anchor_authenticator_id IS NULL AND
-  revoked_at IS NULL`). Under the software policy nothing is re-checked.
+  revoked_at IS NULL`), and enroll an attested passkey through a
+  maintenance enrollment (`passkey-enroll`) for any person whose only
+  passkey that is. Only the anchor's own certificate is re-checked, not the
+  lineage above it. A standing refusal is audited only while its ticket or
+  act and its passkey are live; one that ends in between answers 500,
+  unaudited (logged). Under the software policy nothing is re-checked.
 - **Keep a retired Android root in the PEM while any passkey chains to it.**
   The same re-check verifies the stored chain to a root configured NOW. An
   enrolled `android-key` passkey whose chain reaches no root in
