@@ -12,6 +12,7 @@ pub mod compound_nbhd;
 pub mod content_hash_prefix;
 pub mod embedding_ann;
 pub mod shared_triple;
+pub mod stance_probe;
 pub mod theme_cluster;
 
 pub type CandidatePair = (Uuid, Uuid);
@@ -26,6 +27,15 @@ pub trait Blocker: Send + Sync {
         pool: &PgPool,
         seeds: &[Uuid],
     ) -> Result<Vec<CandidatePair>, sqlx::Error>;
+
+    /// `true` for a probe blocker, one that searches from a rewritten query
+    /// rather than from the seed's own neighbourhood (e.g.
+    /// [`stance_probe::StanceProbeBlocker`]). [`union_block_with_stats`]
+    /// counts a probe blocker's yield separately, so a sweep shows what the
+    /// probes found that no neighbourhood blocker did.
+    fn is_probe(&self) -> bool {
+        false
+    }
 }
 
 /// Build a canonical-ordered pair, or `None` if `a == b`.
@@ -43,7 +53,7 @@ use crate::matching::calibration::EligibilityConfig;
 use crate::matching::source_key::{
     derive_source_key, is_same_source, SourceFilterConfig, SourceKey,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Recall-stage accounting for one [`union_block_with_stats`] call, so a low
 /// yield can be attributed to "few pairs retrieved" versus "pairs retrieved
@@ -58,6 +68,25 @@ pub struct BlockStats {
     /// Dropped by the structural same-source filter (shared asserting paper,
     /// shared derivation root, or same-agent non-paper pair).
     pub same_source_dropped: usize,
+    /// Distinct pairs produced by probe blockers ([`Blocker::is_probe`]),
+    /// before any filter. Included in `retrieved`.
+    pub probe_retrieved: usize,
+    /// Of `probe_retrieved`, the pairs no non-probe blocker produced: the
+    /// probes' own contribution to recall, before any filter.
+    pub probe_only: usize,
+    /// Of `probe_only`, the pairs that survived both filters.
+    pub probe_only_kept: usize,
+}
+
+/// Everything [`union_block_detailed`] produces.
+#[derive(Debug, Clone, Default)]
+pub struct BlockOutcome {
+    /// The surviving pairs, canonical, sorted, deduplicated.
+    pub pairs: Vec<CandidatePair>,
+    pub stats: BlockStats,
+    /// The surviving pairs that only a probe blocker produced, so a caller can
+    /// follow them through scoring.
+    pub probe_only: HashSet<CandidatePair>,
 }
 
 /// Run all blockers on the seed set, union & dedup the results, drop pairs that
@@ -86,14 +115,41 @@ pub async fn union_block_with_stats(
     cfg: SourceFilterConfig,
     eligibility: &EligibilityConfig,
 ) -> Result<(Vec<CandidatePair>, BlockStats), sqlx::Error> {
+    let out = union_block_detailed(pool, blockers, seeds, cfg, eligibility).await?;
+    Ok((out.pairs, out.stats))
+}
+
+/// [`union_block_with_stats`], also returning which surviving pairs only a
+/// probe blocker produced.
+pub async fn union_block_detailed(
+    pool: &PgPool,
+    blockers: &[Box<dyn Blocker>],
+    seeds: &[Uuid],
+    cfg: SourceFilterConfig,
+    eligibility: &EligibilityConfig,
+) -> Result<BlockOutcome, sqlx::Error> {
     let mut all: Vec<CandidatePair> = Vec::new();
+    let mut from_probe: HashSet<CandidatePair> = HashSet::new();
+    let mut from_neighbourhood: HashSet<CandidatePair> = HashSet::new();
     for b in blockers {
-        all.extend(b.candidates(pool, seeds).await?);
+        let found = b.candidates(pool, seeds).await?;
+        if b.is_probe() {
+            from_probe.extend(found.iter().copied());
+        } else {
+            from_neighbourhood.extend(found.iter().copied());
+        }
+        all.extend(found);
     }
     all.sort_unstable();
     all.dedup();
+    let probe_only: HashSet<CandidatePair> = from_probe
+        .difference(&from_neighbourhood)
+        .copied()
+        .collect();
     let mut stats = BlockStats {
         retrieved: all.len(),
+        probe_retrieved: from_probe.len(),
+        probe_only: probe_only.len(),
         ..BlockStats::default()
     };
 
@@ -131,7 +187,17 @@ pub async fn union_block_with_stats(
             out.push((a, b));
         }
     }
-    Ok((out, stats))
+    let probe_only: HashSet<CandidatePair> = out
+        .iter()
+        .filter(|p| probe_only.contains(p))
+        .copied()
+        .collect();
+    stats.probe_only_kept = probe_only.len();
+    Ok(BlockOutcome {
+        pairs: out,
+        stats,
+        probe_only,
+    })
 }
 
 /// Keep only pairs whose BOTH endpoints are eligible to match: not carrying any

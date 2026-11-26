@@ -4,16 +4,22 @@
 //! See `docs/superpowers/specs/2026-05-21-cross-source-matching-design.md` §3.
 
 use crate::matching::blocker::{
-    compound_nbhd::CompoundNbhdBlocker, content_hash_prefix::ContentHashBlocker,
-    embedding_ann::EmbeddingAnnBlocker, shared_triple::SharedTripleBlocker,
-    theme_cluster::ThemeClusterBlocker, union_block_with_stats, Blocker,
+    compound_nbhd::CompoundNbhdBlocker,
+    content_hash_prefix::ContentHashBlocker,
+    embedding_ann::EmbeddingAnnBlocker,
+    shared_triple::SharedTripleBlocker,
+    stance_probe::{StanceProbeBlocker, StanceProbeStats},
+    theme_cluster::ThemeClusterBlocker,
+    union_block_detailed, Blocker,
 };
 use crate::matching::calibration::MatcherConfig;
 use crate::matching::policy::{Policy, PolicyAction};
 use crate::matching::scorer::{score_pair, MatchFeatures};
 use crate::matching::verifier::{map_relationship, MatchVerdict, VerifierClient};
 use epigraph_db::repos::match_candidate::MatchCandidateRepo;
+use epigraph_embeddings::EmbeddingService;
 use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct RunInputs {
@@ -21,6 +27,10 @@ pub struct RunInputs {
     pub cfg: MatcherConfig,
     pub verifier: Box<dyn VerifierClient>,
     pub auto_promote: bool,
+    /// Embedder for the stance-seeking probe stage (a04248cf). `Some` adds a
+    /// [`StanceProbeBlocker`] to the union; it must embed into the same space
+    /// as `claims.embedding`. `None` runs the neighbourhood blockers only.
+    pub probe_embedder: Option<Arc<dyn EmbeddingService>>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,19 +71,47 @@ pub struct RunReport {
     /// alarmed at the seam that *can* tell them apart — see
     /// `epigraph_cli::matching_client::is_total_verifier_outage`.
     pub skipped_no_verdict: usize,
+    /// Whether the stance-probe stage ran (an embedder was supplied).
+    pub stance_probe_enabled: bool,
+    /// Seeds, probe texts and skipped seeds of the stance-probe stage.
+    pub stance_probe: StanceProbeStats,
+    /// Distinct pairs the probe blockers retrieved, before any filter
+    /// (included in `retrieved_pairs`).
+    pub probe_retrieved_pairs: usize,
+    /// Of those, pairs no neighbourhood blocker retrieved: the probes' own
+    /// recall contribution.
+    pub probe_only_pairs: usize,
+    /// Probe-only pairs that survived the recall-stage filters and were scored.
+    pub probe_only_kept: usize,
+    /// Probe-only pairs that scored at or above `bands.mid` and were routed to
+    /// the verifier. `probe_only_kept - probe_only_routed` were rejected on
+    /// score: a probe-found pair is far from the seed by construction, so a
+    /// low ratio here reads as "retrieved, then rejected by the scorer".
+    pub probe_only_routed: usize,
 }
 
 pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<RunReport> {
     let run_id = Uuid::new_v4();
     let fan_out = inputs.cfg.fan_out.max_per_claim;
-    let blockers: Vec<Box<dyn Blocker>> = vec![
+    let mut blockers: Vec<Box<dyn Blocker>> = vec![
         Box::new(EmbeddingAnnBlocker::new(fan_out)),
         Box::new(ThemeClusterBlocker::new(fan_out)),
         Box::new(CompoundNbhdBlocker::new(fan_out)),
         Box::new(SharedTripleBlocker::new(fan_out)),
         Box::new(ContentHashBlocker),
     ];
-    let (pairs, block_stats) = union_block_with_stats(
+    // Stance-seeking probes (a04248cf): embedding happens here, before any
+    // write, so an embedding failure aborts the run with nothing written and
+    // the caller does not stamp the seeds as scanned.
+    let stance_probe_enabled = inputs.probe_embedder.is_some();
+    let mut stance_probe = StanceProbeStats::default();
+    if let Some(embedder) = &inputs.probe_embedder {
+        let (probe, stats) =
+            StanceProbeBlocker::prepare(pool, embedder.as_ref(), &inputs.seeds, fan_out).await?;
+        stance_probe = stats;
+        blockers.push(Box::new(probe));
+    }
+    let outcome = union_block_detailed(
         pool,
         &blockers,
         &inputs.seeds,
@@ -81,6 +119,10 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         &inputs.cfg.eligibility,
     )
     .await?;
+    let block_stats = outcome.stats;
+    let probe_only = outcome.probe_only;
+    let pairs = outcome.pairs;
+    let mut probe_only_routed = 0usize;
 
     let mut promoted = 0usize;
     let mut mid_band = 0usize;
@@ -107,6 +149,9 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         // acceptable since `auto_promote` defaults off and a future
         // `belief_alignment`-gated fast-path can re-optimize the clear cases.
         if f.score >= inputs.cfg.bands.mid {
+            if probe_only.contains(&(*a, *b)) {
+                probe_only_routed += 1;
+            }
             mid_pairs.push((*a, *b));
             mid_features.push(f);
         } else {
@@ -195,5 +240,11 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         rejected,
         verdict_writes_suppressed: policy.verdict_writes_suppressed(),
         skipped_no_verdict,
+        stance_probe_enabled,
+        stance_probe,
+        probe_retrieved_pairs: block_stats.probe_retrieved,
+        probe_only_pairs: block_stats.probe_only,
+        probe_only_kept: block_stats.probe_only_kept,
+        probe_only_routed,
     })
 }

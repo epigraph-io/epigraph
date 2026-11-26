@@ -546,6 +546,7 @@ async fn union_block_reports_recall_stage_drops(pool: PgPool) {
             retrieved: 3,
             ineligible_dropped: 1,
             same_source_dropped: 1,
+            ..BlockStats::default()
         },
         "each recall-stage filter's drop must be counted separately"
     );
