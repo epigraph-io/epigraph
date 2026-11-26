@@ -50,8 +50,12 @@ def _api_commits(d, shas):
         email, date, msg = subprocess.run(
             ["git", "-C", d, "show", "-s", "--format=%ae%x00%aI%x00%B", sha],
             capture_output=True, text=True, check=True).stdout.split("\0")
+        # The API gives author dates in UTC (`...Z`); git gives the author's
+        # own offset, so the match must compare instants, not strings.
+        utc = datetime.datetime.fromisoformat(date).astimezone(datetime.timezone.utc)
         rows.append({"sha": "pre-rebase-" + sha[:7],
-                     "commit": {"author": {"email": email, "date": date}, "message": msg}})
+                     "commit": {"author": {"email": email, "date": utc.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                                "message": msg}})
     return rows
 
 class RebaseRangeTests(unittest.TestCase):
@@ -412,6 +416,29 @@ class StateTests(unittest.TestCase):
         self.assertFalse([c for c in gh.calls if c[0].endswith("/pulls/5")])
         # The backoff is capped at a day.
         self.assertEqual(self._run(gh, self.T0 + 27 * h), ((1, 0), [5]))
+
+    def test_a_cursor_in_the_future_is_clamped_to_now(self):
+        # A clock set back (or a hand-edited state file) must not push the
+        # cutoff past PRs merged in the last window.
+        gir.save_state(self.cfg.state_dir, "o/r",
+                       gir.RepoState(cursor=(self.T0 + datetime.timedelta(days=1)).isoformat()))
+        gh = FakeGitHub([_row(6, "2026-06-03T11:30:00Z")])
+        self.assertEqual(self._run(gh, self.T0), ((1, 0), [6]))
+
+    def test_a_retry_list_pr_that_is_not_merged_is_dropped(self):
+        gir.save_state(self.cfg.state_dir, "o/r", gir.RepoState(
+            cursor=self.T0.isoformat(), retry={7: {"attempts": 1, "last_failed_at": "2026-06-01T00:00:00Z"}}))
+        unmerged = {**_row(7, None, "2026-06-01T00:00:00Z"), "merge_commit_sha": None}
+        with self.assertLogs(gir.LOG, level="WARNING"):
+            self.assertEqual(self._run(FakeGitHub([unmerged]), self.T0), ((0, 0), []))
+        self.assertEqual(gir.load_state(self.cfg.state_dir, "o/r").retry, {})
+
+    def test_a_state_file_that_cannot_be_saved_fails_the_run(self):
+        # The PRs were ingested, but the cursor and the retry list were not
+        # kept: the run must not report success.
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        with mock.patch.object(gir, "save_state", side_effect=OSError(28, "No space left on device")):
+            self.assertEqual(self._run(gh, self.T0), ((1, 1), [5]))
 
 class MainLoopTests(unittest.TestCase):
     def test_runs_all_prs_and_isolates_failures(self):
