@@ -14,11 +14,33 @@ use epigraph_api::scratch::snapshot::{
     RestoredFrom,
 };
 use epigraph_api::scratch::store::{
-    AtomKind, Evidence, NewAtom, NewEdge, Relationship, ScratchStore, Seed, Speaker,
+    agent_id, AgentRole, AtomKind, Evidence, NewAgent, NewAtom, NewEdge, NewRelation, Relationship,
+    ScratchStore, Seed,
 };
 use uuid::Uuid;
 
 const SCOPE: &str = "3f9a1c07be52";
+
+/// The one speaker agent these atoms are attributed to.
+fn speaker() -> Uuid {
+    agent_id(SCOPE, "Dana")
+}
+
+/// `store` with the speaker agent stored (an atom must name a stored agent).
+fn with_speaker(mut store: ScratchStore) -> ScratchStore {
+    store
+        .put_agents(
+            vec![NewAgent {
+                id: speaker(),
+                display_name: "Dana".into(),
+                role: AgentRole::User,
+                aliases: vec![],
+            }],
+            t(0),
+        )
+        .unwrap();
+    store
+}
 
 fn t(secs: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_790_000_000 + secs, 0).unwrap()
@@ -59,7 +81,8 @@ fn new_atom(n: u128, turn: u64, text: &str, confidence: f64) -> NewAtom {
         id: id(n),
         text: text.to_string(),
         kind: AtomKind::Decision,
-        speaker: Speaker::User,
+        speaker_agent: speaker(),
+        about: vec![],
         turn,
         epoch: 4,
         quote: Some(text.chars().take(12).collect()),
@@ -78,10 +101,38 @@ fn new_atom(n: u128, turn: u64, text: &str, confidence: f64) -> NewAtom {
     }
 }
 
+/// Two more agents with awkward names, and a relation between them.
+fn others() -> (Vec<NewAgent>, NewRelation) {
+    let zoe = NewAgent {
+        id: agent_id(SCOPE, "Zoë «Q» \"quoted\""),
+        display_name: "Zoë «Q» \"quoted\"".into(),
+        role: AgentRole::Participant,
+        aliases: vec!["Zo\\e".into(), "测试".into()],
+    };
+    let bo = NewAgent {
+        id: agent_id(SCOPE, "Bo"),
+        display_name: "Bo".into(),
+        role: AgentRole::Participant,
+        aliases: vec![],
+    };
+    let rel = NewRelation {
+        id: id(70),
+        source: bo.id,
+        target: zoe.id,
+        kind: "sibling_of".into(),
+        turn: 2,
+    };
+    (vec![zoe, bo], rel)
+}
+
 /// A graph exercising every stored shape: awkward floats, unicode, escapes,
-/// quotes, a superseded atom, a corroboration, edges and applied turns.
+/// quotes, agents with awkward names, a relation, a superseded atom, a
+/// corroboration, edges and applied turns.
 fn rich_store() -> ScratchStore {
-    let mut s = ScratchStore::new(SCOPE, 4, t(0));
+    let mut s = with_speaker(ScratchStore::new(SCOPE, 4, t(0)));
+    let (agents, rel) = others();
+    s.put_agents(agents, t(0)).unwrap();
+    s.relate(vec![rel], t(0)).unwrap();
     s.put_atoms(
         vec![
             new_atom(
@@ -166,6 +217,11 @@ fn write_restore_write_is_byte_identical() {
     // The bytes do not depend on insertion order: the same graph built in a
     // different order encodes identically.
     let mut other = ScratchStore::new(SCOPE, 4, t(0));
+    let (mut agents, rel) = others();
+    agents.reverse();
+    other.put_agents(agents, t(0)).unwrap();
+    other = with_speaker(other);
+    other.relate(vec![rel], t(0)).unwrap();
     other
         .put_atoms(vec![new_atom(4, 9, "A later correction.", 2.0 / 3.0)], t(1))
         .unwrap();
@@ -246,6 +302,8 @@ fn the_file_is_one_object_with_the_design_fields_and_a_verifiable_hash() {
         "scope",
         "epoch",
         "applied_turns",
+        "agents",
+        "relations",
         "atoms",
         "edges",
         "built_at",
@@ -253,7 +311,7 @@ fn the_file_is_one_object_with_the_design_fields_and_a_verifiable_hash() {
     ];
     expected.sort_unstable();
     assert_eq!(keys, expected);
-    assert_eq!(v["format"], 1);
+    assert_eq!(v["format"], 2);
     assert_eq!(v["applied_turns"], serde_json::json!([2, 7, 9]));
     assert_eq!(
         v["atoms"][0]["id"],
@@ -283,7 +341,7 @@ fn the_file_is_one_object_with_the_design_fields_and_a_verifiable_hash() {
 fn an_edited_snapshot_fails_its_hash_and_restore_falls_back_to_prev() {
     let dir = TempDir::new("tamper");
     let older = {
-        let mut s = ScratchStore::new(SCOPE, 4, t(0));
+        let mut s = with_speaker(ScratchStore::new(SCOPE, 4, t(0)));
         s.put_atoms(
             vec![new_atom(1, 1, "The pilot site has 40 beds.", 0.5)],
             t(1),
@@ -460,8 +518,8 @@ fn decode_refuses_other_formats_and_broken_invariants() {
         "the re-signer is faithful"
     );
     assert_eq!(
-        decode(&rehash(&good.replacen("\"format\":1", "\"format\":2", 1))),
-        Err(DecodeError::UnsupportedFormat(2))
+        decode(&rehash(&good.replacen("\"format\":2", "\"format\":3", 1))),
+        Err(DecodeError::UnsupportedFormat(3))
     );
     let other_epoch_atom = good.replacen(
         "\"epoch\":4,\"created_at\"",
@@ -472,7 +530,10 @@ fn decode_refuses_other_formats_and_broken_invariants() {
         decode(&rehash(&other_epoch_atom)),
         Err(DecodeError::Invalid(_))
     ));
-    let unknown_field = good.replacen("\"format\":1", "\"format\":1,\"extra\":true", 1);
+    let unknown_field = good.replacen("\"format\":2", "\"format\":2,\"extra\":true", 1);
     assert_eq!(decode(&rehash(&unknown_field)), Err(DecodeError::Malformed));
-    assert_eq!(snapshot::FORMAT, 1);
+    // A format-2 body labelled format 1 is not silently read as either.
+    let mislabelled = good.replacen("\"format\":2", "\"format\":1", 1);
+    assert_eq!(decode(&rehash(&mislabelled)), Err(DecodeError::Malformed));
+    assert_eq!(snapshot::FORMAT, 2);
 }

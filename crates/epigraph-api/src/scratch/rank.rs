@@ -61,7 +61,7 @@ use uuid::Uuid;
 
 use super::belief::{AtomBelief, BeliefView};
 use super::bm25;
-use super::store::{AtomKind, Evidence, Relationship, ScratchAtom, ScratchStore, Speaker};
+use super::store::{AgentRole, AtomKind, Evidence, Relationship, ScratchAtom, ScratchStore};
 
 /// BM25 hits considered for the relevant slice.
 pub const RELEVANT_BM25_TOP: usize = 60;
@@ -130,7 +130,10 @@ pub struct DigestItem<'a> {
     pub id: Uuid,
     pub text: &'a str,
     pub kind: AtomKind,
-    pub speaker: Speaker,
+    /// The speaker agent's display name (chat text).
+    pub speaker: &'a str,
+    pub speaker_agent: Uuid,
+    pub role: AgentRole,
     pub turn: u64,
     pub bel: f64,
     pub pl: f64,
@@ -212,12 +215,24 @@ pub struct Digest<'a> {
     pub open: Vec<OpenEntry<'a>>,
 }
 
-fn item<'a>(atom: &'a ScratchAtom, belief: &AtomBelief, score: Option<f64>) -> DigestItem<'a> {
+fn item<'a>(
+    store: &'a ScratchStore,
+    atom: &'a ScratchAtom,
+    belief: &AtomBelief,
+    score: Option<f64>,
+) -> DigestItem<'a> {
+    let (speaker, role) = store
+        .agent(&atom.speaker_agent)
+        .map_or(("", AgentRole::Participant), |a| {
+            (a.display_name.as_str(), a.role)
+        });
     DigestItem {
         id: atom.id,
         text: &atom.text,
         kind: atom.kind,
-        speaker: atom.speaker,
+        speaker,
+        speaker_agent: atom.speaker_agent,
+        role,
         turn: atom.turn,
         bel: belief.bel,
         pl: belief.pl,
@@ -296,7 +311,7 @@ pub fn digest<'a>(
         atoms_total: store.stats().atoms,
         eligible: eligible.len(),
         turns_archived: applied.range(..exclude_turns_from).count(),
-        standing: standing(&eligible, &beliefs, k_per_slice),
+        standing: standing(store, &eligible, &beliefs, k_per_slice),
         relevant: relevant(
             store,
             &eligible,
@@ -306,13 +321,14 @@ pub fn digest<'a>(
             exclude_turns_from,
             k_per_slice,
         ),
-        recent: recent(&eligible, &beliefs, exclude_turns_from, k_per_slice),
+        recent: recent(store, &eligible, &beliefs, exclude_turns_from, k_per_slice),
         recent_corrections: recent_corrections(store, &eligible_ids, &applied, exclude_turns_from),
         open: open(store, &eligible, &eligible_ids, &beliefs, k_per_slice),
     }
 }
 
 fn standing<'a>(
+    store: &'a ScratchStore,
     eligible: &[&'a ScratchAtom],
     beliefs: &BeliefLookup<'_>,
     k: usize,
@@ -326,12 +342,12 @@ fn standing<'a>(
     list.sort_by(|a, b| beliefs.of(&b.id).betp.total_cmp(&beliefs.of(&a.id).betp));
     list.into_iter()
         .take(k)
-        .map(|a| item(a, beliefs.of(&a.id), None))
+        .map(|a| item(store, a, beliefs.of(&a.id), None))
         .collect()
 }
 
 fn relevant<'a>(
-    store: &ScratchStore,
+    store: &'a ScratchStore,
     eligible: &[&'a ScratchAtom],
     eligible_ids: &BTreeSet<Uuid>,
     beliefs: &BeliefLookup<'_>,
@@ -408,12 +424,13 @@ fn relevant<'a>(
         .into_iter()
         .map(|i| {
             let (a, s) = scored[i];
-            item(a, beliefs.of(&a.id), Some(s))
+            item(store, a, beliefs.of(&a.id), Some(s))
         })
         .collect()
 }
 
 fn recent<'a>(
+    store: &'a ScratchStore,
     eligible: &[&'a ScratchAtom],
     beliefs: &BeliefLookup<'_>,
     exclude_turns_from: u64,
@@ -432,7 +449,7 @@ fn recent<'a>(
     });
     list.into_iter()
         .take(k)
-        .map(|a| item(a, beliefs.of(&a.id), None))
+        .map(|a| item(store, a, beliefs.of(&a.id), None))
         .collect()
 }
 
@@ -521,7 +538,7 @@ fn open<'a>(
             }
             if eligible_ids.contains(partner) {
                 shown.insert(p.id);
-                vs.push(item(p, beliefs.of(&p.id), None));
+                vs.push(item(store, p, beliefs.of(&p.id), None));
             } else {
                 vs_unlisted.push(UnlistedPartner {
                     id: p.id,
@@ -535,7 +552,7 @@ fn open<'a>(
         }
         shown.insert(head.id);
         out.push(OpenEntry {
-            item: item(head, beliefs.of(&head.id), None),
+            item: item(store, head, beliefs.of(&head.id), None),
             vs,
             vs_unlisted,
         });
@@ -550,7 +567,7 @@ fn open<'a>(
             break;
         }
         out.push(OpenEntry {
-            item: item(q, beliefs.of(&q.id), None),
+            item: item(store, q, beliefs.of(&q.id), None),
             vs: Vec::new(),
             vs_unlisted: Vec::new(),
         });

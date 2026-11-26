@@ -96,8 +96,9 @@ fn a_full_session_never_dials_the_database_address_and_holds_no_socket() {
     let sha = "cd".repeat(32);
     let session = [
         r#"{"id":1,"op":"health"}"#.to_string(),
+        r#"{"id":"a","op":"put_agents","agents":[{"id":"00000000-0000-5000-8000-0000000000aa","display_name":"Dana","role":"user"}]}"#.to_string(),
         format!(
-            r#"{{"id":2,"op":"put_atoms","atoms":[{{"id":"00000000-0000-5000-8000-000000000001","text":"The pilot uses v2 probes.","kind":"decision","speaker":"user","turn":1,"epoch":0,"evidence":[{{"path":"turns/1.json","sha256":"{sha}"}}],"seed":{{"confidence":0.7,"reliability":0.95}}}}]}}"#
+            r#"{{"id":2,"op":"put_atoms","atoms":[{{"id":"00000000-0000-5000-8000-000000000001","text":"The pilot uses v2 probes.","kind":"decision","speaker_agent":"00000000-0000-5000-8000-0000000000aa","turn":1,"epoch":0,"evidence":[{{"path":"turns/1.json","sha256":"{sha}"}}],"seed":{{"confidence":0.7,"reliability":0.95}}}}]}}"#
         ),
         r#"{"id":3,"op":"candidates","text":"probes"}"#.to_string(),
         r#"{"id":4,"op":"mark_applied","turn":1}"#.to_string(),
@@ -117,12 +118,12 @@ fn a_full_session_never_dials_the_database_address_and_holds_no_socket() {
         responses.push(r);
     }
     // The engine calls really ran: a seeded belief and a ranked hit came back.
-    let belief = &responses[7]["belief"];
+    let belief = &responses[8]["belief"];
     assert!(
         (belief["bel"].as_f64().unwrap() - 0.665).abs() < 1e-12,
         "{belief}"
     );
-    let digest = &responses[8];
+    let digest = &responses[9];
     assert_eq!(
         digest["relevant"][0]["id"], "00000000-0000-5000-8000-000000000001",
         "{digest}"

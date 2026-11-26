@@ -25,16 +25,19 @@
 //! | op | params | result |
 //! |---|---|---|
 //! | `health` | — | `status`, `format`, `scope`, `epoch`, `restored_from`, `restore_degraded`, `version` |
-//! | `stats` | — | `atoms`, `current_atoms`, `edges`, `applied_turns`, `max_applied_turn` |
-//! | `candidates` | `text`, `k`? (10), `recent`? (10) | `candidates: [{id,text,kind,speaker,turn,via,score}]` |
-//! | `put_atoms` | `atoms: [{id,text,kind,speaker,turn,epoch,quote?,evidence?,seed:{confidence,reliability}}]` | `inserted`, `existing` |
+//! | `stats` | — | `agents`, `relations`, `atoms`, `current_atoms`, `edges`, `applied_turns`, `max_applied_turn` |
+//! | `candidates` | `text`, `k`? (10), `recent`? (10) | `candidates: [{id,text,kind,speaker,speaker_agent,role,turn,via,score}]` |
+//! | `put_agents` | `agents: [{id,display_name,role,aliases?}]` | `inserted`, `existing`, `updated` |
+//! | `relate` | `relations: [{id,source,target,kind,turn}]` | `inserted`, `existing` |
+//! | `agents` | — | `agents: [{id,display_name,role,aliases}]` |
+//! | `put_atoms` | `atoms: [{id,text,kind,speaker_agent,about?,turn,epoch,quote?,evidence?,seed:{confidence,reliability}}]` | `inserted`, `existing` |
 //! | `corroborate` | `corroboration_id`, `target`, `seed`, `evidence`? | `applied` |
 //! | `add_edges` | `edges: [{id,source,target,rel}]` | `inserted`, `existing` |
 //! | `supersede` | `old`, `new`, `reason`? | `changed` |
 //! | `mark_applied` | `turn` | `changed` |
 //! | `update_belief` | — | `current_atoms`, `contested`, `seeds` |
 //! | `atom` | `atom_id` | `atom`, `belief: {bel,pl,betp,contested,contested_with}` |
-//! | `neighbors` | `atom_id` | `neighbors: [{edge,relationship,direction,atom:{id,text,kind,speaker,turn,is_current}}]` |
+//! | `neighbors` | `atom_id` | `neighbors: [{edge,relationship,direction,atom:{id,text,kind,speaker_agent,turn,is_current}}]` |
 //! | `snapshot` | — | `bytes` |
 //! | `digest` | `query`, `exclude_turns_from` (the first turn of the verbatim window), `k_per_slice`? (20, at most 200) | `atoms_total`, `eligible`, `turns_archived`, `standing`, `relevant`, `recent`, `recent_corrections`, `open` (see [`super::rank`]) |
 //!
@@ -52,6 +55,13 @@
 //!   parameters are `atom_id`.
 //!
 //! `supersede`'s `reason` is accepted and not stored in slice 1.
+//!
+//! Agents (slice 1b): a role is `user`, `assistant`, `participant` or
+//! `tool`. `put_agents` refuses a known id with another role (`conflict`).
+//! An atom's `speaker_agent` and `about` must name stored agents
+//! (`unknown_agent`), so the runner sends `put_agents` before `put_atoms`.
+//! `speaker` in a `candidates` or `digest` item is the speaker agent's display
+//! name, which is chat text like the atom's own.
 //!
 //! Belief ([`super::belief`]) is derived from the stored graph on every read
 //! and never stored, so `update_belief` writes nothing: it recomputes belief
@@ -89,7 +99,10 @@ use uuid::Uuid;
 use super::belief::{BeliefError, BeliefView};
 use super::rank::{self, DEFAULT_K_PER_SLICE, MAX_K_PER_SLICE};
 use super::snapshot::{self, RestoreError, RestoreReport, RestoredFrom};
-use super::store::{Evidence, NewAtom, NewEdge, ScratchAtom, ScratchStore, Seed, StoreError};
+use super::store::{
+    AgentRole, Evidence, NewAgent, NewAtom, NewEdge, NewRelation, ScratchAtom, ScratchStore, Seed,
+    StoreError,
+};
 
 /// Default BM25 hits for `candidates`.
 pub const DEFAULT_CANDIDATES_K: usize = 10;
@@ -168,6 +181,18 @@ struct PutAtomsParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PutAgentsParams {
+    agents: Vec<NewAgent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelateParams {
+    relations: Vec<NewRelation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CorroborateParams {
     corroboration_id: Uuid,
     target: Uuid,
@@ -220,10 +245,20 @@ fn atom_summary(atom: &ScratchAtom) -> Value {
         "id": atom.id,
         "text": atom.text,
         "kind": atom.kind,
-        "speaker": atom.speaker,
+        "speaker_agent": atom.speaker_agent,
         "turn": atom.turn,
         "is_current": atom.is_current,
     })
+}
+
+/// The speaker agent's display name and role; an atom always names a stored
+/// agent (checked on write and on restore).
+fn speaker_of<'s>(store: &'s ScratchStore, atom: &ScratchAtom) -> (&'s str, AgentRole) {
+    store
+        .agent(&atom.speaker_agent)
+        .map_or(("", AgentRole::Participant), |a| {
+            (a.display_name.as_str(), a.role)
+        })
 }
 
 /// One running scratch graph bound to its snapshot file.
@@ -349,6 +384,8 @@ impl Session {
                 params::<NoParams>(rest)?;
                 let s = self.store.stats();
                 Ok(json!({
+                    "agents": s.agents,
+                    "relations": s.relations,
                     "atoms": s.atoms,
                     "current_atoms": s.current_atoms,
                     "edges": s.edges,
@@ -371,11 +408,14 @@ impl Session {
                     .candidates(&p.text, k, recent)
                     .into_iter()
                     .map(|c| {
+                        let (speaker, role) = speaker_of(&self.store, c.atom);
                         json!({
                             "id": c.atom.id,
                             "text": c.atom.text,
                             "kind": c.atom.kind,
-                            "speaker": c.atom.speaker,
+                            "speaker": speaker,
+                            "speaker_agent": c.atom.speaker_agent,
+                            "role": role,
                             "turn": c.atom.turn,
                             "via": c.via,
                             "score": c.score,
@@ -383,6 +423,27 @@ impl Session {
                     })
                     .collect();
                 Ok(json!({ "candidates": list }))
+            }
+            "put_agents" => {
+                let p: PutAgentsParams = params(rest)?;
+                let (out, updated) = self.store.put_agents(p.agents, now)?;
+                self.commit(
+                    out.inserted > 0 || updated > 0,
+                    json!({ "inserted": out.inserted, "existing": out.existing, "updated": updated }),
+                )
+            }
+            "relate" => {
+                let p: RelateParams = params(rest)?;
+                let out = self.store.relate(p.relations, now)?;
+                self.commit(
+                    out.inserted > 0,
+                    json!({ "inserted": out.inserted, "existing": out.existing }),
+                )
+            }
+            "agents" => {
+                params::<NoParams>(rest)?;
+                let list: Vec<&super::store::ScratchAgent> = self.store.agents().collect();
+                Ok(json!({ "agents": list }))
             }
             "put_atoms" => {
                 let p: PutAtomsParams = params(rest)?;

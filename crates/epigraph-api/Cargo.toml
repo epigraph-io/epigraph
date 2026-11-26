@@ -91,7 +91,7 @@ serde_json = { workspace = true }  # JSON support
 serde_urlencoded = "0.7"  # OAuth token endpoint body (application/x-www-form-urlencoded, RFC 6749)
 serde_with = { workspace = true }  # Helper macros for serde
 toml = "0.8"  # provider config parsing
-uuid = { workspace = true }  # UUID support
+uuid = { workspace = true, features = ["v5"] }  # UUID support (v5: scratch agent ids)
 chrono = { workspace = true }  # Date/time handling
 thiserror = { workspace = true }  # Error derive macros
 tracing = { workspace = true }  # Structured logging
@@ -312,7 +312,8 @@ required-features = ["tls"]
 # whole-package no-db test (most of this crate's tests need `db`):
 # `cargo test -p epigraph-api --no-default-features --features scratch --locked
 #  --lib --test scratch_store --test scratch_snapshot --test scratch_protocol
-#  --test scratch_no_db --test scratch_belief --test scratch_digest`.
+#  --test scratch_no_db --test scratch_belief --test scratch_digest
+#  --test scratch_agents`.
 [[test]]
 name = "scratch_store"
 path = "tests/scratch_store.rs"
@@ -341,6 +342,11 @@ required-features = ["scratch"]
 [[test]]
 name = "scratch_digest"
 path = "tests/scratch_digest.rs"
+required-features = ["scratch"]
+
+[[test]]
+name = "scratch_agents"
+path = "tests/scratch_agents.rs"
 required-features = ["scratch"]
 
 [lints]

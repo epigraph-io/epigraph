@@ -9,13 +9,35 @@
 use chrono::{DateTime, TimeZone, Utc};
 use epigraph_api::scratch::belief::{seed_row, BeliefSummary, BeliefView, SEED_LOCALITY_TAG};
 use epigraph_api::scratch::store::{
-    AtomKind, Evidence, NewAtom, NewEdge, Relationship, ScratchStore, Seed, SeedBba, Speaker,
+    agent_id, AgentRole, AtomKind, Evidence, NewAgent, NewAtom, NewEdge, Relationship,
+    ScratchStore, Seed, SeedBba,
 };
 use epigraph_engine::belief_profile::BeliefProfile;
 use epigraph_engine::edge_factor::effective_source_strength_profiled;
 use uuid::Uuid;
 
 const SCOPE: &str = "3f9a1c07be52";
+
+/// The one speaker agent these atoms are attributed to.
+fn speaker() -> Uuid {
+    agent_id(SCOPE, "Dana")
+}
+
+/// `store` with the speaker agent stored (an atom must name a stored agent).
+fn with_speaker(mut store: ScratchStore) -> ScratchStore {
+    store
+        .put_agents(
+            vec![NewAgent {
+                id: speaker(),
+                display_name: "Dana".into(),
+                role: AgentRole::User,
+                aliases: vec![],
+            }],
+            t(0),
+        )
+        .unwrap();
+    store
+}
 const EPS: f64 = 1e-12;
 
 /// DESIGN §3.4's speaker-reliability tiers.
@@ -34,7 +56,8 @@ fn atom(n: u128, turn: u64, confidence: f64, reliability: f64) -> NewAtom {
         id: id(n),
         text: format!("Atom number {n} from turn {turn}."),
         kind: AtomKind::Fact,
-        speaker: Speaker::User,
+        speaker_agent: speaker(),
+        about: vec![],
         turn,
         epoch: 0,
         quote: None,
@@ -52,7 +75,7 @@ fn atom(n: u128, turn: u64, confidence: f64, reliability: f64) -> NewAtom {
 }
 
 fn store(atoms: Vec<NewAtom>) -> ScratchStore {
-    let mut s = ScratchStore::new(SCOPE, 0, t(0));
+    let mut s = with_speaker(ScratchStore::new(SCOPE, 0, t(0)));
     s.put_atoms(atoms, t(1)).unwrap();
     s
 }

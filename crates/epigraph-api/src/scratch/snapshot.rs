@@ -5,14 +5,21 @@
 //! One line of compact JSON and a newline:
 //!
 //! ```text
-//! {"format":1,"scope":..,"epoch":..,"applied_turns":[..],"atoms":[..],"edges":[..],"built_at":..,"sha256":"<64 hex>"}
+//! {"format":2,"scope":..,"epoch":..,"applied_turns":[..],"agents":[..],"relations":[..],"atoms":[..],"edges":[..],"built_at":..,"sha256":"<64 hex>"}
 //! ```
 //!
-//! Atoms and edges are in id order and applied turns ascend, so the bytes are
-//! a function of the graph's content alone. `sha256` is the SHA-256 of the
-//! same object WITHOUT its `sha256` member, taken over the raw bytes in the
-//! file. Verification never re-serializes parsed values, so it cannot depend
-//! on how a float parses back.
+//! Agents, relations, atoms and edges are in id order and applied turns
+//! ascend, so the bytes are a function of the graph's content alone.
+//! `sha256` is the SHA-256 of the same object WITHOUT its `sha256` member,
+//! taken over the raw bytes in the file. Verification never re-serializes
+//! parsed values, so it cannot depend on how a float parses back.
+//!
+//! Format 2 (slice 1b) added agents and relations, and replaced an atom's
+//! `speaker` role (`user`, `assistant`, `tool`) with `speaker_agent`. A
+//! format-1 snapshot is still read: each role an atom names becomes an agent
+//! of that role named `User`, `Assistant` or `Tool`, with the id
+//! [`agent_id`] gives that name in the snapshot's scope (the id the runner
+//! computes for the same name). The next write stores format 2.
 //!
 //! # Writing
 //!
@@ -43,15 +50,22 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::store::{ScratchAtom, ScratchEdge, ScratchStore};
+use super::store::{
+    agent_id, AgentRelation, AgentRole, AtomKind, Evidence, ScratchAgent, ScratchAtom, ScratchEdge,
+    ScratchStore, SeedBba,
+};
 
-/// The snapshot format version this build reads and writes.
+/// The snapshot format version this build writes. It also reads
+/// [`FORMAT_V1`].
 ///
-/// Still 1 after E2 replaced a seed's `supported` with `confidence` and
-/// `reliability`: no format-1 snapshot existed outside tests when it did. A
-/// snapshot of the older shape fails to decode, restore falls back to `.prev`
-/// or empty, and the runner backfills from its kept atoms (DESIGN §4.2).
-pub const FORMAT: u32 = 1;
+/// Format 1 was not bumped when E2 replaced a seed's `supported` with
+/// `confidence` and `reliability`: no format-1 snapshot existed outside tests
+/// then. A snapshot of that older shape fails to decode, restore falls back
+/// to `.prev` or empty, and the runner backfills from its kept atoms (DESIGN
+/// §4.2).
+pub const FORMAT: u32 = 2;
+/// The slice-1 format, read and upgraded on restore.
+pub const FORMAT_V1: u32 = 1;
 
 /// `,"sha256":"` — the member that closes every snapshot object.
 const SHA_MEMBER: &[u8] = b",\"sha256\":\"";
@@ -64,22 +78,134 @@ struct BodyOut<'a> {
     scope: &'a str,
     epoch: u64,
     applied_turns: Vec<u64>,
+    agents: Vec<&'a ScratchAgent>,
+    relations: Vec<&'a AgentRelation>,
     atoms: Vec<&'a ScratchAtom>,
     edges: Vec<&'a ScratchEdge>,
     built_at: &'a str,
 }
 
+/// Just the version, read first to pick the shape.
+#[derive(Deserialize)]
+struct FormatOnly {
+    format: u32,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileIn {
+    // Read through `FormatOnly`; declared so `deny_unknown_fields` accepts it.
+    #[allow(dead_code)]
     format: u32,
     scope: String,
     epoch: u64,
     applied_turns: Vec<u64>,
+    agents: Vec<ScratchAgent>,
+    relations: Vec<AgentRelation>,
     atoms: Vec<ScratchAtom>,
     edges: Vec<ScratchEdge>,
     built_at: String,
     sha256: String,
+}
+
+/// A format-1 atom's speaker role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SpeakerV1 {
+    User,
+    Assistant,
+    Tool,
+}
+
+impl SpeakerV1 {
+    fn agent(self) -> (&'static str, AgentRole) {
+        match self {
+            Self::User => ("User", AgentRole::User),
+            Self::Assistant => ("Assistant", AgentRole::Assistant),
+            Self::Tool => ("Tool", AgentRole::Tool),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AtomV1 {
+    id: uuid::Uuid,
+    text: String,
+    kind: AtomKind,
+    speaker: SpeakerV1,
+    turn: u64,
+    epoch: u64,
+    created_at: String,
+    is_current: bool,
+    superseded_by: Option<uuid::Uuid>,
+    evidence: Vec<Evidence>,
+    bbas: Vec<SeedBba>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileInV1 {
+    #[allow(dead_code)]
+    format: u32,
+    scope: String,
+    epoch: u64,
+    applied_turns: Vec<u64>,
+    atoms: Vec<AtomV1>,
+    edges: Vec<ScratchEdge>,
+    built_at: String,
+    sha256: String,
+}
+
+impl FileInV1 {
+    /// The same graph in format 2: one agent per role the atoms name.
+    fn upgrade(self) -> FileIn {
+        let roles: std::collections::BTreeSet<SpeakerV1> =
+            self.atoms.iter().map(|a| a.speaker).collect();
+        let agents = roles
+            .into_iter()
+            .map(|r| {
+                let (name, role) = r.agent();
+                ScratchAgent {
+                    id: agent_id(&self.scope, name),
+                    display_name: name.to_string(),
+                    role,
+                    aliases: Vec::new(),
+                }
+            })
+            .collect();
+        let scope = self.scope;
+        let atoms = self
+            .atoms
+            .into_iter()
+            .map(|a| ScratchAtom {
+                id: a.id,
+                text: a.text,
+                kind: a.kind,
+                speaker_agent: agent_id(&scope, a.speaker.agent().0),
+                about: Vec::new(),
+                turn: a.turn,
+                epoch: a.epoch,
+                created_at: a.created_at,
+                is_current: a.is_current,
+                superseded_by: a.superseded_by,
+                evidence: a.evidence,
+                bbas: a.bbas,
+            })
+            .collect();
+        FileIn {
+            format: FORMAT,
+            scope,
+            epoch: self.epoch,
+            applied_turns: self.applied_turns,
+            agents,
+            relations: Vec::new(),
+            atoms,
+            edges: self.edges,
+            built_at: self.built_at,
+            sha256: self.sha256,
+        }
+    }
 }
 
 /// Why a snapshot file could not be used.
@@ -113,6 +239,8 @@ pub fn encode(store: &ScratchStore) -> Vec<u8> {
         scope: store.scope(),
         epoch: store.epoch(),
         applied_turns: store.applied_turns().collect(),
+        agents: store.agents().collect(),
+        relations: store.relations().collect(),
         atoms: store.atoms().collect(),
         edges: store.edges().collect(),
         built_at: store.built_at(),
@@ -147,19 +275,25 @@ pub fn decode(bytes: &[u8]) -> Result<ScratchStore, DecodeError> {
     if actual.as_bytes() != recorded {
         return Err(DecodeError::HashMismatch);
     }
-    let file: FileIn = serde_json::from_slice(object).map_err(|_| DecodeError::Malformed)?;
+    let version: FormatOnly = serde_json::from_slice(object).map_err(|_| DecodeError::Malformed)?;
+    let file: FileIn = match version.format {
+        FORMAT => serde_json::from_slice(object).map_err(|_| DecodeError::Malformed)?,
+        FORMAT_V1 => serde_json::from_slice::<FileInV1>(object)
+            .map_err(|_| DecodeError::Malformed)?
+            .upgrade(),
+        other => return Err(DecodeError::UnsupportedFormat(other)),
+    };
     if file.sha256.as_bytes() != recorded {
         // A second `sha256` member earlier in the object would make the
         // parsed value differ from the tail we hashed against.
         return Err(DecodeError::Malformed);
     }
-    if file.format != FORMAT {
-        return Err(DecodeError::UnsupportedFormat(file.format));
-    }
     ScratchStore::from_parts(
         file.scope,
         file.epoch,
         file.applied_turns,
+        file.agents,
+        file.relations,
         file.atoms,
         file.edges,
         file.built_at,

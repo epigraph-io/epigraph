@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use epigraph_api::scratch::store::agent_id;
 use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_epigraph-scratch");
@@ -112,9 +113,21 @@ fn sha() -> String {
     "ab".repeat(32)
 }
 
+/// The speaker agent every atom here is attributed to.
+fn agent() -> String {
+    agent_id(SCOPE, "Dana").to_string()
+}
+
+/// Store the speaker agent (an atom must name a stored agent).
+fn speak(s: &mut Scratch) {
+    let r = s.ok(json!({"id": "agents", "op": "put_agents", "agents": [
+        {"id": agent(), "display_name": "Dana", "role": "user"}]}));
+    assert_eq!(r["inserted"], 1, "{r}");
+}
+
 fn atom(n: u32, turn: u64, text: &str) -> Value {
     json!({
-        "id": uuid(n), "text": text, "kind": "decision", "speaker": "user",
+        "id": uuid(n), "text": text, "kind": "decision", "speaker_agent": agent(),
         "turn": turn, "epoch": 0, "quote": "anchor",
         "evidence": [{"path": format!("turns/{turn}.json"), "sha256": sha(), "span": "user:0"}],
         "seed": {"confidence": 0.71, "reliability": 0.75},
@@ -135,6 +148,8 @@ fn a_session_of_ops_round_trips_over_stdio() {
     assert_eq!(health["restored_from"], "empty");
     assert_eq!(health["restore_degraded"], false);
     assert!(!dir.graph().exists(), "a read op writes nothing");
+
+    speak(&mut s);
 
     let put = s.ok(json!({"id": "put-1", "op": "put_atoms", "atoms": [
         atom(1, 3, "The operator decided the greenhouse rollout uses v2 probes only."),
@@ -199,13 +214,13 @@ fn a_session_of_ops_round_trips_over_stdio() {
         n["neighbors"],
         json!([{"edge": uuid(50), "relationship": "supports", "direction": "in",
         "atom": {"id": uuid(1), "text": "The operator decided the greenhouse rollout uses v2 probes only.",
-                 "kind": "decision", "speaker": "user", "turn": 3, "is_current": true}}])
+                 "kind": "decision", "speaker_agent": agent(), "turn": 3, "is_current": true}}])
     );
 
     let stats = s.ok(json!({"id": 12, "op": "stats"}));
     assert_eq!(
         stats,
-        json!({"id": 12, "ok": true, "atoms": 3, "current_atoms": 2, "edges": 1,
+        json!({"id": 12, "ok": true, "agents": 1, "relations": 0, "atoms": 3, "current_atoms": 2, "edges": 1,
         "applied_turns": 1, "max_applied_turn": 5})
     );
     let snap = s.ok(json!({"id": 13, "op": "snapshot"}));
@@ -222,6 +237,7 @@ fn the_envelope_id_is_never_read_as_an_op_parameter() {
     // `atom`'s argument: the op still needs its own `atom_id`.
     let dir = TempDir::new("idkey");
     let mut s = Scratch::spawn(&dir.graph(), 0);
+    speak(&mut s);
     s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [atom(1, 1, "alpha fact")]}));
     let r = s.call(json!({"id": uuid(1), "op": "atom"}));
     assert_eq!(
@@ -302,6 +318,7 @@ fn a_seed_must_carry_confidence_and_reliability_apart() {
     assert_eq!(s.ok(json!({"id": 9, "op": "stats"}))["atoms"], 0);
 
     // The accepted shape stores both factors as sent.
+    speak(&mut s);
     s.ok(with_seed(
         10,
         json!({"confidence": 0.8, "reliability": 0.95}),
@@ -328,6 +345,7 @@ fn update_belief_writes_nothing_and_atom_reports_belief() {
         a["seed"] = json!({"confidence": c, "reliability": r});
         a
     };
+    speak(&mut s);
     s.ok(json!({"id": 2, "op": "put_atoms", "atoms": [seeded(1, 0.8, 0.95), seeded(2, 0.6, 0.5)]}));
     s.ok(
         json!({"id": 3, "op": "corroborate", "corroboration_id": uuid(90), "target": uuid(1),
@@ -369,6 +387,7 @@ fn digest_over_stdio_lists_only_evicted_applied_atoms() {
     let dir = TempDir::new("digest");
     let mut s = Scratch::spawn(&dir.graph(), 0);
     // `atom` makes decisions: every one is a standing-slice candidate.
+    speak(&mut s);
     s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [
         atom(1, 2, "The pilot uses v2 probes."),
         atom(2, 3, "Pending turn decision about probes."),
@@ -402,17 +421,83 @@ fn digest_over_stdio_lists_only_evicted_applied_atoms() {
 }
 
 #[test]
+fn agents_and_relations_over_stdio() {
+    let dir = TempDir::new("agents");
+    let mut s = Scratch::spawn(&dir.graph(), 0);
+    let wren = agent_id(SCOPE, "Wren").to_string();
+    let put = s.ok(json!({"id": 1, "op": "put_agents", "agents": [
+        {"id": agent(), "display_name": "Dana", "role": "user"},
+        {"id": wren, "display_name": "Wren", "role": "participant", "aliases": ["Wrennie"]}]}));
+    assert_eq!(
+        (
+            put["inserted"].clone(),
+            put["existing"].clone(),
+            put["updated"].clone()
+        ),
+        (json!(2), json!(0), json!(0))
+    );
+    let rel = json!({"id": 2, "op": "relate", "relations": [
+        {"id": uuid(70), "source": agent(), "target": wren, "kind": "sibling_of", "turn": 1}]});
+    assert_eq!(s.ok(rel.clone())["inserted"], 1);
+    assert_eq!(s.ok(rel)["existing"], 1);
+    let mut a = atom(1, 1, "Wren moved to the coast.");
+    a["about"] = json!([wren]);
+    s.ok(json!({"id": 3, "op": "put_atoms", "atoms": [a]}));
+    let listed = s.ok(json!({"id": 4, "op": "agents"}));
+    let names: Vec<&str> = listed["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["display_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(
+        names.contains(&"Dana") && names.contains(&"Wren"),
+        "{listed}"
+    );
+    let cands = s.ok(json!({"id": 5, "op": "candidates", "text": "coast"}));
+    assert_eq!(
+        (
+            cands["candidates"][0]["speaker"].clone(),
+            cands["candidates"][0]["role"].clone(),
+            cands["candidates"][0]["speaker_agent"].clone()
+        ),
+        (json!("Dana"), json!("user"), json!(agent()))
+    );
+    let stats = s.ok(json!({"id": 6, "op": "stats"}));
+    assert_eq!(
+        (stats["agents"].clone(), stats["relations"].clone()),
+        (json!(2), json!(1))
+    );
+    // An atom naming an unknown agent is refused, by id, never by name.
+    let mut b = atom(2, 1, "A stray atom.");
+    b["speaker_agent"] = json!(uuid(404));
+    let r = s.call(json!({"id": 7, "op": "put_atoms", "atoms": [b]}));
+    assert_eq!(
+        (r["error"].clone(), r["detail"].clone()),
+        (
+            json!("unknown_agent"),
+            json!(format!("no agent {}", uuid(404)))
+        )
+    );
+    s.finish();
+}
+
+#[test]
 fn error_details_never_echo_request_text() {
     let dir = TempDir::new("detail");
     let mut s = Scratch::spawn(&dir.graph(), 0);
     let secret = "SECRET-CHAT-TEXT-7f3a";
     let probes = vec![
         json!({"id": 1, "op": "put_atoms", "atoms": [{"id": uuid(1), "text": secret, "kind": secret,
-            "speaker": "user", "turn": 1, "epoch": 0, "seed": {"confidence": 0.5, "reliability": 0.75}}]}),
+            "speaker_agent": agent(), "turn": 1, "epoch": 0, "seed": {"confidence": 0.5, "reliability": 0.75}}]}),
         json!({"id": 2, "op": "candidates", "text": 17}),
         json!({"id": 3, "op": "put_atoms", "atoms": [{"id": uuid(1), "text": secret, "kind": "fact",
-            "speaker": "user", "turn": 1, "epoch": 3, "seed": {"confidence": 0.5, "reliability": 0.75}}]}),
+            "speaker_agent": agent(), "turn": 1, "epoch": 3, "seed": {"confidence": 0.5, "reliability": 0.75}}]}),
         json!({"id": 4, "op": "mark_applied", "turn": secret}),
+        json!({"id": 5, "op": "put_agents", "agents": [{"id": uuid(5), "display_name": secret, "role": secret}]}),
+        json!({"id": 6, "op": "put_agents", "agents": [{"id": uuid(5), "display_name": " ", "role": "user", "aliases": [secret]}]}),
+        json!({"id": 7, "op": "relate", "relations": [{"id": uuid(6), "source": uuid(5), "target": uuid(7), "kind": secret, "turn": 1}]}),
     ];
     for p in probes {
         let r = s.call(p.clone());
@@ -430,6 +515,7 @@ fn error_details_never_echo_request_text() {
 fn an_acknowledged_write_survives_sigkill_and_restores_on_respawn() {
     let dir = TempDir::new("kill");
     let mut s = Scratch::spawn(&dir.graph(), 0);
+    speak(&mut s);
     s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [atom(1, 1, "first"), atom(2, 2, "second")]}));
     s.ok(json!({"id": 2, "op": "add_edges", "edges": [
         {"id": uuid(50), "source": uuid(1), "target": uuid(2), "rel": "contradicts"}]}));
@@ -459,6 +545,7 @@ fn an_acknowledged_write_survives_sigkill_and_restores_on_respawn() {
 fn a_damaged_snapshot_restores_from_prev_and_reports_degraded() {
     let dir = TempDir::new("prev");
     let mut s = Scratch::spawn(&dir.graph(), 0);
+    speak(&mut s);
     s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [atom(1, 1, "kept in prev")]}));
     s.ok(json!({"id": 2, "op": "mark_applied", "turn": 1}));
     s.finish();
@@ -489,6 +576,7 @@ fn the_first_write_after_a_prev_restore_never_rotates_damage_over_prev() {
     let prev = PathBuf::from(format!("{}.prev", dir.graph().display()));
     let tmp = PathBuf::from(format!("{}.tmp", dir.graph().display()));
     let mut s = Scratch::spawn(&dir.graph(), 0);
+    speak(&mut s);
     s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [atom(1, 1, "kept in prev")]}));
     s.ok(json!({"id": 2, "op": "mark_applied", "turn": 1}));
     s.finish();
@@ -548,6 +636,8 @@ fn the_first_write_after_a_prev_restore_never_rotates_damage_over_prev() {
 fn a_snapshot_write_failure_is_reported_and_retried() {
     let dir = TempDir::new("fail");
     let mut s = Scratch::spawn(&dir.graph(), 0);
+    speak(&mut s);
+    let saved = fs::read(dir.graph()).unwrap();
     // A directory where the tmp file must go makes the snapshot write fail.
     fs::create_dir(format!("{}.tmp", dir.graph().display())).unwrap();
     let r = s.call(json!({"id": 1, "op": "put_atoms", "atoms": [atom(1, 1, "unsaved")]}));
@@ -556,7 +646,7 @@ fn a_snapshot_write_failure_is_reported_and_retried() {
         (json!(false), json!("snapshot_failed")),
         "{r}"
     );
-    assert!(!dir.graph().exists());
+    assert_eq!(fs::read(dir.graph()).unwrap(), saved);
     fs::remove_dir(format!("{}.tmp", dir.graph().display())).unwrap();
     // The replay finds the atom present (in memory) and, because the graph is
     // still unsaved, writes the snapshot this time.
@@ -565,8 +655,9 @@ fn a_snapshot_write_failure_is_reported_and_retried() {
         (r["inserted"].clone(), r["existing"].clone()),
         (json!(0), json!(1))
     );
-    assert!(
-        dir.graph().exists(),
+    assert_ne!(
+        fs::read(dir.graph()).unwrap(),
+        saved,
         "the retried write persisted the earlier change"
     );
     s.finish();
@@ -654,6 +745,7 @@ fn usage_errors_and_foreign_snapshots_exit_nonzero_without_serving() {
 
     // A whole snapshot from epoch 0, opened as epoch 1: refused, file kept.
     let mut s = Scratch::spawn(&graph, 0);
+    speak(&mut s);
     s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [atom(1, 1, "epoch zero")]}));
     s.finish();
     let before = fs::read(&graph).unwrap();

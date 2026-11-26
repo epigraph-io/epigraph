@@ -11,11 +11,33 @@ use chrono::{DateTime, TimeZone, Utc};
 use epigraph_api::scratch::belief::BeliefView;
 use epigraph_api::scratch::rank::{digest, Digest};
 use epigraph_api::scratch::store::{
-    AtomKind, Evidence, NewAtom, NewEdge, Relationship, ScratchStore, Seed, Speaker,
+    agent_id, AgentRole, AtomKind, Evidence, NewAgent, NewAtom, NewEdge, Relationship,
+    ScratchStore, Seed,
 };
 use uuid::Uuid;
 
 const SCOPE: &str = "3f9a1c07be52";
+
+/// The one speaker agent these atoms are attributed to.
+fn speaker() -> Uuid {
+    agent_id(SCOPE, "Dana")
+}
+
+/// `store` with the speaker agent stored (an atom must name a stored agent).
+fn with_speaker(mut store: ScratchStore) -> ScratchStore {
+    store
+        .put_agents(
+            vec![NewAgent {
+                id: speaker(),
+                display_name: "Dana".into(),
+                role: AgentRole::User,
+                aliases: vec![],
+            }],
+            t(0),
+        )
+        .unwrap();
+    store
+}
 
 fn t(secs: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_790_000_000 + secs, 0).unwrap()
@@ -43,7 +65,8 @@ fn seeded(
         id: id(n),
         text: text.to_string(),
         kind,
-        speaker: Speaker::User,
+        speaker_agent: speaker(),
+        about: vec![],
         turn,
         epoch: 0,
         quote: None,
@@ -71,7 +94,7 @@ fn edge(n: u128, source: u128, target: u128, rel: Relationship) -> NewEdge {
 
 /// A store holding `atoms`, with `applied` turns marked written.
 fn graph(atoms: Vec<NewAtom>, edges: Vec<NewEdge>, applied: &[u64]) -> ScratchStore {
-    let mut s = ScratchStore::new(SCOPE, 0, t(0));
+    let mut s = with_speaker(ScratchStore::new(SCOPE, 0, t(0)));
     s.put_atoms(atoms, t(1)).unwrap();
     s.add_edges(edges, t(2)).unwrap();
     for turn in applied {
