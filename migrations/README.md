@@ -3469,8 +3469,8 @@ restart.
   upgraded: unset it on every unit for this rollout and apply 236 with `epigraph-migrate`
   only once every viewer-resolving binary is upgraded (or ship the binary change in a
   release before the one that embeds 236). The team lists `epigraph_writable_teams(agent)` /
-  `epigraph_readable_teams(agent)` still answer for any agent on the application role (an
-  open residual for a separate change). **Applied to throwaway databases only, NOT to any
+  `epigraph_readable_teams(agent)` still answer for any agent on the application role (a
+  residual 236 left open; 309 binds both to the principal). **Applied to throwaway databases only, NOT to any
   deployed database.**
 - **237**: public `workflows_update_owner_scope` (backlog 524f89c1). 183's
   `workflows_update` admitted an UPDATE of any row the session READS (public rows, and
@@ -5044,6 +5044,41 @@ restart.
   definer call is 42883 before 345. **Measure first** whether anything writes `bp_messages` on
   the application DSN (`pg_stat_user_tables` n_tup_ins / n_tup_upd / n_tup_del for
   `bp_messages`, and `max(updated_at)`); this tree has no such writer.
+- **309**: `membership_definers_principal_bound` (backlogs 1c5edc26, a91d957d). Two decisions in
+  one wave, both re-stating membership definers. (1) 236's `epigraph_writable_teams(agent)` and
+  `epigraph_readable_teams(agent)` answer only for the session principal, a maintenance session
+  or a superuser session, and no rows for anyone else: an application session no longer lists
+  another agent's TEAM groups by naming its id (the residual 236 recorded). The writable list
+  also answers the live human operator holding a live, not retired, operator link to the agent
+  (exactly 209's 'operator' admission to `epigraph_set_agent_default_group`, whose VIS02 check
+  asks the AGENT's list with the operator stamped; the set-default routes read the same list for
+  their response). (2) 077's `epigraph_is_group_admin(group)` is re-bodied over 236's bound
+  `epigraph_live_memberships(principal)` with `role = 'admin'`, so a lapsed admin (164's and
+  235's rules) is no longer an admin for 077's `group_memberships_tenancy` WITH CHECK, the
+  privatization plan policies or 181's re-key mark; derived memberships are never `admin`, so
+  no one gains. On 172's path (the `public` path register shrinks by one); re-owned, so it moves
+  to `tenancy_backfill`'s deferred register with its EXECUTE expectation. The privatization
+  checks about an agent other than the principal (`privatization_authority`'s other-admin count
+  and own-admin row, `is_live_group_admin_conn`) move onto 273's roster in the same change. An
+  md5 precondition refuses to apply over any other body of the three (55000). The binaries stamp
+  the principal they ask about: `list_operator_readable_teams` for its one statement,
+  `resolve_visibility_choice` (the write's author) inside a savepoint it rolls back. Because
+  that resolution answers for a write's AUTHOR, `POST /api/v1/submit/packet` (whose author is a
+  body field) first refuses an author the caller may not name, with the claims trigger's own
+  codes (`AgentRepository::author_naming`; `OPL02` for another human's agent, before any team is
+  read), so the refusals cannot list another human's agent's teams on an armed database. Not
+  changed: 081's privatization triggers still count raw admin rows (the API and job checks now
+  refuse a lapsed admin first). Pinned by `epigraph-db/tests/membership_definers_bound.rs` (the
+  operator arm, 209 on the app role, the viewer resolve and the visibility resolution on the
+  app role, the lapsed admin's predicate, re-key mark and privatization checks, the undo and
+  the precondition), `live_memberships_principal_bound.rs` (the flipped residual test, the
+  caller list) and `epigraph-api/tests/packet_author_team_oracle.rs` (the packet author gate). Undo: `docs/runbooks/309-undo.sql`. **Deploy order: BINARIES FIRST**, as 236: a
+  binary that predates 309 asks both lists on an unstamped pool and gets no rows, so an
+  operated agent stops reading its human's teams and a write that names no visibility lands
+  private (silent, fail-closed). That includes every service linking an older `epigraph-db`
+  (bump its pin first). Unset `EPIGRAPH_MIGRATE_ON_BOOT` for this rollout and apply 309 with
+  `epigraph-migrate` once every such binary is upgraded. **Applied to throwaway databases only,
+  NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

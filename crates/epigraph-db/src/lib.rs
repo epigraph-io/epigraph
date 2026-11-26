@@ -182,6 +182,7 @@ pub use repos::{
     AdminScopeSwitch,
 };
 pub use repos::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
+pub use repos::{AuthorNaming, AuthorNamingFacts};
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
 pub use repos::{
     ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome,

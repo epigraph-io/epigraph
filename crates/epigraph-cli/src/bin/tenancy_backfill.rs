@@ -2051,8 +2051,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_workflow_name_has_hidden_rows", 202),
     // 206, claim visibility controls. The two READS fail CLOSED and SILENTLY
     // under a non-member owner. `epigraph_writable_teams` reads `groups`
-    // through 077's `groups_tenancy`, which on the unstamped connection it is
-    // called on admits no row, so it answers "no team": every write that names
+    // through 077's `groups_tenancy`, which on the stamped application
+    // connection it is called on (309: it answers only for the session
+    // principal, the principal's operated agent, or a maintenance session)
+    // admits no team row, so it answers "no team": every write that names
     // no visibility lands private instead of in the author's team, and every
     // explicit team write is refused. `epigraph_default_group` reads only
     // `agents` (readable to every role) and 149's `epigraph_human_of`, so its
@@ -2928,6 +2930,16 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // caller writes the claim (checked first), so the status read still sees
     // it, and a frame the caller cannot read answers BPF03 (closed).
     ("epigraph_promote_hypothesis_factors", 345),
+    // 309, 077's group-admin predicate re-bodied over 236's bound
+    // `epigraph_live_memberships(principal)`. It is the WITH CHECK of 077's
+    // `group_memberships_tenancy` and an arm of the privatization plan
+    // policies, and 181's re-key mark asks it. Its body reads no table
+    // itself: it calls the bound read, a maintenance-owned definer, so its
+    // answer does not depend on its own owner's row visibility. Under an
+    // owner that may not EXECUTE the bound read every call raises 42501 (every
+    // roster write refused: loud, fail-closed). Registered so the pre-flight
+    // sees an owner the guarded `OWNER TO` failed to set.
+    ("epigraph_is_group_admin", 309),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4192,6 +4204,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "public.epigraph_reown_role_projection_edges(text)",
         false,
     ),
+    // 309: 077's RLS policies on `group_memberships` and the privatization
+    // plans call it on the request DSN (policy expressions run with the
+    // invoker's privileges); without the grant every roster write is 42501.
+    (
+        "epigraph_is_group_admin",
+        "public.epigraph_is_group_admin(uuid)",
+        true,
+    ),
     // 268: the prompt-history listing calls it on the request DSN; without
     // the grant every listing is 42501.
     (
@@ -5080,7 +5100,8 @@ mod definer_register_tests {
         // both, never added to either.
         "epigraph_derived_require_tenancy",
         "epigraph_root_require_tenancy",
-        "epigraph_is_group_admin",
+        // epigraph_is_group_admin: re-stated and re-owned by 309 (moved to
+        // DEFERRED_DEFINER_FUNCTIONS with its stake).
         // epigraph_live_memberships: re-stated and re-owned by 164 (moved to
         // DEFINER_FUNCTIONS with its stake).
         "epigraph_is_group_creator",

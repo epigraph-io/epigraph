@@ -190,7 +190,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_inherit_tenancy_stmt()",
     "public.epigraph_instance_admins_frozen()",
     "public.epigraph_is_elevated()",
-    "public.epigraph_is_group_admin(uuid)",
     "public.epigraph_is_group_creator(uuid)",
     "public.epigraph_is_human_operator(uuid)",
     "public.epigraph_is_instance_admin(uuid)",
@@ -297,7 +296,9 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 // 191 -> 189: 285 re-creates `epigraph_passkeys_for_ticket` and
 // `epigraph_passkeys_for_act` (a new result column) on 172's form.
 // 189 -> 188: 311 re-states `epigraph_provision_oauth_agent` on 172's form.
-const HIGH_WATER: usize = 188;
+// 188 -> 187: 309's successor on this tree re-states `epigraph_is_group_admin(uuid)` on
+// 172's form (staging 2026-11-26: each branch lowered it by one on its own).
+const HIGH_WATER: usize = 187;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.

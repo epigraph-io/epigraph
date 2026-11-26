@@ -1452,10 +1452,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "privatization.rs",
         "is_live_group_admin_conn",
-        "READ of `group_memberships`, which carries no `visibility` column. MUST be the \
-         maintenance connection: migration 077's policy narrows that table to what the session can \
-         see, and this asks about the APPROVER rather than about the session, so on an app \
-         connection an authorised approver reads as revoked. Returns a boolean and no rows.",
+        "READ of `group_memberships` through migration 273's `epigraph_group_live_roster` (live \
+         admins only, backlog a91d957d), which carries no `visibility` column. MUST be the \
+         maintenance connection: the roster answers a session that may read the group's roster, \
+         and this asks about the APPROVER rather than about the session, so on an app connection \
+         an authorised approver reads as revoked. Returns a boolean and no rows.",
     ),
     (
         "privatization.rs",
@@ -1978,6 +1979,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "author_naming",
+        "CHECK through migration 122's `epigraph_operator_binding_armed` / `_enforced` and \
+         149's `epigraph_human_of` SECURITY DEFINER functions: the binding facts of the NAMED \
+         writer and author, never a group or a corpus row. It runs before the packet path's \
+         visibility resolution, on an unstamped connection of the write's pool (the valve is \
+         that connection's setting), so a Viewer would be the wrong control; same reason as \
+         `require_bound_author`.",
+    ),
+    (
+        "agent.rs",
         "author_binding",
         "READ through migration 122's `epigraph_author_binding` SECURITY DEFINER function; same \
          reason as `operator_actor`. It returns one label ('live_link' / 'human_operator' / \
@@ -2065,9 +2076,19 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "writable_teams",
         "READ through migration 206's app-callable definer `epigraph_writable_teams(agent)`: \
          the TEAM groups one agent may write into (own writer/admin membership or its live \
-         human's, D-V3). Group ids about the agent, no corpus row and no `visibility` column; \
-         the definer answers the same on any connection, so there is nothing for a viewer to \
-         narrow.",
+         human's, D-V3). Group ids about the agent, no corpus row and no `visibility` column. \
+         Since migration 309 the definer answers only the connection's principal (the agent \
+         itself or its live operator) or a maintenance session; that gate, not a viewer, is \
+         the control.",
+    ),
+    (
+        "claim_visibility.rs",
+        "writable_teams_as_self",
+        "READ through the same definer as `writable_teams`, for a write's AUTHOR asked as its \
+         own principal: it stamps the author for the one read inside a transaction or \
+         savepoint it always rolls back, so the connection's principal is unchanged after it \
+         (migration 309). Group ids about the author, no corpus row and no `visibility` \
+         column, so there is nothing for a viewer to narrow.",
     ),
     (
         "claim_visibility.rs",
@@ -2524,10 +2545,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "instance_admin.rs",
         "privatization_authority",
-        "READ of `group_memberships` and `groups`, returning four scalars and no ids. It MUST run \
-         unfiltered on the maintenance connection and its own doc says why: a count of a target \
-         group's other live admins narrowed to what the CALLER can see would report zero for a \
-         caller who cannot see the roster, and refuse — a fail-closed wrong answer that is \
+        "READ of `groups` and of `group_memberships` through migration 273's \
+         `epigraph_group_live_roster` (live admins only, backlog a91d957d), returning four scalars \
+         and no ids. It MUST run on the maintenance connection and its own doc says why: a count \
+         of a target group's other live admins narrowed to what the CALLER can see would report \
+         zero for a caller who cannot see the roster, and refuse — a fail-closed wrong answer that is \
          indistinguishable from the true one. A viewer predicate here would corrupt the \
          authorisation decision rather than protect it.",
     ),

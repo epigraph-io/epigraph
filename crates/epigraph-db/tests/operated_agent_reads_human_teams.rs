@@ -18,7 +18,8 @@
 //!   human no longer holds (revoked), a human whose registration is revoked, a
 //!   team that is not active, a group that is not a team or community;
 //! * `epigraph_readable_teams` answers `own` for the agent's own teams and
-//!   `operator` only for the human's, and is EXECUTE-able by `epigraph_app`.
+//!   `operator` only for the human's, and is EXECUTE-able by `epigraph_app`
+//!   (answering, since migration 309, only for the stamped principal).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -245,17 +246,31 @@ async fn readable_teams_says_own_or_operator_and_lists_teams_only(pool: PgPool) 
     );
 }
 
+/// `epigraph_app` may execute the definer, and since migration 309 it answers
+/// only for the session principal: stamped as the agent it lists the agent's
+/// one readable team, unstamped it lists nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_application_role_may_call_readable_teams(pool: PgPool) {
     let w = world(&pool).await;
     let app_pool = fixture::downgraded_pool(&pool, "epigraph_app").await;
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM public.epigraph_readable_teams($1)")
-        .bind(w.agent)
-        .fetch_one(&app_pool)
-        .await
-        .expect("epigraph_app has EXECUTE on epigraph_readable_teams");
+    let stamped: i64 = sqlx::query_scalar(
+        "SELECT count(*) \
+           FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid AS p) s \
+          CROSS JOIN LATERAL public.epigraph_readable_teams(s.p)",
+    )
+    .bind(w.agent)
+    .fetch_one(&app_pool)
+    .await
+    .expect("epigraph_app has EXECUTE on epigraph_readable_teams");
+    assert_eq!(stamped, 1, "stamped as the agent: its human's team");
+    let unstamped: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM public.epigraph_readable_teams($1)")
+            .bind(w.agent)
+            .fetch_one(&app_pool)
+            .await
+            .expect("epigraph_app has EXECUTE on epigraph_readable_teams");
     assert_eq!(
-        n, 1,
-        "the definer answers the same on an unstamped app connection"
+        unstamped, 0,
+        "an unstamped app connection reads no one's teams"
     );
 }
