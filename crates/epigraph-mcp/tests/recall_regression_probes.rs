@@ -28,9 +28,27 @@
 //! page. `must_recall` is never empty (an empty page cannot pass), and every
 //! violation is collected before the one assertion, so a regressed run names
 //! each probe that broke.
+//!
+//! # Two servers for the visibility probes
+//!
+//! Every probe runs on a server built over the `#[sqlx::test]` pool, which
+//! connects as a BYPASSRLS superuser: row security filters nothing there, so
+//! that run tests recall's own SQL predicates (`is_current`, the viewer
+//! visibility predicate, the belief floor, `since`) and would catch any of them
+//! being dropped or widened. It cannot see the stamping defect `own_private`
+//! names, because an unstamped superuser connection still reads every row. So
+//! the two visibility probes (`foreign_private`, `own_private`) ALSO run on the
+//! server production builds: one `ScopedPool` downgraded to `epigraph_app`
+//! (`rolbypassrls = false`), whose plain pool is that `ScopedPool`'s inner
+//! pool (as in `mcp_reads_are_stamped_app_role.rs`). There a read that is not
+//! stamped with the member drops the member's private claim, and
+//! `own_private` fails. A widened SQL predicate is masked by row security on
+//! that server, which is why the superuser run stays.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+
+mod common;
 
 use chrono::TimeZone;
 use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
@@ -84,6 +102,31 @@ fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
         epigraph_db::SessionGucMode::Session,
     );
     EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false).with_scoped_pool(scoped)
+}
+
+/// The server production runs: one `ScopedPool` on the application role, and
+/// the plain pool IS that `ScopedPool`'s inner pool. Refuses to run vacuously
+/// if the role can bypass row security.
+async fn app_role_server(pool: &PgPool) -> epigraph_mcp::EpiGraphMcpFull {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: the app-role probes would be vacuous"
+    );
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let plain = scoped.inner().clone();
+    common::build_scoped_test_server(plain, scoped)
 }
 
 async fn embed(pool: &PgPool, claim: Uuid, pgvec: &str) {
@@ -142,6 +185,8 @@ struct Probe {
     since: Option<chrono::DateTime<chrono::Utc>>,
     must_recall: Vec<Uuid>,
     must_not_recall: Vec<Uuid>,
+    /// Also run on the application-role server (the visibility probes).
+    on_app_role: bool,
 }
 
 fn params(p: &Probe) -> RecallWithContextParams {
@@ -211,6 +256,7 @@ async fn recall_with_context_honours_every_regression_probe(pool: PgPool) {
             since: None,
             must_recall: vec![new],
             must_not_recall: vec![old],
+            on_app_role: false,
         });
     }
 
@@ -235,6 +281,7 @@ async fn recall_with_context_honours_every_regression_probe(pool: PgPool) {
         since: None,
         must_recall: vec![public_neighbour],
         must_not_recall: vec![team_private],
+        on_app_role: true,
     });
 
     // 3. own_private: the same query, by a member of the owning group.
@@ -247,6 +294,7 @@ async fn recall_with_context_honours_every_regression_probe(pool: PgPool) {
         since: None,
         must_recall: vec![team_private],
         must_not_recall: vec![public_neighbour],
+        on_app_role: true,
     });
 
     // 4. ds_belief_floor: both authored at 0.9; the exact match's evidence
@@ -281,6 +329,7 @@ async fn recall_with_context_honours_every_regression_probe(pool: PgPool) {
             since: None,
             must_recall: vec![supported],
             must_not_recall: vec![refuted],
+            on_app_role: false,
         });
     }
 
@@ -303,10 +352,16 @@ async fn recall_with_context_honours_every_regression_probe(pool: PgPool) {
             since: Some(since_fixture()),
             must_recall: vec![current],
             must_not_recall: vec![archived],
+            on_app_role: false,
         });
     }
 
-    let server = build_test_server(pool.clone());
+    let superuser = build_test_server(pool.clone());
+    let app_role = app_role_server(&pool).await;
+    assert!(
+        probes.iter().any(|p| p.on_app_role),
+        "no probe runs on the application-role server"
+    );
     let mut violations = Vec::new();
     for p in &probes {
         assert!(
@@ -314,26 +369,43 @@ async fn recall_with_context_honours_every_regression_probe(pool: PgPool) {
             "{}: a probe with nothing to recall passes on an empty page",
             p.name
         );
-        let viewer = viewer_for(&pool, p.who).await;
-        let out =
-            recall_with_context_with_pgvec(&server, &viewer, params(p), 1536, &exact(p.bucket))
-                .await
-                .unwrap_or_else(|e| panic!("{}: recall_with_context failed: {e:?}", p.name));
-        let text = out
-            .content
-            .iter()
-            .find_map(|c| c.as_text().map(|t| t.text.clone()))
-            .expect("text content");
-        let env: Value = serde_json::from_str(&text).expect("parse envelope");
-        let got = returned_ids(&env);
-        for id in &p.must_recall {
-            if !got.contains(id) {
-                violations.push(format!("{}: must recall {id}, got {got:?}", p.name));
-            }
+        let mut servers = vec![("superuser", &superuser)];
+        if p.on_app_role {
+            servers.push(("app_role", &app_role));
         }
-        for id in &p.must_not_recall {
-            if got.contains(id) {
-                violations.push(format!("{}: must NOT recall {id}, got {got:?}", p.name));
+        for (server_name, server) in servers {
+            let viewer = viewer_for(&pool, p.who).await;
+            let out =
+                recall_with_context_with_pgvec(server, &viewer, params(p), 1536, &exact(p.bucket))
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{}@{server_name}: recall_with_context failed: {e:?}",
+                            p.name
+                        )
+                    });
+            let text = out
+                .content
+                .iter()
+                .find_map(|c| c.as_text().map(|t| t.text.clone()))
+                .expect("text content");
+            let env: Value = serde_json::from_str(&text).expect("parse envelope");
+            let got = returned_ids(&env);
+            for id in &p.must_recall {
+                if !got.contains(id) {
+                    violations.push(format!(
+                        "{}@{server_name}: must recall {id}, got {got:?}",
+                        p.name
+                    ));
+                }
+            }
+            for id in &p.must_not_recall {
+                if got.contains(id) {
+                    violations.push(format!(
+                        "{}@{server_name}: must NOT recall {id}, got {got:?}",
+                        p.name
+                    ));
+                }
             }
         }
     }
