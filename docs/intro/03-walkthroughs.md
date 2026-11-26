@@ -76,8 +76,10 @@ neither the key file nor `token_file`.
 (the start of the last run whose discovery succeeded) and a retry list of
 PRs whose ingest failed. A run scans the PRs merged since the cursor minus
 `window_minutes` (since now minus `window_minutes` on the first run) and
-re-tries the whole retry list, so an outage longer than the window or a
-failed ingest does not lose a PR. A dry run reads the state and writes none.
+re-tries the retry list, so an outage longer than the window or a failed
+ingest does not lose a PR. A failed PR waits 15 minutes before its next
+attempt, twice as long after each further failure, at most a day. A dry run
+reads the state and writes none.
 A rebase-merged PR is ingested commit by commit: the reconciler matches the
 PR's commits, as GitHub lists them, against main's history.
 
@@ -208,8 +210,9 @@ Newest first.
 
 - 2026-11-26 (backlog 39dfef78): the reconciler keeps a per-repo cursor and a
   retry list in `state_dir`, so an outage longer than the window or a failed
-  ingest no longer loses a PR, and it ingests every commit of a rebase-merged
-  PR instead of only the last.
+  ingest no longer loses a PR (failed PRs are retried with a backoff of up
+  to a day), and it ingests every commit of a rebase-merged PR instead of
+  only the last.
 
 - 2026-11-15 (review of backlog 7d9e60c6): a live run needs the author key
   file, which keys every author agent; the bare email-derived key was

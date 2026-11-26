@@ -86,13 +86,13 @@ A merged PR is discovered → its commit range computed → ingested. Re-running
 ## 5. Cursor and retry list
 *(v1 had no cursor; revised 2026-11-26, backlog 39dfef78.)* Per repo, `<state_dir>/<owner>__<repo>.state.json` (written atomically) holds:
 - `cursor`: the start time of the last cycle whose discovery succeeded. The next cycle scans PRs merged since `cursor - window`, so the window is an overlap, not a horizon. A repo-level failure (state, mirror, discovery) keeps the old cursor.
-- `retry`: each PR whose ingest failed, with its attempt count. Every cycle fetches them by number (`repos/<slug>/pulls/<n>`) and ingests them, wherever they fall relative to the scan, until they succeed; a PR found not merged is dropped with a warning. This is what makes advancing the cursor past a failed PR safe.
+- `retry`: each PR whose ingest failed, with its attempt count and last failure time. Once its backoff has run out (15 minutes after the first failure, doubling after each further one, capped at a day), a cycle fetches it by number (`repos/<slug>/pulls/<n>`) and ingests it, wherever it falls relative to the scan, until it succeeds; a PR found not merged is dropped with a warning. A PR still backing off is neither attempted nor counted as a failure; the cycle logs a warning naming it. This is what makes advancing the cursor past a failed PR safe.
 - An unreadable state file fails that repo (no silent restart, which would drop the retry list). A dry run reads the state and writes none.
 
 ---
 
 ## 6. Error handling
-- **Per-PR isolation:** a single PR's ingest failure (non-2xx, parse error) is **logged and put on the retry list** (§5); the batch continues, and every later cycle retries it until it succeeds.
+- **Per-PR isolation:** a single PR's ingest failure (non-2xx, parse error) is **logged and put on the retry list** (§5); the batch continues, and later cycles retry it, with a backoff, until it succeeds.
 - **Dead-node 409** (from 2.5 §2.5): logged as an operational anomaly (a structural node was superseded — should never happen); does not abort the batch.
 - **GitHub/API unreachable:** the cycle logs and exits non-zero; the repo's cursor is kept, so the next cycle catches up.
 - **Overlap lock:** a lock file (`flock`) prevents a slow cycle from overlapping the next.

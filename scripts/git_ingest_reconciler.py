@@ -313,8 +313,9 @@ class RepoState:
     an overlap, not a horizon: a reconciler that was down for a day catches up.
 
     `retry`: PR number -> {"attempts", "last_failed_at"} for each PR whose
-    ingest failed. Each run fetches them by number, wherever they fall
-    relative to the scan, until they are ingested."""
+    ingest failed. Once its backoff (`retry_due`) has run out, a run fetches
+    it by number, wherever it falls relative to the scan, until it is
+    ingested."""
     cursor: str | None = None
     retry: dict[int, dict] = field(default_factory=dict)
 
@@ -353,6 +354,23 @@ def compute_cutoff(cursor: str | None, now: datetime.datetime, window_minutes: i
     (before `now` on a first run, or if the cursor is in the future)."""
     since = now if cursor is None else min(_parse_ts(cursor), now)
     return since - datetime.timedelta(minutes=window_minutes)
+
+# A failed PR waits RETRY_BACKOFF_BASE before its next attempt, twice as long
+# after each further failure, never longer than RETRY_BACKOFF_CAP: a PR that
+# cannot be ingested yet (an API that refuses it, a merge commit missing from
+# the mirror) is still retried, about daily, without a failed attempt on every
+# run.
+RETRY_BACKOFF_BASE = datetime.timedelta(minutes=15)
+RETRY_BACKOFF_CAP = datetime.timedelta(hours=24)
+
+def retry_due(entry: dict, now: datetime.datetime) -> bool:
+    """Whether a retry-list entry's backoff has run out at `now`."""
+    last = entry.get("last_failed_at")
+    if not last:
+        return True
+    attempts = max(int(entry.get("attempts", 1)), 1)
+    delay = min(RETRY_BACKOFF_BASE * 2 ** min(attempts - 1, 16), RETRY_BACKOFF_CAP)
+    return now >= _parse_ts(last) + delay
 
 def _record_failure(st: RepoState, number: int, now: datetime.datetime) -> None:
     prev = st.retry.get(number, {})
@@ -425,7 +443,8 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
     (state/mirror/discovery) and per-PR failures are both logged and isolated —
     one bad repo or PR never aborts the rest — and counted into the failure
     tally. A repo-level failure keeps the repo's cursor; a failed PR joins the
-    retry list. A dry run reads the state and writes none. Returns (ok, fail)."""
+    retry list and is not attempted again until its backoff (`retry_due`) runs
+    out. A dry run reads the state and writes none. Returns (ok, fail)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     env = gh_env()
     key_file = resolve_author_key_file(cfg)
@@ -452,8 +471,14 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
             prs = discover_merged_prs(slug, env, cutoff)
         except Exception as e:  # repo-level failure: log + continue, cursor kept
             LOG.error("repo %s discovery failed: %s", slug, e); fail += 1; continue
+        # Failed PRs still backing off are neither attempted nor counted.
+        waiting = {n for n, e in state.retry.items() if not retry_due(e, now)}
+        if waiting:
+            LOG.warning("repo %s: %s failed PR(s) wait for their next retry: %s",
+                        slug, len(waiting), ", ".join(f"#{n}" for n in sorted(waiting)))
+        prs = [pr for pr in prs if pr.number not in waiting]
         found = {pr.number for pr in prs}
-        for number in sorted(set(state.retry) - found):
+        for number in sorted(set(state.retry) - found - waiting):
             try:
                 pr = fetch_pr(slug, number, env)
             except Exception as e:

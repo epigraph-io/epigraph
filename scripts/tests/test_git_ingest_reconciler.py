@@ -385,6 +385,34 @@ class StateTests(unittest.TestCase):
         gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
         self.assertEqual(self._run(gh, self.T0), ((0, 1), []))
 
+    def test_a_failed_pr_backs_off_before_its_next_attempt(self):
+        # Review of 39dfef78: without a backoff, a PR that keeps failing (an
+        # API that refuses its PR node, a merge commit missing from the
+        # mirror) was re-ingested on every 15-minute run and failed each one.
+        m = datetime.timedelta(minutes=1)
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        self.assertEqual(self._run(gh, self.T0, {5: 1}), ((0, 1), [5]))
+        # 10 min later: inside the first 15-minute backoff, though still in
+        # the scan; neither attempted nor counted as a failure.
+        with self.assertLogs(gir.LOG, level="WARNING") as logs:
+            self.assertEqual(self._run(gh, self.T0 + 10 * m, {5: 1}), ((0, 0), []))
+        self.assertIn("#5", "\n".join(logs.output))
+        self.assertEqual(self._run(gh, self.T0 + 20 * m, {5: 1}), ((0, 1), [5]))
+        # The second failure doubles the wait to 30 min.
+        self.assertEqual(self._run(gh, self.T0 + 45 * m), ((0, 0), []))
+        self.assertEqual(self._run(gh, self.T0 + 50 * m), ((1, 0), [5]))
+
+    def test_a_retry_list_pr_backing_off_is_not_fetched(self):
+        h = datetime.timedelta(hours=1)
+        gir.save_state(self.cfg.state_dir, "o/r", gir.RepoState(
+            cursor=self.T0.isoformat(),
+            retry={5: {"attempts": 9, "last_failed_at": (self.T0 + 2 * h).isoformat()}}))
+        gh = FakeGitHub([_row(5, "2026-06-01T00:00:00Z")])  # outside the scan
+        self.assertEqual(self._run(gh, self.T0 + 3 * h), ((0, 0), []))
+        self.assertFalse([c for c in gh.calls if c[0].endswith("/pulls/5")])
+        # The backoff is capped at a day.
+        self.assertEqual(self._run(gh, self.T0 + 27 * h), ((1, 0), [5]))
+
 class MainLoopTests(unittest.TestCase):
     def test_runs_all_prs_and_isolates_failures(self):
         st = tempfile.TemporaryDirectory(); self.addCleanup(st.cleanup)
