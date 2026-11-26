@@ -5079,6 +5079,34 @@ restart.
   (bump its pin first). Unset `EPIGRAPH_MIGRATE_ON_BOOT` for this rollout and apply 346 with
   `epigraph-migrate` once every such binary is upgraded. **Applied to throwaway databases only,
   NOT to any deployed database.**
+- **313**: public `harvester_enriched_concepts_tenancy` (backlog f214b84e). Brings
+  `harvester_enriched_concepts`, the one harvester table 173 left out (no generator finds it:
+  no `claim_id`, no FK to `claims`, no FK to or from `harvester_fragments`), under 173's
+  posture. It has NO parent (no foreign key in or out), so there is nothing to derive a row's
+  owner from or to follow: it takes `harvester_sources`'s half of 173, the parentless root.
+  `owner_group_id` and `visibility` NOT NULL with no default; 062's three constraints,
+  validated; 074's root `harvester_enriched_concepts_require_tenancy` (declare both columns, or
+  the seed escape hatch, or 23502); ENABLE + FORCE row security; 077's `<t>_tenancy` (the
+  same expressions as `harvester_fragments_tenancy`), 115's restrictive `<t>_delete_owner` and
+  `<t>_owner_immutable`. Existing rows are stamped `('public', world)`: they had no owner to
+  derive, and that is what every reader saw before (246's precedent for `papers`), so the
+  upgrade hides nothing and publishes nothing. Removes any `tenancy_exempt` row (none was ever
+  registered). No function is added, so no definer register entry; grants unchanged (the
+  application role reads the table and writes none, 118 section 6); no elevated read arm
+  (`elevation_arms_census.rs`'s excluded list, as 173's two). Registered in every FORCE list
+  (`state.rs`'s `FORCE_PROTECTED_SET`, `locked_decisions.rs`, `rls_enforcement.rs`,
+  `docs/runbooks/079-undo.sql`) and the tier-A, root-trigger and delete-policy counts. Pinned
+  by `epigraph-db/tests/harvester_enriched_concepts_tenancy.rs` (a non-member `epigraph_app`
+  session reads no private concept, a member reads its own, an undeclared INSERT is refused by
+  the root body, the upgrade from below 313 stamps `('public', world)`, the undo) and
+  `tenancy_coverage.rs::the_harvester_neighbours_carry_the_fragment_row_security`. Undo:
+  `docs/runbooks/313-undo.sql` (refuses, 55000, while any concept is group-private).
+  **Deploy order:** apply before, or with, the API binary that lists the table in
+  `FORCE_PROTECTED_SET` (that binary refuses a database where the table is not FORCEd).
+  Measure first: `SELECT count(*) FROM harvester_enriched_concepts` (every existing row becomes
+  public, world-owned, as it is read today). Apply as the maintenance role or a superuser (the
+  two triggers need EXECUTE on 074's and 115's bodies, revoked from PUBLIC).
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

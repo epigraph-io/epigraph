@@ -2079,9 +2079,12 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     // `behavioral_executions_delete_owner` and `behavioral_executions_owner_immutable`.
     // 31 -> 32 (backlog 34864fb5): migration 246's `papers`, with
     // `papers_delete_owner` and `papers_owner_immutable`.
+    // 32 -> 33 (backlog f214b84e): migration 313's `harvester_enriched_concepts`,
+    // with `harvester_enriched_concepts_delete_owner` and
+    // `harvester_enriched_concepts_owner_immutable`.
     assert_eq!(
         rows.len(),
-        32,
+        33,
         "the tier-A set changed size; decide its DELETE rule: {rows:?}"
     );
     let missing: Vec<&String> = rows
@@ -2121,7 +2124,9 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     // 27 -> 30 (Atlas W2): migration 210's three `atlas_map_*_delete_owner`.
     // 30 -> 31 (backlog 88cf603b): migration 240's `behavioral_executions_delete_owner`.
     // 31 -> 32 (backlog 34864fb5): migration 246's `papers_delete_owner`.
-    assert_eq!(quals.len(), 32, "{quals:?}");
+    // 32 -> 33 (backlog f214b84e): migration 313's
+    // `harvester_enriched_concepts_delete_owner`.
+    assert_eq!(quals.len(), 33, "{quals:?}");
     for (table, qual) in &quals {
         assert!(
             qual.contains("owner_group_id = ANY") && qual.contains("epigraph_writable_groups()"),

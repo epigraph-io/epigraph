@@ -1238,6 +1238,10 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
         // 062's shape (`papers_tenancy.rs::paper_rows_carry_the_tier_a_shape`),
         // backfilled by that migration itself, so it has no ledger row.
         .chain(std::iter::once("papers"))
+        // Plus migration 313's `harvester_enriched_concepts` (backlog
+        // f214b84e): a parentless root, backfilled by that migration itself
+        // to what every reader saw, so it has no ledger row.
+        .chain(std::iter::once("harvester_enriched_concepts"))
         .collect();
     assert_eq!(
         observed, expected,
