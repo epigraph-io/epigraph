@@ -1,7 +1,10 @@
 # Design: Automated PR-hierarchical commit ingestion across all repos
 
 - **Date:** 2026-06-02
-- **Status:** Draft (awaiting review)
+- **Status:** Partly superseded. §5 (per-repo CI workflows) and the range and
+  statelessness parts of §8 are replaced by the server-side reconciler, specified in
+  [Plan 3](2026-06-03-plan-3-git-ingest-reconciler-design.md) and implemented in
+  `scripts/git_ingest_reconciler.py` (2026-11-26, backlog 39dfef78).
 - **Author:** Jeremy Barton (via Claude Code orchestrator)
 - **Scope:** A single implementation plan. Cross-repo rollout is phased but one design.
 
@@ -117,6 +120,11 @@ Edges are **upserted** (idempotent): re-ingesting a PR must not duplicate edges.
 
 ## 5. Cross-repo rollout
 
+> **Superseded** by the server-side reconciler of
+> [Plan 3](2026-06-03-plan-3-git-ingest-reconciler-design.md): no per-repo workflow,
+> no published artifact, no write token in external CI. The rest of this section is
+> kept as the original proposal.
+
 This is the structural change that makes it org-wide rather than epigraph-only.
 
 1. **Build once, publish artifact.** `epigraph` CI builds the PR-hierarchical ingester
@@ -198,8 +206,9 @@ logged, not fatal.
   derive the PR node from the event. On the `push` fallback, ingest the pushed range
   `before..after`; `before` all-zeros (first push / force) falls back to `HEAD~N`.
   A new `--rev-range A..B` CLI input supports this; overlapping/rerun ranges are safe
-  because of git-hash idempotency. Stateless by default; an optional stored last-ingested
-  SHA per repo is a possible hardening, not required.
+  because of git-hash idempotency. *(Superseded: the reconciler keeps a per-repo cursor
+  and a retry list of failed PRs, and takes a one-parent merge's range from the PR
+  commits API; see Plan 3 §3.5, §3.6 and §5.)*
 - **Failures** are non-gating, retried with backoff; a fully-failed run leaves the graph
   consistent (idempotent rerun catches up).
 
@@ -219,6 +228,8 @@ logged, not fatal.
 5. **Merge strategy assumption.** Design assumes `--merge` (PR's individual commits land
    on `main` carrying Protocol bodies). Squash-merge would collapse a PR to one commit;
    the PR-hierarchical model still works (one child) but loses per-commit granularity.
+   A rebase merge keeps every commit: the reconciler matches the PR commits API
+   against main's first-parent run (Plan 3 §3.6).
 
 ## 10. Adjacent: historical backfill (separate task)
 

@@ -48,7 +48,7 @@ The reconciler reads a TOML file. Every key is optional and has a default
 ```toml
 repos = ["epigraph-io/epigraph"]           # slugs to watch
 endpoint = "http://127.0.0.1:8080"         # the API ingest_git writes to
-window_minutes = 240                       # look back this far for merges
+window_minutes = 240                       # overlap before the saved cursor
 state_dir = "<a directory the reconciler owns>"
 ingest_git_bin = "<path to the built ingest_git>"
 token_file = "<a file holding an API Bearer token>"
@@ -71,6 +71,15 @@ current, or the writes are refused once the token expires.
 is passed as `--author-key-file`; the path is not secret, the file is. A
 live run without one fails before any PR is ingested. A dry run reads
 neither the key file nor `token_file`.
+
+`state_dir` also holds one `<owner>__<repo>.state.json` per repo: a cursor
+(the start of the last run whose discovery succeeded) and a retry list of
+PRs whose ingest failed. A run scans the PRs merged since the cursor minus
+`window_minutes` (since now minus `window_minutes` on the first run) and
+re-tries the whole retry list, so an outage longer than the window or a
+failed ingest does not lose a PR. A dry run reads the state and writes none.
+A rebase-merged PR is ingested commit by commit: the reconciler matches the
+PR's commits, as GitHub lists them, against main's history.
 
 ## Three worked entries
 
@@ -196,6 +205,11 @@ re-run finds the same node again instead of making a new one.
 ## Change log
 
 Newest first.
+
+- 2026-11-26 (backlog 39dfef78): the reconciler keeps a per-repo cursor and a
+  retry list in `state_dir`, so an outage longer than the window or a failed
+  ingest no longer loses a PR, and it ingests every commit of a rebase-merged
+  PR instead of only the last.
 
 - 2026-11-15 (review of backlog 7d9e60c6): a live run needs the author key
   file, which keys every author agent; the bare email-derived key was

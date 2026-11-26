@@ -148,7 +148,12 @@ across configured repos (read-only GitHub access via the `gh` CLI) and
 runs `ingest_git --pr-ingest` against the localhost EpiGraph API for
 each — continuous, cross-repo, idempotent commit ingestion with no
 external CI and no write-token spray. Stdlib-only; idempotent (Plan
-2.5) and stateless, so it is safe to run repeatedly on a cron.
+2.5), so it is safe to run repeatedly on a cron. Per repo it keeps a
+cursor and a retry list in `<state_dir>/<owner>__<repo>.state.json`: a run
+scans the PRs merged since `cursor - window_minutes` and re-tries every
+PR whose ingest failed, so neither an outage longer than the window nor a
+failed ingest loses a PR. A rebase-merged PR is ingested commit by commit
+(its range is matched against the PR commits API).
 
 **Auth:** set `EPIGRAPH_GIT_INGEST_GITHUB_PAT` to a *read-only* PAT
 (injected as `GH_TOKEN` for the `gh` subprocesses), or leave it unset to

@@ -1,6 +1,6 @@
 # Plan 3: Server-side git-ingest reconciler (cross-repo, continuous)
 
-**Status:** spec
+**Status:** implemented (`scripts/git_ingest_reconciler.py`); §3.5, §3.6, §4 and §5 revised 2026-11-26 (backlog 39dfef78)
 **Repo:** `epigraph` (public) · **Branch base:** `docs/commit-ingestion-spec`
 **Depends on:** Plan #2 (`--pr-ingest`, merged to `main` #257) and **Plan 2.5** (server-side idempotency — merged to `dev` #261, **must reach `main`/prod before live enable**). Final subsystem of `docs/superpowers/specs/2026-06-02-commit-ingestion-automation-design.md`.
 
@@ -30,7 +30,8 @@ system cron (every ~15 min, on the VPC)
           4. log per-PR outcome; continue on failure
 ```
 
-No persistent cursor to start (see §5). Idempotency (2.5) makes overlap a no-op.
+A per-repo cursor and retry list (see §5) bound the scan and carry failed PRs to the next
+cycle. Idempotency (2.5) makes the overlap a no-op.
 
 ---
 
@@ -52,11 +53,11 @@ A small config (TOML/JSON under the state dir, e.g. `/var/lib/epiclaw/git-ingest
 One clone per repo under `/var/lib/epiclaw/git-ingest/<owner__repo>` (created on first run via `git clone`; `git fetch origin` each cycle). Needed because the ingester parses **local** `git log`. Read-only use; never checked out to run code.
 
 ### 3.5 Merged-PR discovery
-Per repo, query the GitHub API for PRs merged within the window:
-`gh api -X GET repos/<slug>/pulls --field state=closed --field sort=updated --field direction=desc --paginate`, filter to `merged_at != null && merged_at >= now-window`. Capture per PR: `number, title, body, merge_commit_sha (M), base.sha, user.login, merged_at`. (Window default ≈ 4× the cron interval, generous overlap; idempotency absorbs it.)
+Per repo, query the GitHub API for PRs merged since the cutoff, `cursor - window` (`now - window` on a first run; §5):
+`gh api -X GET repos/<slug>/pulls --field state=closed --field sort=updated --field direction=desc --field per_page=100 --field page=N`, filter to `merged_at != null && merged_at >= cutoff`. Pages are read one at a time and the scan stops at the first page that is short or whose last row's `updated_at` is before the cutoff: the listing is ordered by `updated_at` and a PR's `updated_at` is never before its `merged_at`. (It must not stop on `merged_at`: a comment on an old PR lifts it to the top.) Capture per PR: `number, title, body, merge_commit_sha (M), base.sha, user.login, merged_at`. (Window default ≈ 4× the cron interval, generous overlap; idempotency absorbs it.)
 
 ### 3.6 Commit-range computation
-For a `--merge` merge commit `M` (two parents): the PR's own commits are **`M^1..M^2`** (base-tip..PR-head). The driver verifies `M` has two parents (`git rev-list --parents -n1 M`); on a **squash** merge (one parent) it uses `M~1..M` (the single squashed commit); a **rebase** merge is flagged/logged as a known edge (epigraph, the pilot, uses `--merge`, so the primary path covers it). The ingester already runs `--no-merges`, so `M` itself is never a claim.
+For a `--merge` merge commit `M` (two parents): the PR's own commits are **`M^1..M^2`** (base-tip..PR-head). The driver verifies `M` has two parents (`git rev-list --parents -n1 M`); a one-parent `M` is a **squash** or a **rebase** merge. The driver reads the PR commits API (`repos/<slug>/pulls/<n>/commits`, n commits): when the n first-parent commits ending at `M` carry the API commits' author email, author date and first message line, in order (a rebase keeps those and changes the sha), the range is **`M~n..M`**; otherwise it is a squash and the range is the single commit `M~1..M`. Matching on identity rather than the count keeps a squash from claiming other PRs' commits. The API lists at most 250 commits, so a 250-commit answer falls back to `M~1..M` with a warning. The ingester already runs `--no-merges`, so `M` itself is never a claim.
 
 ### 3.7 Ingester invocation
 ```
@@ -78,19 +79,22 @@ A crontab entry on the VPC (documented in the spec + a `scripts/` install note),
 ---
 
 ## 4. Data flow & idempotency
-A merged PR is discovered → its commit range computed → ingested. Re-running the same PR (overlapping window, missed cursor, retry) is safe: 2.5 makes repo/PR/commit nodes and author/orchestrator agents find-or-create on `(content_hash, agent_id)` / `public_key`, returning canonical ids. The driver is therefore **stateless** by default (time-window only). An optional per-repo "last merged_at" cursor file is a future optimization to shrink the scan, not a correctness requirement.
+A merged PR is discovered → its commit range computed → ingested. Re-running the same PR (overlapping window, missed cursor, retry) is safe: 2.5 makes repo/PR/commit nodes and author/orchestrator agents find-or-create on `(content_hash, agent_id)` / `public_key`, returning canonical ids. Idempotency alone does not make a time-window driver complete: a PR merged during an outage longer than the window, or one whose ingest failed and aged out of the window, was never ingested. The driver therefore keeps a per-repo cursor and retry list (§5).
 
 ---
 
-## 5. Cursor: deliberately omitted (v1)
-No persistent cursor in v1. Rationale: idempotency makes overlap free, and the GitHub query is cheap (a few merged PRs per window per repo). A cursor would add state/failure modes for marginal benefit. Revisit only if a repo's merge volume makes the per-cycle scan expensive — then add a `<state>/<repo>.cursor` of the last processed `merged_at`.
+## 5. Cursor and retry list
+*(v1 had no cursor; revised 2026-11-26, backlog 39dfef78.)* Per repo, `<state_dir>/<owner>__<repo>.state.json` (written atomically) holds:
+- `cursor`: the start time of the last cycle whose discovery succeeded. The next cycle scans PRs merged since `cursor - window`, so the window is an overlap, not a horizon. A repo-level failure (state, mirror, discovery) keeps the old cursor.
+- `retry`: each PR whose ingest failed, with its attempt count. Every cycle fetches them by number (`repos/<slug>/pulls/<n>`) and ingests them, wherever they fall relative to the scan, until they succeed; a PR found not merged is dropped with a warning. This is what makes advancing the cursor past a failed PR safe.
+- An unreadable state file fails that repo (no silent restart, which would drop the retry list). A dry run reads the state and writes none.
 
 ---
 
 ## 6. Error handling
-- **Per-PR isolation:** a single PR's ingest failure (non-2xx, parse error) is **logged and skipped**; the batch continues. Idempotent rerun next cycle retries it.
+- **Per-PR isolation:** a single PR's ingest failure (non-2xx, parse error) is **logged and put on the retry list** (§5); the batch continues, and every later cycle retries it until it succeeds.
 - **Dead-node 409** (from 2.5 §2.5): logged as an operational anomaly (a structural node was superseded — should never happen); does not abort the batch.
-- **GitHub/API unreachable:** the cycle logs and exits cleanly; the next cycle catches up (window overlap).
+- **GitHub/API unreachable:** the cycle logs and exits non-zero; the repo's cursor is kept, so the next cycle catches up.
 - **Overlap lock:** a lock file (`flock`) prevents a slow cycle from overlapping the next.
 - **Auth failure:** if neither PAT nor `gh auth token` resolves, exit non-zero with a clear message (cron mail / log).
 
