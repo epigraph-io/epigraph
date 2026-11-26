@@ -341,7 +341,7 @@ impl OAuthClientRepository {
     ///
     /// An `agent` client must be given its `owner` (the `oauth_clients.id`
     /// that answers for it): `/oauth/register` writes none, and migration
-    /// 312's definer refuses an agent approval without one (22004) rather
+    /// 348's definer refuses an agent approval without one (22004) rather
     /// than keep whatever owner the row holds. Any other client keeps its
     /// owner when `owner` is `None`.
     #[instrument(skip(pool))]
@@ -357,7 +357,7 @@ impl OAuthClientRepository {
         // security event); the application role holds no UPDATE here.
         // Migration 188: nor EXECUTE on the definer, so `pool` must be a
         // maintenance (or privileged) pool; on the application role this
-        // fails with 42501 and approves nothing. Migration 312: the
+        // fails with 42501 and approves nothing. Migration 348: the
         // four-argument overload, which also writes the owner.
         sqlx::query("SELECT public.epigraph_oauth_client_approve($1, $2, $3, $4)")
             .bind(id)

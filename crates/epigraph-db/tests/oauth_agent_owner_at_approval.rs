@@ -1,11 +1,11 @@
-//! Migration 312 (backlog be024524): an agent client's owner is named by the
+//! Migration 348 (backlog be024524): an agent client's owner is named by the
 //! operator at approval, never guessed at registration.
 //!
-//! Before 312, `/oauth/register` stamped every self-registered agent with the
+//! Before 348, `/oauth/register` stamped every self-registered agent with the
 //! OLDEST ACTIVE HUMAN client as its `owner_id` (001's `agents_must_have_owner`
 //! refused a NULL), so the agent's token carried that human as its owner, and
 //! `OAuthClientRepository::suspend_by_owner(<that human>)` (no caller today)
-//! would have suspended every approved self-registered agent. 312 lets a
+//! would have suspended every approved self-registered agent. 348 lets a
 //! NOT-YET-ACTIVE agent have no owner, adds a four-argument
 //! `epigraph_oauth_client_approve` that must name the owner of an agent (and
 //! only of an agent), and clears the guessed owner of every pending
@@ -21,16 +21,16 @@
 //! * a named owner is another, active client;
 //! * a non-agent client approves with no owner named and keeps its owner, and
 //!   is refused one (22023, nothing changed);
-//! * on a database at 311, 312 clears the owner of a pending agent
+//! * on a database at 347, 348 clears the owner of a pending agent
 //!   `/oauth/register` wrote (agent_id NULL), audited, and of no other row;
 //!   the three-argument approval then cannot activate it (23514);
 //! * the CHECK: only an ACTIVE agent needs an owner;
 //! * the new definer is a maintenance act (owner, path, no PUBLIC or
 //!   application EXECUTE);
-//! * `docs/runbooks/312-undo.sql` restores 001's CHECK and drops the overload,
+//! * `docs/runbooks/348-undo.sql` restores 001's CHECK and drops the overload,
 //!   and refuses while an agent has no owner.
 //!
-//! Fails on 311 and earlier: the four-argument definer does not exist (42883)
+//! Fails on 347 and earlier: the four-argument definer does not exist (42883)
 //! and 001's CHECK refuses the ownerless pending agent every test seeds.
 
 #[path = "viewer_fixture.rs"]
@@ -140,7 +140,7 @@ async fn an_agent_approval_writes_the_named_owner_and_suspension_follows_it(pool
     let oldest_human = client(&pool, "human", "active", None, 30).await;
     let named = client(&pool, "human", "active", None, 1).await;
     let approver = client(&pool, "human", "active", None, 1).await;
-    // What `/oauth/register` writes since 312: pending, no owner.
+    // What `/oauth/register` writes since 348: pending, no owner.
     let agent = client(&pool, "agent", "pending", None, 0).await;
     let maint = role_pool(&pool, "epigraph_maintenance").await;
 
@@ -173,7 +173,7 @@ async fn an_agent_approval_writes_the_named_owner_and_suspension_follows_it(pool
     assert_eq!(audit["owner_id"], serde_json::json!(named), "{audit}");
     assert!(audit["previous_owner_id"].is_null(), "{audit}");
     assert_eq!(audit["approved_by"], serde_json::json!(approver), "{audit}");
-    assert_eq!(audit["migration"], serde_json::json!(312), "{audit}");
+    assert_eq!(audit["migration"], serde_json::json!(348), "{audit}");
 
     // THE DEFECT: suspending the oldest human used to suspend every approved
     // self-registered agent with it.
@@ -189,7 +189,7 @@ async fn an_agent_approval_writes_the_named_owner_and_suspension_follows_it(pool
     assert_eq!(n, 1);
     assert_eq!(state(&pool, agent).await.0, "suspended");
 
-    // A pending agent registered BEFORE 312 carries the oldest human as its
+    // A pending agent registered BEFORE 348 carries the oldest human as its
     // owner; the approval's named owner replaces it, and the audit row keeps
     // the one it replaced.
     let inherited = client(&pool, "agent", "pending", Some(oldest_human), 0).await;
@@ -216,7 +216,7 @@ async fn an_agent_approval_writes_the_named_owner_and_suspension_follows_it(pool
 
 /// An agent is never activated without a named owner: the four-argument
 /// approval refuses a NULL owner even when the row already holds one (rows
-/// registered before 312 hold the oldest human), and the three-argument
+/// registered before 348 hold the oldest human), and the three-argument
 /// approval cannot activate an ownerless agent. Nothing changes.
 ///
 /// Mutation probes: dropping the definer's agent-owner refusal turns the
@@ -367,7 +367,7 @@ async fn a_non_agent_approval_keeps_its_owner_when_none_is_named(pool: PgPool) {
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
-/// Run every migration below 312 (or, with `None`, the rest) on one
+/// Run every migration below 348 (or, with `None`, the rest) on one
 /// connection, then reset it: 001's pg_dump header leaves session-level SETs
 /// behind.
 async fn migrate(pool: &PgPool, below: Option<i64>) {
@@ -398,12 +398,12 @@ async fn migrate(pool: &PgPool, below: Option<i64>) {
     conn.execute("RESET ALL").await.expect("RESET ALL");
 }
 
-/// 312 (c), on a database that holds what 311 deployments hold: the PENDING
+/// 348 (c), on a database that holds what pre-348 deployments hold: the PENDING
 /// agent `/oauth/register` wrote (no `agent_id`, the oldest human guessed as
 /// its owner) loses that owner, with one `oauth.client_owner_cleared` row
 /// keeping the previous one; a pending agent `POST /api/v1/agents` created
 /// (its `agent_id` set, its creator as owner), an ACTIVE agent and a pending
-/// service keep theirs. After 312 the three-argument approval (an older CLI,
+/// service keep theirs. After 348 the three-argument approval (an older CLI,
 /// a hand-written `SELECT`) cannot activate the cleared row (23514), where
 /// before it would have activated it with the guessed owner.
 ///
@@ -412,8 +412,8 @@ async fn migrate(pool: &PgPool, below: Option<i64>) {
 /// `POST /api/v1/agents` row is cleared too; reading the previous owner from
 /// `RETURNING` (the updated row) records NULL as `previous_owner_id`.
 #[sqlx::test(migrations = false)]
-async fn migration_312_clears_the_guessed_owner_of_pending_self_registered_agents(pool: PgPool) {
-    migrate(&pool, Some(312)).await;
+async fn migration_348_clears_the_guessed_owner_of_pending_self_registered_agents(pool: PgPool) {
+    migrate(&pool, Some(348)).await;
     let oldest_human = client(&pool, "human", "active", None, 30).await;
     let creator = client(&pool, "service", "active", None, 10).await;
     // `/oauth/register`'s agent arm before this change.
@@ -427,7 +427,7 @@ async fn migration_312_clears_the_guessed_owner_of_pending_self_registered_agent
         .execute(&pool)
         .await
         .expect("link the provisioned client");
-    // Already approved before 312 (not 312's to re-own), and a service.
+    // Already approved before 348 (not 348's to re-own), and a service.
     let active = client(&pool, "agent", "active", Some(oldest_human), 0).await;
     let service = client(&pool, "service", "pending", Some(creator), 0).await;
 
@@ -450,7 +450,7 @@ async fn migration_312_clears_the_guessed_owner_of_pending_self_registered_agent
         cleared[0]["previous_owner_id"],
         serde_json::json!(oldest_human)
     );
-    assert_eq!(cleared[0]["migration"], serde_json::json!(312));
+    assert_eq!(cleared[0]["migration"], serde_json::json!(348));
     assert_eq!(state(&pool, provisioned).await.1, Some(creator));
     assert_eq!(state(&pool, active).await.1, Some(oldest_human));
     assert_eq!(state(&pool, service).await.1, Some(creator));
@@ -469,7 +469,7 @@ async fn migration_312_clears_the_guessed_owner_of_pending_self_registered_agent
     );
 }
 
-/// 312's CHECK: an ACTIVE agent has an owner; a pending, suspended or revoked
+/// 348's CHECK: an ACTIVE agent has an owner; a pending, suspended or revoked
 /// one may have none (so an unapproved registration can be revoked).
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_an_active_agent_must_have_an_owner(pool: PgPool) {
@@ -553,9 +553,9 @@ async fn the_owner_naming_approval_is_a_maintenance_act(pool: PgPool) {
 /// and return the SQLSTATE.
 async fn run_undo(pool: &PgPool) -> Result<(), String> {
     let sql = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/312-undo.sql"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/348-undo.sql"),
     )
-    .expect("read 312-undo.sql");
+    .expect("read 348-undo.sql");
     let mut conn = pool.acquire().await.unwrap();
     match sqlx::raw_sql(&sql).execute(&mut *conn).await {
         Ok(_) => Ok(()),
@@ -570,11 +570,11 @@ async fn run_undo(pool: &PgPool) -> Result<(), String> {
     }
 }
 
-/// `docs/runbooks/312-undo.sql`: refuses (55000, nothing changed) while an
+/// `docs/runbooks/348-undo.sql`: refuses (55000, nothing changed) while an
 /// agent has no owner; otherwise drops the overload, leaves 118's
 /// three-argument approval, and restores 001's CHECK. Idempotent.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_312_undo_restores_001s_check(pool: PgPool) {
+async fn the_348_undo_restores_001s_check(pool: PgPool) {
     let sig4_exists = |pool: PgPool| async move {
         sqlx::query_scalar::<_, bool>("SELECT to_regprocedure($1) IS NOT NULL")
             .bind(SIG4)
@@ -604,7 +604,7 @@ async fn the_312_undo_restores_001s_check(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(three, "118's approval is not 312's to drop");
+    assert!(three, "118's approval is not 348's to drop");
     let def: String = sqlx::query_scalar(
         "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
           WHERE conrelid = 'public.oauth_clients'::regclass AND conname = 'agents_must_have_owner'",

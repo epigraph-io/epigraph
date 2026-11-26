@@ -10,7 +10,7 @@
 //! changed (the definer itself would rewrite or resurrect it); an admin-only
 //! scope is refused while migration 128 is armed; `platform:admin` is refused
 //! before any connection; an `agent` client is approved only with `--owner`,
-//! which becomes its `owner_id` (migration 312, backlog be024524).
+//! which becomes its `owner_id` (migration 348, backlog be024524).
 
 mod viewer_fixture;
 
@@ -235,7 +235,7 @@ async fn admin_scopes_are_refused_while_armed_and_platform_admin_always(pool: Pg
 }
 
 /// A pending agent client with `owner` (what `/oauth/register` writes since
-/// migration 312: none).
+/// migration 348: none).
 async fn agent_client(pool: &PgPool, owner: Option<Uuid>) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
@@ -274,11 +274,11 @@ async fn owner_of(pool: &PgPool, id: Uuid) -> Option<Uuid> {
 }
 
 /// An agent client is approved only with `--owner`, even when its row already
-/// holds an owner (a pre-312 registration's oldest human): without it the verb
+/// holds an owner (a pre-348 registration's oldest human): without it the verb
 /// refuses with nothing changed; with it the owner is written, printed, and
 /// recorded before and after in the verb's audit row.
 ///
-/// Fails on the pre-312 verb: it approves the agent without `--owner`,
+/// Fails on the pre-348 verb: it approves the agent without `--owner`,
 /// keeping whatever owner the row holds.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_agent_client_is_approved_only_with_its_owner_named(pool: PgPool) {

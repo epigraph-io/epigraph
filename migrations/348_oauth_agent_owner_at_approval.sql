@@ -1,4 +1,4 @@
--- 312: a self-registered agent client has no owner until an operator names
+-- 348: a self-registered agent client has no owner until an operator names
 -- one at approval (backlog be024524).
 --
 -- ===================================================================
@@ -52,18 +52,18 @@
 --         is how an AGENT is answered for, and naming one on a service or
 --         human client would make its tokens carry another principal's
 --         `owner_id` (no path could set a non-agent's owner after creation
---         before 312, and this one does not open one);
+--         before 348, and this one does not open one);
 --       * a named owner must be another `oauth_clients` row (22023 for the
 --         client itself, 23503 for no such row) that is `active` (22023);
 --         its client type is not restricted (`POST /api/v1/agents` gives an
 --         agent its creating client, a human or a service, as owner);
 --       * the `oauth.client_approved` audit row records `owner_id` and
---         `previous_owner_id`, and `migration` 312.
+--         `previous_owner_id`, and `migration` 348.
 --     SECURITY DEFINER on 172's path `pg_catalog, pg_temp`, every relation
 --     and function schema-qualified; owned by `epigraph_maintenance`; no
 --     EXECUTE for PUBLIC or `epigraph_app` (188's rule: approval is a
 --     maintenance act).
--- (c) Every PENDING agent client `/oauth/register` wrote before 312 loses
+-- (c) Every PENDING agent client `/oauth/register` wrote before 348 loses
 --     the owner that registration guessed: `owner_id` becomes NULL, and one
 --     `oauth.client_owner_cleared` security event per row records the
 --     cleared `previous_owner_id`. Those rows are told apart exactly:
@@ -93,14 +93,14 @@
 --
 -- Migrate BEFORE the API binary of this change: that binary registers an
 -- agent with `owner_id = NULL`, which 001's CHECK refuses (every agent
--- registration a 500). An older API runs on 312 unchanged. The operator
+-- registration a 500). An older API runs on 348 unchanged. The operator
 -- CLI's `approve-client` of this change calls the four-argument definer
--- (42883 below 312). Approve agents with the four-argument form only: an
--- older CLI, or a hand-written three-argument `SELECT`, on 312 cannot
+-- (42883 below 348). Approve agents with the four-argument form only: an
+-- older CLI, or a hand-written three-argument `SELECT`, on 348 cannot
 -- activate an ownerless agent (23514), and for an agent that has an owner it
 -- keeps that owner without anyone naming it.
 --
--- UNDO: `docs/runbooks/312-undo.sql` (drops the overload, restores 001's
+-- UNDO: `docs/runbooks/348-undo.sql` (drops the overload, restores 001's
 -- CHECK; refuses while an agent row has no owner, including the rows (c)
 -- cleared, whose previous owners are in their `oauth.client_owner_cleared`
 -- rows).
@@ -121,7 +121,7 @@ BEGIN
        AND c.conname = 'agents_must_have_owner';
     IF v_def IS DISTINCT FROM
        'CHECK ((((client_type)::text <> ''agent''::text) OR (owner_id IS NOT NULL)))' THEN
-        RAISE EXCEPTION '312: oauth_clients.agents_must_have_owner is not 001''s CHECK '
+        RAISE EXCEPTION '348: oauth_clients.agents_must_have_owner is not 001''s CHECK '
                         '(found %); nothing was changed', COALESCE(v_def, '(absent)')
             USING ERRCODE = '55000';
     END IF;
@@ -159,7 +159,7 @@ SELECT 'oauth.client_owner_cleared', NULL, true,
        pg_catalog.jsonb_build_object('oauth_client_id', x.id,
                                      'previous_owner_id', x.previous_owner_id,
                                      'reason', 'owner guessed at /oauth/register (backlog be024524)',
-                                     'migration', 312)
+                                     'migration', 348)
   FROM cleared x;
 
 -- -------------------------------------------------------------------
@@ -224,7 +224,7 @@ BEGIN
                                'granted_scopes', pg_catalog.to_jsonb(COALESCE(p_granted_scopes, ARRAY[]::text[])),
                                'owner_id', COALESCE(p_owner_id, v_prev_owner),
                                'previous_owner_id', v_prev_owner,
-                               'migration', 312));
+                               'migration', 348));
     RETURN true;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_client_approve(uuid, text[], uuid, uuid)

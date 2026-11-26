@@ -415,7 +415,7 @@ async fn a_derived_key_is_refused_by_the_packet_verifier(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_freshly_registered_agent_client_cannot_read_a_claim(pool: PgPool) {
     // An active human client exists, as in any deployment. Since migration
-    // 312 the registration names no owner (backlog be024524;
+    // 348 the registration names no owner (backlog be024524;
     // `agent_registration_owner.rs`), so this one is not the agent's owner.
     sqlx::query(
         r#"INSERT INTO oauth_clients

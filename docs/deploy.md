@@ -1974,14 +1974,14 @@ role cannot EXECUTE `epigraph_oauth_client_approve`.
 `POST /api/v1/admin/clients/:id/approve` answers `501` MOVED on a request
 unit, whether or not 188 is applied. A maintenance session calls
 `public.epigraph_oauth_client_approve(uuid, text[], uuid, uuid)` (migration
-312; the last argument is the client's owner) directly, or runs
+348; the last argument is the client's owner) directly, or runs
 `epigraph-operator approve-client`. An `agent` client is approved only with
 its owner named: `/oauth/register` gives a self-registered agent no owner
-(before 312 it took the oldest active human client), 312's definer refuses an
-agent approval without one (`22004`), and 312's `agents_must_have_owner`
+(before 348 it took the oldest active human client), 348's definer refuses an
+agent approval without one (`22004`), and 348's `agents_must_have_owner`
 refuses an active agent with none (`23514`), so 118's three-argument
 `epigraph_oauth_client_approve(uuid, text[], uuid)` can no longer activate an
-ownerless agent. 312 also clears the guessed owner of every pending agent
+ownerless agent. 348 also clears the guessed owner of every pending agent
 `/oauth/register` wrote before it. Approve agents with the four-argument form
 only: on an agent that has an owner, the three-argument form keeps that owner
 without anyone naming it. The four-argument form refuses an owner for a
@@ -3216,7 +3216,7 @@ the operator verbs take the `oauth_clients.id` row uuid. `approve-client`
 accepts either one (`--client-id <string>` or `--client <uuid>`), maps the
 string to the row, and prints both. It approves a `pending` client only, with
 exactly the `--scope`s given, and audits the approval. Since migration 188,
-the REST approval route answers 501 and names this verb. Since migration 312
+the REST approval route answers 501 and names this verb. Since migration 348
 an `agent` client also needs `--owner <oauth_clients.id>` (the client that
 answers for it, which must be another active client); the verb writes it as
 the agent's `owner_id`, prints it, and records it before and after in its
@@ -4733,7 +4733,7 @@ here. Each migration's header is authoritative and holds its full undo.
 | 261 | `jobs.run_after`, the not-before time the drain writes on a retryable failure so a job waits out its handler's backoff. **Migrate BEFORE** rolling out a `drain_jobs` built with it: its claim names the column, and on a database below 261 every run fails at its first claim (`42703`) and drains nothing. An older `drain_jobs` ignores the column. Undo: `docs/runbooks/261-undo.sql`, only after rolling every such `drain_jobs` back. |
 | 271 | Every function that pins a `search_path` lists `pg_temp` last, and every trigger function pins one (`ALTER ROUTINE .. SET search_path` only; no body changes). No ordering against the binaries. The sweep refuses (`55000`, nothing changed) a function whose path lists `pg_temp` (in any letter case) before another schema, or whose path it would rebuild has an item that is not a plain lower-case name or `"$user"`; check first with `docs/runbooks/271-precheck.sql` (read-only; expect no row). Apply it AFTER every lower-numbered migration still pending: one applied later is not swept by it (the ratchet's production-order test catches one that merges after 271 with a bad path). If an out-of-band `ALTER FUNCTION .. SET search_path = .., pg_temp` was applied before 271, 271 skips those functions, and the undo reverts them too (see its header). Undo: `docs/runbooks/271-undo.sql`. |
 | 347 | `harvester_enriched_concepts` comes under tenancy and FORCE (existing rows become `('public', world)`, what every reader saw). Apply before, or with, the API binary that lists it in `FORCE_PROTECTED_SET`: that binary refuses to serve where the table exists and is not FORCEd. An older binary is unaffected. Undo: `docs/runbooks/347-undo.sql` (refuses while a concept is group-private). |
-| 312 | `/oauth/register` gives a self-registered agent no owner; the owner is named at approval. **Migrate BEFORE** the API binary of this change (it writes `owner_id = NULL` for an agent, which 001's CHECK refuses: every agent registration a 500); an older API runs on 312 unchanged. The `approve-client` verb of this change calls 312's four-argument approval (`42883` below 312). 312 clears the owner `/oauth/register` guessed for every PENDING self-registered agent (`agent_id` NULL), one `oauth.client_owner_cleared` security event per row with the previous owner. Any other tool that approves clients with a hand-written three-argument `epigraph_oauth_client_approve` keeps working for non-agent clients; on an agent it fails for an ownerless one (`23514`) and keeps the existing owner of any other without naming it, so approve agents with the four-argument form and the owner named. An agent ALREADY ACTIVE with a guessed owner keeps it: count active agent clients whose `agent_id` is NULL or links a `derived` agent and whose owner is the oldest active human client, and decide each one's owner. Undo: `docs/runbooks/312-undo.sql` (refuses while an agent client has no owner, including the rows 312 cleared). |
+| 348 | `/oauth/register` gives a self-registered agent no owner; the owner is named at approval. **Migrate BEFORE** the API binary of this change (it writes `owner_id = NULL` for an agent, which 001's CHECK refuses: every agent registration a 500); an older API runs on 348 unchanged. The `approve-client` verb of this change calls 348's four-argument approval (`42883` below 348). 348 clears the owner `/oauth/register` guessed for every PENDING self-registered agent (`agent_id` NULL), one `oauth.client_owner_cleared` security event per row with the previous owner. Any other tool that approves clients with a hand-written three-argument `epigraph_oauth_client_approve` keeps working for non-agent clients; on an agent it fails for an ownerless one (`23514`) and keeps the existing owner of any other without naming it, so approve agents with the four-argument form and the owner named. An agent ALREADY ACTIVE with a guessed owner keeps it: count active agent clients whose `agent_id` is NULL or links a `derived` agent and whose owner is the oldest active human client, and decide each one's owner. Undo: `docs/runbooks/348-undo.sql` (refuses while an agent client has no owner, including the rows 348 cleared). |
 
 The md5 values above are copied from the migrations' own preconditions. They
 are properties of the public function bodies, not of any deployment.

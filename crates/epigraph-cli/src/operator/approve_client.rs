@@ -32,8 +32,8 @@
 //!   self-registered agent no owner (backlog be024524), so `--owner <uuid>`
 //!   (the `oauth_clients.id` that answers for the agent) is required for an
 //!   `agent` client, even one whose row already holds an owner (rows
-//!   registered before migration 312 hold the oldest active human, which
-//!   nobody chose). Migration 312's four-argument definer writes it and
+//!   registered before migration 348 hold the oldest active human, which
+//!   nobody chose). Migration 348's four-argument definer writes it and
 //!   refuses an agent approval without one; a named owner must be another,
 //!   active client. Any other client is refused `--owner` (it keeps the
 //!   owner it was created with; the definer refuses too, 22023).
@@ -122,7 +122,7 @@ pub fn validate(scopes: &[String], reason: &str) -> anyhow::Result<Vec<String>> 
 /// # Errors
 /// [`validate`]'s refusals; an unknown client; a client that is not
 /// `pending`; an `agent` client without `owner`, a non-agent client with
-/// one, or an `owner` that is not another active client (migration 312); an admin-only scope while
+/// one, or an `owner` that is not another active client (migration 348); an admin-only scope while
 /// migration 128 is armed or unreadable;
 /// a failed statement. Nothing is committed in any of these cases.
 // One argument per command-line flag, as the binary passes them.
@@ -211,7 +211,7 @@ pub async fn run(
         }
     }
 
-    // Migration 312's overload: writes the owner too, and refuses an agent
+    // Migration 348's overload: writes the owner too, and refuses an agent
     // approval without one (22004) and an owner that is not another active
     // client (22023 / 23503).
     let approved: bool =

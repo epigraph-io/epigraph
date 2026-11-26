@@ -266,7 +266,7 @@ pub async fn register_endpoint(
                 // registers PENDING with an EMPTY granted set: `allowed_scopes`
                 // records what an admin MAY approve (a maintenance session,
                 // through `epigraph_oauth_client_approve`, migration 188, which
-                // since 312 must also name the agent's owner; the REST approve
+                // since 348 must also name the agent's owner; the REST approve
                 // route answers 501 MOVED), `granted_scopes` is
                 // what the client actually holds, and the client_credentials
                 // grant refuses it entirely until then because
@@ -320,9 +320,9 @@ pub async fn register_endpoint(
             // its `owner_id` (and `OAuthClientRepository::suspend_by_owner`
             // on that human, which nothing calls today, would have suspended
             // every approved self-registered agent). The operator names the owner at
-            // approval instead: migration 312's
+            // approval instead: migration 348's
             // `epigraph_oauth_client_approve(id, scopes, approved_by, owner)`
-            // refuses an agent approval without one, and 312's
+            // refuses an agent approval without one, and 348's
             // `agents_must_have_owner` admits a NULL owner only while the
             // agent is not active.
             None,

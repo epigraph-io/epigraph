@@ -5107,7 +5107,7 @@ restart.
   public, world-owned, as it is read today). Apply as the maintenance role or a superuser (the
   two triggers need EXECUTE on 074's and 115's bodies, revoked from PUBLIC).
   **Applied to throwaway databases only, NOT to any deployed database.**
-- **312**: `oauth_agent_owner_at_approval` (backlog be024524). `/oauth/register` stamped every
+- **348**: `oauth_agent_owner_at_approval` (backlog be024524). `/oauth/register` stamped every
   self-registered agent client's `owner_id` with the OLDEST ACTIVE HUMAN client (001's
   `agents_must_have_owner` refused NULL), so the agent's token carried that human as its owner (and
   `suspend_by_owner` on that human, which nothing calls today, would have suspended every approved
@@ -5117,7 +5117,7 @@ restart.
   55000) and adds the overload `epigraph_oauth_client_approve(id, granted_scopes, approved_by,
   owner) -> boolean` (172's form, owned by `epigraph_maintenance`, no PUBLIC or application EXECUTE):
   224's body plus the owner. An agent approval must name its owner even when the row holds one (rows
-  registered before 312 hold the oldest human; 22004 otherwise); a named owner is another (22023),
+  registered before 348 hold the oldest human; 22004 otherwise); a named owner is another (22023),
   existing (23503), active (22023) client of any type; any other client is refused an owner (22023)
   and keeps the one it was created with; the `oauth.client_approved` row records `owner_id` and
   `previous_owner_id`. 118's three-argument approval is unchanged (224's ratchet pins it) and now
@@ -5129,9 +5129,9 @@ restart.
   decision, with no verb yet). Registered in `tenancy_backfill` by name (the 118 entry covers every
   overload). Pinned by `epigraph-db/tests/oauth_agent_owner_at_approval.rs`,
   `epigraph-api/tests/agent_registration_owner.rs` and `epigraph-cli/tests/operator_approve_client.rs`
-  (`approve-client --owner`). Undo: `docs/runbooks/312-undo.sql` (refuses while an agent client has no
-  owner, including the rows 312 cleared). **Deploy order:** migrate BEFORE the API binary of this change (it registers an agent with
-  no owner, which 001's CHECK refuses); an older API runs on 312 unchanged.
+  (`approve-client --owner`). Undo: `docs/runbooks/348-undo.sql` (refuses while an agent client has no
+  owner, including the rows 348 cleared). **Deploy order:** migrate BEFORE the API binary of this change (it registers an agent with
+  no owner, which 001's CHECK refuses); an older API runs on 348 unchanged.
 
 ## `-- no-transaction` migrations
 
