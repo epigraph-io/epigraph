@@ -154,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
             cfg,
             verifier,
             auto_promote,
+            probe_embedder: None,
         },
     )
     .await?;

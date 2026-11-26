@@ -190,6 +190,7 @@ async fn high_band_pair_is_verified_not_blindly_corroborated(pool: PgPool) {
             relationship: "contradicts",
         }),
         auto_promote: true,
+        probe_embedder: None,
     };
     run_pipeline(&pool, inputs).await.expect("pipeline");
 
@@ -281,6 +282,7 @@ async fn high_band_pair_verified_then_promotes_and_corroborates(pool: PgPool) {
         cfg: test_config(),
         verifier: Box::new(AlwaysSameVerifier),
         auto_promote: true,
+        probe_embedder: None,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
 
@@ -354,6 +356,7 @@ async fn auto_promote_false_stages_pending_for_review_and_skips_edge(pool: PgPoo
         cfg: test_config(),
         verifier: Box::new(AlwaysSameVerifier),
         auto_promote: false,
+        probe_embedder: None,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
     assert!(
@@ -444,6 +447,7 @@ async fn auto_promote_false_populates_pending_review_queue(pool: PgPool) {
         cfg: test_config(),
         verifier: Box::new(AlwaysSameVerifier),
         auto_promote: false,
+        probe_embedder: None,
     };
     run_pipeline(&pool, inputs).await.expect("pipeline");
 
@@ -489,6 +493,7 @@ async fn mid_band_same_verdict_promotes_and_writes_mapped_column(pool: PgPool) {
         cfg: mid_band_config(),
         verifier: Box::new(AlwaysSameVerifier),
         auto_promote: true,
+        probe_embedder: None,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
     assert!(
@@ -554,6 +559,7 @@ async fn mid_band_contradicts_writes_contradicts_edge(pool: PgPool) {
         cfg: mid_band_config(),
         verifier: Box::new(AlwaysContradictsVerifier),
         auto_promote: true,
+        probe_embedder: None,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
     assert!(report.mid_band >= 1);
@@ -628,6 +634,7 @@ async fn mid_band_distinct_verdict_records_rejected_row_and_no_edge(pool: PgPool
         cfg: mid_band_config(),
         verifier: Box::new(AlwaysRejectsVerifier),
         auto_promote: true,
+        probe_embedder: None,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
     assert!(report.mid_band >= 1);
@@ -736,6 +743,7 @@ async fn verifier_no_answer_must_not_overwrite_stored_verdict(pool: PgPool) {
         cfg: mid_band_config(),
         verifier: Box::new(NoAnswerVerifier),
         auto_promote: true,
+        probe_embedder: None,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
 
@@ -805,6 +813,7 @@ async fn verifier_no_answer_writes_nothing_and_is_counted_separately(pool: PgPoo
         cfg: mid_band_config(),
         verifier: Box::new(NoAnswerVerifier),
         auto_promote: true,
+        probe_embedder: None,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
 
