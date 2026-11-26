@@ -325,3 +325,38 @@ async fn an_agent_client_is_approved_only_with_its_owner_named(pool: PgPool) {
     );
     drop_login(&pool, &login).await;
 }
+
+/// `--owner` is refused for any client that is not an agent, with nothing
+/// changed: the verb would otherwise give a service (or human) client an
+/// owner its tokens then carry as `owner_id`. The client keeps the owner it
+/// was created with (none here).
+///
+/// The verb refuses before calling the definer (its message says to drop
+/// `--owner`); the definer refuses too (22023), which
+/// `oauth_agent_owner_at_approval.rs` pins. Mutation probe: removing the
+/// verb's check leaves only the definer's message, and the `drop --owner`
+/// assertion fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn owner_is_refused_for_a_non_agent_client(pool: PgPool) {
+    let other = human_client(&pool).await;
+    let (id, _) = client(&pool, "pending").await;
+    let (login, dsn) = maintenance_login(&pool).await;
+
+    let r = approve(
+        &["--client", &id.to_string(), "--owner", &other.to_string()],
+        &["claims:read"],
+        true,
+        &dsn,
+    );
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(r.stderr.contains("drop --owner"), "{}", r.show());
+    assert_eq!(state(&pool, id).await, ("pending".into(), vec![]));
+    assert_eq!(owner_of(&pool, id).await, None);
+    assert!(audit(&pool, id).await.is_empty());
+
+    // Control: without --owner the same service is approved.
+    let r = approve(&["--client", &id.to_string()], &["claims:read"], true, &dsn);
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(owner_of(&pool, id).await, None);
+    drop_login(&pool, &login).await;
+}

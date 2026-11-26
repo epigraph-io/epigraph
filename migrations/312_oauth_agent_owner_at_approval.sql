@@ -46,9 +46,16 @@
 --         owner: rows registered before this migration carry the oldest
 --         human, and an approval that silently kept it would keep the
 --         defect;
---       * any other client may name one or pass NULL (its owner is kept);
+--       * any other client (human, service) is refused an owner (22023,
+--         nothing changed) and keeps the one it was created with: an owner
+--         is how an AGENT is answered for, and naming one on a service or
+--         human client would make its tokens carry another principal's
+--         `owner_id` (no path could set a non-agent's owner after creation
+--         before 312, and this one does not open one);
 --       * a named owner must be another `oauth_clients` row (22023 for the
 --         client itself, 23503 for no such row) that is `active` (22023);
+--         its client type is not restricted (`POST /api/v1/agents` gives an
+--         agent its creating client, a human or a service, as owner);
 --       * the `oauth.client_approved` audit row records `owner_id` and
 --         `previous_owner_id`, and `migration` 312.
 --     SECURITY DEFINER on 172's path `pg_catalog, pg_temp`, every relation
@@ -129,6 +136,13 @@ BEGIN
             USING ERRCODE = '22004',
                   HINT = 'Pass the oauth_clients.id of the client that answers for this '
                          'agent as p_owner_id.';
+    END IF;
+    IF v_type IS DISTINCT FROM 'agent' AND p_owner_id IS NOT NULL THEN
+        RAISE EXCEPTION 'oauth client % is a % client: only an agent client is given an owner '
+                        'at approval; nothing was approved', p_id, v_type
+            USING ERRCODE = '22023',
+                  HINT = 'Pass NULL as p_owner_id; the client keeps the owner it was created '
+                         'with.';
     END IF;
     IF p_owner_id IS NOT NULL THEN
         IF p_owner_id = p_id THEN

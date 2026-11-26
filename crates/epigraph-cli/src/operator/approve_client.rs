@@ -35,8 +35,8 @@
 //!   registered before migration 312 hold the oldest active human, which
 //!   nobody chose). Migration 312's four-argument definer writes it and
 //!   refuses an agent approval without one; a named owner must be another,
-//!   active client. For any other client `--owner` is optional and, absent,
-//!   the row keeps its owner.
+//!   active client. Any other client is refused `--owner` (it keeps the
+//!   owner it was created with; the definer refuses too, 22023).
 //! * **One transaction.** The definer (which writes its own
 //!   `oauth.client_approved` row) and this verb's `oauth.client_approved_cli`
 //!   row (who ran it, the reason, the scopes and status before and after, and
@@ -121,8 +121,8 @@ pub fn validate(scopes: &[String], reason: &str) -> anyhow::Result<Vec<String>> 
 ///
 /// # Errors
 /// [`validate`]'s refusals; an unknown client; a client that is not
-/// `pending`; an `agent` client without `owner`, or an `owner` that is not
-/// another active client (migration 312); an admin-only scope while
+/// `pending`; an `agent` client without `owner`, a non-agent client with
+/// one, or an `owner` that is not another active client (migration 312); an admin-only scope while
 /// migration 128 is armed or unreadable;
 /// a failed statement. Nothing is committed in any of these cases.
 // One argument per command-line flag, as the binary passes them.
@@ -169,6 +169,16 @@ pub async fn run(
             row.client_name,
             row.client_id,
             row.status
+        );
+    }
+    if row.client_type != "agent" && owner.is_some() {
+        bail!(
+            "OAuth client {id} ({:?}, client_id {}) is a {} client: only an agent client is \
+             given an owner at approval (it keeps the owner it was created with); drop \
+             --owner; nothing was approved",
+            row.client_name,
+            row.client_id,
+            row.client_type
         );
     }
     if row.client_type == "agent" && owner.is_none() {

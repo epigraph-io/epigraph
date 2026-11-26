@@ -304,13 +304,49 @@ async fn a_named_owner_is_another_active_client(pool: PgPool) {
 }
 
 /// A non-agent client needs no owner: approving it with none named keeps its
-/// owner (NULL here, an owner there).
+/// owner (NULL here, an owner there). Naming one is refused (22023) with
+/// nothing changed: an owner at approval is for an agent only, and on a
+/// service or human client it would make that client's tokens carry another
+/// principal's `owner_id`.
+///
+/// Mutation probe: dropping the definer's non-agent refusal lets the first
+/// loop approve the service with `other` as its owner.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_agent_approval_keeps_its_owner_when_none_is_named(pool: PgPool) {
     let owner = client(&pool, "human", "active", None, 3).await;
+    let other = client(&pool, "human", "active", None, 2).await;
     let service = client(&pool, "service", "pending", None, 0).await;
     let owned_service = client(&pool, "service", "pending", Some(owner), 0).await;
+    let human = client(&pool, "human", "pending", None, 0).await;
     let maint = role_pool(&pool, "epigraph_maintenance").await;
+    for s in [service, owned_service, human] {
+        let r = sqlx::query_scalar::<_, bool>(APPROVE4)
+            .bind(s)
+            .bind(scopes(&["claims:read"]))
+            .bind(None::<Uuid>)
+            .bind(other)
+            .fetch_one(&maint)
+            .await;
+        assert_eq!(sqlstate(r).as_deref(), Some("22023"), "client {s}");
+        let e = OAuthClientRepository::approve(
+            &maint,
+            s,
+            &scopes(&["claims:read"]),
+            owner,
+            Some(other),
+        )
+        .await
+        .expect_err("the repository approval naming an owner for a non-agent");
+        assert_eq!(db_err_code(&e).as_deref(), Some("22023"));
+    }
+    assert_eq!(
+        state(&pool, owned_service).await,
+        ("pending".to_string(), Some(owner), vec![], 0)
+    );
+    assert_eq!(
+        state(&pool, human).await,
+        ("pending".to_string(), None, vec![], 0)
+    );
     for s in [service, owned_service] {
         OAuthClientRepository::approve(&maint, s, &scopes(&["claims:read"]), owner, None)
             .await

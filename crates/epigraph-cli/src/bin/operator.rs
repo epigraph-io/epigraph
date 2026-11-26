@@ -137,7 +137,7 @@
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
 //!     epigraph-operator approve-client (--client <uuid> | --client-id <string>) \
 //!         --scope S [--scope S ...] [--approved-by <uuid>] [--owner <uuid>] --reason TEXT [--apply]
-//!         (--owner is required for an agent client: migration 312)
+//!         (--owner is required for an agent client and refused otherwise: migration 312)
 //!     epigraph-operator suspend-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator set-default-group --operator <uuid> --agent <uuid> [--agent <uuid> ...] \
@@ -742,8 +742,9 @@ enum Command {
         approved_by: Option<Uuid>,
         /// The `oauth_clients.id` of the client that answers for this one,
         /// written as its `owner_id` (migration 312). REQUIRED for an `agent`
-        /// client (`/oauth/register` gives it none); optional otherwise, and
-        /// absent the row keeps its owner. Must be another, active client.
+        /// client (`/oauth/register` gives it none); refused for any other
+        /// client, which keeps the owner it was created with. Must be
+        /// another, active client.
         #[arg(long)]
         owner: Option<Uuid>,
         /// Recorded in the audit row. Required, not blank.
