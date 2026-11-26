@@ -259,6 +259,7 @@ fn the_per_call_scanner_sees_the_whole_executor_viewer_surface() {
             ("workflow.rs", "execute_workflow_ingest_plan_in_group"),
             // No database handle: in the population, with no calls.
             ("workflow.rs", "require_caller_writes_group"),
+            // One call, viewed (`tenancy_of_conn(conn, caller, ..)`).
             ("workflow.rs", "reused_with_another_tenancy"),
             ("workflow_match.rs", "matching_workflow_conn"),
             ("workflow_plan.rs", "frozen_plan"),
