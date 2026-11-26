@@ -152,26 +152,61 @@ async fn unframed_get_belief_agrees_with_get_belief_columns(pool: PgPool) {
 /// A claim that has never had a DS write still has NULL columns. It must fall back
 /// to the truth_value reconstruction rather than reporting zeros, which would read
 /// as "refuted" instead of "no DS state".
+///
+/// Backlog 3c4ddac0: that reconstruction is the interval of the LEAST-COMMITTED
+/// binary BBA whose BetP is `truth_value` (`MassFunction::from_pignistic_prior`),
+/// not the old `{belief: t, plausibility: 1, pignistic_prob: t}`, which no BBA
+/// has. One claim on each side of ½: t = 0.73 reads (Bel .46, Pl 1, BetP .73),
+/// t = 0.3 reads (Bel 0, Pl .6, BetP .3). The old shape gives (.73, 1, .73) and
+/// (.3, 1, .3), so both cases fail on it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unframed_get_belief_falls_back_when_no_ds_columns(pool: PgPool) {
     let agent = insert_agent(&pool).await;
-    let claim = insert_claim(&pool, agent, 0.73).await;
-
     let viewer = fixture::public_viewer(&pool).await;
-    let got = get_belief(&pool, &viewer, claim, None)
-        .await
-        .expect("get_belief");
 
-    assert!(
-        (got.belief - 0.73).abs() < 1e-9 && (got.plausibility - 1.0).abs() < 1e-9,
-        "with no DS columns written the unframed read must fall back to the \
-         truth_value reconstruction, got belief={} plausibility={}. Reporting 0.0 \
-         here would make an unassessed claim indistinguishable from a refuted one.",
-        got.belief,
-        got.plausibility
-    );
-    assert_eq!(
-        got.source, "cached",
-        "the fallback must still identify itself as a cached read"
-    );
+    for (truth, want_bel, want_pl) in [(0.73, 0.46, 1.0), (0.3, 0.0, 0.6)] {
+        let claim = insert_claim(&pool, agent, truth).await;
+        let got = get_belief(&pool, &viewer, claim, None)
+            .await
+            .expect("get_belief");
+
+        assert!(
+            (got.belief - want_bel).abs() < 1e-9
+                && (got.plausibility - want_pl).abs() < 1e-9
+                && (got.pignistic_prob - truth).abs() < 1e-9,
+            "truth_value {truth} with no DS columns must read as the least-committed \
+             BBA with BetP = {truth}: want (Bel {want_bel}, Pl {want_pl}, BetP {truth}), \
+             got (Bel {}, Pl {}, BetP {})",
+            got.belief,
+            got.plausibility,
+            got.pignistic_prob
+        );
+        assert!(
+            got.belief < got.plausibility || truth == 1.0,
+            "a non-dogmatic truth_value must not read as a zero-width interval: {got:?}"
+        );
+        assert_eq!(
+            got.source, "cached",
+            "the fallback must still identify itself as a cached read"
+        );
+        assert!(
+            !got.framed,
+            "the unframed fallback must not report framed=true"
+        );
+
+        // Regression pin, not proof of the fix (it holds on the old shape too):
+        // the truth gates (recall / traverse min_truth, query_claims) score a
+        // no-DS row by `EFFECTIVE_BELIEF_SCORE_SQL`'s `truth_value` arm, so the
+        // BetP this read reports must stay equal to that score.
+        let scores = ClaimRepository::effective_belief_batch(&pool, &viewer, &[claim])
+            .await
+            .expect("effective_belief_batch");
+        let gate = *scores.get(&claim).expect("gate score for a visible claim");
+        assert!(
+            (got.pignistic_prob - gate).abs() < 1e-9,
+            "get_belief BetP {} and the truth gates' score {gate} disagree for a \
+             claim with no DS state",
+            got.pignistic_prob
+        );
+    }
 }
