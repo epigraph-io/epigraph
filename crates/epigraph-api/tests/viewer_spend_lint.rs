@@ -342,7 +342,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // viewer-filtered edges, and best-effort derived rows (community scope,
     // silence alarm) that reach no response field. narrows: the source count
     // keeps only the cache-admissible rows of `get_for_claim_frame`, read
-    // through the viewer just before it.
+    // through the viewer just before it. write (backlog 8fcc36a0): the
+    // submission's events INSERT into `events` (no tenancy columns, no row
+    // security; `EventRepository::list` filters readers by payload) and read
+    // nothing: `contradiction.predicted` on the write transaction, the rest
+    // through `record_event` after the commit.
     (
         "belief.rs",
         "submit_evidence",
@@ -350,6 +354,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "CommunityRepository::communities_for_perspective",
             "CommunityRepository::member_perspective_ids",
             "ConflictDensityRepository::for_frames",
+            "EventRepository::publish_or_log_conn",
             "MassFunctionRepository::store_with_perspective",
             "ScopedBeliefRepository::upsert",
             "ScopedBeliefRepository::upsert",
@@ -360,6 +365,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "create_edge_under_savepoint",
             "create_edge_under_savepoint",
             "derivation_scope::retain_for_cache",
+            "record_event",
+            "record_event",
+            "record_event",
+            "record_event",
+            "record_event",
+            "record_event",
+            "record_event",
+            "record_event",
             "sqlx::query(INSERT).execute",
             "sqlx::query_as(SELECT).fetch_all",
             "sqlx::query_as(SELECT).fetch_all",
@@ -482,11 +495,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         ],
     ),
     // write: the caller's principal is the community's creator (one `groups`
-    // insert, no read).
+    // insert, no read), and its `community.formed` event (one `events` insert,
+    // backlog 8fcc36a0; `events` has no row security, readers are filtered by
+    // `EventRepository::list`).
     (
         "community.rs",
         "create_community",
-        &["CommunityRepository::create"],
+        &[
+            "CommunityRepository::create",
+            "EventRepository::publish_or_log",
+        ],
     ),
     // gated (community and perspective) then write. The membership write is a
     // SECURITY DEFINER function on a transaction stamped from this viewer
@@ -707,7 +725,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // the write. `AgentRepository::speaks_for` is an authority check, not a
     // read of tenant content: is the caller the agent an asserts/AUTHORED
     // edge comes from, or its human through a live binding (migration 149's
-    // binding records, identity data every session reads).
+    // binding records, identity data every session reads). write: the
+    // `edge.added` event, one `events` insert on that transaction (backlog
+    // 8fcc36a0).
     (
         "edges.rs",
         "create_edge",
@@ -717,6 +737,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_symmetric_if_absent_row_signed_conn",
             "EdgeRepository::owned_by_session",
+            "EventRepository::publish_or_log_conn",
             "entity_exists",
             "entity_exists",
             "is_valid_entity_type",
@@ -735,13 +756,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::owned_by_session",
         ],
     ),
-    // gated (`EdgeRepository::refusal_for`) then write.
+    // gated (`EdgeRepository::refusal_for`) then write; the `edge.deleted`
+    // event is one `events` insert on the same transaction (backlog 8fcc36a0).
     (
         "edges.rs",
         "delete_edge",
         &[
             "EdgeRepository::retract_by_id",
             "EdgeRepository::withdraw_edge_bbas_conn",
+            "EventRepository::publish_or_log_conn",
             "provenance::record_provenance",
         ],
     ),
@@ -753,12 +776,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "get_evidence",
         &["sqlx::query_as(SELECT).fetch_optional"],
     ),
+    // write: the `edge.updated` / `edge.retired` events are `events` inserts
+    // on the patch's transaction (backlog 8fcc36a0).
     (
         "edges.rs",
         "patch_edge",
         &[
             "EdgeRepository::update_valid_to_and_properties",
             "EdgeRepository::withdraw_edge_bbas_conn",
+            "EventRepository::publish_or_log_conn",
+            "EventRepository::publish_or_log_conn",
             "provenance::record_provenance",
         ],
     ),
@@ -1392,12 +1419,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (`write_target_of`) then write. The detached factors SELECT that
     // was registered here only logged a count and is deleted (backlog 79e1f75d).
+    // The `claim.superseded` event is one `events` insert on the act's
+    // transaction (backlog 8fcc36a0).
     (
         "versioning.rs",
         "supersede_claim",
         &[
             "ClaimRepository::supersede_act_conn",
             "ClaimVersionRepository::create",
+            "EventRepository::publish_or_log_conn",
             "supersede_session_or_deferral",
         ],
     ),
