@@ -1010,3 +1010,73 @@ async fn duplicate_claims_take_the_same_pool_slots_in_both_legs(pool: PgPool) {
         }
     }
 }
+
+/// Backlog 8c511f13, review m5: a zero-norm embedding has a NaN cosine
+/// distance, and Postgres orders NaN above every number, so `NaN >= 0.40` is
+/// TRUE in SQL while the Rust caller's `s >= 0.40` is false. The pool count
+/// must treat NaN as below the floor, or it counts a row the page's numerator
+/// never can and `coverage_rate` can never reach 1.0.
+///
+/// The zero vector cannot sit in the cosine HNSW index (pgvector skips
+/// zero-norm vectors), but the 3-row table is shorter than the pool, so the
+/// exact retry runs and computes its NaN distance.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_zero_norm_embedding_does_not_count_as_well_matched(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let ids = ascending_ids(0x5a00, 4);
+    for (i, deg) in [0.0_f64, 10.0, 20.0].iter().enumerate() {
+        insert_claim(
+            &pool,
+            ids[i],
+            agent,
+            i as u8 + 1,
+            &format!("near filler row {i}"),
+            &vec_angle(*deg),
+            true,
+            &[],
+        )
+        .await;
+    }
+    let zero = format!("[{}]", vec!["0.0"; 1536].join(","));
+    insert_claim(&pool, ids[3], agent, 4, "zero vector row", &zero, true, &[]).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let page = ClaimRepository::search_hybrid_page_conn(
+        &mut conn,
+        &viewer,
+        &vec_angle(0.0),
+        "zzqxnomatch",
+        50,
+        60,
+        10,
+        0,
+        None,
+        None,
+        None,
+        None,
+        0.40,
+    )
+    .await
+    .expect("hybrid page");
+
+    // Calibration: the zero-vector row did reach the dense leg, with a NaN
+    // similarity, so the count below is not passing for want of the row.
+    let nan_hit = page
+        .hits
+        .iter()
+        .find(|h| h.claim_id == ids[3])
+        .unwrap_or_else(|| panic!("the zero-vector row must be in the dense pool: {page:?}"));
+    assert!(
+        nan_hit.dense_similarity.is_some_and(f64::is_nan),
+        "calibration: a zero-norm embedding has NaN similarity: {nan_hit:?}"
+    );
+    assert_eq!(
+        page.candidates,
+        epigraph_db::HybridCandidates {
+            matched: 3,
+            pool_saturated: false
+        },
+        "the three near rows count; the NaN row does not"
+    );
+}

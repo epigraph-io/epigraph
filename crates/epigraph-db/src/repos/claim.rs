@@ -840,8 +840,10 @@ pub struct HybridPage {
 /// The fused candidate pool of one hybrid search, counted before the page cut.
 ///
 /// A candidate is well matched when it is in the lexical leg (its text matches
-/// the query) or its dense similarity is at least the caller's floor. Both legs
-/// are capped at `candidate_pool`, so `matched` is at most twice the pool; it
+/// the query) or its dense similarity is at least the caller's floor. A NaN
+/// similarity (a zero-norm embedding, which only the exact retry reaches) is
+/// below every floor, as it is in Rust; Postgres alone would order NaN above
+/// every number and count it. Both legs are capped at `candidate_pool`, so `matched` is at most twice the pool; it
 /// counts only rows the viewer can read (both legs carry the visibility
 /// splice), so it discloses nothing the hits do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5370,11 +5372,15 @@ impl ClaimRepository {
             )
             SELECT (SELECT count(*) FROM dense)::int8 AS dense_count,
                    (SELECT count(*) FROM pool p
-                     WHERE p.in_lexical OR p.dense_similarity >= $11::float8)::int8
+                     WHERE p.in_lexical
+                        OR (p.dense_similarity >= $11::float8
+                            AND p.dense_similarity <> 'NaN'::float8))::int8
                        AS matched_count,
-                   ((SELECT count(*) FROM lex) >= $3
+                   COALESCE((SELECT count(*) FROM lex) >= $3
                     OR ((SELECT count(*) FROM dense) >= $3
-                        AND (SELECT min(d.cos) FROM dense d) >= $11::float8))
+                        AND (SELECT bool_and(d.cos >= $11::float8
+                                             AND d.cos <> 'NaN'::float8)
+                               FROM dense d)), false)
                        AS pool_saturated,
                    f.claim_id, f.rrf_score, f.dense_similarity, f.in_lexical
             FROM (SELECT 1) one
