@@ -101,12 +101,18 @@ fn call_spends_viewer(region: &str) -> bool {
 ///   definer, by design), whose visible part is then read through the viewer.
 /// * **derive** — the edge factor's source interval and its intra-source
 ///   locality, read on the edge writer's transaction for the BBA the edge
-///   derives on its target. Every request path reads the source through the
-///   caller's viewer before it wires (`epigraph-api` `routes/edges.rs`, the
-///   MCP `link_epistemic` endpoints), the value is written into the derived
-///   row and never returned, and that row's readability is decided at read by
-///   `derivation_scope` (an edge-factor row is admitted only when the edge's
-///   source claim is visible).
+///   derives on its target. Every request path wires on a transaction stamped
+///   from the caller or the author, so `claims` row security bounds the read:
+///   REST `routes/edges.rs` (the caller's stamped transaction, after reading
+///   the source through the viewer) and `routes/workflows.rs`
+///   (`begin_caller_workflow_tx`); MCP `link_epistemic`
+///   (`begin_author_stamped_tx`), `workflow_ingest` (`begin_caller_workflow_tx`;
+///   its `*_via_pool` forms are `#[sqlx::test]` fixtures) and `ingestion`
+///   (`begin_ingest_tx`). The value is written into the derived row; only
+///   the outcome (wired, or no source interval) is reported, and that row's
+///   readability is decided at read by `derivation_scope` (an edge-factor row
+///   is admitted only when the edge's source claim is visible). The operator
+///   backfills run it on the maintenance connection.
 ///
 /// No entry reads content into a response without the viewer: the review
 /// found nothing to fix. The fix sketch's two named examples,
