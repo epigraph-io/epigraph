@@ -5155,7 +5155,8 @@ restart.
   `epigraph_set_paper_licence` (255) first. Pinned by
   `epigraph-mcp/tests/evidence_passage_licence_guard.rs` (refusals on the application role, the
   accepted bodies built by the production writer, the legacy, strip and unseal writes, and the
-  SQL/Rust allowlist parity). Undo: `docs/runbooks/349-undo.sql`. No deploy order: no binary
+  SQL/Rust allowlist parity) and `epigraph-api/tests/submit_embedding_stamped.rs` (a figure of an
+  unlicensed paper is a 400). Undo: `docs/runbooks/349-undo.sql`. No deploy order: no binary
   depends on it.
 
 ## `-- no-transaction` migrations

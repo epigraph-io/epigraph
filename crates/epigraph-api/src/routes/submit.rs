@@ -431,6 +431,51 @@ fn error_response(status: StatusCode, error: ErrorResponse) -> Response {
     (status, Json(ErrorResponse::new(error.error, message))).into_response()
 }
 
+/// The response for a refused evidence INSERT of packet item `index`.
+///
+/// A CHECK refusal (SQLSTATE 23514) is the caller's error: the row it sent is
+/// not one the schema holds. Migration 349's `evidence_passage_licence` is
+/// the case this exists for: a verbatim passage, figure image or caption for a
+/// paper whose recorded licence does not permit retention (backlog b62ae3f2).
+/// The body names the constraint only (a schema identifier, as
+/// `ApiError::from(DbError::CheckViolation)` does); anything else stays a 500.
+#[cfg(feature = "db")]
+fn evidence_insert_error(index: usize, e: &sqlx::Error) -> (StatusCode, ErrorResponse) {
+    if let Some(db) = e.as_database_error() {
+        if db.code().as_deref() == Some("23514") {
+            let constraint = db.constraint().unwrap_or("<unnamed>").to_string();
+            tracing::warn!(
+                constraint = %constraint,
+                detail = %db.message(),
+                "packet evidence refused by a CHECK"
+            );
+            let message = if constraint == "evidence_passage_licence" {
+                format!(
+                    "evidence[{index}] carries a verbatim source passage, figure image or caption \
+                     for a paper whose recorded licence does not permit retention; send the \
+                     locator and BLAKE3 hash instead (constraint {constraint})"
+                )
+            } else {
+                format!(
+                    "evidence[{index}] violates a database constraint (constraint {constraint})"
+                )
+            };
+            return (
+                StatusCode::BAD_REQUEST,
+                ErrorResponse::with_details(
+                    "ValidationError",
+                    message,
+                    serde_json::json!({ "field": format!("evidence[{index}]"), "constraint": constraint }),
+                ),
+            );
+        }
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorResponse::new("DatabaseError", format!("Failed to insert evidence: {e}")),
+    )
+}
+
 // =============================================================================
 // VALIDATION
 // =============================================================================
@@ -1705,12 +1750,7 @@ async fn persist_packet(
         )
         .execute(&mut *tx)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to insert evidence: {}", e)),
-            )
-        })?;
+        .map_err(|e| evidence_insert_error(i, &e))?;
 
             // The evidence's `supports` edge to its claim, through the one
             // writer every evidence insert calls (backlog 2d60f619), in this
