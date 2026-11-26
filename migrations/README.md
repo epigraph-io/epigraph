@@ -5141,14 +5141,19 @@ restart.
   pg_catalog.lower(p_key)`, `LANGUAGE sql IMMUTABLE STRICT LEAKPROOF PARALLEL SAFE SECURITY
   INVOKER`, `SET search_path = pg_catalog, pg_temp` so it is never inlined; EXECUTE stays with
   PUBLIC; owner `epigraph_maintenance` when present, registered in `tenancy_backfill`'s
-  `INVOKER_EXEMPT`) and `papers_doi_fold_idx ON papers (epigraph_document_key_fold(doi))`; the
+  `INVOKER_EXEMPT`) and `papers_doi_fold_idx ON papers (epigraph_document_key_fold(doi))`.
+  LEAKPROOF holds because `doi` is bounded: every value is already a btree key (246), so it sits
+  far below `lower`'s value-dependent allocation errors; the function is for such bounded columns
+  only (its COMMENT says so). The
   lookup's arm folds with the function (the per-row recall filter keeps `lower`). Transactional, not
   CONCURRENTLY (one slot for the function and the index): the build holds a SHARE lock on `papers`
   (writes wait) for one pass over `doi`, behind `SET LOCAL lock_timeout = '3s'`. Precondition LKP02
   (42501): the runner is a superuser (only a superuser may declare LEAKPROOF). Pinned by
   `epigraph-db/tests/papers_document_key_fold_index.rs` (the plan under `SET ROLE epigraph_app`,
   with a plain-`lower` calibration). Measure first: `SELECT count(*),
-  pg_size_pretty(pg_relation_size('papers')) FROM papers` (bounds the lock). Undo:
+  pg_size_pretty(pg_relation_size('papers')) FROM papers` (bounds the lock) and `SELECT
+  max(octet_length(doi)), max(octet_length(lower(doi))) FROM papers` (lowercasing can lengthen a
+  key; one near the btree tuple limit would fail the build, or later an INSERT with 54000). Undo:
   `docs/runbooks/351-undo.sql` (roll the binary back first). **Deploy order:** migrate BEFORE the
   binary of this change (its lookup names the function); an older binary runs on 351 unchanged.
 

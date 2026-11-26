@@ -30,11 +30,20 @@
 -- * `public.epigraph_document_key_fold(text) RETURNS text`: `SELECT
 --   pg_catalog.lower(p_key)`, `LANGUAGE sql IMMUTABLE STRICT LEAKPROOF
 --   PARALLEL SAFE SECURITY INVOKER`, `SET search_path = pg_catalog, pg_temp`.
---     - LEAKPROOF is TRUE of it: `lower` on a stored text value returns the
---       folded text and raises on no value (a stored value is validly
---       encoded; a collation that cannot be determined is a property of the
---       call, not of the row), so it reveals nothing about a row through an
---       error or a side effect.
+--     - LEAKPROOF holds of it ON `papers.doi`, and that bound is the reason.
+--       `lower` has no side effect, and its error paths do not depend on a
+--       stored value's content: a stored value is validly encoded, and a
+--       collation that cannot be determined is a property of the call, not
+--       of the row. Its only value-dependent errors are allocation limits
+--       (`str_tolower`'s wide-char and result buffers) on input of hundreds
+--       of megabytes. Every stored `doi` is already a btree key (246's
+--       `papers_doi_idx` and `papers_document_key_scope_key`), so it fits the
+--       btree tuple limit in its possibly compressed form, which keeps it
+--       orders of magnitude below those limits. No row-dependent error is
+--       therefore reachable on `papers.doi`.
+--     - ONLY FOR BOUNDED COLUMNS: on an unbounded text column under row
+--       security, a length-dependent error could reveal that an invisible
+--       row exists. Do not reuse it there (the function COMMENT says so).
 --     - The SET clause keeps it from being inlined: an inlined body is the
 --       bare `lower`, which is not leakproof. (It also satisfies 271's rule.)
 --     - IMMUTABLE (as `lower` is), so it can be indexed.
@@ -52,6 +61,12 @@
 -- fold and sort every `doi`, as 246 built its three `papers` indexes. The
 -- lock wait is bounded by `lock_timeout`; a timeout fails the migration with
 -- nothing changed, and it can be re-run.
+--
+-- KEY LENGTH: lowercasing can lengthen a value in bytes (a few capitals take
+-- 2 bytes and their lowercase forms 3), so a `doi` near the btree tuple limit
+-- that today's indexes accept could fail this build (the migration fails with
+-- nothing changed) or a later INSERT (54000). Measure first:
+-- `SELECT max(octet_length(doi)), max(octet_length(lower(doi))) FROM papers`.
 --
 -- PRECONDITION (LKP02, 42501): only a superuser may declare a function
 -- LEAKPROOF. The migration runner is a superuser on every deployment (212,
@@ -82,6 +97,11 @@ LANGUAGE sql IMMUTABLE STRICT LEAKPROOF PARALLEL SAFE SECURITY INVOKER
 SET search_path = pg_catalog, pg_temp AS $$
     SELECT pg_catalog.lower(p_key)
 $$;
+
+COMMENT ON FUNCTION public.epigraph_document_key_fold(text) IS
+    '351: LEAKPROOF wrapper of lower() for papers.doi, whose btree keys bound every value '
+    'far below lower()''s allocation limits. Use it only on such bounded columns: on an '
+    'unbounded text column under row security a length-dependent error could reveal a row.';
 
 DO $$
 BEGIN
