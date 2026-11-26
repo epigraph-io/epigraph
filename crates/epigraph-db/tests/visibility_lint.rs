@@ -3381,6 +3381,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `p_open = true` to read only the attested model for the run-token grant, which never \
          returns it; a change to the audience ruling must re-check it.)",
     ),
+    (
+        "factor.rs",
+        "promote_hypothesis_factors",
+        "WRITE through migration 311's SECURITY DEFINER `epigraph_promote_hypothesis_factors` \
+         on the promotion's STAMPED transaction (`AppState::write_as`): it moves one promoted \
+         hypothesis's `factors` (no `visibility` / `owner_group_id`) from \
+         `hypothesis_assessment` to `research_validity`, and the definer refuses a session that \
+         does not write the claim's owner group (BPF01) or a claim not yet promoted (BPF02). \
+         It returns a count, no row. The viewer is spent on the stamp, which the definer reads.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it

@@ -9,13 +9,16 @@
 //! * [`an_app_session_cannot_forge_rewrite_or_drop_a_factor`] pins the attack
 //!   the item names. A stamped session that owns nothing in the graph cannot
 //!   INSERT a factor over another writer's edge, cannot rewrite an existing
-//!   factor's pair or potential, and cannot DELETE or TRUNCATE one; the
-//!   catalog leaves the application role UPDATE on `frame_id` alone.
+//!   factor's pair or potential, and cannot DELETE or TRUNCATE one; since
+//!   migration 311 (backlog 9a9d6850) it cannot move one between frames
+//!   either, and the catalog leaves it no write on any column.
 //! * [`the_legitimate_writers_still_work_on_the_app_role`]. The writer's own
 //!   edge INSERT still mints 038's factor (the matcher-score override
-//!   included, a superseded endpoint still skipped), the promote route's
-//!   `frame_id` move still runs, and retiring a claim still clears its
-//!   factors.
+//!   included, a superseded endpoint still skipped), and retiring a claim
+//!   still clears its factors. A direct `frame_id` move, which 217 left the
+//!   application role for the promote route, is refused since 311 (the route
+//!   moves a promoted hypothesis's factors through 311's definer,
+//!   `factor_frame_promote_definer.rs`).
 //! * [`no_session_can_attach_the_factor_definers_to_its_own_table`] and
 //!   [`the_factor_definers_refuse_any_table_but_their_own`]. The two definers
 //!   cannot be borrowed. An application session cannot attach either to a
@@ -49,6 +52,10 @@
 //!   the column set).
 //! * 217's §7 deleted: fails `a_foreign_factor_writing_trigger_refuses_217`
 //!   (217 applies over the foreign writer).
+//! * 311's `REVOKE UPDATE (frame_id)` removed: fails
+//!   `an_app_session_cannot_forge_rewrite_or_drop_a_factor` (the frame move
+//!   succeeds and the catalog lists `frame_id`) and
+//!   `the_legitimate_writers_still_work_on_the_app_role` (the move runs).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -230,6 +237,22 @@ async fn an_app_session_cannot_forge_rewrite_or_drop_a_factor(pool: PgPool) {
             .await,
         "DELETE a factor",
     );
+    // 311: no frame move either (217 left `frame_id` app-updatable).
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['true', 'false']) RETURNING id",
+    )
+    .bind(format!("f311 frame {}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    assert_denied(
+        sqlx::query("UPDATE factors SET frame_id = $2 WHERE id = $1")
+            .bind(factor)
+            .bind(frame)
+            .execute(&app)
+            .await,
+        "UPDATE an existing factor's frame",
+    );
     assert_denied(
         sqlx::query("TRUNCATE factors CASCADE").execute(&app).await,
         "TRUNCATE factors",
@@ -242,8 +265,8 @@ async fn an_app_session_cannot_forge_rewrite_or_drop_a_factor(pool: PgPool) {
         "the victim's factor is exactly as minted"
     );
 
-    // The catalog: no INSERT on any column, no DELETE or TRUNCATE, and UPDATE
-    // on `frame_id` alone (the hypothesis promote route).
+    // The catalog: no INSERT on any column, no DELETE or TRUNCATE, and (since
+    // 311) no UPDATE on any column.
     let (insert, delete, truncate): (bool, bool, bool) = sqlx::query_as(
         "SELECT has_any_column_privilege('epigraph_app', 'public.factors', 'INSERT'), \
                 has_table_privilege('epigraph_app', 'public.factors', 'DELETE'), \
@@ -267,11 +290,12 @@ async fn an_app_session_cannot_forge_rewrite_or_drop_a_factor(pool: PgPool) {
     .fetch_all(&pool)
     .await
     .expect("column privileges");
-    assert_eq!(updatable, vec!["frame_id".to_string()]);
+    assert_eq!(updatable, Vec::<String>::new());
 }
 
-/// The writers 217 keeps: the edge trigger on the session's own edge, the
-/// promote route's frame move, and the retirement trigger.
+/// The writers 217 keeps: the edge trigger on the session's own edge and the
+/// retirement trigger. The promote route's direct frame move, which 217 also
+/// kept, is refused since 311.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_legitimate_writers_still_work_on_the_app_role(pool: PgPool) {
     let (writer, group) = fixture::seed_agent_with_group(&pool, "f217-writer").await;
@@ -374,7 +398,8 @@ async fn the_legitimate_writers_still_work_on_the_app_role(pool: PgPool) {
         "an edge to a superseded claim mints no factor"
     );
 
-    // The hypothesis promote route's move, as it is written there.
+    // The hypothesis promote route's move as 217 left it, run directly: refused
+    // since 311 (the route moves through 311's definer).
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['true', 'false']) RETURNING id",
     )
@@ -382,18 +407,26 @@ async fn the_legitimate_writers_still_work_on_the_app_role(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("seed frame");
-    let moved = sqlx::query(
-        "UPDATE factors SET frame_id = $2 WHERE frame_id IS NOT DISTINCT FROM $1 \
-           AND $3 = ANY(variable_ids)",
+    assert_denied(
+        sqlx::query(
+            "UPDATE factors SET frame_id = $2 WHERE frame_id IS NOT DISTINCT FROM $1 \
+               AND $3 = ANY(variable_ids)",
+        )
+        .bind(None::<Uuid>)
+        .bind(frame)
+        .bind(c)
+        .execute(&app)
+        .await,
+        "a direct frame move on the application role",
+    );
+    let still: Option<Uuid> = sqlx::query_scalar(
+        "SELECT frame_id FROM factors WHERE properties->>'source_edge_id' = $1::text",
     )
-    .bind(None::<Uuid>)
-    .bind(frame)
-    .bind(c)
-    .execute(&app)
+    .bind(matched)
+    .fetch_one(&pool)
     .await
-    .expect("the frame move runs on the application role")
-    .rows_affected();
-    assert_eq!(moved, 1, "the matcher factor moved frames");
+    .expect("read the matcher factor's frame");
+    assert_eq!(still, None, "the matcher factor stayed frameless");
 
     // The retirement trigger clears the retired claim's factors.
     sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")

@@ -2919,6 +2919,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // (quiet: a binding change keeps the old owner, the stake 315's entries
     // already report).
     ("epigraph_reown_role_projection_edges", 318),
+    // 311 (backlog 9a9d6850), a promoted hypothesis's factor move from
+    // `hypothesis_assessment` to `research_validity` (the application role
+    // holds no UPDATE on `factors.frame_id`). Under an owner without UPDATE on
+    // `factors` every promotion is refused 42501 (loud, an outage of the
+    // promote route). Under a non-member owner that holds it, its reads of the
+    // FORCEd `claims` and `frames` are filtered to what the caller reads: the
+    // caller writes the claim (checked first), so the status read still sees
+    // it, and a frame the caller cannot read answers BPF03 (closed).
+    ("epigraph_promote_hypothesis_factors", 311),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4195,6 +4204,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_agent_prompt_history_blob",
         "public.epigraph_agent_prompt_history_blob(uuid, bytea)",
+        true,
+    ),
+    // 311: the hypothesis promote route calls it on the request DSN in the
+    // promotion's transaction; without the grant every promotion is 42501
+    // (answered 403 after the status write, and rolled back).
+    (
+        "epigraph_promote_hypothesis_factors",
+        "public.epigraph_promote_hypothesis_factors(uuid)",
         true,
     ),
     // 267: every edge withdrawal on the application role

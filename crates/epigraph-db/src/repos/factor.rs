@@ -596,6 +596,11 @@ impl FactorRepository {
     }
 
     /// Upsert a BP message (factor↔variable, one direction).
+    ///
+    /// Needs a maintenance connection: since migration 311 the application
+    /// role holds no write on `bp_messages` (it has no row security, so an
+    /// application write would steer propagation over any claims), and this
+    /// is refused 42501 there.
     pub async fn upsert_bp_message(
         pool: &PgPool,
         factor_id: Uuid,
@@ -619,6 +624,30 @@ impl FactorRepository {
         .await
         .map_err(crate::DbError::from)?;
         Ok(())
+    }
+
+    /// Move a promoted hypothesis's factors from the `hypothesis_assessment`
+    /// frame to `research_validity`, on the caller's connection (the
+    /// promotion's transaction). Returns the number of factors moved.
+    ///
+    /// Runs migration 311's `epigraph_promote_hypothesis_factors` definer:
+    /// the application role holds no UPDATE on `factors.frame_id`. The
+    /// definer names both frames itself and moves only factors over
+    /// `claim_id`, and it refuses unless the session writes the claim
+    /// (BPF01, 42501) and the claim's `hypothesis_status` is already
+    /// `promoted` (BPF02, 55000), so write the status first.
+    ///
+    /// # Errors
+    /// `DbError` when the definer refuses or the statement fails.
+    pub async fn promote_hypothesis_factors(
+        conn: &mut sqlx::PgConnection,
+        claim_id: Uuid,
+    ) -> Result<i64, crate::DbError> {
+        sqlx::query_scalar::<_, i64>("SELECT public.epigraph_promote_hypothesis_factors($1)")
+            .bind(claim_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(crate::DbError::from)
     }
 
     /// Get all BP messages for a given factor.
@@ -708,6 +737,9 @@ impl FactorRepository {
     }
 
     /// Clear all BP messages (reset before new propagation run).
+    ///
+    /// Needs a maintenance connection (migration 311; refused 42501 on the
+    /// application role, as [`Self::upsert_bp_message`] is).
     pub async fn clear_bp_messages(pool: &PgPool) -> Result<u64, crate::DbError> {
         let result = sqlx::query("DELETE FROM bp_messages")
             .execute(pool)

@@ -46,6 +46,12 @@
 //!   `no_rowless_table_is_app_writable_unless_allowlisted` (`factors` is
 //!   app-writable again and no longer allowlisted). 217's own attack tests are
 //!   in `factors_write_posture.rs`.
+//! * migration 311 (`bp_messages` taken off the application role, backlog
+//!   9a9d6850) removed: fails
+//!   `no_rowless_table_is_app_writable_unless_allowlisted` (`bp_messages` is
+//!   app-writable and unlisted; NO_WRITE finds INSERT, UPDATE and DELETE) and
+//!   `the_app_role_writes_no_bp_message` (the upsert and the clear succeed on
+//!   the application role).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -66,9 +72,6 @@ use uuid::Uuid;
 /// security. One reason per class; migration 118's header names the tables it
 /// closed. A table leaves this list when its privilege is revoked, its writes
 /// move into a definer, or it gains row security.
-const DERIVED_BP: &str = "derived belief-propagation messages: upserted and cleared on the \
-    application role by every propagation run; tenancy for derived rows is a follow-up \
-    (`factors` left this list at migration 217: its writers are maintenance-owned definers)";
 const DERIVED_CLUSTER: &str = "derived clustering / theme / neighbourhood state, rebuilt by \
     jobs and the clusters routes; no credential or authority content";
 const OPERATIONAL: &str = "an operational record the request path writes on the application \
@@ -87,7 +90,6 @@ const COMMUNITY: &str = "rows written by 106's community definer; removal delete
 const ALLOWLIST: &[(&str, &str)] = &[
     ("activities", OPERATIONAL),
     ("agent_spans", OPERATIONAL),
-    ("bp_messages", DERIVED_BP),
     ("claim_themes", DERIVED_CLUSTER),
     ("cluster_centroids", SCRIPT_UPSERT),
     ("cluster_edges", DERIVED_CLUSTER),
@@ -169,6 +171,13 @@ const NO_WRITE: &[&str] = &[
     "author_binding_clients",
     "authorization_votes",
     "authorizers",
+    // Migration 311: belief-propagation messages, written only on a
+    // maintenance connection (`FactorRepository::upsert_bp_message` /
+    // `clear_bp_messages`, the match-candidate retirement); the application
+    // role holds SELECT only. It had no row security, so an application write
+    // steered propagation over any claims. (`factors` left the allowlist at
+    // 217 and holds no application write since 311 either.)
+    "bp_messages",
     "entity_merge_candidates",
     "experiment_entities",
     // Migration 165: written only through maintenance definers; the
@@ -1780,13 +1789,16 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
     assert_eq!(status_of(&pool, id).await, "stale");
 }
 
-/// `bp_messages` stays writable by the application role (it is on the
-/// allowlist): BP-message upsert (INSERT ... ON CONFLICT DO UPDATE, which needs
-/// UPDATE) and the clear before a propagation run. The factor they hang off is
-/// minted by the edge trigger; since migration 217 the application role writes
-/// no factor itself (`factors_write_posture.rs`).
+/// Migration 311 (backlog 9a9d6850): the application role writes no
+/// belief-propagation message. Neither the upsert (INSERT ... ON CONFLICT DO
+/// UPDATE) nor the clear runs on it, nor a direct UPDATE or DELETE of another
+/// writer's message; the same repository calls still run on a maintenance
+/// session, which is where they belong.
+///
+/// Fails on 310 and earlier: 077's grants let the application role upsert,
+/// rewrite and clear any message (the allowlist's old `DERIVED_BP` entry).
 #[sqlx::test(migrations = "../../migrations")]
-async fn bp_message_writes_still_work_on_the_app_role(pool: PgPool) {
+async fn the_app_role_writes_no_bp_message(pool: PgPool) {
     use epigraph_db::FactorRepository;
     let (agent, _) = fixture::seed_agent_with_group(&pool, "w11-bp").await;
     let a = fixture::seed_public_claim(&pool, agent, &format!("w11 bp a {}", Uuid::new_v4())).await;
@@ -1798,10 +1810,12 @@ async fn bp_message_writes_still_work_on_the_app_role(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("the edge trigger minted the factor");
-    let app = app_pool(&pool, 2).await;
+
+    // The maintenance half: the repository's writers run there.
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
     for iteration in [1, 2] {
         FactorRepository::upsert_bp_message(
-            &app,
+            &maint,
             factor,
             a,
             "factor_to_var",
@@ -1809,23 +1823,97 @@ async fn bp_message_writes_still_work_on_the_app_role(pool: PgPool) {
             iteration,
         )
         .await
-        .expect("bp message upsert on the application role");
+        .expect("bp message upsert on a maintenance session");
     }
-    let iteration: i32 = sqlx::query_scalar(
-        "SELECT iteration FROM bp_messages WHERE factor_id = $1 AND variable_id = $2",
-    )
-    .bind(factor)
-    .bind(a)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        iteration, 2,
-        "the second upsert took the ON CONFLICT DO UPDATE arm"
-    );
-    let cleared = FactorRepository::clear_bp_messages(&app)
+    let message = |pool: PgPool| async move {
+        sqlx::query_as::<_, (i32, serde_json::Value)>(
+            "SELECT iteration, message FROM bp_messages WHERE factor_id = $1 AND variable_id = $2",
+        )
+        .bind(factor)
+        .bind(a)
+        .fetch_one(&pool)
         .await
-        .expect("clear on the application role");
+        .expect("read the message")
+    };
+    assert_eq!(
+        message(pool.clone()).await,
+        (2, serde_json::json!([0.6, 0.4])),
+        "CALIBRATION: the second maintenance upsert took the ON CONFLICT DO UPDATE arm"
+    );
+
+    // The application half: every write is refused, and nothing changes.
+    let app = app_pool(&pool, 2).await;
+    let up = FactorRepository::upsert_bp_message(
+        &app,
+        factor,
+        a,
+        "factor_to_var",
+        &serde_json::json!([0.99, 0.01]),
+        3,
+    )
+    .await;
+    assert_eq!(
+        up.as_ref().err().and_then(db_err_code).as_deref(),
+        Some("42501"),
+        "bp message upsert on the application role: {up:?}"
+    );
+    let fresh = FactorRepository::upsert_bp_message(
+        &app,
+        factor,
+        b,
+        "factor_to_var",
+        &serde_json::json!([0.99, 0.01]),
+        1,
+    )
+    .await;
+    assert_eq!(
+        fresh.as_ref().err().and_then(db_err_code).as_deref(),
+        Some("42501"),
+        "a new bp message on the application role: {fresh:?}"
+    );
+    let cleared = FactorRepository::clear_bp_messages(&app).await;
+    assert_eq!(
+        cleared.as_ref().err().and_then(db_err_code).as_deref(),
+        Some("42501"),
+        "the clear on the application role: {cleared:?}"
+    );
+    let r = sqlx::query("UPDATE bp_messages SET message = '[1.0, 0.0]' WHERE factor_id = $1")
+        .bind(factor)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "UPDATE bp_messages");
+    let r = sqlx::query("DELETE FROM bp_messages WHERE factor_id = $1")
+        .bind(factor)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "DELETE bp_messages");
+    let r = sqlx::query("TRUNCATE bp_messages").execute(&app).await;
+    assert_eq!(
+        sqlstate(r).as_deref(),
+        Some("42501"),
+        "TRUNCATE bp_messages"
+    );
+    assert_eq!(
+        message(pool.clone()).await,
+        (2, serde_json::json!([0.6, 0.4])),
+        "the message is exactly as the maintenance session wrote it"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM bp_messages WHERE factor_id = $1")
+        .bind(factor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "no message was added");
+    let read: i64 = sqlx::query_scalar("SELECT count(*) FROM bp_messages WHERE factor_id = $1")
+        .bind(factor)
+        .fetch_one(&app)
+        .await
+        .expect("the application role still reads bp_messages");
+    assert_eq!(read, 1);
+
+    let cleared = FactorRepository::clear_bp_messages(&maint)
+        .await
+        .expect("the clear on a maintenance session");
     assert!(cleared >= 1);
 }
 
