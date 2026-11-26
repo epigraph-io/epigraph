@@ -269,6 +269,12 @@ pub struct ScratchAtom {
     pub about: Vec<Uuid>,
     pub turn: u64,
     pub epoch: u64,
+    /// When the turn happened in the conversation (RFC 3339, UTC,
+    /// milliseconds), as the runner's turn record says; absent when unknown.
+    /// `created_at` is when the graph stored the atom, which for a replayed
+    /// or lazily extracted turn can be much later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
     pub created_at: String,
     pub is_current: bool,
     pub superseded_by: Option<Uuid>,
@@ -300,6 +306,9 @@ pub struct NewAtom {
     pub about: Vec<Uuid>,
     pub turn: u64,
     pub epoch: u64,
+    /// RFC 3339 time of the turn; stored normalised to UTC milliseconds.
+    #[serde(default)]
+    pub at: Option<String>,
     /// Copied into every evidence entry that has no quote of its own.
     #[serde(default)]
     pub quote: Option<String>,
@@ -444,6 +453,13 @@ fn validate_evidence(evidence: &[Evidence]) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+/// Normalise an RFC 3339 time to the stored form (UTC, milliseconds).
+fn normalise_at(at: &str) -> Result<String, StoreError> {
+    DateTime::parse_from_rfc3339(at.trim())
+        .map(|t| timestamp(t.with_timezone(&Utc)))
+        .map_err(|_| StoreError::InvalidValue("at"))
 }
 
 fn valid_name(name: &str) -> bool {
@@ -794,11 +810,12 @@ impl ScratchStore {
                 return Err(StoreError::InvalidValue("about"));
             }
             validate_evidence(&atom.evidence)?;
-            checked.push(validate_seed(atom.seed)?);
+            let at = atom.at.as_deref().map(normalise_at).transpose()?;
+            checked.push((validate_seed(atom.seed)?, at));
         }
         let mut outcome = BatchOutcome::default();
         let created_at = timestamp(now);
-        for (atom, (confidence, reliability)) in atoms.into_iter().zip(checked) {
+        for (atom, ((confidence, reliability), at)) in atoms.into_iter().zip(checked) {
             if self.atoms.contains_key(&atom.id) {
                 outcome.existing += 1;
                 continue;
@@ -824,6 +841,7 @@ impl ScratchStore {
                     about: dedup_ids(atom.about),
                     turn: atom.turn,
                     epoch: atom.epoch,
+                    at,
                     created_at: created_at.clone(),
                     is_current: true,
                     superseded_by: None,

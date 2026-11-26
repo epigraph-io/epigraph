@@ -186,6 +186,7 @@ impl FileInV1 {
                 about: Vec::new(),
                 turn: a.turn,
                 epoch: a.epoch,
+                at: None,
                 created_at: a.created_at,
                 is_current: a.is_current,
                 superseded_by: a.superseded_by,

@@ -60,6 +60,7 @@ fn atom(n: u128, turn: u64, confidence: f64, reliability: f64) -> NewAtom {
         about: vec![],
         turn,
         epoch: 0,
+        at: None,
         quote: None,
         evidence: vec![Evidence {
             path: format!("turns/{turn}.json"),

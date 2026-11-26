@@ -135,6 +135,9 @@ pub struct DigestItem<'a> {
     pub speaker_agent: Uuid,
     pub role: AgentRole,
     pub turn: u64,
+    /// When the turn happened in the conversation, if the runner said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<&'a str>,
     pub bel: f64,
     pub pl: f64,
     pub betp: f64,
@@ -234,6 +237,7 @@ fn item<'a>(
         speaker_agent: atom.speaker_agent,
         role,
         turn: atom.turn,
+        at: atom.at.as_deref(),
         bel: belief.bel,
         pl: belief.pl,
         betp: belief.betp,

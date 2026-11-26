@@ -30,7 +30,7 @@
 //! | `put_agents` | `agents: [{id,display_name,role,aliases?}]` | `inserted`, `existing`, `updated` |
 //! | `relate` | `relations: [{id,source,target,kind,turn}]` | `inserted`, `existing` |
 //! | `agents` | — | `agents: [{id,display_name,role,aliases}]` |
-//! | `put_atoms` | `atoms: [{id,text,kind,speaker_agent,about?,turn,epoch,quote?,evidence?,seed:{confidence,reliability}}]` | `inserted`, `existing` |
+//! | `put_atoms` | `atoms: [{id,text,kind,speaker_agent,about?,turn,epoch,at?,quote?,evidence?,seed:{confidence,reliability}}]` | `inserted`, `existing` |
 //! | `corroborate` | `corroboration_id`, `target`, `seed`, `evidence`? | `applied` |
 //! | `add_edges` | `edges: [{id,source,target,rel}]` | `inserted`, `existing` |
 //! | `supersede` | `old`, `new`, `reason`? | `changed` |
@@ -62,6 +62,11 @@
 //! (`unknown_agent`), so the runner sends `put_agents` before `put_atoms`.
 //! `speaker` in a `candidates` or `digest` item is the speaker agent's display
 //! name, which is chat text like the atom's own.
+//!
+//! An atom's `at` is the conversation time of its turn (RFC 3339; stored in
+//! UTC with milliseconds), carried into every `digest` item, so a question
+//! about when something happened does not depend on the extractor having
+//! written the date into the text. An unparsable `at` is `invalid_value`.
 //!
 //! Belief ([`super::belief`]) is derived from the stored graph on every read
 //! and never stored, so `update_belief` writes nothing: it recomputes belief

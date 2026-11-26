@@ -388,8 +388,10 @@ fn digest_over_stdio_lists_only_evicted_applied_atoms() {
     let mut s = Scratch::spawn(&dir.graph(), 0);
     // `atom` makes decisions: every one is a standing-slice candidate.
     speak(&mut s);
+    let mut dated = atom(1, 2, "The pilot uses v2 probes.");
+    dated["at"] = json!("2023-05-08T13:56:00Z");
     s.ok(json!({"id": 1, "op": "put_atoms", "atoms": [
-        atom(1, 2, "The pilot uses v2 probes."),
+        dated,
         atom(2, 3, "Pending turn decision about probes."),
         atom(3, 9, "Window turn decision about probes."),
     ]}));
@@ -407,6 +409,8 @@ fn digest_over_stdio_lists_only_evicted_applied_atoms() {
     assert_eq!(d["relevant"][0]["id"], uuid(1), "{d}");
     assert!(d["relevant"][0]["score"].is_f64(), "{d}");
     assert_eq!(d["standing"][0]["evidence"][0]["path"], "turns/2.json");
+    assert_eq!(d["standing"][0]["at"], "2023-05-08T13:56:00.000Z", "{d}");
+    assert_eq!(d["standing"][0]["speaker"], "Dana", "{d}");
     assert_eq!(
         (d["eligible"].clone(), d["turns_archived"].clone()),
         (json!(1), json!(1))

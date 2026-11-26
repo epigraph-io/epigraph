@@ -85,6 +85,8 @@ fn new_atom(n: u128, turn: u64, text: &str, confidence: f64) -> NewAtom {
         about: vec![],
         turn,
         epoch: 4,
+        // Every other atom carries an offset conversation time, stored in UTC.
+        at: (n % 2 == 1).then(|| format!("2023-05-0{n}T13:56:00.5+02:00")),
         quote: Some(text.chars().take(12).collect()),
         evidence: vec![Evidence {
             path: format!("turns/{turn}.json"),

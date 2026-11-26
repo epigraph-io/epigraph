@@ -43,6 +43,7 @@ fn atom(n: u128, speaker: &str, about: &[&str]) -> NewAtom {
         about: about.iter().map(|a| agent_id(SCOPE, a)).collect(),
         turn: 1,
         epoch: 0,
+        at: None,
         quote: None,
         evidence: vec![Evidence {
             path: "turns/1.json".into(),

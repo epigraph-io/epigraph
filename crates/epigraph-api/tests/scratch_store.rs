@@ -74,6 +74,7 @@ fn atom(n: u128, turn: u64, text: &str, confidence: f64) -> NewAtom {
         about: vec![],
         turn,
         epoch: 0,
+        at: None,
         quote: Some(format!("anchor {n}")),
         evidence: vec![ev(turn, 'a')],
         seed: seed(confidence),
@@ -535,4 +536,32 @@ fn candidates_rank_by_bm25_then_fill_with_recent_atoms() {
         none.iter().map(|x| x.atom.id).collect::<Vec<_>>(),
         vec![id(24), id(23)]
     );
+}
+
+#[test]
+fn an_atom_keeps_its_turns_conversation_time_in_utc_and_a_bad_time_refuses_the_batch() {
+    let mut s = with_speaker(ScratchStore::new(SCOPE, 0, t(0)));
+    let mut dated = atom(1, 2, "Batch B-17 shipped.", 0.5);
+    dated.at = Some("2023-05-08T13:56:00+02:00".into());
+    let undated = atom(2, 2, "Batch B-18 is late.", 0.5);
+    s.put_atoms(vec![dated, undated], t(1)).unwrap();
+    assert_eq!(
+        s.atom(&id(1)).unwrap().at.as_deref(),
+        Some("2023-05-08T11:56:00.000Z")
+    );
+    assert_eq!(s.atom(&id(2)).unwrap().at, None);
+    // created_at is when the graph stored it, not when the turn happened.
+    assert_eq!(
+        s.atom(&id(1)).unwrap().created_at,
+        "2026-09-21T14:13:21.000Z"
+    );
+
+    let before = s.clone();
+    let mut bad = atom(3, 3, "A third atom.", 0.5);
+    bad.at = Some("8 May, 2023".into());
+    assert_eq!(
+        s.put_atoms(vec![atom(4, 3, "A fourth atom.", 0.5), bad], t(2)),
+        Err(StoreError::InvalidValue("at"))
+    );
+    assert_eq!(s, before);
 }

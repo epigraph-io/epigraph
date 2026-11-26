@@ -69,6 +69,7 @@ fn seeded(
         about: vec![],
         turn,
         epoch: 0,
+        at: None,
         quote: None,
         evidence: vec![Evidence {
             path: format!("turns/{turn}.json"),
