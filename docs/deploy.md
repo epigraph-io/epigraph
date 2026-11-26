@@ -65,7 +65,7 @@ The four logins:
 | **API login** (`epigraph_api_login`) | you: a `LOGIN` role that is a member of `epigraph_app`, with `SET role = 'epigraph_app'` as its default (step 4) | Nothing of its own: it inherits `epigraph_app`'s grants, and every session starts as `epigraph_app`, so row security and the API's posture checks see the application role. Give every other request process (each MCP unit) a login of its own made the same way, so each credential can be rotated and traced alone. |
 | **maintenance login** | you: a login role that is a member of `epigraph_maintenance` | `epigraph_bypass()` is true on it, so it can do cross-tenant maintenance. It must be a NON-superuser with no CREATE on schema `public`. |
 | **`epigraph_bba_guard_owner`** | migration 251 creates the role `NOLOGIN`, a member of no role. **Never grant it to anything** (not even with ADMIN OPTION only), and never give it LOGIN | Owns the three functions of the retracted-BBA grant ledger (`mass_function_purge_grants`) and alone writes it, so no session deletes or un-retracts a retracted BBA without a ledger row naming its login and the row. Audit: `SELECT public.epigraph_bba_guard_owner_faults();` returns `{}` (`epigraph-tenancy-backfill verify` runs it); it names any role that can become it or write the ledger, any non-superuser CREATEROLE role, and anything it holds that it must not. |
-| **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | USAGE on schema `public`, EXECUTE on agent-identity registration (161) and on the role-attachment question `epigraph_role_agent_may_run` (166), nothing else. Needed only if a host registers agent identities (section 9). |
+| **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | USAGE on schema `public`, EXECUTE on agent-identity registration (161) and on the role-attachment question `epigraph_role_agent_may_run` (166), nothing else. Needed only if a host registers agent identities (section 9). **Never grant it to another role** (not even with ADMIN OPTION only), and run no non-superuser CREATEROLE role beside it: `SELECT public.epigraph_identity_attestor_faults();` returns `{}` (`epigraph-tenancy-backfill verify` runs it; migration 350). |
 
 Migration 060 also creates `epigraph_seed` (`NOLOGIN`), the fixture escape
 hatch of migration 074. Nothing connects as it in production, and no
@@ -2601,8 +2601,11 @@ application DSN, so registration is gated on the connection's ROLE:
 * **Check it** at any time, on the maintenance DSN:
   `SELECT public.epigraph_identity_attestor_faults();`. It must return `{}`.
   It lists any elevated attribute, any membership of the attestor's own, and
-  any other non-superuser role that can act as it. The migration raises on
-  any fault if the role already exists.
+  any other non-superuser role that can act as it or make itself able to:
+  from migration 350, a member of it in any form (an ADMIN-only grant
+  included), a holder of ADMIN OPTION on it, and any non-superuser
+  CREATEROLE role. Migrations 161 and 350 raise on any fault if the role
+  already exists, and `epigraph-tenancy-backfill verify` reports each one.
 * **If migration 161 could not create the role** (no CREATEROLE), it says so
   and skips the attestor grant. Create the role and grant it, as a superuser
   or the owner:
