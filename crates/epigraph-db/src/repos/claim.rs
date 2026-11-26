@@ -5143,10 +5143,15 @@ impl ClaimRepository {
     ///
     /// ## Residual, recorded rather than fixed
     ///
-    /// The page is now a function of the data within one execution and across
-    /// executions, with one timing-dependent exception: the exact retry below
-    /// runs under a timeout, so if it finishes for one page of a walk and
-    /// times out for another, those pages rank different dense pools.
+    /// The lexical leg's cut is now a function of the data alone. The dense
+    /// leg's is too on the exact pass; on the HNSW pass it is a function of
+    /// the rows the approximate index reaches, and which members of a group of
+    /// identical vectors it reaches depends on the graph's construction
+    /// (insertion history), not on the data alone. The tie order among the
+    /// rows it does reach is by id. One further exception is timing: the
+    /// exact retry below runs under a timeout, so if it finishes for one page
+    /// of a walk and times out for another, those pages rank different dense
+    /// pools.
     ///
     /// ## The dense leg runs with pgvector's iterative HNSW scan (fdd8e494)
     ///
