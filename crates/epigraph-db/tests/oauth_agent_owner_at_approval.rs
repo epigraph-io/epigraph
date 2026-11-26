@@ -17,7 +17,11 @@
 //!   row already holds, and the three-argument approval cannot activate an
 //!   ownerless agent (23514); nothing changes on either refusal;
 //! * a named owner is another, active client;
-//! * a non-agent client approves with no owner named and keeps its owner;
+//! * a non-agent client approves with no owner named and keeps its owner, and
+//!   is refused one (22023, nothing changed);
+//! * on a database at 311, 312 clears the owner of a pending agent
+//!   `/oauth/register` wrote (agent_id NULL), audited, and of no other row;
+//!   the three-argument approval then cannot activate it (23514);
 //! * the CHECK: only an ACTIVE agent needs an owner;
 //! * the new definer is a maintenance act (owner, path, no PUBLIC or
 //!   application EXECUTE);
@@ -357,6 +361,110 @@ async fn a_non_agent_approval_keeps_its_owner_when_none_is_named(pool: PgPool) {
         ("active".to_string(), None, scopes(&["claims:read"]), 1)
     );
     assert_eq!(state(&pool, owned_service).await.1, Some(owner));
+}
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// Run every migration below 312 (or, with `None`, the rest) on one
+/// connection, then reset it: 001's pg_dump header leaves session-level SETs
+/// behind.
+async fn migrate(pool: &PgPool, below: Option<i64>) {
+    use sqlx::Executor;
+    let m = match below {
+        Some(v) => sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                MIGRATOR
+                    .migrations
+                    .iter()
+                    .filter(|m| m.version < v)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        },
+        None => sqlx::migrate::Migrator {
+            migrations: MIGRATOR.migrations.clone(),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        },
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    m.run(&mut *conn).await.expect("migrate");
+    conn.execute("RESET ALL").await.expect("RESET ALL");
+}
+
+/// 312 (c), on a database that holds what 311 deployments hold: the PENDING
+/// agent `/oauth/register` wrote (no `agent_id`, the oldest human guessed as
+/// its owner) loses that owner, with one `oauth.client_owner_cleared` row
+/// keeping the previous one; a pending agent `POST /api/v1/agents` created
+/// (its `agent_id` set, its creator as owner), an ACTIVE agent and a pending
+/// service keep theirs. After 312 the three-argument approval (an older CLI,
+/// a hand-written `SELECT`) cannot activate the cleared row (23514), where
+/// before it would have activated it with the guessed owner.
+///
+/// Mutation probes: without (c) the cleared row keeps the oldest human and
+/// the three-argument approval activates it; without `agent_id IS NULL` the
+/// `POST /api/v1/agents` row is cleared too; reading the previous owner from
+/// `RETURNING` (the updated row) records NULL as `previous_owner_id`.
+#[sqlx::test(migrations = false)]
+async fn migration_312_clears_the_guessed_owner_of_pending_self_registered_agents(pool: PgPool) {
+    migrate(&pool, Some(312)).await;
+    let oldest_human = client(&pool, "human", "active", None, 30).await;
+    let creator = client(&pool, "service", "active", None, 10).await;
+    // `/oauth/register`'s agent arm before this change.
+    let registered = client(&pool, "agent", "pending", Some(oldest_human), 0).await;
+    // `POST /api/v1/agents`: the agent it created, its creator as owner.
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "o312 provisioned").await;
+    let provisioned = client(&pool, "agent", "pending", Some(creator), 0).await;
+    sqlx::query("UPDATE oauth_clients SET agent_id = $2 WHERE id = $1")
+        .bind(provisioned)
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .expect("link the provisioned client");
+    // Already approved before 312 (not 312's to re-own), and a service.
+    let active = client(&pool, "agent", "active", Some(oldest_human), 0).await;
+    let service = client(&pool, "service", "pending", Some(creator), 0).await;
+
+    migrate(&pool, None).await;
+
+    assert_eq!(
+        state(&pool, registered).await,
+        ("pending".to_string(), None, vec![], 0)
+    );
+    let cleared: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'oauth.client_owner_cleared' \
+          ORDER BY created_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    assert_eq!(cleared[0]["oauth_client_id"], serde_json::json!(registered));
+    assert_eq!(
+        cleared[0]["previous_owner_id"],
+        serde_json::json!(oldest_human)
+    );
+    assert_eq!(cleared[0]["migration"], serde_json::json!(312));
+    assert_eq!(state(&pool, provisioned).await.1, Some(creator));
+    assert_eq!(state(&pool, active).await.1, Some(oldest_human));
+    assert_eq!(state(&pool, service).await.1, Some(creator));
+
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    let r = sqlx::query_scalar::<_, bool>(APPROVE3)
+        .bind(registered)
+        .bind(scopes(&["claims:read"]))
+        .bind(None::<Uuid>)
+        .fetch_one(&maint)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("23514"));
+    assert_eq!(
+        state(&pool, registered).await,
+        ("pending".to_string(), None, vec![], 0)
+    );
 }
 
 /// 312's CHECK: an ACTIVE agent has an owner; a pending, suspended or revoked

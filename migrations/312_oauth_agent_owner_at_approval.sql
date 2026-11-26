@@ -62,13 +62,30 @@
 --     and function schema-qualified; owned by `epigraph_maintenance`; no
 --     EXECUTE for PUBLIC or `epigraph_app` (188's rule: approval is a
 --     maintenance act).
+-- (c) Every PENDING agent client `/oauth/register` wrote before 312 loses
+--     the owner that registration guessed: `owner_id` becomes NULL, and one
+--     `oauth.client_owner_cleared` security event per row records the
+--     cleared `previous_owner_id`. Those rows are told apart exactly:
+--     `/oauth/register` creates an agent client with `agent_id` NULL, and
+--     `POST /api/v1/agents` (the only other creator of an agent client)
+--     always passes the agent it created; a client's `agent_id` is linked
+--     only at its first token mint, which a pending client never reaches,
+--     and nothing moves a client back to `pending`. A pending client never
+--     held a token, so clearing its owner revokes nothing. Without (c), 118's
+--     three-argument approval (an older CLI, a hand-written `SELECT`) on one
+--     of those rows would activate it with the guessed owner, which is the
+--     defect itself; with it, that approval fails on the CHECK (23514).
 --
 -- NOT CHANGED: 118's three-argument definer keeps its 224 body, owner and
 -- ACL (224's ratchet pins it). For an ownerless agent it now fails on the
--- CHECK (23514, nothing changed): fail closed. No existing row is touched:
--- an agent already approved with the oldest human as its owner keeps it (SQL
--- cannot tell such a row from an agent `POST /api/v1/agents` provisioned with
--- its creator as owner); re-owning those is an operator decision.
+-- CHECK (23514, nothing changed): fail closed. For a pending agent
+-- `POST /api/v1/agents` created, it keeps that row's owner (the creating
+-- client, which is legitimate). An agent ALREADY ACTIVE with the oldest human
+-- as its owner keeps it: the CHECK refuses an active ownerless agent, and
+-- which client should answer for it is an operator's decision (re-owning an
+-- active client has no verb yet). Such rows can be counted: an active agent
+-- client whose `agent_id` is NULL or links a `derived` placeholder agent was
+-- self-registered (`POST /api/v1/agents` links a real key at creation).
 --
 -- ===================================================================
 -- 3. DEPLOY ORDER
@@ -77,11 +94,15 @@
 -- agent with `owner_id = NULL`, which 001's CHECK refuses (every agent
 -- registration a 500). An older API runs on 312 unchanged. The operator
 -- CLI's `approve-client` of this change calls the four-argument definer
--- (42883 below 312); an older CLI, or a hand-written three-argument
--- `SELECT`, on 312 cannot activate an ownerless agent (23514).
+-- (42883 below 312). Approve agents with the four-argument form only: an
+-- older CLI, or a hand-written three-argument `SELECT`, on 312 cannot
+-- activate an ownerless agent (23514), and for an agent that has an owner it
+-- keeps that owner without anyone naming it.
 --
 -- UNDO: `docs/runbooks/312-undo.sql` (drops the overload, restores 001's
--- CHECK; refuses while an agent row has no owner).
+-- CHECK; refuses while an agent row has no owner, including the rows (c)
+-- cleared, whose previous owners are in their `oauth.client_owner_cleared`
+-- rows).
 -- ===================================================================
 
 SET LOCAL lock_timeout = '3s';
@@ -110,6 +131,35 @@ ALTER TABLE public.oauth_clients ADD CONSTRAINT agents_must_have_owner
     CHECK (((client_type)::text <> 'agent'::text)
            OR (owner_id IS NOT NULL)
            OR ((status)::text <> 'active'::text));
+
+-- -------------------------------------------------------------------
+-- (c) Pending self-registered agents lose the owner their registration
+--     guessed (after (a): 001's CHECK would refuse the NULL). The previous
+--     owner is read BEFORE the UPDATE (`RETURNING` sees the new row) and
+--     kept in one append-only security event per row.
+-- -------------------------------------------------------------------
+WITH guessed AS (
+    SELECT c.id, c.owner_id
+      FROM public.oauth_clients c
+     WHERE c.client_type = 'agent'
+       AND c.status = 'pending'
+       AND c.agent_id IS NULL
+       AND c.owner_id IS NOT NULL
+       FOR UPDATE
+), cleared AS (
+    UPDATE public.oauth_clients o
+       SET owner_id = NULL, updated_at = pg_catalog.now()
+      FROM guessed g
+     WHERE o.id = g.id
+    RETURNING o.id, g.owner_id AS previous_owner_id
+)
+INSERT INTO public.security_events (event_type, agent_id, success, details)
+SELECT 'oauth.client_owner_cleared', NULL, true,
+       pg_catalog.jsonb_build_object('oauth_client_id', x.id,
+                                     'previous_owner_id', x.previous_owner_id,
+                                     'reason', 'owner guessed at /oauth/register (backlog be024524)',
+                                     'migration', 312)
+  FROM cleared x;
 
 -- -------------------------------------------------------------------
 -- (b) The approval that names the owner.

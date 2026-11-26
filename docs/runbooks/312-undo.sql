@@ -14,8 +14,12 @@
 -- its status).
 --
 -- REFUSES (55000, nothing changed) while any agent client has no owner (the
--- rows 312's registration wrote and nobody approved): 001's CHECK cannot be
--- restored over them. List them with
+-- rows 312's registration wrote and nobody approved, and the pending rows
+-- 312 itself cleared): 001's CHECK cannot be restored over them. A cleared
+-- row's previous owner is in its 312 security event:
+--   SELECT details->>'oauth_client_id', details->>'previous_owner_id'
+--     FROM security_events WHERE event_type = 'oauth.client_owner_cleared';
+-- List the ownerless rows with
 --   SELECT id, client_id, client_name, status, created_at FROM oauth_clients
 --    WHERE client_type = 'agent' AND owner_id IS NULL;
 -- and give each an owner first (or delete one that was never approved: a
