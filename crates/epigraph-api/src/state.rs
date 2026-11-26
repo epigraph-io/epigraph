@@ -896,8 +896,8 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // that migration, on the same precedent. Apply 246 before or with a binary
     // carrying this name.
     "papers",
-    // Enriched harvester concepts (313, backlog f214b84e): given tenancy
-    // columns and FORCEd by that migration, on the same precedent. Apply 313
+    // Enriched harvester concepts (347, backlog f214b84e): given tenancy
+    // columns and FORCEd by that migration, on the same precedent. Apply 347
     // before or with a binary carrying this name.
     "harvester_enriched_concepts",
 ];

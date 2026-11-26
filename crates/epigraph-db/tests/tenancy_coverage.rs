@@ -44,7 +44,7 @@
 //!
 //! `harvester_enriched_concepts` is in the harvester pipeline too but has no
 //! foreign key in or out, so neither the generators nor the FK-neighbour rule
-//! reach it. Migration 313 (backlog f214b84e) gives it the same posture, and
+//! reach it. Migration 347 (backlog f214b84e) gives it the same posture, and
 //! `the_harvester_neighbours_carry_the_fragment_row_security` names it
 //! explicitly so that posture is pinned rather than unreachable.
 //!
@@ -474,7 +474,7 @@ async fn every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt(pool: Pg
 /// role reads both tables and writes neither (118 section 6).
 /// `harvester_tenancy.rs` is the behavioural half, as `epigraph_app`.
 ///
-/// Migration 313 (backlog f214b84e) gives `harvester_enriched_concepts`, the
+/// Migration 347 (backlog f214b84e) gives `harvester_enriched_concepts`, the
 /// parentless harvester table no generator or FK rule reaches, the same
 /// posture; it is compared here too, together with both tenancy columns NOT
 /// NULL and the absence of a registry row, which no other test would check

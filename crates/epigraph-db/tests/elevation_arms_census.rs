@@ -198,7 +198,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     ),
     (
         "harvester_enriched_concepts",
-        "harvester pipeline (313): the application writes no row (118 section 6), and no \
+        "harvester pipeline (347): the application writes no row (118 section 6), and no \
          elevated read arm is added, so an elevated session reads only what its tenancy admits",
     ),
     (

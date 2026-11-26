@@ -1,4 +1,4 @@
--- 313: bring harvester_enriched_concepts under tenancy (backlog f214b84e),
+-- 347: bring harvester_enriched_concepts under tenancy (backlog f214b84e),
 -- the posture migration 173 gave the other harvester tables.
 --
 -- EVIDENCE
@@ -57,7 +57,7 @@
 -- table exists and is not FORCEd (`rls_verdict`'s partial-FORCE refusal); an
 -- older binary on a migrated database is unaffected (it writes no concept).
 --
--- UNDO: `docs/runbooks/313-undo.sql`.
+-- UNDO: `docs/runbooks/347-undo.sql`.
 SET LOCAL lock_timeout = '3s';
 
 -- ===================================================================
@@ -78,7 +78,7 @@ BEGIN
         IF (r.column_name = 'owner_group_id' AND r.data_type <> 'uuid')
         OR (r.column_name = 'visibility' AND r.data_type <> 'character varying') THEN
             RAISE EXCEPTION 'public.harvester_enriched_concepts.% already exists as %, a '
-                            'shape 313 did not create. Reconcile by hand, then re-run.',
+                            'shape 347 did not create. Reconcile by hand, then re-run.',
                 r.column_name, r.data_type;
         END IF;
     END LOOP;

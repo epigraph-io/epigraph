@@ -1,5 +1,5 @@
 //! `harvester_enriched_concepts` is under tenancy, with the row security of
-//! the tier-A `harvester_fragments` (migration 313, backlog f214b84e).
+//! the tier-A `harvester_fragments` (migration 347, backlog f214b84e).
 //!
 //! # What is measured
 //!
@@ -11,8 +11,8 @@
 //! `harvester_sources`'s (173), not `harvester_audit_reports`'s: a writer
 //! declares both columns or the INSERT is refused, and an `epigraph_app`
 //! session reads a row only when it is public or owned by one of the
-//! session's groups. Rows written before 313 had no owner to derive, and every
-//! reader read them; 313 stamps them `('public', world)`, which is what every
+//! session's groups. Rows written before 347 had no owner to derive, and every
+//! reader read them; 347 stamps them `('public', world)`, which is what every
 //! reader saw (246's precedent for `papers`), so nothing becomes more or less
 //! readable on upgrade.
 //!
@@ -39,7 +39,7 @@ use uuid::Uuid;
 use viewer_fixture as fixture;
 
 /// The migration under test.
-const MIGRATION: i64 = 313;
+const MIGRATION: i64 = 347;
 
 /// Bind the three session GUCs on a connection, the way `ScopedPool` does.
 async fn set_gucs(conn: &mut sqlx::PgConnection, groups: &str, principal: &str) {
@@ -258,7 +258,7 @@ async fn an_undeclared_concept_is_refused(pool: PgPool) {
 }
 
 // ===========================================================================
-// Migration 313 on a database that already holds concepts
+// Migration 347 on a database that already holds concepts
 // ===========================================================================
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -291,23 +291,23 @@ async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
         .expect("RESET ALL");
 }
 
-/// Rows written before 313 have no parent to derive an owner from, and every
-/// application session read them. 313 stamps them `('public', world)`, so
+/// Rows written before 347 have no parent to derive an owner from, and every
+/// application session read them. 347 stamps them `('public', world)`, so
 /// after the upgrade a stranger still reads them (nothing narrowed without an
 /// owner to narrow to) and the row carries a declared pair, NOT NULL. The
-/// cut is "every migration below 313", not a fixed predecessor, so the test
+/// cut is "every migration below 347", not a fixed predecessor, so the test
 /// holds whichever lower slots land first.
 #[sqlx::test(migrations = false)]
-async fn migration_313_stamps_existing_concepts_with_what_every_reader_saw(pool: PgPool) {
+async fn migration_347_stamps_existing_concepts_with_what_every_reader_saw(pool: PgPool) {
     migrate(&pool, &migrator_where(|v| v < MIGRATION)).await;
     assert!(
         !has_tenancy_columns(&pool).await,
         "CALIBRATION: the table already carries tenancy columns below {MIGRATION}, so this \
          test does not measure the upgrade"
     );
-    let (_a, group_a) = fixture::seed_agent_with_group(&pool, "hec-313").await;
-    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "hec-313-x").await;
-    // Written below 313, so `seed_concept` takes its undeclared arm.
+    let (_a, group_a) = fixture::seed_agent_with_group(&pool, "hec-347").await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "hec-347-x").await;
+    // Written below 347, so `seed_concept` takes its undeclared arm.
     let old = seed_concept(&pool, group_a, "group").await;
 
     migrate(&pool, &MIGRATOR).await;
@@ -342,15 +342,15 @@ async fn migration_313_stamps_existing_concepts_with_what_every_reader_saw(pool:
     );
 }
 
-/// `docs/runbooks/313-undo.sql` refuses while a concept is group-private (a
-/// pre-313 schema would publish it) and changes nothing; once no private
-/// concept is left it returns the table to its pre-313 shape: no tenancy
-/// columns, no row security, no 313 trigger or policy, rows kept. A second
+/// `docs/runbooks/347-undo.sql` refuses while a concept is group-private (a
+/// pre-347 schema would publish it) and changes nothing; once no private
+/// concept is left it returns the table to its pre-347 shape: no tenancy
+/// columns, no row security, no 347 trigger or policy, rows kept. A second
 /// run is a no-op, not an error on the dropped column.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_313_undo_refuses_over_a_private_concept_then_restores_the_old_shape(pool: PgPool) {
+async fn the_347_undo_refuses_over_a_private_concept_then_restores_the_old_shape(pool: PgPool) {
     use sqlx::Executor;
-    const UNDO: &str = include_str!("../../../docs/runbooks/313-undo.sql");
+    const UNDO: &str = include_str!("../../../docs/runbooks/347-undo.sql");
     let (_a, group_a) = fixture::seed_agent_with_group(&pool, "hec-undo").await;
     let private = seed_concept(&pool, group_a, "group").await;
     let public = seed_concept(&pool, group_a, "public").await;
@@ -406,7 +406,7 @@ async fn the_313_undo_refuses_over_a_private_concept_then_restores_the_old_shape
     .fetch_one(&pool)
     .await
     .expect("policy and trigger count");
-    assert_eq!(leftovers, 0, "no 313 policy or trigger survives the undo");
+    assert_eq!(leftovers, 0, "no 347 policy or trigger survives the undo");
     let kept: i64 =
         sqlx::query_scalar("SELECT count(*) FROM harvester_enriched_concepts WHERE id = $1")
             .bind(public)
@@ -424,9 +424,9 @@ async fn the_313_undo_refuses_over_a_private_concept_then_restores_the_old_shape
 /// publish every other group's concept. The runbook must refuse it first
 /// (42501) and change nothing.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_313_undo_refuses_an_owner_that_cannot_read_every_concept(pool: PgPool) {
+async fn the_347_undo_refuses_an_owner_that_cannot_read_every_concept(pool: PgPool) {
     use sqlx::Executor;
-    const UNDO: &str = include_str!("../../../docs/runbooks/313-undo.sql");
+    const UNDO: &str = include_str!("../../../docs/runbooks/347-undo.sql");
     let (_a, group_a) = fixture::seed_agent_with_group(&pool, "hec-undo-owner").await;
     let private = seed_concept(&pool, group_a, "group").await;
 
@@ -492,7 +492,7 @@ async fn the_313_undo_refuses_an_owner_that_cannot_read_every_concept(pool: PgPo
     assert_eq!(db.code().as_deref(), Some("42501"), "{err}");
     assert!(
         db.message()
-            .contains("313-undo: run as the maintenance role or a superuser"),
+            .contains("347-undo: run as the maintenance role or a superuser"),
         "refused by the runbook's own guard, not by a missing privilege: {err}"
     );
     assert!(
