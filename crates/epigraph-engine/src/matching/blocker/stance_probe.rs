@@ -25,9 +25,54 @@ use uuid::Uuid;
 /// Probe texts per seed, at most: one directional inversion and one negation.
 pub const MAX_PROBES_PER_SEED: usize = 2;
 
-/// Texts per `batch_generate` call. Below the provider's batch ceiling, and
-/// small enough that one request stays well inside its per-request token budget.
+/// Texts per `batch_generate` call, at most. Below the provider's batch ceiling.
 const EMBED_CHUNK: usize = 64;
+
+/// Upper bound on the input tokens of one `batch_generate` call, enforced by
+/// [`embed_chunks`]. Kept well below the provider's per-request input cap: a
+/// chunk of long seeds that exceeded that cap would be refused outright and,
+/// because an embedding failure aborts the run, would fail the whole sweep.
+const EMBED_CHUNK_TOKEN_BUDGET: usize = 200_000;
+
+/// Per-text token ceiling the embedding provider truncates every input to.
+const PROVIDER_MAX_TOKENS_PER_TEXT: usize =
+    epigraph_embeddings::tokenizer::DEFAULT_OPENAI_MAX_TOKENS;
+
+/// An upper bound on the tokens `text` is sent as. A byte-level BPE token
+/// covers at least one byte, so the token count never exceeds the byte length,
+/// and the provider clips each text to [`PROVIDER_MAX_TOKENS_PER_TEXT`].
+fn token_upper_bound(text: &str) -> usize {
+    text.len().min(PROVIDER_MAX_TOKENS_PER_TEXT)
+}
+
+/// Split `0..texts.len()` into contiguous, in-order, non-empty ranges, each of
+/// at most `max_texts` texts and (unless a single text alone exceeds it) at
+/// most `token_budget` by [`token_upper_bound`]. Contiguity matters: callers
+/// zip each range's vectors back onto the same slice of `texts`.
+fn embed_chunks<S: AsRef<str>>(
+    texts: &[S],
+    max_texts: usize,
+    token_budget: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let max_texts = max_texts.max(1);
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut tokens = 0;
+    for (i, t) in texts.iter().enumerate() {
+        let bound = token_upper_bound(t.as_ref());
+        let len = i - start;
+        if len > 0 && (len >= max_texts || tokens + bound > token_budget) {
+            out.push(start..i);
+            start = i;
+            tokens = 0;
+        }
+        tokens += bound;
+    }
+    if start < texts.len() {
+        out.push(start..texts.len());
+    }
+    out
+}
 
 /// Directional words and the word that inverts each one. The map is not
 /// required to be an involution (`reduces` → `increases` while `increases` →
@@ -349,7 +394,9 @@ impl StanceProbeBlocker {
         }
 
         let mut probes: Vec<(Uuid, Vec<f32>)> = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(EMBED_CHUNK) {
+        let bodies: Vec<&str> = texts.iter().map(|(_, _, t)| t.as_str()).collect();
+        for range in embed_chunks(&bodies, EMBED_CHUNK, EMBED_CHUNK_TOKEN_BUDGET) {
+            let chunk = &texts[range];
             let batch: Vec<&str> = chunk.iter().map(|(_, _, t)| t.as_str()).collect();
             let vectors = embedder
                 .batch_generate(&batch)
@@ -424,6 +471,40 @@ impl Blocker for StanceProbeBlocker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bound_sum(texts: &[String], r: &std::ops::Range<usize>) -> usize {
+        texts[r.clone()].iter().map(|t| token_upper_bound(t)).sum()
+    }
+
+    #[test]
+    fn long_seeds_split_under_the_token_budget() {
+        // 64 texts that the provider sends at its full per-text ceiling:
+        // 64 x 8191 tokens is far over the budget, so one count-sized chunk
+        // would be refused by the provider.
+        let texts: Vec<String> = (0..EMBED_CHUNK).map(|_| "a".repeat(10_000)).collect();
+        let chunks = embed_chunks(&texts, EMBED_CHUNK, EMBED_CHUNK_TOKEN_BUDGET);
+        assert!(chunks.len() > 1, "got {chunks:?}");
+        for r in &chunks {
+            assert!(!r.is_empty());
+            assert!(bound_sum(&texts, r) <= EMBED_CHUNK_TOKEN_BUDGET, "{r:?}");
+        }
+        let flat: Vec<usize> = chunks.into_iter().flatten().collect();
+        assert_eq!(flat, (0..texts.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn short_seeds_stay_in_count_sized_chunks() {
+        let texts: Vec<String> = (0..150).map(|i| format!("Drug {i} increases X")).collect();
+        let chunks = embed_chunks(&texts, EMBED_CHUNK, EMBED_CHUNK_TOKEN_BUDGET);
+        assert_eq!(chunks, vec![0..64, 64..128, 128..150]);
+        assert!(embed_chunks::<String>(&[], EMBED_CHUNK, EMBED_CHUNK_TOKEN_BUDGET).is_empty());
+    }
+
+    #[test]
+    fn a_text_over_the_budget_gets_its_own_chunk() {
+        let texts = vec!["short".to_string(), "b".repeat(50), "c".to_string()];
+        assert_eq!(embed_chunks(&texts, 64, 10), vec![0..1, 1..2, 2..3]);
+    }
 
     #[test]
     fn inverts_directional_verb() {
