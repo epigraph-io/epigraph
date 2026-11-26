@@ -508,12 +508,20 @@ async fn force_hnsw_plan(conn: &mut sqlx::PgConnection, tags: Option<&str>) {
         None => String::new(),
     };
     let q = vec_hot(0);
+    // The dense CTE's shape (backlog 0a986628): the scan orders by distance
+    // alone and cuts WITH TIES, and only the outer query ranks by (distance,
+    // id), so the id tiebreak must not take the scan off the index.
     let plan = sqlx::query_scalar::<_, String>(&format!(
         "EXPLAIN (COSTS OFF) \
-         SELECT c.id, row_number() OVER (ORDER BY c.embedding <=> '{q}'::vector) AS rank \
-         FROM claims c \
-         WHERE c.embedding IS NOT NULL AND c.is_current {tag_pred} \
-         ORDER BY c.embedding <=> '{q}'::vector \
+         WITH dense_scan AS ( \
+             SELECT c.id, c.embedding <=> '{q}'::vector AS dist \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL AND c.is_current {tag_pred} \
+             ORDER BY c.embedding <=> '{q}'::vector \
+             FETCH FIRST 50 ROWS WITH TIES) \
+         SELECT s.id, row_number() OVER (ORDER BY s.dist, s.id) AS rank \
+         FROM dense_scan s \
+         ORDER BY s.dist, s.id \
          LIMIT 50"
     ))
     .fetch_all(&mut *conn)
@@ -714,6 +722,54 @@ async fn unscoped_dense_leg_fills_the_candidate_pool(pool: PgPool) {
         "dense leg must be the 50 nearest rows in distance order"
     );
     assert_dense_similarity_strictly_falls(&hits);
+
+    // The pool above came from the HNSW index, not from a sequential scan:
+    // the dense leg filled the pool, so no exact retry ran, and the first
+    // pass must have walked `idx_claims_embedding_hnsw`. Backlog 0a986628
+    // moved the id tiebreak outside the scan (`FETCH FIRST .. WITH TIES`, then
+    // rank by (distance, id)) so that it would not cost the index plan; a
+    // full page alone cannot show that, since a sequential scan returns the
+    // same rows. Counted inside a caller transaction: the per-transaction
+    // index scan count survives the call's rolled-back savepoint.
+    use sqlx::Connection;
+    let mut outer = conn.begin().await.expect("BEGIN");
+    let before = hnsw_index_scans(&mut outer).await;
+    let again = ClaimRepository::search_hybrid_scoped_since_in_theme(
+        &mut *outer,
+        &viewer,
+        &vec_hot(0),
+        "zzqxnomatch",
+        50,
+        60,
+        100,
+        0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("hybrid search inside a caller transaction");
+    let after = hnsw_index_scans(&mut outer).await;
+    outer.rollback().await.expect("ROLLBACK");
+    let again: Vec<Uuid> = again.iter().map(|h| h.claim_id).collect();
+    assert_eq!(again, dense, "the same call must return the same page");
+    assert!(
+        after > before,
+        "the dense leg's first pass did not use idx_claims_embedding_hnsw \
+         (index scans before {before}, after {after})"
+    );
+}
+
+/// Index scans of `idx_claims_embedding_hnsw` counted so far in the current
+/// transaction.
+async fn hnsw_index_scans(conn: &mut sqlx::PgConnection) -> i64 {
+    sqlx::query_scalar(
+        "SELECT pg_stat_get_xact_numscans('idx_claims_embedding_hnsw'::regclass)::bigint",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("pg_stat_get_xact_numscans(idx_claims_embedding_hnsw)")
 }
 
 /// The function sets `hnsw.iterative_scan` / `hnsw.ef_search` with
@@ -786,4 +842,171 @@ async fn caller_transaction_does_not_inherit_the_hnsw_settings(pool: PgPool) {
         "the hybrid search leaked its SET LOCAL hnsw.* values into the caller's transaction"
     );
     tx.rollback().await.expect("caller rollback");
+}
+
+// ── Tied ranks (backlog 0a986628) ──
+//
+// Rows that tie on `ts_rank_cd` (or on distance) used to be ordered by the
+// physical scan, so which of them the `LIMIT $3` pool cut kept, and the
+// `row_number()` ranks they got, were not a function of the data. Both legs
+// now break ties on `claims.id`, the key the fused `ORDER BY` and the
+// lexical-only path already use. The fixtures insert the tied rows in
+// DESCENDING id order, so a cut that follows the physical order keeps the
+// highest ids, and the expected answer (the lowest ids, ascending) differs.
+
+/// `n` fixed ids, ascending: `Uuid::from_u128(base + 1) .. (base + n)`.
+fn ascending_ids(base: u128, n: usize) -> Vec<Uuid> {
+    (1..=n as u128).map(|i| Uuid::from_u128(base + i)).collect()
+}
+
+/// A current claim with no embedding: it can enter the lexical leg only.
+async fn insert_unembedded_claim(pool: &PgPool, id: Uuid, agent: Uuid, tag: u8, content: &str) {
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, is_current) \
+         VALUES ($1, $2, $3, $4, 0.8, true)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(distinct_hash(tag))
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("insert unembedded claim");
+}
+
+/// The tied rows that win a pool of 3 are the 3 lowest ids, ranked in id
+/// order, so the fused page is the same on every call.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lexical_leg_breaks_rank_ties_on_claim_id(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+
+    // 8 rows with the same text, so the same ts_rank_cd, and no embedding.
+    let ids = ascending_ids(0x1000, 8);
+    for (i, id) in ids.iter().enumerate().rev() {
+        insert_unembedded_claim(
+            &pool,
+            *id,
+            agent,
+            10 + i as u8,
+            "zephyrolite cadence marker",
+        )
+        .await;
+    }
+    let ranks: Vec<f32> = sqlx::query_scalar(
+        "SELECT DISTINCT ts_rank_cd(content_tsv, websearch_to_tsquery('english', $1)) \
+         FROM claims WHERE id = ANY($2)",
+    )
+    .bind("zephyrolite cadence")
+    .bind(&ids)
+    .fetch_all(&pool)
+    .await
+    .expect("calibration ranks");
+    assert_eq!(
+        ranks.len(),
+        1,
+        "calibration: the 8 rows must tie on ts_rank_cd"
+    );
+
+    for call in 0..2 {
+        let hits = ClaimRepository::search_hybrid_scoped(
+            &pool,
+            &viewer,
+            &vec_hot(0),
+            "zephyrolite cadence",
+            3,
+            60,
+            10,
+            None,
+            None,
+        )
+        .await
+        .expect("hybrid search");
+
+        let got: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
+        assert_eq!(
+            got,
+            ids[..3].to_vec(),
+            "call {call}: a pool of 3 over 8 tied lexical rows must keep the 3 lowest ids, \
+             in id order"
+        );
+        for (r, h) in hits.iter().enumerate() {
+            assert!(
+                h.in_lexical && h.dense_similarity.is_none(),
+                "lexical-only fixture"
+            );
+            let want = 1.0 / (60.0 + (r as f64 + 1.0));
+            assert!(
+                (h.rrf_score - want).abs() < 1e-12,
+                "call {call}: hit {r} ({}) has rrf_score {}, want 1/(60+{})",
+                h.claim_id,
+                h.rrf_score,
+                r + 1
+            );
+        }
+    }
+}
+
+/// Exact duplicates (same embedding, same text) tie in BOTH legs. With the
+/// shared id key both legs keep the same 3 of them and rank them the same way,
+/// so each hit carries both legs' terms, 2/(60+r), and the page is the 3
+/// lowest ids. If the legs broke these ties independently, a duplicate could
+/// sit in one leg's pool and not the other's, and lose half its score.
+#[sqlx::test(migrations = "../../migrations")]
+async fn duplicate_claims_take_the_same_pool_slots_in_both_legs(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+
+    let ids = ascending_ids(0x2000, 6);
+    for (i, id) in ids.iter().enumerate().rev() {
+        insert_claim(
+            &pool,
+            *id,
+            agent,
+            10 + i as u8,
+            "xylophonic duplicate marker",
+            &vec_hot(0),
+            true,
+            &[],
+        )
+        .await;
+    }
+
+    for call in 0..2 {
+        let hits = ClaimRepository::search_hybrid_scoped(
+            &pool,
+            &viewer,
+            &vec_hot(0),
+            "xylophonic duplicate",
+            3,
+            60,
+            10,
+            None,
+            None,
+        )
+        .await
+        .expect("hybrid search");
+
+        let got: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
+        assert_eq!(
+            got,
+            ids[..3].to_vec(),
+            "call {call}: both legs must keep the 3 lowest-id duplicates, in id order"
+        );
+        for (r, h) in hits.iter().enumerate() {
+            assert!(
+                h.in_lexical && h.dense_similarity.is_some(),
+                "call {call}: duplicate {} must be in both legs' pools",
+                h.claim_id
+            );
+            let want = 2.0 / (60.0 + (r as f64 + 1.0));
+            assert!(
+                (h.rrf_score - want).abs() < 1e-12,
+                "call {call}: hit {r} ({}) has rrf_score {}, want 2/(60+{})",
+                h.claim_id,
+                h.rrf_score,
+                r + 1
+            );
+        }
+    }
 }

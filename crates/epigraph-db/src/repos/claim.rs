@@ -5060,39 +5060,42 @@ impl ClaimRepository {
     /// return tied rows in a different order per page — showing the caller one
     /// claim twice and another never.
     ///
-    /// ## The tiebreaker is on the FUSED output only, deliberately
+    /// ## Both legs break ties on `claims.id` (backlog 0a986628)
     ///
-    /// The two CTEs' own `ORDER BY`s are left alone. An earlier revision added
-    /// `, c.id` to each CTE's `row_number()` window and `LIMIT` as well, on the
-    /// theory that a deterministic candidate-pool cut is strictly better. It is
-    /// not free: the dense and lexical legs then break their ties on
-    /// *independent* keys, so a claim can be 2nd in one leg and 3rd in the
-    /// other where previously the two arbitrary orders were correlated, and the
-    /// RRF sum flips. That regressed
+    /// Each leg cuts its candidates at `LIMIT $3` and ranks them with
+    /// `row_number()`. Rows that tie on the leg's score (equal `ts_rank_cd`,
+    /// which is common for short texts, or equal distance, as exact duplicates
+    /// have) used to come out in physical scan order. Which tied rows won the
+    /// last pool slots, and which rank each got, was then not a function of
+    /// the data: an `UPDATE` that moved a row on disk could change the page.
+    ///
+    /// Both legs now order by their score, then `c.id`, the key the fused
+    /// `ORDER BY` and [`Self::search_lexical_scoped_since_in_theme`] already
+    /// use. One SHARED key keeps the legs correlated: a group of rows tied in
+    /// both legs (duplicates) is ordered the same way in each, so the lowest
+    /// ids take both legs' pool slots and the group scores `2/(k+r)` in id
+    /// order. Independent tie orders could instead keep a duplicate in one
+    /// leg's pool and drop it from the other's.
+    ///
+    /// The dense cut stays on the HNSW index: `dense_scan` orders by distance
+    /// alone (the order the index yields) and takes `FETCH FIRST $3 ROWS WITH
+    /// TIES`, so the whole tie group at the boundary comes back; `dense` then
+    /// ranks those rows by `(distance, id)` and keeps `$3`. Ordering the scan
+    /// itself by `(distance, id)` would need a sort above the index scan.
+    ///
+    /// An earlier attempt added `, c.id` to both legs and was reverted after
     /// `claim_search_hybrid::hybrid_fuses_both_legs_ranking_the_overlap_first`
-    /// in 2 of 6 runs (6 of 6 green before, 6 of 6 green again after this was
-    /// reverted). Making the pool cut deterministic is a real improvement but
-    /// it is a RANKING change, not a paging one, and it belongs in its own
-    /// commit with its own analysis of which tied row deserves the pool slot.
+    /// failed in 2 of 6 runs. That fixture tied its two lexical matches in BOTH
+    /// legs (equal distance, equal `ts_rank_cd`) and passed only because the
+    /// expected winner was inserted first; with random UUIDs an id key picked
+    /// the other row about half the time. The fixture now has strict orders.
     ///
     /// ## Residual, recorded rather than fixed
     ///
-    /// The fused `ORDER BY` is total WITHIN one execution. A walk spans several
-    /// executions, and across them two things are still arbitrary:
-    ///
-    ///  - which rows of a tie group enter the pool when `candidate_pool`
-    ///    truncates it (needs a tie group straddling the 50th candidate at
-    ///    `HYBRID_CANDIDATE_POOL = 50`); and
-    ///  - the `row_number()` ranks assigned inside a tie group, which feed
-    ///    `rrf_score`, so two executions could in principle score a tied group
-    ///    differently and reorder it.
-    ///
-    /// In practice the legs stay correlated — each sees the same physical scan
-    /// order, so a fully tied group scores `2/(k+r)`, monotone in the same `r`
-    /// — which is why the paging walk is stable. Both hazards predate this
-    /// change; neither is introduced by it. Closing them properly means an
-    /// explicit deterministic key inside each leg, which is the ranking change
-    /// described above.
+    /// The page is now a function of the data within one execution and across
+    /// executions, with one timing-dependent exception: the exact retry below
+    /// runs under a timeout, so if it finishes for one page of a walk and
+    /// times out for another, those pages rank different dense pools.
     ///
     /// ## The dense leg runs with pgvector's iterative HNSW scan (fdd8e494)
     ///
@@ -5220,10 +5223,8 @@ impl ClaimRepository {
         // markers resolve to the same bind ($11).
         let sql = viewer.splice(
             r#"
-            WITH dense AS (
-                SELECT c.id,
-                       row_number() OVER (ORDER BY c.embedding <=> $1::vector) AS rank,
-                       1 - (c.embedding <=> $1::vector) AS cos
+            WITH dense_scan AS (
+                SELECT c.id, c.embedding <=> $1::vector AS dist
                 FROM claims c
                 WHERE c.embedding IS NOT NULL AND c.is_current
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
@@ -5232,11 +5233,20 @@ impl ClaimRepository {
                   AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
                   /* {VISIBILITY:c} */
                 ORDER BY c.embedding <=> $1::vector
+                FETCH FIRST $3 ROWS WITH TIES
+            ),
+            dense AS (
+                SELECT s.id,
+                       row_number() OVER (ORDER BY s.dist, s.id) AS rank,
+                       1 - s.dist AS cos
+                FROM dense_scan s
+                ORDER BY s.dist, s.id
                 LIMIT $3
             ),
             lex AS (
                 SELECT c.id,
-                       row_number() OVER (ORDER BY ts_rank_cd(c.content_tsv, q) DESC) AS rank
+                       row_number() OVER (
+                           ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id) AS rank
                 FROM claims c, websearch_to_tsquery('english', $2) q
                 WHERE c.content_tsv @@ q AND c.is_current
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
@@ -5244,7 +5254,7 @@ impl ClaimRepository {
                   AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
                   AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
                   /* {VISIBILITY:c} */
-                ORDER BY ts_rank_cd(c.content_tsv, q) DESC
+                ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id
                 LIMIT $3
             ),
             fused AS (
