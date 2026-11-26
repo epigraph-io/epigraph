@@ -5149,9 +5149,13 @@ restart.
   answers 400). An unseal (body was the `[sealed]` sentinel and a ciphertext row exists) is not
   re-judged. No row is read or changed: stored passages stay, a write that leaves body, type, DOI
   and caption alone does not fire, and the strip rewrite to the locator shape passes. **Not
-  closed:** text in rows not typed literature or figure, free text in the admitted shape's title
-  and locator (a title or locator containing `Passage: '` is read as a passage: closed), the
-  maintenance DSN. **Operator note:** the CLI's `--allow-verbatim` and its extraction-declared
+  closed:** text in rows not typed literature or figure; free text in the admitted shape's title,
+  locator and `licence: <licence>` group (the guard is shape-based: only the exact token
+  `Passage: '` is screened, and a title or locator containing it is read as a passage, so it stops
+  well-formed clients and bugs, not a determined application-DSN holder or API client); an unseal
+  (the server cannot verify the plaintext it is handed, so a caller with the `instance:admin`
+  scope and authority over the group can seal a locator-and-hash row and unseal it with a passage
+  body under a paywalled DOI, not re-judged); the maintenance DSN. **Operator note:** the CLI's `--allow-verbatim` and its extraction-declared
   licence no longer override the paper's recorded licence; set it with
   `epigraph_set_paper_licence` (255) first. Pinned by
   `epigraph-mcp/tests/evidence_passage_licence_guard.rs` (refusals on the application role, the

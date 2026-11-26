@@ -86,15 +86,24 @@
 --     literature or figure (a document, testimony or observation row) may
 --     hold any text, including a publisher's, and no trigger can tell. The
 --     guard enforces the ingest contract on the rows that NAME a paper.
---   * Free-text fields inside the admitted shape. The title and the locator
---     are free text, so a writer set on it could still smuggle prose into
---     them; the shape check stops a writer (or a bug) storing the passage
---     itself.
+--   * Free-text fields inside the admitted shape. The guard is SHAPE-based:
+--     the title, the locator and the `licence: <licence>` group of the
+--     locator-and-hash body are free text (only the exact token `Passage: '`
+--     is screened), so a writer set on it could still smuggle prose into them,
+--     e.g. after `Passage not retained (licence: none). `. The shape check
+--     stops a well-formed client or a bug (such as the CLI's
+--     `--allow-verbatim`) storing the passage itself, not a determined holder
+--     of the application DSN or a determined API client.
 --   * The maintenance DSN and superuser. The guard fires for every role, but
 --     a holder of the maintenance DSN can disable a trigger (as in 123 and
 --     255, provenance against that DSN waits for the elevation batch).
---   * An unseal of a row a session sealed itself: the unseal arm trusts the
---     sentinel plus a ciphertext row, both of which the application writes.
+--   * An unseal: the unseal arm trusts the sentinel plus a ciphertext row,
+--     both of which the application writes, and the server cannot verify the
+--     plaintext an unseal hands it (`PrivatizationRepository::unseal_claims_conn`).
+--     So a caller with the `instance:admin` scope and authority over the
+--     group (the unseal route's gate) can seal a claim whose literature row
+--     holds the locator-and-hash body, then unseal it with a passage as the
+--     body under a paywalled DOI, and the guard does not judge it again.
 --
 -- ===================================================================
 -- 3. DEPLOY AND UNDO

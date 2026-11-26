@@ -21,17 +21,23 @@
 //!
 //! # Verified to fail
 //!
-//! Without migration 349 every refusal test fails (the write succeeds),
+//! Without migration 349, 7 of the 8 tests fail (measured). Every refusal
+//! test fails (the write succeeds); `a_permitting_licence_admits_the_passage`
+//! fails at its case-differing suffix (`10.5555/guard.case`, which nothing
+//! then refuses);
 //! `a_stored_passage_stays_writable_and_strippable_after_its_licence_is_withdrawn`
-//! fails at its "still refused" check, and
+//! fails at its "still refused" check; and
 //! `the_sql_allowlist_matches_the_rust_allowlist` fails (the SQL function does
-//! not exist); the two acceptance tests pass with or without it (measured).
+//! not exist). Only `the_locator_and_hash_bodies_are_accepted_whatever_the_licence`
+//! passes with or without it.
 //! Each mutation of 349 alone fails the test named (measured):
 //!
 //! * the unseal arm removed: the withdrawn-licence test, at the unseal;
 //! * the `Passage: '` check removed: the refusal test, at the passage carried
 //!   inside a locator;
 //! * the figure caption ignored: the figure test, at the caption;
+//! * the update trigger not firing on a caption change: the rewrite test, at
+//!   the caption set on a figure stored with neither image nor caption;
 //! * the guard made SECURITY DEFINER (it then reads every group's papers):
 //!   `another_groups_paper_licence_permits_nothing`;
 //! * the update trigger not firing on a DOI change: the rewrite test, at the
@@ -372,6 +378,25 @@ async fn the_app_role_cannot_rewrite_evidence_into_a_verbatim_passage(pool: PgPo
             .execute(&app)
             .await,
         "UPDATE the DOI of a passage row onto a paywalled paper",
+    );
+
+    // A figure stored with neither image nor caption (admitted whatever the
+    // licence), then given the publisher's caption by an UPDATE that touches
+    // nothing else: the update trigger must fire on the caption alone.
+    let bare_figure = insert(&app, claim, "figure", None, &figure(doi, None))
+        .await
+        .expect("a figure with no image and no caption is accepted");
+    assert_refused(
+        sqlx::query(
+            "UPDATE evidence \
+             SET properties = jsonb_set(properties, '{caption}', to_jsonb($2::text)) \
+             WHERE id = $1",
+        )
+        .bind(bare_figure)
+        .bind(PASSAGE)
+        .execute(&app)
+        .await,
+        "UPDATE only the caption of a paywalled paper's figure",
     );
 }
 
