@@ -4,7 +4,7 @@
 //! section 14).
 //!
 //! A human principal's `display_name` is the person's real name, and the
-//! operator's rule shows it only to the callers migration 286's
+//! operator's rule shows it only to the callers migration 309's
 //! `epigraph_agent_disclosure` admits. `agents` is readable by every session
 //! (077 `agents_identity ... USING (true)`), so nothing in the database stops
 //! a new statement from reading the name, ORCID, ROR id or `properties` and
@@ -220,13 +220,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 /// unregistered.
 const PENDING: &[(&str, &str)] = &[];
 
-// `profile_visibility` joined after review (leaks#4b): after migration 288 a
+// `profile_visibility` joined after review (leaks#4b): after migration 311 a
 // human principal reads 'group' and non-humans keep the 'public' default, so
 // the value itself is near-human evidence. `agent_type` is NOT a lint column:
 // on HEAD it is read only for `= 'role'` checks (`cards_inner`,
 // `author_nodes`, `exact_name_candidates`), and a role node is public by
 // design; a future surface that serves it is review's to catch.
-// `profile_public_consented_at` (297, operator ruling C11) is set only on a
+// `profile_public_consented_at` (320, operator ruling C11) is set only on a
 // person who opted in, so a non-null value is human evidence too.
 const IDENTITY_COLUMNS: &[&str] = &[
     "display_name",
@@ -668,7 +668,7 @@ fn the_scanner_sees_aliased_unaliased_and_gated_shapes() {
     )));
 }
 
-/// Operator ruling C7 (migration 299): wherever a statement decides an
+/// Operator ruling C7 (migration 322): wherever a statement decides an
 /// agent's name by the disclosure rule, the unnamed reading is the
 /// `oauth:<client row id>` placeholder a nameless service principal carries,
 /// never NULL (a null name on an OAuth principal marked exactly the hidden
@@ -752,7 +752,7 @@ fn no_name_decision_falls_back_to_null() {
         );
     }
     // And the Rust-side spelling: a `!<d>.named` branch that writes a null
-    // name (what `redact_agent` did before 299 gave it `unnamed_as`).
+    // name (what `redact_agent` did before 322 gave it `unnamed_as`).
     assert_eq!(
         rust_offenders("fn f() { if !d.named { agent.display_name = None; } }"),
         1

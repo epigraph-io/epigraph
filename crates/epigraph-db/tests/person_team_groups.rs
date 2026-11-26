@@ -25,7 +25,7 @@
 //! * who may: only a live admin invites (TGP02; a non-member is told the
 //!   group does not exist, TGP08); any agent but a role's node or a system
 //!   identity is invited alike and only a Person can accept (TGP03 / TGP01,
-//!   migration 298); only the
+//!   migration 321); only the
 //!   invitee answers (TGP08 for anyone else, TGP01 for its operated agent);
 //!   an invitation is answered once (TGP05); it lapses when its sender is no
 //!   longer a live admin (TGP05);
@@ -584,7 +584,7 @@ async fn only_a_live_admin_invites_and_only_a_person_can_accept(pool: PgPool) {
     )
     .await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP01"), "{r:?}");
-    // Operator ruling C10 (migration 298): the invite no longer asks whether
+    // Operator ruling C10 (migration 321): the invite no longer asks whether
     // the invitee is a person (TGP03 answered "is this id a registered
     // human?" to any team admin). An agent a Person operates is invited like
     // anyone; the refusal is at accept time (TGP01), so it never joins.
@@ -618,7 +618,7 @@ async fn only_a_live_admin_invites_and_only_a_person_can_accept(pool: PgPool) {
     assert_eq!(code_of(&r).as_deref(), Some("TGP04"), "{r:?}");
 }
 
-/// Operator ruling C10 (migration 298; spec R11): the invite answers
+/// Operator ruling C10 (migration 321; spec R11): the invite answers
 /// IDENTICALLY whoever the invitee is, so a team admin cannot use it to learn
 /// whether an id is a person, or a person named to them. For an unnamed
 /// registered person (profile `'group'`, no shared team, no claims), a named
@@ -1040,16 +1040,16 @@ async fn the_repository_maps_each_refusal_by_kind(pool: PgPool) {
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
-/// 298 re-states 263's invite; over any other body it refuses (TIV01) with
+/// 321 re-states 263's invite; over any other body it refuses (TIV01) with
 /// nothing changed.
 #[sqlx::test(migrations = false)]
-async fn migration_298_refuses_over_another_invite_body(pool: PgPool) {
+async fn migration_321_refuses_over_another_invite_body(pool: PgPool) {
     let below = sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(
             MIGRATOR
                 .migrations
                 .iter()
-                .filter(|m| m.version < 298)
+                .filter(|m| m.version < 321)
                 .cloned()
                 .collect(),
         ),
@@ -1058,7 +1058,7 @@ async fn migration_298_refuses_over_another_invite_body(pool: PgPool) {
         no_tx: false,
     };
     let mut conn = pool.acquire().await.expect("acquire");
-    below.run(&mut *conn).await.expect("migrate to 297");
+    below.run(&mut *conn).await.expect("migrate to 320");
     sqlx::query("RESET ALL")
         .execute(&mut *conn)
         .await
@@ -1075,7 +1075,7 @@ async fn migration_298_refuses_over_another_invite_body(pool: PgPool) {
     let err = MIGRATOR
         .run(&mut *conn)
         .await
-        .expect_err("298 must refuse over another body")
+        .expect_err("321 must refuse over another body")
         .to_string();
     assert!(err.contains("TIV01"), "precondition refusal: {err}");
 }

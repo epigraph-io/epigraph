@@ -385,7 +385,7 @@ async fn each_refusal_answers_by_its_kind_with_nothing_written(pool: PgPool) {
             None,
         ),
         (
-            // Since migration 298 (operator ruling C10) only a role's node
+            // Since migration 321 (operator ruling C10) only a role's node
             // or a system identity, whose kind every reader sees, is refused
             // as an invitee; whether an id is a person is never answered.
             "invitee a role's node",
@@ -535,7 +535,7 @@ async fn an_operated_agent_cannot_act_for_its_human(pool: PgPool) {
     assert_eq!(live_rows(&pool, group, b_agent).await, 0);
 }
 
-/// Operator ruling C10 (migration 298; spec R11): `POST
+/// Operator ruling C10 (migration 321; spec R11): `POST
 /// /api/v1/groups/:id/invitations` answers a team admin IDENTICALLY for a
 /// person and for an agent a person operates (201 with the same body modulo
 /// ids; a repeat 409 TGP04 with the same body modulo ids), so it no longer

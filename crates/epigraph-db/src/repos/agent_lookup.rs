@@ -11,16 +11,16 @@
 //! `agents` rows are readable by every session (migration 077 section 9:
 //! `agents_identity ... USING (true)`), and `GET /api/v1/agents/:id` answers
 //! for any id, so the EXISTENCE of an agent, its `public_key` and
-//! `created_at` are not secrets. Its NAME is shown only when migration 286's
+//! `created_at` are not secrets. Its NAME is shown only when migration 309's
 //! `epigraph_agent_disclosure` admits the caller's stamped session (spec
 //! `docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md`):
 //! every non-human agent is named to everyone; a human principal only to
 //! itself, a privileged session, a teammate, everyone once it opted in or
 //! once it or an agent bound to it made a public assertion of any kind
-//! (claim, challenge, assessment BBA, ingest record; 316) from the binding's start,
+//! (claim, challenge, assessment BBA, ingest record; 339) from the binding's start,
 //! whoever can read a claim one of them filed while bound, and whoever can
 //! read a paper whose authorship one of them countersigned (migrations
-//! 302, 309, 311). Everything on a card is computed under that
+//! 325, 332, 334). Everything on a card is computed under that
 //! decision and the caller's [`Viewer`], and every rule below makes a fact
 //! the caller may not see produce EXACTLY what an agent without that fact
 //! produces (never a distinguishable "hidden"):
@@ -30,7 +30,7 @@
 //!   slot by it and never moves `candidates_truncated`, and its card reads as
 //!   a nameless OAuth service principal's (operator ruling C7): shown, and
 //!   found, under its own `oauth:<client row id>` placeholder (migration
-//!   299), `kind: unknown`, no roles, no attachments. Its id is never
+//!   322), `kind: unknown`, no roles, no attachments. Its id is never
 //!   withheld.
 //! * `orcid` / `ror_id`, and matching on them: only when `details` (the
 //!   profile is public, the caller is the agent, or shares a live group with
@@ -201,7 +201,7 @@ fn ident_sql(expr: &str) -> String {
 /// The matcher's PLACEHOLDER candidates (operator ruling C7): every agent
 /// linked to a `human` OAuth client (each human principal; 122's registered
 /// operators are linked to one too), as `(id, display_name)` under the name it
-/// reads as when UNNAMED, migration 299's `epigraph_unnamed_agent_name`. A
+/// reads as when UNNAMED, migration 322's `epigraph_unnamed_agent_name`. A
 /// nameless service principal is found by its `oauth:<client row id>` name, so
 /// an unnamed human must be found by its own the same way, and only when it is
 /// unnamed: [`AgentLookupRepository::match_by_name`] and
@@ -645,7 +645,7 @@ impl AgentLookupRepository {
     ///
     /// The reusable matcher. Runs on the caller's connection, which must be
     /// stamped from the caller's viewer (a `read_as` connection or a stamped
-    /// transaction): migration 286's `epigraph_agent_disclosure` decides on
+    /// transaction): migration 309's `epigraph_agent_disclosure` decides on
     /// that session whether a candidate's name may match (`named`) and
     /// whether its ORCID / ROR may (`details`). An unnamed human is never
     /// found by name, prefix, trigram, ORCID or ROR, exactly as a nameless
@@ -802,13 +802,13 @@ impl AgentLookupRepository {
         // 1. The rows, and every evidence bit already narrowed IN SQL to what
         //    this caller may see (a hidden bit is computed as false/NULL, so
         //    it never reaches Rust as a distinguishable value). Migration
-        //    286's `epigraph_agent_disclosure` decides, on the stamped
+        //    309's `epigraph_agent_disclosure` decides, on the stamped
         //    session, whether the name (`named`) and the profile details
         //    (`details`: ORCID, ROR, an LLM model) may be shown. An UNNAMED
         //    human carries no human evidence either: registration, the
         //    reverse binding, roles and attachments are all withheld below,
         //    and its name is the `oauth:<client row id>` placeholder
-        //    (migration 299), so its card reads as a nameless service
+        //    (migration 322), so its card reads as a nameless service
         //    principal's (operator ruling C7).
         let sql = format!(
             "SELECT a.id, CASE WHEN d_a.named THEN a.display_name \
@@ -998,7 +998,7 @@ impl AgentLookupRepository {
         }
         type Row = (Uuid, Option<String>, String, Vec<u8>, bool);
         // The name is OUTPUT (the ingest report's `display_name`), so it goes
-        // through migration 286's disclosure on the ingest's stamped
+        // through migration 309's disclosure on the ingest's stamped
         // transaction; the internal checks read no name.
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT a.id, CASE WHEN d.named THEN a.display_name \
@@ -1048,7 +1048,7 @@ impl AgentLookupRepository {
     /// (MEASURED, 7,600 agents, debug build: a 50-author document spent ~12 s
     /// in a per-author matcher call). The matches carry id, `display_name`
     /// and `created_at`; the ORCID / ROR tiers never apply. A match whose
-    /// name the session may not see (an unnamed human, migration 286's
+    /// name the session may not see (an unnamed human, migration 309's
     /// `epigraph_human_named_to_viewer`) is dropped BEFORE it is ranked or
     /// counted, so the total and the cut never reveal it, and such a human
     /// matches under its `oauth:<client row id>` placeholder instead, as a

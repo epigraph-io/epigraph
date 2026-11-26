@@ -139,7 +139,7 @@ pub async fn load_subgraph_conn(
     }
 
     // 3. Fetch agents
-    // Names through migration 286's rule on this stamped connection: an
+    // Names through migration 309's rule on this stamped connection: an
     // unnamed human gets its `oauth:<client row id>` placeholder, the name
     // and label a nameless service principal gets (spec 7 row H2, operator
     // ruling C7). Ordered by id so the node list does not depend on a map.

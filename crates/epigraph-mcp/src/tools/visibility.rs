@@ -177,7 +177,7 @@ pub async fn set_default_group(
 }
 
 /// `set_profile_visibility`: the caller (a person, over HTTP its own token's
-/// principal) sets whether its own name is shown to everyone (migration 287).
+/// principal) sets whether its own name is shown to everyone (migration 310).
 /// Always the stamped principal's own row; an operated agent, a service or a
 /// stdio server's own agent is refused (PVS05).
 ///

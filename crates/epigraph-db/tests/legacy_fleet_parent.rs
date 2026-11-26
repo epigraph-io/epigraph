@@ -620,10 +620,10 @@ async fn a_real_human_with_the_legacy_shape_is_still_refused_aid03(pool: PgPool)
     .execute(&pool)
     .await
     .expect("revoke the human operator");
-    // Migration 294's HEV01 now refuses re-pointing a linked human client, so
+    // Migration 317's HEV01 now refuses re-pointing a linked human client, so
     // the out-of-band state this case simulates is reached with triggers off
     // (`session_replication_role = replica`) on one connection: the state can
-    // still exist on a database that predates 294.
+    // still exist on a database that predates 317.
     {
         let mut c = pool.acquire().await.expect("acquire");
         sqlx::query("SET session_replication_role = replica")

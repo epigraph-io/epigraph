@@ -58,7 +58,7 @@ async fn named(pool: &PgPool, agent: Uuid, name: &str) {
 /// A registered human operator with its personal group, named `name`, opted
 /// in to a public profile as the self-service setter records it (`'public'`
 /// plus a consent stamp), so its name is shown to every reader. Before
-/// migration 297 (operator ruling C11) the fixture's column default
+/// migration 320 (operator ruling C11) the fixture's column default
 /// `'public'` was read as that opt-in; it never was consent, and now names no
 /// one. The tests of the disclosure rule on this block set `'group'` through
 /// [`group_profile`].
@@ -1735,7 +1735,7 @@ async fn group_profile(pool: &PgPool, agent: Uuid) {
 
 /// Row D1, after operator ruling C6: a human that INGESTED a claim it did not
 /// file is listed among the ingesters, and its PUBLIC ingest record is a
-/// public assertion of its own, so it is NAMED to an outsider (migration 309).
+/// public assertion of its own, so it is NAMED to an outsider (migration 332).
 /// Before C6 the record named no one and the outsider got the C7 placeholder;
 /// a marked public record the outsider can read now always names its
 /// ingester, so that case no longer exists on this surface. CALIBRATION: with

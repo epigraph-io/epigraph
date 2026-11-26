@@ -1154,7 +1154,7 @@ impl AtlasLeafRepository {
 
     /// The raw label text of a leaf's agent and evidence nodes (Atlas W9's
     /// real leaves): each agent's `display_name` as the MAP's audience may see
-    /// it (migration 286; an unnamed human is labelled by its
+    /// it (migration 309; an unnamed human is labelled by its
     /// `oauth:<client row id>` placeholder, as a nameless service principal
     /// is, operator ruling C7), and each evidence row's `raw_content`, else its `evidence_type`,
     /// for the rows `map` may draw. Run it on the maintenance session (the
@@ -1180,7 +1180,7 @@ impl AtlasLeafRepository {
         // The stored document is served to the MAP's whole audience, not to
         // the maintenance session building it (which is privileged and would
         // name every human): names are decided for that audience by
-        // migration 286's explicit-audience core (spec 7 row H3).
+        // migration 309's explicit-audience core (spec 7 row H3).
         let agents: BTreeMap<Uuid, String> =
             crate::repos::agent_disclosure::AgentDisclosureRepository::names_for_audience(
                 &mut *conn, agent_ids, map,

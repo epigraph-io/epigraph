@@ -296,7 +296,7 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 // branch.
 // 191 -> 189: 285 re-creates `epigraph_passkeys_for_ticket` and
 // `epigraph_passkeys_for_act` (a new result column) on 172's form.
-// 189 -> 188: 288 re-states `epigraph_provision_oauth_agent` on 172's form.
+// 189 -> 188: 311 re-states `epigraph_provision_oauth_agent` on 172's form.
 const HIGH_WATER: usize = 188;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.

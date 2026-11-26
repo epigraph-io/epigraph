@@ -1654,7 +1654,7 @@ async fn a_revoked_human_operator_cannot_set_its_agents_default(pool: PgPool) {
     assert_eq!(default_of(&pool, crew).await, (None, true), "unchanged");
 }
 
-// ─── set_profile_visibility (migration 287) ──────────────────────────────
+// ─── set_profile_visibility (migration 310) ──────────────────────────────
 
 fn profile(value: &str) -> SetProfileVisibilityParams {
     SetProfileVisibilityParams {

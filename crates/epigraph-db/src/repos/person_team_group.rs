@@ -126,7 +126,7 @@ impl PersonTeamGroupRepository {
     /// `NotFound` when the caller holds no live membership of `group` (as for
     /// a missing group); `Refused` (authority) when the caller is not a
     /// Person or not an admin of it; (input) for an invitee that names no
-    /// agent, is a role's node or a system identity (migration 298: whether
+    /// agent, is a role's node or a system identity (migration 321: whether
     /// it is a Person is never answered; only a Person can accept), the
     /// caller itself, or a bad role or reason; (state) for an
     /// invitee already a member or already invited, or a group that is not

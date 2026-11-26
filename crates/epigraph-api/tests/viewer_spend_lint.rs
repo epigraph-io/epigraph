@@ -193,7 +193,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // untenanted: the agent row; its claims are read through the viewer.
     ("agents.rs", "agent_claims", &["AgentRepository::get_by_id"]),
     // stamped: `AgentDisclosureRepository::disclosure` runs on the handler's
-    // `read_as(viewer)` connection and migration 286's
+    // `read_as(viewer)` connection and migration 309's
     // `epigraph_agent_disclosure` decides on that stamp (a definer that
     // applies its own audience), so the viewer is spent on the stamp.
     (
@@ -219,7 +219,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["AgentDisclosureRepository::redact_authored_edges"],
     ),
     // untenanted: the agent rows (`agents` is USING (true)); their name, ORCID
-    // and ROR id are nulled through the stamped disclosure (migration 286,
+    // and ROR id are nulled through the stamped disclosure (migration 309,
     // `AgentDisclosureRepository::disclosure` on `read_as(viewer)`).
     (
         "agents.rs",
@@ -243,7 +243,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         ],
     ),
     // `update_agent` takes a viewer only for the profile opt-in (migration
-    // 287): `set_profile_visibility_conn` runs on `AppState::write_as(viewer)`,
+    // 310): `set_profile_visibility_conn` runs on `AppState::write_as(viewer)`,
     // a transaction STAMPED from it, and writes the stamped principal's own
     // row, so the viewer is spent on the stamp. untenanted: the agent row
     // (`get_by_id`) and the pre-existing profile-column write (`update`, on the
@@ -1079,7 +1079,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "political.rs",
         "compare_agents",
-        // stamped: the agent's name through migration 286's disclosure on the
+        // stamped: the agent's name through migration 309's disclosure on the
         // handler's `read_as(viewer)` connection; `redact_agent` is pure.
         &[
             "AgentDisclosureRepository::disclosure",
@@ -1090,7 +1090,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "political.rs",
         "epistemic_profile",
-        // stamped: the agent's name through migration 286's disclosure on the
+        // stamped: the agent's name through migration 309's disclosure on the
         // handler's `read_as(viewer)` connection; `redact_agent` is pure.
         &[
             "AgentDisclosureRepository::disclosure",
@@ -1577,7 +1577,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an
     // unconverted no_unscoped_pool.rs site); every projection in
     // load_subgraph_conn splices the viewer except `agents` (untenanted), whose
-    // names it reads through migration 286's disclosure on the caller's
+    // names it reads through migration 309's disclosure on the caller's
     // connection (`AgentDisclosureRepository::names`, a definer that applies
     // its own audience: the session stamp; an unstamped call is the outsider).
     (

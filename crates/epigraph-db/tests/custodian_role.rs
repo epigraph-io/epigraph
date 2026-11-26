@@ -1933,8 +1933,8 @@ async fn occupies_mirrors_assignments_and_is_never_read_for_authz(pool: PgPool) 
     assert!(holds, "deleting the projection does not end B's holding");
 
     // Catalog ratchet: at head, no policy and no function but the projection's
-    // maintainers reads OCCUPIES. 292 added the second maintainer (team-only
-    // ruling); 295 moved its body into `epigraph_reown_role_projection_edges`,
+    // maintainers reads OCCUPIES. 315 added the second maintainer (team-only
+    // ruling); 318 moved its body into `epigraph_reown_role_projection_edges`,
     // which re-owns GENUINE projections only (joined to their assignment) when
     // a role is bound or unbound: it writes the projection's owner and reads
     // nothing for authority. The binding trigger now only calls it.

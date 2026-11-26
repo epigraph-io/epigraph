@@ -26,7 +26,7 @@
 //!   them would narrow nothing. Since backlog 761c2b05 both `get_agent` and
 //!   `list_agents` take a `Viewer` and null `orcid` / `ror_id` for a profile
 //!   the caller may not see and, since the human-identity rule (migration
-//!   286), `display_name` for a human the caller may not see named, through
+//!   309), `display_name` for a human the caller may not see named, through
 //!   `epigraph_db::AgentDisclosureRepository::disclosure` on a
 //!   [`AppState::read_as`] connection (the decision reads the stamp);
 //!   `get_agent`'s one row read moved onto that connection too.
@@ -398,7 +398,7 @@ pub async fn create_agent(
     // created row echoes what this caller just supplied.
     //
     // The NAME of an existing human principal is gated the same way the agent
-    // routes gate it (migration 286's disclosure, on a connection stamped from
+    // routes gate it (migration 309's disclosure, on a connection stamped from
     // the caller's viewer): a find-hit must not read back a name
     // `GET /api/v1/agents/:id` would null.
     let mut created_agent = created_agent;
@@ -459,7 +459,7 @@ pub async fn create_agent(
 /// row id>` placeholder a nameless service principal carries (operator
 /// ruling C7), and `orcid` /
 /// `ror_id` are profile DETAILS, null unless the caller may see the agent's
-/// profile: both decided by migration 286's `epigraph_agent_disclosure` on the
+/// profile: both decided by migration 309's `epigraph_agent_disclosure` on the
 /// caller's stamped connection (`epigraph_db::AgentDisclosureRepository`, the
 /// rule `get_public_profile` and `find_agent` apply). An unnamed human
 /// answers 200 like any agent; its id is never withheld.
@@ -791,7 +791,7 @@ pub async fn get_agent_reputation(
     // `claims` is FORCEd and `get_by_agent` splices the viewer.
     let claims = ClaimRepository::get_by_agent(&mut *read, &viewer, agent_id).await?;
 
-    // The name as the caller may see it (migration 286, on this stamped
+    // The name as the caller may see it (migration 309, on this stamped
     // connection): an unnamed human's reputation reads as a nameless service
     // principal's (its `oauth:<client row id>` placeholder, ruling C7).
     let mut agent = agent;
@@ -1032,7 +1032,7 @@ pub struct UpdateAgentRequest {
     /// Reserved for future use
     pub properties: Option<serde_json::Value>,
     /// Whether the caller's OWN name is shown to everyone: `"public"` or
-    /// `"group"` (migration 287, human-identity visibility spec section 8).
+    /// `"group"` (migration 310, human-identity visibility spec section 8).
     /// Accepted only on the caller's own record, `claims:admin` included, and
     /// only from a person (a human principal); written through the audited
     /// self-service definer on a viewer-stamped transaction.
@@ -1098,7 +1098,7 @@ pub async fn update_agent(
 
     // The opt-in is its own act, never mixed with a profile edit: the edit
     // and the opt-in run on different connections (the edit on the request
-    // pool, the opt-in through 287's definer on a stamped transaction), so a
+    // pool, the opt-in through 310's definer on a stamped transaction), so a
     // mixed body could commit the edit and then have the opt-in refused
     // (review finding correctness#7). Refused before anything is written.
     let profile_only = profile.is_some();
@@ -1144,7 +1144,7 @@ pub async fn update_agent(
         AgentRepository::update(&state.db_pool, &agent).await?
     };
 
-    // Migration 287's definer, on a transaction stamped from the caller: the
+    // Migration 310's definer, on a transaction stamped from the caller: the
     // target is the stamped principal, which is `id` (checked above).
     if let Some(visibility) = profile {
         let mut tx = state.write_as(&viewer, "update_agent").await?;

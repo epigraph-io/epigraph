@@ -225,7 +225,7 @@ fn spends_viewer(body: &str) -> bool {
 }
 
 /// Viewer-taking repo fns whose agent-identity statement is filtered by
-/// migration 286's `epigraph_agent_disclosure` on the caller's STAMPED
+/// migration 309's `epigraph_agent_disclosure` on the caller's STAMPED
 /// session rather than by a predicate over the viewer's binds, as
 /// `(file, fn)`: an exact register, not a marker any fn may cite.
 ///
@@ -2133,7 +2133,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "agent_disclosure.rs",
         "disclosure",
         "untenanted `agents` (077 `agents_identity` USING (true)); the decision is migration \
-         286's `epigraph_agent_disclosure`, which reads the STAMPED session (principal, groups, \
+         309's `epigraph_agent_disclosure`, which reads the STAMPED session (principal, groups, \
          bypass, elevation) as its audience. A viewer argument would only invite a call on a \
          connection stamped from someone else; an unstamped call is the anonymous outsider.",
     ),
@@ -2141,7 +2141,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "agent_disclosure.rs",
         "names",
         "untenanted `agents`; the name leaves the database only through `CASE WHEN d.named`, \
-         decided by migration 286's `epigraph_agent_disclosure` on the STAMPED session. The \
+         decided by migration 309's `epigraph_agent_disclosure` on the STAMPED session. The \
          one output reader of another agent's `display_name`; an unstamped call hides more.",
     ),
     (
@@ -2155,13 +2155,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "agent_disclosure.rs",
         "names_for_audience",
         "untenanted `agents`; for a stored Atlas document the audience is the MAP's (the public \
-         outsider, or one team's members), passed to 286's explicit-audience core, which only \
+         outsider, or one team's members), passed to 309's explicit-audience core, which only \
          the maintenance session the builder holds may EXECUTE. Never the building session.",
     ),
     (
         "agent.rs",
         "set_profile_visibility_conn",
-        "WRITE through 287's definer `epigraph_set_profile_visibility` on a STAMPED \
+        "WRITE through 310's definer `epigraph_set_profile_visibility` on a STAMPED \
          transaction: the session principal's OWN `profile_visibility`, never an argument's; \
          only a human principal may (PVS01 / PVS05), audited. The viewer is spent on the stamp.",
     ),
@@ -2426,7 +2426,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent_lookup.rs",
         "author_nodes",
-        "READ of `agents` (id, agent_type, public_key; display_name only where migration 286's \
+        "READ of `agents` (id, agent_type, public_key; display_name only where migration 309's \
          `epigraph_agent_disclosure` admits the STAMPED ingest session) by id for the document \
          ingest's explicit-author check, plus migration 148's `system_agents` registry (no row \
          security). No tenancy columns; the name's audience is the session, not a viewer bind.",
@@ -2456,7 +2456,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of `agents` (id, display_name, created_at, agent_type, public_key) by folded-name \
          equality, excluding migration 148's `system_agents` rows: the document ingest's \
          same-name author candidates. A match the STAMPED ingest session may not name (migration \
-         286's `epigraph_human_named_to_viewer`) is dropped before it is ranked or counted; no \
+         309's `epigraph_human_named_to_viewer`) is dropped before it is ranked or counted; no \
          tenancy columns, and the audience is the session, so there is no Viewer to add.",
     ),
     (
@@ -2464,13 +2464,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "match_by_name",
         "delegates to `match_ranked` (below): the name matcher over `agents`, which has no \
          tenancy columns; whether a candidate's name or ORCID / ROR may match is decided by \
-         migration 286's `epigraph_agent_disclosure` on the STAMPED session the caller passes.",
+         migration 309's `epigraph_agent_disclosure` on the STAMPED session the caller passes.",
     ),
     (
         "agent_lookup.rs",
         "match_ranked",
         "READ of `agents` by folded name / ORCID / ROR: untenanted (077 `agents_identity` USING \
-         (true)); each raw match is kept only on a tier migration 286's `epigraph_agent_disclosure` \
+         (true)); each raw match is kept only on a tier migration 309's `epigraph_agent_disclosure` \
          admits on the STAMPED session (`named` for the name tiers, `details` for ORCID / ROR), \
          before the LIMIT. The audience is the session; a viewer bind would be a second source.",
     ),
@@ -3932,7 +3932,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          That migration names `AgentRepository::get_by_id` EXPLICITLY among the functions which \
          `take no Viewer and return the full row`, and points at the compensating projection -- \
          `profile_visibility` gating `properties`/`orcid`/`ror_id` -- implemented in \
-         `agent.rs::get_public_profile` (since the human-identity change, migration 286's \
+         `agent.rs::get_public_profile` (since the human-identity change, migration 309's \
          `epigraph_agent_disclosure`, the one rule every identity reader calls; \
          `agent_name_disclosure_lint.rs` reviews this fetcher's callers). The residual that leaves is already on record \
          as `D-PR17-agent-projection-enforced-at-one-call-site`; this entry does not discharge \
@@ -4296,7 +4296,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "agent.rs",
         "get_public_profile",
         "READ of one `agents` row's Tier-B projection: untenanted (077 `agents_identity` USING \
-         (true)); the name and every detail leave the database only through migration 286's \
+         (true)); the name and every detail leave the database only through migration 309's \
          `epigraph_agent_disclosure`, which decides on the STAMPED session the executor carries \
          (a definer that applies its own audience). An unstamped call reads as the outsider.",
     ),
@@ -5294,12 +5294,12 @@ fn call_spends_viewer(region: &str) -> bool {
 /// No entry reads content into a response without the viewer: the review
 /// found nothing to fix. Do not add an entry to make the build pass.
 const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
-    // untenanted: the name matcher over `agents`, whose tiers migration 286's
+    // untenanted: the name matcher over `agents`, whose tiers migration 309's
     // `epigraph_agent_disclosure` (a definer that applies its own audience) gates on the
     // STAMPED session `find` reads on; the viewer reaches the cards and counts it calls next.
     ("agent_lookup.rs", "find", &["Self::match_ranked"]),
     // untenanted: the card rows (`agents`, the name gated by `named` and each detail by
-    // `details`, both from migration 286's `epigraph_agent_disclosure` on the STAMPED session,
+    // `details`, both from migration 309's `epigraph_agent_disclosure` on the STAMPED session,
     // a definer that applies its own audience), `disclosed_roles` (the role-assignment
     // definer), `disclosed_attachments` (269's role-attachment definer, which decides on the
     // session in its body) and the operator humans' names through the one disclosure reader.
@@ -5348,7 +5348,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // untenanted: `claim_themes` labels for the themes `visible_themes` admitted.
     ("atlas_layout.rs", "unplaced_themes", &["Self::theme_rows"]),
     // untenanted: `agents` display names, decided for the MAP's audience by migration
-    // 286's explicit-audience core (a definer that applies its own audience; the builder's
+    // 309's explicit-audience core (a definer that applies its own audience; the builder's
     // privileged session is deliberately not the audience); the evidence labels are spliced.
     (
         "atlas_leaf.rs",
@@ -5566,7 +5566,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ("ego.rs", "edges", &["Self::untenanted_entity_types"]),
     // untenanted: `agents` display names; the claim, evidence, trace and (since migration 246
     // gave `papers` tenancy) paper reads are spliced.
-    // untenanted / stamped: the agent nodes' names through migration 286's
+    // untenanted / stamped: the agent nodes' names through migration 309's
     // disclosure on the caller's stamped connection (a definer that applies
     // its own audience).
     ("ego.rs", "hydrate", &["AgentDisclosureRepository::names"]),
@@ -6068,7 +6068,7 @@ pub async fn spliced(conn: &mut PgConnection, viewer: &Viewer) -> R {
 /// The agent public-profile rule (the profile is public, the caller IS the
 /// agent, or shares a live group with it; or an admin) used to be spelled in
 /// four repo statements, pinned one text by a test here. Since the
-/// human-identity change it lives in one place, migration 286's
+/// human-identity change it lives in one place, migration 309's
 /// `epigraph_agent_disclosure`, which every identity reader calls
 /// (`agent_name_disclosure_lint.rs` keeps that list). No repo statement may
 /// spell it again: any live-SQL `profile_visibility = 'public'` is a copy.
@@ -6109,7 +6109,7 @@ fn no_repo_statement_spells_the_agent_profile_rule() {
     assert!(
         copies.is_empty(),
         "these repo statements spell the agent profile rule instead of calling migration \
-         286's `epigraph_agent_disclosure`: {copies:?}"
+         309's `epigraph_agent_disclosure`: {copies:?}"
     );
 }
 

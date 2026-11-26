@@ -1649,13 +1649,13 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         (
             "agents_consent_stamp_definer_only",
             "profile_public_consented_at IS NULL",
-            "321's RESTRICTIVE insert policy: its row-only arm (`profile_public_consented_at \
+            "344's RESTRICTIVE insert policy: its row-only arm (`profile_public_consented_at \
              IS NULL`) says WHICH rows the restriction applies to (an unstamped row), and \
              grants nothing. A restrictive policy is AND-ed with the permissive \
              `agents_provision`, so every unstamped row is still decided by 077's arms alone; a \
              row stamped as consented needs one of the two session arms beside it \
              (`epigraph_bypass()` / `epigraph_definer_bypass()`), i.e. the maintenance session \
-             or a definer frame (297's setter stamps by UPDATE, not INSERT).",
+             or a definer frame (320's setter stamps by UPDATE, not INSERT).",
         ),
         (
             "workflow_outcome_reports_read",

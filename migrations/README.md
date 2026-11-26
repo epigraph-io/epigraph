@@ -4571,7 +4571,7 @@ restart.
   /api/v1/agents`, `GET /api/v1/agents/:id`, `GET /api/v1/agents/search` and MCP `find_agent` /
   `get_agent`, and answers 42883 there without it. (Since the human-identity branch merged,
   the agent routes, the agent search and `find_agent` / `get_agent` decide profile details
-  through 286's `epigraph_agent_disclosure`, whose 320 body applies the same 164 / 235 lapse
+  through 309's `epigraph_agent_disclosure`, whose 343 body applies the same 164 / 235 lapse
   rules; `GET /api/v1/groups/:id` still calls 273.)
 - **274**: public `retract_mark_grant` (backlog 03d444a9). Closes the residual 251 recorded:
   184's retract guard MARK arm (an UPDATE that sets or changes the retract columns to a
@@ -4751,7 +4751,7 @@ restart.
   `epigraph-api/tests/frames_evidence_app_role.rs` (two global writes on the application role
   leave one row). Undo: `docs/runbooks/308-undo.sql` (the deleted duplicates are not restored).
   **Applied to throwaway databases only, NOT to any deployed database.**
-- **286**: `human_identity_disclosure` (spec
+- **309**: `human_identity_disclosure` (spec
   `docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md` sections 3, 4 and
   6.1). Adds the ONE predicate deciding whether a human principal's name is shown to a viewer;
   no surface calls it yet. `epigraph_is_human_principal(agent)`: the structural, status-free
@@ -4772,44 +4772,44 @@ restart.
   `epigraph_oauth_clients_human_evidence_guard` (HEV01, 55000): a linked human client is
   never deleted or retyped, because it is the evidence that fails OPEN if lost. Fails CLOSED
   under a non-member owner (no binding, membership or group claim is read). Pinned by
-  `epigraph-db/tests/human_identity_visibility.rs`. Undo: `docs/runbooks/286-undo.sql`.
+  `epigraph-db/tests/human_identity_visibility.rs`. Undo: `docs/runbooks/309-undo.sql`.
   **Deploy order:** migrate BEFORE a binary that calls the wrappers (42883 without them).
-- **287**: `profile_visibility_setter` (spec section 8). `epigraph_set_profile_visibility(value)`:
+- **310**: `profile_visibility_setter` (spec section 8). `epigraph_set_profile_visibility(value)`:
   the session principal sets its OWN `agents.profile_visibility` ('public' | 'group'), which
-  286's opt-in arm reads as consent. Self only, no operator or admin arm. Refusals change
+  309's opt-in arm reads as consent. Self only, no operator or admin arm. Refusals change
   nothing: PVS01 (42501) no principal, PVS02 (22023) another value, PVS05 (42501) the
   principal is not a human principal (an operated agent or a service), PVS04 (55000) the row
   did not move. Returns `(previous, profile_visibility, named_to_everyone)`, the last from
-  286's core with an empty audience, so opting out while a bound agent's public claim exists
+  309's core with an empty audience, so opting out while a bound agent's public claim exists
   answers true. One `agent.profile_visibility_set` audit row per call. On 172's form with no
   write window (271 pinned every trigger's path), owned by `epigraph_maintenance`, EXECUTE to
   `epigraph_app` only. The column stays outside 118's app UPDATE grant
   (`app_role_table_lockdown.rs::agents_identity_columns_are_not_app_updatable`). Pinned by
-  `epigraph-db/tests/human_identity_visibility.rs`. Undo: `docs/runbooks/287-undo.sql`.
+  `epigraph-db/tests/human_identity_visibility.rs`. Undo: `docs/runbooks/310-undo.sql`.
   **Deploy order:** migrate BEFORE a binary with the MCP tool or the PUT field.
-- **288**: `human_profile_visibility_group` (spec section 10, M3). 062 defaulted
-  `agents.profile_visibility` to 'public' and nothing wrote it, so it was never consent; 286's
+- **311**: `human_profile_visibility_group` (spec section 10, M3). 062 defaulted
+  `agents.profile_visibility` to 'public' and nothing wrote it, so it was never consent; 309's
   opt-in arm reads it as consent. Precondition PVR01 (55000): `epigraph_provision_oauth_agent`'s
   body is still 077's (md5; 271 changed proconfig only). Re-states that definer to insert a
   `p_agent_type = 'human'` principal as 'group' and any other as 'public' (same upsert, same
   `key_kind = 'derived'` guard), moved to 172's form (it leaves `definer_search_path_ratchet`'s
   PUBLIC_PATH_REGISTER; HIGH_WATER 191 -> 190); owner and ACL kept. Resets every human
-  principal (286's `epigraph_is_human_principal`) to 'group'; post-condition PVR02 (55000)
+  principal (309's `epigraph_is_human_principal`) to 'group'; post-condition PVR02 (55000)
   refuses when any is left, because `agents` is FORCE RLS and a non-superuser, non-maintenance
   runner's UPDATE moves no row without an error. One `agent.profile_visibility_reset` row with
   `{before, rows, after}`. The column default stays 'public'; the functions that insert agents
   are pinned (`the_functions_that_insert_agents_are_exactly_the_register`). Pinned by
   `epigraph-db/tests/human_identity_visibility.rs` (production order, the zero-row refusal, the
-  precondition). Undo: `docs/runbooks/288-undo.sql` restores 077's body; the reset stays.
+  precondition). Undo: `docs/runbooks/311-undo.sql` restores 077's body; the reset stays.
   **Deploy order:** none against the binaries; the reset takes row locks under
   `lock_timeout = '3s'`.
-- **289**, **290**: `idx_claims_public_by_agent (agent_id) WHERE visibility = 'public'` and
+- **312**, **313**: `idx_claims_public_by_agent (agent_id) WHERE visibility = 'public'` and
   `idx_claims_group_by_agent (agent_id, owner_group_id) WHERE visibility <> 'public'`, each a
   single-statement `-- no-transaction` `CREATE INDEX CONCURRENTLY IF NOT EXISTS`. The probes of
-  286's public-claim and readable-claim arms, one per agent ever bound to a human. Registered
+  309's public-claim and readable-claim arms, one per agent ever bound to a human. Registered
   in `tenancy_migration_shape.rs::INDEX_MIGRATIONS` (validity checked). A failed build leaves
   an INVALID index that IF NOT EXISTS skips: `DROP INDEX CONCURRENTLY`, then re-apply.
-- **291**: `disclosure_team_arm_without_the_twin`. Re-states 286's
+- **314**: `disclosure_team_arm_without_the_twin`. Re-states 309's
   `epigraph_agent_disclosure_for` (CREATE OR REPLACE: owner, ACL kept; COST 1000 and 172's
   path restated) with the SAME answers and a cheaper evaluation, after
   `epigraph-db/tests/human_identity_visibility_perf.rs` measured ~600 ms per human
@@ -4818,8 +4818,8 @@ restart.
   verb-made-group condition kept) and calls the role derivation only when a viewer group
   carries a `group_role_bindings` row; the viewer-free public-claim arm runs before it.
   Pinned by `epigraph-db/tests/human_identity_visibility.rs` (every arm, unchanged). Undo:
-  `docs/runbooks/291-undo.sql` restores 286's body.
-- **292**: `role_edges_team_only` (spec section 7 row K1; operator ruling: the role edges are
+  `docs/runbooks/314-undo.sql` restores 309's body.
+- **315**: `role_edges_team_only` (spec section 7 row K1; operator ruling: the role edges are
   team-only). Precondition OCC01 (55000): `epigraph_role_assignments_audit`'s body is still
   130's (md5). NEW `epigraph_role_edge_owner(role, holder)`: the role's single live
   `group_role_bindings` group when it is an active team/community, else the holder's personal
@@ -4831,35 +4831,35 @@ restart.
   does on INSERT), one `edges.role_edges_team_only` summary `{before, rows, after}`, and
   post-condition OCC02 (55000) because `edges` is FORCE RLS. Both new functions on 172's form,
   maintenance-owned, not application-callable. Pinned by
-  `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/292-undo.sql` (130's body;
+  `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/315-undo.sql` (130's body;
   the backfill stays). **Deploy pre-check:** no role holder with only revoked personal rows.
-- **293**: `disclosure_role_derived_arm_last`. Precondition DAO01 (55000): the core is still
-  291's (md5). Re-states `epigraph_agent_disclosure_for` (same answers): the readable-claim arm
+- **316**: `disclosure_role_derived_arm_last`. Precondition DAO01 (55000): the core is still
+  314's (md5). Re-states `epigraph_agent_disclosure_for` (same answers): the readable-claim arm
   now precedes the role-derived arm, and for a target linked as nobody's agent and holding no
   allowance the role-derived arm is one binding probe per viewer group (249's window and
   `epigraph_live_role_assignment`) instead of 249's call; otherwise 249's call as before.
   Measured 617 -> 28 ms p50 for a viewer in a role-bound group. Pinned by
   `human_identity_visibility.rs::the_cheap_role_probe_answers_as_249_does`. Undo:
-  `docs/runbooks/293-undo.sql` restores 291's body.
-- **294**: `human_evidence_guard_agent_id`. Re-states 286's HEV01 guard (INVOKER, 271's path)
+  `docs/runbooks/316-undo.sql` restores 314's body.
+- **317**: `human_evidence_guard_agent_id`. Re-states 309's HEV01 guard (INVOKER, 271's path)
   to also refuse re-pointing or unlinking a LINKED human client's `agent_id`, and the trigger
   watches `UPDATE OF client_type, agent_id`; the first link of an unlinked client stays
-  allowed. Undo: `docs/runbooks/294-undo.sql`.
-- **295**: `role_edges_genuine_projections_only` (security review of 292, finding 1).
-  Precondition OCC03 (55000): the binding trigger's body is still 292's (md5). NEW
-  `epigraph_reown_role_projection_edges(role)` (NULL: every role) re-owns by 292's rule only a
+  allowed. Undo: `docs/runbooks/317-undo.sql`.
+- **318**: `role_edges_genuine_projections_only` (security review of 315, finding 1).
+  Precondition OCC03 (55000): the binding trigger's body is still 315's (md5). NEW
+  `epigraph_reown_role_projection_edges(role)` (NULL: every role) re-owns by 315's rule only a
   GENUINE projection: the audit trigger's marker (`source = role_assignments`,
   `projection = true`) AND a `role_assignments` row with that `assignment_id`, the edge's
-  source as holder and the edge's role. 292's binding trigger is re-stated to call it, so a
+  source as holder and the edge's role. 315's binding trigger is re-stated to call it, so a
   forged edge of the projection's shape is never re-owned and never fails a bind / unbind
-  (292 minted a personal group for its source, or raised RVK01 for one with only revoked rows).
+  (315 minted a personal group for its source, or raised RVK01 for one with only revoked rows).
   A reconcile pass over every role, one `edges.role_projection_edges_reconciled` summary
   `{before, rows, after}` counting genuine projections only, post-condition OCC04 (55000).
   On 172's form, maintenance-owned, not application-callable. Pinned by
-  `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/295-undo.sql`. 292's own
-  backfill and OCC02 still match the relationship alone (292 is not edited): **deploy
+  `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/318-undo.sql`. 315's own
+  backfill and OCC02 still match the relationship alone (315 is not edited): **deploy
   pre-check** in the spec, section 17.
-- **296**: `role_projection_edges_maintenance_only` (security review of 292, finding 2). NEW
+- **319**: `role_projection_edges_maintenance_only` (security review of 315, finding 2). NEW
   `epigraph_role_projection_edges_guard()` (SECURITY INVOKER on 271's path, maintenance-owned)
   and three BEFORE triggers on `edges` keyed by WHEN on the projection marker
   (`source = role_assignments`, `projection = true`): INSERT (NEW carries it), UPDATE (OLD or
@@ -4867,9 +4867,9 @@ restart.
   `epigraph_definer_bypass()`; otherwise OCC05 (42501). So a writer of the owning team cannot
   widen, strip, re-time or delete a projection edge, and no application writer can write the
   marker. The grant / end / bind / unbind re-projection runs as maintenance and passes. Pinned
-  by `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/296-undo.sql`.
-- **297**: `profile_public_consent` (operator ruling C11). Precondition PCN01 (55000): the
-  disclosure core is still 293's and the profile setter still 287's (md5). NEW column
+  by `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/319-undo.sql`.
+- **320**: `profile_public_consent` (operator ruling C11). Precondition PCN01 (55000): the
+  disclosure core is still 316's and the profile setter still 310's (md5). NEW column
   `agents.profile_public_consented_at timestamptz` (no backfill: no one has consented) and
   CHECK `agents_profile_public_consent_check` (a stamp only on a `'public'` profile). No
   column privilege for the application role. `epigraph_agent_disclosure_for` re-stated: for a
@@ -4879,8 +4879,8 @@ restart.
   `epigraph-db/tests/human_identity_visibility.rs`
   (`a_public_profile_without_recorded_consent_names_no_one`,
   `the_consent_stamp_is_the_setters_alone`, the PCN01 refusal). Undo:
-  `docs/runbooks/297-undo.sql`.
-- **298**: `team_invite_no_human_oracle` (operator ruling C10; spec R11). Precondition TIV01
+  `docs/runbooks/320-undo.sql`.
+- **321**: `team_invite_no_human_oracle` (operator ruling C10; spec R11). Precondition TIV01
   (55000): the invite is still 263's (md5). `epigraph_invite_to_team_group` re-stated without
   the `epigraph_is_human_operator(invitee)` refusal: TGP03 now refuses only an id naming no
   agent, a role's node or a registered system identity (each visible to every reader), so the
@@ -4888,8 +4888,8 @@ restart.
   unchanged and already refuses any caller that is not a registered person (TGP01): the
   refusal moved there. Pinned by `epigraph-db/tests/person_team_groups.rs`
   (`an_invitation_answers_alike_whoever_the_invitee_is`), `epigraph-api/tests/team_groups_http.rs`,
-  `epigraph-mcp/tests/team_groups_app_role.rs`. Undo: `docs/runbooks/298-undo.sql`.
-- **299**: `unnamed_agent_placeholder_name` (operator ruling C7). NEW
+  `epigraph-mcp/tests/team_groups_app_role.rs`. Undo: `docs/runbooks/321-undo.sql`.
+- **322**: `unnamed_agent_placeholder_name` (operator ruling C7). NEW
   `epigraph_unnamed_agent_name(agent) -> text`: `'oauth:' || <id of the agent's earliest linked
   oauth_clients row>`, the provisioning client, so the name is the one a nameless OAuth service
   principal carries and its uuid derives the agent's key as a service principal's does; NULL
@@ -4900,18 +4900,18 @@ restart.
   unnamed human by that placeholder as they find a service principal. Pinned by
   `epigraph-db/tests/human_identity_visibility.rs` (placeholder search, provisioning-client
   derivation), `agent_name_disclosure_lint.rs::no_name_decision_falls_back_to_null`, and the
-  H-vs-N tests across REST and MCP. Undo: `docs/runbooks/299-undo.sql` (after rolling back the
+  H-vs-N tests across REST and MCP. Undo: `docs/runbooks/322-undo.sql` (after rolling back the
   binaries).
-- **300**, **301**: `idx_claims_public_by_agent_since (agent_id, created_at) WHERE visibility =
+- **323**, **324**: `idx_claims_public_by_agent_since (agent_id, created_at) WHERE visibility =
   'public'` and `idx_claims_group_by_agent_since (agent_id, owner_group_id, created_at) WHERE
   visibility <> 'public'` (operator ruling C5), each a single-statement `-- no-transaction`
-  `CREATE INDEX CONCURRENTLY IF NOT EXISTS`: 302's windowed claim probes, one descent per bound
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS`: 325's windowed claim probes, one descent per bound
   agent to its first claim at or after its binding start. Registered in
   `tenancy_migration_shape.rs::INDEX_MIGRATIONS` (validity checked; the probes' plans are
   pinned there). A failed build leaves an INVALID index that IF NOT EXISTS skips: `DROP INDEX
   CONCURRENTLY`, then re-apply.
-- **302**: `disclosure_binding_window_start` (operator ruling C5). Precondition BWS01 (55000):
-  the core is still 297's (md5). Re-states `epigraph_agent_disclosure_for`: B(H) carries each
+- **325**: `disclosure_binding_window_start` (operator ruling C5). Precondition BWS01 (55000):
+  the core is still 320's (md5). Re-states `epigraph_agent_disclosure_for`: B(H) carries each
   agent's binding START (H itself `-infinity`; a bound agent the earliest of its link's
   `created_at` and its allowances' `added_at` for H), and the public-claim and readable-claim
   arms count only a claim with `created_at >= start`. No end bound: retiring or revoking never
@@ -4919,25 +4919,25 @@ restart.
   creation here, unlike 199's `epigraph_operator_bound_at`. Pinned by
   `human_identity_visibility.rs` (`an_assertion_from_before_the_binding_never_names_the_human`,
   `an_assertion_after_the_binding_names_the_human_after_the_binding_ends`, the BWS01 refusal).
-  Undo: `docs/runbooks/302-undo.sql` (297's body; re-apply 289 and 290 first). **Deploy
+  Undo: `docs/runbooks/325-undo.sql` (320's body; re-apply 312 and 313 first). **Deploy
   note:** a human named today only by public claims its agents filed before their binding
   (legacy-linked authors) becomes unnamed to outsiders (spec section 17).
-- **303**, **304**: `DROP INDEX CONCURRENTLY IF EXISTS` of 289's and 290's indexes, each a
-  single-statement `-- no-transaction` file; 300 and 301 supersede them (same predicates,
+- **326**, **327**: `DROP INDEX CONCURRENTLY IF EXISTS` of 312's and 313's indexes, each a
+  single-statement `-- no-transaction` file; 323 and 324 supersede them (same predicates,
   `created_at` appended). Registered in `tenancy_migration_shape.rs::DROPPED_INDEX_MIGRATIONS`.
-  Undo: re-run 289 / 290.
-- **305**-**308**: the partial indexes of 309's arm (operator ruling C6), each a
+  Undo: re-run 312 / 313.
+- **328**-**331**: the partial indexes of 332's arm (operator ruling C6), each a
   single-statement `-- no-transaction` `CREATE INDEX CONCURRENTLY IF NOT EXISTS`:
   `idx_evidence_public_by_signer (signer_id, created_at)`,
   `idx_challenges_public_by_challenger (challenger_id, created_at)` and
   `idx_mass_functions_public_by_source (source_agent_id, created_at)`, each `WHERE visibility =
   'public'`; `idx_edges_public_ingest_records_by_ingester ((properties ->> 'ingested_by'),
   created_at) WHERE relationship = 'ingested_claim' AND visibility = 'public'`. Registered in
-  `tenancy_migration_shape.rs`, where each probe's plan is pinned. 308's index is superseded
-  by 313 and dropped by 315: a bare `->>` is no index condition under the core's row security.
-- **309**: `disclosure_every_public_assertion` (operator ruling C6). Precondition PAK01 (55000):
-  the core is still 302's (md5). Re-states `epigraph_agent_disclosure_for` with one arm after the
-  public-claim arm: a PUBLIC row by an agent of B(H), at or after its binding start (302), of
+  `tenancy_migration_shape.rs`, where each probe's plan is pinned. 331's index is superseded
+  by 336 and dropped by 338: a bare `->>` is no index condition under the core's row security.
+- **332**: `disclosure_every_public_assertion` (operator ruling C6). Precondition PAK01 (55000):
+  the core is still 325's (md5). Re-states `epigraph_agent_disclosure_for` with one arm after the
+  public-claim arm: a PUBLIC row by an agent of B(H), at or after its binding start (325), of
   evidence (`signer_id`: the table has no author column), a challenge (`challenger_id`), a BBA
   (`source_agent_id`; a retracted one still counts) or an ingest record (`edges`
   `paper -ingested_claim-> claim` whose `properties.ingested_by` is the agent and whose
@@ -4945,62 +4945,62 @@ restart.
   `human_identity_visibility.rs` (`a_public_assertion_of_every_kind_names_the_human`,
   `an_assertion_of_any_kind_from_before_the_binding_never_names_the_human`, the PAK01 refusal)
   and `claim_authored_by.rs::a_human_ingesters_public_record_names_it_to_every_reader`. Undo:
-  `docs/runbooks/309-undo.sql` (302's body).
-- **310**: `idx_security_events_countersigned (agent_id, created_at) WHERE event_type =
+  `docs/runbooks/332-undo.sql` (325's body).
+- **333**: `idx_security_events_countersigned (agent_id, created_at) WHERE event_type =
   'authorship.countersigned'` (operator ruling C2), a single-statement `-- no-transaction`
-  `CREATE INDEX CONCURRENTLY IF NOT EXISTS`: 311's probe of 208's countersign audit rows, one
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS`: 334's probe of 208's countersign audit rows, one
   descent per bound agent. Registered in `tenancy_migration_shape.rs::INDEX_MIGRATIONS`.
-- **311**: `disclosure_countersigned_authorship` (operator ruling C2; spec R3). Precondition
-  CSN01 (55000): the core is still 309's (md5). Re-states `epigraph_agent_disclosure_for` with
-  one arm after 309's: a 208 `authorship.countersigned` audit row whose caller is an agent of
-  B(H), at or after its binding start (302), on a paper that is `'public'` or owned by one of the
+- **334**: `disclosure_countersigned_authorship` (operator ruling C2; spec R3). Precondition
+  CSN01 (55000): the core is still 332's (md5). Re-states `epigraph_agent_disclosure_for` with
+  one arm after 332's: a 208 `authorship.countersigned` audit row whose caller is an agent of
+  B(H), at or after its binding start (325), on a paper that is `'public'` or owned by one of the
   viewer's groups (246's `papers_read`). The audit row, not the edge's
   `epigraph:countersigned_by:` label, because only the row carries the act's time; 208's
   RESTRICTIVE policy reserves it to definer frames with `created_at = now()`. A pending naming,
   or a declined one, names no one. Pinned by `human_identity_visibility.rs`
   (`a_countersigned_authorship_of_a_readable_paper_names_the_human`,
   `a_countersign_from_before_the_binding_never_names_the_human`, the CSN01 refusal). Undo:
-  `docs/runbooks/311-undo.sql` (309's body).
-- **312**: `ingest_record_ingester_leakproof`. NEW `epigraph_ingest_record_ingester(jsonb) ->
+  `docs/runbooks/334-undo.sql` (332's body).
+- **335**: `ingest_record_ingester_leakproof`. NEW `epigraph_ingest_record_ingester(jsonb) ->
   text` (`properties ->> 'ingested_by'`), `LANGUAGE sql IMMUTABLE LEAKPROOF PARALLEL SAFE`, path
   `pg_catalog, pg_temp` (so it is never inlined back into a bare `->>`), maintenance-owned,
-  EXECUTE left with PUBLIC (pure; every edges writer evaluates 313's index expression).
+  EXECUTE left with PUBLIC (pure; every edges writer evaluates 336's index expression).
   Precondition LKP01 (42501): the migration runner must be a superuser (LEAKPROOF needs one).
   Why: the disclosure core is a definer over FORCE RLS tables, so a non-leakproof qual is no
-  index condition there; 309's `->>` probe measured 198 s. Registered in `tenancy_backfill`'s
+  index condition there; 332's `->>` probe measured 198 s. Registered in `tenancy_backfill`'s
   INVOKER_EXEMPT.
-- **313**: `idx_edges_public_ingest_records_by_ingester_lp
+- **336**: `idx_edges_public_ingest_records_by_ingester_lp
   (epigraph_ingest_record_ingester(properties), created_at) WHERE relationship =
   'ingested_claim' AND visibility = 'public'`, single-statement `-- no-transaction`. Registered
   in `tenancy_migration_shape.rs::INDEX_MIGRATIONS`.
-- **314**: `disclosure_probes_leakproof`. Precondition LPR01 (55000): the core is still 311's
+- **337**: `disclosure_probes_leakproof`. Precondition LPR01 (55000): the core is still 334's
   (md5). Re-states `epigraph_agent_disclosure_for` with the same arms and answers: B(H)'s ids
-  are also materialised as text once, the ingest-record probe reads 312's accessor (313's
+  are also materialised as text once, the ingest-record probe reads 335's accessor (336's
   index), and the countersign arm computes the paper id in a fenced subquery so its `papers`
   join is `uuid = Var`. Pinned by
   `tenancy_migration_shape.rs::the_disclosure_probes_reach_their_indexes_under_the_cores_row_security`
-  (EXPLAIN under `SET ROLE epigraph_maintenance`; red before 312-315) and the LPR01 refusal.
-  Undo: `docs/runbooks/314-undo.sql` (re-apply 308 first).
-- **315**: `DROP INDEX CONCURRENTLY IF EXISTS` of 308's index (unusable under row security),
+  (EXPLAIN under `SET ROLE epigraph_maintenance`; red before 335-338) and the LPR01 refusal.
+  Undo: `docs/runbooks/337-undo.sql` (re-apply 331 first).
+- **338**: `DROP INDEX CONCURRENTLY IF EXISTS` of 331's index (unusable under row security),
   single-statement `-- no-transaction`. Registered in `DROPPED_INDEX_MIGRATIONS`. Undo: re-run
-  308.
-- **316**: `disclosure_counts_own_assertions_only` (security review of 309, "Addendum 5").
-  Precondition OWN01 (55000): the core is still 314's (md5). Re-states
+  331.
+- **339**: `disclosure_counts_own_assertions_only` (security review of 332, "Addendum 5").
+  Precondition OWN01 (55000): the core is still 337's (md5). Re-states
   `epigraph_agent_disclosure_for` so the public-assertion arm counts only rows the agent itself
   made: the evidence probe is removed (`signer_id` is the server's agent on every MCP write; no
   column records the asserting agent) and the BBA probe counts only `slot_kind = 'assessment'`
   (an edge factor is attributed to the source claim's author whoever wrote the edge, and
-  unscoped rows are copied under another identity). Every other arm and the order are 314's.
+  unscoped rows are copied under another identity). Every other arm and the order are 337's.
   Pinned by `human_identity_visibility.rs::only_an_agents_own_assertion_names_its_human` and
-  the OWN01 refusal. Undo: `docs/runbooks/316-undo.sql` (re-apply 305 and 307 first).
-- **317**: `idx_mass_functions_public_assessments_by_source (source_agent_id, created_at) WHERE
+  the OWN01 refusal. Undo: `docs/runbooks/339-undo.sql` (re-apply 328 and 330 first).
+- **340**: `idx_mass_functions_public_assessments_by_source (source_agent_id, created_at) WHERE
   visibility = 'public' AND slot_kind = 'assessment'`, single-statement `-- no-transaction`.
   Registered in `tenancy_migration_shape.rs::INDEX_MIGRATIONS`.
-- **318**, **319**: `DROP INDEX CONCURRENTLY IF EXISTS` of 307's and 305's indexes, which no
-  probe reads after 316, each single-statement `-- no-transaction`. Registered (with 305 and
-  307) in `DROPPED_INDEX_MIGRATIONS`. Undo: re-run 307 / 305.
-- **320**: `disclosure_details_live_rows_only` (review 2, correctness#3; backlog f712db53).
-  Precondition LRD01 (55000): the core is still 316's (md5). Re-states
+- **341**, **342**: `DROP INDEX CONCURRENTLY IF EXISTS` of 330's and 328's indexes, which no
+  probe reads after 339, each single-statement `-- no-transaction`. Registered (with 328 and
+  330) in `DROPPED_INDEX_MIGRATIONS`. Undo: re-run 330 / 328.
+- **343**: `disclosure_details_live_rows_only` (review 2, correctness#3; backlog f712db53).
+  Precondition LRD01 (55000): the core is still 339's (md5). Re-states
   `epigraph_agent_disclosure_for` so the profile details rule counts a shared group only
   through a membership row that still COUNTS: 164 (a verb-made group's row, while its agent's
   human is a live human operator) and 235 (a personal-group row of an agent allowlisted for the
@@ -5008,10 +5008,10 @@ restart.
   in its hand-copied predicates through `epigraph_group_live_roster`; a merge of main must keep
   this core and may express the rule through that function. Pinned by
   `human_identity_visibility.rs::a_lapsed_membership_row_shares_no_details` (red before) and the
-  LRD01 refusal. Undo: `docs/runbooks/320-undo.sql`.
-- **321**: `agents_consent_stamp_insert_definer_only` (review 2, leaks#5). A RESTRICTIVE INSERT
+  LRD01 refusal. Undo: `docs/runbooks/343-undo.sql`.
+- **344**: `agents_consent_stamp_insert_definer_only` (review 2, leaks#5). A RESTRICTIVE INSERT
   policy on `agents` refuses a non-NULL `profile_public_consented_at` unless the session is
-  maintenance or a definer frame, so 297's "only the setter writes it" holds for INSERT as well
+  maintenance or a definer frame, so 320's "only the setter writes it" holds for INSERT as well
   as UPDATE (077's table-level INSERT grant reached the column). Pinned by
   `human_identity_visibility.rs::the_consent_stamp_is_the_setters_alone` (the INSERT case, red
   before). Undo: `DROP POLICY IF EXISTS agents_consent_stamp_definer_only ON public.agents`.

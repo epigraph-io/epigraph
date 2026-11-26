@@ -11,11 +11,13 @@ one is marked either **[ORCHESTRATOR'S CALL]** or **[SPEC AUTHOR'S CALL]**. Item
 §16.R2; an item ruled there is marked **[RULED]**.
 
 **Migration numbers.** Every migration number in this spec is the branch's number AFTER the
-second renumber (C17, §16.R2): the branch's migrations, first written as 272-307 on a head of
-271, were moved to 274-309 by C15 (above origin/main's 272 and 273), then to 286-321 by C17
-(above origin/main's 274, 275, 276, 284 and 285, which the triage pull requests landed).
-Only §16.R2's record of C15, §16.C's records of C15 and C17, §20's correctness#1 row and §21
-quote earlier numbers, as history; each says which numbering it uses.
+third renumber: the branch's migrations, first written as 272-307 on a head of 271, were
+moved to 274-309 by C15 (above origin/main's 272 and 273), then to 286-321 by C17 (above
+origin/main's 274, 275, 276, 284 and 285, which the triage pull requests landed), then to
+309-344 on the 2026-11-25-3 staging branch (above the staged triage migration 308), by the
+same mechanical rewrite (+23). Only §16.R2's record of C15 and C17, §16.C's records of C15
+and C17, §20's correctness#1 row and §21 quote earlier numbers, as history; each says which
+numbering it uses.
 
 **Revision 2.** Two adversarial reviews (a leak hunt, findings L1-L15, and an
 accountability / migration-safety / performance review, findings 1-20) were resolved into
@@ -85,7 +87,7 @@ maps a DCR request and an explicit `client_type: "human"` registration to `clien
 `oauth:` placeholder name (§9), so hiding them costs nothing.
 
 **Bound agents of H, B(H).** H itself, plus every agent ever bound to H, each with its
-**binding start** (**[RULED] C5**, migration 302): `-infinity` for H itself, else the earliest
+**binding start** (**[RULED] C5**, migration 325): `-infinity` for H itself, else the earliest
 start of any of that agent's bindings to H (a link's `created_at`, an allowance's
 `added_at`). An agent's assertions count for H only from its binding start; there is no end
 bound. The agents are:
@@ -124,8 +126,8 @@ H is **NAMED** to viewer V when any arm below holds. Otherwise H is **UNNAMED**.
 | team | V's live group set (the stamped `epigraph.group_ids`: direct, role-derived and the 234 operator-readable teams, i.e. what `Viewer::resolve` yields) contains a group G such that G has `kind IN ('team','community')`, `status = 'active'`, and G is among H's live memberships (`epigraph_live_memberships_unbound(H)`: direct, 165 role-derived, 164 lapse, 235 allowance lapse). Personal, world and seed groups never count. | approved rule |
 | opt-in | `agents.profile_visibility = 'public'` on H, set by H through the self-service definer (§8). Migration resets every human principal to `'group'` and new human principals are created as `'group'` (§10), so the value is evidence of consent. | approved rule |
 | public claim | some agent in B(H) is `claims.agent_id` of a claim with `visibility = 'public'`, current or superseded (`is_current` is not read), created at or after that agent's binding start. This is sticky across binding changes: retiring a link or revoking an allowance never re-hides H. | approved rule ("No anonymous claims"); window **[RULED] C5** |
-| public assertion | some agent in B(H), from its binding start, ITSELF made a PUBLIC row of another kind: a challenge (`challenger_id`, pinned to the filing principal by 170's CR08), an assessment (`mass_functions.source_agent_id` on a `slot_kind = 'assessment'` row, retracted or not), or a document ingest record (`edges` `paper -ingested_claim-> claim`, `properties.ingested_by`, marked by the same ingest). Evidence and every other BBA shape are not counted (Addendum 5, migration 316). | **[RULED] C6** (migration 309), narrowed by the security review's Addendum 5 (migration 316) |
-| countersigned authorship | some agent in B(H), from its binding start, countersigned (confirmed) an authorship of a paper V can read (`'public'`, or owned by one of V's groups): 208's `authorship.countersigned` audit row with that agent as caller. | **[RULED] C2** (migration 311) |
+| public assertion | some agent in B(H), from its binding start, ITSELF made a PUBLIC row of another kind: a challenge (`challenger_id`, pinned to the filing principal by 170's CR08), an assessment (`mass_functions.source_agent_id` on a `slot_kind = 'assessment'` row, retracted or not), or a document ingest record (`edges` `paper -ingested_claim-> claim`, `properties.ingested_by`, marked by the same ingest). Evidence and every other BBA shape are not counted (Addendum 5, migration 339). | **[RULED] C6** (migration 332), narrowed by the security review's Addendum 5 (migration 339) |
+| countersigned authorship | some agent in B(H), from its binding start, countersigned (confirmed) an authorship of a paper V can read (`'public'`, or owned by one of V's groups): 208's `authorship.countersigned` audit row with that agent as caller. | **[RULED] C2** (migration 334) |
 | readable claim | V can read some claim whose `agent_id` is in B(H), created at or after that agent's binding start: `visibility = 'group' AND owner_group_id = ANY(V's groups)`. Whoever can read a claim can trace it to its human. | **[ORCHESTRATOR'S CALL]** (§16.A1); window **[RULED] C5** |
 
 Consequences that follow directly from the rule and that the PR must state in its text:
@@ -170,7 +172,7 @@ Consequences that follow directly from the rule and that the PR must state in it
 
   §12.T8 pins each of the four with the behaviour implemented now: the approved rule read
   literally ("team members"), option (a) of C3.
-- **The binding window (**[RULED] C5**, migration 302).** Revision 2 implemented "ever bound"
+- **The binding window (**[RULED] C5**, migration 325).** Revision 2 implemented "ever bound"
   (brief-literal): a claim an agent filed before H's link or allowance existed named H, and
   123's `epigraph_link_legacy_authors` (bulk retired links for legacy authors) made every
   legacy public claim name its receiving human. The operator ruled: an assertion counts for
@@ -185,12 +187,12 @@ Consequences that follow directly from the rule and that the PR must state in it
   - a legacy-linked author's pre-link public claims no longer name its human (§15.R17, §17);
   - the window reads `created_at`, which every application write path sets to `now()`; a
     direct database write can set it, the trust class of **[RULED] C13**.
-  The probes stay index probes: `created_at` is the trailing key of 300's and 301's indexes,
+  The probes stay index probes: `created_at` is the trailing key of 323's and 324's indexes,
   so each probe descends to the first row at or after the start (§11.1). The rejected
   revision-2 alternative, a per-claim `bound_at(c.agent_id, c.created_at) = H`, is not what
   was built: the start is read once per bound agent, not once per claim.
-- **Every kind of public assertion counts (**[RULED] C6**, migration 309; B15 superseded),
-  but only an assertion the agent ITSELF made (security review "Addendum 5", migration 316).**
+- **Every kind of public assertion counts (**[RULED] C6**, migration 332; B15 superseded),
+  but only an assertion the agent ITSELF made (security review "Addendum 5", migration 339).**
   A row counts only where the column naming the agent is, on every writer, the identity that
   wrote it. Re-verified per kind on this head:
   - `challenges.challenger_id`: 170's CR08 refuses an application session whose principal is
@@ -234,7 +236,7 @@ Consequences that follow directly from the rule and that the PR must state in it
   `created_at`). The widening act is the admin's or the sweep's, not H's; the assertion is
   B(H)'s own and is now world-readable with its agent id, so it is accountability-positive in
   the same way as C4. Implemented as built; listed for the operator (PR body).
-- **A countersigned authorship counts (**[RULED] C2**, migration 311; R3 closed).** The arm
+- **A countersigned authorship counts (**[RULED] C2**, migration 334; R3 closed).** The arm
   reads 208's audit row (caller and time), not the edge's `epigraph:countersigned_by:` label,
   because only the row carries the time the window needs; 208's RESTRICTIVE policy reserves
   the event type to definer frames with `created_at = now()`, and nothing deletes
@@ -274,7 +276,7 @@ options put to the operator:
   list-by-label enumeration as known.
 
 Part B implemented (b), the brief's literal text. **The operator ruled (a)** (§16.R, C7),
-and migration 299 implements it: NEW `epigraph_unnamed_agent_name(agent)` =
+and migration 322 implements it: NEW `epigraph_unnamed_agent_name(agent)` =
 `'oauth:' || <id of the agent's EARLIEST linked oauth_clients row>`, the one SQL spelling of
 the placeholder, called in the ELSE of every name decision (`CASE WHEN named THEN
 display_name ELSE epigraph_unnamed_agent_name(id) END`). The earliest linked client is the
@@ -300,9 +302,9 @@ Concretely:
 - `roles` is `[]`: non-elevating assignments are hidden too. `role_attachments` is `[]`.
 - `orcid` and `ror_id` are null. In `get_public_profile` (§7, row B1) `profile_visibility` is
   `'public'` and `properties` is `{}`, what a minted service principal shows (its profile is
-  `'public'` from 288's mint, its properties the column default), whatever H's row holds.
+  `'public'` from 311's mint, its properties the column default), whatever H's row holds.
   `key_kind` is H's own: `derived` for a provider-provisioned person, as for N.
-- `labels` are not redacted: H and N both carry 288's provisioning label `oauth-principal`,
+- `labels` are not redacted: H and N both carry 311's provisioning label `oauth-principal`,
   so `GET /api/v1/agents?label=oauth-principal` lists both alike. Redacting labels while
   `?label=` filters raw rows would itself be a marker.
 - H is never found by its name, prefix, trigram, ORCID or ROR, and never listed as a
@@ -349,7 +351,7 @@ only made `0` a hidden-human marker (review findings leaks#2, correctness#2).
 
 All four functions are `SECURITY DEFINER` and owned by `epigraph_maintenance`. They use
 172's form: `SET search_path = pg_catalog, pg_temp`, and every object is schema-qualified.
-Every `CREATE` is followed by `REVOKE ALL ... FROM PUBLIC`. They land in migration 286 (§10).
+Every `CREATE` is followed by `REVOKE ALL ... FROM PUBLIC`. They land in migration 309 (§10).
 
 ```sql
 -- Human evidence (§3). Maintenance-only EXECUTE: definers call it as their owner.
@@ -391,7 +393,7 @@ The core's body, in order (the decision is made in SQL; the Rust side only redac
    - `p_target = p_principal`;
    - `profile_visibility = 'public'`;
    - a live direct `group_memberships` row of `p_target` with `group_id = ANY(p_groups)`.
-     **Since migration 320** (review 2, correctness#3) the row must still COUNT under 236's
+     **Since migration 343** (review 2, correctness#3) the row must still COUNT under 236's
      direct-arm lapse rules: 164 (a verb-made `did:epigraph:group:` group's row counts while
      its agent's human is a live human operator) and 235 (a personal-group row of an agent
      allowlisted for the group's owner counts while an allowance still names the owner). Main
@@ -448,11 +450,11 @@ The probes use `idx_claims_public_by_agent (agent_id) WHERE visibility = 'public
 (§10, M4/M5). **Since the C5/C6/C2 rulings (M15-M22)** B(H) is materialised as
 `(agent_id, since)` pairs (§3) and every probe reads `ROWS FROM (unnest(v_bound),
 unnest(v_since)) b(agent_id, since)` with `AND <row>.created_at >= b.since`; the claim probes
-use 300's `(agent_id, created_at)` and 301's `(agent_id, owner_group_id, created_at)` indexes
-(289's and 290's are dropped by 303 and 304), and the arms for the other kinds and the
-countersign use 305-307, 313 and 310 (§10). Every probe qual must be LEAKPROOF: the core is
+use 323's `(agent_id, created_at)` and 324's `(agent_id, owner_group_id, created_at)` indexes
+(312's and 313's are dropped by 326 and 327), and the arms for the other kinds and the
+countersign use 328-330, 336 and 333 (§10). Every probe qual must be LEAKPROOF: the core is
 a definer over FORCE RLS tables, so any other qual runs after the policy qual and is no index
-condition (§11.2; the ingest-record probe therefore compares 312's LEAKPROOF accessor with
+condition (§11.2; the ingest-record probe therefore compares 335's LEAKPROOF accessor with
 B(H)'s ids cast to text once). The arm order is: privileged, self, opt-in, public
 claim, public assertion (C6), countersigned authorship (C2), then the viewer-group arms
 (team, readable claim, role-derived last). B(H)'s `author_binding_clients` read uses a new
@@ -481,7 +483,7 @@ whether the rule applies at all: if it ever read empty, H would be treated as no
 NAMED. It keys on `oauth_clients` (`client_type = 'human'`), which carries no row policy
 (077), and on `human_operators`. For a provider-provisioned human who is not a registered
 operator, the `oauth_clients` row is the only evidence, and `human_operators.client_id ON
-DELETE RESTRICT` does not protect it. Migration 286 therefore adds a trigger,
+DELETE RESTRICT` does not protect it. Migration 309 therefore adds a trigger,
 `epigraph_oauth_clients_human_evidence_guard`, that refuses (SQLSTATE 55000, code `HEV01`)
 a DELETE of a `client_type = 'human'` row that is linked to an agent, and an UPDATE that
 changes `client_type` away from `'human'` on such a row. On HEAD no code deletes such a row
@@ -622,7 +624,7 @@ Operator: "Make the OCCUPIES role edges team-only too." Moved here from §15.R1 
 
 | # | Site | Today | Change |
 |---|---|---|---|
-| K1 | `migrations/130_pending_admin_acts.sql::epigraph_role_assignments_audit` (the only `OCCUPIES` writer on HEAD; 123's body re-stated by 130), its revoke/expiry arm, `group_role_bindings` changes, and every existing row | `holder -OCCUPIES-> role node` written `('public', world)` with `properties.role`: an outsider reads "this id holds role X" on `list_edges`, `get_neighborhood` / `traverse`, graph query and `graph_full`, while the card shows `roles: []`. | Migration 292 (§10 M7): owner = the role's single live binding's group when it is an active team/community, else the holder's personal group **[ORCHESTRATOR'S CALL, §16.A2]**; the personal group is minted by 105's function when absent **[FIX AGENT'S CALL, §16.A3]**; a bind/unbind re-owns the role's edges; every existing row is backfilled. Read surfaces are unchanged (edge row security already filters a `group` edge). The ego view and PROV export cannot reach an agent-to-agent edge (claim-centred / claim-rooted). After the security review of 292: migration 295 (§10 M10) re-owns only a GENUINE projection (the audit trigger's marker joined to its `role_assignments` row), so a forged edge of the same shape is never re-owned and never fails a binding change; migration 296 (§10 M11) makes every row carrying the marker writable only by a maintenance session or a maintenance-owned definer frame (OCC05), so a writer of the owning team cannot widen, strip, re-time or delete one, and no application writer can write the marker. |
+| K1 | `migrations/130_pending_admin_acts.sql::epigraph_role_assignments_audit` (the only `OCCUPIES` writer on HEAD; 123's body re-stated by 130), its revoke/expiry arm, `group_role_bindings` changes, and every existing row | `holder -OCCUPIES-> role node` written `('public', world)` with `properties.role`: an outsider reads "this id holds role X" on `list_edges`, `get_neighborhood` / `traverse`, graph query and `graph_full`, while the card shows `roles: []`. | Migration 315 (§10 M7): owner = the role's single live binding's group when it is an active team/community, else the holder's personal group **[ORCHESTRATOR'S CALL, §16.A2]**; the personal group is minted by 105's function when absent **[FIX AGENT'S CALL, §16.A3]**; a bind/unbind re-owns the role's edges; every existing row is backfilled. Read surfaces are unchanged (edge row security already filters a `group` edge). The ego view and PROV export cannot reach an agent-to-agent edge (claim-centred / claim-rooted). After the security review of 315: migration 318 (§10 M10) re-owns only a GENUINE projection (the audit trigger's marker joined to its `role_assignments` row), so a forged edge of the same shape is never re-owned and never fails a binding change; migration 319 (§10 M11) makes every row carrying the marker writable only by a maintenance session or a maintenance-owned definer frame (OCC05), so a writer of the owning team cannot widen, strip, re-time or delete one, and no application writer can write the marker. |
 
 ### J. Re-verified: no change
 
@@ -648,7 +650,7 @@ change.
 ## 8. Opt-in surface
 
 The opt-in is modelled on 209's `epigraph_set_agent_default_group`, the current successor of
-206's self-service setter. It lands in migration 287 (§10).
+206's self-service setter. It lands in migration 310 (§10).
 
 ```sql
 public.epigraph_set_profile_visibility(p_visibility text)
@@ -805,7 +807,7 @@ below the applied maximum. 265 is held by open PR #1028. Use the next free numbe
 transactional file has `SET LOCAL lock_timeout = '3s'` and the header sections WHY / RULE /
 SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
 
-- **M1 `286_human_identity_disclosure.sql`** (transactional): the predicate.
+- **M1 `309_human_identity_disclosure.sql`** (transactional): the predicate.
   1. CREATE `epigraph_is_human_principal`, `epigraph_agent_disclosure_for`,
      `epigraph_agent_disclosure` and `epigraph_human_named_to_viewer` (§6.1). Each gets
      `REVOKE ALL ... FROM PUBLIC`. Then a guarded `DO` block:
@@ -819,9 +821,9 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
      `lock_timeout` bounds it.
   3. The human-evidence guard trigger on `oauth_clients` (§6.1, `HEV01`), an INVOKER
      trigger function on `pg_catalog, public, pg_temp` per 271.
-- **M2 `287_profile_visibility_setter.sql`** (transactional): `epigraph_set_profile_visibility`
+- **M2 `310_profile_visibility_setter.sql`** (transactional): `epigraph_set_profile_visibility`
   (§8), owner maintenance, EXECUTE to `epigraph_app` only.
-- **M3 `288_human_profile_visibility_group.sql`** (transactional): provisioning and the reset.
+- **M3 `311_human_profile_visibility_group.sql`** (transactional): provisioning and the reset.
   1. Precondition guard in 224's style: refuse (55000) if `epigraph_provision_oauth_agent`'s
      `prosrc` is not 077's (md5). 271 changed proconfig only, so 077's md5 still holds.
   2. `CREATE OR REPLACE public.epigraph_provision_oauth_agent(bytea, text, text)`, which keeps
@@ -844,22 +846,22 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   `lock_timeout = '3s'` also bounds the row locks of the reset: a long `ensure_for_client`
   transaction holding a human row makes the boot migration fail, and the API restarts and
   retries (§17).
-- **M4 `289_idx_claims_public_by_agent.sql`** (`-- no-transaction`, exactly one statement):
+- **M4 `312_idx_claims_public_by_agent.sql`** (`-- no-transaction`, exactly one statement):
   `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_claims_public_by_agent ON public.claims
   (agent_id) WHERE visibility = 'public'`.
-- **M5 `290_idx_claims_group_by_agent.sql`** (`-- no-transaction`, exactly one statement):
+- **M5 `313_idx_claims_group_by_agent.sql`** (`-- no-transaction`, exactly one statement):
   `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_claims_group_by_agent ON public.claims
   (agent_id, owner_group_id) WHERE visibility <> 'public'`. Key order (finding 15):
   `agent_id` first matches the forced per-bound-agent probe of §6.1 (one descent per agent,
   `owner_group_id = ANY(...)` as array keys), and cannot be mistaken for a group-partition
   scan. It covers the minority partition, as 063 does.
 
-- **M6 `291_disclosure_team_arm_without_the_twin.sql`** (part B, transactional): re-states
+- **M6 `314_disclosure_team_arm_without_the_twin.sql`** (part B, transactional): re-states
   the core with the same answers after the section 11.1 measurement (team arm per viewer
   group, role derivation only for a bound group, public-claim arm first, readable probe
-  per agent x group). Undo: `docs/runbooks/291-undo.sql`.
+  per agent x group). Undo: `docs/runbooks/314-undo.sql`.
 
-- **M7 `292_role_edges_team_only.sql`** (after review, operator ruling 2026-11-24,
+- **M7 `315_role_edges_team_only.sql`** (after review, operator ruling 2026-11-24,
   transactional): md5 precondition `OCC01` on 130's audit body; NEW
   `epigraph_role_edge_owner(text, uuid)` (172's path, maintenance-owned, not
   application-callable); `epigraph_role_assignments_audit` re-stated with the projection
@@ -868,27 +870,27 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   backfill of every existing row with the declaration columns written, a
   `security_events` summary `edges.role_edges_team_only` {migration, before, rows, after},
   and post-condition `OCC02` (FORCE RLS would make a non-privileged runner move 0 rows).
-  Registers: `edge_writer_signing_ratchet` DB site moves 130 -> 292; `tenancy_backfill.rs`
-  DEFERRED (both new functions at 292), OPERATOR_FUNCTION_GRANTS (owner rule, `false`),
+  Registers: `edge_writer_signing_ratchet` DB site moves 130 -> 315; `tenancy_backfill.rs`
+  DEFERRED (both new functions at 315), OPERATOR_FUNCTION_GRANTS (owner rule, `false`),
   GRANT_EXEMPT_TRIGGERS (the re-own trigger); `custodian_role.rs`'s catalog ratchet admits
   the re-own trigger as a second projection maintainer. Undo:
-  `docs/runbooks/292-undo.sql` (130's body back; the backfill is not reversed).
+  `docs/runbooks/315-undo.sql` (130's body back; the backfill is not reversed).
 
-- **M8 `293_disclosure_role_derived_arm_last.sql`** (after review, correctness#3,
-  transactional): md5 precondition `DAO01` on 291's core body; the core re-stated with the
+- **M8 `316_disclosure_role_derived_arm_last.sql`** (after review, correctness#3,
+  transactional): md5 precondition `DAO01` on 314's core body; the core re-stated with the
   readable-claim arm before the role-derived arm, and the role-derived arm's cheap probe
   (§11.1, after review). Same signature, owner, ACL, COST and path. Undo:
-  `docs/runbooks/293-undo.sql` (291's body).
+  `docs/runbooks/316-undo.sql` (314's body).
 
-- **M9 `294_human_evidence_guard_agent_id.sql`** (after review, correctness#5,
+- **M9 `317_human_evidence_guard_agent_id.sql`** (after review, correctness#5,
   transactional): HEV01 also refuses re-pointing or unlinking a LINKED human client's
   `agent_id` (the trigger watches `UPDATE OF client_type, agent_id`); the first link of an
-  unlinked client stays allowed. Undo: `docs/runbooks/294-undo.sql`.
+  unlinked client stays allowed. Undo: `docs/runbooks/317-undo.sql`.
 
-- **M10 `295_role_edges_genuine_projections_only.sql`** (security review of 292, finding 1,
-  transactional): md5 precondition `OCC03` on 292's binding-trigger body. NEW
+- **M10 `318_role_edges_genuine_projections_only.sql`** (security review of 315, finding 1,
+  transactional): md5 precondition `OCC03` on 315's binding-trigger body. NEW
   `epigraph_reown_role_projection_edges(text)` (NULL: every role; 172's path,
-  maintenance-owned, not application-callable) re-owns by 292's rule only a GENUINE
+  maintenance-owned, not application-callable) re-owns by 315's rule only a GENUINE
   projection: relationship and `source_type = 'agent'` as the audit trigger writes them, the
   marker `properties @> {"source": "role_assignments", "projection": true}`, and a
   `role_assignments` row with `id = properties.assignment_id`,
@@ -899,79 +901,79 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   transaction (the definer frame is the non-BYPASSRLS maintenance role). Registers:
   `tenancy_backfill.rs` DEFERRED and OPERATOR_FUNCTION_GRANTS (`false`); `custodian_role.rs`'s
   catalog ratchet names the new function instead of the trigger (whose body no longer spells
-  the relationship). Undo: `docs/runbooks/295-undo.sql` (292's trigger body).
+  the relationship). Undo: `docs/runbooks/318-undo.sql` (315's trigger body).
 
-- **M11 `296_role_projection_edges_maintenance_only.sql`** (security review of 292, finding
+- **M11 `319_role_projection_edges_maintenance_only.sql`** (security review of 315, finding
   2, transactional): NEW `epigraph_role_projection_edges_guard()`, SECURITY INVOKER on 271's
   `pg_catalog, pg_temp` path, maintenance-owned, and three BEFORE triggers on `edges` keyed by
   WHEN on the marker (INSERT: NEW; UPDATE: OLD or NEW; DELETE: OLD). A write is admitted only
   when `epigraph_bypass()` or `epigraph_definer_bypass()`, otherwise `OCC05` (42501). An
   INVOKER on purpose: a definer's frame is its owner and would admit everyone. Registered in
-  `tenancy_backfill.rs`'s INVOKER_EXEMPT. Undo: `docs/runbooks/296-undo.sql`.
-- **M12 `297_profile_public_consent.sql`** (operator ruling C11, transactional):
-  precondition PCN01 (55000) that the core is 293's and the setter 287's (md5). NEW column
+  `tenancy_backfill.rs`'s INVOKER_EXEMPT. Undo: `docs/runbooks/319-undo.sql`.
+- **M12 `320_profile_public_consent.sql`** (operator ruling C11, transactional):
+  precondition PCN01 (55000) that the core is 316's and the setter 310's (md5). NEW column
   `agents.profile_public_consented_at timestamptz` (no backfill) and CHECK
   `agents_profile_public_consent_check` (a stamp only on a `'public'` profile; added NOT VALID,
   then VALIDATEd). No application column privilege. The core is re-stated so that, for a
   HUMAN principal, the profile term is `'public' AND consented` in the opt-in arm and in the
   details rule; the setter stamps `now()` on `'public'` and clears it on `'group'`. Undo:
-  `docs/runbooks/297-undo.sql`.
-- **M13 `298_team_invite_no_human_oracle.sql`** (operator ruling C10, transactional):
+  `docs/runbooks/320-undo.sql`.
+- **M13 `321_team_invite_no_human_oracle.sql`** (operator ruling C10, transactional):
   precondition TIV01 (55000) that the invite is 263's (md5). `epigraph_invite_to_team_group`
   re-stated without the `epigraph_is_human_operator(invitee)` refusal; TGP03 now refuses only
   an id naming no agent, a role's node or a registered system identity. Accept unchanged (it
-  refuses a caller that is not a registered person, TGP01). Undo: `docs/runbooks/298-undo.sql`.
-- **M14 `299_unnamed_agent_placeholder_name.sql`** (operator ruling C7, transactional): NEW
+  refuses a caller that is not a registered person, TGP01). Undo: `docs/runbooks/321-undo.sql`.
+- **M14 `322_unnamed_agent_placeholder_name.sql`** (operator ruling C7, transactional): NEW
   `epigraph_unnamed_agent_name(uuid) -> text`, SECURITY INVOKER `LANGUAGE sql STABLE`, every
   name qualified, reading only `oauth_clients`; maintenance-owned, EXECUTE for
   `epigraph_app`; registered in `tenancy_backfill.rs`'s INVOKER_EXEMPT. Undo:
-  `docs/runbooks/299-undo.sql` (after rolling back the binaries that call it).
-- **M15 `300_idx_claims_public_by_agent_since.sql`**, **M16
-  `301_idx_claims_group_by_agent_since.sql`** (operator ruling C5; `-- no-transaction`, one
+  `docs/runbooks/322-undo.sql` (after rolling back the binaries that call it).
+- **M15 `323_idx_claims_public_by_agent_since.sql`**, **M16
+  `324_idx_claims_group_by_agent_since.sql`** (operator ruling C5; `-- no-transaction`, one
   statement each): `(agent_id, created_at) WHERE visibility = 'public'` and `(agent_id,
   owner_group_id, created_at) WHERE visibility <> 'public'`.
-- **M17 `302_disclosure_binding_window_start.sql`** (C5, transactional): precondition BWS01
-  (297's core md5); B(H) with binding starts; both claim arms windowed. Undo:
-  `docs/runbooks/302-undo.sql` (re-apply 289 and 290 first).
-- **M18 `303_drop_idx_claims_public_by_agent.sql`**, **`304_drop_idx_claims_group_by_agent.sql`**
-  (`-- no-transaction`, one statement each): drop 289's and 290's indexes, superseded by M15 and
+- **M17 `325_disclosure_binding_window_start.sql`** (C5, transactional): precondition BWS01
+  (320's core md5); B(H) with binding starts; both claim arms windowed. Undo:
+  `docs/runbooks/325-undo.sql` (re-apply 312 and 313 first).
+- **M18 `326_drop_idx_claims_public_by_agent.sql`**, **`327_drop_idx_claims_group_by_agent.sql`**
+  (`-- no-transaction`, one statement each): drop 312's and 313's indexes, superseded by M15 and
   M16.
-- **M19 `305`-`308`** (C6; `-- no-transaction`, one statement each):
+- **M19 `328`-`331`** (C6; `-- no-transaction`, one statement each):
   `idx_evidence_public_by_signer (signer_id, created_at)`,
   `idx_challenges_public_by_challenger (challenger_id, created_at)`,
   `idx_mass_functions_public_by_source (source_agent_id, created_at)`, each `WHERE visibility =
   'public'`, and `idx_edges_public_ingest_records_by_ingester ((properties ->> 'ingested_by'),
-  created_at) WHERE relationship = 'ingested_claim' AND visibility = 'public'` (308's is
-  superseded by M24 and dropped by 315: a bare `->>` is no index condition under row security).
-- **M20 `309_disclosure_every_public_assertion.sql`** (C6, transactional): precondition PAK01
-  (302's core md5); the public-assertion arm. Undo: `docs/runbooks/309-undo.sql`.
-- **M21 `310_idx_security_events_countersigned.sql`** (C2; `-- no-transaction`): `(agent_id,
+  created_at) WHERE relationship = 'ingested_claim' AND visibility = 'public'` (331's is
+  superseded by M24 and dropped by 338: a bare `->>` is no index condition under row security).
+- **M20 `332_disclosure_every_public_assertion.sql`** (C6, transactional): precondition PAK01
+  (325's core md5); the public-assertion arm. Undo: `docs/runbooks/332-undo.sql`.
+- **M21 `333_idx_security_events_countersigned.sql`** (C2; `-- no-transaction`): `(agent_id,
   created_at) WHERE event_type = 'authorship.countersigned'`.
-- **M22 `311_disclosure_countersigned_authorship.sql`** (C2, transactional): precondition CSN01
-  (309's core md5); the countersigned-authorship arm. Undo: `docs/runbooks/311-undo.sql`.
-- **M23 `312_ingest_record_ingester_leakproof.sql`** (after the §11.2 measurement,
+- **M22 `334_disclosure_countersigned_authorship.sql`** (C2, transactional): precondition CSN01
+  (332's core md5); the countersigned-authorship arm. Undo: `docs/runbooks/334-undo.sql`.
+- **M23 `335_ingest_record_ingester_leakproof.sql`** (after the §11.2 measurement,
   transactional): NEW `epigraph_ingest_record_ingester(jsonb) -> text`, `IMMUTABLE LEAKPROOF`,
   path `pg_catalog, pg_temp` (never inlined). Precondition LKP01 (42501): a superuser runner.
-- **M24 `313_idx_edges_public_ingest_records_by_ingester_lp.sql`** (`-- no-transaction`): the
-  ingest-record probe's index on M23's accessor. **`315_drop_idx_edges_public_ingest_records_by_ingester.sql`**
-  drops 308's index (unusable under row security).
-- **M25 `314_disclosure_probes_leakproof.sql`** (transactional): precondition LPR01 (311's core
+- **M24 `336_idx_edges_public_ingest_records_by_ingester_lp.sql`** (`-- no-transaction`): the
+  ingest-record probe's index on M23's accessor. **`338_drop_idx_edges_public_ingest_records_by_ingester.sql`**
+  drops 331's index (unusable under row security).
+- **M25 `337_disclosure_probes_leakproof.sql`** (transactional): precondition LPR01 (334's core
   md5); same arms and answers; B(H)'s ids as text once, the ingest probe on M23's accessor, the
   countersign arm's paper id fenced so its `papers` join is `uuid = Var`. Undo:
-  `docs/runbooks/314-undo.sql` (re-apply 308 first).
-- **M26 `316_disclosure_counts_own_assertions_only.sql`** (security review Addendum 5,
-  transactional): precondition OWN01 (314's core md5); the evidence probe removed and the BBA
-  probe restricted to `slot_kind = 'assessment'` (§4); every other arm and the order are 314's.
-  Undo: `docs/runbooks/316-undo.sql` (re-apply 305 and 307 first).
-- **M27 `317_idx_mass_functions_public_assessments_by_source.sql`** (`-- no-transaction`):
+  `docs/runbooks/337-undo.sql` (re-apply 331 first).
+- **M26 `339_disclosure_counts_own_assertions_only.sql`** (security review Addendum 5,
+  transactional): precondition OWN01 (337's core md5); the evidence probe removed and the BBA
+  probe restricted to `slot_kind = 'assessment'` (§4); every other arm and the order are 337's.
+  Undo: `docs/runbooks/339-undo.sql` (re-apply 328 and 330 first).
+- **M27 `340_idx_mass_functions_public_assessments_by_source.sql`** (`-- no-transaction`):
   `(source_agent_id, created_at) WHERE visibility = 'public' AND slot_kind = 'assessment'`.
-  **`318_drop_idx_mass_functions_public_by_source.sql`** and
-  **`319_drop_idx_evidence_public_by_signer.sql`** drop 307's and 305's indexes, which no probe
+  **`341_drop_idx_mass_functions_public_by_source.sql`** and
+  **`342_drop_idx_evidence_public_by_signer.sql`** drop 330's and 328's indexes, which no probe
   reads after M26.
-- **M28 `320_disclosure_details_live_rows_only.sql`** (review 2, correctness#3, transactional):
-  precondition LRD01 (316's core md5); the details rule's membership EXISTS applies 164's and
-  235's lapse rules (§6.1). Undo: `docs/runbooks/320-undo.sql`.
-- **M29 `321_agents_consent_stamp_insert_definer_only.sql`** (review 2, leaks#5,
+- **M28 `343_disclosure_details_live_rows_only.sql`** (review 2, correctness#3, transactional):
+  precondition LRD01 (339's core md5); the details rule's membership EXISTS applies 164's and
+  235's lapse rules (§6.1). Undo: `docs/runbooks/343-undo.sql`.
+- **M29 `344_agents_consent_stamp_insert_definer_only.sql`** (review 2, leaks#5,
   transactional): RESTRICTIVE INSERT policy `agents_consent_stamp_definer_only` (§16.R C11).
 
 Every index file is registered in `tenancy_migration_shape.rs` (validity, one statement), and
@@ -988,8 +990,8 @@ silently; the arms would then fall back to `idx_claims_agent_id` with heap check
 indexes are added to `tenancy_migration_shape.rs::INDEX_MIGRATIONS` (which checks
 `indisvalid` on test databases), and §17 carries the post-deploy check and the runbook line.
 
-Undo runbooks (269's convention): `docs/runbooks/286-undo.sql`, `287-undo.sql` and
-`288-undo.sql`:
+Undo runbooks (269's convention): `docs/runbooks/309-undo.sql`, `310-undo.sql` and
+`311-undo.sql`:
 
 - restore 077's provision body, re-owned and re-granted;
 - DROP the setter, the four disclosure functions, the guard trigger and its function;
@@ -1002,9 +1004,9 @@ privacy-safe value.
 Registrations the PR must make (re-measure each list on HEAD):
 
 - `epigraph-cli/src/bin/tenancy_backfill.rs`:
-  - `DEFERRED_DEFINER_FUNCTIONS`: the four disclosure functions at 286, the setter at 287.
-  - `OPERATOR_FUNCTION_GRANTS`: the two wrappers at 286 (application EXECUTE), the core and
-    the evidence helper with `false`, the setter at 287.
+  - `DEFERRED_DEFINER_FUNCTIONS`: the four disclosure functions at 309, the setter at 310.
+  - `OPERATOR_FUNCTION_GRANTS`: the two wrappers at 309 (application EXECUTE), the core and
+    the evidence helper with `false`, the setter at 310.
   - `epigraph_provision_oauth_agent` is in `PRE_REGISTER_DEFINERS`. M3 does not re-own it,
     so no entry moves.
 - `epigraph-db/tests/definer_search_path_ratchet.rs`: new definers are on 172's form;
@@ -1095,14 +1097,14 @@ definer frame):
 |---|---|---|
 | B(H) | `idx_operator_links_operator` (1,500 rows); `author_binding_clients` seq scan (empty table) | 0.2-0.3 ms |
 | public-claim arm | nested loop over `unnest(B)`, `Index Only Scan using idx_claims_public_by_agent`, 1,501 loops, 4.5k buffers | 0.8-1.2 ms |
-| readable-claim arm, 286 form (`owner_group_id = ANY`) | UNSTABLE: `idx_claims_group_by_agent` in some runs (18 ms, 135k buffers), `idx_claims_agent_id` + filter in others (52-74 ms) | 18-74 ms |
-| readable-claim arm, 291 form (per agent x group) | `Index Scan using idx_claims_group_by_agent`, Index Cond `agent_id = b.agent_id AND owner_group_id = vg.group_id`, 45,030 loops, 135k buffers | 30-43 ms |
-| team arm, 286 form (236's twin) | `Function Scan on epigraph_live_memberships_unbound`; nearly all of it is 249's `epigraph_role_derived_memberships` (575-585 ms with no `group_role_bindings` row) | 583-816 ms |
+| readable-claim arm, 309 form (`owner_group_id = ANY`) | UNSTABLE: `idx_claims_group_by_agent` in some runs (18 ms, 135k buffers), `idx_claims_agent_id` + filter in others (52-74 ms) | 18-74 ms |
+| readable-claim arm, 314 form (per agent x group) | `Index Scan using idx_claims_group_by_agent`, Index Cond `agent_id = b.agent_id AND owner_group_id = vg.group_id`, 45,030 loops, 135k buffers | 30-43 ms |
+| team arm, 309 form (236's twin) | `Function Scan on epigraph_live_memberships_unbound`; nearly all of it is 249's `epigraph_role_derived_memberships` (575-585 ms with no `group_role_bindings` row) | 583-816 ms |
 
 No plan scans `claims` sequentially. Whole-core wall time (one local round trip
 included), 25 evaluations each:
 
-| Case | 286 | 291 |
+| Case | 309 | 314 |
 |---|---|---|
 | human, no arm holds (worst case) | p50 623-635 ms | p50 20-38 ms, max 26-129 ms |
 | human, one public claim by the LAST bound agent | p50 596-658 ms | p50 1.2-1.5 ms |
@@ -1117,16 +1119,16 @@ s, prefix search 0.3-0.6 s, both dominated by per-card / per-match work that exi
 without this change only partly; the prefix search pays one predicate call per match by
 design (the filter must precede the pool LIMIT).
 
-Insert cost of 289 / 290: 20,000 group claims took 754-970 ms with both partial indexes
+Insert cost of 312 / 313: 20,000 group claims took 754-970 ms with both partial indexes
 and 600-662 ms without (triggers off, so the difference is the indexes): +15-60 %.
 
 **Verdict against the budget (blocking, reported, not waived).**
 
 - Non-human: within the 0.2 ms p50 target at the low end of the range.
 - Human, a public claim exists: 1.2-1.5 ms, within 10 ms.
-- Human, worst case: 20-38 ms p50 after 291, OVER the 10 ms budget. The cost is the
+- Human, worst case: 20-38 ms p50 after 314, OVER the 10 ms budget. The cost is the
   readable-claim arm, |B(H)| x |viewer groups| index descents (45,030 here). Migration
-  291 removed the 600 ms team-arm cost and the plan instability, and cannot remove this
+  314 removed the 600 ms team-arm cost and the plan instability, and cannot remove this
   one without changing the data model: **[RULED] C12**, the cost is accepted for this
   population (§16.R).
 
@@ -1135,32 +1137,32 @@ sequential scan; calls per match well under the table); it prints the rest. It i
 `#[ignore]`d measurement harness, not a regression gate (review tests#7): the performance
 claims here rest on the recorded runs.
 
-**After review (correctness#3, migration 293): a viewer group carries a role binding.**
+**After review (correctness#3, migration 316): a viewer group carries a role binding.**
 The production shape (a role bound to a team) was not measured before review. Same shape,
 plus one `group_role_bindings` row on the viewer's first group:
 
-| Case | 291 (before 293) | 293 |
+| Case | 314 (before 316) | 316 |
 |---|---|---|
 | H holds no bound role (a miss) | 617 ms p50, 657 ms max | 28.0 ms p50, 30.5 ms max |
 | H holds the role bound to a viewer group (role-derived names) | 645 ms p50, 742 ms max | 27.9 ms p50, 33.3 ms max |
 | worst case, no binding (unchanged) | 27.1 ms p50 | 27.2 ms p50 |
 
-291 called 249's `epigraph_role_derived_memberships` (about 0.56 s on its own here) for
-every evaluation once any viewer group carried a binding. 293 runs that arm last and,
+314 called 249's `epigraph_role_derived_memberships` (about 0.56 s on its own here) for
+every evaluation once any viewer group carried a binding. 316 runs that arm last and,
 for a target linked as nobody's agent and holding no allowance (where 249's candidate set
 is the target alone), replaces the call with one binding probe per viewer group, pinned
 equal to 249 by `human_identity_visibility.rs::the_cheap_role_probe_answers_as_249_does`.
 A human principal that is also some human's agent, or holds an allowance, still pays the
 249 call; the remaining worst case is C12's readable-claim arm.
 
-### 11.2 Measured after the C5, C6 and C2 rulings (migrations 300-315)
+### 11.2 Measured after the C5, C6 and C2 rulings (migrations 323-338)
 
 Same harness, same host class (noisy shared CI host; one run of 25 evaluations per case),
 same shape as 11.1 plus, per the rulings:
 
 - (e) PRE-BINDING rows, created a day before every bound agent's link: 150 public claims per
   bound agent (225,000) and, per bound agent, 20 public evidence rows, challenges, BBAs and
-  ingest records and 2 countersign acts. Under 297 the first public claim named H at once;
+  ingest records and 2 countersign acts. Under 320 the first public claim named H at once;
   now every probe must skip them by its index range, so this is the windowed worst case.
 - (f) other agents' rows of every new kind: 1,000,000 public evidence rows, 300,000 each of
   challenges, BBAs and ingest records, 100,000 countersign acts.
@@ -1170,32 +1172,32 @@ owner, so each FORCE RLS policy applies as in the definer frame), 1,501 bound ag
 
 | Arm (migration) | Plan | Time |
 |---|---|---|
-| B(H) with binding starts (302) | `idx_operator_links_operator`, aggregate per agent | 1.2-1.6 ms |
-| public claim (302) | `idx_claims_public_by_agent_since`, Index Cond `agent_id = b.agent_id AND created_at >= b.since` | 1.5-1.6 ms |
-| evidence (309) | `idx_evidence_signer_id` (001), `created_at` as a row filter; the planner's choice over 305's index at 20 rows per agent | 1.5-8.5 ms |
-| challenge (309) | `idx_challenges_public_by_challenger`, both columns as Index Cond | 1.5-1.7 ms |
-| BBA (309) | `idx_mass_functions_public_by_source`, Index Only Scan | 1.5 ms |
-| ingest record, 309's spelling | `idx_edges_created_at`, ingester as a FILTER: 300,020 rows removed per agent, 18.4M buffers | **198 s** |
-| ingest record, 314's spelling (312's LEAKPROOF accessor) | `idx_edges_public_ingest_records_by_ingester_lp`, both columns as Index Cond | 2.5 ms |
-| countersign act (311/314) | `idx_security_events_agent` (001) with the event type and window as a filter (2 rows per agent); `papers` by key | 3.6-4.2 ms |
-| readable claim (302) | `idx_claims_group_by_agent_since`, three columns as Index Cond, 45,030 loops | 41 ms |
+| B(H) with binding starts (325) | `idx_operator_links_operator`, aggregate per agent | 1.2-1.6 ms |
+| public claim (325) | `idx_claims_public_by_agent_since`, Index Cond `agent_id = b.agent_id AND created_at >= b.since` | 1.5-1.6 ms |
+| evidence (332) | `idx_evidence_signer_id` (001), `created_at` as a row filter; the planner's choice over 328's index at 20 rows per agent | 1.5-8.5 ms |
+| challenge (332) | `idx_challenges_public_by_challenger`, both columns as Index Cond | 1.5-1.7 ms |
+| BBA (332) | `idx_mass_functions_public_by_source`, Index Only Scan | 1.5 ms |
+| ingest record, 332's spelling | `idx_edges_created_at`, ingester as a FILTER: 300,020 rows removed per agent, 18.4M buffers | **198 s** |
+| ingest record, 337's spelling (335's LEAKPROOF accessor) | `idx_edges_public_ingest_records_by_ingester_lp`, both columns as Index Cond | 2.5 ms |
+| countersign act (334/337) | `idx_security_events_agent` (001) with the event type and window as a filter (2 rows per agent); `papers` by key | 3.6-4.2 ms |
+| readable claim (325) | `idx_claims_group_by_agent_since`, three columns as Index Cond, 45,030 loops | 41 ms |
 
-**Finding (fixed by 312-315).** The core is a SECURITY DEFINER over FORCE RLS tables, so a
+**Finding (fixed by 335-338).** The core is a SECURITY DEFINER over FORCE RLS tables, so a
 probe qual that is not LEAKPROOF runs only after the policy qual and can be no index
-condition. 309's `(r.properties ->> 'ingested_by') = b.agent_id::text` (jsonb `->>` and a
-uuid-to-text cast on a Var) therefore never used 308's expression index: 198 s per core
+condition. 332's `(r.properties ->> 'ingested_by') = b.agent_id::text` (jsonb `->>` and a
+uuid-to-text cast on a Var) therefore never used 331's expression index: 198 s per core
 evaluation on this shape. The plan pins of `tenancy_migration_shape.rs` passed regardless,
-because they ran on the superuser pool where row security never applies. 312 adds a LEAKPROOF
-accessor (needs a superuser migration runner, LKP01), 313 indexes it, 314 compares it with
+because they ran on the superuser pool where row security never applies. 335 adds a LEAKPROOF
+accessor (needs a superuser migration runner, LKP01), 336 indexes it, 337 compares it with
 B(H)'s ids cast to text once in plpgsql (and fences the countersign arm's paper id so its join
-is `uuid = Var`), 315 drops 308's index. The new pin
+is `uuid = Var`), 338 drops 331's index. The new pin
 `::the_disclosure_probes_reach_their_indexes_under_the_cores_row_security` EXPLAINs every probe
-as `epigraph_maintenance` and was red before 312-315. Every other probe compares `uuid` and
+as `epigraph_maintenance` and was red before 335-338. Every other probe compares `uuid` and
 `timestamptz` (leakproof operators) and was unaffected.
 
 Whole-core wall time, 25 evaluations each (one local round trip included):
 
-| Case | 293 / 297 (§11.1) | 314 |
+| Case | 316 / 320 (§11.1) | 337 |
 |---|---|---|
 | human, no arm holds (worst case; pre-binding rows of every kind) | p50 20-38 ms | **p50 56.8 ms, max 80.6 ms** |
 | human, a viewer group is role-bound, H holds no role | p50 28.0 ms | p50 57.2 ms, max 59.5 ms |
@@ -1205,8 +1207,8 @@ Whole-core wall time, 25 evaluations each (one local round trip included):
 
 Call counts are unchanged (a 200-card read calls the session wrapper 201 times, 1.36 s; a
 two-character prefix search calls it once per raw match, 1,502 calls over 21,507 agents,
-0.52 s). Insert of 20,000 group claims: 780 ms with 300/301, 611 ms without (+28 %, the same
-range as 289/290's; 303/304 dropped those, so a claim insert still maintains two partial
+0.52 s). Insert of 20,000 group claims: 780 ms with 323/324, 611 ms without (+28 %, the same
+range as 312/313's; 326/327 dropped those, so a claim insert still maintains two partial
 indexes).
 
 **Verdict against the budget (recorded, as C12 ruled; not waived silently).** The worst case
@@ -1220,19 +1222,19 @@ recorded here for the operator, not decided by this PR. The marker-table fallbac
 remains the one structural remedy.
 
 **After review 2 (correctness#8, correctness#9), not re-measured in this round.**
-- 316 removed the evidence probe and narrowed the BBA probe to assessment slots (317's
+- 339 removed the evidence probe and narrowed the BBA probe to assessment slots (340's
   index), so the extra C6/C2 cost is now three per-bound-agent arms plus the countersign act,
-  not five; the harness (`human_identity_visibility_perf.rs`) is updated to 316's arms but was
-  not re-run, so the numbers above are 314's and an upper bound for 316's.
+  not five; the harness (`human_identity_visibility_perf.rs`) is updated to 339's arms but was
+  not re-run, so the numbers above are 337's and an upper bound for 339's.
 - The EXPLAIN pins (`tenancy_migration_shape.rs::the_disclosure_probes_reach_their_indexes_under_the_cores_row_security`)
   run on an EMPTY database. On the harness shape the countersign probe planned on 001's
-  `idx_security_events_agent` with `event_type` / `created_at` as row filters, not 310's
+  `idx_security_events_agent` with `event_type` / `created_at` as row filters, not 333's
   partial index, and a real agent's audit trail is far longer than the 2 events per agent the
   harness seeded. Open: re-measure with a realistic per-agent `security_events` volume and pin
-  the plan observed at scale, or make 310 the only fitting index (as 301's three-column key did
-  for the readable-claim arm). Until then 310 may be pure write cost. (The evidence half of
-  the finding is moot: 319 drops 305's index with the probe.)
-- 320 (correctness#3) adds a `groups` join and, for a verb-made or personal group row, up to
+  the plan observed at scale, or make 333 the only fitting index (as 324's three-column key did
+  for the readable-claim arm). Until then 333 may be pure write cost. (The evidence half of
+  the finding is moot: 342 drops 328's index with the probe.)
+- 343 (correctness#3) adds a `groups` join and, for a verb-made or personal group row, up to
   two `epigraph_human_of` calls and one `author_binding_clients` probe to the details EXISTS,
   which runs on EVERY evaluation, the non-human path (0.2 ms above) included. Not measured.
 - §15.R16's placeholder rows (an `epigraph_unnamed_agent_name` per human principal in every name
@@ -1341,7 +1343,7 @@ by redacting everyone.
 - **T9. Privileged arms.** A maintenance bypass session and an elevated viewer see H named.
 - **T10. Migrations.**
   - M3 reset, in production migration order (271's ratchet pattern): a human that is
-    `'public'` before 288 is `'group'` after; a non-human is untouched; one summary audit row
+    `'public'` before 311 is `'group'` after; a non-human is untouched; one summary audit row
     carrying the pre-count, rows and post-count.
   - M3's post-condition: replayed with the reset neutralized, the file refuses (55000).
   - M3's precondition: a provision function with another body refuses (55000).
@@ -1437,14 +1439,14 @@ one says why.
 | `no_unscoped_pool` | C4 and C5 gain stamped connections; no new unscoped site. |
 | `cargo check -p epigraph-api --no-default-features` | The new route fields sit behind `db`. |
 | `viewer_spend_lint` | New `&Viewer` parameters are spent. |
-| `visibility_lint` | `PROFILE_RULE_SITES` is replaced (part B). `EXPECTED_EXEMPTIONS` gains nothing: the new reads take no viewer, and `agents` is not `tier_a`. `CONN_WITHOUT_VIEWER` gains `agent.rs::set_profile_visibility_conn` (part A): a write through 287's definer on a stamped transaction, as `set_agent_default_conn` is. |
+| `visibility_lint` | `PROFILE_RULE_SITES` is replaced (part B). `EXPECTED_EXEMPTIONS` gains nothing: the new reads take no viewer, and `agents` is not `tier_a`. `CONN_WITHOUT_VIEWER` gains `agent.rs::set_profile_visibility_conn` (part A): a write through 310's definer on a stamped transaction, as `set_agent_default_conn` is. |
 | `definer_search_path_ratchet` | See §10. |
 | `app_role_table_lockdown` | See §10. |
 | `edge_writer_signing_ratchet` | Unaffected: no edge writer changes. E2 changes the edge READ projection (part B), which this ratchet does not cover; E3's tests do. |
 | `tenancy_migration_shape` | M4 and M5 join `INDEX_MIGRATIONS`. |
-| `function_search_path_pg_temp_ratchet` | The new trigger function pins its path; so do 295's definer and 296's INVOKER guard (`pg_catalog, pg_temp`). |
-| `custodian_role.rs` OCCUPIES catalog ratchet | The projection's maintainers are the audit trigger and 295's `epigraph_reown_role_projection_edges`; 296's guard keys on the marker and does not spell the relationship. |
-| `tenancy_backfill.rs` definer registers | 292's two functions and 295's re-own in DEFERRED; the owner rule and the re-own `false` in OPERATOR_FUNCTION_GRANTS; 296's guard in INVOKER_EXEMPT. |
+| `function_search_path_pg_temp_ratchet` | The new trigger function pins its path; so do 318's definer and 319's INVOKER guard (`pg_catalog, pg_temp`). |
+| `custodian_role.rs` OCCUPIES catalog ratchet | The projection's maintainers are the audit trigger and 318's `epigraph_reown_role_projection_edges`; 319's guard keys on the marker and does not spell the relationship. |
+| `tenancy_backfill.rs` definer registers | 315's two functions and 318's re-own in DEFERRED; the owner rule and the re-own `false` in OPERATOR_FUNCTION_GRANTS; 319's guard in INVOKER_EXEMPT. |
 
 **New static lint, `epigraph-db/tests/agent_name_disclosure_lint.rs`** (part B). It refuses any
 SQL literal that selects or matches `display_name`, `orcid`, `ror_id` or `properties` from an
@@ -1466,27 +1468,27 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 
 ## 15. Residuals and out-of-scope follow-ups (recorded, not built)
 
-- **R1. (Closed by the operator's 2026-11-24 ruling; now §7 row K1, migration 292.)** The
+- **R1. (Closed by the operator's 2026-11-24 ruling; now §7 row K1, migration 315.)** The
   `OCCUPIES` edges role grants project are team-only. Residual: a later change of a bound
   group's `status` or `kind` does not re-own its edges (a suspended team's members stop
   reading through it anyway; a group's kind does not change after creation, 108).
   Residual: a grant concurrent with an unbind of the same role can leave the new edge owned by
   the ex-team (under READ COMMITTED the unbind's re-own UPDATE cannot see the uncommitted
-  INSERT); both are maintenance acts. 292 adds a DATABASE-side caller of 105's
+  INSERT); both are maintenance acts. 315 adds a DATABASE-side caller of 105's
   personal-group mint, which `personal_group_mint_ratchet.rs` (a Rust-caller inventory) does
   not list.
-  **Hardening after the security review of 292 (migrations 295, 296).** 292's re-own,
+  **Hardening after the security review of 315 (migrations 318, 319).** 315's re-own,
   backfill and OCC02 matched `relationship = 'OCCUPIES'` (plus `properties.role`) alone, on
   the argument that no other writer creates that relationship today (REST `create_edge`'s
   `VALID_RELATIONSHIPS` and the MCP link tools' sets exclude it). That is no longer relied on:
-  - 295: a bind, an unbind and the reconcile pass re-own only a GENUINE projection (the
+  - 318: a bind, an unbind and the reconcile pass re-own only a GENUINE projection (the
     marker AND its `role_assignments` row by assignment id, holder and role). A forged row is
     never re-owned, never gets a personal group minted for its source, and can no longer fail
-    a binding change (under 292 a forged row whose source had only a revoked personal row made
+    a binding change (under 315 a forged row whose source had only a revoked personal row made
     the unbind raise RVK01). Tested:
     `role_edges_team_only.rs::a_forged_role_edge_is_never_reowned_and_never_blocks_a_binding_change`,
-    `::migration_295_reconciles_genuine_projections_only`.
-  - 296: a row carrying the marker is written (INSERT, UPDATE, DELETE) only by a maintenance
+    `::migration_318_reconciles_genuine_projections_only`.
+  - 319: a row carrying the marker is written (INSERT, UPDATE, DELETE) only by a maintenance
     session or a maintenance-owned definer frame; OCC05 otherwise. A writer of the owning
     team cannot widen one to `public` (260's guard froze only the owner columns), strip or
     rewrite its marker, role or window, or delete it; no application writer can put the
@@ -1494,11 +1496,11 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
     `::a_team_writer_cannot_write_the_projection_marker`, and
     `::the_maintenance_verbs_still_re_project_through_the_guard` (grant, bind, unbind, end and
     a `valid_to` narrowing on a real maintenance `session_user`).
-  - Residual: 292 is not edited (an applied migration never is), so ITS one-time backfill and
-    OCC02 still match the relationship alone. A forged row present when 292 runs would be
+  - Residual: 315 is not edited (an applied migration never is), so ITS one-time backfill and
+    OCC02 still match the relationship alone. A forged row present when 315 runs would be
     re-owned into its source's personal group (minting one), could fail the boot migration
     (RVK01 / RVK02 for its source), and a forged PUBLIC row with a non-agent source would trip
-    OCC02. The §17 pre-check closes that window; 295 and 296 close it from then on.
+    OCC02. The §17 pre-check closes that window; 318 and 319 close it from then on.
   - Not changed: an UNMARKED edge of the same relationship written by an ordinary edge
     writer stays that writer's graph content (123 section 5): it is not a projection, is never
     re-owned, and is never read for authority.
@@ -1516,7 +1518,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   (§16.R). The publicize path is **[RULED] C4: yes**, as built (§16.R).
 - **R3. A public DOI plus an author position re-identifies an unnamed author.** The paper text
   names its authors. An authorship edge is not a claim, so an UNCONFIRMED naming does not name
-  H. (Closed for the countersigned case by **[RULED] C2**, migration 311: a countersigned
+  H. (Closed for the countersigned case by **[RULED] C2**, migration 334: a countersigned
   authorship of a paper the viewer can read names H.) Residual: an ingest's pending naming,
   which H never confirmed, still sits beside the paper's public text.
 - **R4. Privatizing a public claim un-names H**, because the arm reads current `visibility`.
@@ -1543,7 +1545,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   logins are secured maintenance only (§16.R). How the application-role DSN is distributed
   (agent containers hold it today) is the follow-up that premise needs, out of scope here.
   After review (correctness#8): the same holder can stamp `epigraph.principal_id` and call
-  287's setter for ANY human, which persists an opt-in and names that person to everyone.
+  310's setter for ANY human, which persists an opt-in and names that person to everyone.
   It amplifies an exposure the holder already has (it can read the name) rather than
   creating one. The setter's audit row records only `session_user` (always the application
   login through the API), and HEAD has no request-correlation GUC to add (the only stamped
@@ -1553,7 +1555,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   token jti) to every stamped connection is a follow-up, not built here.
 - **R10.** Events `actor_id` is out of scope by ruling. Guest routes were confirmed to drop
   agent identity (§7.J). Event PAYLOADS are covered (§7.J, §14).
-- **R11. (Closed by [RULED] C10, migration 298.) `invite_to_group` answered "is this id a
+- **R11. (Closed by [RULED] C10, migration 321.) `invite_to_group` answered "is this id a
   registered human?"** (finding L4). History:
   263's `epigraph_invite_to_team_group` raises `TGP03: agent % is not a registered human
   operator` for a non-human invitee, and the text reaches REST and MCP. TGP01 requires the
@@ -1562,7 +1564,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   which the `operator_human` trade-off does not cover. The options were (a) accept any
   non-role, non-system invitee and refuse a non-human only at accept time, which no non-human
   can reach; (b) keep it as an explicit residual with the operator's sign-off. The operator
-  ruled to fix it (§16.R); 298 implements (a). Residual: TGP04 still tells the admin that the
+  ruled to fix it (§16.R); 321 implements (a). Residual: TGP04 still tells the admin that the
   invitee is already a member or already invited to the admin's own group (a roster the admin
   reads anyway), and an invitation to a non-person stays `pending` for ever.
 - **R12. World-readable `OPERATED_BY` edges** (finding L7): 107's `epigraph_link_operator`,
@@ -1583,12 +1585,12 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 - **R15. An LLM driving H's own session can call `set_profile_visibility`** (finding 17), for
   example under prompt injection, and publish H's name. The REST route is the deliberate
   path; the MCP tool exists because the brief asks for it. The setter is audited.
-- **R16. C7 residuals** (operator ruling C7, migration 299). An unnamed human reads as a
+- **R16. C7 residuals** (operator ruling C7, migration 322). An unnamed human reads as a
   minted nameless service principal only as far as its own row allows:
   - `key_kind`: a provider-provisioned person is `derived`, as a service principal is; a
     registered operator holding a real Ed25519 key (`key_kind = 'ed25519'`) shows that, which
     no OAuth service principal does, and its placeholder's uuid does not derive its key.
-  - `labels`: shown as stored. Both carry 288's `oauth-principal`; a label the person or an
+  - `labels`: shown as stored. Both carry 311's `oauth-principal`; a label the person or an
     admin writes later is shown as written.
   - A human principal with no linked OAuth client (evidence only a `human_operators` row
     whose client is not linked to it) is shown with a null name.
@@ -1600,7 +1602,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
     comparisons (and `truth_value`, which `agents` lacks), and a minted principal's
     properties are `{}`, so no condition selects it either; the two do not separate. A
     service principal whose properties were later written would.
-- **R17. The binding window and 199's reach-back** (operator ruling C5, migration 302). 199's
+- **R17. The binding window and 199's reach-back** (operator ruling C5, migration 325). 199's
   `epigraph_operator_bound_at`, which `authored_by.human` reads, lets a link RECORDED retired
   (107's `epigraph_link_retired_agent`, 123's `epigraph_link_legacy_authors`) reach back before
   its creation, so a legacy claim's block still shows the receiving human's id. The ruling names
@@ -1608,10 +1610,10 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   claim no longer names the human, and the block shows the human's id under its placeholder
   unless another arm names it. Kept as ruled, not aligned silently; aligning 199 (or making the
   core reach back for recorded-retired links) needs the operator.
-- **R18. (Closed by migration 316.) Evidence named its SIGNER's human** (operator ruling C6,
-  migration 309). `evidence` has no author column; over MCP the signer is the server's own
+- **R18. (Closed by migration 339.) Evidence named its SIGNER's human** (operator ruling C6,
+  migration 332). `evidence` has no author column; over MCP the signer is the server's own
   agent, so a maintenance link of that agent would have named its person by every
-  MCP-written evidence row. Since 316 evidence names no one by itself (§4, Addendum 5; open
+  MCP-written evidence row. Since 339 evidence names no one by itself (§4, Addendum 5; open
   item C6a), so the server-agent case is gone with it.
 - **R18a. A backfilled ingest record is windowed by its WRITE time** (C5 x C6). The operator's
   marker backfill (`epigraph-cli` `operator/backfill_markers.rs`) writes the
@@ -1634,13 +1636,13 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
     and its filer is counted; a version row records an edit, and its author is counted only if
     it filed a claim of its own. Arguably an assertion: put to the operator with C6a.
   - `perspectives.owner_agent_id`: a stated viewpoint, not an assertion about a claim; its
-    BBAs are perspective-keyed rows, which 316 does not count (C6a). Put to the operator with
+    BBAs are perspective-keyed rows, which 339 does not count (C6a). Put to the operator with
     C6a.
   - `recall_events.agent_id`: a READ, not an assertion.
   - `claim_signature_revocations` (`previous_signer_id`, `revoked_by`, `superseded_by`): an
     administrative act on a signature, not an assertion by the agent it names.
   - `evidence`, and every BBA except an assessment: not the agent's own assertion on every
-    writer (316, §4).
+    writer (339, §4).
 - **F1.** Author nodes from ingested literature and git authors are not human principals.
   Their names are public-source names, and they stay named.
 - **F2.** Stale derivatives (finding L13): stored Atlas leaf documents built before deploy
@@ -1658,7 +1660,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   change. The alternative, a `profile_public_consented_at` column written only by the
   setter (opt-in reads `'public' AND consented_at IS NOT NULL`), makes consent literal and
   the reset's completeness non-critical; it departs from the brief's prescribed reset, so it
-  was put to the operator as C11. **[RULED] C11: yes**; migration 297 adds the column, the
+  was put to the operator as C11. **[RULED] C11: yes**; migration 320 adds the column, the
   setter writes it, and the opt-in arm (and a human's details rule) requires it, so a
   `'public'` left by any other path is not consent. Closed.
 - **F5.** Have `provision.rs` stop storing an email as `client_name`, and carry the asserted
@@ -1667,7 +1669,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 - **F7. (From [RULED] C6a, §16.R2.)** A write-once writer column on `evidence` and
   `mass_functions`, stamped from the session principal at INSERT and never updatable, so the
   C6 arm can count a row by WHO WROTE IT rather than by an attribution column another writer
-  can fill (Addendum 5). With it, evidence and the non-assessment BBA kinds 316 dropped could
+  can fill (Addendum 5). With it, evidence and the non-assessment BBA kinds 339 dropped could
   name H again, windowed as C5 rules. Not this PR.
 - **F8. (From [RULED] C16, §16.R2; was [OPEN] C9.)** The sticky public-assertion marker table
   (§11, `human_public_claim_marks(human_id)` maintained by triggers), built only if the
@@ -1686,17 +1688,17 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   NO personal group be refused (the grant and the backfill RAISE). Registration as a human
   operator does not guarantee a personal group, so a RAISE could fail a boot migration over
   a holder that simply never had one, which the main session cannot pre-measure from a
-  subagent. 292 instead mints it through 105's `epigraph_ensure_personal_group` (found by
+  subagent. 315 instead mints it through 105's `epigraph_ensure_personal_group` (found by
   its `did:epigraph:personal:` key): never the world group, and 105's RVK01 (only revoked
   personal rows) and RVK02 (a squatted key) still refuse with nothing written. Tested both
   ways (`role_edges_team_only.rs::a_missing_personal_group_is_minted_and_a_revoked_one_refuses`).
-- **A4. (Fix agent's calls, after the security review of 292.)** (a) The two findings ship as
-  NEW migrations 295 and 296, not as an edit of 292, although 292 is not yet on the
-  production database: 292 may already be applied on development and test databases, and the
+- **A4. (Fix agent's calls, after the security review of 315.)** (a) The two findings ship as
+  NEW migrations 318 and 319, not as an edit of 315, although 315 is not yet on the
+  production database: 315 may already be applied on development and test databases, and the
   repository rule forbids editing an applied migration. The cost is the §15.R1 residual for
-  292's own backfill, covered by the §17 pre-check. (b) 296 guards INSERT and the NEW arm of
+  315's own backfill, covered by the §17 pre-check. (b) 319 guards INSERT and the NEW arm of
   UPDATE as well as the UPDATE / DELETE the review asked for, so the marker itself is
-  maintenance-only and 295's predicate cannot be satisfied by an application-written row.
+  maintenance-only and 318's predicate cannot be satisfied by an application-written row.
   (c) The guard is a trigger, not RESTRICTIVE policies: a refused policy USING is a silent
   0-row write, which would hide a widening attempt instead of raising OCC05.
 
@@ -1732,18 +1734,18 @@ silently changed.
   `agents:write` on REST (the existing PUT scope). The brief is silent on scope; this needs
   confirmation.
 - **B15. (Superseded by [RULED] C6.)** Only `claims.agent_id` counted for the public-claim
-  and readable-claim arms; migration 309 adds the other kinds of public assertion.
+  and readable-claim arms; migration 332 adds the other kinds of public assertion.
 - **B16. (Reversed after review, leaks#2 / correctness#2.)** An unnamed human's
   `pending_authored_papers` count is served as computed, as for N. Zeroing it rested on a
   false premise (only a registered person can be named pending) and created a marker.
 - **B17.** The human-evidence row is pinned by a trigger (HEV01, §6.1) rather than only by a
-  ratchet test. After review (correctness#5, migration 294) the pin covers `agent_id` too.
+  ratchet test. After review (correctness#5, migration 317) the pin covers `agent_id` too.
 - **B18.** One evidence helper, `epigraph_is_human_principal`, shared by the rule, the reset
   and the setter.
 - **B19.** The setter has no search_path write window (271 pinned every trigger's path) and
   returns `named_to_everyone`.
 - **B20. (Superseded by [RULED] C7.)** Part B implemented the brief's literal
-  `display_name: null` until C7 was ruled; migration 299 replaces it with the placeholder.
+  `display_name: null` until C7 was ruled; migration 322 replaces it with the placeholder.
 
 ### R. Ruled by the operator (2026-11-24)
 
@@ -1751,7 +1753,7 @@ The operator's answer, verbatim: "1. Sure, use your recommendation. 2. accept. 3
 Direct database logins are supposed to be secured maintenance only. 4. Accept. c2, c4, c5,
 c6, c10, c11 use your recommendations". The numbered answers are, in the order they were put:
 1 = C7, 2 = C3, 3 = C13, 4 = C12. C2, C5 and C6 are ruled in the same answer ("use your
-recommendations") and implemented by migrations 300-311 (rulings part B); C8 was not ruled and
+recommendations") and implemented by migrations 323-334 (rulings part B); C8 was not ruled and
 stays open.
 
 - **C3. Third-party unhide through group-admin authority** (§4, §15.R2). Ruled: accept
@@ -1765,13 +1767,13 @@ stays open.
   shows, not null; labels, properties and kind must match such a principal so
   `?label=oauth-principal` and every other listing cannot separate them; the
   indistinguishability tests compare against a production-shaped nameless OAuth service
-  principal. Implemented: migration 299 (`epigraph_unnamed_agent_name`, the earliest linked
+  principal. Implemented: migration 322 (`epigraph_unnamed_agent_name`, the earliest linked
   client's id) in the ELSE of every name decision, `Disclosure::unnamed_as` for the REST
   whole-row redaction, the matchers' placeholder rows, `get_public_profile`'s `'public'` /
   `{}`; labels shown as stored (both carry `oauth-principal`). Residuals: §15.R16.
 - **C10. The TGP03 invite oracle** (§15.R11). Ruled: fix it; the invite answers identically
   whether or not the target is a human (or named), and the refusal moves to accept time.
-  Implemented: migration 298 (option (a)); accept already refused a non-person (TGP01).
+  Implemented: migration 321 (option (a)); accept already refused a non-person (TGP01).
   Pinned by `person_team_groups.rs::an_invitation_answers_alike_whoever_the_invitee_is`,
   `team_groups_http.rs::an_invite_answers_alike_for_a_person_and_an_agent` and the MCP
   parity test.
@@ -1779,15 +1781,15 @@ stays open.
   `profile_public_consented_at timestamptz`, set by the self-service setter on opt-in and
   cleared on opt-out; the opt-in arm requires `profile_visibility = 'public' AND
   consented_at IS NOT NULL`; backfill nothing (no one has consented yet). Implemented:
-  migration 297; the same consent term also gates a human's details rule, and a CHECK keeps
-  a stamp only on a `'public'` profile. Migration 321 (review 2, leaks#5) extends "only the
+  migration 320; the same consent term also gates a human's details rule, and a CHECK keeps
+  a stamp only on a `'public'` profile. Migration 344 (review 2, leaks#5) extends "only the
   setter writes it" to INSERT: a RESTRICTIVE policy refuses an application INSERT that carries a
   stamp (077's table-level INSERT grant reached the column; 118 had narrowed UPDATE only).
   Pinned by `human_identity_visibility.rs::a_public_profile_without_recorded_consent_names_no_one`
   and `::the_consent_stamp_is_the_setters_alone` (UPDATE and INSERT).
 - **C2. A countersigned authorship** (§15.R3). Ruled: yes: a countersigned authorship (H's
-  own act) of a paper the viewer can read names H, like a claim. Implemented: migration 311
-  (310's index), read from 208's `authorship.countersigned` audit row (caller, time) so it is
+  own act) of a paper the viewer can read names H, like a claim. Implemented: migration 334
+  (333's index), read from 208's `authorship.countersigned` audit row (caller, time) so it is
   windowed as C5 rules; the paper is readable as 246's `papers_read` decides. Pinned by
   `human_identity_visibility.rs::a_countersigned_authorship_of_a_readable_paper_names_the_human`
   (self, linked agent, live operator, group paper to its readers only, a pending naming names
@@ -1797,20 +1799,20 @@ stays open.
   assertion counts for H only if created at or after its agent's binding to H began
   (`operator_links.created_at` / `author_binding_clients.added_at` / any newer binding's
   start); sticky after the binding is retired or revoked; an agent's assertions from before it
-  was bound to H never name H. Implemented: migration 302 (300/301's indexes; 303/304 drop
-  289/290's), both claim arms windowed (the readable arm too: "never" is unconditional), and
+  was bound to H never name H. Implemented: migration 325 (323/324's indexes; 326/327 drop
+  312/313's), both claim arms windowed (the readable arm too: "never" is unconditional), and
   the C6 and C2 arms read the same start. Pinned by
   `human_identity_visibility.rs::an_assertion_from_before_the_binding_never_names_the_human`,
   `::an_assertion_after_the_binding_names_the_human_after_the_binding_ends` and the BWS01
   refusal. Residual: §15.R17.
 - **C6. Public assertions of every kind** (finding 6; §4, B15). Ruled: yes: public claims,
   evidence, challenges, BBAs/mass functions and public ingest records by H or B(H) name H,
-  windowed as C5. Implemented: migration 309 (305-307's indexes; the ingest probe on 312's
-  LEAKPROOF accessor and 313's index after the §11.2 measurement, migrations 312-315), tables
-  re-verified (§4). **Narrowed by the security review's Addendum 5 (migration 316)**: a row
+  windowed as C5. Implemented: migration 332 (328-330's indexes; the ingest probe on 335's
+  LEAKPROOF accessor and 336's index after the §11.2 measurement, migrations 335-338), tables
+  re-verified (§4). **Narrowed by the security review's Addendum 5 (migration 339)**: a row
   counts only where it is the agent's own assertion, so evidence is dropped (no asserting
-  column) and a BBA counts only on an assessment slot (317's index; 318/319 drop 307's and
-  305's); open item C6a (§16.C) asks the operator whether to restore the narrowed kinds with a
+  column) and a BBA counts only on an assessment slot (340's index; 341/342 drop 330's and
+  328's); open item C6a (§16.C) asks the operator whether to restore the narrowed kinds with a
   writer column.
   Pinned by `human_identity_visibility.rs::a_public_assertion_of_every_kind_names_the_human`,
   `::an_assertion_of_any_kind_from_before_the_binding_never_names_the_human`,
@@ -1874,7 +1876,7 @@ recommendations, as put:
   the branch only calls, and 284 re-bodies the declared-edge narrowing functions, which the
   branch only relies on. Deploy note, as for C15: a development or test database that applied
   any of 274-309 from this branch holds checksums sqlx refuses; recreate it.
-- **C6a. Addendum 5's narrowing of C6.** Ruled: ACCEPT it, as built (migration 316): evidence
+- **C6a. Addendum 5's narrowing of C6.** Ruled: ACCEPT it, as built (migration 339): evidence
   is excluded and only assessment-slot BBAs count. Follow-up, not this PR: a write-once writer
   column on `evidence` and `mass_functions` (§15.F7).
 - **C16. Cost of the C6 / C2 arms** (§11.2). Ruled: ACCEPT the measured worst case (57 ms p50,
@@ -1882,7 +1884,7 @@ recommendations, as put:
   latency (§15.F8). §15.R16's name-search cost stays unmeasured.
 - **C14. An END bound on the binding window.** Ruled: unchanged; the 2026-11-24 ruling stands:
   a START-of-binding window, sticky, with no end. Implemented as built.
-- Deploy pre-check for 312's LEAKPROOF step (§17): kept. The orchestrator measured the
+- Deploy pre-check for 335's LEAKPROOF step (§17): kept. The orchestrator measured the
   migration login read-only on 2026-11-25; the §17 pre-check is still re-run at deploy time.
 
 ### C. Open, needs a ruling
@@ -1931,9 +1933,9 @@ Each item states the behaviour implemented until the operator rules.
   `migration_NNN_...` test identifier in the range, and the migration header comments and
   spec citations that name them, in the same pass.
 - **C16. ([RULED] 2026-11-25, §16.R2: accepted; marker table is §15.F8.) Cost not ruled on.** The C6/C2 arms' share of
-  the worst case (§11.2; three arms plus the countersign act since 316) and the unmeasured name
+  the worst case (§11.2; three arms plus the countersign act since 339) and the unmeasured name
   search cost of §15.R16's placeholder rows. C12 accepted only the readable-claim arm.
-- **C6a. ([RULED] 2026-11-25, §16.R2: narrowing accepted; writer column is §15.F7.)** Addendum 5 narrowed C6 (migration 316): evidence and every
+- **C6a. ([RULED] 2026-11-25, §16.R2: narrowing accepted; writer column is §15.F7.)** Addendum 5 narrowed C6 (migration 339): evidence and every
   BBA except an assessment no longer name H by themselves, because no column records which
   identity wrote them. Implemented: narrowed. Alternative for the operator: a write-once
   writer column on `evidence` and `mass_functions`, stamped from the session principal, and
@@ -1965,7 +1967,7 @@ the text above.
   its PENDING register is empty. After review (leaks#4) it also scans a write that hands
   its row back (`UPDATE` / `INSERT INTO agents ... RETURNING` an identity column; four
   writers registered in ALLOWED) and treats `profile_visibility` as an identity column
-  (after 288 its value is near-human evidence); `agent_type` stays out (read only for
+  (after 311 its value is near-human evidence); `agent_type` stays out (read only for
   `= 'role'` checks today). Limits: it is textual, so a statement whose table is a
   format argument (`graph_view.rs::graph_query_node_ids`, H6) is guarded by its HTTP test,
   not by the lint; it does not scan `events` payload builders (L14 stays pinned by T7 only).
@@ -1994,7 +1996,7 @@ Not covered by part B (open):
   (part A); part B adds T2 on the `authored_by` block, not a full viewer x claim matrix per
   surface.
 - **C7** was the brief's literal `display_name: null` (option (b)) in part B; ruled since
-  (§16.R) and replaced by the placeholder (migration 299).
+  (§16.R) and replaced by the placeholder (migration 322).
 - **C12** (§16.R): the worst-case budget, accepted by the operator.
 - **After review (tests#5), residual:** MCP `query_paper`, MCP `get_claim`'s `authored_by`,
   PROV export and `SourceOverviewRepository::agents` have no tool- or route-level H-vs-N
@@ -2019,12 +2021,12 @@ Not covered by part B (open):
 - Migrations apply at API boot. M4 and M5 build concurrently.
 - Rollout order: the API (which migrates) deploys before any binary that calls the new
   functions; part A's binaries call the setter only from the new routes and the new tool.
-- M3's reset (288) evaluates `epigraph_is_human_principal` (a definer with a SET clause,
+- M3's reset (311) evaluates `epigraph_is_human_principal` (a definer with a SET clause,
   never inlined: two index probes plus call overhead) for every agent whose profile is not
   'group', three times (before-count, UPDATE, after-count). Nearly every agent is 'public',
   so the boot migration's time scales with the whole `agents` table x3 (review
-  correctness#6). It runs once; 288 is not edited (the standing rule), so a NEW migration
-  could not improve it. Expect it on the deploy that applies 288.
+  correctness#6). It runs once; 311 is not edited (the standing rule), so a NEW migration
+  could not improve it. Expect it on the deploy that applies 311.
 - M3's reset takes row locks under `lock_timeout = '3s'`. A long `ensure_for_client`
   transaction holding a human row fails the boot migration; the API restarts and retries.
 - After M4 and M5: `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid` must
@@ -2032,64 +2034,64 @@ Not covered by part B (open):
   migration is re-applied (finding 15).
 - The undo runbooks are paired with a binary rollback: a binary that calls a dropped function
   fails.
-- M7 (292) mints a personal group for any role holder that has none, and refuses the boot
+- M7 (315) mints a personal group for any role holder that has none, and refuses the boot
   migration (RVK01 / RVK02) for a holder whose personal membership is only revoked or whose
   personal key is squatted. Pre-check on the maintenance DSN before deploy: every live or
   ended `role_assignments.holder_person_id` has a live row in the group whose `did_key` is
   `did:epigraph:personal:<holder>`, or no such group at all.
-- M7 (292) is not narrowed by M10/M11 (it is not edited), and its one-time backfill and OCC02
+- M7 (315) is not narrowed by M10/M11 (it is not edited), and its one-time backfill and OCC02
   match `relationship = 'OCCUPIES'` alone. Pre-check on the maintenance DSN before the deploy
-  that applies 292: every `OCCUPIES` edge is a genuine projection, i.e. this returns 0:
+  that applies 315: every `OCCUPIES` edge is a genuine projection, i.e. this returns 0:
   `SELECT count(*) FROM edges e WHERE e.relationship = 'OCCUPIES' AND NOT (e.source_type =
   'agent' AND e.properties @> '{"source": "role_assignments", "projection": true}' AND EXISTS
   (SELECT 1 FROM role_assignments ra WHERE ra.id::text = e.properties->>'assignment_id' AND
   ra.holder_person_id = e.source_id AND ra.role = e.properties->>'role'))`. A non-zero count
-  means a forged row would be re-owned (and could fail the boot) by 292: remove or relabel it
-  first. 295's reconcile pass and post-condition, and 296's guard, apply from then on.
+  means a forged row would be re-owned (and could fail the boot) by 315: remove or relabel it
+  first. 318's reconcile pass and post-condition, and 319's guard, apply from then on.
 - After deploy, rebuild the Atlas leaf levels: run the Atlas nightly builder once, outside its
   schedule. Previously stored documents carry names built under a bypass viewer.
 - MCP stdio clients pin their binary. Restart them so that the find_agent and get_agent text,
   and the new tool, are served.
-- M12-M14 (297-299, the operator's 2026-11-24 rulings) apply at API boot after 296. 297's
+- M12-M14 (320-322, the operator's 2026-11-24 rulings) apply at API boot after 319. 320's
   CHECK is added NOT VALID (a brief ACCESS EXCLUSIVE lock under `lock_timeout = '3s'`) and
-  then VALIDATEd (every row is NULL); 297 and 298 refuse (PCN01 / TIV01) over a core, setter
-  or invite body other than the one they re-state. 299 must be applied before any binary of
+  then VALIDATEd (every row is NULL); 320 and 321 refuse (PCN01 / TIV01) over a core, setter
+  or invite body other than the one they re-state. 322 must be applied before any binary of
   this branch serves a request: every name decision calls `epigraph_unnamed_agent_name`, so
-  an API built here against a database without 299 fails every agent-naming read (42883).
+  an API built here against a database without 322 fails every agent-naming read (42883).
   Migrations apply at API boot, so this holds by construction for the API; a separately
-  deployed MCP binary must not start before the API's boot has applied 299.
-- 298 changes what a team invite answers: an invitation to any agent but a role's node or a
+  deployed MCP binary must not start before the API's boot has applied 322.
+- 321 changes what a team invite answers: an invitation to any agent but a role's node or a
   system identity is written `pending`; only a registered person can accept one.
-- M15-M22 (300-311, rulings C5, C6, C2) apply at API boot after 299. The `-- no-transaction`
-  files (300, 301, 303-308, 310) build or drop indexes CONCURRENTLY; after deploy, `SELECT
-  indexrelid::regclass FROM pg_index WHERE NOT indisvalid` must return nothing. 305 builds a
-  partial index over every public `evidence` row and 308 an expression index over the public
-  ingest records: expect those two builds to take the longest. 302, 309 and 311 refuse
+- M15-M22 (323-334, rulings C5, C6, C2) apply at API boot after 322. The `-- no-transaction`
+  files (323, 324, 326-331, 333) build or drop indexes CONCURRENTLY; after deploy, `SELECT
+  indexrelid::regclass FROM pg_index WHERE NOT indisvalid` must return nothing. 328 builds a
+  partial index over every public `evidence` row and 331 an expression index over the public
+  ingest records: expect those two builds to take the longest. 325, 332 and 334 refuse
   (BWS01 / PAK01 / CSN01) over a core body other than the one each re-states, so they must
-  apply in order, after 297.
-- 302 (C5) can UN-name a person who is named today only through public claims its agents
+  apply in order, after 320.
+- 325 (C5) can UN-name a person who is named today only through public claims its agents
   filed before their binding (typically 123's legacy-linked authors). Pre-measure, count
   shape only, on the maintenance DSN before the deploy: `SELECT count(DISTINCT l.operator_id)
   FROM operator_links l JOIN claims c ON c.agent_id = l.agent_id AND c.visibility = 'public'
   AND c.created_at < l.created_at` (humans with a pre-link public claim) against the same
   count with `>=` (humans still named by a windowed claim). A human only in the first count
   loses the public-claim arm.
-- 309 (C6) and 311 (C2) can only NAME more people (new arms), never fewer. 316 (Addendum 5)
+- 332 (C6) and 334 (C2) can only NAME more people (new arms), never fewer. 339 (Addendum 5)
   names FEWER: a human named only by evidence, or by a non-assessment BBA, of a bound agent
   becomes unnamed. Nothing is deployed yet, so no one is named today by those arms.
-- 312 declares a LEAKPROOF function, which needs a SUPERUSER migration runner (as 212 / 238
+- 335 declares a LEAKPROOF function, which needs a SUPERUSER migration runner (as 212 / 238
   already assume); on another runner it refuses (LKP01) with nothing changed. **Deploy
   pre-check, NOT measured (review 2, correctness#6):** no earlier migration requires a
-  superuser (060 falls back without one, 067 declined LEAKPROOF for that reason, 288 was written
+  superuser (060 falls back without one, 067 declined LEAKPROOF for that reason, 311 was written
   for a non-superuser runner), and this branch's reviewers cannot read production. On the DSN
   that applies migrations in production, before deploying, run
   `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`. If it is false, boot stops at
-  312 after 297-311 committed (one transaction per migration), leaving 309's slow ingest probe
-  live: either apply 312 out of band as a superuser first, or replace the accessor with a
+  335 after 320-334 committed (one transaction per migration), leaving 332's slow ingest probe
+  live: either apply 335 out of band as a superuser first, or replace the accessor with a
   generated, indexed `uuid` column on `edges` set by the ingest walk (compared `uuid = uuid`,
-  leakproof without a declaration) in a new migration. Record the measured answer here. Without 312-315,
-  309's ingest-record probe scans `edges` by `created_at` on every human evaluation (198 s on
-  the §11.2 shape), so 309 must never be deployed without them.
+  leakproof without a declaration) in a new migration. Record the measured answer here. Without 335-338,
+  332's ingest-record probe scans `edges` by `created_at` on every human evaluation (198 s on
+  the §11.2 shape), so 332 must never be deployed without them.
 
 ## 18. Critique resolution (revision 2)
 
@@ -2098,15 +2100,15 @@ now says it; "Part" is where the change is built.
 
 | Finding | Disposition | Where | Part |
 |---|---|---|---|
-| L1 null name is a marker; `?label=oauth-principal` enumerates | **[RULED] C7**: the placeholder name (migration 299); N production-shaped as minted; labels and properties compared | §5, §12.T1, §16.R | B, rulings |
+| L1 null name is a marker; `?label=oauth-principal` enumerates | **[RULED] C7**: the placeholder name (migration 322); N production-shaped as minted; labels and properties compared | §5, §12.T1, §16.R | B, rulings |
 | L2 `author_name` and `replaces` on `authored` edges | Accepted: resolved now, not deferred (C1 closed) | §7 E2, E3 | B |
 | L3 `same_spelling` name-to-id oracle | Accepted: the `declined` half is gated | §7 A6, §12.T1 | B |
-| L4 TGP03 invite oracle | **[RULED] C10**: fixed, refusal at accept time (migration 298) | §15.R11, §16.R | rulings |
+| L4 TGP03 invite oracle | **[RULED] C10**: fixed, refusal at accept time (migration 321) | §15.R11, §16.R | rulings |
 | L5 GQL matches `properties` | Accepted: anchor rows gated before LIMIT; lint scope | §7 H6, §14 | B |
 | L6 drop before LIMIT and truncation | Accepted: normative placement plus decoy test | §7 A1, A4, §12.T1 | B |
 | L7 `OPERATED_BY` edges | Accepted as residual; §5 no longer says `operator_human` is the only signal | §5, §15.R12 | - |
 | L8 MCP forwards OPL text | Accepted (reachability PLAUSIBLE, re-verified in part B) | §7 I3 | B |
-| L9 binding window | **[RULED] C5**: binding-window start (migration 302) | §3, §4, §16.R | rulings B |
+| L9 binding window | **[RULED] C5**: binding-window start (migration 325) | §3, §4, §16.R | rulings B |
 | L10 timing | Accepted as residual | §15.R13 | - |
 | L11 pending count | Accepted in revision 2 (zeroed when unnamed), REVERSED after review: the premise was false and the zero was a marker; served to all (B16) | §7 A2 | B |
 | L12 assessment-slot BBAs | Accepted as residual | §15.R14 | - |
@@ -2119,7 +2121,7 @@ now says it; "Part" is where the change is built.
 | 3 A1/A4 filter in SQL | Accepted (same as L6) | §7 A1, A4 | B |
 | 4 COST on the wrappers | Accepted | §6.1 | A |
 | 5 accountability property | Accepted: T13 | §12.T13 | A (predicate), B (surfaces) |
-| 6 non-claim assertions | **[RULED] C6**: every kind of public assertion (migration 309) | §4, §16.R | rulings B |
+| 6 non-claim assertions | **[RULED] C6**: every kind of public assertion (migration 332) | §4, §16.R | rulings B |
 | 7 ever-bound over-discloses | **[RULED] C5**: windowed from the binding start | §4, §16.R | rulings B |
 | 8 status-free claim contradicted | Accepted: §3 corrected, R5 folded, T3 case | §3, §15.R5, §12.T3 | A |
 | 9 B(H) completeness | Accepted: invariants cited and tested | §3, §12.T13 | A |
@@ -2128,7 +2130,7 @@ now says it; "Part" is where the change is built.
 | 11 reset can move zero rows; split M1 | Accepted: post-condition, counts, lock note, split into M1-M3 | §10, §17 | A |
 | 12 `profile_visibility` app-updatable; R8 premise | Accepted: lockdown test; R8 rewritten | §10, §15.R8, §7 C5 | A |
 | 13 lock-function DROP + CREATE avoidable | Accepted: B7 reversed, revision 1's M2 dropped | §9.3, §16.B7 | A |
-| 14 column default fails open | Catalog insert-path pin accepted; consent column **[RULED] C11** (migration 297) | §15.F4, §12.T10, §16.R | A, rulings |
+| 14 column default fails open | Catalog insert-path pin accepted; consent column **[RULED] C11** (migration 320) | §15.F4, §12.T10, §16.R | A, rulings |
 | 15 index trap, registration, key order | Accepted | §10, §17 | A |
 | 16 budget at risk; `author_binding_clients` index | Accepted: index added; fallback listed (C9) | §6.1, §10, §11 | A |
 | 17 setter: non-humans, truthful text, LLM residual | Accepted: PVS05, `named_to_everyone`, description, R15 | §8, §15.R15 | A |
@@ -2149,23 +2151,23 @@ raised 25 findings. Dispositions; none was rejected outright.
 
 | Finding | Disposition | Where |
 |---|---|---|
-| correctness#1, leaks#1, tests#1 (BLOCKING) role-holding `OCCUPIES` edges world-readable | Fixed: migration 292, team-only owner rule, bind/unbind re-own, backfill. One deviation, the fix agent's call: a holder with no personal group gets one minted instead of a refusal (§16.A3) | §7 K1, §10 M7 |
+| correctness#1, leaks#1, tests#1 (BLOCKING) role-holding `OCCUPIES` edges world-readable | Fixed: migration 315, team-only owner rule, bind/unbind re-own, backfill. One deviation, the fix agent's call: a holder with no personal group gets one minted instead of a refusal (§16.A3) | §7 K1, §10 M7 |
 | correctness#2, leaks#2 (BLOCKING) `hide_pending` marker | Fixed: the count is served to every reader; the premise was false | §5, §7 A2, B16 |
-| correctness#3 (MAJOR) role-derived arm cost | Fixed: migration 293, arm last plus a cheap probe pinned equal to 249; measured 617 -> 28 ms | §10 M8, §11.1 |
+| correctness#3 (MAJOR) role-derived arm cost | Fixed: migration 316, arm last plus a cheap probe pinned equal to 249; measured 617 -> 28 ms | §10 M8, §11.1 |
 | correctness#4, leaks#3 DB-layer real-name storage | **[RULED] C13**: as built, on the operator's threat model; DSN distribution is a follow-up | §16.R |
-| correctness#5 HEV01 `agent_id` | Fixed: migration 294 | §10 M9 |
-| correctness#6 288's boot cost | Recorded (288 not edited) | §17 |
+| correctness#5 HEV01 `agent_id` | Fixed: migration 317 | §10 M9 |
+| correctness#6 311's boot cost | Recorded (311 not edited) | §17 |
 | correctness#7, leaks#4a, tests#2 `update_agent` | Fixed: mixed body 400; response redacted | §7 C5 |
 | correctness#8 unattributable opt-in | Recorded: no correlation GUC on HEAD | §15.R9 |
 | correctness#9 `find_agent` text | Fixed | §7 I1 |
 | leaks#4 lint blind spots | Fixed: RETURNING and `profile_visibility` scanned; `agent_type` left out with the reason | §16a |
-| leaks#5 TGP03 | **[RULED] C10**: fixed by migration 298 | §15.R11, §16.R |
+| leaks#5 TGP03 | **[RULED] C10**: fixed by migration 321 | §15.R11, §16.R |
 | tests#3, #3b, #4, #5, #8, #8b | Fixed by new or strengthened tests (tests#5's remaining tool-level rows recorded as residual, §16a) | §16a |
 | tests#6 equivalent mutant | Kept as defence in depth, commented | §9.2 |
 | tests#7 perf harness | Recorded: a measurement harness, not a gate | §11.1 |
 | tests#9 pinned-test audit | No defect; the MCP fixture asymmetry is commented | - |
-| Security review of 292, finding 1: re-own / backfill / OCC02 act on forgeable rows | Fixed: migration 295, genuine-projection predicate (marker plus `role_assignments` join) on bind, unbind and the reconcile pass; 292's own backfill covered by a deploy pre-check | §7 K1, §10 M10, §15.R1, §17 |
-| Security review of 292, finding 2: owner-writable projection | Fixed: migration 296, INVOKER guard on INSERT / UPDATE / DELETE of a marked row, maintenance and definer frames only (OCC05) | §7 K1, §10 M11, §15.R1, §16.A4 |
+| Security review of 315, finding 1: re-own / backfill / OCC02 act on forgeable rows | Fixed: migration 318, genuine-projection predicate (marker plus `role_assignments` join) on bind, unbind and the reconcile pass; 315's own backfill covered by a deploy pre-check | §7 K1, §10 M10, §15.R1, §17 |
+| Security review of 315, finding 2: owner-writable projection | Fixed: migration 319, INVOKER guard on INSERT / UPDATE / DELETE of a marked row, maintenance and definer frames only (OCC05) | §7 K1, §10 M11, §15.R1, §16.A4 |
 
 ## 20. Review resolution (round 3, after the operator's rulings C2-C13)
 
@@ -2174,26 +2176,27 @@ migrations, tests) raised 16 findings, 4 blocking. Dispositions:
 
 | Finding | Disposition | Where |
 |---|---|---|
-| leaks#1, correctness#2 (BLOCKING) C6 counted rows another writer made (Addendum 5) | Fixed: migration 316 drops evidence and counts a BBA only on an assessment slot; 317 indexes it, 318/319 drop 307/305. Narrowing listed for the operator (C6a) | §4, §10 M26-M27, §16.R C6, §16.C C6a |
+| leaks#1, correctness#2 (BLOCKING) C6 counted rows another writer made (Addendum 5) | Fixed: migration 339 drops evidence and counts a BBA only on an assessment slot; 340 indexes it, 341/342 drop 330/328. Narrowing listed for the operator (C6a) | §4, §10 M26-M27, §16.R C6, §16.C C6a |
 | leaks#2 (BLOCKING) explicit `authored` edge marker | Fixed: the spelling is withheld from every agent's authored edge for every non-privileged reader; H-vs-N edge test | §7 E2 |
 | correctness#1 (BLOCKING) migrations 272/273 collide with origin/main | Open, needs an orchestrator / operator ruling (renumber at merge; the standing rule forbids editing 272-282) | §16.C C15 |
-| correctness#3 (MAJOR) main's live-roster fix vs the core's details rule | Fixed now in the core: migration 320 | §6.1, §10 M28 |
+| correctness#3 (MAJOR) main's live-roster fix vs the core's details rule | Fixed now in the core: migration 343 | §6.1, §10 M28 |
 | correctness#4 (MAJOR) C5 stickiness across two bindings untested | Fixed: pin test; kills mutation P1 on the final core | §12 |
 | correctness#5 (MAJOR) ingest marker equality untested | Fixed: unmarked and foreign-marked records in `only_an_agents_own_assertion_names_its_human`; kills mutation P4 on the final core | §4 |
-| correctness#6 (deploy pre-check) superuser runner for 312 | Recorded as a deploy pre-check with the fallback; not measurable from here | §17 |
+| correctness#6 (deploy pre-check) superuser runner for 335 | Recorded as a deploy pre-check with the fallback; not measurable from here | §17 |
 | correctness#7 tables with `visibility` not named | Recorded: each rejected table and why | §15.R19 |
-| correctness#8 EXPLAIN pins vs §11.2 plans | Evidence half moot (316/319); countersign half open (re-measure or make 310 the only fitting index) | §11.2 |
+| correctness#8 EXPLAIN pins vs §11.2 plans | Evidence half moot (339/342); countersign half open (re-measure or make 333 the only fitting index) | §11.2 |
 | correctness#9 cost not ruled on | Recorded for the operator | §11.2, §16.C C16 |
 | leaks#3 inherited `public` on C6 rows (publicize, dedup move) | Recorded as the C4 analogue for C6 rows; PR-body item | §4 |
 | leaks#4 no END bound on the window | Put to the operator, not changed | §16.C C14 |
-| leaks#5 consent stamp writable on INSERT | Fixed: migration 321 (RESTRICTIVE INSERT policy) | §10 M29, §16.R C11 |
+| leaks#5 consent stamp writable on INSERT | Fixed: migration 344 (RESTRICTIVE INSERT policy) | §10 M29, §16.R C11 |
 | leaks#6 lint saw one fallback spelling | Fixed: structural CASE scan plus a Rust-side check, planted self-tests | §14 |
 | leaks#7 H-vs-N gaps | Fixed for the paper-author listing and the edge listing; the rest recorded with the reason they are not reachable for an unnamed H | §16a |
 
 ## 21. Verification of the renumber and the merge (round 4, after ruling C15)
 
 This section keeps the C15 numbering (274-309) in which the audits were written; each
-branch migration it names is that number plus 12 today (C17, §16.R2).
+branch migration it names is that number plus 35 today (+12 by C17, §16.R2, then +23 on the
+2026-11-25-3 staging branch).
 
 Two audits of the renumber (274-309) and the merge of origin/main (272, 273) raised 20
 findings, 2 blocking. Dispositions (findings that passed are listed once, as passed):

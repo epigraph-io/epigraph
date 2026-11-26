@@ -1177,7 +1177,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `check_explicit_author_ids`; untenanted: `AgentLookupRepository::author_nodes`,
     // `AgentLookupRepository::exact_name_candidates`, `AgentRepository::get_by_public_key`,
     // `SystemAgentRepository::registered_agent_ids`; stamped:
-    // `AgentDisclosureRepository::disclosure` (migration 286's rule on the walk's
+    // `AgentDisclosureRepository::disclosure` (migration 309's rule on the walk's
     // stamped transaction, a definer that applies its own audience).
     (
         "ingest_authors.rs",
@@ -1726,7 +1726,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::begin_author_stamped_tx",
         ],
     ),
-    // write: `AgentRepository::set_profile_visibility_conn` (287's definer, the
+    // write: `AgentRepository::set_profile_visibility_conn` (310's definer, the
     // stamped principal's own row); opener: `claim_helper::begin_author_stamped_tx`.
     (
         "visibility.rs",
