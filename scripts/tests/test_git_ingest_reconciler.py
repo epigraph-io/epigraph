@@ -174,15 +174,42 @@ class DiscoverTests(unittest.TestCase):
         cutoff = datetime.datetime(2026, 6, 3, 11, 0, tzinfo=UTC)
         unmerged = {**_row(3, None, "2026-06-03T11:55:00Z"), "merge_commit_sha": None}
         pages = [
-            [_row(1, "2026-06-03T11:50:00Z"), unmerged],
+            [unmerged, _row(1, "2026-06-03T11:50:00Z")],
             [_row(4, "2026-06-03T11:20:00Z"), _row(2, "2026-06-01T00:00:00Z")],
             [_row(9, "2026-05-01T00:00:00Z")],  # must not be fetched
         ]
         with mock.patch.object(gir, "PULLS_PER_PAGE", 2), self._paged(pages[:2]) as run:
             prs = gir.discover_merged_prs("o/r", {}, cutoff)
-        self.assertEqual([p.number for p in prs], [1, 4])
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(sorted(p.number for p in prs), [1, 4])
+        # Pages 1 and 2, then the re-read of page 1 a multi-page scan needs
+        # (see test_a_pr_updated_mid_scan_is_not_lost); it ends there because
+        # page 1's last row is older than page 1's newest.
+        pages_read = [next(a for a in c.args[0] if a.startswith("page=")) for c in run.call_args_list]
+        self.assertEqual(pages_read, ["page=1", "page=2", "page=1"])
         self.assertNotIn("--paginate", run.call_args.args[0])
+
+    def test_a_pr_updated_mid_scan_is_not_lost(self):
+        # Review of 39dfef78: the listing moves while it is paged. PR 5 sits
+        # on page 3; a comment after page 1 was read lifts it to page 1, so
+        # the pages read after that never hold it. The next run's cutoff is
+        # this run's start minus the window, past PR 5's merge, so a scan that
+        # misses it loses it.
+        cutoff = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=UTC)
+        listing = [_row(n, f"2026-06-03T{23 - n:02d}:00:00Z") for n in range(7)]  # 0 newest
+        served = []
+        def gh(args, env):
+            page = int(next(a for a in args if a.startswith("page=")).split("=", 1)[1])
+            served.append(page)
+            if len(served) == 2:  # PR 5 is commented on after page 1 is read
+                pr5 = next(r for r in listing if r["number"] == 5)
+                listing.remove(pr5)
+                listing.insert(0, {**pr5, "updated_at": "2026-06-04T00:00:00Z"})
+            return [dict(r) for r in listing[(page - 1) * 2:page * 2]]
+        with mock.patch.object(gir, "PULLS_PER_PAGE", 2), \
+             mock.patch.object(gir, "_gh_json", side_effect=gh):
+            prs = gir.discover_merged_prs("o/r", {}, cutoff)
+        numbers = [p.number for p in prs]
+        self.assertEqual(sorted(numbers), list(range(7)))  # each PR exactly once
 
     def test_an_old_pr_updated_recently_does_not_stop_paging(self):
         # A comment on a PR merged last month moves it to the top of the

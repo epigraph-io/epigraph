@@ -223,19 +223,13 @@ def _pr_from_row(r: dict) -> "PullRequest | None":
 
 PULLS_PER_PAGE = 100  # the pulls API's largest page
 
-def discover_merged_prs(slug: str, env: dict, cutoff: datetime.datetime) -> list[PullRequest]:
-    """The repo's PRs merged at or after `cutoff`.
-
-    The closed-PR listing is ordered by updated_at, newest first, and a PR's
-    updated_at is never before its merged_at, so paging stops at the first
-    page that ends before `cutoff` (or is short): no later page holds a PR
-    merged after it. Stopping on updated_at, not merged_at, matters: a comment
-    on a PR merged long ago lifts it to the top of the listing.
-
-    A PR updated while the pages are read can shift a row across a page
-    boundary; the next run's overlap (`compute_cutoff`) picks it up."""
-    out = []
-    page = 1
+def _scan_closed_prs(slug: str, env: dict, stop_before: datetime.datetime,
+                     cutoff: datetime.datetime, found: dict) -> tuple[int, "str | None"]:
+    """Read the closed-PR listing (newest update first) page by page until a
+    short page, or a page whose last row was updated before `stop_before`.
+    Each merged PR with merged_at >= `cutoff` goes into `found` (by number).
+    Returns (pages read, page 1's newest updated_at)."""
+    page, newest = 1, None
     while True:
         rows = _gh_json(
             [f"repos/{slug}/pulls", "-X", "GET",
@@ -244,16 +238,61 @@ def discover_merged_prs(slug: str, env: dict, cutoff: datetime.datetime) -> list
              "--field", f"page={page}"],
             env,
         )
+        if page == 1:
+            stamps = [r["updated_at"] for r in rows if r.get("updated_at")]
+            newest = max(stamps, key=_parse_ts) if stamps else None
         for r in rows:
             pr = _pr_from_row(r)
             if pr is not None and _parse_ts(pr.merged_at) >= cutoff:
-                out.append(pr)
+                found.setdefault(pr.number, pr)
         if len(rows) < PULLS_PER_PAGE:
-            return out
+            return page, newest
         last = rows[-1].get("updated_at")
-        if last and _parse_ts(last) < cutoff:
-            return out
+        if last and _parse_ts(last) < stop_before:
+            return page, newest
         page += 1
+
+# A re-read only repeats when more than a page of PRs was updated during the
+# previous read; past this many passes, give up and fail the repo (its cursor
+# is kept, so the next run scans the same range).
+MAX_DISCOVERY_PASSES = 5
+
+def discover_merged_prs(slug: str, env: dict, cutoff: datetime.datetime) -> list[PullRequest]:
+    """The repo's PRs merged at or after `cutoff`, each once.
+
+    The closed-PR listing is ordered by updated_at, newest first, and a PR's
+    updated_at is never before its merged_at, so paging stops at the first
+    page that ends before `cutoff` (or is short): no later page holds a PR
+    merged after it. Stopping on updated_at, not merged_at, matters: a comment
+    on a PR merged long ago lifts it to the top of the listing.
+
+    Pages are read one request at a time, so a PR updated while a multi-page
+    scan runs jumps from a page not yet read to page 1, already read, and the
+    scan never sees it. Every such PR was updated after page 1 was read, so its
+    updated_at is at or after page 1's newest one: after a multi-page scan,
+    the listing is read again down to that mark (normally one page), and again
+    if that re-read itself spans pages. A single-page read is one request and
+    needs no re-read. A re-read repeats only while page 1's newest row moves.
+
+    Not covered: a closed, unmerged PR reopened mid-scan leaves the listing,
+    the rows below it move up one place, and the row moved across the page
+    boundary is skipped with its updated_at unchanged. The previous
+    `--paginate` scan had the same gap."""
+    found: dict[int, PullRequest] = {}
+    pages, mark = _scan_closed_prs(slug, env, cutoff, cutoff, found)
+    passes = 1
+    while pages > 1 and mark is not None:
+        if passes >= MAX_DISCOVERY_PASSES:
+            raise RuntimeError(f"{slug}: the closed-PR listing kept moving over "
+                               f"{passes} reads; discovery not trusted")
+        pages, newer = _scan_closed_prs(slug, env, _parse_ts(mark), cutoff, found)
+        passes += 1
+        # Page 1's newest row did not change: no PR was updated during the
+        # re-read, so nothing moved past it.
+        if newer is None or _parse_ts(newer) <= _parse_ts(mark):
+            break
+        mark = newer
+    return list(found.values())
 
 def fetch_pr(slug: str, number: int, env: dict) -> "PullRequest | None":
     """One PR by number (for the retry list); None when it is not merged."""
