@@ -323,9 +323,10 @@ pub enum CascadeState {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CascadeStatus {
-    /// Applied, deferred or failed.
+    /// Applied, deferred, failed, or (a match-candidate retirement only)
+    /// obsolete.
     pub status: CascadeState,
-    /// Why it was deferred or failed.
+    /// Why it was deferred, failed or closed as obsolete.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The `security_events` row recording it; `None` only when writing that
@@ -1471,7 +1472,9 @@ pub async fn apply_after_consolidate(
 /// ([`MatchCandidateRepo::retire_conn`]), and write its audit row, in ONE
 /// transaction. `trigger.candidate_status`, when set, is the status the
 /// retirement was requested against, and a candidate decided again since is
-/// refused (the status is `failed` and nothing changed).
+/// refused: nothing changes, and the request is CLOSED as obsolete on first
+/// sight (the status is `obsolete`, with an [`EVENT_RETIRED`] row naming the
+/// candidate), never failed, so the replay does not retry it.
 ///
 /// Then, when the retirement withdrew anything (an edge, a factor or an
 /// edge-keyed BBA), the belief of both endpoints is re-derived from the
