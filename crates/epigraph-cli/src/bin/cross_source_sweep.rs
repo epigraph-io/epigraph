@@ -77,7 +77,10 @@ struct Args {
     /// Skip the LLM verifier — every mid-band pair is reported as "no answer"
     /// and skipped (counted in `skipped_no_verdict`, no candidate row written).
     /// Lets you measure band distribution against the calibration without
-    /// burning LLM tokens. Forces --dry-run.
+    /// verifier LLM calls. Forces --dry-run. It does NOT turn off the
+    /// stance-probe stage: with `OPENAI_API_KEY` set, the run still makes paid
+    /// embedding calls (up to 2 probe texts per seed) unless
+    /// `--no-stance-probe` is also passed.
     #[arg(long)]
     count_only: bool,
 
