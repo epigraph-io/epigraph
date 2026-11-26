@@ -261,3 +261,40 @@ async fn a_rate_limited_retry_waits_out_retry_after_not_just_the_handler_backoff
         .expect("the loop wrote the job back");
     assert_eq!((last.state, last.retry_count), (JobState::Failed, 2));
 }
+
+/// The worker loop's rate-limit wait is capped at
+/// `MAX_WORKER_RATE_LIMIT_SLEEP` (one hour). The loop sleeps with the job's
+/// row still `running`, so an uncapped "retry after 10 days" would hold the
+/// row past the drain reaper's 90-minute stale threshold, and the reaper would
+/// reset and re-claim it while this worker still held it (the job would run
+/// twice). Before the cap, the retry below never came within the window.
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_retry_sleeps_no_longer_than_the_worker_cap() {
+    const TEN_DAYS: u64 = 10 * 24 * 3600;
+    let cap = epigraph_jobs::MAX_WORKER_RATE_LIMIT_SLEEP;
+    let queue = Arc::new(RecordingQueue::default());
+    let job = Job::new("rate_limited", json!({})).with_max_retries(2);
+    queue.enqueue(job).await.unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+
+    let mut runner = JobRunner::new(1, Arc::clone(&queue) as Arc<dyn JobQueue>);
+    runner.register_handler(Arc::new(RateLimitedNoBackoff {
+        retry_after_secs: TEN_DAYS,
+        calls: Arc::clone(&calls),
+    }));
+    runner.start().await;
+    tokio::time::sleep(cap + Duration::from_secs(60)).await;
+    runner.shutdown().await;
+
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the retry of a 10-day rate limit did not come within the {cap:?} cap: {calls:?}"
+    );
+    let gap = calls[1] - calls[0];
+    assert!(
+        gap >= cap && gap < cap + Duration::from_secs(60),
+        "the retry came {gap:?} after the rate limit; the worker cap is {cap:?}"
+    );
+}
