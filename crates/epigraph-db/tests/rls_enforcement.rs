@@ -2714,8 +2714,9 @@ async fn assert_stamp_landed(app_pool: &PgPool, group: Uuid) {
 /// Before 086 both read `claims` directly, so on a role the policy applies to
 /// they coincided and the difference was empty for every input — and BOTH
 /// callers read an empty set as *"nothing is hidden"*
-/// (`routes/events.rs::retain_visible_events` returns early and keeps every
-/// event; `routes/webhooks.rs::agent_may_receive` returns `true` and delivers).
+/// (`routes/events.rs::retain_visible_events`, deleted since by backlog
+/// 8fcc36a0, returned early and kept every event;
+/// `routes/webhooks.rs::agent_may_receive` returns `true` and delivers).
 /// An always-empty probe is therefore uninformative, not conservative.
 ///
 /// Nothing in the pre-existing suite could see that. Every other exerciser —

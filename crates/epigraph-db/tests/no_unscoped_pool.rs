@@ -337,7 +337,7 @@
 //!   Enumerated so no shard author mistakes this table for complete —
 //!   `middleware/provenance.rs::record_provenance`,
 //!   `oauth/providers/provision.rs::emit_oauth_audit`,
-//!   `routes/events.rs::retain_visible_events`,
+//!   `routes/events.rs::retain_visible_events` (deleted by backlog 8fcc36a0),
 //!   `routes/graph_query_utils.rs::load_subgraph`,
 //!   `routes/independence.rs::analyze_independence`,
 //!   `routes/webhooks.rs::{retain_visible_subscriptions, agent_principal_exists,
@@ -877,7 +877,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `AppState::write_as` transaction (`routes/claims.rs` 12 -> 7). No file
 /// reached zero. (Staging 2026-11-25-3: #1101's 158 -> 157 and #1102's
 /// 158 -> 153 compose to 152 on the merged tree.)
-const HIGH_WATER: usize = 152;
+/// 152 -> 151 (backlog 8fcc36a0): `list_events` reads only the `events`
+/// table, and the Rust-side filter of the in-process store it merged
+/// (`retain_visible_events`, one `state.db_pool` site) is deleted, not
+/// converted (`routes/events.rs` 6 -> 5). No file reached zero.
+const HIGH_WATER: usize = 151;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1127,7 +1131,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `batch_create_triples`: each now runs on ONE `AppState::write_as`
     // transaction, and the two batches authorize every target claim through the
     // caller's viewer before their first insert.
-    ("routes/events.rs", 6),
+    // 6 -> 5 (backlog 8fcc36a0): `list_events` no longer merges an in-process
+    // store, so its `retain_visible_events` call on `state.db_pool` is gone with
+    // it. Removed, not converted; the DO-NOT-CONVERT hold above stands.
+    ("routes/events.rs", 5),
     ("routes/experiment_loop.rs", 20),
     // 8 -> 4 (HTTP public-only reads, 2026-11-05): `hypothesize` (2) and
     // `design_experiment` (2) moved onto `AppState::read_as`. The 4 that remain

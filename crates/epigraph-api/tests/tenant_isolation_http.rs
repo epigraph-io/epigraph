@@ -1609,19 +1609,16 @@ async fn hypothesis_status_http_hides_a_group_private_claim_from_a_stranger() {
     let _ = shutdown.send(());
 }
 
-// ── GET /api/v1/events — a real round trip, both halves of the merge ────────
+// ── GET /api/v1/events — a real round trip, seeded AND route-emitted rows ───
 //
-// This endpoint is the one place in the crate where a viewer-filtered SQL read
-// is merged with an UNFILTERED in-process source before the response is built.
-// A repo-level test proves the SQL half and cannot see the merge at all: the
-// ring buffer is a `OnceLock<Arc<EventStore>>` reached from inside the handler.
-// So this case drives the HTTP route, seeds the same private claim into BOTH
-// stores, and asserts the stranger receives neither copy.
-//
-// The db-build handlers that push into that buffer are `routes/edges.rs`
-// (`edge.added`, `claim.superseded`), `routes/belief.rs` (`frame.created`) and
-// `routes/community.rs` — so the unfiltered half was the live event stream of
-// the db build, not a no-db legacy artefact.
+// This endpoint used to merge the viewer-filtered SQL read with an in-process
+// store that the db-build handlers pushed to (`routes/edges.rs`,
+// `routes/versioning.rs`, `routes/belief.rs`, `routes/community.rs`), filtered
+// by a second, Rust-side copy of the rule. Since backlog 8fcc36a0 those
+// handlers write the `events` table and the route reads only the table, so
+// this case drives the HTTP route over two kinds of row: one seeded through
+// SQL, and an `edge.added` the edge route itself emitted. The stranger must
+// receive neither private id; the owner must receive both events.
 
 /// `GET /api/v1/events?event_type=<ty>` with `token`; returns the raw body.
 ///
@@ -1653,8 +1650,38 @@ async fn get_events_body(
     body
 }
 
+/// [`get_events_body`] from `since` on: the oldest events of `event_type` at or
+/// after it. For a type real routes emit (`edge.added`), whose newest rows on
+/// the ambient database can outnumber a page.
+async fn get_events_since_body(
+    addr: std::net::SocketAddr,
+    token: &str,
+    who: &str,
+    event_type: &str,
+    since: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/events"))
+        .query(&[
+            ("limit", "1000".to_string()),
+            ("event_type", event_type.to_string()),
+            ("since", since.to_rfc3339()),
+        ])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("GET /api/v1/events as {who}: {e}"));
+    let status = resp.status();
+    let body = resp.text().await.expect("response body");
+    assert!(
+        status.is_success(),
+        "GET /api/v1/events as {who} must succeed; got {status}: {body}"
+    );
+    body
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn list_events_http_hides_a_private_claim_from_both_the_table_and_the_ring_buffer() {
+async fn list_events_http_hides_a_private_claim_from_seeded_and_route_emitted_events() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
@@ -1685,42 +1712,63 @@ async fn list_events_http_hides_a_private_claim_from_both_the_table_and_the_ring
     .await
     .expect("seed persisted event");
 
-    // Half 2: the in-process ring buffer, in the `edge.added` shape
-    // `routes/edges.rs` actually pushes — under its own unique type so this
-    // read is bounded too.
-    let in_mem_type = format!("events-http.inmem.{}", Uuid::new_v4());
-    epigraph_api::routes::events::global_event_store()
-        .push(
-            in_mem_type.clone(),
-            None,
-            serde_json::json!({
-                "source_id": private.to_string(),
-                "target_id": public.to_string(),
-                "relationship": "supports",
-            }),
-        )
-        .await;
-
-    let owner_token = common::mint_token_with_agent(&["claims:read", "graph:read"], owner_agent);
+    let owner_token =
+        common::mint_token_with_agent(&["claims:read", "graph:read", "edges:write"], owner_agent);
     let stranger_token =
         common::mint_token_with_agent(&["claims:read", "graph:read"], stranger_agent);
     let (addr, shutdown) = common::spawn_app(&url).await;
 
-    // Each half carries BOTH the private id and the public control id, so a
+    // Row 2: an `edge.added` the edge ROUTE emits (backlog 8fcc36a0), payload
+    // `source_id` = the private claim, `target_id` = the public control. Read
+    // from the database clock's `now()` on, so the ambient table's older
+    // `edge.added` rows cannot page it out.
+    let since: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .expect("database clock");
+    let created = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/edges"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "source_id": private,
+            "source_type": "claim",
+            "target_id": public,
+            "target_type": "claim",
+            "relationship": "supports",
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/edges as owner");
+    let created_status = created.status();
+    let created_body = created.text().await.expect("response body");
+    assert!(
+        created_status.is_success(),
+        "PREMISE: the owner creates the edge; got {created_status}: {created_body}"
+    );
+
+    // Each row carries BOTH the private id and the public control id, so a
     // response that withholds the private one while still returning the event
     // is distinguishable from a response that returns nothing.
-    for (half, ty) in [("persisted", &persisted_type), ("in-memory", &in_mem_type)] {
-        let stranger_body = get_events_body(addr, &stranger_token, "stranger", ty).await;
+    for (row, stranger_body, owner_body) in [
+        (
+            "seeded",
+            get_events_body(addr, &stranger_token, "stranger", &persisted_type).await,
+            get_events_body(addr, &owner_token, "owner", &persisted_type).await,
+        ),
+        (
+            "route-emitted edge.added",
+            get_events_since_body(addr, &stranger_token, "stranger", "edge.added", since).await,
+            get_events_since_body(addr, &owner_token, "owner", "edge.added", since).await,
+        ),
+    ] {
         assert!(
             !stranger_body.contains(&private.to_string()),
-            "the {half} half of GET /api/v1/events leaked the private claim's \
+            "the {row} event in GET /api/v1/events leaked the private claim's \
              id to a stranger. Body: {stranger_body}"
         );
-
-        let owner_body = get_events_body(addr, &owner_token, "owner", ty).await;
         assert!(
             owner_body.contains(&private.to_string()) && owner_body.contains(&public.to_string()),
-            "Class P for the {half} half: the owner must receive its own \
+            "Class P for the {row} event: the owner must receive its own \
              event, with both ids. A filter that returns nothing to anybody \
              passes the stranger assertion and is a fail-closed regression. \
              Body: {owner_body}"
