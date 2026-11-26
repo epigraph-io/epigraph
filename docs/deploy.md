@@ -484,9 +484,14 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
 Nothing in a request process applies cascades or runs jobs. Create these on
 the host that holds the maintenance DSN, each with a 0600 environment file
 holding `MAINTENANCE_DATABASE_URL` and `DATABASE_URL` (naming the same
-database). All of them refuse to start without `DATABASE_URL` (a
-`enqueue_job --dry-run` needs none); the `epigraph-cli` binaries also accept it
-as `--database-url`, while `drain_jobs` reads it from the environment only:
+database). The `epigraph-cli` binaries refuse to start without `DATABASE_URL`
+(a `enqueue_job --dry-run` needs none) and also accept it as `--database-url`,
+while `drain_jobs` reads it from the environment only. The two theme jobs at
+the end of the table are Python scripts from `scripts/`; install their pinned
+dependencies from `tests/requirements-ci.txt` (see `scripts/README.md`). The
+scripts that open a database connection have no built-in DSN: they use
+`MAINTENANCE_DATABASE_URL`, then `DATABASE_URL`, and refuse to start with
+neither.
 
 | Job | Command | Cadence | Notes |
 |---|---|---|---|
@@ -495,12 +500,15 @@ as `--database-url`, while `drain_jobs` reads it from the environment only:
 | Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or retired kind, a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
 | Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY`. `--allow-mock` (deterministic mock vectors, for a smoke run) is refused, exit 1 with nothing read or written, unless the database's name ends in `_test` or `EPIGRAPH_ENV=test` is set: a mock vector in a real database is served by recall as a real one and never refilled. |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
+| Theme maintenance | `assign_unthemed_themes --apply` (`epigraph-cli`), then `python3 scripts/maintain_themes.py` | nightly | Keeps the themes `recall(diverse=true)` samples from current between rebuilds: assigns unthemed claims, reassigns misplaced ones, splits at most three high-variance themes, recomputes the affected centroids. `maintain_themes.py` works over the HTTP API, not a DSN: it needs `EPIGRAPH_API_URL` and `EPIGRAPH_TOKEN`, a token with `claims:write` and `claims:admin` minted through the token endpoint (the script's docstring shows how), and refuses to start without the token. On a row-secured deployment its first phase can only assign claims the token may write, so run `assign_unthemed_themes --apply` first (maintenance DSN; a dry run without `--apply`). Small in memory: a split clusters at most 5,000 2-D projections. `--dry-run` reports without writing. |
+| Theme rebuild | `python3 scripts/theme_pipeline.py grow` | weekly or monthly, and after a large ingest | The full UMAP rebuild `theme_cluster` used to point at: base clustering, split loop, projection onto `claim_themes`, then labelling. Connects on `MAINTENANCE_DATABASE_URL` (an application login under row security clusters only the rows it can see and still exits 0); every statement is bounded at 15 minutes. The label step runs `scripts/label_themes_llm.py --relabel-all`, which calls the `claude` CLI, so the unit's user needs that CLI installed and signed in; when labelling fails the run prints `"status": "label_failed"` and exits 1 with the clustering already committed, and `theme_pipeline.py label` retries just that step. The base assignment alone has taken about 40 minutes; `--from-run-id <run>` resumes the split, projection and label phases on an existing run. Memory: budget about 3 GB. `cluster_claims.py` documents a 620 MB UMAP reducer and a 2.6 GB peak at a 100K batch (this job's default `--batch-size` is 20000), and `refine_clusters.py` fits UMAP on a capped sample; measure the peak on your corpus before you tighten a cgroup limit. Writes the fitted reducer to `data/umap_reducer.pkl` in the checkout. `--dry-run` reports the plan without writing. |
 
 `replay_deferred_cascades` and `drain_jobs` each take their own session
 advisory lock, so an overlapping or hand-started run prints
-`{"locked": true}`, exits 0 and does nothing. `embed_backfill` and
-`prune_recall_events` take no lock; do not schedule overlapping runs of
-them.
+`{"locked": true}`, exits 0 and does nothing. `embed_backfill`,
+`prune_recall_events` and the two theme jobs take no lock; do not schedule
+overlapping runs of them, and do not let theme maintenance and a theme rebuild
+overlap each other (both write `claim_themes`).
 
 ### Step 11 — Bind writers and arm, when you are ready
 

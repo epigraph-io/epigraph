@@ -4,6 +4,29 @@ Operational scripts for the live EpiGraph deployment. Not part of the
 build; invoked manually or by maintenance tasks (see `epiclaw-host`'s
 `schedules.toml`).
 
+## Dependencies and database
+
+There is no `scripts/requirements.txt`. The Python packages these scripts
+import (psycopg2, numpy, scikit-learn, umap-learn, requests, ...) are pinned,
+with hashes, in `tests/requirements-ci.txt`, the file the CI `python` job
+installs and tests them against (edit `tests/requirements-ci.in` and recompile;
+its header says how). Install it into a virtual environment on the host that
+runs them:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --require-hashes --only-binary :all: -r tests/requirements-ci.txt
+```
+
+A script that opens a database connection has no built-in DSN: it connects on
+`--database-url`, else `MAINTENANCE_DATABASE_URL`, else `DATABASE_URL`, and
+refuses to start with none of them (`scripts/maintenance_dsn.py`). The few
+read-only scripts that deliberately stay off the maintenance login
+(`subcluster_outliers.py`, `lib/tiered_enrichment.py --claim-id`) take
+`--database-url` or `DATABASE_URL` only. Which jobs to schedule, and with what
+role and cadence, is in `docs/deploy.md`, "Step 10 — Schedule the maintenance
+jobs" (the theme pipeline is there too).
+
 ## audit_claims_content_hash_agent.py
 
 Audits the drifted `uq_claims_content_hash_agent` constraint (migration 013)
