@@ -82,6 +82,12 @@ async fn insert_running(pool: &PgPool, job_type: &str, retry_count: i32, max_ret
     id
 }
 
+/// The reaper's backoff for the tests that are about WHAT it resets, not when
+/// the reset row is due: none, so a reset row is due at once.
+fn no_backoff(_job_type: &str, _attempt: u32) -> Duration {
+    Duration::ZERO
+}
+
 async fn row(pool: &PgPool, id: Uuid) -> (String, i32, Option<String>, bool) {
     sqlx::query_as(
         "SELECT state, retry_count, error_message, completed_at IS NOT NULL FROM jobs WHERE id = $1",
@@ -114,7 +120,7 @@ async fn a_counted_reap_bounds_a_job_killed_on_every_attempt(pool: PgPool) {
 
     for attempt in 1..=2 {
         let reaped = q
-            .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+            .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &no_backoff)
             .await
             .unwrap();
         assert_eq!(reaped.len(), 1, "attempt {attempt}: {reaped:?}");
@@ -128,7 +134,7 @@ async fn a_counted_reap_bounds_a_job_killed_on_every_attempt(pool: PgPool) {
         make_stale_again(&pool, looping).await;
     }
     let reaped = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &no_backoff)
         .await
         .unwrap();
     assert_eq!(reaped.len(), 1, "{reaped:?}");
@@ -141,7 +147,7 @@ async fn a_counted_reap_bounds_a_job_killed_on_every_attempt(pool: PgPool) {
     assert_eq!(err.as_deref(), Some(epigraph_jobs::REAPED_SPENT_MESSAGE));
 
     let again = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &no_backoff)
         .await
         .unwrap();
     assert!(again.is_empty(), "a failed row was reaped again: {again:?}");
@@ -167,7 +173,7 @@ async fn a_one_attempt_row_is_reset_without_counting_whatever_its_type(pool: PgP
     let spent = insert_running(&pool, "privatization_apply", 2, 3).await;
 
     let reaped = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &no_backoff)
         .await
         .unwrap();
     assert_eq!(reaped.len(), 4, "{reaped:?}");
@@ -216,7 +222,7 @@ async fn a_one_attempt_job_killed_on_every_run_is_failed_after_bounded_redeliver
 
     for redelivery in 1..=bound {
         let reaped = q
-            .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+            .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &no_backoff)
             .await
             .unwrap();
         assert_eq!(reaped.len(), 1, "redelivery {redelivery}: {reaped:?}");
@@ -236,7 +242,7 @@ async fn a_one_attempt_job_killed_on_every_run_is_failed_after_bounded_redeliver
     }
 
     let reaped = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &no_backoff)
         .await
         .unwrap();
     assert_eq!(reaped.len(), 1, "{reaped:?}");
@@ -259,11 +265,92 @@ async fn a_one_attempt_job_killed_on_every_run_is_failed_after_bounded_redeliver
     // A counted (multi-attempt) reap leaves the re-delivery counter alone.
     let counted = insert_running(&pool, "cluster_graph", 0, 3).await;
     let reaped = q
-        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &no_backoff)
         .await
         .unwrap();
     let r = reaped.iter().find(|r| r.id == counted).expect("reaped");
     assert!(!r.failed && !r.one_attempt, "{reaped:?}");
     assert_eq!(redeliveries(&pool, counted).await, 0);
     assert_eq!(row(&pool, counted).await.1, 1);
+}
+
+/// Seconds from the database's `now()` to the row's `run_after` (migration
+/// 261), `None` when it is NULL (due at once).
+async fn wait_s(pool: &PgPool, id: Uuid) -> Option<f64> {
+    sqlx::query_scalar(
+        "SELECT extract(epoch FROM run_after - now())::float8 FROM jobs WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("the job's run_after")
+}
+
+/// A counted reap gives the reset row a not-before time of `now() +` its
+/// handler's backoff for the retry it just counted (backlog 000cca08): the
+/// attempt index is the new `retry_count - 1`, as the drain's own retry, and
+/// the backoff is looked up by the row's type. Here the backoff is `attempt +
+/// 1` hours, so the first reap makes the row due in one hour and the second in
+/// two. Before the fix the reaper left `run_after` alone, so a job whose run
+/// was killed mid-job (a provider that hangs, say) was handed straight back
+/// out by the same drain run that reaped it, with no backoff at all.
+///
+/// The bounds: a one-attempt row's uncounted re-delivery and a row the reap
+/// fails are given no not-before time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_counted_reap_makes_the_row_wait_its_handlers_backoff(pool: PgPool) {
+    let q = PostgresJobQueue::new(pool.clone());
+    let counted = insert_running(&pool, "cluster_graph", 0, 3).await;
+    let one_attempt = insert_running(&pool, "privatization_apply", 0, 1).await;
+    let spent = insert_running(&pool, "embedding_generation", 2, 3).await;
+    let asked = std::sync::Mutex::new(Vec::new());
+    let hours_by_attempt = |job_type: &str, attempt: u32| {
+        asked.lock().unwrap().push((job_type.to_string(), attempt));
+        Duration::from_secs(3600 * (u64::from(attempt) + 1))
+    };
+    let hour = 3600.0_f64;
+
+    let reaped = q
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &hours_by_attempt)
+        .await
+        .unwrap();
+    assert_eq!(reaped.len(), 3, "{reaped:?}");
+    let wait = wait_s(&pool, counted)
+        .await
+        .expect("the counted reap left the row due at once");
+    assert!(
+        (hour - 10.0..=hour + 0.5).contains(&wait),
+        "the first counted reap is not backoff(0) = 1h out: {wait}s"
+    );
+    assert_eq!(
+        asked.lock().unwrap().clone(),
+        vec![("cluster_graph".to_string(), 0)],
+        "the backoff must be asked once, for the counted reset row's type and attempt"
+    );
+    assert_eq!(
+        wait_s(&pool, one_attempt).await,
+        None,
+        "a one-attempt row's crash re-delivery is not a counted retry"
+    );
+    assert_eq!(row(&pool, spent).await.0, "failed");
+    assert_eq!(wait_s(&pool, spent).await, None, "a failed row is not due");
+
+    // A row that is due later is not claimable now.
+    assert_eq!(
+        q.count_pending_of_types(&["cluster_graph".to_string()], &[])
+            .await
+            .unwrap(),
+        0,
+        "a reaped row inside its backoff is claimable at once"
+    );
+
+    make_stale_again(&pool, counted).await;
+    q.reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60), &hours_by_attempt)
+        .await
+        .unwrap();
+    let wait = wait_s(&pool, counted).await.expect("the second reap");
+    assert!(
+        (2.0 * hour - 10.0..=2.0 * hour + 0.5).contains(&wait),
+        "the second counted reap is not backoff(1) = 2h out: {wait}s"
+    );
 }

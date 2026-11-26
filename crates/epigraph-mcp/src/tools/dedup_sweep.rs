@@ -410,10 +410,12 @@ pub async fn sweep(
                             audit_event_ids.push(id);
                         }
                     }
-                    CascadeState::Failed | CascadeState::Deferred => failures.push(format!(
-                        "{dup} -> {survivor} (cascade): {}",
-                        status.reason.unwrap_or_default()
-                    )),
+                    CascadeState::Failed | CascadeState::Deferred | CascadeState::Obsolete => {
+                        failures.push(format!(
+                            "{dup} -> {survivor} (cascade): {}",
+                            status.reason.unwrap_or_default()
+                        ))
+                    }
                 }
                 for err in report.errors {
                     failures.push(format!("{dup} -> {survivor} (belief cascade): {err}"));

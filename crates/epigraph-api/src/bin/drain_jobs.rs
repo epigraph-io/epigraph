@@ -17,15 +17,17 @@
 //! 4. take the drain's advisory lock on that connection; when another run
 //!    holds it, print `{"locked": true}` and exit 0;
 //! 5. reap `running` rows older than 90 minutes (a counted attempt: back to
-//!    `pending`, or `failed` once the attempts are used up; a one-attempt row,
+//!    `pending` with a not-before time of now plus its handler's backoff, or
+//!    `failed` once the attempts are used up; a one-attempt row,
 //!    `max_retries <= 1`, is reset uncounted and re-delivered at most
 //!    `MAX_CRASH_REDELIVERIES` times, then failed, see
 //!    `PostgresJobQueue::reap_stale_jobs_counting_attempts`), then run
 //!    the oldest pending job of a registered type, one at a time, until none
 //!    is left or `--max-runtime` (default 50min) has elapsed. A job that
 //!    fails retryably goes back to `pending` with a not-before time of now
-//!    plus its handler's backoff (`jobs.run_after`, migration 261), and no
-//!    run claims it before then (`retry_not_before` in the report).
+//!    plus its handler's backoff, or a rate limit's retry-after when that is
+//!    longer (`jobs.run_after`, migration 261), and no run claims it before
+//!    then (`retry_not_before` in the report).
 //!
 //! Exit codes: 0 drained (or locked); 1 a job failed in this run (retryable
 //! or terminal; a failure outranks every other code), or the run could not

@@ -25,8 +25,9 @@
 //!   failed; nothing of it committed. Replayable like a deferral.
 //! * [`EVENT_BELIEF`]: the belief re-derivation after an applied repair.
 //! * [`EVENT_RETIRED`]: an operator retired a pending cascade that will not
-//!   replay ([`retire_pending`]); it answers the pending rows like an applied
-//!   one.
+//!   replay ([`retire_pending`]), or the maintenance connection closed one that
+//!   can never apply (outcome `obsolete`); it answers the pending rows like an
+//!   applied one.
 //!
 //! The [`EVENT_APPLIED`] row is written INSIDE the repair's transaction, so an
 //! applied cross-owner repair never exists without its audit row.
@@ -77,7 +78,10 @@ pub const EVENT_BELIEF_IDS: &str = "cascade.belief_rederived_ids";
 
 /// `security_events.event_type` of a pending cascade an operator retired
 /// instead of replaying (its act was undone, say, so its repair can never
-/// verify). Written on the maintenance connection only.
+/// verify), or that the maintenance connection closed as obsolete
+/// (`details.outcome = 'obsolete'`: a match-candidate retirement whose
+/// candidate was decided again, `epigraph_engine::admin_cascade`). Written on
+/// the maintenance connection only.
 pub const EVENT_RETIRED: &str = "cascade.retired";
 
 /// Record a deferred cascade on the CALLER's session, through 117's

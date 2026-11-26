@@ -276,6 +276,11 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
 /// A job left `running` by a crashed run (older than the 90-minute bound) is
 /// reset and drained; a `running` job younger than that is left alone, since it
 /// may still be running.
+///
+/// The reset counts an attempt, so the row waits out its handler's backoff
+/// before it is claimed again (backlog 000cca08): the reaper stores a
+/// not-before time, and the job completes on a run once that has passed (here
+/// back-dated). Before the fix the reaper stored none.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool) {
     let stale = enqueue(
@@ -294,8 +299,11 @@ async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool
         },
     )
     .await;
+    // Eight attempts used of ten: the counted reap schedules retry number 8,
+    // whose default backoff (2^8 s) is far longer than this run.
     sqlx::query(
-        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours' WHERE id = $1",
+        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours', \
+                retry_count = 8, max_retries = 10 WHERE id = $1",
     )
     .bind(stale)
     .execute(&pool)
@@ -317,7 +325,31 @@ async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool
         .expect("the drain ran");
 
     assert_eq!(report.recovered_stale, 1, "{report:?}");
-    assert_eq!(report.completed, 1, "{report:?}");
+    assert_eq!(
+        report.completed, 0,
+        "the run that reaped the job claimed it again inside its backoff: {report:?}"
+    );
+    let (state, wait): (String, Option<f64>) = sqlx::query_as(
+        "SELECT state, extract(epoch FROM run_after - now())::float8 FROM jobs WHERE id = $1",
+    )
+    .bind(stale)
+    .fetch_one(&pool)
+    .await
+    .expect("the reaped row");
+    assert_eq!(state, "pending");
+    assert!(
+        wait.is_some_and(|s| (200.0..=256.5).contains(&s)),
+        "the reaper reset the row without its handler's backoff(8) = 256 s: {wait:?}"
+    );
+    sqlx::query("UPDATE jobs SET run_after = now() - interval '1 second' WHERE id = $1")
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .expect("let the backoff elapse");
+    let next = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("the next drain ran");
+    assert_eq!(next.completed, 1, "{next:?}");
     assert_eq!(job_state(&pool, stale).await.0, "completed");
     assert_eq!(
         job_state(&pool, fresh).await.0,
@@ -1085,6 +1117,60 @@ async fn a_retry_waits_out_the_handlers_backoff(pool: PgPool) {
         "the second retry is not backoff(1) = 2h out: {wait}s"
     );
     assert_eq!(retries, 2);
+}
+
+/// A rate limit's `retry_after_secs` is a floor on the retry's not-before time
+/// (backlog 000cca08): the drain stores `now() + max(retry_after, backoff)`.
+/// The handler here backs off one second while the provider asks for two
+/// hours, so the row must wait the two hours. Before the fix the drain read
+/// only the handler's backoff and the job was due one second later, so the
+/// next timer run hit the same rate limit and spent another attempt.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rate_limited_retry_waits_out_retry_after_when_the_backoff_is_shorter(pool: PgPool) {
+    let id = enqueue_typed(&pool, "drain_test_rate_limited", 5).await;
+
+    let scoped = maintenance_scoped(&pool).await;
+    let handler = FailsWith {
+        job_type: "drain_test_rate_limited",
+        error: epigraph_jobs::JobError::RateLimited {
+            retry_after_secs: 7200,
+        },
+        backoff: |_| Duration::from_secs(1),
+        calls: Arc::default(),
+    };
+    let calls = Arc::clone(&handler.calls);
+    let (runner, queue) = runner_with(&scoped, handler);
+
+    let first = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        first.failures.len() == 1 && !first.failures[0].terminal,
+        "a rate limit must be retryable: {first:?}"
+    );
+    let (wait, retries) = wait_and_retries(&pool, id).await;
+    let wait = wait.expect("a retryable failure stored no not-before time");
+    assert!(
+        (7200.0 - 10.0..=7200.0 + 0.5).contains(&wait),
+        "the retry is not retry_after = 2h out on the database clock (the handler's backoff \
+         is 1s): {wait}s"
+    );
+    assert_eq!(retries, 1);
+
+    // Past the handler's one-second backoff, still inside the rate limit.
+    sqlx::query("SELECT pg_sleep(1.5)")
+        .execute(&pool)
+        .await
+        .expect("outlast the handler's backoff");
+    let early = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a run inside the provider's retry-after window re-ran the job: {early:?}"
+    );
+    assert_eq!(job_state(&pool, id).await.0, "pending");
 }
 
 /// A job whose handler fails PERMANENTLY (`JobError::should_retry` false: here
