@@ -103,6 +103,8 @@ struct World {
     _shutdown: oneshot::Sender<()>,
     /// Owns the claim through its personal group.
     owner: Uuid,
+    /// The claim's owner group (`owner`'s personal group).
+    owner_group: Uuid,
     /// Neither owns the claim nor is a member of its group.
     stranger: Uuid,
     claim: Uuid,
@@ -152,6 +154,7 @@ async fn world(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions, raw: RawPo
         addr,
         _shutdown: shutdown,
         owner,
+        owner_group,
         stranger,
         claim,
         frame,
@@ -160,6 +163,12 @@ async fn world(pool_opts: PgPoolOptions, conn_opts: PgConnectOptions, raw: RawPo
 
 /// POST `{0: 0.6, Θ: 0.4}` at reliability 1.0 as `agent`; insist on 201.
 async fn submit(w: &World, agent: Uuid) -> Value {
+    submit_support(w, agent, 0.6).await
+}
+
+/// POST `{0: support, Θ: 1 - support}` at reliability 1.0 as `agent`; insist
+/// on 201.
+async fn submit_support(w: &World, agent: Uuid, support: f64) -> Value {
     let token = common::mint_token_with_agent(&["claims:write"], agent);
     let resp = reqwest::Client::new()
         .post(format!(
@@ -169,7 +178,7 @@ async fn submit(w: &World, agent: Uuid) -> Value {
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "claim_id": w.claim, "agent_id": agent, "reliability": 1.0,
-            "masses": {"0": 0.6, "0,1": 0.4},
+            "masses": {"0": support, "0,1": 1.0 - support},
         }))
         .send()
         .await
@@ -419,6 +428,103 @@ async fn the_owners_global_scoped_belief_lands_when_the_raw_pool_is_the_app_role
         scoped.is_some_and(|b| (b - 0.6).abs() < EPS),
         "the global scoped belief must be stored with this frame's belief 0.6: {scoped:?} \
          (response {resp})"
+    );
+}
+
+/// Backlog 3adc219b (migration 308): the owner's SECOND submission on the
+/// frame replaces the global scoped belief in place rather than adding a row
+/// beside it. Before 308 the key was NULLS DISTINCT, so the upsert's
+/// `ON CONFLICT ... DO UPDATE` never fired for `scope_id IS NULL` and every
+/// global write inserted another row. On the application role, so the
+/// DO UPDATE arm a global write now reaches is held to the table's policies
+/// and triggers: were it refused, step 15's savepoint would swallow the
+/// refusal and the row would keep the first value.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_submission_replaces_the_global_scoped_belief_on_the_app_role(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts, RawPool::AppRole).await;
+    submit_support(&w, w.owner, 0.6).await;
+    // The same agent, frame and perspective: the BBA is replaced, so this
+    // frame's fold is the second BBA alone.
+    let resp = submit_support(&w, w.owner, 0.3).await;
+
+    let scoped: Vec<f64> = sqlx::query_scalar(
+        "SELECT belief FROM ds_combined_beliefs \
+          WHERE frame_id = $1 AND claim_id = $2 AND scope_type = 'global' AND scope_id IS NULL",
+    )
+    .bind(w.frame)
+    .bind(w.claim)
+    .fetch_all(&w.pool)
+    .await
+    .expect("read ds_combined_beliefs");
+    assert_eq!(
+        scoped.len(),
+        1,
+        "two global writes of one (frame, claim) leave ONE row: {scoped:?} (response {resp})"
+    );
+    assert!(
+        (scoped[0] - 0.3).abs() < EPS,
+        "the global row holds the second submission's belief 0.3: {scoped:?} (response {resp})"
+    );
+}
+
+/// Backlog 3adc219b (migration 308), second writer: a WRITER member of the
+/// claim's owner group (not the owner) posts after the owner. Its global write
+/// reaches the DO UPDATE arm on a row another agent stored, so this pins that
+/// the table's policies and triggers admit the update for any writer of the
+/// owner group, not only for the agent that inserted the row. Were the update
+/// refused, step 15's savepoint would swallow it and the row would keep the
+/// owner's 0.6.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_writers_submission_replaces_the_owners_global_scoped_belief_on_the_app_role(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts, RawPool::AppRole).await;
+    let (member, _) = fixture::seed_agent_with_group(&w.pool, "3adc219b-member").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(w.owner_group)
+    .bind(member)
+    .execute(&w.pool)
+    .await
+    .expect("seed the writer membership");
+
+    submit_support(&w, w.owner, 0.6).await;
+    let resp = submit_support(&w, member, 0.3).await;
+
+    let mut sources = bbas(&w).await;
+    sources.sort();
+    let mut expected = vec![Some(w.owner), Some(member)];
+    expected.sort();
+    assert_eq!(sources, expected, "PREMISE: both BBAs persisted");
+    let folded = reported(&resp);
+    assert!(
+        (folded - 0.6).abs() > EPS,
+        "PREMISE: the second BBA moves this frame's fold off 0.6: {resp}"
+    );
+
+    let scoped: Vec<f64> = sqlx::query_scalar(
+        "SELECT belief FROM ds_combined_beliefs \
+          WHERE frame_id = $1 AND claim_id = $2 AND scope_type = 'global' AND scope_id IS NULL",
+    )
+    .bind(w.frame)
+    .bind(w.claim)
+    .fetch_all(&w.pool)
+    .await
+    .expect("read ds_combined_beliefs");
+    assert_eq!(
+        scoped.len(),
+        1,
+        "the owner's and the member's global writes leave ONE row: {scoped:?} (response {resp})"
+    );
+    assert!(
+        (scoped[0] - folded).abs() < EPS,
+        "the global row holds the member's fold {folded}, not the owner's 0.6: {scoped:?}"
     );
 }
 

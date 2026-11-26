@@ -13,7 +13,8 @@
 //!
 //! Scope is deliberately narrow: the two route modules that serve the expand
 //! family. `routes/clusters.rs` writes and prunes `graph_cluster_runs` rows
-//! and legitimately names the table; it is not in scope here.
+//! (through `ClusterRunRepository`'s bridge-run methods since backlog
+//! 67c905a3); it is not in scope here.
 //!
 //! The source is read through `lint_text::strip_comments`, the same helper
 //! `no_redaction_sentinel.rs` uses. A raw `contains` failed on both files even

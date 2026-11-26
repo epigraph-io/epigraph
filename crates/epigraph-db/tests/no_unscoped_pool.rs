@@ -337,7 +337,6 @@
 //!   Enumerated so no shard author mistakes this table for complete —
 //!   `middleware/provenance.rs::record_provenance`,
 //!   `oauth/providers/provision.rs::emit_oauth_audit`,
-//!   `routes/clusters.rs::{persist_bridge_run, gc_bridge_runs}`,
 //!   `routes/events.rs::retain_visible_events`,
 //!   `routes/graph_query_utils.rs::load_subgraph`,
 //!   `routes/independence.rs::analyze_independence`,
@@ -869,7 +868,15 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 161 -> 158 (backlog 52b96600): `compose_subgraphs` reads on the caller's
 /// stamped connection; `routes/computation.rs` 3 -> 0, key DELETED
 /// (`HIGH_WATER_FILES` falls by one with it).
-const HIGH_WATER: usize = 158;
+/// 158 -> 157 (backlog 67c905a3): `routes/clusters.rs::build_from_bridges`
+/// moved onto the caller's stamped transaction (`routes/clusters.rs` 1 -> 0,
+/// key DELETED).
+/// 157 -> 152 (backlog a2d3e945): `update_claim` (PUT /claims/:id) reads its
+/// write target through `AppState::read_as` and writes on one
+/// `AppState::write_as` transaction (`routes/claims.rs` 12 -> 7). No file
+/// reached zero. (Staging 2026-11-25-3: #1101's 158 -> 157 and #1102's
+/// 158 -> 153 compose to 152 on the merged tree.)
+const HIGH_WATER: usize = 152;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -944,7 +951,8 @@ const HIGH_WATER: usize = 158;
 /// 35 -> 34 when `routes/embeddings.rs` reached zero (backlog batch B37).
 /// 34 -> 33 when `routes/assess.rs` reached zero (backlog 74feb76b).
 /// 33 -> 32 when `routes/computation.rs` reached zero (backlog 52b96600).
-const HIGH_WATER_FILES: usize = 32;
+/// 32 -> 31 when `routes/clusters.rs` reached zero (backlog 67c905a3).
+const HIGH_WATER_FILES: usize = 31;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1009,12 +1017,18 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 13 -> 12 (backlog 7c2a0b36): `patch_claim`'s non-admin write moved off
     // `state.db_pool.begin()` onto `AppState::write_as`, the transaction its
     // admin branch already used.
-    ("routes/claims.rs", 12),
+    // 12 -> 7 (backlog a2d3e945): `update_claim` (PUT /claims/:id) reads its
+    // write target through `AppState::read_as` and runs its truth, trace,
+    // embedding and properties writes on one `AppState::write_as` transaction;
+    // its provenance append stays on the pool.
+    ("routes/claims.rs", 7),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
     // so a `0` row could never be satisfied.
-    ("routes/clusters.rs", 1),
+    // `routes/clusters.rs` was 1 and is GONE (backlog 67c905a3):
+    // `build_from_bridges` runs its reads and writes on one transaction from
+    // the caller's `AppState::write_as` instead of `state.db_pool`.
     // 3 before batch F. `remove_member` no longer touches `state.db_pool` at
     // all: both membership writes run on a transaction stamped from the
     // caller's viewer (`routes/community.rs::membership_tx`), because migration

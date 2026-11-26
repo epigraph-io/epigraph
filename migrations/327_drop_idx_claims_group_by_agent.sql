@@ -1,0 +1,11 @@
+-- no-transaction
+--
+-- 313's `idx_claims_group_by_agent (agent_id, owner_group_id) WHERE visibility
+-- <> 'public'` is superseded by 324's `(agent_id, owner_group_id, created_at)`
+-- index with the same predicate: 325's windowed readable-claim arm probes the
+-- new one, and its two leading columns serve any probe 313 served. Keeping both
+-- would only add a second index write to every non-public claim insert.
+--
+-- Exactly one statement (see 312).
+-- Undo: re-run 313 (CREATE INDEX CONCURRENTLY IF NOT EXISTS ...).
+DROP INDEX CONCURRENTLY IF EXISTS public.idx_claims_group_by_agent;

@@ -1391,28 +1391,45 @@ pub(crate) async fn create_claim_core(
         }
     }
 
-    // Materialize edges (best-effort, after commit) — ONLY for a row this call
-    // created.
+    // Materialize edges (best-effort, after commit).
+    //
+    // A row this call CREATED gets its structural edges: `AUTHORED`, and
+    // `HAS_TRACE` / `DERIVED_FROM` when the request names a trace / evidence.
     //
     // On an `if_not_exists` dedup hit `created_claim` is a row someone else
     // may own: `create_or_get` matches on `(content_hash, agent_id)`, and
     // `agent_id` is the request BODY's (see the note on `claim` above), so any
-    // caller can name another agent's public claim. These statements run on
-    // the raw, unstamped pool after the commit, so migration 122's trigger
-    // never sees them (no claims INSERT happens) and the edges land public and
-    // world-owned, which migration 120 makes administrative: neither the
-    // caller nor the claim's owner can retract them.
-    // Unguarded, a dedup hit let a caller hang `AUTHORED`, `HAS_TRACE` and
-    // `DERIVED_FROM` edges off another tenant's claim. Guarded the same way,
-    // and for the same reason, as the labels and properties writes above.
-    if was_created {
-        let mut structural: Vec<(Uuid, &str, Uuid, &str, &str)> =
-            vec![(request.agent_id, "agent", claim_uuid, "claim", "AUTHORED")];
-        if let Some(trace_uuid) = request.trace_id {
-            structural.push((claim_uuid, "claim", trace_uuid, "trace", "HAS_TRACE"));
-        }
-        if let Some(evidence_id) = request.evidence_id {
-            structural.push((claim_uuid, "claim", evidence_id, "evidence", "DERIVED_FROM"));
+    // caller can name another agent's public claim. These statements run
+    // after the commit, outside migration 122's trigger (no claims INSERT
+    // happens), and an agent-sourced edge is world-owned, which migration 120
+    // makes administrative: neither the caller nor the claim's owner can
+    // retract it. Unguarded, a dedup hit let a caller hang `AUTHORED`,
+    // `HAS_TRACE` and `DERIVED_FROM` edges off another tenant's claim, so a
+    // dedup hit writes them only for the matched claim's AUTHOR.
+    //
+    // For that author a resubmission is itself an authorship event, so it
+    // gets its own `AUTHORED` edge, as MCP's `submit_claim` emits on every
+    // submission (`claim_helper::create_claim_idempotent`; backlog 4952d77a).
+    // The author is the AUTHENTICATED principal (`author_agent_id`, never the
+    // body's `agent_id`), and the matched row's `agent_id` must equal it.
+    // `HAS_TRACE` / `DERIVED_FROM` are still not re-emitted on a resubmit
+    // (docs/architecture/noun-claims-and-verb-edges.md, `if_not_exists`
+    // semantics).
+    let resubmitted_by_author =
+        !was_created && Uuid::from(created_claim.agent_id) == author_agent_id;
+    if was_created || resubmitted_by_author {
+        let mut structural: Vec<(Uuid, &str, Uuid, &str, &str)> = if was_created {
+            vec![(request.agent_id, "agent", claim_uuid, "claim", "AUTHORED")]
+        } else {
+            vec![(author_agent_id, "agent", claim_uuid, "claim", "AUTHORED")]
+        };
+        if was_created {
+            if let Some(trace_uuid) = request.trace_id {
+                structural.push((claim_uuid, "claim", trace_uuid, "trace", "HAS_TRACE"));
+            }
+            if let Some(evidence_id) = request.evidence_id {
+                structural.push((claim_uuid, "claim", evidence_id, "evidence", "DERIVED_FROM"));
+            }
         }
         // A group-visible claim (the team / private default,
         // docs/tenancy/claim-visibility-controls.md) is invisible to the
@@ -1421,9 +1438,15 @@ pub(crate) async fn create_claim_core(
         // them as the caller that just wrote the claim, one transaction per
         // edge so one bad reference does not take the others with it (the
         // same best-effort contract as the public path).
-        let group_visible = resolved
-            .as_ref()
-            .is_some_and(|r| r.decl.visibility_bind() == Some("group"));
+        //
+        // A dedup hit's row is the one the author wrote EARLIER, whose
+        // visibility need not be the one this request asked for (a public
+        // resubmit can match the author's private claim), so that arm always
+        // writes as the caller: the author can see and reference its own row.
+        let group_visible = resubmitted_by_author
+            || resolved
+                .as_ref()
+                .is_some_and(|r| r.decl.visibility_bind() == Some("group"));
         for (source, source_type, target, target_type, relationship) in structural {
             if group_visible {
                 let written = async {
@@ -2305,17 +2328,61 @@ pub async fn update_claim(
 
     let claim_id = ClaimId::from_uuid(id);
 
-    // Verify claim exists (404 if not found)
-    let mut current = ClaimRepository::get_by_id(&state.db_pool, &viewer, claim_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound {
-            entity: "Claim".to_string(),
-            id: id.to_string(),
+    // The write target, read through the CALLER's viewer, as `patch_claim` and
+    // `update_labels` do. A claim the caller cannot read is 404, exactly like
+    // one that does not exist, and 404 fires before the 403 below.
+    let claim_agent_id = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "update_claim",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
         })?;
+        ClaimRepository::write_target_of(&mut *read, &viewer, id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB error fetching claim owner: {e}"),
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: id.to_string(),
+            })?
+            .0
+    };
 
-    // Ownership / admin gate (after 404 check to avoid leaking existence)
-    let claim_agent_id: Uuid = current.agent_id.into();
+    // Ownership / admin gate (after the 404 to avoid leaking existence).
     crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
+
+    // EVERY write runs on one transaction stamped from the CALLER's viewer
+    // (backlog a2d3e945). The gate above admits by authorship; whether the
+    // caller may still WRITE the claim is `claims_tenancy`'s WITH CHECK on
+    // this stamp: an author whose membership in the owning group was revoked
+    // or downgraded to `reader` is refused (42501, answered 403, nothing
+    // written). These writes ran on the unstamped `state.db_pool`: on the
+    // application role they reached no row for any caller, and on a pool with
+    // a permissive orphan policy authorship alone would have decided the write.
+    // A `claims:admin` caller is stamped as itself too: this route has no
+    // audited admin path (`PATCH` has one), so it writes only where the admin
+    // writes.
+    let refused = |e: epigraph_db::DbError| -> ApiError {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "update_claim",
+                claim = %id,
+                error = %e,
+                "the database refused the update"
+            );
+            return crate::errors::write_refused("claim");
+        }
+        e.into()
+    };
+    let mut tx = state.write_as(&viewer, "update_claim").await?;
 
     // Update truth value if provided
     if let Some(tv) = request.truth_value {
@@ -2323,23 +2390,58 @@ pub async fn update_claim(
             field: "truth_value".to_string(),
             reason: "Truth value must be between 0.0 and 1.0".to_string(),
         })?;
-        current = ClaimRepository::update_truth_value(&state.db_pool, claim_id, truth).await?;
+        ClaimRepository::update_truth_value_conn(&mut tx, claim_id, truth)
+            .await
+            .map_err(refused)?;
     }
 
     // Update trace_id if provided
     if let Some(trace_uuid) = request.trace_id {
         let trace_id = TraceId::from_uuid(trace_uuid);
-        current = ClaimRepository::update_trace_id(&state.db_pool, claim_id, trace_id).await?;
+        ClaimRepository::update_trace_id_conn(&mut tx, claim_id, trace_id)
+            .await
+            .map_err(refused)?;
     }
 
     // Update embedding if provided (used by backfill_embeddings.py)
     if let Some(ref embedding) = request.embedding {
         let pgvector = epigraph_db::pgvector_literal(embedding);
-        ClaimRepository::store_embedding(&state.db_pool, id, &pgvector)
+        let stored = ClaimRepository::store_embedding_if_unsealed(&mut tx, &viewer, id, &pgvector)
             .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to store embedding: {e}"),
+            .map_err(|e| {
+                if crate::errors::db_is_insufficient_privilege(&e) {
+                    return refused(e);
+                }
+                ApiError::DatabaseError {
+                    message: format!("Failed to store embedding: {e}"),
+                }
             })?;
+        // The store filters to current, unsealed rows the caller may write,
+        // so a refusal matches zero rows and raises nothing. Answering 200
+        // then would report a vector that was never stored; say which of the
+        // three it was instead (the transaction is dropped, so nothing else in
+        // this request is written either).
+        if !stored {
+            return Err(
+                match ClaimRepository::embedding_refusal_of_conn(&mut tx, &viewer, id).await? {
+                    None => ApiError::NotFound {
+                        entity: "Claim".to_string(),
+                        id: id.to_string(),
+                    },
+                    Some((false, _)) => ApiError::Conflict {
+                        reason: "the claim is superseded; embed its current version. \
+                                 Nothing was written"
+                            .to_string(),
+                    },
+                    Some((true, true)) => ApiError::Conflict {
+                        reason: "the claim is sealed and takes no embedding. \
+                                 Nothing was written"
+                            .to_string(),
+                    },
+                    Some((true, false)) => crate::errors::write_refused("claim"),
+                },
+            );
+        }
     }
 
     // Update properties if provided
@@ -2347,12 +2449,29 @@ pub async fn update_claim(
         sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
             .bind(properties)
             .bind(id)
-            .execute(&state.db_pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to update properties: {e}"),
+            .map_err(|e| {
+                let e = epigraph_db::DbError::from(e);
+                if crate::errors::db_is_insufficient_privilege(&e) {
+                    return refused(e);
+                }
+                ApiError::DatabaseError {
+                    message: format!("Failed to update properties: {e}"),
+                }
             })?;
     }
+
+    // The claim as this transaction leaves it, read on the same stamp.
+    let current = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: id.to_string(),
+        })?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit transaction: {e}"),
+    })?;
 
     // Record provenance
     {

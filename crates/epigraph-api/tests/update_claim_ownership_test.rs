@@ -2,7 +2,12 @@
 mod common;
 use sqlx::postgres::PgPoolOptions;
 
-/// PUT /api/v1/claims/:id with a matching-owner token returns 200.
+/// PUT /api/v1/claims/:id by the claim's author returns 200.
+///
+/// The claim is authored by the token's `agents.id` principal (the agent
+/// `ensure_for_client` linked to the client), as a real author's is. It used
+/// to be authored by an agent whose id was the `oauth_clients.id`, the only
+/// shape the pre-a2d3e945 gate admitted (backlog a2d3e945).
 #[tokio::test(flavor = "multi_thread")]
 async fn update_claim_matching_owner_returns_200() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
@@ -16,7 +21,7 @@ async fn update_claim_matching_owner_returns_200() {
     let (token, client_id) =
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
     let claim_id =
-        common::seed_claim_with_agent(&pool, "update claim owner match", client_id).await;
+        common::seed_claim_writable_by_client(&pool, "update claim owner match", client_id).await;
 
     let body = serde_json::json!({ "truth_value": 0.8 });
     let resp = reqwest::Client::new()

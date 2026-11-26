@@ -228,7 +228,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_platform_roles_guard_update()",
     "public.epigraph_propagate_tenancy()",
     "public.epigraph_propose_admin_act(text, jsonb, text, text)",
-    "public.epigraph_provision_oauth_agent(bytea, text, text)",
     // 250: its delete fires 001's INVOKER `cascade_delete_edges`, whose
     // unqualified `DELETE FROM edges` resolves on the definer's path.
     "public.epigraph_prune_telemetry_events(integer)",
@@ -297,7 +296,8 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 // branch.
 // 191 -> 189: 285 re-creates `epigraph_passkeys_for_ticket` and
 // `epigraph_passkeys_for_act` (a new result column) on 172's form.
-const HIGH_WATER: usize = 189;
+// 189 -> 188: 311 re-states `epigraph_provision_oauth_agent` on 172's form.
+const HIGH_WATER: usize = 188;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.

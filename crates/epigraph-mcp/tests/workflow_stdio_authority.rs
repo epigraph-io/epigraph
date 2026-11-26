@@ -885,3 +885,120 @@ async fn every_stdio_mutation_tool_completes_on_a_one_connection_pool(pool: PgPo
     .expect("the depends_on edge");
     assert_eq!(linked_edges, 1, "link_hierarchical wrote its edge");
 }
+
+/// An authenticated MCP context for `agent` (undelegated, write scopes).
+fn http_auth(agent: Uuid) -> epigraph_auth::AuthContext {
+    epigraph_auth::AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_auth::ClientType::Agent,
+        scopes: ["claims:read", "claims:write", "edges:write"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    }
+}
+
+/// Backlog bdc96181: the authenticated (HTTP) twin of
+/// [`every_stdio_mutation_tool_completes_on_a_one_connection_pool`]. On a
+/// server whose pool holds ONE connection, the lineage's submitter, calling
+/// with a token, runs every workflow mutation tool to completion. The HTTP
+/// arm of the authority check used to resolve the caller's viewer again on
+/// `server.pool` (`workflow_authority::caller_view_of`) while the write's
+/// transaction held the only connection, so every tool waited out the acquire
+/// timeout and failed; with N concurrent HTTP workflow writes on an
+/// N-connection pool every one of them waited the same way.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_http_mutation_tool_completes_on_a_one_connection_pool(pool: PgPool) {
+    let seeding = app_role_server(&pool, MEMBER_SEED).await;
+    let (seeding_viewer, member) = stdio(&pool, &seeding, MEMBER_SEED).await;
+    let name = "http-auth-one-connection";
+    ingest(&seeding, &seeding_viewer, name, None).await;
+    let (dependent, prerequisite) = (
+        "http-auth-one-connection-dependent",
+        "http-auth-one-connection-prerequisite",
+    );
+    ingest_public(&pool, &seeding, &seeding_viewer, dependent).await;
+    ingest_public(&pool, &seeding, &seeding_viewer, prerequisite).await;
+
+    let server = one_connection_server(&pool, MEMBER_SEED).await;
+    let auth = http_auth(member);
+    let viewer = tools::viewer::request_viewer(&server, Some(&auth))
+        .await
+        .expect("the HTTP viewer");
+    assert_eq!(
+        viewer.principal(),
+        Some(member),
+        "PREMISE: the token's agent"
+    );
+    let (source, target) = (
+        head(&pool, dependent).await,
+        head(&pool, prerequisite).await,
+    );
+    let linked = tools::link_hierarchical::do_link_hierarchical(
+        &server,
+        &viewer,
+        LinkHierarchicalParams {
+            source_claim_id: source.to_string(),
+            target_claim_id: target.to_string(),
+            relationship: "depends_on".to_string(),
+            source_type: Some("workflow".to_string()),
+            target_type: Some("workflow".to_string()),
+            ..Default::default()
+        },
+        Some(&auth),
+    )
+    .await;
+    let mut outcomes = vec![(
+        "link_hierarchical",
+        match linked {
+            Ok(out) if out.is_error == Some(true) => Some(format!("{out:?}")),
+            Ok(_) => None,
+            Err(e) => Some(e.message.to_string()),
+        },
+    )];
+    outcomes.extend(
+        every_tool(
+            &pool,
+            &server,
+            &viewer,
+            name,
+            "http-one-connection",
+            Some(&auth),
+        )
+        .await,
+    );
+    let refused: Vec<&(&str, Option<String>)> =
+        outcomes.iter().filter(|(_, o)| o.is_some()).collect();
+    assert!(
+        refused.is_empty(),
+        "every HTTP workflow tool completes on one connection: {outcomes:?}"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'workflows.caller_write' AND details->>'transport' = 'http' \
+            AND details->>'acting_agent' = $1::text",
+    )
+    .bind(member)
+    .fetch_one(&pool)
+    .await
+    .expect("HTTP provenance rows");
+    assert!(rows >= 6, "each admitted HTTP write is recorded: {rows}");
+    let linked_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'depends_on' AND valid_to IS NULL",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_one(&pool)
+    .await
+    .expect("the depends_on edge");
+    assert_eq!(linked_edges, 1, "link_hierarchical wrote its edge");
+}

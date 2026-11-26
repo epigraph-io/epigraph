@@ -238,8 +238,12 @@ async fn the_named_person_confirms_over_http_and_a_repeat_is_a_noop(pool: PgPool
     let p = paper(&pool, "10.9999/countersign-http-confirm").await;
     let e = pending_naming(&pool, s, h, p).await;
     let before = edge_state(&pool, e).await;
+    // Read by the person itself: before its countersign nothing names it to a
+    // third party (spec section 4), so a name search by the third party finds
+    // nothing. After the countersign (operator ruling C2, migration 334) the
+    // third party finds it, below.
     assert_eq!(
-        card_counts(&state, third, h, "Hesper Quill").await,
+        card_counts(&state, h, h, "Hesper Quill").await,
         (json!(0), json!(1)),
         "CALIBRATION: the naming is pending"
     );

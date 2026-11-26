@@ -389,20 +389,32 @@ impl MethodRepository {
     /// It takes no `Viewer` because neither relation in its FROM has anything for
     /// one to filter — see this function's row in
     /// `epigraph-db/tests/visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    ///
+    /// # Matching and limit
+    ///
+    /// `capability` is matched as a case-insensitive LITERAL substring of
+    /// `method_capabilities.capability`: `\`, `%` and `_` in it are escaped,
+    /// so they match themselves and are not `ILIKE` wildcards. At most `limit`
+    /// rows are returned, the highest `evidence_count` first (ties by method
+    /// id, so the cut is deterministic). A caller that wants to know whether
+    /// the cut removed anything asks for one more row than it keeps.
     pub async fn get_methods_for_capability<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
-        capability_pattern: &str,
+        capability: &str,
+        limit: i64,
     ) -> Result<Vec<MethodForCapability>, sqlx::Error> {
-        let like = format!("%{capability_pattern}%");
+        let like = format!("%{}%", escape_like(capability));
         let rows: Vec<MethodForCapabilityRow> = sqlx::query_as(
             "SELECT m.id, m.name, m.canonical_name, m.technique_type, \
                     mc.capability, mc.specificity, mc.evidence_count \
              FROM methods m \
              JOIN method_capabilities mc ON mc.method_id = m.id \
-             WHERE mc.capability ILIKE $1 \
-             ORDER BY mc.evidence_count DESC",
+             WHERE mc.capability ILIKE $1 ESCAPE '\\' \
+             ORDER BY mc.evidence_count DESC, m.id \
+             LIMIT $2",
         )
         .bind(&like)
+        .bind(limit.max(0))
         .fetch_all(executor)
         .await?;
 
@@ -474,7 +486,18 @@ impl MethodRepository {
         ))
     }
 
-    /// Get source papers for a method.
+    /// Get source papers for a method: the papers that `asserts` one of the
+    /// method's source claims, through edges `viewer` may read.
+    ///
+    /// `pub_year` and `source_type` are always `None`. `papers` has no
+    /// `properties` column and never had one (`id, doi, title, journal,
+    /// created_at`, plus `licence` and the tenancy columns), so this statement
+    /// used to read `p.properties->>'year'` and failed with `42703` whenever a
+    /// method matched; the method gap analysis, its only caller, answered 500
+    /// for every capability some method covers. That was invisible while the
+    /// route could not take a capability at all (backlog 97381982). The fields
+    /// stay, as `None`, so the response shape does not change; a stale flag
+    /// can only come from a year the schema does not store.
     pub async fn get_source_papers<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -482,14 +505,14 @@ impl MethodRepository {
     ) -> Result<Vec<MethodSourcePaper>, sqlx::Error> {
         let sql = viewer.splice(
             "SELECT DISTINCT p.id, p.doi, p.title, \
-                    (p.properties->>'year')::int AS pub_year, \
-                    p.properties->>'source_type' AS source_type \
+                    NULL::int AS pub_year, \
+                    NULL::text AS source_type \
              FROM methods m \
              CROSS JOIN LATERAL unnest(m.source_claim_ids) AS scid \
              JOIN edges e ON e.target_id = scid AND e.source_type = 'paper' AND e.relationship = 'asserts' \
              JOIN papers p ON p.id = e.source_id \
              WHERE m.id = $1 /* {EDGE_VISIBILITY:e} */ \
-             ORDER BY pub_year DESC NULLS LAST",
+             ORDER BY p.doi",
             2,
         );
         let mut q = sqlx::query_as::<_, MethodSourcePaperRow>(&sql).bind(method_id);
@@ -593,5 +616,33 @@ fn search_result_from_row(r: MethodSearchRow) -> MethodSearchResult {
         source_claim_ids: r.source_claim_ids.unwrap_or_default(),
         properties: r.properties,
         similarity: r.similarity,
+    }
+}
+
+/// `s` with the `LIKE`/`ILIKE` metacharacters (`\`, `%`, `_`) escaped by a
+/// backslash, for use under `ESCAPE '\'`, so it matches only itself.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod escape_like_tests {
+    use super::escape_like;
+
+    #[test]
+    fn metacharacters_are_escaped_and_nothing_else_is() {
+        assert_eq!(escape_like("xps"), "xps");
+        assert_eq!(escape_like("%"), "\\%");
+        assert_eq!(escape_like("_"), "\\_");
+        assert_eq!(escape_like("\\"), "\\\\");
+        assert_eq!(escape_like("a_b%c\\d"), "a\\_b\\%c\\\\d");
+        assert_eq!(escape_like("µ-raman"), "µ-raman");
     }
 }

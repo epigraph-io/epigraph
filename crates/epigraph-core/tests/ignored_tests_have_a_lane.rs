@@ -67,6 +67,16 @@ const SCALE_LANE: Lane = Lane {
     triggers: &["schedule", "workflow_dispatch"],
 };
 
+const DISCLOSURE_PERF_LANE: Lane = Lane {
+    workflow: ".github/workflows/scale-advisory.yml",
+    step_contains: &[
+        "-p epigraph-db",
+        "--test human_identity_visibility_perf",
+        "--ignored",
+    ],
+    triggers: &["schedule", "workflow_dispatch"],
+};
+
 /// Every `#[ignore]`d test in the workspace and the lane that runs it.
 const REGISTER: &[Entry] = &[
     // Production-scale (~1.25M edges, tens of minutes): too slow for every run.
@@ -79,6 +89,13 @@ const REGISTER: &[Entry] = &[
         file: "crates/epigraph-cli/tests/operator_backfill_ingest_markers_scale.rs",
         test: "the_backfill_and_its_reversal_finish_at_production_scale",
         lane: SCALE_LANE,
+    },
+    // The disclosure predicate's measurement harness (~2.2M claims bulk
+    // loaded): asserts plan shape, prints timings; its own scale-advisory job.
+    Entry {
+        file: "crates/epigraph-db/tests/human_identity_visibility_perf.rs",
+        test: "measure_the_disclosure_predicate",
+        lane: DISCLOSURE_PERF_LANE,
     },
 ];
 

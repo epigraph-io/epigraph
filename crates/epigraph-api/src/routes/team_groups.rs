@@ -250,7 +250,9 @@ pub async fn my_groups(
 /// or `admin`.
 ///
 /// # Errors
-/// 400 the invitee is not a Person, is the caller, or a bad role or reason;
+/// 400 the invitee names no agent, is a role's node or a system identity, is
+/// the caller, or a bad role or reason (whether the invitee is a Person is
+/// never answered here, migration 321: only a registered Person can accept);
 /// 403 the caller is not a Person, or not an admin of the group; 404 the
 /// caller holds no live membership of it (as for a missing group); 409 the
 /// invitee is already a member or already invited, or the group takes no

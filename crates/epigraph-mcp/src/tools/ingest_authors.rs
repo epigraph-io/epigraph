@@ -483,6 +483,25 @@ pub(crate) async fn resolve_document_authors(
             .filter(|id| !edges.iter().any(|e| e.agent_id == *id))
             .collect()
     };
+    // Another ingester's explicit attachment matched by SPELLING is a
+    // name-to-id answer: reported only when its agent is named to this caller
+    // (migration 309, on the ingest's stamped transaction). An unnamed human
+    // must not be found by name (spec 7 row A6, finding L3); the
+    // same-position report below (`at_position`, whatever the spelling) is
+    // the DOI-plus-position exposure already accepted (spec 15.R3).
+    let foreign_spelled: Vec<Uuid> = edges
+        .iter()
+        .filter(|e| e.explicit && e.author_name.is_some() && e.written_by != Some(writer))
+        .map(|e| e.agent_id)
+        .collect();
+    let named_to_caller: HashSet<Uuid> =
+        epigraph_db::AgentDisclosureRepository::disclosure(conn, &foreign_spelled)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .filter(|(_, d)| d.named)
+            .map(|(id, _)| id)
+            .collect();
     let mut taken: HashSet<Uuid> = HashSet::new();
     let mut kept: HashMap<usize, Uuid> = HashMap::new();
     // Earlier explicit attachments by this spelling that are NOT kept for
@@ -521,6 +540,7 @@ pub(crate) async fn resolve_document_authors(
             let others: Vec<Uuid> = edges
                 .iter()
                 .filter(same_spelling)
+                .filter(|e| e.written_by == Some(writer) || named_to_caller.contains(&e.agent_id))
                 .map(|e| e.agent_id)
                 .collect();
             if !others.is_empty() {

@@ -29,10 +29,9 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 #[derive(Debug, serde::Serialize)]
 pub struct IngestWorkflowResponse {
-    /// Empty, and then not serialized, for a re-ingest of a row the caller
-    /// cannot read (backlog c831df4a): the answer must not hand over the id
-    /// of a workflow the caller cannot see.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    /// The row this ingest wrote or re-ingested. Always a row the caller
+    /// reads: a re-ingest of a row it cannot read is refused instead
+    /// (backlogs c831df4a, ea93e471).
     pub workflow_id: String,
     pub canonical_name: String,
     pub generation: i32,
@@ -381,11 +380,16 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         .await?;
     }
     // A re-ingest reports the EXISTING row, read on the caller's own stamp
-    // and through its viewer; a row it may not read is not reported. Its id
-    // is then left out of the answer (backlog c831df4a, ruling R-100), and so
-    // not handed to the post-commit goal embedding either.
-    let caller_reads_row = !result.already_ingested
-        || epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut tx, viewer, result.workflow_id)
+    // and through its viewer. A row the caller may not read is not reported
+    // at all (backlog ea93e471): the ingest is REFUSED, before the commit, with
+    // the refusal the executor gives a lineage with generations the caller
+    // cannot read (migration 202's `LineageOutsideView`), which is what a
+    // caller gets for this name wherever row security hides the row. Leaving
+    // only the id out (backlog c831df4a) still answered `already_ingested`
+    // with a re-ingest's counts, which a fresh name never does: an existence
+    // oracle for a hidden workflow.
+    if result.already_ingested
+        && epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut tx, viewer, result.workflow_id)
             .await
             .map_err(|e| {
                 crate::errors::internal_error_logged(
@@ -393,7 +397,15 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                     e,
                 )
             })?
-            .is_some();
+            .is_none()
+    {
+        return Err(crate::errors::executor_caller_error(
+            "workflow ingest",
+            epigraph_ingest_executor::IngestExecutorError::LineageOutsideView {
+                canonical_name: extraction.source.canonical_name.clone(),
+            },
+        ));
+    }
     tx.commit().await.map_err(|e| {
         crate::errors::internal_error_logged("workflow ingest: could not commit", e)
     })?;
@@ -441,11 +453,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // and the ones it revived from a workflow deprecation (backlog 1767f2ae).
     let inserted = result.claims_to_embed();
     let response = IngestWorkflowResponse {
-        workflow_id: if caller_reads_row {
-            result.workflow_id.to_string()
-        } else {
-            String::new()
-        },
+        workflow_id: result.workflow_id.to_string(),
         canonical_name: result.canonical_name,
         generation: result.generation,
         claims_ingested: result.claims_ingested,
@@ -855,8 +863,7 @@ pub struct ImproveWorkflowHierarchyResponse {
     pub parent_canonical_name: String,
     pub parent_generation: i32,
     pub new_generation: i32,
-    /// Left out as in [`IngestWorkflowResponse::workflow_id`].
-    #[serde(skip_serializing_if = "String::is_empty")]
+    /// As [`IngestWorkflowResponse::workflow_id`].
     pub workflow_id: String,
     pub claims_ingested: usize,
     pub already_ingested: bool,

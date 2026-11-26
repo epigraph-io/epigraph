@@ -1176,11 +1176,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // write: `AgentRepository::create_seed_derived_conn`; authority: `attributions`,
     // `check_explicit_author_ids`; untenanted: `AgentLookupRepository::author_nodes`,
     // `AgentLookupRepository::exact_name_candidates`, `AgentRepository::get_by_public_key`,
-    // `SystemAgentRepository::registered_agent_ids`.
+    // `SystemAgentRepository::registered_agent_ids`; stamped:
+    // `AgentDisclosureRepository::disclosure` (migration 309's rule on the walk's
+    // stamped transaction, a definer that applies its own audience).
     (
         "ingest_authors.rs",
         "resolve_document_authors",
         &[
+            "AgentDisclosureRepository::disclosure",
             "AgentLookupRepository::author_nodes",
             "AgentLookupRepository::exact_name_candidates",
             "AgentRepository::create_seed_derived_conn",
@@ -1723,24 +1726,28 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::begin_author_stamped_tx",
         ],
     ),
+    // write: `AgentRepository::set_profile_visibility_conn` (310's definer, the
+    // stamped principal's own row); opener: `claim_helper::begin_author_stamped_tx`.
+    (
+        "visibility.rs",
+        "set_profile_visibility",
+        &[
+            "AgentRepository::set_profile_visibility_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
     // opener: `claim_helper::begin_author_stamped_tx`.
     (
         "visibility.rs",
         "share_claims_with_team",
         &["claim_helper::begin_author_stamped_tx"],
     ),
-    // resolves: `Viewer::resolve`. Raw pool: `Viewer::resolve` reads memberships on
-    // `server.pool`.
-    (
-        "workflow_authority.rs",
-        "caller_view_of",
-        &["Viewer::resolve"],
-    ),
     // authority: the workflow authority rule's arms (`admin_arm`, `claims::operator_arm_allows`,
     // `delegate_arm`, `owner_group_arm`, `unrecorded_row_owner_group_arm`,
-    // `viewer::live_delegation`), each an allow or refuse on `conn`; stamped:
-    // `WorkflowRepository::submitter_of` and `caller_view_of`, the `workflows` row on the caller's
-    // connection under its forced row security.
+    // `viewer::live_delegation_on`), each an allow or refuse on `conn`; stamped:
+    // `WorkflowRepository::submitter_of`, the `workflows` row on the caller's connection under
+    // its forced row security. (`caller_view_of` is handed the viewer since backlog bdc96181,
+    // and reads through it on `conn` instead of resolving one on `server.pool`.)
     (
         "workflow_authority.rs",
         "require_workflow_authority",
@@ -1748,12 +1755,11 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::submitter_of",
             "admin_arm",
             "admin_arm",
-            "caller_view_of",
             "claims::operator_arm_allows",
             "delegate_arm",
             "owner_group_arm",
             "unrecorded_row_owner_group_arm",
-            "viewer::live_delegation",
+            "viewer::live_delegation_on",
         ],
     ),
     // authority: `claims::operator_arm_allows`, `delegate_arm`, `owner_group_arm`,

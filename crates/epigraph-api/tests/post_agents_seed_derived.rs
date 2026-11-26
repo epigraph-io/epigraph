@@ -54,8 +54,17 @@ async fn post(
     auth: &AuthContext,
     body: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
+    // A find-hit's name is decided on a viewer-stamped connection (migration
+    // 309's disclosure), so the state carries a ScopedPool as the server's.
+    let scoped = epigraph_db::ScopedPool::connect(
+        &viewer_fixture::database_url_for(pool).await,
+        epigraph_db::SessionGucMode::Session,
+    )
+    .await
+    .expect("ScopedPool");
     post_on(
-        AppState::with_db(pool.clone(), ApiConfig::default()),
+        AppState::with_scoped_pool(scoped, ApiConfig::default()),
+        pool,
         auth,
         body,
     )
@@ -65,11 +74,23 @@ async fn post(
 /// `create_agent` on `state`.
 async fn post_on(
     state: AppState,
+    pool: &PgPool,
     auth: &AuthContext,
     body: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
     let req: CreateAgentRequest = serde_json::from_value(body).expect("request");
-    let r = create_agent(State(state), Some(Extension(auth.clone())), Json(req)).await;
+    // The handler's viewer (a find-hit's name is decided for it); this
+    // principal-less caller reads as the guest.
+    let viewer = epigraph_api::middleware::bearer::ViewerExtractor(
+        viewer_fixture::public_viewer(pool).await,
+    );
+    let r = create_agent(
+        State(state),
+        Some(Extension(auth.clone())),
+        viewer,
+        Json(req),
+    )
+    .await;
     let resp = r.into_response();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.expect("body").to_bytes();
@@ -221,7 +242,7 @@ async fn a_seed_derived_declaration_is_stored_on_the_application_role(pool: PgPo
     let state = AppState::with_db(app_pool, ApiConfig::default());
     let seed = "10.0000/example.0003:Cy Example";
     let author = key_of(seed);
-    let (status, body) = post_on(state, &auth, declared(seed, "Cy Example")).await;
+    let (status, body) = post_on(state, &pool, &auth, declared(seed, "Cy Example")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         stored(&pool, &author).await,

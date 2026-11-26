@@ -55,11 +55,25 @@ async fn named(pool: &PgPool, agent: Uuid, name: &str) {
         .expect("name the agent");
 }
 
-/// A registered human operator with its personal group, named `name`.
+/// A registered human operator with its personal group, named `name`, opted
+/// in to a public profile as the self-service setter records it (`'public'`
+/// plus a consent stamp), so its name is shown to every reader. Before
+/// migration 320 (operator ruling C11) the fixture's column default
+/// `'public'` was read as that opt-in; it never was consent, and now names no
+/// one. The tests of the disclosure rule on this block set `'group'` through
+/// [`group_profile`].
 async fn human(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     let (agent, group) = fixture::seed_agent_with_group(pool, name).await;
     fixture::make_human_operator(pool, agent).await;
     named(pool, agent, name).await;
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'public', profile_public_consented_at = now() \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("opt in");
     (agent, group)
 }
 
@@ -1702,4 +1716,155 @@ async fn the_document_and_author_edges_are_filtered_in_the_query_itself(pool: Pg
         vec![shown],
         "the authored-edge predicate is in the query"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The human-identity rule on the block (spec 2026-11-24, rows D1, T2)
+// ---------------------------------------------------------------------------
+
+async fn group_profile(pool: &PgPool, agent: Uuid) {
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'group', profile_public_consented_at = NULL \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("group profile");
+}
+
+/// Row D1, after operator ruling C6: a human that INGESTED a claim it did not
+/// file is listed among the ingesters, and its PUBLIC ingest record is a
+/// public assertion of its own, so it is NAMED to an outsider (migration 332).
+/// Before C6 the record named no one and the outsider got the C7 placeholder;
+/// a marked public record the outsider can read now always names its
+/// ingester, so that case no longer exists on this surface. CALIBRATION: with
+/// the record made non-public (a privatized record, which the outsider cannot
+/// read and so is not listed), the ingest no longer names the person, and the
+/// outsider reads it unnamed (`oauth:<client row id>`) on its card. A teammate
+/// sees the name throughout. The filer stays named.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_human_ingesters_public_record_names_it_to_every_reader(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "outsider").await;
+    let (filer, _) = fixture::seed_agent_with_group(&pool, "filer").await;
+    named(&pool, filer, "Filing Bot").await;
+    let (ingesting_human, _) = human(&pool, "Gwendolyn Ingest").await;
+    group_profile(&pool, ingesting_human).await;
+    let (mate, _) = fixture::seed_agent_with_group(&pool, "teammate").await;
+    let team = Uuid::new_v4();
+    let pk: Vec<u8> = team.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO groups (id, did_key, public_key, kind, display_name) \
+         VALUES ($1, $2, $3, 'team', 'ingester team')",
+    )
+    .bind(team)
+    .bind(format!("did:key:ingester-team-{team}"))
+    .bind(&pk)
+    .execute(&pool)
+    .await
+    .expect("team");
+    for m in [ingesting_human, mate] {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'writer')",
+        )
+        .bind(team)
+        .bind(m)
+        .execute(&pool)
+        .await
+        .expect("team membership");
+    }
+    let claim = fixture::seed_public_claim(&pool, filer, "a claim the human did not file").await;
+    let d = paper(&pool, "10.0000/fixture.human-ingester", "Ingested").await;
+    ingested(&pool, d, claim, ingesting_human, false, &[]).await;
+
+    let ingester_name = |block: &AuthoredBy| {
+        let AuthoredBy::Agent(a) = block else {
+            panic!("the filer is the author: {block:?}");
+        };
+        assert_eq!(a.filer.agent.display_name.as_deref(), Some("Filing Bot"));
+        let i = a
+            .corroboration
+            .ingesters
+            .iter()
+            .find(|i| i.agent.id == ingesting_human)
+            .expect("the ingest is listed by id");
+        i.agent.display_name.clone()
+    };
+    let out = claim_block_as_filed(&pool, &scoped, outsider, claim, filer).await;
+    let client: Uuid = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(ingesting_human)
+        .fetch_one(&pool)
+        .await
+        .expect("the fixture's one client");
+    assert_eq!(
+        ingester_name(&out).as_deref(),
+        Some("Gwendolyn Ingest"),
+        "a public ingest record names its ingesting human to an outsider (C6)"
+    );
+    let mine = claim_block_as_filed(&pool, &scoped, mate, claim, filer).await;
+    assert_eq!(
+        ingester_name(&mine).as_deref(),
+        Some("Gwendolyn Ingest"),
+        "CALIBRATION: a teammate sees the name"
+    );
+
+    // CALIBRATION: without the public record, nothing names the person to the
+    // outsider; it reads as the placeholder a nameless service principal
+    // carries (C7).
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE relationship = 'ingested_claim' AND target_id = $1",
+    )
+    .bind(claim)
+    .bind(team)
+    .execute(&pool)
+    .await
+    .expect("make the record non-public");
+    let names = {
+        let v = epigraph_db::visibility::Viewer::resolve(&pool, outsider)
+            .await
+            .expect("viewer");
+        let mut read = scoped.read_as(&v).await.expect("read_as");
+        let n = epigraph_db::AgentDisclosureRepository::names(&mut read, &[ingesting_human])
+            .await
+            .expect("names");
+        read.commit().await.expect("finish");
+        n
+    };
+    assert_eq!(
+        names.get(&ingesting_human).cloned().flatten(),
+        Some(format!("oauth:{client}")),
+        "with no public assertion the outsider gets the placeholder (C7)"
+    );
+}
+
+/// T2 on the surface: a human whose ONLY public claim was filed by a bound
+/// agent whose link is now RETIRED is named on that claim's block
+/// (`human`) to an outsider: no anonymous claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_claim_by_a_retired_bound_agent_names_its_human_on_the_block(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "outsider").await;
+    let (op, _) = human(&pool, "Hartmut Accountable").await;
+    group_profile(&pool, op).await;
+    let (bot, _) = fixture::seed_agent_with_group(&pool, "accountable-bot").await;
+    link(&pool, bot, op).await;
+    let claim = fixture::seed_public_claim(&pool, bot, "the one public claim").await;
+    let outcome: String = sqlx::query_scalar(
+        "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'accountability test', true)",
+    )
+    .bind(bot)
+    .fetch_one(&pool)
+    .await
+    .expect("retire");
+    assert_eq!(outcome, "retired", "CALIBRATION");
+    let block = claim_block_as_filed(&pool, &scoped, outsider, claim, bot).await;
+    let AuthoredBy::Agent(a) = &block else {
+        panic!("{block:?}");
+    };
+    let h = a.filer.human.as_ref().expect("bound when it filed");
+    assert_eq!(h.id, op);
+    assert_eq!(h.display_name.as_deref(), Some("Hartmut Accountable"));
 }

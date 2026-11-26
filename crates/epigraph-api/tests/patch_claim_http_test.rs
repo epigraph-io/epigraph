@@ -17,9 +17,11 @@ async fn patch_claim_happy_path_returns_200() {
     let (token, client_id) =
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
 
-    // Seed claim whose agent_id == client_id so ownership check passes.
+    // Seed a claim authored by the token's `agents.id` principal so the
+    // ownership check passes (backlog a2d3e945: an author whose id is the
+    // `oauth_clients.id` no longer does).
     let claim_id =
-        common::seed_claim_with_agent(&pool, "patch happy path content", client_id).await;
+        common::seed_claim_writable_by_client(&pool, "patch happy path content", client_id).await;
 
     let body = serde_json::json!({
         "add_labels": ["test-label"],
@@ -223,7 +225,8 @@ async fn patch_claim_invalid_body_returns_400() {
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
 
     // Claim owned by the same client so we reach the is_empty() check.
-    let claim_id = common::seed_claim_with_agent(&pool, "patch 400 test content", client_id).await;
+    let claim_id =
+        common::seed_claim_writable_by_client(&pool, "patch 400 test content", client_id).await;
 
     // Empty body: no trace_id, no properties, no add_labels, no remove_labels.
     // The handler's is_empty() check returns true → 400.

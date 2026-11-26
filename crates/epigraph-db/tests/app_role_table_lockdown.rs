@@ -431,6 +431,13 @@ async fn agents_identity_columns_are_not_app_updatable(pool: PgPool) {
         // `epigraph_set_default_group` / `epigraph_set_agent_default_group`.
         "default_group_id",
         "default_private",
+        // Whether a human principal's name is shown to everyone (310): written
+        // only through the audited self-service definer
+        // `epigraph_set_profile_visibility`, never by a column grant.
+        "profile_visibility",
+        // When that human consented to a public profile (320, operator
+        // ruling C11): stamped and cleared by the same definer only.
+        "profile_public_consented_at",
     ] {
         let r = sqlx::query(&format!("UPDATE agents SET {col} = {col} WHERE id = $1"))
             .bind(agent)

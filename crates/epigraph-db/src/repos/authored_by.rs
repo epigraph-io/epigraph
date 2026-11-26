@@ -8,9 +8,16 @@
 //! caller's viewer-stamped connection ([`ScopedRead`]), so this block never
 //! tells a caller anything it could not already read elsewhere:
 //!
-//! * **`agent`** `{id, display_name}`: every reader of the claim. `agents` is
-//!   readable by every session (077's `agents_identity` policy), and
-//!   `GET /api/v1/agents/:id` answers the same two fields for any id.
+//! * **`agent`** `{id, display_name}`: every reader of the claim. The id is
+//!   always shown; every NAME in this block (agent, human, ingesters,
+//!   `named_by`, `added_by`, paper authors) is read through
+//!   `AgentDisclosureRepository::names`, migration 309's rule on the stamped
+//!   session: a human principal is named only to readers the rule admits,
+//!   and to anyone who can read a claim it (or an agent ever bound to it)
+//!   filed, so the filer of a claim the caller reads, and the filer's human,
+//!   are always named; an ingester that did not file it, or an author, may
+//!   read its `oauth:<client row id>` placeholder instead (migration 322,
+//!   operator ruling C7: as a nameless service principal reads).
 //! * **`human`** `{id, display_name}`: every reader of the claim. The human
 //!   the agent was BOUND to when it filed the claim (`created_at`), read from
 //!   the binding RECORD through migration 199's `epigraph_operator_bound_at`:
@@ -516,7 +523,9 @@ impl AuthoredByRepository {
         }
         wanted.sort_unstable();
         wanted.dedup();
-        let names: HashMap<Uuid, Option<String>> = Self::display_names(&mut *conn, &wanted).await?;
+        let names: HashMap<Uuid, Option<String>> =
+            crate::repos::agent_disclosure::AgentDisclosureRepository::names(&mut *conn, &wanted)
+                .await?;
         let author_ref = |id: Uuid| AuthorRef {
             id,
             display_name: names.get(&id).cloned().flatten(),
@@ -658,7 +667,9 @@ impl AuthoredByRepository {
         wanted.extend(bound.iter().flatten().copied());
         wanted.sort_unstable();
         wanted.dedup();
-        let names = Self::display_names(&mut *conn, &wanted).await?;
+        let names =
+            crate::repos::agent_disclosure::AgentDisclosureRepository::names(&mut *conn, &wanted)
+                .await?;
         let author_ref = |id: Uuid| AuthorRef {
             id,
             display_name: names.get(&id).cloned().flatten(),
@@ -733,21 +744,5 @@ impl AuthoredByRepository {
                 started_at,
             },
         ))
-    }
-
-    /// The display name of each agent of `ids`; `agents` is readable by every
-    /// session.
-    async fn display_names(
-        conn: &mut sqlx::PgConnection,
-        ids: &[Uuid],
-    ) -> Result<HashMap<Uuid, Option<String>>, DbError> {
-        Ok(sqlx::query_as::<_, (Uuid, Option<String>)>(
-            "SELECT id, display_name FROM agents WHERE id = ANY($1)",
-        )
-        .bind(ids)
-        .fetch_all(&mut *conn)
-        .await?
-        .into_iter()
-        .collect())
     }
 }

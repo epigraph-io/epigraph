@@ -139,14 +139,20 @@ pub async fn load_subgraph_conn(
     }
 
     // 3. Fetch agents
-    let agent_rows: Vec<AgentGraphRow> =
-        sqlx::query_as("SELECT id, display_name FROM agents WHERE id = ANY($1)")
-            .bind(&node_ids)
-            .fetch_all(&mut *conn)
+    // Names through migration 309's rule on this stamped connection: an
+    // unnamed human gets its `oauth:<client row id>` placeholder, the name
+    // and label a nameless service principal gets (spec 7 row H2, operator
+    // ruling C7). Ordered by id so the node list does not depend on a map.
+    let mut agent_rows: Vec<AgentGraphRow> =
+        epigraph_db::AgentDisclosureRepository::names(&mut *conn, &node_ids)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Fetch agents: {e}"),
-            })?;
+            })?
+            .into_iter()
+            .map(|(id, display_name)| AgentGraphRow { id, display_name })
+            .collect();
+    agent_rows.sort_by_key(|r| r.id);
 
     for row in agent_rows {
         let label = row

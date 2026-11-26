@@ -1358,6 +1358,18 @@ impl GraphViewRepository {
         } else {
             ""
         };
+        // `agents.properties` (`full_name`, `email`, `affiliations`) is a
+        // profile DETAIL: matching on it is an oracle for it, as a private
+        // ORCID would be (finding L5). An agent anchor that any condition
+        // touched is kept only where migration 309's disclosure admits its
+        // details on the stamped session, before the LIMIT, so a hidden
+        // match neither returns nor takes a slot (spec 7 row H6).
+        if matches!(table, GqlNodeTable::Agents) && !conditions.is_empty() {
+            filters.push_str(
+                " AND COALESCE((SELECT d.details FROM public.epigraph_agent_disclosure(n.id) d), \
+                 false)",
+            );
+        }
         let anchor = format!(
             "SELECT n.id FROM {name} n WHERE true{filters}{anchor_marker} \
              ORDER BY n.created_at DESC, n.id LIMIT {limit}"

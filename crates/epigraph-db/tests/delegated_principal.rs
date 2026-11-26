@@ -136,3 +136,69 @@ async fn every_revocation_reads_none_on_the_application_role(pool: PgPool) {
         );
     }
 }
+
+/// `AgentRepository::delegated_principal_conn` (backlog bdc96181), the check
+/// made on a transaction the caller holds: on the application role it answers
+/// what the pool check answers, and it leaves the transaction's principal
+/// stamp as it found it. The statement stamps the DELEGATOR as
+/// `epigraph.principal_id` for its own read (migration 236); on a held
+/// transaction that stamp would otherwise outlive the statement and every
+/// later write of the caller's act would run as the delegator. Asked twice
+/// (live, then an unlinked principal), so a stamp left by either answer shows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_conn_check_answers_alike_and_leaves_the_callers_stamp(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "conn-stamp").await;
+    let (unlinked, _) = delegation::agent_with_group(&pool, "conn-stamp-unlinked").await;
+    let expected = DelegationLive {
+        operator_id: d.operator,
+        operator_group_id: d.operator_group,
+    };
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let caller = d.principal;
+    let mut tx = app.begin().await.expect("begin");
+    sqlx::query("SELECT set_config('epigraph.principal_id', $1::text, true)")
+        .bind(caller)
+        .execute(&mut *tx)
+        .await
+        .expect("stamp the caller");
+
+    let live =
+        AgentRepository::delegated_principal_conn(&mut tx, RunTokens::On, d.delegator, caller)
+            .await
+            .expect("the check answers on a held transaction");
+    assert_eq!(live, Some(expected), "the same answer as the pool check");
+    let after: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('epigraph.principal_id', true)")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read the stamp");
+    assert_eq!(
+        after,
+        Some(caller.to_string()),
+        "the transaction's principal stamp is the caller's again, not the delegator's"
+    );
+
+    let none =
+        AgentRepository::delegated_principal_conn(&mut tx, RunTokens::On, d.delegator, unlinked)
+            .await
+            .expect("the check answers");
+    assert_eq!(none, None, "an unlinked principal is not delegated to");
+    let after: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('epigraph.principal_id', true)")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read the stamp");
+    assert_eq!(
+        after,
+        Some(caller.to_string()),
+        "unchanged after a None too"
+    );
+    assert_eq!(
+        AgentRepository::delegated_principal_conn(&mut tx, RunTokens::Off, d.delegator, caller)
+            .await
+            .expect("off"),
+        None,
+        "the switch off reads None"
+    );
+    tx.rollback().await.expect("rollback");
+}

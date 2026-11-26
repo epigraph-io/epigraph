@@ -2473,3 +2473,296 @@ async fn a_delegate_fills_its_operators_planless_row_through_the_rerun_gate(pool
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The delegate arm against a concurrent end of the link (backlog f1438bfb)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The delegate arm admits on the caller's ACTING link. An operator ends that
+// link by retiring it (191's verb) or by revoking the agent's writer row in
+// the operator's group (an acting link needs it). Either must stop a workflow
+// write that is in flight: the act must not commit after the end of the link
+// committed. The race is made deterministic as the claim gate's race test
+// (`epigraph-mcp/tests/owner_gate_link_retire_race_app_role.rs`) makes it: a
+// second session (the harness superuser) ends the link and holds that
+// transaction OPEN, so the act's gate starts while the link still reads as
+// acting; the hold commits once the act has finished or is waiting on a lock;
+// then the act's outcome is read.
+//
+// * Now: the arm reads the link on the act's transaction under 107's link
+//   advisory lock, shared (`AgentRepository::operator_actor_for_act`), and
+//   both ends of a link take it exclusively first (the retire verb, and since
+//   this change `GroupMembershipRepository::revoke_member_unless_last_admin`).
+//   The act waits for the end, reads the link as not acting, and is refused by
+//   the gate with nothing written.
+// * Before: the arm read the link with no lock (`operator_actor`), saw it
+//   live, and the act committed.
+
+/// Sessions of this database waiting on a lock they have not been granted.
+async fn lock_waiters(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+          WHERE NOT l.granted AND a.datname = current_database()",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("pg_locks")
+}
+
+/// How the race ends `agent`'s acting link on another session.
+#[derive(Clone, Copy, Debug)]
+enum LinkEnd {
+    /// 191's retire verb, with the membership revoke.
+    Retire,
+    /// A direct revoke of the agent's writer row in its operator's group
+    /// (`GroupMembershipRepository::revoke_member_unless_last_admin_conn`),
+    /// the link record left as it is.
+    RevokeMembership,
+}
+
+/// Begin ending `agent`'s link (to `operator`, whose group is `operator_group`)
+/// on a transaction of the harness pool, and return it UNCOMMITTED.
+async fn begin_link_end(
+    pool: &PgPool,
+    end: LinkEnd,
+    agent: Uuid,
+    operator_group: Uuid,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut hold = pool.begin().await.expect("begin the link end");
+    match end {
+        LinkEnd::Retire => {
+            let (outcome, revoked): (String, i32) = sqlx::query_as(
+                "SELECT outcome, memberships_revoked \
+                   FROM public.epigraph_retire_operator_link($1, 'workflow race test', true)",
+            )
+            .bind(agent)
+            .fetch_one(&mut *hold)
+            .await
+            .expect("the retire verb");
+            assert_eq!(
+                (outcome.as_str(), revoked),
+                ("retired", 1),
+                "PREMISE: the retire retires the live link and revokes its writer row"
+            );
+        }
+        LinkEnd::RevokeMembership => {
+            let outcome =
+                epigraph_db::GroupMembershipRepository::revoke_member_unless_last_admin_conn(
+                    &mut hold,
+                    operator_group,
+                    agent,
+                )
+                .await
+                .expect("the membership revoke");
+            assert_eq!(
+                outcome,
+                epigraph_db::RevokeOutcome::Revoked,
+                "PREMISE: the agent's writer row in its operator's group is revoked"
+            );
+        }
+    }
+    hold
+}
+
+/// Run `act` while `hold` (an uncommitted end of the caller's link) is open,
+/// committing it once the act has finished or is waiting on a lock.
+async fn racing_a_link_end<T>(
+    pool: &PgPool,
+    hold: sqlx::Transaction<'static, sqlx::Postgres>,
+    act: impl std::future::Future<Output = T>,
+) -> T {
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let act = async {
+        let out = act.await;
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        out
+    };
+    let commit = async {
+        for _ in 0..200 {
+            if done.load(std::sync::atomic::Ordering::SeqCst) || lock_waiters(pool).await > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        hold.commit().await.expect("commit the link end");
+    };
+    let (out, ()) = tokio::join!(act, commit);
+    out
+}
+
+/// One fresh agent live-linked to `p` per transport, so each race ends a
+/// link of its own: `(stdio server, agent)`. Its HTTP twins use the agent's id
+/// with `p`'s delegator, as `d` does.
+async fn fresh_delegate(
+    w: &World,
+    pool: &PgPool,
+    seed: u8,
+) -> (epigraph_mcp::server::EpiGraphMcpFull, Uuid) {
+    let server = mcp_server(pool, seed).await;
+    let agent = stdio_agent(pool, &server, seed).await;
+    link(pool, agent, w.p).await;
+    assert_eq!(
+        acting_operator(pool, agent).await,
+        Some(w.p),
+        "PREMISE: the fresh delegate acts for p"
+    );
+    (server, agent)
+}
+
+/// For each transport (stdio, MCP HTTP, REST with a live delegated token), a
+/// fresh delegate of `p` adds a step to `p`'s public workflow once with no
+/// race (admitted: the calibration), then again while `end` of its link is
+/// held open: the second write is refused by the GATE, the end committed, and
+/// nothing is written.
+async fn a_link_end_during_a_delegate_write_refuses_it(pool: &PgPool, end: LinkEnd) {
+    let w = world(pool).await;
+    let dl = &w.p_delegator;
+    let mut outcomes = Vec::new();
+    for (i, seed) in [0xE1_u8, 0xE2, 0xE3].into_iter().enumerate() {
+        let (server, agent) = fresh_delegate(&w, pool, seed).await;
+        let via = match i {
+            0 => Via::McpStdio(&server),
+            1 => Via::McpHttp(
+                &w.mcp,
+                mcp_auth(dl.delegator_client, agent, Some(dl.delegator), WRITE_SCOPES),
+            ),
+            _ => Via::Rest(
+                &w.router,
+                rest_token(
+                    &w.state,
+                    dl.delegator_client,
+                    agent,
+                    Some(dl.delegator),
+                    WRITE_SCOPES,
+                ),
+            ),
+        };
+        let label = via.label();
+        via.add_step(PUB, &format!("acme race calibration via {label}"))
+            .await
+            .unwrap_or_else(|e| panic!("{label}: CALIBRATION: the delegate is admitted: {e}"));
+        let admitted_before = caller_writes(pool, w.pub_wf, agent).await.len();
+
+        let hold = begin_link_end(pool, end, agent, w.p_g).await;
+        assert_eq!(
+            acting_operator(pool, agent).await,
+            Some(w.p),
+            "{label}: PREMISE: the end of the link is not committed, so it still reads as acting"
+        );
+        let before = row_counts(pool).await;
+        let out = racing_a_link_end(
+            pool,
+            hold,
+            via.add_step(PUB, &format!("acme race step via {label}")),
+        )
+        .await;
+        assert_eq!(
+            acting_operator(pool, agent).await,
+            None,
+            "{label}: the end of the link committed"
+        );
+        let wrote = row_counts(pool).await;
+        let recorded = caller_writes(pool, w.pub_wf, agent).await.len();
+        outcomes.push((label, out, before == wrote, recorded == admitted_before));
+    }
+    for (label, out, unchanged, unrecorded) in &outcomes {
+        let err = out.as_ref().err().unwrap_or_else(|| {
+            panic!(
+                "{label}: a delegate write admitted on a link ended ({end:?}) before it \
+                 committed must be refused: {outcomes:?}"
+            )
+        });
+        assert!(
+            err.contains(GATE_REFUSAL),
+            "{label}: the lineage gate refused ({end:?}): {err}"
+        );
+        assert!(
+            *unchanged,
+            "{label}: the refused write wrote rows ({end:?})"
+        );
+        assert!(
+            *unrecorded,
+            "{label}: the refused write recorded a provenance row ({end:?})"
+        );
+    }
+}
+
+/// The link RETIRED (191's verb) while a delegate's workflow write is in
+/// flight, on every transport: the write is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_link_retired_during_a_delegate_workflow_write_refuses_it(pool: PgPool) {
+    a_link_end_during_a_delegate_write_refuses_it(&pool, LinkEnd::Retire).await;
+}
+
+/// The delegate's writer row in its operator's group REVOKED directly
+/// (`revoke_member_unless_last_admin`, no roster verb) while its workflow
+/// write is in flight, on every transport: the write is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_membership_revoked_during_a_delegate_workflow_write_refuses_it(pool: PgPool) {
+    a_link_end_during_a_delegate_write_refuses_it(&pool, LinkEnd::RevokeMembership).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// One connection (backlog bdc96181)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An app-role MCP server whose ONE pool holds a single connection (its plain
+/// pool is the scoped pool's own, as `main.rs` builds it), run tokens on.
+async fn one_connection_mcp_server(
+    pool: &PgPool,
+    seed: u8,
+) -> epigraph_mcp::server::EpiGraphMcpFull {
+    let url = fixture::database_url_for(pool).await;
+    let scoped = ScopedPool::connect_with_access_recorder_for_tests(
+        &url,
+        SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(3),
+            statement_timeout: None,
+        },
+        Some("epigraph_app"),
+    )
+    .await
+    .expect("a one-connection app-role ScopedPool");
+    let plain = scoped.inner().clone();
+    let signer = epigraph_crypto::AgentSigner::from_bytes(&[seed; 32]).expect("signer");
+    let embedder = epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None)
+        .with_scoped_pool(scoped.clone())
+        .with_generator(std::sync::Arc::new(|_text: &str| Ok(vec![0.5_f32; 1536])));
+    epigraph_mcp::server::EpiGraphMcpFull::new(plain, signer, embedder, false)
+        .with_scoped_pool(scoped)
+        .with_run_tokens(RunTokens::On)
+}
+
+/// The delegate arm over the authenticated transport re-asks whether the
+/// caller's delegated run token is live (`viewer::live_delegation_on`). Called
+/// outside the dispatch (which would have left its own answer), that read was
+/// made on `server.pool` while the write's transaction held a connection.
+/// On a ONE-connection server the delegate's `add_step` on `p`'s public
+/// workflow now completes, recorded as a delegate write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_http_delegate_write_completes_on_a_one_connection_pool(pool: PgPool) {
+    let w = world(&pool).await;
+    let dl = &w.p_delegator;
+    let server = one_connection_mcp_server(&pool, 0xA2).await;
+    let via = Via::McpHttp(
+        &server,
+        mcp_auth(dl.delegator_client, w.d, Some(dl.delegator), WRITE_SCOPES),
+    );
+    let step = via
+        .add_step(PUB, "acme one-connection delegate step")
+        .await
+        .unwrap_or_else(|e| panic!("the delegate's write completes on one connection: {e}"));
+    assert_eq!(
+        claim_row(&pool, step).await,
+        (w.d, "public".to_string(), w.p_g),
+        "the step is the delegate's"
+    );
+    let rows = caller_writes(&pool, w.pub_wf, w.d).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].1, "delegate",
+        "admitted on the delegate arm: {rows:?}"
+    );
+}

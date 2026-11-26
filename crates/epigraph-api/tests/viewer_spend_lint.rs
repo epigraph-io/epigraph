@@ -192,15 +192,76 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: the agent row; its claims are read through the viewer.
     ("agents.rs", "agent_claims", &["AgentRepository::get_by_id"]),
+    // stamped: `AgentDisclosureRepository::disclosure` runs on the handler's
+    // `read_as(viewer)` connection and migration 309's
+    // `epigraph_agent_disclosure` decides on that stamp (a definer that
+    // applies its own audience), so the viewer is spent on the stamp.
     (
         "agents.rs",
         "get_agent_reputation",
-        &["AgentRepository::get_by_id"],
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+        ],
     ),
-    // untenanted: the agent rows (`agents` is USING (true)); their ORCID / ROR
-    // id are nulled through the viewer (`profile_details_visible`, backlog
-    // 761c2b05).
-    ("agents.rs", "get_agent", &["AgentRepository::get_by_id"]),
+    // stamped: every agent's `authored` edges lose the spelling of its name
+    // unless the handler's `read_as(viewer)` session is privileged (review 2,
+    // leaks#2: per-agent redaction was itself a marker); the edges themselves
+    // were read under the viewer's splice.
+    (
+        "edges.rs",
+        "claim_neighborhood",
+        &["AgentDisclosureRepository::redact_authored_edges"],
+    ),
+    (
+        "edges.rs",
+        "list_edges",
+        &["AgentDisclosureRepository::redact_authored_edges"],
+    ),
+    // untenanted: the agent rows (`agents` is USING (true)); their name, ORCID
+    // and ROR id are nulled through the stamped disclosure (migration 309,
+    // `AgentDisclosureRepository::disclosure` on `read_as(viewer)`).
+    (
+        "agents.rs",
+        "get_agent",
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+        ],
+    ),
+    // `create_agent` takes a viewer only for a find-hit's NAME: the stamped
+    // disclosure (as `get_agent`) on `read_as(viewer)`. The create itself and
+    // the optional login client are the pre-existing writes on the pool,
+    // gated by `agents:write` / `claims:admin` as before.
+    (
+        "agents.rs",
+        "create_agent",
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::create_or_get_declaring",
+            "OAuthClientRepository::create",
+        ],
+    ),
+    // `update_agent` takes a viewer only for the profile opt-in (migration
+    // 310): `set_profile_visibility_conn` runs on `AppState::write_as(viewer)`,
+    // a transaction STAMPED from it, and writes the stamped principal's own
+    // row, so the viewer is spent on the stamp. untenanted: the agent row
+    // (`get_by_id`) and the pre-existing profile-column write (`update`, on the
+    // pool, self or `claims:admin` as before; spec section 15.R8);
+    // `record_provenance` is the request's own audit row. After review
+    // (correctness#7) the response is redacted by the stamped disclosure on
+    // `read_as(viewer)`, as `get_agent`'s.
+    (
+        "agents.rs",
+        "update_agent",
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+            "AgentRepository::set_profile_visibility_conn",
+            "AgentRepository::update",
+            "provenance::record_provenance",
+        ],
+    ),
     // untenanted, as `get_agent`: `get_by_public_key` (backlog 8946be59) reads
     // the one agent row holding the key on the caller's stamped read, and
     // that row's ORCID / ROR id are nulled through the viewer like the list's.
@@ -208,6 +269,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "agents.rs",
         "list_agents",
         &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentDisclosureRepository::disclosure",
             "AgentRepository::count",
             "AgentRepository::count_by_label",
             "AgentRepository::get_by_public_key",
@@ -377,14 +440,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ProvenanceRepository::append_conn",
         ],
     ),
-    // gated (`ClaimRepository::get_by_id`) then write.
+    // gated (`write_target_of`, viewed) then write, on one transaction stamped
+    // from the caller's viewer (backlog a2d3e945): the two `_conn` updates and
+    // the properties UPDATE run on that stamp, which `claims_tenancy`'s WITH
+    // CHECK decides; provenance stays on the pool, as `create_claim`'s does.
     (
         "claims.rs",
         "update_claim",
         &[
-            "ClaimRepository::store_embedding",
-            "ClaimRepository::update_trace_id",
-            "ClaimRepository::update_truth_value",
+            "ClaimRepository::update_trace_id_conn",
+            "ClaimRepository::update_truth_value_conn",
             "provenance::record_provenance",
             "sqlx::query(UPDATE).execute",
         ],
@@ -398,6 +463,22 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::admin_patch_claim_conn",
             "ClaimRepository::update_labels_conn",
             "state.write_as",
+        ],
+    ),
+    // write (backlog 67c905a3): on the transaction stamped from the caller's
+    // viewer, after the two viewed reads (`bridge_edges`,
+    // `bridge_paragraphs`). `insert_bridge_run` writes the run, its clusters
+    // and one membership row per paragraph those reads returned; a membership
+    // row inherits its paragraph's tenancy, so `WITH CHECK` refuses (42501,
+    // answered 403) a paragraph the caller may not write. `gc_bridge_runs`
+    // deletes old `louvain_bridge` runs (`graph_cluster_runs`, untenanted)
+    // and their orphaned clusters / memberships (owner-scoped DELETE).
+    (
+        "clusters.rs",
+        "build_from_bridges",
+        &[
+            "ClusterRunRepository::gc_bridge_runs",
+            "ClusterRunRepository::insert_bridge_run",
         ],
     ),
     // write: the caller's principal is the community's creator (one `groups`
@@ -998,12 +1079,24 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "political.rs",
         "compare_agents",
-        &["AgentRepository::get_by_id"],
+        // stamped: the agent's name through migration 309's disclosure on the
+        // handler's `read_as(viewer)` connection; `redact_agent` is pure.
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+            "epigraph_db::redact_agent",
+        ],
     ),
     (
         "political.rs",
         "epistemic_profile",
-        &["AgentRepository::get_by_id"],
+        // stamped: the agent's name through migration 309's disclosure on the
+        // handler's `read_as(viewer)` connection; `redact_agent` is pure.
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+            "epigraph_db::redact_agent",
+        ],
     ),
     (
         "political.rs",
@@ -1483,7 +1576,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an
     // unconverted no_unscoped_pool.rs site); every projection in
-    // load_subgraph_conn splices the viewer except `agents` (untenanted).
+    // load_subgraph_conn splices the viewer except `agents` (untenanted), whose
+    // names it reads through migration 309's disclosure on the caller's
+    // connection (`AgentDisclosureRepository::names`, a definer that applies
+    // its own audience: the session stamp; an unstamped call is the outsider).
     (
         "graph_query_utils.rs",
         "load_subgraph",
@@ -1492,7 +1588,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "graph_query_utils.rs",
         "load_subgraph_conn",
-        &["sqlx::query_as(SELECT).fetch_all"],
+        &["AgentDisclosureRepository::names"],
     ),
     // stamped: the plan read on the actor's own stamped connection; the 404 is
     // migration 087's SELECT policy.
@@ -1627,7 +1723,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "workflows.rs",
         "workflow_authority",
         &[
-            "AgentRepository::operator_actor",
+            "AgentRepository::operator_actor_for_act",
             "AgentRepository::operator_of_author",
             "WorkflowRepository::submitter_of",
             "api_admin_arm",

@@ -199,6 +199,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("publicize_claims", "claims:write"),
     ("share_claims_with_team", "claims:write"),
     ("set_default_group", "claims:write"),
+    // Human-identity visibility (migration 310): a person sets whether their
+    // own name is shown to everyone. Self only, decided by the definer; the
+    // same scope as set_default_group, the other self-service setter.
+    ("set_profile_visibility", "claims:write"),
     // Person-facing keyless team groups and consented invitations (migration
     // 263). The same scopes as their REST twins (`routes/team_groups.rs`):
     // groups:write to create, invite, accept or decline, groups:read to list.

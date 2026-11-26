@@ -432,9 +432,13 @@ impl SourceOverviewRepository {
     ) -> Result<Vec<SourceEntry>, DbError> {
         let sql = viewer.splice(
             &format!(
-                "SELECT s.id, s.k, s.display_name, s.n \
-                   FROM (SELECT a.id, a.id::text AS k, \
-                                left(a.display_name, {SOURCE_TEXT_MAX}) AS display_name, \
+                "SELECT s.id, s.k, \
+                        left(CASE WHEN public.epigraph_human_named_to_viewer(s.id) \
+                                  THEN s.display_name \
+                                  ELSE public.epigraph_unnamed_agent_name(s.id) END, \
+                             {SOURCE_TEXT_MAX}) AS display_name, \
+                        s.n \
+                   FROM (SELECT a.id, a.id::text AS k, a.display_name, \
                                 COUNT(*) AS n \
                            FROM claims c \
                            JOIN agents a ON a.id = c.agent_id \
@@ -449,7 +453,7 @@ impl SourceOverviewRepository {
                                    AND (ae.valid_to IS NULL OR ae.valid_to > now()) \
                                    AND {marked} \
                                    /* {{EDGE_VISIBILITY:ae}} */) \
-                          GROUP BY a.id, a.display_name) s \
+                          GROUP BY a.id) s \
                   {PAGE_TAIL}",
                 marked = crate::repos::ingest_written::ingest_written_edge_sql("ae"),
             ),

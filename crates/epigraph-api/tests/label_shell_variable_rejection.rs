@@ -84,7 +84,7 @@ async fn patch_labels_rejects_unexpanded_add_with_400_not_500() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let (token, client_id) =
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
-    let claim_id = common::seed_claim_with_agent(
+    let claim_id = common::seed_claim_writable_by_client(
         &pool,
         &format!("shell-var patch rejection {}", uuid::Uuid::new_v4()),
         client_id,
@@ -184,7 +184,7 @@ async fn patch_labels_can_still_remove_an_already_corrupted_label() {
     let (pool, addr, _shutdown) = pool_and_app().await;
     let (token, client_id) =
         common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
-    let claim_id = common::seed_claim_with_agent(
+    let claim_id = common::seed_claim_writable_by_client(
         &pool,
         &format!("shell-var remediation {}", uuid::Uuid::new_v4()),
         client_id,

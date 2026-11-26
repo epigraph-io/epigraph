@@ -96,6 +96,9 @@ pub use repos::PolicyRepository;
 pub use repos::SpeaksFor;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
+    agent_disclosure, disclosure_lateral_sql, redact_agent, AgentDisclosureRepository, Disclosure,
+};
+pub use repos::{
     agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
     PromptBlobRead, PromptFile, PromptHistoryCursor, PromptHistoryEntry, PromptHistoryIndexEntry,
     PromptHistoryPage, PromptSnapshot, PromptSnapshotIndex, PROMPT_HISTORY_PAGE_MAX,
@@ -142,22 +145,22 @@ pub use repos::{
     NearestClaimHit, NeighbourhoodThemeCoverage, NewHierarchicalOutcomeReport, NewRecallEvent,
     NonceConsumption, OAuthClientRepository, OAuthClientRow, OperatorLink, OperatorLinkOutcome,
     PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
-    PatternTemplateRow, PerspectiveRepository, PromotionStanding, ProvenanceChain,
-    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
-    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
-    RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
-    RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
-    SecurityEventRepository, SecurityEventRow, SemanticFlatPage, SemanticSelectedClaim,
-    SheafRepository, SortDirection, StructuralRepository, SupersedeActor, SupersedeEdgeMigration,
-    SupersedeTool, SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow,
-    ThemeSummaryRow, TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
-    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
-    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
-    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
-    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
-    SUPERSEDE_ACT_TOOLS,
+    PatternTemplateRow, PerspectiveRepository, ProfileVisibility, ProfileVisibilitySet,
+    PromotionStanding, ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge,
+    ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReasoningTraceRepository,
+    RecallEventRepository, RecallEventRow, RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome,
+    RevokedAccessTokenRepository, RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository,
+    ScoredHierarchicalWorkflowRow, SecurityEventRepository, SecurityEventRow, SemanticFlatPage,
+    SemanticSelectedClaim, SheafRepository, SortDirection, StructuralRepository, SupersedeActor,
+    SupersedeEdgeMigration, SupersedeTool, SweepCandidate, TaskRepository, TaskRow,
+    TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow, TraceProvenanceStep, TripleRepository,
+    TripleRow, UnmarkedDuplicate, WebhookSubscriptionRepository, WebhookSubscriptionRow,
+    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
+    WorkflowRecallResult, WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED,
+    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    PRUNABLE_EVENT_TYPES, RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED,
+    SUPERSEDE_ACT_PROPERTY, SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{
     create_ingest_written_edge_if_absent_conn, credited_agent_end, ingest_only_edge_refusal,

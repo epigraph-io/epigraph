@@ -150,7 +150,29 @@ async fn post_json(router: &Router, uri: &str, body: serde_json::Value) -> (Stat
 /// `agents_public_key_unique` → `DbError::DuplicateKey` → 400.
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_agent_is_idempotent_on_public_key(pool: PgPool) {
-    let router = create_test_router(pool.clone());
+    // The second POST is a find-hit, whose name `create_agent` decides on a
+    // viewer-stamped connection (migration 309's disclosure), so the state
+    // carries a ScopedPool as the server's does.
+    let router = {
+        let config = ApiConfig {
+            require_packet_signatures: false,
+            max_request_size: 1024 * 1024,
+            public_base_url: "http://localhost:8080".to_string(),
+            ..ApiConfig::default()
+        };
+        let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
+        let mut state =
+            AppState::with_db_and_signature_state(pool.clone(), config, signature_state);
+        state.scoped = Some(
+            epigraph_db::ScopedPool::connect(
+                &fixture::database_url_for(&pool).await,
+                epigraph_db::SessionGucMode::Session,
+            )
+            .await
+            .expect("ScopedPool"),
+        );
+        create_router(state)
+    };
     // 64 hex chars == 32-byte Ed25519 public key, fixed so both POSTs collide.
     let public_key_hex = "ab".repeat(32);
     let request_body = serde_json::json!({

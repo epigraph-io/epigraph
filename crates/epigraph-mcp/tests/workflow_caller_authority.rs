@@ -622,13 +622,23 @@ async fn a_reingest_by_another_caller_does_not_take_the_workflow_over(pool: PgPo
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
     let (_other, other_token, other_viewer) = seed_caller(&pool, &["claims:write"]).await;
-    for (viewer, token) in [(&owner_viewer, &owner_token), (&other_viewer, &other_token)] {
+    // The owner's row is PUBLIC, so the other caller READS it and its
+    // re-ingest is the idempotent no-op (a row it cannot read is refused
+    // instead, below and backlog ea93e471).
+    for (viewer, token, tenancy) in [
+        (
+            &owner_viewer,
+            &owner_token,
+            Some(common::public_tenancy_for(&owner_viewer)),
+        ),
+        (&other_viewer, &other_token, None),
+    ] {
         tools::workflow_ingest::ingest_workflow(
             &server,
             viewer,
             IngestWorkflowParams {
                 extraction: extraction("h3-reingest", serde_json::json!({})),
-                tenancy: None,
+                tenancy,
                 embed: None,
             },
             Some(token),
@@ -638,6 +648,46 @@ async fn a_reingest_by_another_caller_does_not_take_the_workflow_over(pool: PgPo
     }
     assert_eq!(
         submitter(&pool, "h3-reingest").await,
+        Some(owner.to_string())
+    );
+
+    // A row the other caller cannot READ (the owner's undeclared, private
+    // plan): its re-ingest is refused as the hidden lineage it is, on this
+    // superuser harness exactly as row security refuses it on the
+    // application role, and takes nothing over either.
+    tools::workflow_ingest::ingest_workflow(
+        &server,
+        &owner_viewer,
+        IngestWorkflowParams {
+            extraction: extraction("h3-reingest-private", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
+        },
+        Some(&owner_token),
+    )
+    .await
+    .expect("the owner's private ingest");
+    let refused = tools::workflow_ingest::ingest_workflow(
+        &server,
+        &other_viewer,
+        IngestWorkflowParams {
+            extraction: extraction("h3-reingest-private", serde_json::json!({})),
+            tenancy: None,
+            embed: None,
+        },
+        Some(&other_token),
+    )
+    .await
+    .expect_err("a re-ingest of a row the caller cannot read is refused");
+    assert!(
+        refused
+            .message
+            .contains("has generations this caller cannot read"),
+        "refused as a hidden lineage: {}",
+        refused.message
+    );
+    assert_eq!(
+        submitter(&pool, "h3-reingest-private").await,
         Some(owner.to_string())
     );
 

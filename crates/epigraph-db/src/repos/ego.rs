@@ -491,11 +491,16 @@ impl EgoRepository {
         // marker; writing one would enter it in `visibility_lint.rs`'s
         // `EXPECTED_EXEMPTIONS`, which is an exact set reserved for functions
         // that filter NOTHING.
-        let agents: Vec<(Uuid, Option<String>)> =
-            sqlx::query_as("SELECT id, display_name FROM agents WHERE id = ANY($1)")
-                .bind(ids)
-                .fetch_all(&mut *conn)
-                .await?;
+        // Names through migration 309's rule on the caller's stamped
+        // connection: an unnamed human gets its `oauth:<client row id>`
+        // placeholder, the label a nameless service principal gets (spec 7
+        // row H1, operator ruling C7).
+        let mut agents: Vec<(Uuid, Option<String>)> =
+            crate::repos::agent_disclosure::AgentDisclosureRepository::names(&mut *conn, ids)
+                .await?
+                .into_iter()
+                .collect();
+        agents.sort_by_key(|(id, _)| ids.iter().position(|x| x == id));
         for (id, display_name) in agents {
             let label = display_name.unwrap_or_else(|| short_id("Agent", id));
             out.push(EgoEntity {

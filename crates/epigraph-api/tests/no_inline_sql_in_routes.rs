@@ -97,7 +97,6 @@ const REGISTER: &[(&str, usize)] = &[
     ("assess.rs", 2),
     ("belief.rs", 7),
     ("claims.rs", 3),
-    ("clusters.rs", 8),
     ("computation.rs", 4),
     ("conventions.rs", 3),
     ("cross_source.rs", 1),
@@ -106,7 +105,6 @@ const REGISTER: &[(&str, usize)] = &[
     ("experiment_loop.rs", 2),
     ("graph.rs", 8),
     ("graph_neighborhood.rs", 1),
-    ("graph_query_utils.rs", 1),
     ("hypothesis.rs", 11),
     ("papers.rs", 4),
     ("policies.rs", 4),
@@ -150,7 +148,16 @@ const REGISTER: &[(&str, usize)] = &[
 /// and belief read moved into `GraphViewRepository::claim_neighborhood_ids`
 /// and `FactorRepository::bp_priors`, both spending the caller's viewer
 /// (`computation.rs` 6 -> 4).
-const HIGH_WATER: usize = 82;
+/// Lowered to 74 by backlog 04ab6607 / 67c905a3: `build_from_bridges`' two
+/// reads, its run / cluster / membership inserts and its retention sweep moved
+/// into `ClusterRunRepository` on one viewer-stamped transaction
+/// (`clusters.rs` 8 -> 0, row removed).
+/// Lowered to 73 by the human-identity visibility branch: `graph_query_utils.rs`'s
+/// one inline read (the subgraph's agent labels) moved into the repository layer,
+/// named through the disclosure rule (`graph_query_utils.rs` 1 -> 0). (Staging
+/// 2026-11-25-3: the branch's 82 -> 81 and backlog 67c905a3's 82 -> 74 compose
+/// to 73 on the merged tree.)
+const HIGH_WATER: usize = 73;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

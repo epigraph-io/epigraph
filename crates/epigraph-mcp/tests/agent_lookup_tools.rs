@@ -122,12 +122,56 @@ async fn get_agent_names_the_agent_that_filed_a_claim(pool: PgPool) {
     assert!(missing.message.contains("not found"), "{missing:?}");
 }
 
+/// The `oauth:<client row id>` name an unnamed principal is shown under,
+/// from the ONE client the fixture links to it (read from the link).
+async fn placeholder(pool: &PgPool, agent: Uuid) -> String {
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_all(pool)
+        .await
+        .expect("linked clients");
+    assert_eq!(rows.len(), 1, "the fixture links one client");
+    format!("oauth:{}", rows[0])
+}
+
+/// A nameless OAuth service principal exactly as a token mint provisions it
+/// (`AgentRepository::ensure_for_client` for a `service` client).
+async fn service_principal(pool: &PgPool) -> Uuid {
+    let row: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'fixture service', 'service', ARRAY['claims:write'], 'active', \
+                 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("epigraph_{}", Uuid::new_v4().simple()))
+    .fetch_one(pool)
+    .await
+    .expect("client row");
+    let mut tx = pool.begin().await.expect("begin");
+    let agent = AgentRepository::ensure_for_client(&mut tx, row)
+        .await
+        .expect("ensure_for_client");
+    tx.commit().await.expect("commit");
+    agent.into()
+}
+
 #[sqlx::test(migrations = "../../migrations")]
-async fn every_reader_sees_the_operator_human_through_both_tools(pool: PgPool) {
+async fn every_reader_sees_the_operator_humans_id_and_its_name_by_the_rule(pool: PgPool) {
+    // Was `every_reader_sees_the_operator_human_through_both_tools`, which
+    // pinned the human's NAME to every reader. Since the human-identity rule
+    // (migration 309) the id is still on every reader's card, and the name
+    // only on the cards of readers the rule admits: here the human itself.
     let server = app_server(&pool).await;
     let (outsider, _) = named(&pool, "outsider").await;
     let (human, _) = named(&pool, "Talia Brennick").await;
     fixture::make_human_operator(&pool, human).await;
+    // As provisioning writes a person since migration 311; the column
+    // default 'public' would read as the person's opt-in.
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(human)
+        .execute(&pool)
+        .await
+        .expect("group profile");
     let (linked, _) = named(&pool, "helper-bot").await;
     let mut conn = pool.acquire().await.expect("acquire");
     assert!(
@@ -138,10 +182,27 @@ async fn every_reader_sees_the_operator_human_through_both_tools(pool: PgPool) {
     );
     drop(conn);
 
-    for who in [outsider, linked, human] {
+    // The bound agent (`linked`) gets Null here, while the DB-level twin
+    // (`agent_lookup.rs::the_operator_humans_id_is_shown_to_every_reader_and_its_name_by_the_rule`)
+    // names the human to its bound agent: consistent, because this fixture
+    // gives the human NO team (a bound agent reads its operator's teams, 234,
+    // and the DB twin adds one), so no arm names the human to its bot here
+    // (review finding tests#9).
+    // Unnamed: shown under the `oauth:<client row id>` placeholder a nameless
+    // service principal carries (operator ruling C7), never the name.
+    let hidden = serde_json::json!(placeholder(&pool, human).await);
+    let real = serde_json::json!("Talia Brennick");
+    for (who, name) in [
+        (outsider, hidden.clone()),
+        (linked, hidden.clone()),
+        (human, real.clone()),
+    ] {
         let card = get(&server, &pool, who, linked).await;
         assert_eq!(card["operator_human"]["id"], human.to_string(), "{card}");
-        assert_eq!(card["operator_human"]["display_name"], "Talia Brennick");
+        assert_eq!(
+            card["operator_human"]["display_name"], name,
+            "{who}: {card}"
+        );
         assert_eq!(card["kind"], "llm_agent");
         let r = find(&server, &pool, who, "helper-bot").await;
         assert_eq!(
@@ -149,7 +210,73 @@ async fn every_reader_sees_the_operator_human_through_both_tools(pool: PgPool) {
             human.to_string(),
             "{r}"
         );
+        assert_eq!(r["results"][0]["operator_human"]["display_name"], name);
+        // The human itself is found by name only by readers it is named to.
+        let r = find(&server, &pool, who, "Talia Brennick").await;
+        let found = r["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .any(|h| h["id"] == human.to_string());
+        assert_eq!(found, name == real, "{who}: {r}");
     }
+}
+
+/// Review finding tests#5 and operator ruling C7: through the TOOLS (not
+/// only the shared card builder), an outsider's `get_agent` card of an
+/// unnamed human equals its card of a production-shaped nameless OAuth
+/// service principal N (minted by `ensure_for_client`, left as minted) modulo
+/// id, timestamp and the client row id in the `oauth:` placeholder each is
+/// shown under; `find_agent` by the person's name finds nothing, and by the
+/// placeholder finds H as it finds N; the person itself sees and finds its
+/// name (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_tools_show_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
+    let server = app_server(&pool).await;
+    let (outsider, _) = named(&pool, "tool outsider").await;
+    let (h, _) = named(&pool, "Octavia Veilstone").await;
+    fixture::make_human_operator(&pool, h).await;
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(h)
+        .execute(&pool)
+        .await
+        .expect("group profile");
+    let n = service_principal(&pool).await;
+    let (ph, pn) = (placeholder(&pool, h).await, placeholder(&pool, n).await);
+    let shape = |mut v: Value, p: &str| {
+        let o = v.as_object_mut().expect("object");
+        o.insert("id".into(), serde_json::json!("<id>"));
+        o.insert("created_at".into(), serde_json::json!("<t>"));
+        if o.get("display_name") == Some(&serde_json::json!(p)) {
+            o.insert("display_name".into(), serde_json::json!("oauth:<client>"));
+        }
+        v
+    };
+    let card_h = get(&server, &pool, outsider, h).await;
+    let card_n = get(&server, &pool, outsider, n).await;
+    assert_eq!(card_h["display_name"], ph.as_str(), "{card_h}");
+    assert_eq!(card_n["display_name"], pn.as_str(), "CALIBRATION: {card_n}");
+    assert_eq!(
+        shape(card_h, &ph),
+        shape(card_n, &pn),
+        "get_agent: H reads as N"
+    );
+    for (who, p) in [(h, &ph), (n, &pn)] {
+        let r = find(&server, &pool, outsider, p).await;
+        assert!(
+            r.to_string().contains(&who.to_string()),
+            "find_agent by the placeholder finds {who}: {r}"
+        );
+    }
+    let r = find(&server, &pool, outsider, "Octavia Veilstone").await;
+    assert!(
+        !r.to_string().contains(&h.to_string()) && !r.to_string().contains("Octavia"),
+        "find_agent found an unnamed human by name: {r}"
+    );
+    let mine = get(&server, &pool, h, h).await;
+    assert_eq!(mine["display_name"], "Octavia Veilstone", "CALIBRATION");
+    let r = find(&server, &pool, h, "Octavia Veilstone").await;
+    assert!(r.to_string().contains(&h.to_string()), "CALIBRATION: {r}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

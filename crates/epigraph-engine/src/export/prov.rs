@@ -173,7 +173,7 @@ fn clip_content(content: String, max: Option<usize>) -> (String, Option<usize>) 
 ///
 /// This is **read-only**: it issues only `SELECT`s (via
 /// `LineageRepository`, `EdgeRepository`, `ClaimRepository`,
-/// `AgentRepository`) and never writes to `edges` or `claims`. Internal
+/// `AgentDisclosureRepository`) and never writes to `edges` or `claims`. Internal
 /// relationship strings in the DB are left exactly as they are; the PROV-O
 /// predicate only ever appears in the returned JSON value.
 ///
@@ -217,8 +217,7 @@ pub async fn export_provenance_prov_o(
     max_depth: Option<i32>,
     limits: ProvExportLimits,
 ) -> Result<serde_json::Value, epigraph_db::DbError> {
-    use epigraph_core::domain::ids::AgentId;
-    use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, LineageRepository};
+    use epigraph_db::{ClaimRepository, EdgeRepository, LineageRepository};
     use std::collections::{HashMap, HashSet};
 
     // --- Pass 1: assemble the candidate claim set -----------------------
@@ -316,13 +315,19 @@ pub async fn export_provenance_prov_o(
 
         let agent_uuid: uuid::Uuid = claim.agent_id.into();
         if agents_seen.insert(agent_uuid) {
-            if let Some(agent) =
-                AgentRepository::get_by_id(&mut *conn, AgentId::from_uuid(agent_uuid)).await?
+            // The name through migration 309's rule on the caller's stamped
+            // connection (spec 7 row G1). A filer of a claim the caller reads
+            // is named by the rule's claim arms; the CLI's maintenance session
+            // is the privileged arm.
+            if let Some(display_name) =
+                epigraph_db::AgentDisclosureRepository::names(&mut *conn, &[agent_uuid])
+                    .await?
+                    .remove(&agent_uuid)
             {
                 agent_entities.push(serde_json::json!({
                     "@id": format!("agent:{agent_uuid}"),
                     "@type": "prov:Agent",
-                    "display_name": agent.display_name,
+                    "display_name": display_name,
                 }));
             }
         }

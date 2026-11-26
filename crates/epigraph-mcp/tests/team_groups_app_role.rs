@@ -319,7 +319,33 @@ async fn each_refusal_reaches_the_caller_by_its_kind(pool: PgPool) {
         (ErrorCode::INVALID_REQUEST, "TGP01:"),
         "{msg}"
     );
-    let (code, msg) = refusal(mcp.invite(a, group, b_agent, None).await);
+    // Operator ruling C10 (migration 321): an agent a Person operates is
+    // invited like anyone (the invite never says whether an id is a person);
+    // only a role's node or a system identity, whose kind is public, is
+    // refused TGP03. The agent's invitation is refused at accept (TGP01).
+    let to_agent = id(
+        &json_of(
+            mcp.invite(a, group, b_agent, None)
+                .await
+                .expect("C10: an operated agent is invited like anyone"),
+        ),
+        "invitation_id",
+    );
+    let (code, msg) = refusal(mcp.accept(b_agent, to_agent).await);
+    assert_eq!(
+        (code, &msg[..6]),
+        (ErrorCode::INVALID_REQUEST, "TGP01:"),
+        "the refusal is at accept time: {msg}"
+    );
+    let role: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type, role, labels) \
+         VALUES (uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), 'role:par', \
+                 'role', 'custom', ARRAY['role']) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("role node");
+    let (code, msg) = refusal(mcp.invite(a, group, role, None).await);
     assert_eq!(
         (code, &msg[..6]),
         (ErrorCode::INVALID_PARAMS, "TGP03:"),

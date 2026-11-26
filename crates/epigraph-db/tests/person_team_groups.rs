@@ -23,7 +23,9 @@
 //!   row at the invited role, the invitation names it, and the act is
 //!   audited; decline writes no membership;
 //! * who may: only a live admin invites (TGP02; a non-member is told the
-//!   group does not exist, TGP08); only a Person is invited (TGP03); only the
+//!   group does not exist, TGP08); any agent but a role's node or a system
+//!   identity is invited alike and only a Person can accept (TGP03 / TGP01,
+//!   migration 321); only the
 //!   invitee answers (TGP08 for anyone else, TGP01 for its operated agent);
 //!   an invitation is answered once (TGP05); it lapses when its sender is no
 //!   longer a live admin (TGP05);
@@ -182,6 +184,52 @@ async fn operated(pool: &PgPool, operator: Uuid, label: &str) -> Uuid {
         .expect("link the agent");
     assert!(out.link_live, "PREMISE: a live link: {out:?}");
     agent
+}
+
+/// A role's graph node (`agent_type = 'role'`, as 123 / 165 seed one): its
+/// kind is shown to every reader, so refusing it as an invitee tells no one
+/// anything new.
+async fn role_node(pool: &PgPool, key: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type, role, labels) \
+         VALUES (uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), $1, 'role', \
+                 'custom', ARRAY['role']) RETURNING id",
+    )
+    .bind(format!("role:{key}"))
+    .fetch_one(pool)
+    .await
+    .expect("role node")
+}
+
+/// A principal provisioned through the real OAuth path
+/// (`AgentRepository::ensure_for_client`) for a client of `client_type`: a
+/// `human` client with a provider-form id (so the provider's name is
+/// adopted), or a `service` one (a nameless service principal, named
+/// `oauth:<client row id>`).
+async fn provisioned(pool: &PgPool, client_type: &str, name: &str) -> Uuid {
+    let client_id = if client_type == "human" {
+        format!("fixtureprovider:{}", Uuid::new_v4().simple())
+    } else {
+        format!("epigraph_{}", Uuid::new_v4().simple())
+    };
+    let row: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, legal_entity_name, legal_contact_email) \
+         VALUES ($1, $2, $3, ARRAY['claims:write'], 'active', 'Fixture Org', \
+                 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(&client_id)
+    .bind(name)
+    .bind(client_type)
+    .fetch_one(pool)
+    .await
+    .expect("client row");
+    let mut tx = pool.begin().await.expect("begin");
+    let agent = AgentRepository::ensure_for_client(&mut tx, row)
+        .await
+        .expect("ensure_for_client");
+    tx.commit().await.expect("commit");
+    agent.into()
 }
 
 /// Every membership row of `(group, agent)`: `(role, revoked)`.
@@ -504,7 +552,7 @@ async fn a_declined_invitation_places_no_one_and_can_be_reissued(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn only_a_live_admin_invites_and_only_a_person_is_invited(pool: PgPool) {
+async fn only_a_live_admin_invites_and_only_a_person_can_accept(pool: PgPool) {
     let a = human(&pool, "who-inv-a").await;
     let b = human(&pool, "who-inv-b").await;
     let c = human(&pool, "who-inv-c").await;
@@ -536,9 +584,27 @@ async fn only_a_live_admin_invites_and_only_a_person_is_invited(pool: PgPool) {
     )
     .await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP01"), "{r:?}");
-    // Only a Person is invited; a member or a pending invitee is not again.
-    let r = invite(&pool, a, group, agent, "reader").await;
+    // Operator ruling C10 (migration 321): the invite no longer asks whether
+    // the invitee is a person (TGP03 answered "is this id a registered
+    // human?" to any team admin). An agent a Person operates is invited like
+    // anyone; the refusal is at accept time (TGP01), so it never joins.
+    let to_agent = invite(&pool, a, group, agent, "reader")
+        .await
+        .expect("C10: an operated agent is invited like anyone");
+    let r = accept(&pool, agent, to_agent).await;
+    assert_eq!(code_of(&r).as_deref(), Some("TGP01"), "{r:?}");
+    assert!(rows(&pool, group, agent).await.is_empty(), "no membership");
+    // A role's node is no one's to invite (its kind is public), TGP03.
+    let r = invite(
+        &pool,
+        a,
+        group,
+        role_node(&pool, "who-inv-role").await,
+        "reader",
+    )
+    .await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP03"), "{r:?}");
+    // A member or a pending invitee is not invited again.
     let r = invite(&pool, a, group, b, "reader").await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP04"), "{r:?}");
     let r = invite(&pool, a, group, a, "reader").await;
@@ -550,6 +616,87 @@ async fn only_a_live_admin_invites_and_only_a_person_is_invited(pool: PgPool) {
         .expect("POSITIVE CONTROL: the admin invites a Person");
     let r = invite(&pool, a, group, c, "reader").await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP04"), "{r:?}");
+}
+
+/// Operator ruling C10 (migration 321; spec R11): the invite answers
+/// IDENTICALLY whoever the invitee is, so a team admin cannot use it to learn
+/// whether an id is a person, or a person named to them. For an unnamed
+/// registered person (profile `'group'`, no shared team, no claims), a named
+/// one (a registered person who opted in), a provider-provisioned person who
+/// is not a registered operator, a production-shaped nameless service
+/// principal and an agent a person operates: the first invite returns an
+/// invitation id, and a second answers TGP04 with the same text modulo the
+/// ids. The refusal moved to accept time: every invitee that is not a
+/// registered person is refused TGP01 and joins nothing; the unnamed person
+/// accepts (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_invitation_answers_alike_whoever_the_invitee_is(pool: PgPool) {
+    let admin = human(&pool, "alike-admin").await;
+    let group = create(&pool, Some(admin), "Synthetic Alike Team")
+        .await
+        .expect("create");
+    let unnamed = human(&pool, "alike-unnamed").await;
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(unnamed)
+        .execute(&pool)
+        .await
+        .expect("unnamed keeps a group profile");
+    let unregistered = provisioned(&pool, "human", "Odile Unregistered").await;
+    let named = human(&pool, "alike-named").await;
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'public', profile_public_consented_at = now() \
+          WHERE id = $1",
+    )
+    .bind(named)
+    .execute(&pool)
+    .await
+    .expect("named opts in");
+    let service = provisioned(&pool, "service", "fixture service").await;
+    let bot = operated(&pool, named, "alike-bot").await;
+
+    let mut shapes = Vec::new();
+    let mut invitations = Vec::new();
+    for (who, label) in [
+        (unnamed, "unnamed person"),
+        (named, "named person"),
+        (unregistered, "unregistered person"),
+        (service, "service principal"),
+        (bot, "operated agent"),
+    ] {
+        let first = invite(&pool, admin, group, who, "reader").await;
+        let invitation = first.unwrap_or_else(|e| panic!("{label}: invited, got {e:?}"));
+        let again = invite(&pool, admin, group, who, "reader").await;
+        assert_eq!(
+            code_of(&again).as_deref(),
+            Some("TGP04"),
+            "{label}: {again:?}"
+        );
+        let shape = message_of(&again)
+            .replace(&who.to_string(), "<invitee>")
+            .replace(&group.to_string(), "<group>");
+        shapes.push((label, shape));
+        invitations.push((who, invitation));
+    }
+    for (label, shape) in &shapes[1..] {
+        assert_eq!(shape, &shapes[0].1, "{label} answers as {}", shapes[0].0);
+    }
+
+    for (who, invitation) in &invitations[2..] {
+        let r = accept(&pool, *who, *invitation).await;
+        assert_eq!(code_of(&r).as_deref(), Some("TGP01"), "{who}: {r:?}");
+        assert!(
+            rows(&pool, group, *who).await.is_empty(),
+            "{who} joined nothing"
+        );
+        assert_eq!(invitation_state(&pool, *invitation).await.0, "pending");
+    }
+    accept(&pool, unnamed, invitations[0].1)
+        .await
+        .expect("CALIBRATION: the invited person accepts");
+    assert_eq!(
+        rows(&pool, group, unnamed).await,
+        vec![("reader".to_string(), false)]
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -830,7 +977,8 @@ async fn the_repository_maps_each_refusal_by_kind(pool: PgPool) {
         .expect("create");
     let r = Repo::create_conn(&mut c, "Synthetic Repo Team", None).await;
     assert_eq!(kind_of(&r), format!("{:?}:TGP06", RefusalKind::State));
-    let r = Repo::invite_conn(&mut c, group, agent, "reader", None).await;
+    let role = role_node(&pool, "repo-role").await;
+    let r = Repo::invite_conn(&mut c, group, role, "reader", None).await;
     assert_eq!(kind_of(&r), format!("{:?}:TGP03", RefusalKind::Input));
     let r = Repo::invite_conn(&mut c, group, b, "owner", None).await;
     assert_eq!(kind_of(&r), format!("{:?}:TGP09", RefusalKind::Input));
@@ -888,4 +1036,46 @@ async fn the_repository_maps_each_refusal_by_kind(pool: PgPool) {
     let r = Repo::invite_conn(&mut c, group, a, "reader", None).await;
     assert_eq!(kind_of(&r), format!("{:?}:TGP02", RefusalKind::Authority));
     reset(c).await;
+}
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// 321 re-states 263's invite; over any other body it refuses (TIV01) with
+/// nothing changed.
+#[sqlx::test(migrations = false)]
+async fn migration_321_refuses_over_another_invite_body(pool: PgPool) {
+    let below = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version < 321)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    below.run(&mut *conn).await.expect("migrate to 320");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_invite_to_team_group( \
+             p_group uuid, p_invitee uuid, p_role text, p_reason text) \
+         RETURNS uuid LANGUAGE plpgsql VOLATILE SECURITY DEFINER \
+         SET search_path = pg_catalog, pg_temp AS $$ BEGIN RETURN NULL; END $$",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("another body");
+    let err = MIGRATOR
+        .run(&mut *conn)
+        .await
+        .expect_err("321 must refuse over another body")
+        .to_string();
+    assert!(err.contains("TIV01"), "precondition refusal: {err}");
 }

@@ -48,6 +48,62 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "196_idx_claims_theme_current_tenancy.sql",
         "idx_claims_theme_current_tenancy",
     ),
+    // The two partial indexes the disclosure core's claim arms probe per bound
+    // agent from its binding start (human-identity visibility spec, section
+    // 11; operator ruling C5). They supersede 312's and 313's, which 326 and
+    // 327 drop (`the_superseded_claim_arm_indexes_are_dropped`).
+    (
+        "323_idx_claims_public_by_agent_since.sql",
+        "idx_claims_public_by_agent_since",
+    ),
+    (
+        "324_idx_claims_group_by_agent_since.sql",
+        "idx_claims_group_by_agent_since",
+    ),
+    // The per-bound-agent probes of 332's arm for every other kind of public
+    // assertion (operator ruling C6), as 339 narrowed it to the agent's own
+    // assertions (Addendum 5): challenges, assessment-slot BBAs (340).
+    (
+        "329_idx_challenges_public_by_challenger.sql",
+        "idx_challenges_public_by_challenger",
+    ),
+    (
+        "340_idx_mass_functions_public_assessments_by_source.sql",
+        "idx_mass_functions_public_assessments_by_source",
+    ),
+    (
+        "336_idx_edges_public_ingest_records_by_ingester_lp.sql",
+        "idx_edges_public_ingest_records_by_ingester_lp",
+    ),
+    // The per-bound-agent probe of 334's countersigned-authorship arm
+    // (operator ruling C2).
+    (
+        "333_idx_security_events_countersigned.sql",
+        "idx_security_events_countersigned",
+    ),
+];
+
+/// `-- no-transaction` index files whose index no longer exists at head: 312 and
+/// 313 created the claim-arm indexes 326 and 327 drop (superseded by 323 and
+/// 324, operator ruling C5). Each is still one CONCURRENTLY statement, so the
+/// one-statement lint reads them; validity is not checked (there is no index).
+const DROPPED_INDEX_MIGRATIONS: &[&str] = &[
+    "312_idx_claims_public_by_agent.sql",
+    "313_idx_claims_group_by_agent.sql",
+    "326_drop_idx_claims_public_by_agent.sql",
+    "327_drop_idx_claims_group_by_agent.sql",
+    // 331's index on the bare `->>` could be no index condition under the
+    // core's row security; 336 (on 335's LEAKPROOF accessor) replaces it and
+    // 338 drops it.
+    "331_idx_edges_public_ingest_records_by_ingester.sql",
+    "338_drop_idx_edges_public_ingest_records_by_ingester.sql",
+    // 339 counts only an agent's own assertions (Addendum 5): evidence is no
+    // longer probed (342 drops 328's index) and a BBA only on an assessment
+    // slot (340's index; 341 drops 330's).
+    "328_idx_evidence_public_by_signer.sql",
+    "330_idx_mass_functions_public_by_source.sql",
+    "341_drop_idx_mass_functions_public_by_source.sql",
+    "342_drop_idx_evidence_public_by_signer.sql",
 ];
 
 /// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
@@ -144,6 +200,204 @@ async fn no_transaction_is_honoured_and_every_index_is_valid(pool: PgPool) {
     );
 }
 
+/// 326 and 327 drop 312's and 313's claim-arm indexes, which 323's and 324's
+/// (the same predicates, `created_at` appended) supersede: only the windowed
+/// pair is left to maintain on every claim insert.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_superseded_claim_arm_indexes_are_dropped(pool: PgPool) {
+    for index in ["idx_claims_public_by_agent", "idx_claims_group_by_agent"] {
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass('public.' || $1)::text")
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass");
+        assert_eq!(found, None, "{index} must be dropped (326 / 327)");
+    }
+    for index in [
+        "idx_evidence_public_by_signer",
+        "idx_mass_functions_public_by_source",
+    ] {
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass('public.' || $1)::text")
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass");
+        assert_eq!(found, None, "{index} must be dropped (341 / 342)");
+    }
+    for index in [
+        "idx_claims_public_by_agent_since",
+        "idx_claims_group_by_agent_since",
+    ] {
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass('public.' || $1)::text")
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass");
+        assert!(found.is_some(), "CALIBRATION: {index} exists");
+    }
+}
+
+/// Every per-bound-agent probe of the disclosure core reaches its index WITH
+/// the core's row security in force (human-identity visibility spec, section
+/// 11.1, after the C5 / C6 / C2 measurement).
+///
+/// The core is a maintenance-owned definer and the probed tables are FORCE
+/// RLS, so in the definer frame each probe runs under its table's policy. A
+/// qual that is not leakproof (a jsonb `->>`, a uuid-to-text cast on a Var)
+/// cannot be evaluated ahead of the policy qual, so it can be no index
+/// condition: 334's ingest-record probe (`(r.properties ->> 'ingested_by') =
+/// b.agent_id::text`) fell back to `idx_edges_created_at` and took 198 s per
+/// evaluation on the harness shape. The pins in
+/// `the_partial_tenancy_indexes_serve_an_explicit_visibility_qual` run on the
+/// superuser pool, where row security never applies, and passed regardless.
+/// These run under `SET ROLE epigraph_maintenance`, the core's owner, as the
+/// perf harness does, in the core's own per-bound-agent shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_disclosure_probes_reach_their_indexes_under_the_cores_row_security(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    for stmt in ["SET ROLE epigraph_maintenance", "SET enable_seqscan = off"] {
+        sqlx::query(stmt)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    async fn explain(conn: &mut sqlx::PgConnection, sql: &str) -> String {
+        sqlx::query_scalar::<_, String>(&format!("EXPLAIN (COSTS OFF) {sql}"))
+            .fetch_all(conn)
+            .await
+            .unwrap_or_else(|e| panic!("EXPLAIN {sql}: {e}"))
+            .join("\n")
+    }
+    let rows_from =
+        "ROWS FROM (pg_catalog.unnest(ARRAY['00000000-0000-0000-0000-00000000feed'::uuid, \
+                                                   '00000000-0000-0000-0000-00000000f00d'::uuid]), \
+                                pg_catalog.unnest(ARRAY['-infinity'::timestamptz, now()])) \
+                     AS b(agent_id, since)";
+    let text_rows_from = "ROWS FROM (pg_catalog.unnest(ARRAY['00000000-0000-0000-0000-00000000feed', \
+                                                        '00000000-0000-0000-0000-00000000f00d']::text[]), \
+                                     pg_catalog.unnest(ARRAY['-infinity'::timestamptz, now()])) \
+                          AS b(agent_text, since)";
+    let lateral =
+        |body: &str| format!("SELECT 1 FROM {rows_from} CROSS JOIN LATERAL ({body} LIMIT 1) x");
+    for (label, sql, index) in [
+        (
+            "public claim (325)",
+            lateral(
+                "SELECT 1 FROM public.claims c WHERE c.agent_id = b.agent_id \
+                   AND c.visibility = 'public' AND c.created_at >= b.since",
+            ),
+            "idx_claims_public_by_agent_since",
+        ),
+        (
+            "readable claim (325)",
+            format!(
+                "SELECT 1 FROM {rows_from} \
+                  CROSS JOIN pg_catalog.unnest(ARRAY['00000000-0000-0000-0000-00000000beef'::uuid]) \
+                             vg(group_id) \
+                  CROSS JOIN LATERAL (SELECT 1 FROM public.claims c \
+                                       WHERE c.agent_id = b.agent_id \
+                                         AND c.owner_group_id = vg.group_id \
+                                         AND c.visibility <> 'public' \
+                                         AND c.created_at >= b.since LIMIT 1) x"
+            ),
+            "idx_claims_group_by_agent_since",
+        ),
+        (
+            "challenge (332)",
+            lateral(
+                "SELECT 1 FROM public.challenges ch WHERE ch.challenger_id = b.agent_id \
+                   AND ch.visibility = 'public' AND ch.created_at >= b.since",
+            ),
+            "idx_challenges_public_by_challenger",
+        ),
+        (
+            "assessment BBA (339)",
+            lateral(
+                "SELECT 1 FROM public.mass_functions m WHERE m.source_agent_id = b.agent_id \
+                   AND m.slot_kind = 'assessment' \
+                   AND m.visibility = 'public' AND m.created_at >= b.since",
+            ),
+            "idx_mass_functions_public_assessments_by_source",
+        ),
+        (
+            "ingest record (337)",
+            format!(
+                "SELECT 1 FROM {text_rows_from} \
+                  CROSS JOIN LATERAL (SELECT 1 FROM public.edges r \
+                                       WHERE public.epigraph_ingest_record_ingester(r.properties) \
+                                             = b.agent_text \
+                                         AND r.relationship = 'ingested_claim' \
+                                         AND r.visibility = 'public' \
+                                         AND r.created_at >= b.since \
+                                         AND (r.properties -> 'ingest_written' ->> 'by') \
+                                             = public.epigraph_ingest_record_ingester(r.properties) \
+                                       LIMIT 1) x"
+            ),
+            "idx_edges_public_ingest_records_by_ingester_lp",
+        ),
+        (
+            "countersign act (337)",
+            lateral(
+                "SELECT s.agent_id FROM public.security_events s WHERE s.agent_id = b.agent_id \
+                   AND s.event_type = 'authorship.countersigned' AND s.created_at >= b.since",
+            ),
+            "idx_security_events_countersigned",
+        ),
+    ] {
+        let plan = explain(&mut conn, &sql).await;
+        assert!(
+            plan.contains(index) && plan.contains("created_at >="),
+            "{label}: under the core's row security the probe must reach {index} with the \
+             binding start as an index bound. Plan:\n{plan}"
+        );
+    }
+
+    // The countersign arm's paper: the paper id is computed in a fenced
+    // subquery so the join is `uuid = Var` (leakproof) and reaches papers' key.
+    let plan = explain(
+        &mut conn,
+        &lateral(
+            "SELECT 1 FROM (SELECT (s.details ->> 'paper_id')::uuid AS paper_id \
+                              FROM public.security_events s \
+                             WHERE s.agent_id = b.agent_id \
+                               AND s.event_type = 'authorship.countersigned' \
+                               AND s.created_at >= b.since OFFSET 0) s \
+               JOIN public.papers p ON p.id = s.paper_id \
+              WHERE (p.visibility = 'public' \
+                     OR p.owner_group_id = ANY (ARRAY['00000000-0000-0000-0000-00000000beef'::uuid]))",
+        ),
+    )
+    .await;
+    assert!(
+        plan.contains("papers_pkey"),
+        "the countersign arm must look its paper up by key under row security. Plan:\n{plan}"
+    );
+
+    // CALIBRATION, and the record of why 337 exists: 334's spelling of the
+    // ingest-record probe reaches no ingester index under row security.
+    let plan = explain(
+        &mut conn,
+        &lateral(
+            "SELECT 1 FROM public.edges r \
+              WHERE (r.properties ->> 'ingested_by') = b.agent_id::text \
+                AND r.relationship = 'ingested_claim' AND r.visibility = 'public' \
+                AND r.created_at >= b.since",
+        ),
+    )
+    .await;
+    // The planner may still pick a partial index for its predicate and the
+    // created_at range, but the ingester comparison is left as a row filter.
+    assert!(
+        plan.lines()
+            .any(|l| l.contains("Filter:") && l.contains("ingested_by"))
+            && !plan
+                .lines()
+                .any(|l| l.contains("Index Cond:") && l.contains("ingested_by")),
+        "CALIBRATION: a non-leakproof `->>` is no index condition under row security. \
+         Plan:\n{plan}"
+    );
+}
+
 /// The three partial tenancy indexes must all spell their predicate the SAME
 /// way, and it must be `<> 'public'`.
 ///
@@ -208,16 +462,67 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
     }
 
     // Reachable: an explicit `visibility = 'group'` qual.
+    //
+    // 324's `idx_claims_group_by_agent_since (agent_id, owner_group_id,
+    // created_at) WHERE visibility <> 'public'` shares this predicate, so on an
+    // EMPTY table (all costs near zero) the planner may pick it through a skip
+    // scan on its second column, which says nothing about whether
+    // idx_claims_group_current is a candidate. It is hidden inside a
+    // rolled-back transaction for this one EXPLAIN, so the assertion keeps
+    // testing what it was written for.
+    sqlx::query("BEGIN")
+        .execute(&mut *conn)
+        .await
+        .expect("begin");
+    sqlx::query("DROP INDEX idx_claims_group_by_agent_since")
+        .execute(&mut *conn)
+        .await
+        .expect("hide 324's index for this EXPLAIN");
     let plan = explain(
         &mut conn,
         "SELECT id FROM claims WHERE visibility = 'group' \
            AND owner_group_id = '00000000-0000-0000-0000-00000000beef'::uuid",
     )
     .await;
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("rollback");
     assert!(
         plan.contains("idx_claims_group_current"),
         "an explicit `visibility = 'group'` qual must reach idx_claims_group_current \
          (this is the D4/PR-18 shape the index exists for). Plan:\n{plan}"
+    );
+
+    // 325's per-bound-agent probes, windowed from the binding start (C5),
+    // reach 323's and 324's indexes with created_at in the index condition.
+    let plan = explain(
+        &mut conn,
+        "SELECT 1 FROM claims c \
+          WHERE c.agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+            AND c.visibility = 'public' \
+            AND c.created_at >= '2026-01-01'::timestamptz LIMIT 1",
+    )
+    .await;
+    assert!(
+        plan.contains("idx_claims_public_by_agent_since") && plan.contains("created_at >="),
+        "325's public-claim probe must reach idx_claims_public_by_agent_since with the \
+         binding start as an index bound. Plan:\n{plan}"
+    );
+    let plan = explain(
+        &mut conn,
+        "SELECT 1 FROM claims c \
+          WHERE c.agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+            AND c.owner_group_id = '00000000-0000-0000-0000-00000000beef'::uuid \
+            AND c.visibility <> 'public' \
+            AND c.created_at >= '2026-01-01'::timestamptz \
+          LIMIT 1",
+    )
+    .await;
+    assert!(
+        plan.contains("idx_claims_group_by_agent_since") && plan.contains("created_at >="),
+        "325's readable-claim probe must reach idx_claims_group_by_agent_since with the \
+         binding start as an index bound. Plan:\n{plan}"
     );
 
     // Also reachable from the `<>` spelling, which `= 'group'` does not admit.
@@ -385,11 +690,12 @@ fn no_transaction_files_contain_exactly_one_statement() {
 
     assert_eq!(
         checked,
-        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len(),
+        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len() + DROPPED_INDEX_MIGRATIONS.len(),
         "expected exactly {} `-- no-transaction` migrations (063-066, 073, 126, 196); found \
          {checked}. Adding one is fine — add it to INDEX_MIGRATIONS so its index validity \
-         is checked too, or to POLICY_ARM_MIGRATIONS if it has that shape.",
-        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len()
+         is checked too, to POLICY_ARM_MIGRATIONS if it has that shape, or to \
+         DROPPED_INDEX_MIGRATIONS if it drops an index (or created one a later file drops).",
+        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len() + DROPPED_INDEX_MIGRATIONS.len()
     );
 }
 

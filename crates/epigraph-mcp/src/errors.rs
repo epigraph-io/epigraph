@@ -347,13 +347,36 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
             message: Cow::from(message),
             data: None,
         },
-        // Migration 122's OPL01: the author is not bound to a human operator.
-        // The same class of denial; its rendering carries the code and the fix.
-        // Migration 166's ROL01 (a role's agent without its live holder) is
-        // the same class.
-        e @ (epigraph_db::DbError::OperatorLinkRequired { .. }
-        | epigraph_db::DbError::OperatorScopeRefused { .. }
-        | epigraph_db::DbError::RoleHolderRequired { .. }) => McpError {
+        // Migration 122's OPL01 names only the unbound agent (the caller's own
+        // write identity or the author it named), never a human: forwarded as
+        // the database words it, code and fix included.
+        e @ epigraph_db::DbError::OperatorLinkRequired { .. } => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(e.to_string()),
+            data: None,
+        },
+        // OPL02 carries the database's own words, which name the agent's human
+        // operator ("... belongs to human operator <id>"): a human's id is a
+        // disclosure the human-identity rule keeps to readers it admits (spec
+        // 2026-11-24, row I3; finding L8). Mapped to the fixed text the REST
+        // surface already answers (`epigraph-api/src/errors.rs`); the ids stay
+        // in the server log.
+        epigraph_db::DbError::OperatorScopeRefused { message } => {
+            tracing::warn!(detail = %message, "linked agent outside its operator's groups");
+            McpError {
+                code: ErrorCode::INVALID_REQUEST,
+                message: Cow::from(
+                    "OPL02: the write is outside the groups its human operator holds \
+                     writer/admin membership in, or names an author that belongs to another \
+                     human than the caller's; an agent writes only where its own operator \
+                     writes, and only in its own human's name. Nothing was written.",
+                ),
+                data: None,
+            }
+        }
+        // Migration 166's ROL01 (a role's agent without its live holder): the
+        // same class of denial; its rendering carries the code and the fix.
+        e @ epigraph_db::DbError::RoleHolderRequired { .. } => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(e.to_string()),
             data: None,
@@ -575,11 +598,20 @@ mod tests {
             "the denial must carry the code and name the fix: {}",
             unbound.message
         );
+        let human = "5d1b1f2e-0000-4000-8000-00000000abcd";
         let scope = db_caller_error(epigraph_db::DbError::OperatorScopeRefused {
-            message: "OPL02: agent a is linked to operator o".to_string(),
+            message: format!(
+                "OPL02: agent a writes a claim attributed to b, which belongs to human \
+                 operator {human}"
+            ),
         });
         assert_eq!(scope.code, ErrorCode::INVALID_REQUEST);
-        assert!(scope.message.contains("OPL02"), "{}", scope.message);
+        assert!(scope.message.starts_with("OPL02"), "{}", scope.message);
+        assert!(
+            !scope.message.contains(human),
+            "the human's id must stay in the log (spec I3): {}",
+            scope.message
+        );
 
         let role = db_caller_error(epigraph_db::DbError::RoleHolderRequired {
             message: "ROL01: agent a is attached to role r".to_string(),

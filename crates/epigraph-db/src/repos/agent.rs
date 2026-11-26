@@ -22,6 +22,22 @@ pub const LIVE_LINK_BINDING: &str = "live_link";
 /// keeps its HTTP token and viewer.
 pub const CLIENT_ALLOWLIST_BINDING: &str = "client_allowlist";
 
+/// The one statement of a delegated run token's liveness check, shared by
+/// `AgentRepository::delegated_principal_pool` and
+/// `AgentRepository::delegated_principal_conn` so the two cannot drift.
+/// Binds: `$1` the delegator, `$2` the principal, `$3`
+/// [`CLIENT_ALLOWLIST_BINDING`]. It stamps `$1` as `epigraph.principal_id`
+/// transaction-locally first (migration 236).
+const DELEGATED_PRINCIPAL_SQL: &str = "SELECT a.operator_id, a.operator_group_id \
+       FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
+                    AS delegator) s \
+      CROSS JOIN LATERAL public.epigraph_operator_actor($2) a \
+      WHERE public.epigraph_author_binding($1) = $3 \
+        AND public.epigraph_human_of($1, true) = a.operator_id \
+        AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships(s.delegator) m \
+                     WHERE m.group_id = a.operator_group_id \
+                       AND m.role IN ('writer', 'admin'))";
+
 /// The environment variable that switches delegated run tokens on for a
 /// request-serving process ([`RunTokens`]). Read ONCE, at boot.
 pub const RUN_TOKENS_ENV: &str = "EPIGRAPH_RUN_TOKENS";
@@ -234,8 +250,8 @@ pub struct CapabilityFilter {
     pub privileged_access: Option<bool>,
 }
 
-/// A Tier-B projection of one `agents` row, narrowed to what a given
-/// [`crate::visibility::Viewer`] may see.
+/// A Tier-B projection of one `agents` row, narrowed to what the reading
+/// session may see (migration 309's `epigraph_agent_disclosure`).
 ///
 /// See [`AgentRepository::get_public_profile`] for the rule. The four
 /// always-present fields are the ones authorship rendering needs; the three
@@ -243,6 +259,77 @@ pub struct CapabilityFilter {
 /// agent's PII, which is **indistinguishable from the agent simply not having
 /// set them** — deliberately, so the projection is not itself an oracle for
 /// "this agent has a private profile".
+/// A human principal's own choice of who sees its name (migration 310): the
+/// two values 062's CHECK admits on `agents.profile_visibility`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileVisibility {
+    /// The name is shown to everyone.
+    Public,
+    /// The name is shown only to the readers 309's rule admits (teammates,
+    /// readers of the person's claims, and everyone once the person or an
+    /// agent bound to it made a public assertion while bound; 325, 332, 334).
+    Group,
+}
+
+impl ProfileVisibility {
+    /// The stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Group => "group",
+        }
+    }
+
+    /// Parse the stored spelling; `None` for anything else.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "public" => Some(Self::Public),
+            "group" => Some(Self::Group),
+            _ => None,
+        }
+    }
+}
+
+/// What [`AgentRepository::set_profile_visibility_conn`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileVisibilitySet {
+    /// The value before the call.
+    pub previous: String,
+    /// The value after the call.
+    pub profile_visibility: String,
+    /// Whether an anonymous outsider sees the principal's name after the
+    /// call. True for `'public'`, and also for `'group'` while an agent ever
+    /// bound to the principal has a public claim ("no anonymous claims").
+    pub named_to_everyone: bool,
+}
+
+/// Map migration 310's refusals to designed refusals (the VIS pattern,
+/// `claim_visibility.rs::map_vis_error`). `refusal_codes.rs` is pinned to
+/// migration 176's codes, so the PVS codes are mapped here instead.
+fn map_profile_visibility_error(e: sqlx::Error) -> DbError {
+    if let sqlx::Error::Database(db) = &e {
+        let msg = db.message();
+        let kind = if msg.starts_with("PVS01") || msg.starts_with("PVS05") {
+            Some(crate::errors::RefusalKind::Authority)
+        } else if msg.starts_with("PVS02") {
+            Some(crate::errors::RefusalKind::Input)
+        } else if msg.starts_with("PVS04") {
+            Some(crate::errors::RefusalKind::State)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return DbError::Refused {
+                kind,
+                message: msg.to_string(),
+            };
+        }
+    }
+    DbError::from(e)
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentPublicProfile {
     pub id: Uuid,
@@ -253,9 +340,11 @@ pub struct AgentPublicProfile {
     /// cannot tell a real verifier from the BLAKE3 placeholder will feed the
     /// placeholder to a signature check.
     pub key_kind: String,
-    /// `public` or `group` (migration 062). Always returned so a caller can say
-    /// *why* the detail fields are empty without a second query.
-    pub profile_visibility: String,
+    /// `public` or `group` (migration 062), shown only with the details; an
+    /// unnamed human shows `public`, as a minted nameless service principal
+    /// does (spec 2026-11-24-human-identity-visibility-design.md, B1, ruling
+    /// C7).
+    pub profile_visibility: Option<String>,
     /// `agents.properties` — `full_name`, `affiliations`, `email`. `None` when
     /// the viewer is not entitled to it.
     pub properties: Option<JsonValue>,
@@ -281,6 +370,89 @@ pub struct AgentPublicProfile {
 /// [`AgentRepository::create_seed_derived_conn`] (over HTTP, `POST /agents`
 /// with `key_kind: "seed-derived"`).
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
+
+/// `agents.display_name` is `varchar(255)`.
+const DISPLAY_NAME_MAX_CHARS: usize = 255;
+
+/// Unicode general category `Cf` (format characters: bidi controls and
+/// isolates, zero-width spaces and joiners, the BOM, tag characters, ...),
+/// as of Unicode 15.1. A name carrying one can render as another name.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// The person's name an identity provider asserted for an OAuth client, or
+/// `None` when the client is not provider-provisioned or carries no usable
+/// name (human-identity visibility spec, section 9.2).
+///
+/// `Some` only when ALL hold:
+/// * `client_type == "human"`;
+/// * `client_id` contains `':'`. Only
+///   `oauth/providers/provision.rs::provision_external_user_client` mints that
+///   shape (`<provider>:<subject>`); a DCR or legacy human registration
+///   (`epigraph_<hex>`) chose its own `client_name`, so it is never trusted as
+///   a person's name (`identity_provisioning.rs::
+///   only_provider_provisioning_mints_a_colon_client_id` pins the creators);
+/// * the name, trimmed and with whitespace runs collapsed to one space, is
+///   non-empty, at most 255 characters, has no control (`Cc`) or format
+///   (`Cf`) character, contains no `'@'`, and is not
+///   `legal_contact_email` in any letter case. `provision.rs` stores
+///   `identity.name.unwrap_or(email)` as `client_name`, so a provider that
+///   sent no name leaves the EMAIL there, and an email must never become a
+///   display name.
+#[must_use]
+pub fn provider_asserted_person_name(
+    client_type: &str,
+    client_id: &str,
+    client_name: &str,
+    legal_contact_email: Option<&str>,
+) -> Option<String> {
+    if client_type != "human" || !client_id.contains(':') {
+        return None;
+    }
+    // Whitespace runs (tabs and newlines included) collapse to one space; any
+    // control or format character left after that refuses the name.
+    let name = client_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.chars().any(|c| c.is_control() || is_format_char(c)) {
+        return None;
+    }
+    if name.is_empty() || name.chars().count() > DISPLAY_NAME_MAX_CHARS || name.contains('@') {
+        return None;
+    }
+    // Defence in depth, kept on purpose: while the '@' arm above stands, every
+    // email address is refused there first, so no test can tell this arm
+    // apart (review finding tests#6, an equivalent mutant). It still refuses
+    // the contact address if that arm is ever relaxed (for a name that
+    // legitimately contains '@'), so the brief's "never copy an email into
+    // display_name" does not rest on one check.
+    if legal_contact_email.is_some_and(|e| e.trim().eq_ignore_ascii_case(&name)) {
+        return None;
+    }
+    Some(name)
+}
 
 /// Step 2 of [`AgentRepository::ensure_for_client`]: refuse to adopt an
 /// `ed25519` row whose key anyone can compute (backlog 55fba366).
@@ -742,12 +914,10 @@ impl AgentRepository {
     /// universally readable and PostgreSQL has no column-level RLS to narrow
     /// it." That migration names THIS function explicitly among the ones which
     /// "take no `Viewer` and return the full row". The compensating projection —
-    /// `profile_visibility` gating `properties`, `orcid` and `ror_id` — lives in
-    /// [`Self::get_public_profile`], and the residual is already on record as
-    /// `D-PR17-agent-projection-enforced-at-one-call-site`. The agent-lookup
-    /// card and matcher (`agent_lookup.rs`) spell the same rule in their own
-    /// statements; `visibility_lint.rs::the_agent_profile_rule_is_one_text_at_every_site`
-    /// keeps the three one text.
+    /// the name and `properties`, `orcid`, `ror_id` gated by migration 309's
+    /// disclosure rule — is applied by every caller that serializes the row
+    /// (`epigraph_db::redact_agent` / `AgentDisclosureRepository::disclosure`),
+    /// and `agent_name_disclosure_lint.rs` lists the callers it reviewed.
     /// Stamping the session GUCs on this read changes no row either way; the
     /// value of the widening is entirely in the SIBLING statement it lets share
     /// the connection.
@@ -1607,7 +1777,12 @@ impl AgentRepository {
     ///    path: one indexed read). `client_type` is read from the LOCKED ROW
     ///    rather than taken as a parameter, so a caller cannot pass one
     ///    inconsistent with what is stored (`providers::provision` hardcoded
-    ///    `"human"`).
+    ///    `"human"`). For a human client, `client_name` and
+    ///    `legal_contact_email` are then read from the same locked row: a
+    ///    provider-provisioned person is named as the provider asserted
+    ///    ([`provider_asserted_person_name`], never an email), and every other
+    ///    principal is named `oauth:<client row id>`. A client that is already
+    ///    linked keeps its agent and name (no backfill).
     /// 2. **`client_type = 'agent'` first.** For an agent client the `client_id`
     ///    IS the hex Ed25519 public key by construction
     ///    (`oauth/register.rs` requires it; `oauth/token.rs` decodes it to
@@ -1705,7 +1880,25 @@ impl AgentRepository {
             "human" => "human",
             _ => "software_agent", // "agent" and "service"
         };
-        let display_name = format!("oauth:{client_row_id}");
+        // A provider-provisioned person is named as the provider asserted
+        // (operator ruling, human-identity visibility spec section 9); every
+        // other principal keeps the placeholder. The name is read from the
+        // row locked above: this transaction holds its FOR UPDATE, so no
+        // writer can change it between the two statements, and the
+        // application role keeps SELECT on `oauth_clients` (118).
+        let provider_name = if client_type == "human" {
+            let (client_name, email): (String, Option<String>) = sqlx::query_as(
+                "SELECT client_name::text, legal_contact_email::text \
+                   FROM public.oauth_clients WHERE id = $1",
+            )
+            .bind(client_row_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            provider_asserted_person_name(&client_type, &client_id, &client_name, email.as_deref())
+        } else {
+            None
+        };
+        let display_name = provider_name.unwrap_or_else(|| format!("oauth:{client_row_id}"));
 
         // 2. An agent client's client_id IS its Ed25519 public key. Adopt the
         //    real signer row when one exists rather than minting a second,
@@ -2089,11 +2282,13 @@ impl AgentRepository {
     /// before they add, remove or re-role a member, so a writer-membership
     /// revoke made through them is serialised like a retire. Such a revoke
     /// also ends the acting link (`epigraph_operator_actor` joins the live
-    /// writer row). It does NOT serialise a revoke that UPDATEs
-    /// `group_memberships` directly, without a verb (for example
-    /// `GroupMembershipRepository::remove_member` or
-    /// `revoke_member_unless_last_admin`), nor a direct maintenance `UPDATE`
-    /// of `operator_links.retired`, which 191 leaves unserialised.
+    /// writer row). So do the repository's own revokes,
+    /// `GroupMembershipRepository::remove_member` and
+    /// `revoke_member_unless_last_admin(_conn)` (backlog f1438bfb), which
+    /// take it exclusively before their first row lock. It does NOT
+    /// serialise any other statement that UPDATEs `group_memberships`
+    /// directly, nor a direct maintenance `UPDATE` of
+    /// `operator_links.retired`, which 191 leaves unserialised.
     ///
     /// # Errors
     /// As [`Self::operator_actor`]; the lock statement's failure is
@@ -2162,23 +2357,70 @@ impl AgentRepository {
         // (transaction-local; the statement is its own transaction on a pool
         // connection). The read's argument is the stamped value, so the stamp
         // precedes the call. Nothing else here reads the principal.
-        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
-            "SELECT a.operator_id, a.operator_group_id \
-               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
-                            AS delegator) s \
-              CROSS JOIN LATERAL public.epigraph_operator_actor($2) a \
-              WHERE public.epigraph_author_binding($1) = $3 \
-                AND public.epigraph_human_of($1, true) = a.operator_id \
-                AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships(s.delegator) m \
-                             WHERE m.group_id = a.operator_group_id \
-                               AND m.role IN ('writer', 'admin'))",
-        )
-        .bind(delegator_agent)
-        .bind(principal)
-        .bind(CLIENT_ALLOWLIST_BINDING)
-        .fetch_optional(pool)
-        .await?;
+        let row: Option<(Uuid, Uuid)> = sqlx::query_as(DELEGATED_PRINCIPAL_SQL)
+            .bind(delegator_agent)
+            .bind(principal)
+            .bind(CLIENT_ALLOWLIST_BINDING)
+            .fetch_optional(pool)
+            .await?;
         Ok(row.map(|(operator_id, operator_group_id)| DelegationLive {
+            operator_id,
+            operator_group_id,
+        }))
+    }
+
+    /// [`Self::delegated_principal_pool`] on a connection the caller already
+    /// holds, inside its transaction: the same one statement, so the same
+    /// answer, without a second connection from the pool (backlog bdc96181:
+    /// a write that asks it while holding its own transaction's connection
+    /// must not wait on the pool for another).
+    ///
+    /// The statement stamps the DELEGATOR as `epigraph.principal_id`,
+    /// transaction-locally (migration 236; see the pool variant). On a pool
+    /// connection that stamp ended with the statement's own implicit
+    /// transaction; here it would outlive the statement and leave every later
+    /// statement of the caller's transaction (its writes included) stamped as
+    /// the delegator. So the statement runs inside a SAVEPOINT that is then
+    /// ROLLED BACK, which undoes the stamp (a GUC set inside a savepoint is
+    /// reverted with it): the caller's stamp after the call is the stamp
+    /// before it, whether the read answered or failed. The rows it read are
+    /// already in hand. It takes no lock and writes nothing, so the rollback
+    /// discards nothing else.
+    ///
+    /// `conn` must be inside a transaction (a `SAVEPOINT` outside one is an
+    /// error, returned as such).
+    ///
+    /// # Errors
+    /// As [`Self::delegated_principal_pool`]; also `DbError::QueryFailed` if
+    /// the savepoint cannot be opened or rolled back.
+    pub async fn delegated_principal_conn(
+        conn: &mut sqlx::PgConnection,
+        run_tokens: RunTokens,
+        delegator_agent: Uuid,
+        principal: Uuid,
+    ) -> Result<Option<DelegationLive>, DbError> {
+        if run_tokens != RunTokens::On {
+            return Ok(None);
+        }
+        sqlx::query("SAVEPOINT epigraph_delegated_principal")
+            .execute(&mut *conn)
+            .await?;
+        let row: Result<Option<(Uuid, Uuid)>, sqlx::Error> =
+            sqlx::query_as(DELEGATED_PRINCIPAL_SQL)
+                .bind(delegator_agent)
+                .bind(principal)
+                .bind(CLIENT_ALLOWLIST_BINDING)
+                .fetch_optional(&mut *conn)
+                .await;
+        // Undo the delegator stamp (and, after a failure, the aborted state),
+        // then drop the savepoint itself.
+        sqlx::query("ROLLBACK TO SAVEPOINT epigraph_delegated_principal")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT epigraph_delegated_principal")
+            .execute(&mut *conn)
+            .await?;
+        Ok(row?.map(|(operator_id, operator_group_id)| DelegationLive {
             operator_id,
             operator_group_id,
         }))
@@ -2593,45 +2835,44 @@ impl AgentRepository {
         .await?)
     }
 
-    /// Tier-B projection of one agent, filtered by what `viewer` may see.
+    /// Tier-B projection of one agent, filtered by what the reading session
+    /// may see.
     ///
     /// `agents` is deliberately **not** a tenancy-partitioned table: authorship
     /// must render on a public claim, so the row itself stays readable and
     /// migration 077's policy on it is `USING (true)` with an explicit
     /// `-- VISIBILITY-EXEMPT:` marker. What is *not* universally readable is the
     /// PII the row carries — `agents.properties` holds `full_name`, `orcid`,
-    /// `affiliations` and `email` (migration 001).
+    /// `affiliations` and `email` (migration 001) — and, for a human principal,
+    /// the name itself.
     ///
     /// PostgreSQL has no column-level RLS, so the narrowing is a **repo-layer
-    /// projection**: `id`, `display_name`, `public_key` and `key_kind` are
-    /// always returned; [`AgentPublicProfile::properties`], `orcid` and `ror_id`
-    /// are `None` unless one of three things holds —
+    /// projection**, decided by migration 309's `epigraph_agent_disclosure` on
+    /// the session `executor` is stamped as (`read_as` from the caller's
+    /// viewer): `id`, `public_key` and `key_kind` are always returned;
+    /// `display_name` only when `named`; [`AgentPublicProfile::properties`],
+    /// `orcid`, `ror_id` and `profile_visibility` only when `details` (the
+    /// profile is public, the session IS the agent, shares a live group with
+    /// it, or is privileged; for a human, also only when named). An unstamped
+    /// application session reads as the anonymous outsider.
     ///
-    /// 1. `profile_visibility = 'public'` (migration 062's default), or
-    /// 2. the viewer **is** this agent, or
-    /// 3. the viewer shares a live group with it: the agent holds a row that
-    ///    still COUNTS in a group of the viewer's set, by migration 273's
-    ///    `epigraph_group_live_roster` (backlog f712db53). An unrevoked row
-    ///    that has LAPSED (migrations 164 and 235) does not count. A member
-    ///    DERIVED from a role binding (migration 165) holds no row, so it is
-    ///    not recognised as a groupmate here (the roster lists no derived
-    ///    member: no roster oracle); its own profile still shows to itself.
-    ///    The roster answers only for groups in the connection's stamp, so
-    ///    run this on a connection stamped from `viewer` (`read_as`); on any
-    ///    other connection this arm answers no groupmate (fail-closed). The
-    ///    subquery is uncorrelated, so it is evaluated once per statement
-    ///    (a hashed subplan), not once per agent.
+    /// "Shares a live group" counts only a membership row that still COUNTS
+    /// (migration 343, backlog f712db53): an unrevoked row that has LAPSED by
+    /// the 164 or 235 rule does not, exactly as migration 273's
+    /// `epigraph_group_live_roster` counts; a member DERIVED from a role
+    /// binding (165) holds no row and so shares no details (it may still be
+    /// NAMED by the team arm). Pinned by
+    /// `live_membership_readers.rs::a_profile_shows_details_to_a_live_explicit_groupmate_only`.
     ///
-    /// A bypass viewer sees everything, as everywhere else.
-    ///
-    /// The same rule is spelled in two more statements, the agent-lookup card
-    /// and matcher (`agent_lookup.rs::cards_inner` / `match_ranked`), because
-    /// `visibility_lint.rs` requires each viewer-taking statement to carry its
-    /// predicate text. Change all three together:
-    /// `visibility_lint.rs::the_agent_profile_rule_is_one_text_at_every_site`
-    /// fails while their text or bind order differs, and
-    /// `agent_lookup.rs::the_three_copies_of_the_profile_rule_decide_alike`
-    /// (epigraph-db tests) while their decisions do.
+    /// An UNNAMED human reads exactly as a nameless OAuth service principal
+    /// (operator ruling C7): such a principal's profile is `'public'` (311's
+    /// mint) with the column default `{}` for properties and no ORCID / ROR,
+    /// so the unnamed human is shown under its `oauth:<client row id>`
+    /// placeholder (migration 322) with `profile_visibility = 'public'`,
+    /// `properties = {}` and null ORCID / ROR, whatever its row holds. Its
+    /// `key_kind` is its own: a provider-provisioned person is `derived`, as
+    /// the service principal is (a registered operator holding a real key is
+    /// the residual the spec records).
     ///
     /// The decision is made in SQL, in the same round trip as the row, so there
     /// is no window in which the caller holds the PII and has not yet decided
@@ -2643,10 +2884,9 @@ impl AgentRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(executor, viewer))]
+    #[instrument(skip(executor))]
     pub async fn get_public_profile<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
-        viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<AgentPublicProfile>, DbError> {
         type Row = (
@@ -2654,9 +2894,8 @@ impl AgentRepository {
             Option<String>,
             Vec<u8>,
             String,
-            String,
-            bool,
-            JsonValue,
+            Option<String>,
+            Option<JsonValue>,
             Option<String>,
             Option<String>,
         );
@@ -2664,28 +2903,22 @@ impl AgentRepository {
         let row: Option<Row> = sqlx::query_as(
             r#"
             SELECT a.id,
-                   a.display_name,
+                   CASE WHEN d.named THEN a.display_name
+                        ELSE public.epigraph_unnamed_agent_name(a.id) END,
                    a.public_key,
                    a.key_kind,
-                   a.profile_visibility,
-                   (   $4::bool
-                    OR a.profile_visibility = 'public'
-                    OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
-                    OR a.id IN (SELECT r.agent_id
-                                  FROM unnest($3::uuid[]) vg(id)
-                                  CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r)
-                   ) AS may_see_details,
-                   a.properties,
-                   a.orcid,
-                   a.ror_id
+                   CASE WHEN NOT d.named THEN 'public'
+                        WHEN d.details THEN a.profile_visibility END,
+                   CASE WHEN NOT d.named THEN '{}'::jsonb
+                        WHEN d.details THEN a.properties END,
+                   CASE WHEN d.details THEN a.orcid END,
+                   CASE WHEN d.details THEN a.ror_id END
             FROM agents a
+            CROSS JOIN LATERAL public.epigraph_agent_disclosure(a.id) d
             WHERE a.id = $1
             "#,
         )
         .bind(id)
-        .bind(viewer.principal())
-        .bind(viewer.group_bind().unwrap_or(&[]))
-        .bind(viewer.bypass_bind())
         .fetch_optional(executor)
         .await?;
 
@@ -2696,7 +2929,6 @@ impl AgentRepository {
                 public_key,
                 key_kind,
                 profile_visibility,
-                may_see_details,
                 properties,
                 orcid,
                 ror_id,
@@ -2706,56 +2938,43 @@ impl AgentRepository {
                 public_key,
                 key_kind,
                 profile_visibility,
-                properties: may_see_details.then_some(properties),
-                orcid: if may_see_details { orcid } else { None },
-                ror_id: if may_see_details { ror_id } else { None },
+                properties,
+                orcid,
+                ror_id,
             },
         ))
     }
 
-    /// The ids among `ids` whose profile DETAILS (`orcid`, `ror_id`,
-    /// `properties`) `viewer` may see, by [`Self::get_public_profile`]'s rule:
-    /// a bypass viewer, a `public` profile, the viewer itself, or a live group
-    /// membership the viewer shares. Ids that name no agent are absent.
-    ///
-    /// For the routes that read whole `Agent` rows (`GET /api/v1/agents` and
-    /// `/api/v1/agents/:id`) and must null the detail fields themselves
-    /// (backlog 761c2b05): one round trip for a whole page. Run it on a
-    /// connection stamped from `viewer` (`AppState::read_as`): the shared-group
-    /// arm reads `group_memberships`, which row security hides on an unstamped
-    /// connection, so a raw-pool call answers "not visible" for a shared group.
+    /// Set the SESSION PRINCIPAL's own `profile_visibility` through migration
+    /// 310's definer `epigraph_set_profile_visibility`, on `conn` (which must
+    /// be stamped from the caller's viewer). Only a human principal may; the
+    /// target is always the principal, never an argument. One
+    /// `agent.profile_visibility_set` audit row per successful call.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(executor, viewer, ids))]
-    pub async fn profile_details_visible<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        ids: &[Uuid],
-    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
-        if ids.is_empty() {
-            return Ok(std::collections::HashSet::new());
-        }
-        let rows: Vec<(Uuid,)> = sqlx::query_as(
-            r#"
-            SELECT a.id
-            FROM agents a
-            WHERE a.id = ANY($1::uuid[])
-              AND (   $4::bool
-                   OR a.profile_visibility = 'public'
-                   OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
-                   OR a.id IN (SELECT r.agent_id
-                                 FROM unnest($3::uuid[]) vg(id)
-                                 CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r))
-            "#,
-        )
-        .bind(ids)
-        .bind(viewer.principal())
-        .bind(viewer.group_bind().unwrap_or(&[]))
-        .bind(viewer.bypass_bind())
-        .fetch_all(executor)
-        .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
+    /// `DbError::Refused`: `Authority` with no principal (PVS01) or for a
+    /// principal that is not a person (PVS05: an operated agent, a service);
+    /// `Input` for a value the CHECK does not admit (PVS02, unreachable from
+    /// [`ProfileVisibility`]); `State` if the row did not move (PVS04).
+    /// Nothing is changed on any of them. `DbError::QueryFailed` otherwise.
+    pub async fn set_profile_visibility_conn(
+        conn: &mut sqlx::PgConnection,
+        visibility: ProfileVisibility,
+    ) -> Result<ProfileVisibilitySet, DbError> {
+        let (previous, profile_visibility, named_to_everyone): (Option<String>, String, bool) =
+            sqlx::query_as(
+                "SELECT previous, profile_visibility, named_to_everyone \
+                   FROM public.epigraph_set_profile_visibility($1)",
+            )
+            .bind(visibility.as_str())
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_profile_visibility_error)?;
+        Ok(ProfileVisibilitySet {
+            previous: previous.unwrap_or_default(),
+            profile_visibility,
+            named_to_everyone,
+        })
     }
 
     /// The agent's public key, but **only** when it is a real Ed25519 verifier.
@@ -2813,7 +3032,98 @@ impl AgentRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::RunTokens;
+    use super::{provider_asserted_person_name, RunTokens};
+
+    const EMAIL: Option<&str> = Some("ada.example@example.test");
+
+    fn provider(name: &str) -> Option<String> {
+        provider_asserted_person_name("human", "google:1234", name, EMAIL)
+    }
+
+    /// A provider-provisioned human client (`<provider>:<subject>`) with a
+    /// real name gives that name, whitespace trimmed and collapsed.
+    #[test]
+    fn a_provider_name_is_used_trimmed_and_collapsed() {
+        assert_eq!(provider("Ada Example").as_deref(), Some("Ada Example"));
+        assert_eq!(
+            provider("  Ada \t\n  Example  ").as_deref(),
+            Some("Ada Example")
+        );
+    }
+
+    /// The email fallback `provision.rs` stores when the provider sent no
+    /// name, in any letter case, or anything carrying an `@`, is never a
+    /// display name; neither is an empty or blank name.
+    #[test]
+    fn an_email_or_empty_name_is_never_used() {
+        for bad in [
+            "ada.example@example.test",
+            "ADA.Example@Example.TEST",
+            "someone@else.test",
+            "Ada @ Example",
+            "",
+            "   ",
+        ] {
+            assert_eq!(provider(bad), None, "{bad:?}");
+        }
+        // With no recorded contact email the '@' rule alone still holds.
+        assert_eq!(
+            provider_asserted_person_name("human", "google:1", "a@b.test", None),
+            None
+        );
+    }
+
+    /// Control (Cc) and format (Cf) characters make a name spoofable (bidi
+    /// overrides, zero-width characters, the BOM): such a name is not used.
+    #[test]
+    fn control_and_format_characters_refuse_the_name() {
+        for bad in [
+            "Ada\u{0007}Example",
+            "Ada\u{202E}elpmaxE",
+            "Ada\u{200B}Example",
+            "\u{FEFF}Ada Example",
+            "Ada\u{2066}Example",
+            "Ada\u{00AD}Example",
+            "Ada\u{E0041}Example",
+        ] {
+            assert_eq!(provider(bad), None, "{bad:?}");
+        }
+        // A non-ASCII letter is not a format character.
+        assert_eq!(provider("Zoë Ångström").as_deref(), Some("Zoë Ångström"));
+    }
+
+    /// `agents.display_name` is varchar(255): 255 characters fit, 256 do not
+    /// (counted in characters, as PostgreSQL counts varchar).
+    #[test]
+    fn the_name_fits_the_column_or_is_not_used() {
+        let fits = "é".repeat(255);
+        assert_eq!(provider(&fits).as_deref(), Some(fits.as_str()));
+        assert_eq!(provider(&"é".repeat(256)), None);
+    }
+
+    /// Only a provider-provisioned HUMAN client qualifies: a DCR or legacy
+    /// human registration (`epigraph_<hex>`, a client-chosen name), and any
+    /// service or agent client, keep the placeholder.
+    #[test]
+    fn only_a_provider_human_client_qualifies() {
+        assert_eq!(
+            provider_asserted_person_name(
+                "human",
+                "epigraph_0123456789abcdef0123456789abcdef",
+                "Ada Example",
+                EMAIL
+            ),
+            None,
+            "a DCR / legacy human registration chooses its own name"
+        );
+        for t in ["service", "agent"] {
+            assert_eq!(
+                provider_asserted_person_name(t, "google:1234", "Ada Example", EMAIL),
+                None,
+                "{t}"
+            );
+        }
+    }
 
     /// OFF unless the value is exactly `on`: unset, empty, `true`, `1`, `yes`
     /// and a typo all leave delegated run tokens refused. Mutation caught:
