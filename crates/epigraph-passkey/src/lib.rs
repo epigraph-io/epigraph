@@ -639,8 +639,10 @@ impl Passkeys {
     /// hardware key whose attestation is trusted is recorded attested
     /// ([`Self::finish_anchored_registration`]), so it stands on its own and
     /// is not revoked with its anchor. Synced passkeys answer `none` either
-    /// way. No `attestationFormats` hint is given (the attested ceremony's
-    /// options carry one).
+    /// way, and a statement the library cannot verify is dropped to `none`
+    /// at the finish rather than refused, as the browser would have stripped
+    /// it had the relying party asked for none. No `attestationFormats` hint
+    /// is given (the attested ceremony's options carry one).
     ///
     /// The caller takes the anchored path only when [`Self::check_anchor`]
     /// admits the enrollment's [`ActAnchor`] (re-verified there: see
@@ -720,13 +722,23 @@ impl Passkeys {
     ///   attestation as none). It is then the first case. A statement is
     ///   never recorded unless it is trusted here, so it cannot anchor
     ///   unverified.
+    /// * a statement the library cannot verify at all (a StrongBox-level
+    ///   Android key, which its parser refuses; `android-safetynet` or another
+    ///   format it does not support; an Android key with a leading zero byte
+    ///   in a coordinate): the response is finished again with its statement
+    ///   stripped (`fmt` `none`, an empty `attStmt`, the authenticator data and
+    ///   client data byte-identical), exactly what a browser sends when the
+    ///   relying party asks for none, and the passkey recorded `none` as in
+    ///   the previous case (its standing is never read, so a stale status list
+    ///   does not refuse it). The attested ceremony still refuses such a
+    ///   statement.
     ///
     /// # Errors
     /// [`PasskeyError::Config`] (the path is off), [`PasskeyError::Anchor`],
     /// [`PasskeyError::State`], [`PasskeyError::AttestationRefused`] (an
     /// Android key whose standing cannot be checked), or the library's
-    /// refusal (which comes before any of the above: a statement the library
-    /// cannot verify at all is refused, not dropped).
+    /// refusal of the response with its statement stripped (origin, rp id,
+    /// challenge, user verification, ...: what no statement could change).
     pub fn finish_anchored_registration(
         &self,
         response: &Value,
@@ -745,10 +757,33 @@ impl Passkeys {
             serde_json::from_value(response.clone()).map_err(|e| malformed("response", e))?;
         let st: PasskeyRegistration =
             serde_json::from_value(library).map_err(|e| malformed("state", e))?;
-        let pk = self
-            .webauthn
-            .finish_passkey_registration(&reg, &st)
-            .map_err(|e| refused(&e))?;
+        let pk = match self.webauthn.finish_passkey_registration(&reg, &st) {
+            Ok(pk) => pk,
+            Err(first) => {
+                // A statement the library cannot verify at all: finish the
+                // same response with the statement stripped, as a browser
+                // asked for `none` would have sent it. Any other refusal
+                // (origin, challenge, user verification, ...) does not
+                // depend on the statement and recurs on the stripped one.
+                let Some(stripped) = stripped_to_none(&reg) else {
+                    return Err(refused(&first));
+                };
+                let pk = self
+                    .webauthn
+                    .finish_passkey_registration(&stripped, &st)
+                    .map_err(|e| refused(&e))?;
+                tracing::info!(
+                    target: "passkey.anchor",
+                    act = %anchor.act_id,
+                    reason = %first,
+                    "an anchored enrollment's attestation statement cannot be verified by the \
+                     library; it is dropped and the passkey recorded `none`"
+                );
+                return registered_from(without_attestation(
+                    serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?,
+                )?);
+            }
+        };
         let registered = registered_from(with_statement(
             serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?,
             &reg,
@@ -2189,6 +2224,44 @@ fn without_attestation(mut passkey: Value) -> Result<Value, PasskeyError> {
     serde_json::from_value::<Passkey>(passkey.clone())
         .map_err(|e| malformed("credential without its attestation", e))?;
     Ok(passkey)
+}
+
+/// `reg` with its attestation statement stripped as a client asked for `none`
+/// attestation strips it (WebAuthn §5.1.3, `none` conveyance): the
+/// attestation object re-encoded as `{"fmt": "none", "attStmt": {},
+/// "authData": ...}` with the authenticator data byte-identical, and the
+/// client data and everything else untouched. `None` when there is nothing
+/// to strip: the object does not parse (with the parser the library reads it
+/// with), is not a map, has no text `fmt` or byte-string `authData`, or is
+/// already `none`.
+fn stripped_to_none(reg: &RegisterPublicKeyCredential) -> Option<RegisterPublicKeyCredential> {
+    use serde_cbor_2::Value as Cbor;
+    let text = |s: &str| Cbor::Text(s.to_string());
+    let Ok(Cbor::Map(object)) =
+        serde_cbor_2::from_slice::<Cbor>(reg.response.attestation_object.as_slice())
+    else {
+        return None;
+    };
+    match object.get(&text("fmt")) {
+        Some(Cbor::Text(fmt)) if fmt != "none" => {}
+        _ => return None,
+    }
+    let Some(auth_data @ Cbor::Bytes(_)) = object.get(&text("authData")) else {
+        return None;
+    };
+    let none = Cbor::Map(
+        [
+            (text("fmt"), text("none")),
+            (text("attStmt"), Cbor::Map(Default::default())),
+            (text("authData"), auth_data.clone()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let bytes = serde_cbor_2::to_vec(&none).ok()?;
+    let mut stripped = reg.clone();
+    *stripped.response.attestation_object = bytes;
+    Some(stripped)
 }
 
 /// The row columns of a library-serialized credential (`{"cred": {...}}`).

@@ -121,9 +121,10 @@ fn p256() -> PKey<Private> {
 /// genuine key in 64. That is the library's behaviour (a real device that hits
 /// it registers on a retry, with a new key); a test that drew such a key would
 /// fail at random, so the test authenticator never does.
-fn credential_key() -> PKey<Private> {
+fn credential_key(leading_zero: bool) -> PKey<Private> {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("P-256");
-    loop {
+    // About one P-256 key in 128 has a coordinate whose first byte is zero.
+    for _ in 0..100_000 {
         let key = EcKey::generate(&group).expect("key");
         let mut ctx = BigNumContext::new().expect("ctx");
         let mut x = BigNum::new().expect("x");
@@ -131,10 +132,12 @@ fn credential_key() -> PKey<Private> {
         key.public_key()
             .affine_coordinates(&group, &mut x, &mut y, &mut ctx)
             .expect("coordinates");
-        if x.num_bytes() == 32 && y.num_bytes() == 32 {
+        let full = x.num_bytes() == 32 && y.num_bytes() == 32;
+        if full != leading_zero {
             return PKey::from_ec_key(key).expect("pkey");
         }
     }
+    panic!("no P-256 key of the requested shape in 100000 tries");
 }
 
 fn cbor(v: &Cbor) -> Vec<u8> {
@@ -220,6 +223,7 @@ pub struct SoftAuthenticator {
     not_backed_up: bool,
     counting: bool,
     counter: u32,
+    leading_zero: bool,
     credentials: Vec<Credential>,
 }
 
@@ -256,6 +260,7 @@ impl SoftAuthenticator {
             not_backed_up: false,
             counting: false,
             counter: 0,
+            leading_zero: false,
             credentials: Vec::new(),
         }
     }
@@ -281,6 +286,18 @@ impl SoftAuthenticator {
     #[must_use]
     pub fn counting(mut self) -> Self {
         self.counting = true;
+        self
+    }
+
+    /// Create credentials whose public key has a coordinate with a leading
+    /// zero byte (still encoded as 32 bytes in the COSE key, as the
+    /// specification requires). Every other credential has none, because
+    /// `webauthn-rs-core` 0.5.5 compares an attestation certificate's key with
+    /// the credential's by the coordinates' minimal encodings, and refuses
+    /// such a key's `android-key` statement.
+    #[must_use]
+    pub fn leading_zero_coordinate(mut self) -> Self {
+        self.leading_zero = true;
         self
     }
 
@@ -345,7 +362,7 @@ impl SoftAuthenticator {
         }))
         .expect("client data");
 
-        let key = credential_key();
+        let key = credential_key(self.leading_zero);
         let mut id = vec![0_u8; 32];
         openssl::rand::rand_bytes(&mut id).expect("rand");
         let mut auth_data = sha256(rp_id.as_bytes());
@@ -481,6 +498,16 @@ pub fn hardware_bound(registration: &Value) -> Value {
     let mut auth_data = auth_data_of(registration);
     auth_data[FLAGS_AT] &= !(BE | BS);
     with_attestation(registration, "none", Cbor::Map(vec![]), auth_data)
+}
+
+/// `registration` re-made with the attestation statement `att_stmt` in the
+/// format `fmt` (any identifier, registered or not), its authenticator data
+/// and client data unchanged. Nothing is signed: the statement is one the
+/// relying party cannot verify (`android-safetynet`, which `webauthn-rs-core`
+/// 0.5.5 does not support, or a format it does not know).
+#[must_use]
+pub fn restated(registration: &Value, fmt: &str, att_stmt: Cbor) -> Value {
+    with_attestation(registration, fmt, att_stmt, auth_data_of(registration))
 }
 
 /// A test attestation root and an attestation certificate it issued.

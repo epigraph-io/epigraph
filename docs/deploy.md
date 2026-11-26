@@ -3630,11 +3630,13 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   or its model is not allowlisted) is revoked with the phone; enroll it again
   and allow the prompt, or enroll it with the setting off, which refuses an
   untrusted key outright.
-  - A statement the WebAuthn library cannot verify at all is refused before
-    this choice is made, as on the attested path: a StrongBox-level Android
-    key, an unsupported format, and the one-in-64 Android key with a leading
-    zero byte in a coordinate (retry). Before this change the browser
-    stripped those to `none`.
+  - A statement the WebAuthn library cannot verify at all (a StrongBox-level
+    Android key, an unsupported format such as `android-safetynet`, the
+    one-in-64 Android key with a leading zero byte in a coordinate) is
+    dropped and the passkey recorded `none`, exactly as the browser strips it
+    when asked for none; so it is revoked with the phone like any other
+    `none` backup. The attested path (the setting off) still refuses such a
+    key.
   - The anchored ceremony does not ask the authenticator to enforce the
     credential protection policy as the attested one does. User verification
     is still required at registration and at every assertion.

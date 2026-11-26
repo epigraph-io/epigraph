@@ -28,6 +28,11 @@ webauthn-rs-core = "=0.5.5"
 x509-parser = "0.16"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Already in the tree through webauthn-rs-core (the same version, no
+# features): the anchored path re-encodes a statement the library cannot
+# verify as `none` (`stripped_to_none`), parsing the attestation object with
+# the parser the library reads it with.
+serde_cbor_2 = "0.13"
 uuid = { workspace = true }
 url = "2"
 base64 = "0.22"
