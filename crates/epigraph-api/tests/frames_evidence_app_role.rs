@@ -427,6 +427,43 @@ async fn the_owners_global_scoped_belief_lands_when_the_raw_pool_is_the_app_role
     );
 }
 
+/// Backlog 8fcc36a0: with the raw pool on the application role, as on prod,
+/// the submission's post-commit events (`evidence.submitted`, and
+/// `belief.updated` when the cache moved) PERSIST: they are written by
+/// `EventRepository::publish_or_log` on that raw pool, which swallows a
+/// refusal into a log line, so only a read of the table shows they landed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_submission_events_persist_when_the_raw_pool_is_the_app_role(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts, RawPool::AppRole).await;
+    let resp = submit(&w, w.owner).await;
+    let mf = resp["mass_function_id"]
+        .as_str()
+        .expect("mass_function_id")
+        .to_string();
+
+    let submitted: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT actor_id FROM events \
+          WHERE event_type = 'evidence.submitted' AND payload->>'mass_function_id' = $1",
+    )
+    .bind(&mf)
+    .fetch_all(&w.pool)
+    .await
+    .expect("read evidence.submitted");
+    assert_eq!(
+        submitted,
+        vec![Some(w.owner)],
+        "one persisted evidence.submitted, attributed to the owner (response {resp})"
+    );
+    assert_eq!(
+        belief_updated_frames(&w.pool, w.claim).await,
+        vec![w.frame],
+        "the owner's submission moved the cache: one persisted belief.updated"
+    );
+}
+
 /// Backlog 3adc219b (migration 308): the owner's SECOND submission on the
 /// frame replaces the global scoped belief in place rather than adding a row
 /// beside it. Before 308 the key was NULLS DISTINCT, so the upsert's
