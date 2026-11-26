@@ -219,7 +219,12 @@ async fn main() {
         return;
     }
 
-    let scoped = Arc::new(scoped);
+    // Vetted above (`privilege.bypass`), and the whole pool is the configured
+    // maintenance DSN, so it is attached as the maintenance pool the job
+    // handlers draw from: `ScopedPool::unscoped_for_maintenance` never falls
+    // back to an unattached pool (backlog e27ad9b6).
+    let maintenance = scoped.inner().clone();
+    let scoped = Arc::new(scoped.with_maintenance_pool(maintenance));
     let queue = epigraph_jobs::PostgresJobQueue::new(scoped.inner().clone());
     let (embedder, provider) = epigraph_api::embedding_restore::embedding_service_from_env();
     let runner = jobs_drain::build_job_runner(

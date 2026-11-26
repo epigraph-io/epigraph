@@ -311,7 +311,8 @@ async fn a_bypass_viewer_sees_everything(pool_opts: PgPoolOptions, conn_opts: Pg
         .to_string();
     let scoped = ScopedPool::connect(&format!("{prefix}/{db}"), SessionGucMode::Session)
         .await
-        .expect("ScopedPool::connect");
+        .expect("ScopedPool::connect")
+        .with_application_pool_maintenance_for_tests();
 
     let subject = seed_agent(&pool, "group").await;
 

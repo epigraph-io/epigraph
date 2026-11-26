@@ -15,6 +15,7 @@
 
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
+use epigraph_core::edge::relationships::{canonical_relationship, relationship_spellings};
 use epigraph_core::{
     AgentId, ClaimId, LinkStrength, SemanticLink, SemanticLinkId, SemanticLinkType,
 };
@@ -47,8 +48,15 @@ fn link_type_to_str(link_type: SemanticLinkType) -> &'static str {
 }
 
 /// Convert database string to `SemanticLinkType`
+///
+/// Matched on [`canonical_relationship`], so the upper-case spelling of a
+/// case-folded relationship (`SUPPORTS`, `CONTRADICTS`, written by the HTTP
+/// edge route and the DS evidence writers) maps like its lower-case twin. The
+/// fold is the closed list in `CASE_FOLDED_RELATIONSHIPS`, never a blanket
+/// `lower()`: `REFINES` (synthesis->synthesis) is a different relationship
+/// from `refines` and stays unknown here.
 fn str_to_link_type(s: &str) -> Result<SemanticLinkType, DbError> {
-    match s {
+    match canonical_relationship(s) {
         "supports" => Ok(SemanticLinkType::Supports),
         "contradicts" => Ok(SemanticLinkType::Contradicts),
         "derives_from" => Ok(SemanticLinkType::DerivesFrom),
@@ -274,12 +282,21 @@ impl SemanticLinkRepository {
 
     /// Get all semantic links of a specific type
     ///
-    /// Matches the lower-case spelling only (`relationship = $1`), so a
-    /// claim->claim row stored as `SUPPORTS` / `CONTRADICTS` is not returned.
-    /// That is deliberate for now and pinned in
-    /// `tests/relationship_param_spelling_lint.rs::KNOWN_BYTE_EXACT`: widening
-    /// the match also needs upper-case arms in `str_to_link_type`, which
-    /// rejects those spellings today.
+    /// Matches every stored spelling of the relationship
+    /// ([`relationship_spellings`]: `supports` and `SUPPORTS`, `contradicts`
+    /// and `CONTRADICTS`; one spelling for the others), bound as an array to
+    /// `relationship = ANY($1)` so the btree index on `edges.relationship`
+    /// stays usable. `str_to_link_type` maps both spellings.
+    ///
+    /// A mixed-case spelling (`Supports`) is NOT matched here, although
+    /// `str_to_link_type` (through `canonical_relationship`, which folds any
+    /// ASCII case) maps such a row when `get_by_source` / `get_by_target`
+    /// return it. That asymmetry is deliberate: an array bind can only carry
+    /// a finite spelling list, and no writer stores a mixed-case spelling
+    /// (every edge writer stores the lower-case form `canonical_relationship`
+    /// returns; older rows carry the upper-case form). Matching one would
+    /// need a `lower()` predicate, which gives up the index this query
+    /// relies on.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -289,13 +306,13 @@ impl SemanticLinkRepository {
         viewer: &crate::visibility::Viewer,
         link_type: SemanticLinkType,
     ) -> Result<Vec<SemanticLink>, DbError> {
-        let relationship = link_type_to_str(link_type);
+        let spellings = relationship_spellings(link_type_to_str(link_type));
 
         let sql = viewer.splice(
             r#"
             SELECT id, source_id, target_id, relationship, properties
             FROM edges
-            WHERE relationship = $1
+            WHERE relationship = ANY($1)
               AND source_type = 'claim'
               AND target_type = 'claim'
               /* {EDGE_VISIBILITY:edges} */
@@ -303,7 +320,7 @@ impl SemanticLinkRepository {
             "#,
             2,
         );
-        let mut q = sqlx::query_as::<_, EdgeRow>(&sql).bind(relationship);
+        let mut q = sqlx::query_as::<_, EdgeRow>(&sql).bind(spellings);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -464,6 +481,29 @@ mod tests {
             let s = link_type_to_str(link_type);
             let roundtrip = str_to_link_type(s).expect("Should parse valid link type");
             assert_eq!(roundtrip, link_type);
+        }
+    }
+
+    /// Backlog `be76e301`: the HTTP edge route and the DS evidence writers
+    /// store the case-folded relationships upper-case, so `SUPPORTS` and
+    /// `CONTRADICTS` are the same links as their lower-case spellings. A
+    /// non-folded upper-case relationship (`REFINES` is synthesis->synthesis)
+    /// stays unknown.
+    #[test]
+    fn test_str_to_link_type_maps_case_folded_upper_spellings() {
+        assert_eq!(
+            str_to_link_type("SUPPORTS").expect("SUPPORTS"),
+            SemanticLinkType::Supports
+        );
+        assert_eq!(
+            str_to_link_type("CONTRADICTS").expect("CONTRADICTS"),
+            SemanticLinkType::Contradicts
+        );
+        for not_folded in ["REFINES", "DERIVES_FROM", "ANALOGOUS"] {
+            assert!(
+                str_to_link_type(not_folded).is_err(),
+                "{not_folded} is not a case-folded relationship and must not map"
+            );
         }
     }
 

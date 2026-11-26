@@ -2070,9 +2070,10 @@ impl PrivatizationRepository {
     /// connection is established, not on each checkout, and `ScopedPool`'s
     /// `after_release` scrub covers the three tenancy GUCs and nothing else. So
     /// the bound outlived the request and applied to whatever ran next on that
-    /// connection — and `ScopedPool::maintenance_inner()` falls back to the
-    /// APPLICATION pool when no dedicated maintenance pool is attached, which is
-    /// what every fixture does. A privatization preview could therefore pin a
+    /// connection — and the maintenance connection used to be drawn from the
+    /// APPLICATION pool when no dedicated maintenance pool was attached, which is
+    /// what every fixture does (today only through the test-only opt-in;
+    /// production refuses, backlog e27ad9b6). A privatization preview could therefore pin a
     /// 30-second cap on a request-path connection.
     ///
     /// So the prior value is read with `SHOW`, and restored on EVERY exit

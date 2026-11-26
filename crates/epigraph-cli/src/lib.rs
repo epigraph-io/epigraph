@@ -221,6 +221,11 @@ impl MaintenancePool {
         )
         .await?;
         epigraph_db::assert_maintenance_privilege(scoped.inner(), source, context).await?;
+        // The whole pool IS the vetted maintenance DSN, so it is attached as
+        // the maintenance pool explicitly: `ScopedPool::unscoped_for_maintenance`
+        // never falls back to an unattached pool (backlog e27ad9b6).
+        let maintenance = scoped.inner().clone();
+        let scoped = scoped.with_maintenance_pool(maintenance);
         Ok(Self { scoped, source })
     }
 
@@ -247,7 +252,11 @@ impl MaintenancePool {
     /// borrow checker's job.
     ///
     /// # Errors
-    /// `DbError::ConnectionFailed` if the connection cannot be acquired.
+    /// * `DbError::ConnectionFailed` if the connection cannot be acquired.
+    /// * `DbError::MaintenancePoolNotAttached` if no maintenance pool is
+    ///   attached. Unreachable for a pool built by [`Self::connect_to`], which
+    ///   attaches its own vetted pool after the privilege check; listed so a
+    ///   future constructor that skips the attach is caught by its callers.
     pub async fn viewer(
         &self,
         reason: epigraph_db::visibility::SystemReason,

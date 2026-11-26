@@ -946,6 +946,19 @@ impl From<DbError> for ApiError {
                     message: "ELEVATED ACCESS NOT RECORDED: the response is withheld",
                 }
             }
+            // Fail-closed (backlog e27ad9b6): maintenance work asked of a pool
+            // with no maintenance pool attached. A server-side fault; logged,
+            // not sent.
+            DbError::MaintenancePoolNotAttached { reason } => {
+                tracing::error!(
+                    target: "tenancy.maintenance",
+                    reason,
+                    "maintenance connection refused: no maintenance pool is attached"
+                );
+                ApiError::InternalErrorStatic {
+                    message: "this server holds no maintenance connection for this operation",
+                }
+            }
             DbError::MigrationFailed { source } => {
                 tracing::error!(error = %source, "Database migration failed");
                 ApiError::DatabaseError {
@@ -1072,6 +1085,41 @@ mod tests {
                 .any(|l| l.contains("the repository refused the request") && l.contains(ID))
                 .then_some(())
                 .ok_or_else(|| "no refusal warn line carries the refusal's text".to_string())
+        });
+    }
+
+    /// A maintenance lease refused for want of a maintenance pool (backlog
+    /// e27ad9b6) is a server fault: a 500 with a fixed body that names no
+    /// maintenance reason, and an error line on the `tenancy.maintenance`
+    /// target that does, so an operator can find the unwired path.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_missing_maintenance_pool_is_a_logged_500_naming_no_reason() {
+        let (status, body) = rendered(ApiError::from(DbError::MaintenancePoolNotAttached {
+            reason: "belief_recomputation",
+        }))
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body.contains("holds no maintenance connection"),
+            "the fixed body reaches the caller: {body}"
+        );
+        assert!(
+            !body.contains("belief_recomputation"),
+            "the maintenance reason stays in the log: {body}"
+        );
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|l| {
+                    l.contains("ERROR")
+                        && l.contains("tenancy.maintenance")
+                        && l.contains("maintenance connection refused")
+                        && l.contains("belief_recomputation")
+                })
+                .then_some(())
+                .ok_or_else(|| "no error line names the refused maintenance reason".to_string())
         });
     }
 
