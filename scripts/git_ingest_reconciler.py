@@ -221,21 +221,39 @@ def _pr_from_row(r: dict) -> "PullRequest | None":
         author=(r.get("user") or {}).get("login") or "", merged_at=ma,
     )
 
+PULLS_PER_PAGE = 100  # the pulls API's largest page
+
 def discover_merged_prs(slug: str, env: dict, cutoff: datetime.datetime) -> list[PullRequest]:
-    """The repo's PRs merged at or after `cutoff`."""
-    rows = _gh_json(
-        [f"repos/{slug}/pulls", "-X", "GET",
-         "--field", "state=closed", "--field", "sort=updated",
-         "--field", "direction=desc", "--field", "per_page=50",
-         "--paginate", "--slurp"],
-        env,
-    )
+    """The repo's PRs merged at or after `cutoff`.
+
+    The closed-PR listing is ordered by updated_at, newest first, and a PR's
+    updated_at is never before its merged_at, so paging stops at the first
+    page that ends before `cutoff` (or is short): no later page holds a PR
+    merged after it. Stopping on updated_at, not merged_at, matters: a comment
+    on a PR merged long ago lifts it to the top of the listing.
+
+    A PR updated while the pages are read can shift a row across a page
+    boundary; the next run's overlap (`compute_cutoff`) picks it up."""
     out = []
-    for r in rows:
-        pr = _pr_from_row(r)
-        if pr is not None and _parse_ts(pr.merged_at) >= cutoff:
-            out.append(pr)
-    return out
+    page = 1
+    while True:
+        rows = _gh_json(
+            [f"repos/{slug}/pulls", "-X", "GET",
+             "--field", "state=closed", "--field", "sort=updated",
+             "--field", "direction=desc", "--field", f"per_page={PULLS_PER_PAGE}",
+             "--field", f"page={page}"],
+            env,
+        )
+        for r in rows:
+            pr = _pr_from_row(r)
+            if pr is not None and _parse_ts(pr.merged_at) >= cutoff:
+                out.append(pr)
+        if len(rows) < PULLS_PER_PAGE:
+            return out
+        last = rows[-1].get("updated_at")
+        if last and _parse_ts(last) < cutoff:
+            return out
+        page += 1
 
 def fetch_pr(slug: str, number: int, env: dict) -> "PullRequest | None":
     """One PR by number (for the retry list); None when it is not merged."""

@@ -130,6 +130,14 @@ class RebaseRangeTests(unittest.TestCase):
                 self.assertEqual(gir.compute_rev_range(d, m, _api_commits(d, shas)), f"{m}~1..{m}")
             self.assertEqual(gir.compute_rev_range(d, m, _api_commits(d, shas)), f"{m}~3..{m}")
 
+UTC = datetime.timezone.utc
+
+def _row(n, merged_at, updated_at=None, sha=None):
+    """A merged PR as the pulls API lists it."""
+    return {"number": n, "title": f"fix(x): pr {n}", "body": "", "merge_commit_sha": sha or f"m{n}",
+            "base": {"sha": "b"}, "user": {"login": "u"}, "merged_at": merged_at,
+            "updated_at": updated_at or merged_at}
+
 class DiscoverTests(unittest.TestCase):
     def test_filters_to_merged_within_window(self):
         now = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=datetime.timezone.utc)
@@ -148,51 +156,69 @@ class DiscoverTests(unittest.TestCase):
         self.assertEqual(prs[0].base_sha, "bbb")
         self.assertEqual(prs[0].author, "u")
 
-    def test_paginated_slurp_pages_parse_through_real_gh_json(self):
-        # Regression for the --paginate + json.loads defect: gh --paginate WITHOUT
-        # --slurp emits one JSON array per page, concatenated ("[...]\n[...]"), which
-        # a single json.loads cannot parse. --slurp wraps all pages in ONE outer
-        # array. This test mocks subprocess.run (NOT _gh_json), so the real parse
-        # path runs against the two-page slurp shape; the older DiscoverTests mocked
-        # _gh_json and never exercised it.
-        now = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=datetime.timezone.utc)
-        page1 = [
-            {"number": 1, "title": "feat: x", "body": "b", "merge_commit_sha": "aaa",
-             "base": {"sha": "bbb"}, "user": {"login": "u"},
-             "merged_at": "2026-06-03T11:30:00Z"},               # in window
-            {"number": 2, "title": "old", "body": "", "merge_commit_sha": "ccc",
-             "base": {"sha": "ddd"}, "user": {"login": "u"},
-             "merged_at": "2026-06-01T00:00:00Z"},                # too old
+    def _paged(self, pages):
+        """A `subprocess.run` that answers `gh api .../pulls ... page=N` with
+        `pages[N-1]` through the real `_gh_json` parse, and fails the test if
+        a page past the given ones is requested."""
+        def run(argv, **kw):
+            page = int(next(a for a in argv if a.startswith("page=")).split("=", 1)[1])
+            self.assertLessEqual(page, len(pages), f"page {page} fetched")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(pages[page - 1]), "")
+        return mock.patch.object(gir.subprocess, "run", side_effect=run)
+
+    def test_paging_stops_once_a_page_ends_before_the_cutoff(self):
+        # Backlog 39dfef78: `--paginate` walked every closed PR the repo ever
+        # had on every run. The listing is ordered by updated_at, newest first,
+        # and a PR's updated_at is never before its merged_at, so once a page
+        # ends before the cutoff, no later page holds a PR merged after it.
+        cutoff = datetime.datetime(2026, 6, 3, 11, 0, tzinfo=UTC)
+        unmerged = {**_row(3, None, "2026-06-03T11:55:00Z"), "merge_commit_sha": None}
+        pages = [
+            [_row(1, "2026-06-03T11:50:00Z"), unmerged],
+            [_row(4, "2026-06-03T11:20:00Z"), _row(2, "2026-06-01T00:00:00Z")],
+            [_row(9, "2026-05-01T00:00:00Z")],  # must not be fetched
         ]
-        page2 = [
-            {"number": 4, "title": "feat: y", "body": "", "merge_commit_sha": "eee",
-             "base": {"sha": "fff"}, "user": {"login": "v"},
-             "merged_at": "2026-06-03T11:45:00Z"},               # in window (page 2)
-            {"number": 3, "title": "open", "body": "", "merge_commit_sha": None,
-             "base": {"sha": "e"}, "user": {"login": "u"}, "merged_at": None},  # not merged
+        with mock.patch.object(gir, "PULLS_PER_PAGE", 2), self._paged(pages[:2]) as run:
+            prs = gir.discover_merged_prs("o/r", {}, cutoff)
+        self.assertEqual([p.number for p in prs], [1, 4])
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("--paginate", run.call_args.args[0])
+
+    def test_an_old_pr_updated_recently_does_not_stop_paging(self):
+        # A comment on a PR merged last month moves it to the top of the
+        # listing; its merged_at is no reason to stop, its updated_at is.
+        cutoff = datetime.datetime(2026, 6, 3, 11, 0, tzinfo=UTC)
+        pages = [
+            [{**_row(7, "2026-06-03T11:58:00Z"), "merge_commit_sha": None, "merged_at": None},
+             _row(2, "2026-05-01T00:00:00Z", "2026-06-03T11:55:00Z")],
+            [_row(4, "2026-06-03T11:20:00Z"), _row(1, "2026-05-02T00:00:00Z")],
         ]
-        # --slurp output is one outer array of pages, each page a JSON array.
-        slurp_stdout = json.dumps([page1, page2])
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=slurp_stdout, stderr="")
-        with mock.patch.object(gir.subprocess, "run", return_value=completed) as run:
-            prs = gir.discover_merged_prs("epigraph-io/epigraph", {}, now - datetime.timedelta(minutes=60))
-        # Both pages' in-window merged PRs survive (1 from page1, 4 from page2); the
-        # too-old #2 and unmerged #3 are dropped. Proves cross-page flattening works.
-        self.assertEqual(sorted(p.number for p in prs), [1, 4])
-        # The call MUST request --slurp (alongside --paginate); without it the real
-        # gh would emit concatenated arrays and json.loads would raise. This pins
-        # the fix so a future drop of --slurp fails the suite.
-        called_args = run.call_args.args[0]
-        self.assertIn("--paginate", called_args)
-        self.assertIn("--slurp", called_args)
+        with mock.patch.object(gir, "PULLS_PER_PAGE", 2), self._paged(pages):
+            prs = gir.discover_merged_prs("o/r", {}, cutoff)
+        self.assertEqual([p.number for p in prs], [4])
+
+    def test_a_short_page_is_the_last(self):
+        cutoff = datetime.datetime(2026, 6, 3, 11, 0, tzinfo=UTC)
+        with mock.patch.object(gir, "PULLS_PER_PAGE", 2), \
+             self._paged([[_row(1, "2026-06-03T11:50:00Z")]]) as run:
+            self.assertEqual([p.number for p in gir.discover_merged_prs("o/r", {}, cutoff)], [1])
+        self.assertEqual(run.call_count, 1)
 
     def test_concatenated_pages_without_slurp_would_crash(self):
-        # Documents WHY --slurp is required: the pre-fix shape (concatenated
-        # per-page arrays, no outer wrapper) is what plain --paginate emits, and a
-        # single json.loads raises JSONDecodeError ("Extra data") on it.
+        # Why `fetch_pr_commits` keeps --slurp with --paginate: plain --paginate
+        # emits one JSON array per page, concatenated, and a single json.loads
+        # raises JSONDecodeError ("Extra data") on it.
         concatenated = '[{"number": 1}]\n[{"number": 2}]\n'
         with self.assertRaises(json.JSONDecodeError):
             json.loads(concatenated)
+
+    def test_slurped_pages_flatten_through_real_gh_json(self):
+        pages = [[{"sha": "a"}], [{"sha": "b"}]]
+        done = subprocess.CompletedProcess([], 0, json.dumps(pages), "")
+        with mock.patch.object(gir.subprocess, "run", return_value=done) as run:
+            rows = gir.fetch_pr_commits("o/r", 9, {})
+        self.assertEqual([r["sha"] for r in rows], ["a", "b"])
+        self.assertIn("--slurp", run.call_args.args[0])
 
 class MirrorTests(unittest.TestCase):
     def test_clone_then_fetch(self):
@@ -230,14 +256,6 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(val("--repo"), "/m")
         self.assertEqual(val("--endpoint"), "http://127.0.0.1:8080")
         self.assertIn("--dry-run", argv)
-
-UTC = datetime.timezone.utc
-
-def _row(n, merged_at, updated_at=None, sha=None):
-    """A merged PR as the pulls API lists it."""
-    return {"number": n, "title": f"fix(x): pr {n}", "body": "", "merge_commit_sha": sha or f"m{n}",
-            "base": {"sha": "b"}, "user": {"login": "u"}, "merged_at": merged_at,
-            "updated_at": updated_at or merged_at}
 
 class FakeGitHub:
     """Answers `_gh_json` like GitHub: the closed-PR listing (most recently
