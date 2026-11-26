@@ -492,6 +492,68 @@ async fn a_placeholder_doi_is_refused_and_writes_nothing() {
     assert_eq!(body["doi"], real.as_str(), "{body}");
 }
 
+/// Backlog cc71759f: a placeholder behind a DOI resolver prefix or with a
+/// trailing `/` is still a placeholder. The writer tested the raw value, so
+/// `doi:unknown` (not a bare DOI, so stored verbatim) gave every caller
+/// posting it one shared row. Refused with 400 like the bare spelling, and no
+/// row is written under the spelling or its folded bare placeholder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefixed_or_slashed_placeholder_doi_is_refused_and_writes_nothing() {
+    let (url, pool) = connect().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:read"]).await;
+
+    for (spelling, bare) in [
+        ("doi:unknown", "unknown"),
+        ("DOI: n/a", "n/a"),
+        ("https://doi.org/unknown", "unknown"),
+        ("HTTPS://DX.DOI.ORG/TBD", "tbd"),
+        ("doi.org/none", "none"),
+        ("doi:https://doi.org/null", "null"),
+        ("unknown/", "unknown"),
+        ("doi:unknown/", "unknown"),
+        ("https://doi.org/", ""),
+    ] {
+        let key = spelling.trim().to_ascii_lowercase();
+        let before = (
+            rows_keyed_on_folded(&pool, &key).await,
+            rows_keyed_on_folded(&pool, bare).await,
+        );
+        let (status, body) = post_paper(addr, &token, spelling).await;
+        assert_eq!(
+            status, 400,
+            "POST doi={spelling:?} must be refused as a placeholder: {body}"
+        );
+        assert_eq!(body["details"]["field"], "doi", "{spelling:?}: {body}");
+        assert!(
+            body["details"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("placeholder")),
+            "{spelling:?}: the refusal names the reason: {body}"
+        );
+        assert_eq!(
+            (
+                rows_keyed_on_folded(&pool, &key).await,
+                rows_keyed_on_folded(&pool, bare).await,
+            ),
+            before,
+            "{spelling:?}: no paper row written"
+        );
+    }
+
+    // Near misses: a real DOI behind a prefix, and a non-DOI URL whose path
+    // is a placeholder word, are identities and are stored.
+    let real = format!("10.5555/unknown.{}", Uuid::new_v4());
+    let (status, body) = post_paper(addr, &token, &format!("doi:{real}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["doi"], real.as_str(), "{body}");
+    let page = format!("https://example.org/unknown-{}", Uuid::new_v4());
+    let (status, body) = post_paper(addr, &token, &page).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["doi"], page.as_str(), "{body}");
+}
+
 /// Backlog f3a3ca54: a legacy row keyed on a resolver URL whose prefix differs
 /// from the listed spellings only in letter case (`HTTPS://DOI.ORG/...`) is
 /// found by the bare DOI on both routes, and the writer reuses it rather than

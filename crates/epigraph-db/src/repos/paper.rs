@@ -1888,16 +1888,43 @@ pub fn peel_document_key_prefixes(t: &str) -> Option<&str> {
 /// sources to the belief engine.
 #[must_use]
 pub fn document_identity_key(raw: &str) -> Option<String> {
-    let t = raw.trim();
-    let t = peel_document_key_prefixes(t)
-        .unwrap_or(t)
-        .trim()
-        .trim_end_matches('/');
-    if t.is_empty() || t.contains("://") || epigraph_core::domain::evidence::is_placeholder_id(t) {
+    let t = peeled_document_key(raw);
+    if t.contains("://") || epigraph_core::domain::evidence::is_placeholder_id(t) {
         None
     } else {
         Some(t.to_ascii_lowercase())
     }
+}
+
+/// `raw` with every [`DOI_KEY_PREFIXES`] spelling peeled
+/// ([`peel_document_key_prefixes`]), trimmed, trailing `/` removed: the part
+/// of a document key that names the document. Shared by
+/// [`document_identity_key`] and [`is_placeholder_document_key`], so what the
+/// belief engine treats as no identity and what a writer refuses cannot drift.
+fn peeled_document_key(raw: &str) -> &str {
+    let t = raw.trim();
+    peel_document_key_prefixes(t)
+        .unwrap_or(t)
+        .trim()
+        .trim_end_matches('/')
+}
+
+/// True when the document key `raw` means "this document has no identifier":
+/// once its DOI resolver prefixes and trailing `/` are peeled
+/// ([`peeled_document_key`]), it is blank or a placeholder
+/// (`epigraph_core::domain::evidence::is_placeholder_id`: "unknown", "n/a",
+/// ...). So `doi:unknown`, `https://doi.org/unknown`, `unknown/` and a bare
+/// resolver root (`https://doi.org/`) are placeholders, as `unknown` is
+/// (backlog cc71759f): keyed on one, every DOI-less document posted with it
+/// collapsed onto one paper row.
+///
+/// The test both transports' writers apply to a document key: the REST paper
+/// route refuses one, and the MCP ingest tools treat one as absent. Unlike
+/// [`document_identity_key`], a URL that is not a DOI resolver link
+/// (`https://example.org/report`) is NOT a placeholder: it is a usable key.
+#[must_use]
+pub fn is_placeholder_document_key(raw: &str) -> bool {
+    epigraph_core::domain::evidence::is_placeholder_id(peeled_document_key(raw))
 }
 
 /// The case-variant arm shared by [`document_key_match_sql`] and
@@ -2151,6 +2178,43 @@ mod document_key_tests {
             "https://example.org/articles/10.5555/x",
         ] {
             assert_eq!(document_identity_key(none), None, "{none:?}");
+        }
+    }
+
+    /// Backlog cc71759f: a placeholder behind a DOI resolver prefix, or with
+    /// a trailing `/`, is still a placeholder. Spellings are literal, not
+    /// built from the shared lists, so emptying a list cannot pass this.
+    #[test]
+    fn a_prefixed_or_slashed_placeholder_is_a_placeholder() {
+        for raw in [
+            "unknown",
+            " N/A ",
+            "",
+            "doi:unknown",
+            "DOI: unknown",
+            "https://doi.org/unknown",
+            "HTTPS://DX.DOI.ORG/N/A",
+            "doi.org/tbd",
+            "doi:https://doi.org/none",
+            "unknown/",
+            "doi:unknown/",
+            "https://doi.org/null/",
+            "https://doi.org/",
+            "doi:",
+            "/",
+        ] {
+            assert!(is_placeholder_document_key(raw), "{raw:?}");
+        }
+        for key in [
+            "10.5555/unknown",
+            "doi:10.5555/unknown",
+            "https://doi.org/10.5555/n/a",
+            "https://example.org/unknown",
+            "https://doi.org/about",
+            "urn:epigraph:doc:unknown-0123456789abcdef",
+            "unknown-run-7",
+        ] {
+            assert!(!is_placeholder_document_key(key), "{key:?}");
         }
     }
 

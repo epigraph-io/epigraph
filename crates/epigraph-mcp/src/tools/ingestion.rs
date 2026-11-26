@@ -719,7 +719,7 @@ pub async fn check_already_ingested(
 /// # Errors
 /// `invalid_params` when `doi` is a placeholder.
 pub fn refuse_placeholder_document_key(doi: &str) -> Result<(), McpError> {
-    if is_placeholder_id(doi) {
+    if is_placeholder_document_key(doi) {
         return Err(invalid_params(format!(
             "{doi:?} is a placeholder, not a document identity. Documents with no DOI are keyed \
              on a synthesized `urn:epigraph:doc:*` key — pass the `document_key` the ingest \
@@ -2229,8 +2229,10 @@ const SYNTHETIC_KEY_PREFIX: &str = "urn:epigraph:doc:";
 // onto a single shared `papers` row (issue #356 — one node had accrued 1244
 // claims from at least four unrelated sources, with their author lists
 // unioned). The list lives in epigraph-core so the belief engine's source key
-// rejects exactly the same values.
-use epigraph_core::domain::evidence::is_placeholder_id;
+// rejects exactly the same values. Every key a caller supplies is tested with
+// its DOI resolver prefixes and trailing `/` peeled, so `doi:unknown`,
+// `https://doi.org/unknown` and `unknown/` are absent too (backlog cc71759f).
+use epigraph_db::repos::paper::is_placeholder_document_key;
 
 /// Legible-but-bounded slug for the human-readable half of a synthetic key:
 /// lowercased, non-alphanumerics collapsed to single `-`, capped at 48 bytes on
@@ -2270,7 +2272,7 @@ fn key_slug(s: &str) -> String {
 ///    why `external_id` is the documented path for authored records.
 fn synthetic_document_key(source: &DocumentSource) -> String {
     let (basis, slug_seed) = match source.external_id.as_deref() {
-        Some(ext) if !is_placeholder_id(ext) => {
+        Some(ext) if !is_placeholder_document_key(ext) => {
             (format!("external_id\u{1f}{}", ext.trim()), ext.to_string())
         }
         _ => {
@@ -2346,8 +2348,10 @@ pub(crate) use epigraph_db::repos::paper::canonical_document_key;
 /// `external_id` (synthesized key) → plain `uri` → metadata-synthesized key.
 /// A DOI given as a resolver URL or `doi:` (in `doi` or in `uri`) is keyed on
 /// the bare DOI ([`canonical_document_key`]).
-/// Placeholder DOIs/URIs/external ids (`"unknown"`, `"n/a"`, empty, …) are
-/// treated as absent so they fall through instead of becoming a shared bucket.
+/// Placeholder DOIs/URIs/external ids (`"unknown"`, `"n/a"`, empty, …, also
+/// behind a resolver prefix or with a trailing `/`: `doi:unknown`,
+/// `https://doi.org/unknown`, `unknown/`) are treated as absent so they fall
+/// through instead of becoming a shared bucket.
 ///
 /// `external_id` outranks a plain `uri` (backlog b69dfb91): a uri is where a
 /// document lives, and several works can live at one (an ELN notebook page, a
@@ -2360,7 +2364,7 @@ pub(crate) use epigraph_db::repos::paper::canonical_document_key;
 /// merged node this rule exists to stop reusing.
 fn resolve_doi(extraction: &DocumentExtraction) -> String {
     if let Some(d) = &extraction.source.doi {
-        if !is_placeholder_id(d) {
+        if !is_placeholder_document_key(d) {
             return canonical_document_key(d);
         }
         tracing::warn!(
@@ -2373,9 +2377,9 @@ fn resolve_doi(extraction: &DocumentExtraction) -> String {
         .source
         .external_id
         .as_deref()
-        .is_some_and(|ext| !is_placeholder_id(ext));
+        .is_some_and(|ext| !is_placeholder_document_key(ext));
     if let Some(uri) = &extraction.source.uri {
-        if !is_placeholder_id(uri) {
+        if !is_placeholder_document_key(uri) {
             // Hand-rolled arXiv pattern: \d{4}\.\d{4,5}. It matches any digit
             // run, so against an external_id it counts only when the uri
             // names arXiv (host or `arXiv:` scheme); a date-shaped path
@@ -3352,6 +3356,90 @@ mod tests {
         let mut other = src("Run 4 summary");
         other.doi = Some("unknown".to_string());
         assert_ne!(resolve_doi(&extraction_of(other)), baseline);
+    }
+
+    /// Backlog cc71759f: a placeholder behind a DOI resolver prefix, or with a
+    /// trailing `/`, is absent in EVERY arm that reads a caller key (`doi`,
+    /// `uri`, `external_id`): the document keys exactly as it does with the
+    /// arm empty, and two documents carrying the same spelling do not share a
+    /// key. Before, `doi:unknown` was kept verbatim (it is not a bare DOI, so
+    /// `canonical_document_key` leaves it), and every DOI-less document posted
+    /// with it landed on one `papers` row. Spellings are literal.
+    #[test]
+    fn prefixed_or_slashed_placeholders_are_absent_in_every_arm() {
+        let spellings = [
+            "doi:unknown",
+            "DOI: n/a",
+            "https://doi.org/unknown",
+            "HTTP://DX.DOI.ORG/TBD",
+            "doi.org/none",
+            "unknown/",
+            "doi:unknown/",
+            "https://doi.org/",
+        ];
+        type Set = fn(&mut DocumentSource, String);
+        let arms: [(&str, Set); 3] = [
+            ("doi", |s, v| s.doi = Some(v)),
+            ("uri", |s, v| s.uri = Some(v)),
+            ("external_id", |s, v| s.external_id = Some(v)),
+        ];
+        let baseline = resolve_doi(&extraction_of(src("Run 3 summary")));
+        let other = resolve_doi(&extraction_of(src("Run 4 summary")));
+        assert_ne!(baseline, other);
+        for (arm, set) in arms {
+            for spelling in spellings {
+                let mut a = src("Run 3 summary");
+                set(&mut a, spelling.to_string());
+                let mut b = src("Run 4 summary");
+                set(&mut b, spelling.to_string());
+                let (ka, kb) = (
+                    resolve_doi(&extraction_of(a)),
+                    resolve_doi(&extraction_of(b)),
+                );
+                assert_eq!(
+                    ka, baseline,
+                    "{arm}={spelling:?} was kept as an identity key: {ka}"
+                );
+                assert_eq!(kb, other, "{arm}={spelling:?}: {kb}");
+            }
+        }
+        // A real external_id still outranks a uri whose placeholder hides
+        // behind a resolver prefix: the uri arm is skipped, not keyed.
+        let mut s = src("Run 3 summary");
+        s.uri = Some("https://doi.org/unknown".to_string());
+        s.external_id = Some("eln-run-v2".to_string());
+        let mut t = src("Run 3 summary");
+        t.external_id = Some("eln-run-v2".to_string());
+        assert_eq!(
+            resolve_doi(&extraction_of(s)),
+            resolve_doi(&extraction_of(t))
+        );
+    }
+
+    /// The `check_already_ingested` gate (and its HTTP twin) refuses a
+    /// prefixed or slashed placeholder as it refuses a bare one, and still
+    /// answers for a real key that merely contains a placeholder word.
+    #[test]
+    fn the_gate_refuses_prefixed_or_slashed_placeholders() {
+        for raw in [
+            "unknown",
+            "doi:unknown",
+            "https://doi.org/unknown",
+            "unknown/",
+            "https://doi.org/",
+        ] {
+            let err = refuse_placeholder_document_key(raw)
+                .expect_err(&format!("{raw:?} must be refused"));
+            assert!(err.message.contains("placeholder"), "{raw:?}: {err:?}");
+        }
+        for key in [
+            "10.5555/unknown",
+            "doi:10.5555/unknown",
+            "https://example.org/unknown",
+            "urn:epigraph:doc:unknown-0123456789abcdef",
+        ] {
+            assert!(refuse_placeholder_document_key(key).is_ok(), "{key:?}");
+        }
     }
 
     #[test]
