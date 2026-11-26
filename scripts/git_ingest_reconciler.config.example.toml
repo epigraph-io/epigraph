@@ -1,7 +1,7 @@
 # scripts/git_ingest_reconciler.config.example.toml — copy to the state dir as config.toml
 repos = ["epigraph-io/epigraph"]   # pilot: epigraph only; add slugs to expand
 endpoint = "http://127.0.0.1:8080"
-window_minutes = 240               # generous overlap; idempotency (Plan 2.5) tolerates re-scan
+window_minutes = 240               # overlap before the saved cursor (the first run scans this far back); idempotency (Plan 2.5) tolerates re-scan
 state_dir = "/var/lib/epiclaw/git-ingest"
 ingest_git_bin = "<path to the built ingest_git>"  # e.g. target/release/ingest_git
 # token_file = "<file holding an API Bearer token>"  # re-read each run; else $EPIGRAPH_TOKEN
