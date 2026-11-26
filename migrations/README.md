@@ -5132,6 +5132,31 @@ restart.
   (`approve-client --owner`). Undo: `docs/runbooks/348-undo.sql` (refuses while an agent client has no
   owner, including the rows 348 cleared). **Deploy order:** migrate BEFORE the API binary of this change (it registers an agent with
   no owner, which 001's CHECK refuses); an older API runs on 348 unchanged.
+- **350**: `identity_attestor_isolation_admin_createrole` (backlog cfaa5065). 161's
+  `epigraph_identity_attestor_faults()` named a non-superuser that can act as the attestor NOW
+  (USAGE or SET), so it passed two roles that can make themselves the attestor and then register
+  any agent identity under any parent: a holder of ADMIN OPTION alone (on PostgreSQL 16 `WITH
+  ADMIN TRUE, INHERIT FALSE, SET FALSE` confers neither USAGE nor SET, but its holder can grant
+  the role to itself) and any non-superuser CREATEROLE role. Re-states the function (161's
+  signature, SECURITY INVOKER, owner and ACL; on 172's `pg_catalog, pg_temp` path, every name
+  qualified) with the three arms 251 and 257 apply to their own roles: any non-superuser MEMBER
+  in any form, any non-superuser ADMIN OPTION holder (named once per role), any non-superuser
+  CREATEROLE role other than the attestor. No exemption for the migration runner: 251, which
+  applies first, already refuses a non-superuser migrating login and any non-superuser
+  CREATEROLE role, and every arm excludes superusers. Then refuses (55000, nothing changed)
+  while the attestor exists and is not isolated; a cluster without the role (161 could not
+  create it) is unchanged. Precondition: 161's body (md5 `31cac2063a345bfff500e75b4095c4fa`) on
+  271's path, else 55000. `epigraph-tenancy-backfill verify` now runs the function (skipped
+  with a NOTE before 161 or without the role) and reports each fault. Pinned by
+  `epigraph-db/tests/identity_attestor_isolation.rs` (the ADMIN-only holder, the CREATEROLE
+  role, the superuser and revoke controls, the migrate-time refusal, the undo),
+  `schema_contract.rs::migration_350_attestor_isolation_check_is_complete` and
+  `tenancy_backfill`'s `verify_reports_an_attestor_that_is_not_isolated`. Undo:
+  `docs/runbooks/350-undo.sql` (161's body on 271's path, byte for byte). **Measure first**
+  (350 refuses on any row): `SELECT r.rolname FROM pg_roles r WHERE NOT r.rolsuper AND
+  r.rolname <> 'epigraph_identity_attestor' AND (r.rolcreaterole OR pg_has_role(r.oid,
+  'epigraph_identity_attestor', 'MEMBER'));`. No binary depends on it.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

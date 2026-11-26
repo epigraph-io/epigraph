@@ -3082,6 +3082,61 @@ async fn verify_operator_link_retirer_isolation(
     Ok(faults.len())
 }
 
+/// The role migration 161 gates agent-identity registration on.
+const IDENTITY_ATTESTOR_ROLE: &str = "epigraph_identity_attestor";
+
+/// Migrations 161 and 350 (backlog cfaa5065): no role but the host may act as
+/// [`IDENTITY_ATTESTOR_ROLE`], which alone may execute
+/// `epigraph_register_agent_identity`. Both migrations refuse to apply over an
+/// attestor that is not isolated, but a grant made after them (a hand
+/// `GRANT ... WITH ADMIN OPTION`, a new CREATEROLE login) silently lets that
+/// login register any identity under any parent; this reports it. Every fault
+/// `epigraph_identity_attestor_faults()` names is a failure (from 350 on it
+/// names ADMIN OPTION holders and non-superuser CREATEROLE roles as well as
+/// members). Skipped with a NOTE when the function does not exist (before
+/// 161) or the role does not (it is optional: a cluster where 161 could not
+/// create it registers no identities). On a `&mut PgConnection` so a test can
+/// stage a grant in a transaction it never commits (roles are cluster-wide).
+async fn verify_identity_attestor_isolation(
+    conn: &mut sqlx::PgConnection,
+) -> anyhow::Result<usize> {
+    let (function, role): (bool, bool) = sqlx::query_as(
+        "SELECT to_regprocedure('public.epigraph_identity_attestor_faults()') IS NOT NULL, \
+                EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)",
+    )
+    .bind(IDENTITY_ATTESTOR_ROLE)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !function {
+        eprintln!(
+            "NOTE: skipping the attestor isolation check: migration 161 has not been applied, \
+             so public.epigraph_identity_attestor_faults() does not exist."
+        );
+        return Ok(0);
+    }
+    if !role {
+        eprintln!(
+            "NOTE: skipping the attestor isolation check: the role \
+             '{IDENTITY_ATTESTOR_ROLE}' does not exist, so no host registers agent identities \
+             here (docs/deploy.md, migration 161)."
+        );
+        return Ok(0);
+    }
+    let faults: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(public.epigraph_identity_attestor_faults())")
+            .fetch_all(&mut *conn)
+            .await?;
+    for fault in &faults {
+        eprintln!(
+            "FAIL: '{IDENTITY_ATTESTOR_ROLE}' (migrations 161, 350) is not isolated: {fault}. \
+             Only the host may act as that role, which alone registers agent identities; a \
+             non-superuser that can act as it, or grant it to itself, can register any identity \
+             under any parent. Revoke the grant or the attribute."
+        );
+    }
+    Ok(faults.len())
+}
+
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
 /// actually EXISTS on this database.
 ///
@@ -4636,6 +4691,7 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     failures += verify_definer_ownership(pool).await?;
     failures += verify_dedicated_definer_owners(pool).await?;
     failures += verify_operator_link_retirer_isolation(&mut *pool.acquire().await?).await?;
+    failures += verify_identity_attestor_isolation(&mut *pool.acquire().await?).await?;
     failures += verify_operator_function_grants(pool).await?;
     failures += verify_no_maintenance_create_on_public(pool).await?;
     failures += verify_role_holder_write_check_coverage(pool).await?;
@@ -5761,6 +5817,87 @@ mod definer_register_tests {
         assert!(
             admin_faults >= 1,
             "an ADMIN-only holder of the retirer role is reported"
+        );
+        assert_eq!(clean, 0, "CONTROL: with the grant revoked it passes");
+        assert_eq!(
+            creator_faults, 1,
+            "a non-superuser CREATEROLE login is reported"
+        );
+    }
+
+    /// Migrations 161 and 350's attestor isolation, re-checked by `verify`
+    /// (backlog cfaa5065): a non-superuser granted the attestor WITH ADMIN
+    /// OPTION only (no INHERIT, no SET: on PostgreSQL 16 it can still grant
+    /// the role to itself), and a non-superuser CREATEROLE login, are each
+    /// reported. Staged in ONE transaction that is rolled back (roles are
+    /// cluster-wide). CONTROL: at head, and with the grant revoked, it passes.
+    ///
+    /// Verified to fail: with 350 replaced by a no-op, and with 350 re-stating
+    /// 161's USAGE / SET arm (its migrate-time raise kept), the ADMIN-only
+    /// holder gives 0 failures, not 2.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_an_attestor_that_is_not_isolated(pool: sqlx::PgPool) {
+        let mut conn = pool.acquire().await.expect("acquire");
+        assert_eq!(
+            super::verify_identity_attestor_isolation(&mut conn)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        let pg16: bool =
+            sqlx::query_scalar("SELECT current_setting('server_version_num')::integer >= 160000")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("server version");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let admin_only = format!("t350_attestor_admin_{suffix}");
+        let creator = format!("t350_attestor_createrole_{suffix}");
+
+        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+        sqlx::query(&format!("CREATE ROLE {admin_only} NOLOGIN NOINHERIT"))
+            .execute(&mut *tx)
+            .await
+            .expect("create the admin-only role");
+        let grant = if pg16 {
+            format!(
+                "GRANT epigraph_identity_attestor TO {admin_only} \
+                 WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+            )
+        } else {
+            format!("GRANT epigraph_identity_attestor TO {admin_only} WITH ADMIN OPTION")
+        };
+        sqlx::query(&grant)
+            .execute(&mut *tx)
+            .await
+            .expect("grant the attestor with ADMIN OPTION only");
+        let admin_faults = super::verify_identity_attestor_isolation(&mut tx)
+            .await
+            .expect("check with the ADMIN-only grant");
+        sqlx::query(&format!(
+            "REVOKE epigraph_identity_attestor FROM {admin_only}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("revoke it again");
+        let clean = super::verify_identity_attestor_isolation(&mut tx)
+            .await
+            .expect("check after the revoke");
+        sqlx::query(&format!("CREATE ROLE {creator} NOLOGIN CREATEROLE"))
+            .execute(&mut *tx)
+            .await
+            .expect("create a CREATEROLE role");
+        let creator_faults = super::verify_identity_attestor_isolation(&mut tx)
+            .await
+            .expect("check with the CREATEROLE role");
+        tx.rollback()
+            .await
+            .expect("rollback: the roles are never committed");
+
+        assert_eq!(
+            admin_faults, 2,
+            "an ADMIN-only holder of the attestor is reported (as a member and as an ADMIN \
+             OPTION holder)"
         );
         assert_eq!(clean, 0, "CONTROL: with the grant revoked it passes");
         assert_eq!(
