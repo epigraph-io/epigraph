@@ -2116,8 +2116,8 @@ async fn every_unknown_status_list_state_is_refused_on_the_anchored_path() {
 // dropped to `none`, as a browser strips it, not refused
 // =====================================================================
 
-/// A statement `webauthn-rs-core` 0.5.5 cannot verify at all, from a genuine
-/// device-bound key.
+/// A statement `webauthn-rs-core` 0.5.5 refuses, from a genuine device-bound
+/// key: one it cannot verify at all, or one that fails verification.
 #[derive(Clone, Copy, Debug)]
 enum Unverifiable {
     /// A StrongBox-level `android-key` statement (the parser refuses level 2).
@@ -2129,14 +2129,18 @@ enum Unverifiable {
     /// A genuine TEE `android-key` statement for a key with a leading zero
     /// byte in a coordinate (the library's certificate-key comparison).
     LeadingZero,
+    /// A `packed` self-attestation whose signature does not verify (a format
+    /// the library supports, refused for a reason other than support).
+    BadSignature,
 }
 
 impl Unverifiable {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::StrongBox,
         Self::SafetyNet,
         Self::UnknownFormat,
         Self::LeadingZero,
+        Self::BadSignature,
     ];
 
     fn authenticator(self) -> SoftAuthenticator {
@@ -2178,17 +2182,50 @@ impl Unverifiable {
             ),
             Self::UnknownFormat => restated(created, "x-vendor-format", Cbor::Map(vec![])),
             Self::LeadingZero => google.android_key(auth, created, true),
+            Self::BadSignature => restated(
+                created,
+                "packed",
+                corrupted_signature(&auth.self_attest(created)),
+            ),
         }
     }
 }
 
-/// On the ANCHORED path a statement the library cannot verify at all (a
-/// StrongBox Android key, `android-safetynet`, an unknown format, an Android
-/// key with a leading-zero coordinate) is DROPPED and the passkey recorded
-/// `none`, exactly as a browser asked for `none` would have stripped it: the
-/// nil AAGUID, the stored attestation a genuine `none` registration's, no
-/// statement stored beside it, never hardware-attested, so it anchors nothing
-/// and holds only through its anchor; it asserts with its key. The ATTESTED
+/// The attestation statement of `registration` with the last byte of its
+/// `sig` flipped: still a well-formed DER signature, over the same data, that
+/// does not verify.
+fn corrupted_signature(registration: &serde_json::Value) -> Cbor {
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let raw = registration["response"]["attestationObject"]
+        .as_str()
+        .expect("base64url")
+        .trim_end_matches('=');
+    let bytes = base64::Engine::decode(&b64, raw).expect("an attestation object");
+    let object: Cbor = ciborium::from_reader(bytes.as_slice()).expect("cbor");
+    let mut stmt = object
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_text() == Some("attStmt")))
+        .map(|(_, v)| v.clone())
+        .expect("an attStmt");
+    let sig = stmt
+        .as_map_mut()
+        .and_then(|m| m.iter_mut().find(|(k, _)| k.as_text() == Some("sig")))
+        .and_then(|(_, v)| v.as_bytes_mut())
+        .expect("a sig");
+    *sig.last_mut().expect("a non-empty sig") ^= 0x01;
+    stmt
+}
+
+/// On the ANCHORED path a statement the library refuses (one it cannot verify
+/// at all: a StrongBox Android key, `android-safetynet`, an unknown format, an
+/// Android key with a leading-zero coordinate; or one that fails
+/// verification: a `packed` statement with a bad signature) is DROPPED and the
+/// passkey recorded `none`, exactly as a browser asked for `none` would have
+/// stripped it: the nil AAGUID, the stored attestation and format a genuine
+/// `none` registration's, no statement stored beside it (the shape of a
+/// dropped untrusted statement; a genuine `none` keeps its response), never
+/// hardware-attested, so it anchors nothing and holds only through its
+/// anchor; it asserts with its key. The ATTESTED
 /// ceremony still refuses each (the library's refusal). Guards (green before
 /// the change too, by design): the drop removes only the statement, so a
 /// response without user verification, or made for another ceremony's
@@ -2196,8 +2233,9 @@ impl Unverifiable {
 /// Red line: before this change every case was refused on the anchored path
 /// (`Refused`, the library's error), so such a device had no path at all.
 /// Mutations: the fallback removed -> the StrongBox case is refused; the
-/// fallback recording the ORIGINAL response beside the credential -> the
-/// stored statement is found.
+/// fallback skipped for a signature error -> the bad-signature case is
+/// refused; the fallback recording the ORIGINAL response beside the
+/// credential -> the stored statement is found.
 #[tokio::test]
 async fn a_statement_the_library_cannot_verify_is_dropped_on_the_anchored_path() {
     let vendor = TestAttestation::new("Allowlisted");
@@ -2251,7 +2289,7 @@ async fn a_statement_the_library_cannot_verify_is_dropped_on_the_anchored_path()
                 &genuine_none.passkey["cred"]["attestation"],
                 &genuine_none.passkey["cred"]["attestation_format"]
             ),
-            "{case:?}: stored exactly as a none registration"
+            "{case:?}: its attestation stored as a none registration's"
         );
         assert!(
             reg.passkey.get(STATEMENT_KEY).is_none(),
