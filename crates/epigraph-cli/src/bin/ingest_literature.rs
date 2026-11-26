@@ -25,6 +25,13 @@
 //! attached; the run prints what it withheld. `--allow-verbatim` is the
 //! operator override for a source the operator has the right to republish.
 //!
+//! The server applies the same rule against the paper's RECORDED licence
+//! (`papers.licence`, migration 349, backlog b62ae3f2), not the extraction's:
+//! a packet carrying a verbatim passage or a figure for a DOI whose paper row
+//! has no permitting licence (or no row at all) is refused with a 400, with
+//! or without `--allow-verbatim`. Record the licence first, through the
+//! operator definer `epigraph_set_paper_licence` (migration 255).
+//!
 //! # Input Format
 //!
 //! ```json
@@ -147,7 +154,9 @@ Options:
   -k, --agent-key <KEY>    Base64-encoded 32-byte agent key, or 'generate' [default: generate]
   -n, --dry-run            Validate and show packets without submitting
       --allow-verbatim     Ship supporting passages and figures verbatim even when
-                           source.licence does not permit retention (operator override)
+                           source.licence does not permit retention (operator override;
+                           the server still refuses them unless the paper's recorded
+                           licence permits retention)
   -h, --help               Show this help message";
 
 /// Maximum allowed input file size (100 MB). Prevents OOM from malicious or
