@@ -40,6 +40,8 @@ ELSEWHERE = "55555555-eeee-4eee-8eee-000000000005"
 WRITE_SQL = re.compile(r"^\s*(UPDATE|DELETE|INSERT|ALTER|TRUNCATE)\b", re.I | re.M)
 
 
+_PLACEHOLDER_DSN = "postgres://fuzzy@localhost:5432/fuzzy_dedup_test"
+
 class _Recorder(http.server.BaseHTTPRequestHandler):
     """Records each request; answers POST /api/v1/claims/<id>/dedup with the
     status configured for that id (default 200), or hangs up without an answer
@@ -188,6 +190,9 @@ class FuzzyDedupThroughTheEndpointTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _run(self, argv, env):
+        # The DSN is pinned on the command line (connect is mocked, so nothing
+        # reaches it): the script has no built-in default (backlog 62bdae04),
+        # and the test must not depend on the shell's DATABASE_URL.
         out = io.StringIO()
         environ = {
             k: v
@@ -197,7 +202,8 @@ class FuzzyDedupThroughTheEndpointTests(unittest.TestCase):
         environ.update(env)
         with mock.patch.dict(os.environ, environ, clear=True), \
                 mock.patch.object(fdc.psycopg2, "connect", return_value=self.conn), \
-                mock.patch.object(sys, "argv", ["fuzzy_dedup_claims.py", "--input", self.input, *argv]), \
+                mock.patch.object(sys, "argv", ["fuzzy_dedup_claims.py", "--input", self.input,
+                                                "--database-url", _PLACEHOLDER_DSN, *argv]), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             try:
                 rc = fdc.main()

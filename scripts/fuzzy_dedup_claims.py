@@ -69,9 +69,6 @@ import psycopg2.extras
 from maintenance_dsn import maintenance_dsn
 
 DEFAULT_API_BASE = "http://127.0.0.1:8080"
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
-)
 DEFAULT_INPUT_PATH = "/home/jeremy/epigraph-gui/public/semantic-dedup.json"
 
 
@@ -244,8 +241,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help="Postgres connection string for the READ-ONLY reads (env DATABASE_URL overrides default)",
+        default=None,
+        help="Postgres connection string for the READ-ONLY reads (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL; no built-in default)",
     )
     parser.add_argument(
         "--api-base",
@@ -280,6 +277,9 @@ def main() -> int:
         help="Print one line per cluster.",
     )
     args = parser.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
     if args.execute and not args.token:
         parser.error("--execute needs a bearer token (--token or EPIGRAPH_TOKEN)")
     token = args.token if args.execute else None

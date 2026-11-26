@@ -25,7 +25,6 @@ Usage:
     python3 scripts/evidential_clustering.py --limit 500 --agent-filter 'textbook-extractor:%'
 """
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 
 import argparse
 import json
@@ -386,8 +385,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evidential clustering with compound claim structure")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=None,
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL; no built-in default)",
     )
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--k", type=int, default=8, help="Initial proto-clusters for parent claims")
@@ -395,6 +394,9 @@ def main():
     parser.add_argument("--agent-filter", type=str, default=None)
     parser.add_argument("--atomic-only", action="store_true", help="(default behavior, kept for compat)")
     args = parser.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = psycopg2.connect(args.database_url)
     run_id = str(uuid.uuid4())

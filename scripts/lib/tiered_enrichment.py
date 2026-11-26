@@ -358,8 +358,10 @@ def main():
     # not a corpus enumeration and has no write path, so there is nothing here
     # for FORCE to silently truncate. It is also a library entry point invoked
     # by hand, not a scheduled background writer.
-    parser.add_argument("--database-url", type=str,
-        default="postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph")
+    # No built-in DSN (backlog 62bdae04): $DATABASE_URL or the flag.
+    parser.add_argument("--database-url", type=str, default=None,
+        help="Postgres URL of a read-only role for --claim-id "
+             "(default: $DATABASE_URL; no built-in default)")
     args = parser.parse_args()
 
     claim_text = args.claim_text
@@ -373,7 +375,11 @@ def main():
         except ValueError:
             print(f"Invalid UUID: {args.claim_id}", file=sys.stderr)
             sys.exit(1)
-        conn = psycopg2.connect(args.database_url)
+        database_url = args.database_url or os.environ.get("DATABASE_URL")
+        if not database_url:
+            parser.error("--claim-id needs a database: set DATABASE_URL (a read-only "
+                         "role) or pass --database-url; there is no built-in default")
+        conn = psycopg2.connect(database_url)
         with conn.cursor() as cur:
             cur.execute("SELECT content FROM claims WHERE id = %s::uuid", (args.claim_id,))
             row = cur.fetchone()

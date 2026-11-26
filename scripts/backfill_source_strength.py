@@ -37,9 +37,6 @@ import psycopg2
 
 from maintenance_dsn import maintenance_dsn
 
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
-)
 DEFAULT_CALIBRATION = Path(__file__).resolve().parent.parent / "calibration.toml"
 AGENT_ONLY_TIER_KEY = "conversational"  # claims with no evidence rows
 UNKNOWN_TYPE_DEFAULT = 0.5
@@ -172,7 +169,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=None,
     )
     parser.add_argument(
         "--calibration",
@@ -186,6 +183,9 @@ def main() -> int:
         help="Actually write. Without this flag, the script only previews.",
     )
     args = parser.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     weight_map = load_weight_map(args.calibration)
     agent_only_weight = weight_map.get(AGENT_ONLY_TIER_KEY, 0.3)

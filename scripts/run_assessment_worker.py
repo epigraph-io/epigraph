@@ -45,10 +45,7 @@ log = logging.getLogger(__name__)
 # purpose: that keyword is paired with an entry in
 # `no_unmaintained_dsn.rs::EXEMPT`, and this file is NOT exempt — its writing
 # connection is converted, which is what that lint checks.
-DATABASE_RO_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph",
-)
+DATABASE_RO_URL = os.environ.get("DATABASE_URL")
 # Admin DB for UPDATE assessment_queue (status transitions only).
 # PR-15: MAINTENANCE_DATABASE_URL takes precedence, because this is the writing
 # connection and its UPDATEs are what silently match zero rows once RLS is
@@ -58,11 +55,26 @@ DATABASE_RO_URL = os.environ.get(
 # unset. The precedence is spelled out; only the guard is shared.
 DATABASE_ADMIN_URL = (
     os.environ.get("MAINTENANCE_DATABASE_URL")
-    or os.environ.get(
-        "DATABASE_ADMIN_URL",
-        "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph",
-    )
+    or os.environ.get("DATABASE_ADMIN_URL")
 )
+# Neither half has a built-in default (backlog 62bdae04). Both used to fall
+# back to hard-coded roles on a database named like the live one, so a run with
+# a missing environment file read and wrote there instead of failing. Refused
+# here, at import, because the module-level DSNs are the default arguments of
+# every query helper below.
+if not DATABASE_RO_URL or not DATABASE_ADMIN_URL:
+    missing = [
+        name for name, value in (
+            ("DATABASE_URL (the read-only DSN)", DATABASE_RO_URL),
+            ("MAINTENANCE_DATABASE_URL or DATABASE_ADMIN_URL (the writing DSN)",
+             DATABASE_ADMIN_URL),
+        ) if not value
+    ]
+    sys.exit(
+        "run_assessment_worker: no database configured; set "
+        + " and ".join(missing)
+        + ". There is no built-in default."
+    )
 # The read/write split is only a safety property while both halves are the same
 # DATABASE. An exported MAINTENANCE_DATABASE_URL naming a different one would
 # have this worker SELECT its queue from one database and UPDATE the statuses in

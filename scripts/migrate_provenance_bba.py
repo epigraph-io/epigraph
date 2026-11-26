@@ -563,13 +563,8 @@ def main() -> None:
     p.add_argument("--execute", action="store_true", help="Commit (default: dry-run)")
     args = p.parse_args()
 
-    if not args.database_url:
-        args.database_url = maintenance_dsn()
-    if not args.database_url:
-        sys.exit(
-            "FATAL: set MAINTENANCE_DATABASE_URL (preferred) or DATABASE_URL, "
-            "or pass --database-url"
-        )
+    # maintenance_dsn() refuses (NoDatabaseConfigured) when neither variable is set.
+    args.database_url = args.database_url or maintenance_dsn()
     if args.execute and not args.manifest:
         sys.exit("FATAL: --execute requires --manifest. An unjournalled write is not reversible.")
     if not args.rollback and not (args.frame_ids and args.perspective_id and args.source_agent_id):

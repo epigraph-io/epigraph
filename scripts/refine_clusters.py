@@ -21,7 +21,6 @@ Usage:
         python3 scripts/refine_clusters.py --cluster-id 2
 """
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 
 import argparse
 import json
@@ -424,14 +423,17 @@ def main():
     parser = argparse.ArgumentParser(description="Interactive cluster refinement")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=None,
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL; no built-in default)",
     )
     parser.add_argument("--cluster-id", type=int, required=False)
     parser.add_argument("--run-id", default=None, help="Cluster run ID (default: latest)")
     parser.add_argument("--auto", action="store_true",
                         help="Non-interactive: embedding-subcluster + LLM label")
     args = parser.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = get_connection(args.database_url)
 
