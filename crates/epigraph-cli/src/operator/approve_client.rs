@@ -28,6 +28,15 @@
 //!   (`ADMIN_ONLY_SCOPES`) is refused while migration 128's switch is armed or
 //!   cannot be read; unarmed, it is granted with a WARN line, as the route
 //!   warned.
+//! * **An agent's owner is named here.** `/oauth/register` gives a
+//!   self-registered agent no owner (backlog be024524), so `--owner <uuid>`
+//!   (the `oauth_clients.id` that answers for the agent) is required for an
+//!   `agent` client, even one whose row already holds an owner (rows
+//!   registered before migration 312 hold the oldest active human, which
+//!   nobody chose). Migration 312's four-argument definer writes it and
+//!   refuses an agent approval without one; a named owner must be another,
+//!   active client. Any other client is refused `--owner` (it keeps the
+//!   owner it was created with; the definer refuses too, 22023).
 //! * **One transaction.** The definer (which writes its own
 //!   `oauth.client_approved` row) and this verb's `oauth.client_approved_cli`
 //!   row (who ran it, the reason, the scopes and status before and after, and
@@ -67,6 +76,8 @@ pub struct Outcome {
     pub client_name: String,
     pub client_type: String,
     pub granted_scopes: Vec<String>,
+    /// The client's `owner_id` after the approval.
+    pub owner: Option<Uuid>,
     /// The admin-only scopes granted while the switch was unarmed.
     pub admin_scopes_warned: Vec<String>,
     pub audit_event_id: Uuid,
@@ -110,13 +121,18 @@ pub fn validate(scopes: &[String], reason: &str) -> anyhow::Result<Vec<String>> 
 ///
 /// # Errors
 /// [`validate`]'s refusals; an unknown client; a client that is not
-/// `pending`; an admin-only scope while migration 128 is armed or unreadable;
+/// `pending`; an `agent` client without `owner`, a non-agent client with
+/// one, or an `owner` that is not another active client (migration 312); an admin-only scope while
+/// migration 128 is armed or unreadable;
 /// a failed statement. Nothing is committed in any of these cases.
+// One argument per command-line flag, as the binary passes them.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     conn: &mut PgConnection,
     client: &ClientRef,
     scopes: &[String],
     approved_by: Option<Uuid>,
+    owner: Option<Uuid>,
     reason: &str,
     apply: bool,
     operator: &Operator,
@@ -155,6 +171,27 @@ pub async fn run(
             row.status
         );
     }
+    if row.client_type != "agent" && owner.is_some() {
+        bail!(
+            "OAuth client {id} ({:?}, client_id {}) is a {} client: only an agent client is \
+             given an owner at approval (it keeps the owner it was created with); drop \
+             --owner; nothing was approved",
+            row.client_name,
+            row.client_id,
+            row.client_type
+        );
+    }
+    if row.client_type == "agent" && owner.is_none() {
+        bail!(
+            "OAuth client {id} ({:?}, client_id {}) is an agent: name the client that answers \
+             for it with --owner <oauth_clients.id> (its current owner_id, {}, was not chosen at \
+             approval); nothing was approved",
+            row.client_name,
+            row.client_id,
+            row.owner_id
+                .map_or_else(|| "none".to_string(), |o| o.to_string())
+        );
+    }
     let admin: Vec<String> = scopes
         .iter()
         .filter(|s| ADMIN_ONLY_SCOPES.contains(&s.as_str()))
@@ -174,14 +211,19 @@ pub async fn run(
         }
     }
 
+    // Migration 312's overload: writes the owner too, and refuses an agent
+    // approval without one (22004) and an owner that is not another active
+    // client (22023 / 23503).
     let approved: bool =
-        sqlx::query_scalar("SELECT public.epigraph_oauth_client_approve($1, $2, $3)")
+        sqlx::query_scalar("SELECT public.epigraph_oauth_client_approve($1, $2, $3, $4)")
             .bind(id)
             .bind(&scopes)
             .bind(approved_by)
+            .bind(owner)
             .fetch_one(&mut *tx)
             .await
             .context("epigraph_oauth_client_approve")?;
+    let owner_after = owner.or(row.owner_id);
     if !approved {
         bail!("epigraph_oauth_client_approve found no client {id} under its lock; nothing was approved");
     }
@@ -221,6 +263,7 @@ pub async fn run(
             "granted_scopes": { "before": row.granted_scopes, "after": scopes },
             "allowed_scopes": row.allowed_scopes,
             "approved_by": approved_by,
+            "owner_id": { "before": row.owner_id, "after": owner_after },
             "created_by_before": row.created_by,
             "admin_scopes_granted_unarmed": admin,
             "reason": reason,
@@ -245,6 +288,7 @@ pub async fn run(
         client_name: row.client_name,
         client_type: row.client_type,
         granted_scopes: scopes,
+        owner: owner_after,
         admin_scopes_warned: admin,
         audit_event_id,
         applied: apply,
@@ -255,12 +299,14 @@ pub async fn run(
 #[must_use]
 pub fn describe(o: &Outcome) -> Vec<String> {
     let mut out = vec![format!(
-        "{}APPROVED\tclient={}\tclient_id={}\ttype={}\tgranted_scopes={}\taudit_row={}{}",
+        "{}APPROVED\tclient={}\tclient_id={}\ttype={}\tgranted_scopes={}\towner={}\taudit_row={}{}",
         if o.applied { "" } else { "WOULD BE " },
         o.id,
         o.client_id,
         o.client_type,
         o.granted_scopes.join(","),
+        o.owner
+            .map_or_else(|| "none".to_string(), |u| u.to_string()),
         o.audit_event_id,
         if o.applied { "" } else { " (rolled back)" }
     )];

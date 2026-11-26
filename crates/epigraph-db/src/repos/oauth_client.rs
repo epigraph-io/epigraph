@@ -336,23 +336,34 @@ impl OAuthClientRepository {
         Ok(())
     }
 
+    /// Approve a pending client: `active`, exactly `granted_scopes`, and
+    /// `owner_id` = `owner` when one is given.
+    ///
+    /// An `agent` client must be given its `owner` (the `oauth_clients.id`
+    /// that answers for it): `/oauth/register` writes none, and migration
+    /// 312's definer refuses an agent approval without one (22004) rather
+    /// than keep whatever owner the row holds. Any other client keeps its
+    /// owner when `owner` is `None`.
     #[instrument(skip(pool))]
     pub async fn approve(
         pool: &PgPool,
         id: Uuid,
         granted_scopes: &[String],
         approved_by: Uuid,
+        owner: Option<Uuid>,
     ) -> Result<(), DbError> {
         // Migration 118: the same UPDATE, in `epigraph_oauth_client_approve`
         // (a SECURITY DEFINER that also writes an `oauth.client_approved`
         // security event); the application role holds no UPDATE here.
         // Migration 188: nor EXECUTE on the definer, so `pool` must be a
         // maintenance (or privileged) pool; on the application role this
-        // fails with 42501 and approves nothing.
-        sqlx::query("SELECT public.epigraph_oauth_client_approve($1, $2, $3)")
+        // fails with 42501 and approves nothing. Migration 312: the
+        // four-argument overload, which also writes the owner.
+        sqlx::query("SELECT public.epigraph_oauth_client_approve($1, $2, $3, $4)")
             .bind(id)
             .bind(granted_scopes)
             .bind(approved_by)
+            .bind(owner)
             .execute(pool)
             .await
             .map_err(|e| DbError::QueryFailed { source: e })?;
