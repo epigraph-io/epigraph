@@ -8,7 +8,13 @@ Subcommands:
   label     run label_themes_llm
 
 All grow writes happen in Model B under one consolidated run_id; project
-materialises Model A; label names it. --dry-run reports the plan without writing.
+materialises Model A; label names it.
+
+--dry-run writes nothing. `grow --dry-run --from-run-id <run>` reports the
+split candidates the loop would act on for that existing run; a plain
+`grow --dry-run` has no run to inspect (base clustering is a write: it commits
+a new run and overwrites the fitted reducer), so it only reports that a fresh
+grow would start with base clustering. `discover` previews the latest run.
 """
 import argparse
 import json
@@ -184,6 +190,18 @@ def grow(conn, args):
     if getattr(args, "from_run_id", None):
         run_id = args.from_run_id
         print(f"== resuming run {run_id} (skipping base clustering) ==", file=sys.stderr)
+    elif args.dry_run:
+        # Base clustering is not a preview: seed_phase writes the reducer file
+        # and commits a new run's centroids and labels, and assign_batch commits
+        # its claim_clusters. That run would then be the NEWEST run, the one a
+        # later `project` / `discover` without --run-id picks (latest_run_id),
+        # so a "dry run" here could end up rebuilding the live claim_themes
+        # from an unsplit, unlabelled run. Stop before any of it.
+        print("  [dry-run] a fresh grow would start with base clustering (a write); "
+              "nothing done. Preview splits with `discover` or "
+              "`grow --dry-run --from-run-id <run>`.", file=sys.stderr)
+        return {"status": "dry-run", "run_id": None, "k": None,
+                "plan": "base clustering, then the split loop, projection and labelling"}
     else:
         run_id = theme_lib.new_run_id()
         print(f"== base clustering (run {run_id}) ==", file=sys.stderr)
