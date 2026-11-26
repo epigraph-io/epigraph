@@ -63,6 +63,10 @@
 //! `speaker` in a `candidates` or `digest` item is the speaker agent's display
 //! name, which is chat text like the atom's own.
 //!
+//! `candidates` and the digest's `relevant` slice index each atom's text
+//! together with the names and aliases of its speaker and of the agents it
+//! is about, so a query naming a person retrieves that person's atoms.
+//!
 //! An atom's `at` is the conversation time of its turn (RFC 3339; stored in
 //! UTC with milliseconds), carried into every `digest` item, so a question
 //! about when something happened does not depend on the extractor having

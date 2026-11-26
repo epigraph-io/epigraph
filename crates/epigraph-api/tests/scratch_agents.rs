@@ -383,3 +383,59 @@ fn agents_and_relations_survive_a_snapshot_byte_for_byte() {
     assert_eq!(back, s);
     assert_eq!(encode(&back), bytes);
 }
+
+/// Two people with no word in common with the query except a name.
+fn named_graph() -> ScratchStore {
+    let mut s = ScratchStore::new(SCOPE, 0, t(0));
+    s.put_agents(
+        vec![
+            agent("Caroline", AgentRole::Participant, &[]),
+            agent("Melanie", AgentRole::Participant, &["Mel"]),
+        ],
+        t(1),
+    )
+    .unwrap();
+    let mut said = |n: u128, speaker: &str, about: &[&str], text: &str| {
+        let mut a = atom(n, speaker, about);
+        a.text = text.to_string();
+        a
+    };
+    let atoms = vec![
+        said(1, "Melanie", &[], "Painted a sunrise over the lake."),
+        said(2, "Caroline", &["Melanie"], "Gave her a pottery book."),
+        said(3, "Caroline", &[], "Went to a support group."),
+    ];
+    s.put_atoms(atoms, t(2)).unwrap();
+    s.mark_applied(1, t(3));
+    s
+}
+
+#[test]
+fn a_query_naming_a_person_by_any_of_their_names_retrieves_that_persons_atoms() {
+    use epigraph_api::scratch::belief::BeliefView;
+    use epigraph_api::scratch::rank::digest;
+    let s = named_graph();
+    let view = BeliefView::compute(&s).unwrap();
+    for query in ["What did Mel do?", "melanie"] {
+        let d = digest(&s, &view, query, 5, 20);
+        let mut hits: Vec<Uuid> = d.relevant.iter().map(|i| i.id).collect();
+        hits.sort();
+        assert_eq!(
+            hits,
+            vec![id(1), id(2)],
+            "{query}: what Melanie said and what is about her, not Caroline's own atom"
+        );
+        let mut cands: Vec<Uuid> = s
+            .candidates(query, 10, 0)
+            .into_iter()
+            .map(|c| c.atom.id)
+            .collect();
+        cands.sort();
+        assert_eq!(cands, vec![id(1), id(2)], "{query}: candidates");
+    }
+    // A name matches on its own words only: "Caroline" finds both of her atoms.
+    let d = digest(&s, &view, "caroline", 5, 20);
+    let mut hits: Vec<Uuid> = d.relevant.iter().map(|i| i.id).collect();
+    hits.sort();
+    assert_eq!(hits, vec![id(2), id(3)]);
+}

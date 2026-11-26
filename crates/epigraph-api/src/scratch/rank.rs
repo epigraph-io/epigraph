@@ -27,7 +27,7 @@
 //! | slice | contents | order |
 //! |---|---|---|
 //! | `standing` | decision, preference, instruction, commitment atoms, whatever the query | BetP, then newer turn |
-//! | `relevant` | BM25 top [`RELEVANT_BM25_TOP`], plus one hop from the top [`EXPANSION_SEEDS`] over [`EXPANSION_RELS`] at [`HOP_DECAY`] | blended score, then greedy coverage-vs-relevance selection |
+//! | `relevant` | BM25 top [`RELEVANT_BM25_TOP`] over the text plus the speaker's and subjects' names and aliases, plus one hop from the top [`EXPANSION_SEEDS`] over [`EXPANSION_RELS`] at [`HOP_DECAY`] | blended score, then greedy coverage-vs-relevance selection |
 //! | `recent` | atoms from the [`RECENT_TURNS`] turns below `exclude_turns_from` | newer turn, then BetP |
 //! | `open` | CONTESTED atoms with their contradicting partners, each conflict once, then `question` atoms | latest conflict first; newer question first |
 //!
@@ -362,7 +362,11 @@ fn relevant<'a>(
     if k == 0 {
         return Vec::new();
     }
-    let docs: Vec<&str> = eligible.iter().map(|a| a.text.as_str()).collect();
+    // Names and aliases of the speaker and the subjects are indexed with the
+    // text (`ScratchStore::indexed_text`), so a question naming a person
+    // reaches that person's atoms.
+    let indexed: Vec<String> = eligible.iter().map(|a| store.indexed_text(a)).collect();
+    let docs: Vec<&str> = indexed.iter().map(String::as_str).collect();
     let hits = bm25::rank(&docs, query, RELEVANT_BM25_TOP);
     let Some(best) = hits.first().map(|h| h.1) else {
         return Vec::new();

@@ -626,6 +626,23 @@ impl ScratchStore {
         self.relations.values()
     }
 
+    /// The text BM25 indexes for an atom: its own text, then the names and
+    /// aliases of its speaker and of every agent it is about, so a query
+    /// that names a person (by any of their names) finds that person's atoms
+    /// even when the atom's text uses another of the names, or none.
+    pub fn indexed_text(&self, atom: &ScratchAtom) -> String {
+        let mut out = atom.text.clone();
+        for id in std::iter::once(&atom.speaker_agent).chain(atom.about.iter()) {
+            if let Some(agent) = self.agents.get(id) {
+                for name in std::iter::once(&agent.display_name).chain(agent.aliases.iter()) {
+                    out.push(' ');
+                    out.push_str(name);
+                }
+            }
+        }
+        out
+    }
+
     /// Add agents; a known id only gains the aliases it lacks. The whole
     /// batch is validated first. `inserted` counts new agents, `existing`
     /// known ones (with or without new aliases); `updated` counts those that
@@ -990,7 +1007,8 @@ impl ScratchStore {
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let docs: Vec<&str> = current.iter().map(|a| a.text.as_str()).collect();
+        let indexed: Vec<String> = current.iter().map(|a| self.indexed_text(a)).collect();
+        let docs: Vec<&str> = indexed.iter().map(String::as_str).collect();
         let mut out: Vec<Candidate<'_>> = bm25::rank(&docs, text, k)
             .into_iter()
             .map(|(i, score)| Candidate {
