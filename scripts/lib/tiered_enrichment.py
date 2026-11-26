@@ -353,15 +353,18 @@ def main():
     parser.add_argument("--abstract", default="")
     parser.add_argument("--output", choices=["json", "text"], default="json")
     parser.add_argument("--claim-id", type=str, help="Load claim from database by UUID")
-    # MAINTENANCE-DSN-EXEMPT: single-claim debug lookup on the read-only role.
-    # `--claim-id` fetches ONE row the operator names on the command line; it is
-    # not a corpus enumeration and has no write path, so there is nothing here
-    # for FORCE to silently truncate. It is also a library entry point invoked
-    # by hand, not a scheduled background writer.
-    # No built-in DSN (backlog 62bdae04): $DATABASE_URL or the flag.
+    # MAINTENANCE-DSN-EXEMPT: single-claim debug lookup on a login the operator
+    # names explicitly. `--claim-id` fetches ONE row the operator names on the
+    # command line; it is not a corpus enumeration and has no write path, so
+    # there is nothing here for FORCE to silently truncate. It is also a library
+    # entry point invoked by hand, not a scheduled background writer.
+    # The DSN comes from `--database-url` ONLY (backlog 62bdae04). It used to
+    # default to a hard-coded read-only role; with that gone, reading
+    # $DATABASE_URL instead would let a privileged login exported for some
+    # other job print a private claim here unasked. Name a read-only login.
     parser.add_argument("--database-url", type=str, default=None,
-        help="Postgres URL of a read-only role for --claim-id "
-             "(default: $DATABASE_URL; no built-in default)")
+        help="Postgres URL for --claim-id; required with it. Use a read-only "
+             "login. Not read from the environment; no built-in default")
     args = parser.parse_args()
 
     claim_text = args.claim_text
@@ -375,11 +378,10 @@ def main():
         except ValueError:
             print(f"Invalid UUID: {args.claim_id}", file=sys.stderr)
             sys.exit(1)
-        database_url = args.database_url or os.environ.get("DATABASE_URL")
-        if not database_url:
-            parser.error("--claim-id needs a database: set DATABASE_URL (a read-only "
-                         "role) or pass --database-url; there is no built-in default")
-        conn = psycopg2.connect(database_url)
+        if not args.database_url:
+            parser.error("--claim-id needs --database-url (a read-only login); it is "
+                         "not read from DATABASE_URL and there is no built-in default")
+        conn = psycopg2.connect(args.database_url)
         with conn.cursor() as cur:
             cur.execute("SELECT content FROM claims WHERE id = %s::uuid", (args.claim_id,))
             row = cur.fetchone()

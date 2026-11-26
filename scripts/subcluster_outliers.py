@@ -34,7 +34,7 @@ from sklearn.preprocessing import normalize
 
 psycopg2.extras.register_uuid()
 
-# MAINTENANCE-DSN-EXEMPT: read-only by design, on the `epigraph_ro` role, and
+# MAINTENANCE-DSN-EXEMPT: read-only by design, meant for a read-only login, and
 # the module docstring above states "script never writes" as a property callers
 # rely on. Threading MAINTENANCE_DATABASE_URL in would silently escalate it to a
 # writable role whenever that variable is exported for a sibling job — a
@@ -42,6 +42,9 @@ psycopg2.extras.register_uuid()
 # needs this script to see non-public rows, give it its own read-only
 # maintenance role rather than borrowing the writer's. It has no built-in DSN
 # either (backlog 62bdae04): DATABASE_URL or --database-url, else it refuses.
+# Nothing enforces read-only on the login it is given; the operator chooses it.
+# (DATABASE_URL was already read before 62bdae04: the old default applied only
+# when that variable was unset, so honouring it adds no new exposure.)
 
 
 def load_boundary_claims(conn, cluster_ids, boundary_threshold=0.85,

@@ -215,7 +215,7 @@ _SCRIPTS = [
     # DATABASE_URL (or the flag) and never fall back to a role of their own.
     ("subcluster_outliers.py", [], "DATABASE_URL"),
     ("lib/tiered_enrichment.py",
-     ["--tier", "1", "--claim-id", "00000000-0000-0000-0000-000000000001"], "DATABASE_URL"),
+     ["--tier", "1", "--claim-id", "00000000-0000-0000-0000-000000000001"], "--database-url"),
     # Refuses at import: both halves of its read/write split are required.
     ("run_assessment_worker.py", [], "DATABASE_URL"),
 ]
@@ -247,3 +247,22 @@ def test_an_explicit_database_url_still_wins():
                             ["--database-url", "postgres://nobody@127.0.0.1:1/never_test"])
     assert "CONNECT-ATTEMPTED" in proc.stderr, proc.stderr[-2000:]
     assert proc.returncode == _TRIPWIRE
+
+
+def test_tiered_enrichment_claim_lookup_ignores_an_exported_database_url():
+    """`--claim-id` reads only the login named on its command line. An exported
+    DATABASE_URL (possibly a privileged login set for another job) is not used:
+    the lookup refuses before connecting. The pre-62bdae04 code never read the
+    variable either; its default was a hard-coded read-only role."""
+    env = {k: v for k, v in os.environ.items() if k not in DSN_VARS and not k.startswith("PG")}
+    env["DATABASE_URL"] = "postgres://privileged@127.0.0.1:1/never_test"
+    proc = subprocess.run(
+        [sys.executable, "-c", _BOOTSTRAP, str(SCRIPTS / "lib/tiered_enrichment.py"),
+         "--tier", "1", "--claim-id", "00000000-0000-0000-0000-000000000001"],
+        env=env, capture_output=True, text=True, timeout=120, cwd=str(REPO),
+    )
+    assert "CONNECT-ATTEMPTED" not in proc.stderr and proc.returncode != _TRIPWIRE, (
+        f"--claim-id connected on DATABASE_URL\n{proc.stderr[-2000:]}"
+    )
+    assert proc.returncode != 0
+    assert "--database-url" in proc.stderr, proc.stderr[-2000:]
