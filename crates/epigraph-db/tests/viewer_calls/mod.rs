@@ -1,11 +1,12 @@
 //! The per-call viewer-spend scanner shared by `visibility_lint.rs` (the repo
 //! layer) and `epigraph-mcp/tests/tool_viewer_is_spent.rs` (the MCP tools),
-//! backlog ada8ee55.
+//! backlog ada8ee55, and by the `viewer_calls_register.rs` lints of
+//! `epigraph-engine` and `epigraph-ingest-executor` (backlog 37e68f5b).
 //!
 //! # What it measures
 //!
 //! For every `fn` that holds a viewer, every database call in its body, and
-//! whether that call receives the viewer. The two lints that include this
+//! whether that call receives the viewer. The lints that include this
 //! module assert the UNVIEWED calls against an exact per-fn register, the shape
 //! `epigraph-api/tests/viewer_spend_lint.rs` gives the route handlers. The
 //! fn-level checks those two files already run ("the body spends its viewer at
@@ -31,9 +32,9 @@
 //!   it. A three-bind statement is viewed by its SQL text, which is in the
 //!   call's region.
 //! * **The database handles are named by a [`Surface`]**, so one scanner reads
-//!   both the repo layer (pool, connection, transaction and generic-executor
-//!   parameters) and the MCP tools (the server handle, its pool fields, its
-//!   stamped-connection method, the maintenance sessions).
+//!   the repo, engine and executor layers (pool, connection, transaction and
+//!   generic-executor parameters) and the MCP tools (the server handle, its
+//!   pool fields, its stamped-connection method, the maintenance sessions).
 //!
 //! # Regions
 //!
@@ -383,8 +384,17 @@ fn flat_type(ty: &str) -> String {
 }
 
 /// Is `ty` (flattened) a `Viewer`, by reference or by value:
-/// `&Viewer`, `&epigraph_db::visibility::Viewer`, `Viewer`?
+/// `&Viewer`, `&epigraph_db::visibility::Viewer`, `Viewer`, or one of those
+/// in an `Option` (`Option<&Viewer>`, the ingest executor's caller-or-none
+/// walk)? A fn that holds an optional viewer runs its `Some` arm with it, so
+/// its calls are measured like any other holder's; handing the option on is
+/// a handoff, as handing on the bare viewer is.
 fn is_viewer_type(ty: &str) -> bool {
+    let ty = ty
+        .strip_prefix("Option<")
+        .or_else(|| ty.strip_prefix("std::option::Option<"))
+        .and_then(|inner| inner.strip_suffix('>'))
+        .unwrap_or(ty);
     let rest = ty.strip_prefix('&').unwrap_or(ty);
     let rest = rest.trim_start_matches("mut");
     rest == "Viewer"
