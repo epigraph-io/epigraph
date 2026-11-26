@@ -1,4 +1,4 @@
-import datetime, json, os, subprocess, sys, tempfile, unittest
+import dataclasses, datetime, json, os, subprocess, sys, tempfile, unittest
 from unittest import mock
 from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
@@ -142,7 +142,7 @@ class DiscoverTests(unittest.TestCase):
              "user":{"login":"u"},"merged_at":None},                          # not merged
         ]
         with mock.patch.object(gir, "_gh_json", return_value=rows):
-            prs = gir.discover_merged_prs("epigraph-io/epigraph", {}, window_minutes=60, now=now)
+            prs = gir.discover_merged_prs("epigraph-io/epigraph", {}, now - datetime.timedelta(minutes=60))
         self.assertEqual([p.number for p in prs], [1])
         self.assertEqual(prs[0].merge_sha, "aaa")
         self.assertEqual(prs[0].base_sha, "bbb")
@@ -175,7 +175,7 @@ class DiscoverTests(unittest.TestCase):
         slurp_stdout = json.dumps([page1, page2])
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=slurp_stdout, stderr="")
         with mock.patch.object(gir.subprocess, "run", return_value=completed) as run:
-            prs = gir.discover_merged_prs("epigraph-io/epigraph", {}, window_minutes=60, now=now)
+            prs = gir.discover_merged_prs("epigraph-io/epigraph", {}, now - datetime.timedelta(minutes=60))
         # Both pages' in-window merged PRs survive (1 from page1, 4 from page2); the
         # too-old #2 and unmerged #3 are dropped. Proves cross-page flattening works.
         self.assertEqual(sorted(p.number for p in prs), [1, 4])
@@ -231,9 +231,119 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(val("--endpoint"), "http://127.0.0.1:8080")
         self.assertIn("--dry-run", argv)
 
+UTC = datetime.timezone.utc
+
+def _row(n, merged_at, updated_at=None, sha=None):
+    """A merged PR as the pulls API lists it."""
+    return {"number": n, "title": f"fix(x): pr {n}", "body": "", "merge_commit_sha": sha or f"m{n}",
+            "base": {"sha": "b"}, "user": {"login": "u"}, "merged_at": merged_at,
+            "updated_at": updated_at or merged_at}
+
+class FakeGitHub:
+    """Answers `_gh_json` like GitHub: the closed-PR listing (most recently
+    updated first, one page) and single PRs by number."""
+    def __init__(self, rows):
+        self.rows = rows; self.calls = []
+    def __call__(self, args, env):
+        self.calls.append(args)
+        path = args[0]
+        if path.endswith("/pulls"):
+            if any(a.startswith("page=") and a != "page=1" for a in args):
+                return []
+            return sorted(self.rows, key=lambda r: r["updated_at"], reverse=True)
+        number = int(path.rsplit("/", 1)[1])
+        for r in self.rows:
+            if r["number"] == number:
+                return r
+        raise subprocess.CalledProcessError(1, ["gh", "api", path], stderr="HTTP 404")
+
+class StateTests(unittest.TestCase):
+    """Backlog 39dfef78: the reconciler kept no state, so a PR merged while it
+    was down for longer than the window, or one whose ingest failed, was never
+    ingested. It now keeps a per-repo cursor and a retry list."""
+    T0 = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=UTC)
+
+    def setUp(self):
+        st = tempfile.TemporaryDirectory(); self.addCleanup(st.cleanup)
+        self.cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir=st.name,
+                              window_minutes=60, author_key_file="/k")
+
+    def _run(self, gh, at, results=None, dry_run=False):
+        """One reconciler run at `at`; `results` maps a PR number to its
+        ingest outcome (an int return code, or an exception to raise),
+        default 0. Returns ((ok, fail), [PR numbers attempted])."""
+        attempted = []
+        def ingest(pr, *a, **k):
+            attempted.append(pr.number)
+            res = (results or {}).get(pr.number, 0)
+            if isinstance(res, Exception):
+                raise res
+            return res
+        with mock.patch.object(gir, "ensure_mirror", return_value="/m"), \
+             mock.patch.object(gir, "_gh_json", side_effect=gh), \
+             mock.patch.object(gir, "ingest_pr", side_effect=ingest):
+            return gir.run_once(self.cfg, dry_run=dry_run, now=at), attempted
+
+    def test_a_gap_longer_than_the_window_is_caught_up(self):
+        h = datetime.timedelta(hours=1)
+        gh = FakeGitHub([])
+        self.assertEqual(self._run(gh, self.T0), ((0, 0), []))
+        # Down for 10 h; the PR merged 9 h before the next run, far outside
+        # its 60-minute window.
+        gh.rows = [_row(5, "2026-06-03T13:00:00Z")]
+        self.assertEqual(self._run(gh, self.T0 + 10 * h), ((1, 0), [5]))
+
+    def test_the_first_run_scans_only_the_window(self):
+        gh = FakeGitHub([_row(5, "2026-06-03T09:00:00Z"), _row(6, "2026-06-03T11:30:00Z")])
+        self.assertEqual(self._run(gh, self.T0), ((1, 0), [6]))
+
+    def test_a_failed_pr_is_retried_until_it_is_ingested(self):
+        h = datetime.timedelta(hours=1)
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        # Run 1: the ingest raises (e.g. the range could not be computed).
+        self.assertEqual(self._run(gh, self.T0, {5: RuntimeError("git rev-list failed")}),
+                         ((0, 1), [5]))
+        # Run 2, 3 h later: still inside the cursor's overlap; ingest_git exits 1.
+        self.assertEqual(self._run(gh, self.T0 + 3 * h, {5: 1}), ((0, 1), [5]))
+        # Run 3, 6 h later: the PR is outside the scan (cutoff = run 2 - 60
+        # min), so only the retry list brings it back, and it now succeeds.
+        self.assertEqual(self._run(gh, self.T0 + 6 * h), ((1, 0), [5]))
+        st = gir.load_state(self.cfg.state_dir, "o/r")
+        self.assertEqual(st.retry, {})
+        # Run 4: ingested, so neither scanned nor retried again.
+        self.assertEqual(self._run(gh, self.T0 + 9 * h), ((0, 0), []))
+
+    def test_a_retried_pr_counts_its_attempts_and_keeps_the_run_failing(self):
+        h = datetime.timedelta(hours=1)
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        for i in range(3):
+            self.assertEqual(self._run(gh, self.T0 + 5 * i * h, {5: 1}), ((0, 1), [5]))
+        self.assertEqual(gir.load_state(self.cfg.state_dir, "o/r").retry[5]["attempts"], 3)
+
+    def test_a_repo_whose_discovery_fails_keeps_its_cursor(self):
+        h = datetime.timedelta(hours=1)
+        gh = FakeGitHub([])
+        self._run(gh, self.T0)
+        def down(args, env): raise subprocess.CalledProcessError(1, ["gh"])
+        self.assertEqual(self._run(down, self.T0 + 5 * h), ((0, 1), []))
+        gh.rows = [_row(5, "2026-06-03T13:00:00Z")]  # merged during the outage
+        self.assertEqual(self._run(gh, self.T0 + 10 * h), ((1, 0), [5]))
+
+    def test_a_dry_run_writes_no_state(self):
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        self.assertEqual(self._run(gh, self.T0, {5: 1}, dry_run=True), ((0, 1), [5]))
+        self.assertEqual(list(Path(self.cfg.state_dir).iterdir()), [])
+
+    def test_an_unreadable_state_file_fails_the_repo_instead_of_rescanning(self):
+        # Silently starting over would drop the retry list.
+        Path(self.cfg.state_dir, "o__r.state.json").write_text("{not json")
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        self.assertEqual(self._run(gh, self.T0), ((0, 1), []))
+
 class MainLoopTests(unittest.TestCase):
     def test_runs_all_prs_and_isolates_failures(self):
-        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
+        st = tempfile.TemporaryDirectory(); self.addCleanup(st.cleanup)
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir=st.name,
                          default_orchestrator_id=None, author_key_file="/k")
         prs = [gir.PullRequest(1,"a","",f"s1","b","u","2026-06-03T11:59:00Z"),
                gir.PullRequest(2,"b","",f"s2","b","u","2026-06-03T11:59:00Z")]
@@ -252,6 +362,8 @@ KEYF = "/s/author.key"
 class ChildEnvTests(unittest.TestCase):
     """Backlog 7d9e60c6 (1) and (2): what run_once hands each ingest_git child."""
     def _run(self, cfg, environ, dry_run=False):
+        st = tempfile.TemporaryDirectory(); self.addCleanup(st.cleanup)
+        cfg = dataclasses.replace(cfg, state_dir=st.name)  # no retry list leaks in
         pr = gir.PullRequest(7, "fix(x): y", "body", "s7", "b", "u", "2026-06-03T11:59:00Z")
         seen = []
         def fake_run(argv, **kw):

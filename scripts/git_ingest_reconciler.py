@@ -3,7 +3,13 @@
 
 Discovers newly-merged PRs across configured repos (read-only GitHub access via
 the `gh` CLI) and runs `ingest_git --pr-ingest` against the localhost EpiGraph
-API for each. Idempotent (Plan 2.5), stateless, safe to run repeatedly on a cron.
+API for each. Idempotent (Plan 2.5), safe to run repeatedly on a cron.
+
+State: per repo, a cursor (the start of the last complete run) and a retry
+list of PRs whose ingest failed (`RepoState`, a JSON file in `state_dir`). A
+run scans the PRs merged since `cursor - window_minutes` and re-tries the
+retry list, so neither an outage longer than the window nor a failed ingest
+loses a PR. A dry run reads the state and writes none.
 
 Auth: EPIGRAPH_GIT_INGEST_GITHUB_PAT (read-only) injected as GH_TOKEN, else the
 host's existing `gh auth` token. Writes go to the localhost API, not GitHub —
@@ -203,8 +209,20 @@ def _gh_json(args: list[str], env: dict) -> list | dict:
         return [row for page in data for row in (page if isinstance(page, list) else [page])]
     return data
 
-def discover_merged_prs(slug: str, env: dict, window_minutes: int, now: datetime.datetime) -> list[PullRequest]:
-    cutoff = now - datetime.timedelta(minutes=window_minutes)
+def _pr_from_row(r: dict) -> "PullRequest | None":
+    """A merged PR from a pulls API row; None when the row is not merged."""
+    ma = r.get("merged_at")
+    if not ma or not r.get("merge_commit_sha"):
+        return None
+    return PullRequest(
+        number=int(r["number"]), title=r.get("title") or "",
+        body=r.get("body") or "", merge_sha=r["merge_commit_sha"],
+        base_sha=(r.get("base") or {}).get("sha") or "",
+        author=(r.get("user") or {}).get("login") or "", merged_at=ma,
+    )
+
+def discover_merged_prs(slug: str, env: dict, cutoff: datetime.datetime) -> list[PullRequest]:
+    """The repo's PRs merged at or after `cutoff`."""
     rows = _gh_json(
         [f"repos/{slug}/pulls", "-X", "GET",
          "--field", "state=closed", "--field", "sort=updated",
@@ -214,19 +232,75 @@ def discover_merged_prs(slug: str, env: dict, window_minutes: int, now: datetime
     )
     out = []
     for r in rows:
-        ma = r.get("merged_at")
-        if not ma or not r.get("merge_commit_sha"):
-            continue
-        when = datetime.datetime.fromisoformat(ma.replace("Z", "+00:00"))
-        if when < cutoff:
-            continue
-        out.append(PullRequest(
-            number=int(r["number"]), title=r.get("title") or "",
-            body=r.get("body") or "", merge_sha=r["merge_commit_sha"],
-            base_sha=(r.get("base") or {}).get("sha") or "",
-            author=(r.get("user") or {}).get("login") or "", merged_at=ma,
-        ))
+        pr = _pr_from_row(r)
+        if pr is not None and _parse_ts(pr.merged_at) >= cutoff:
+            out.append(pr)
     return out
+
+def fetch_pr(slug: str, number: int, env: dict) -> "PullRequest | None":
+    """One PR by number (for the retry list); None when it is not merged."""
+    return _pr_from_row(_gh_json([f"repos/{slug}/pulls/{number}"], env))
+
+# -----------------------------------------------------------------------------
+# Per-repo state: the cursor and the retry list
+# -----------------------------------------------------------------------------
+
+@dataclass
+class RepoState:
+    """What the reconciler keeps per repo between runs, in
+    `<state_dir>/<owner>__<repo>.state.json`.
+
+    `cursor`: the start time of the last run whose discovery succeeded and
+    whose every merged PR was either ingested or put on the retry list. The
+    next run scans PRs merged since `cursor - window_minutes`, so the window is
+    an overlap, not a horizon: a reconciler that was down for a day catches up.
+
+    `retry`: PR number -> {"attempts", "last_failed_at"} for each PR whose
+    ingest failed. Each run fetches them by number, wherever they fall
+    relative to the scan, until they are ingested."""
+    cursor: str | None = None
+    retry: dict[int, dict] = field(default_factory=dict)
+
+def _state_path(state_dir: str, slug: str) -> Path:
+    d = _mirror_dir(state_dir, slug)
+    return d.with_name(d.name + ".state.json")
+
+def load_state(state_dir: str, slug: str) -> RepoState:
+    """The repo's state; empty when it has none yet. An unreadable or malformed
+    file raises: starting over would drop the retry list without a word."""
+    p = _state_path(state_dir, slug)
+    if not p.exists():
+        return RepoState()
+    data = json.loads(p.read_text())
+    return RepoState(cursor=data.get("cursor"),
+                     retry={int(k): dict(v) for k, v in (data.get("retry") or {}).items()})
+
+def save_state(state_dir: str, slug: str, st: RepoState) -> None:
+    """Write the repo's state atomically (temp file, then rename)."""
+    p = _state_path(state_dir, slug)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"cursor": st.cursor,
+                       "retry": {str(k): v for k, v in sorted(st.retry.items())}},
+                      indent=2, sort_keys=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=p.name + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body + "\n")
+        os.replace(tmp, p)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+def compute_cutoff(cursor: str | None, now: datetime.datetime, window_minutes: int) -> datetime.datetime:
+    """The earliest merge time a run scans: `window_minutes` before the cursor
+    (before `now` on a first run, or if the cursor is in the future)."""
+    since = now if cursor is None else min(_parse_ts(cursor), now)
+    return since - datetime.timedelta(minutes=window_minutes)
+
+def _record_failure(st: RepoState, number: int, now: datetime.datetime) -> None:
+    prev = st.retry.get(number, {})
+    st.retry[number] = {"attempts": int(prev.get("attempts", 0)) + 1,
+                        "last_failed_at": now.isoformat()}
 
 def _mirror_dir(state_dir: str, slug_key: str) -> Path:
     return Path(state_dir) / slug_key.replace("/", "__")
@@ -289,9 +363,12 @@ def ingest_pr(pr, mirror, endpoint, slug, *, env=None, github_env=None,
     return res.returncode
 
 def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None) -> tuple[int, int]:
-    """Reconcile every configured repo once. Repo-level failures (mirror/discovery)
-    and per-PR failures are both logged and isolated — one bad repo or PR never
-    aborts the rest — and counted into the failure tally. Returns (ok, fail)."""
+    """Reconcile every configured repo once: the PRs merged since the repo's
+    cutoff (`compute_cutoff`) plus its retry list. Repo-level failures
+    (state/mirror/discovery) and per-PR failures are both logged and isolated —
+    one bad repo or PR never aborts the rest — and counted into the failure
+    tally. A repo-level failure keeps the repo's cursor; a failed PR joins the
+    retry list. A dry run reads the state and writes none. Returns (ok, fail)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     env = gh_env()
     key_file = resolve_author_key_file(cfg)
@@ -312,18 +389,43 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
     ok = fail = 0
     for slug in cfg.repos:
         try:
+            state = load_state(cfg.state_dir, slug)
             mirror = ensure_mirror(f"https://github.com/{slug}.git", cfg.state_dir, env, slug_key=slug)
-            prs = discover_merged_prs(slug, env, cfg.window_minutes, now)
-        except Exception as e:  # repo-level failure: log + continue
+            cutoff = compute_cutoff(state.cursor, now, cfg.window_minutes)
+            prs = discover_merged_prs(slug, env, cutoff)
+        except Exception as e:  # repo-level failure: log + continue, cursor kept
             LOG.error("repo %s discovery failed: %s", slug, e); fail += 1; continue
+        found = {pr.number for pr in prs}
+        for number in sorted(set(state.retry) - found):
+            try:
+                pr = fetch_pr(slug, number, env)
+            except Exception as e:
+                LOG.error("PR #%s (%s) retry lookup failed: %s", number, slug, e)
+                _record_failure(state, number, now); fail += 1; continue
+            if pr is None:
+                LOG.warning("PR #%s (%s) is on the retry list but not merged; dropping it", number, slug)
+                del state.retry[number]; continue
+            LOG.info("retrying PR #%s (%s), attempt %s", number, slug,
+                     state.retry[number].get("attempts", 0) + 1)
+            prs.append(pr)
         for pr in prs:
             try:
                 rc = ingest_pr(pr, mirror, cfg.endpoint, slug, env=child_env, github_env=env,
                                ingest_git_bin=cfg.ingest_git_bin, dry_run=dry_run,
                                author_key_file=key_file)
-                ok += (rc == 0); fail += (rc != 0)
             except Exception as e:
-                LOG.error("PR #%s (%s) ingest raised: %s", pr.number, slug, e); fail += 1
+                LOG.error("PR #%s (%s) ingest raised: %s", pr.number, slug, e); rc = None
+            if rc == 0:
+                ok += 1; state.retry.pop(pr.number, None)
+            else:
+                fail += 1; _record_failure(state, pr.number, now)
+        # Every merged PR since the cutoff is now ingested or on the retry list.
+        state.cursor = now.isoformat()
+        if not dry_run:
+            try:
+                save_state(cfg.state_dir, slug, state)
+            except OSError as e:
+                LOG.error("repo %s: cannot save state: %s", slug, e); fail += 1
     return ok, fail
 
 def main(argv=None) -> int:
