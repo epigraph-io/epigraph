@@ -73,14 +73,30 @@ async fn insert_claim(
     .expect("insert claim");
 }
 
+/// The overlap claim is strictly 2nd in the dense leg and strictly 1st in the
+/// lexical leg, so it outranks the dense leg's top row on the fused score
+/// alone. No two rows tie in either leg, and the ids are pinned so that `lex`
+/// sorts lowest: an id tiebreak, if the fixture ever needed one, would favour
+/// the row the test expects to lose.
+///
+/// Backlog 0a986628: the earlier fixture put `both` (`vec_hot(1)`) and `lex`
+/// (`vec_hot(900)`) at the same distance from the query (both orthogonal to
+/// it, cosine distance exactly 1), gave them equal `ts_rank_cd` (0.1 each), and
+/// with a pool of 50 put `lex` in the dense leg as well. The two rows tied in
+/// both legs, and `both` won only because it was inserted first, so any id
+/// tiebreak made the test depend on which random UUID sorted lower.
 #[sqlx::test(migrations = "../../migrations")]
 async fn hybrid_fuses_both_legs_ranking_the_overlap_first(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let query = vec_hot(0); // dense query points at dim 0
 
+    // Lowest id to the row expected to lose to `both`; see the doc above.
+    let lex = Uuid::from_u128(1);
+    let both = Uuid::from_u128(2);
+    let dense = Uuid::from_u128(3);
+
     // DENSE: closest vector, no lexical overlap with the query text.
-    let dense = Uuid::new_v4();
     insert_claim(
         &pool,
         dense,
@@ -92,21 +108,21 @@ async fn hybrid_fuses_both_legs_ranking_the_overlap_first(pool: PgPool) {
         &[],
     )
     .await;
-    // BOTH: 2nd-closest vector AND contains the rare lexical term.
-    let both = Uuid::new_v4();
+    // BOTH: 2nd-closest vector (30 degrees off the query) AND the best
+    // lexical match (the query phrase twice, so two covers for ts_rank_cd).
     insert_claim(
         &pool,
         both,
         agent,
         2,
-        "discussion of quasinormal mechanosynthesis tooling",
-        &vec_hot(1),
+        "quasinormal mechanosynthesis tooling, quasinormal mechanosynthesis at scale",
+        &vec_angle(30.0),
         true,
         &[],
     )
     .await;
-    // LEX: far vector, contains the rare lexical term.
-    let lex = Uuid::new_v4();
+    // LEX: farthest vector (orthogonal), one lexical cover. It is still in the
+    // dense leg (pool 50 > 3 rows), but last there and 2nd in the lexical leg.
     insert_claim(
         &pool,
         lex,
