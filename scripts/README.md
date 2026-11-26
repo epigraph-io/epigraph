@@ -20,10 +20,18 @@ python3 -m venv .venv
 
 A script that opens a database connection has no built-in DSN: it connects on
 `--database-url`, else `MAINTENANCE_DATABASE_URL`, else `DATABASE_URL`, and
-refuses to start with none of them (`scripts/maintenance_dsn.py`). The few
-read-only scripts that deliberately stay off the maintenance login
-(`subcluster_outliers.py`, `lib/tiered_enrichment.py --claim-id`) take
-`--database-url` or `DATABASE_URL` only. Which jobs to schedule, and with what
+refuses to start with none of them (`scripts/maintenance_dsn.py`). Three
+scripts differ:
+
+- `subcluster_outliers.py` is read-only and deliberately stays off the
+  maintenance login: `--database-url` or `DATABASE_URL` only. Give it a
+  read-only login; nothing enforces that.
+- `lib/tiered_enrichment.py --claim-id` takes `--database-url` only (not from
+  the environment), so a privileged `DATABASE_URL` exported for another job is
+  never used for it.
+- `run_assessment_worker.py` has no `--database-url`: it reads on
+  `DATABASE_URL` and writes on `MAINTENANCE_DATABASE_URL`, else
+  `DATABASE_ADMIN_URL`, and exits at startup unless both sides are set. Which jobs to schedule, and with what
 role and cadence, is in `docs/deploy.md`, "Step 10 — Schedule the maintenance
 jobs" (the theme pipeline is there too).
 

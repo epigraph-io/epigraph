@@ -669,7 +669,8 @@ not to the API.
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `MAINTENANCE_DATABASE_URL` | the maintenance CLIs | Preferred over `DATABASE_URL`. The fallback WARNs, and some binaries refuse it (section 5). |
+| `MAINTENANCE_DATABASE_URL` | the maintenance CLIs; the database-opening scripts under `scripts/` (`scripts/maintenance_dsn.py`); the WRITES of `scripts/run_assessment_worker.py` | Preferred over `DATABASE_URL`. The fallback WARNs, and some binaries refuse it (section 5). The scripts have no built-in DSN: with neither variable set (and no `--database-url`) they refuse to start ("The Python scripts" below). |
+| `DATABASE_ADMIN_URL` | `scripts/run_assessment_worker.py` only | The worker's writing DSN (its `assessment_queue` status updates) when `MAINTENANCE_DATABASE_URL` is unset. The worker reads on `DATABASE_URL` and writes on `MAINTENANCE_DATABASE_URL`, else this; it has no `--database-url` flag and exits at startup unless both its read and its write DSN are set. It used to fall back to a built-in admin DSN, so a worker environment that sets only `DATABASE_URL` must add one of the two before this release. |
 | `EPIGRAPH_API` | `decompose_claims` and the belief-mode check in `recompute_betp`, `backfill_factors` and `refresh_truth_mirrors` (read before `EPIGRAPH_API_URL`); `epigraph-privatize` (the only API variable it reads); `scripts/reconcile_backlog_labels.py` (`--base-url` default) | The API's base URL, explicit override. |
 | `EPIGRAPH_API_URL` | among them `dekg`, `decompose_claims`, `recompute_betp`, `backfill_factors`, `refresh_truth_mirrors`, `scripts/maintain_themes.py`, `scripts/run_assessment_worker.py` | The API's base URL, for CLIs that call the HTTP API. |
 | `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `ingest_git` (when `--token` is not given; the git-ingest reconciler hands its token over this way), `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
@@ -1212,8 +1213,7 @@ the Rust one. So a script run on an unprivileged role once policies apply
 reads a subset and exits 0 with no warning. The refusal that protects you is
 at the API and CLI boundary only. It is standard library only, so the
 scripts that need the rule but not numpy do not acquire a numpy dependency.
-`scripts/theme_lib.py::maintenance_dsn` binds it to that script family's
-default.
+`scripts/theme_lib.py::maintenance_dsn` re-exports it for the theme scripts.
 
 The precedence carries a refusal that is not optional politeness. Giving
 `MAINTENANCE_DATABASE_URL` precedence means that an operator who points
@@ -1221,20 +1221,28 @@ The precedence carries a refusal that is not optional politeness. Giving
 exported, would otherwise have every write in this family silently
 redirected, and several of these scripts write.
 
-Many scripts under `scripts/` fall back to a hardcoded DSN when neither
-variable is set. Among them are
-`postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph` (also
-spelled with `127.0.0.1`), `epigraph_ro` variants, and
-`postgres://epigraph:epigraph@127.0.0.1:5432/epigraph`. List the candidates
-with:
+**The scripts have no built-in DSN.** A script that opens a database
+connection connects on `--database-url` when given, else on
+`MAINTENANCE_DATABASE_URL`, else on `DATABASE_URL`. With none of them it
+refuses to start (`maintenance_dsn.NoDatabaseConfigured`, a `RuntimeError`
+naming the variables) before it connects to anything. `--help` and an explicit
+`--database-url` work with no environment; an explicit `--database-url` also
+skips the same-database check between the two variables, since the flag is
+not chosen by environment precedence. Earlier releases fell back to hard-coded
+DSNs naming privileged roles on a database named like the production one, so
+a scheduled run whose environment file was missing went there instead of
+failing; set the variable in every scheduled job's environment before
+deploying this release. Three scripts differ:
 
-```bash
-grep -rlE 'postgres(ql)?://[a-z_]+:[a-z_]+@' scripts/
-```
-
-(The hits under `scripts/e2e/` are example DSNs in comments.) This repository
-creates none of those logins. Always set `MAINTENANCE_DATABASE_URL` (or
-`DATABASE_URL`) explicitly when you run a script.
+- `scripts/run_assessment_worker.py` has no `--database-url`. It reads on
+  `DATABASE_URL` and writes on `MAINTENANCE_DATABASE_URL`, else
+  `DATABASE_ADMIN_URL`, and exits at startup unless both are set.
+- `scripts/subcluster_outliers.py` is read-only and stays off the maintenance
+  login: `--database-url` or `DATABASE_URL`. Give it a read-only login;
+  nothing enforces one.
+- `scripts/lib/tiered_enrichment.py --claim-id` takes `--database-url` only and
+  never reads the environment, so a privileged `DATABASE_URL` exported for
+  another job is not used for it.
 
 **Every login that runs the theme scripts needs two grants.** Every theme
 label path (`label_themes_llm.py`, including `--dry-run`, `cluster_claims.py`,
