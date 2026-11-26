@@ -97,8 +97,10 @@ pub fn public_paper_id(doi: &str) -> Uuid {
 /// The scope predicate every in-scope `papers` lookup splices into
 /// [`document_key_first_in_sql`]: the declared scope's row, never another's.
 /// `vis` and `owner` are the bind numbers of the declaration's visibility and
-/// owner group (trusted literals, never caller input).
-fn in_scope_predicate(vis: usize, owner: usize) -> String {
+/// owner group (trusted literals, never caller input). Public so a plan test
+/// can EXPLAIN the lookup with the very predicate the repository splices.
+#[must_use]
+pub fn in_scope_predicate(vis: usize, owner: usize) -> String {
     format!("visibility = ${vis}::text AND (${vis}::text = 'public' OR owner_group_id = ${owner}::uuid)")
 }
 
@@ -1888,28 +1890,69 @@ pub fn peel_document_key_prefixes(t: &str) -> Option<&str> {
 /// sources to the belief engine.
 #[must_use]
 pub fn document_identity_key(raw: &str) -> Option<String> {
-    let t = raw.trim();
-    let t = peel_document_key_prefixes(t)
-        .unwrap_or(t)
-        .trim()
-        .trim_end_matches('/');
-    if t.is_empty() || t.contains("://") || epigraph_core::domain::evidence::is_placeholder_id(t) {
+    let t = peeled_document_key(raw);
+    if t.contains("://") || epigraph_core::domain::evidence::is_placeholder_id(t) {
         None
     } else {
         Some(t.to_ascii_lowercase())
     }
 }
 
+/// `raw` with every [`DOI_KEY_PREFIXES`] spelling peeled
+/// ([`peel_document_key_prefixes`]), trimmed, trailing `/` removed: the part
+/// of a document key that names the document. Shared by
+/// [`document_identity_key`] and [`is_placeholder_document_key`], so what the
+/// belief engine treats as no identity and what a writer refuses cannot drift.
+fn peeled_document_key(raw: &str) -> &str {
+    let t = raw.trim();
+    peel_document_key_prefixes(t)
+        .unwrap_or(t)
+        .trim()
+        .trim_end_matches('/')
+}
+
+/// True when the document key `raw` means "this document has no identifier":
+/// once its DOI resolver prefixes and trailing `/` are peeled
+/// ([`peeled_document_key`]), it is blank or a placeholder
+/// (`epigraph_core::domain::evidence::is_placeholder_id`: "unknown", "n/a",
+/// ...). So `doi:unknown`, `https://doi.org/unknown`, `unknown/` and a bare
+/// resolver root (`https://doi.org/`) are placeholders, as `unknown` is
+/// (backlog cc71759f): keyed on one, every DOI-less document posted with it
+/// collapsed onto one paper row.
+///
+/// The test both transports' writers apply to a document key: the REST paper
+/// route refuses one, and the MCP ingest tools treat one as absent. Unlike
+/// [`document_identity_key`], a URL that is not a DOI resolver link
+/// (`https://example.org/report`) is NOT a placeholder: it is a usable key.
+#[must_use]
+pub fn is_placeholder_document_key(raw: &str) -> bool {
+    epigraph_core::domain::evidence::is_placeholder_id(peeled_document_key(raw))
+}
+
 /// The case-variant arm shared by [`document_key_match_sql`] and
 /// [`document_key_rows_sql`]: `column` equals one of the spellings bound at
 /// `$bind` ignoring letter case AND ends in the canonical key (`$bind[1]`)
 /// exactly, so only the resolver PREFIX is folded.
-fn case_variant_arm_sql(column: &str, bind: usize) -> String {
+///
+/// `fold` is the case fold, applied to both sides: [`DOCUMENT_KEY_FOLD`] in a
+/// lookup over `papers`, whose index on it is what serves the arm; plain
+/// `lower` in a per-row filter, which needs no index and so does not pay a
+/// non-inlined function call per row. Both fold identically.
+fn case_variant_arm_sql(column: &str, bind: usize, fold: &str) -> String {
     format!(
-        "(lower({column}) = ANY(SELECT lower(s) FROM unnest(${bind}::text[]) AS s) \
+        "({fold}({column}) = ANY(SELECT {fold}(s) FROM unnest(${bind}::text[]) AS s) \
          AND right({column}, char_length((${bind}::text[])[1])) = (${bind}::text[])[1])"
     )
 }
+
+/// The case fold of a document key that `papers_doi_fold_idx` indexes
+/// (migration 351): `pg_catalog.lower`, wrapped in a LEAKPROOF, non-inlinable
+/// SQL function. `papers` is FORCE RLS (246), and under row security a qual
+/// that is not leakproof is evaluated only after the policy, so it can be no
+/// index condition; `lower` itself is not marked leakproof, so an index on
+/// `lower(doi)` would never serve the application's lookup (backlog
+/// cc71759f).
+pub const DOCUMENT_KEY_FOLD: &str = "public.epigraph_document_key_fold";
 
 /// The per-row SQL predicate for a `papers.doi` match: true when `column`
 /// holds a stored spelling of the document key whose
@@ -1927,9 +1970,11 @@ fn case_variant_arm_sql(column: &str, bind: usize) -> String {
 /// are just the key, and the second arm then admits nothing but that key.
 ///
 /// **Only for a filter applied to rows already reached another way** (the
-/// recall paper filter joins `papers` by primary key). No index serves the
-/// second arm, so as the WHERE of a lookup over `papers` it makes even an
-/// exact hit scan the whole table; a lookup uses [`document_key_rows_sql`].
+/// recall paper filter joins `papers` by primary key). The second arm folds
+/// with plain `lower`, which no index serves, and an OR of the two arms is
+/// no index probe anyway, so as the WHERE of a lookup over `papers` it makes
+/// even an exact hit scan the whole table; a lookup uses
+/// [`document_key_rows_sql`].
 ///
 /// `column` must be a trusted identifier (a static literal such as `doi` or
 /// `p.doi`), never caller input.
@@ -1937,7 +1982,7 @@ fn case_variant_arm_sql(column: &str, bind: usize) -> String {
 pub fn document_key_match_sql(column: &str, bind: usize) -> String {
     format!(
         "({column} = ANY(${bind}::text[]) OR {variant})",
-        variant = case_variant_arm_sql(column, bind),
+        variant = case_variant_arm_sql(column, bind, "lower"),
     )
 }
 
@@ -1949,13 +1994,15 @@ pub fn document_key_match_sql(column: &str, bind: usize) -> String {
 /// f3a3ca54).
 ///
 /// The fallback is what keeps the lookup on the unique index. The exact set
-/// is an index probe. The case-variant set, which no index serves, is gated
-/// by an uncorrelated `NOT EXISTS` over the exact spellings (planned once, as
-/// a one-time filter), so on a hit its scan of `papers` never runs; it also
-/// never runs for a key that is not a bare DOI, whose spellings are the key
-/// alone (`cardinality = 1`) and which therefore has no prefix to fold. Only
-/// a miss on a bare DOI (a new paper's first ingest) scans `papers`; an
-/// expression index on `lower(doi)` would serve that too.
+/// is an index probe. The case-variant set is gated by an uncorrelated `NOT
+/// EXISTS` over the exact spellings (planned once, as a one-time filter), so
+/// on a hit it never runs; it also never runs for a key that is not a bare
+/// DOI, whose spellings are the key alone (`cardinality = 1`) and which
+/// therefore has no prefix to fold. On a miss on a bare DOI (a new paper's
+/// first ingest) it is an index probe too: it folds with
+/// [`DOCUMENT_KEY_FOLD`], which `papers_doi_fold_idx` (migration 351) indexes
+/// and which, being LEAKPROOF, is an index condition under `papers`' row
+/// security (backlog cc71759f).
 ///
 /// Wrap it as a derived table and rank by
 /// `array_position($bind::text[], doi)` (canonical first; a case-variant row
@@ -1987,7 +2034,7 @@ pub fn document_key_rows_in_sql(columns: &str, bind: usize, scope: &str) -> Stri
            AND NOT EXISTS (SELECT 1 FROM papers k \
                             WHERE k.doi = ANY(${bind}::text[]) AND ({scope})) \
            AND {variant} AND ({scope})",
-        variant = case_variant_arm_sql("doi", bind),
+        variant = case_variant_arm_sql("doi", bind, DOCUMENT_KEY_FOLD),
     )
 }
 
@@ -2151,6 +2198,43 @@ mod document_key_tests {
             "https://example.org/articles/10.5555/x",
         ] {
             assert_eq!(document_identity_key(none), None, "{none:?}");
+        }
+    }
+
+    /// Backlog cc71759f: a placeholder behind a DOI resolver prefix, or with
+    /// a trailing `/`, is still a placeholder. Spellings are literal, not
+    /// built from the shared lists, so emptying a list cannot pass this.
+    #[test]
+    fn a_prefixed_or_slashed_placeholder_is_a_placeholder() {
+        for raw in [
+            "unknown",
+            " N/A ",
+            "",
+            "doi:unknown",
+            "DOI: unknown",
+            "https://doi.org/unknown",
+            "HTTPS://DX.DOI.ORG/N/A",
+            "doi.org/tbd",
+            "doi:https://doi.org/none",
+            "unknown/",
+            "doi:unknown/",
+            "https://doi.org/null/",
+            "https://doi.org/",
+            "doi:",
+            "/",
+        ] {
+            assert!(is_placeholder_document_key(raw), "{raw:?}");
+        }
+        for key in [
+            "10.5555/unknown",
+            "doi:10.5555/unknown",
+            "https://doi.org/10.5555/n/a",
+            "https://example.org/unknown",
+            "https://doi.org/about",
+            "urn:epigraph:doc:unknown-0123456789abcdef",
+            "unknown-run-7",
+        ] {
+            assert!(!is_placeholder_document_key(key), "{key:?}");
         }
     }
 
