@@ -83,9 +83,9 @@ fn sqlstate(err: &sqlx::Error) -> Option<String> {
 /// named (it can do anything already), and with the grant revoked the check
 /// passes again.
 ///
-/// Verified to fail on the old code (350 moved out of `migrations/`, so head
-/// is 161's body on 271's path): the ADMIN-only holder and the CREATEROLE role
-/// are not named.
+/// Verified to fail on the old code: with 350 replaced by a no-op (head is
+/// 161's body on 271's path), and with 350 re-stating 161's USAGE / SET arm
+/// but keeping its migrate-time raise, the ADMIN-only holder is not named.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_check_names_an_admin_option_holder_and_a_createrole_role(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire");
@@ -201,8 +201,9 @@ async fn a_role_that_can_act_as_the_attestor_is_still_named(pool: PgPool) {
 /// applies on a clean cluster. Each refusal is staged on a database at 349 in
 /// a transaction that is rolled back.
 ///
-/// Verified to fail: 350's new arms removed (its function back to 161's
-/// USAGE / SET arm) -> both stagings apply.
+/// Verified to fail: 350 re-stating 161's USAGE / SET arm but keeping its
+/// migrate-time raise -> the ADMIN-only staging applies; 350 replaced by a
+/// no-op -> the same.
 #[sqlx::test(migrations = false)]
 async fn migration_350_refuses_an_attestor_that_is_not_isolated(pool: PgPool) {
     migrate(&pool, &up_to(349)).await;

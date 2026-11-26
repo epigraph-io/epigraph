@@ -5832,9 +5832,9 @@ mod definer_register_tests {
     /// reported. Staged in ONE transaction that is rolled back (roles are
     /// cluster-wide). CONTROL: at head, and with the grant revoked, it passes.
     ///
-    /// Verified to fail: without the check in this binary nothing is reported;
-    /// with it but without migration 350 (161's USAGE / SET arm only) neither
-    /// the ADMIN-only holder nor the CREATEROLE login is reported.
+    /// Verified to fail: with 350 replaced by a no-op, and with 350 re-stating
+    /// 161's USAGE / SET arm (its migrate-time raise kept), the ADMIN-only
+    /// holder gives 0 failures, not 2.
     #[sqlx::test(migrations = "../../migrations")]
     async fn verify_reports_an_attestor_that_is_not_isolated(pool: sqlx::PgPool) {
         let mut conn = pool.acquire().await.expect("acquire");
