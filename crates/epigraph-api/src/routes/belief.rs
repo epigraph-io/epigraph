@@ -380,9 +380,10 @@ async fn finish_savepoint<T>(
 /// They used to be pushed to an in-process store that was never persisted:
 /// lost on every restart, invisible to MCP, and growing for the life of the
 /// process. Best-effort, as the push was: every call site is after the
-/// submission's COMMIT (or, for `contradiction.predicted`, before its
-/// transaction opens), so a failed INSERT is logged by
+/// submission's COMMIT, so a failed INSERT is logged by
 /// `EventRepository::publish_or_log` and the request still succeeds.
+/// (`contradiction.predicted`, decided before the transaction opens, is
+/// published ON the transaction instead, step 5b'.)
 #[cfg(feature = "db")]
 async fn record_event(
     pool: &sqlx::PgPool,
@@ -1476,6 +1477,10 @@ pub async fn submit_evidence(
     // 4e. Pre-screen for contradiction potential (G8)
     //     Load the claim's edge neighborhood and check if the new evidence
     //     would introduce a contradiction via the Ascent reasoning engine.
+    //     The `contradiction.predicted` payload is HELD here and published on
+    //     the submission's transaction once the BBA is stored (5b'): written
+    //     now it would outlive a submission refused or rolled back below.
+    let mut predicted_contradiction: Option<serde_json::Value> = None;
     {
         use epigraph_engine::reasoning::{ReasoningClaim, ReasoningEdge, ReasoningEngine};
 
@@ -1553,22 +1558,16 @@ pub async fn submit_evidence(
             if let Some(contradiction) =
                 ReasoningEngine::would_contradict(&extended_claims, &reasoning_edges, &new_edge)
             {
-                record_event(
-                    pool,
-                    "contradiction.predicted",
-                    request.agent_id,
-                    serde_json::json!({
-                        "claim_id": request.claim_id,
-                        "contradicting_claims": [
-                            contradiction.claim_a.to_string(),
-                            contradiction.claim_b.to_string(),
-                        ],
-                        "target": contradiction.target.to_string(),
-                        "support_strength": contradiction.support_strength,
-                        "refute_strength": contradiction.refute_strength,
-                    }),
-                )
-                .await;
+                predicted_contradiction = Some(serde_json::json!({
+                    "claim_id": request.claim_id,
+                    "contradicting_claims": [
+                        contradiction.claim_a.to_string(),
+                        contradiction.claim_b.to_string(),
+                    ],
+                    "target": contradiction.target.to_string(),
+                    "support_strength": contradiction.support_strength,
+                    "refute_strength": contradiction.refute_strength,
+                }));
             }
         }
     }
@@ -1704,6 +1703,20 @@ pub async fn submit_evidence(
         None,      // HTTP belief endpoint has no evidence row in scope (issue #197 Phase 3)
     )
     .await?;
+
+    // 5b'. Step 4e's `contradiction.predicted`, on this transaction (backlog
+    //      8fcc36a0): it commits with the BBA it was predicted for, or not at
+    //      all. SAVEPOINT-wrapped inside `publish_or_log_conn`, so a refused
+    //      event cannot abort the submission.
+    if let Some(payload) = &predicted_contradiction {
+        let _ = epigraph_db::EventRepository::publish_or_log_conn(
+            &mut tx,
+            "contradiction.predicted",
+            request.agent_id,
+            payload,
+        )
+        .await;
+    }
 
     // 6. Ensure the claim is assigned to the frame (best-effort, under a
     //    SAVEPOINT: unsavepointed, a refused INSERT would abort the transaction
