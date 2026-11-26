@@ -881,7 +881,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// table, and the Rust-side filter of the in-process store it merged
 /// (`retain_visible_events`, one `state.db_pool` site) is deleted, not
 /// converted (`routes/events.rs` 6 -> 5). No file reached zero.
-const HIGH_WATER: usize = 151;
+/// 151 -> 150 (backlog 716288f9): `list_tasks`'s state-and-workflow arm
+/// merged into the workflow arm, which applies the state filter in its own
+/// query, so the arm's separate `list_by_workflow(&state.db_pool, ..)` call is
+/// gone (`routes/tasks.rs` 15 -> 14). Removed, not converted. No file reached
+/// zero. (Staging 2026-11-26-2: the PR did not lower this register; its own
+/// CI failed on it.)
+const HIGH_WATER: usize = 150;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1275,7 +1281,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // (its agent-existence and dedup reads). Read off this test's own failure
     // (`recorded 4, measured 2`).
     ("routes/submit.rs", 2),
-    ("routes/tasks.rs", 15),
+    // 15 -> 14 (backlog 716288f9): the state-and-workflow arm of `list_tasks`
+    // folded into the workflow arm; its own `list_by_workflow` call on
+    // `state.db_pool` went with it. Removed, not converted.
+    ("routes/tasks.rs", 14),
     ("routes/timeline.rs", 2),
     // 9 before conversion shard 7, which moved `claim_history` onto
     // `AppState::read_as`. Of the eight that remain, six are `supersede_claim`
