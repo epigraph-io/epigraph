@@ -13,14 +13,17 @@
 //! there would pass whatever the index could do for the application.
 
 use epigraph_db::repos::paper::{
-    document_key_first_in_sql, document_key_spellings, DOCUMENT_KEY_FOLD,
+    document_key_first_in_sql, document_key_spellings, in_scope_predicate, DOCUMENT_KEY_FOLD,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// The scope `PaperRepository::get_or_create` passes
-/// (`repos::paper::in_scope_predicate(2, 3)`), bound here to the public scope.
-const SCOPE: &str = "visibility = $2::text AND ($2::text = 'public' OR owner_group_id = $3::uuid)";
+/// The lookup `PaperRepository::get_or_create` runs, with the repository's
+/// own scope predicate (binds 2 and 3, bound here to the public scope), so the
+/// plan read here cannot drift from the predicate the repository splices.
+fn miss_lookup_sql() -> String {
+    document_key_first_in_sql("id", 1, &in_scope_predicate(2, 3))
+}
 
 /// `EXPLAIN (COSTS OFF)` of the get_or_create lookup for a bare DOI no row
 /// holds, on `conn` as it is (role and settings).
@@ -52,7 +55,7 @@ async fn the_bare_doi_miss_path_is_an_index_probe_under_row_security(pool: PgPoo
             .await
             .unwrap_or_else(|e| panic!("{stmt}: {e}"));
     }
-    let plan = explain_miss(&mut conn, &document_key_first_in_sql("id", 1, SCOPE)).await;
+    let plan = explain_miss(&mut conn, &miss_lookup_sql()).await;
     assert!(
         plan.contains("papers_doi_fold_idx")
             && index_cond_on(&plan, "epigraph_document_key_fold(doi)"),
@@ -78,7 +81,7 @@ async fn a_plain_lower_doi_index_is_no_index_condition_under_row_security(pool: 
             .await
             .unwrap_or_else(|e| panic!("{stmt}: {e}"));
     }
-    let plain = document_key_first_in_sql("id", 1, SCOPE).replace(DOCUMENT_KEY_FOLD, "lower");
+    let plain = miss_lookup_sql().replace(DOCUMENT_KEY_FOLD, "lower");
     assert!(!plain.contains("epigraph_document_key_fold"), "{plain}");
     let plan = explain_miss(&mut tx, &plain).await;
     assert!(

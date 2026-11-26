@@ -97,8 +97,10 @@ pub fn public_paper_id(doi: &str) -> Uuid {
 /// The scope predicate every in-scope `papers` lookup splices into
 /// [`document_key_first_in_sql`]: the declared scope's row, never another's.
 /// `vis` and `owner` are the bind numbers of the declaration's visibility and
-/// owner group (trusted literals, never caller input).
-fn in_scope_predicate(vis: usize, owner: usize) -> String {
+/// owner group (trusted literals, never caller input). Public so a plan test
+/// can EXPLAIN the lookup with the very predicate the repository splices.
+#[must_use]
+pub fn in_scope_predicate(vis: usize, owner: usize) -> String {
     format!("visibility = ${vis}::text AND (${vis}::text = 'public' OR owner_group_id = ${owner}::uuid)")
 }
 
