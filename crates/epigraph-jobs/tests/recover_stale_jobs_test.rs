@@ -277,11 +277,13 @@ async fn a_one_attempt_job_killed_on_every_run_is_failed_after_bounded_redeliver
 /// Seconds from the database's `now()` to the row's `run_after` (migration
 /// 261), `None` when it is NULL (due at once).
 async fn wait_s(pool: &PgPool, id: Uuid) -> Option<f64> {
-    sqlx::query_scalar("SELECT extract(epoch FROM run_after - now())::float8 FROM jobs WHERE id = $1")
-        .bind(id)
-        .fetch_one(pool)
-        .await
-        .expect("the job's run_after")
+    sqlx::query_scalar(
+        "SELECT extract(epoch FROM run_after - now())::float8 FROM jobs WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("the job's run_after")
 }
 
 /// A counted reap gives the reset row a not-before time of `now() +` its

@@ -652,8 +652,7 @@ impl JobRunner {
                                 // Apply backoff before re-enqueueing: the
                                 // handler's, or a rate limit's retry-after
                                 // when that is longer.
-                                let delay =
-                                    retry_delay(&e, handler.backoff(job.retry_count - 1));
+                                let delay = retry_delay(&e, handler.backoff(job.retry_count - 1));
                                 tokio::time::sleep(delay).await;
                             }
                             write_back(queue.as_ref(), &job).await;
