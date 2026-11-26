@@ -19,6 +19,7 @@ mod support;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ciborium::Value as Cbor;
 use epigraph_passkey::android::StatusFreshness;
 use epigraph_passkey::{
     act_challenge, AaguidAllowlist, ActAnchor, AnchorRefusal, AttestationPolicy, AttestedPolicy,
@@ -26,7 +27,8 @@ use epigraph_passkey::{
     StandingRefusal, StoredPasskey, ACT_NONCE_LEN, STATEMENT_KEY,
 };
 use support::{
-    android_status, AndroidKeyOpts, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID,
+    android_status, restated, AndroidKeyOpts, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN,
+    RP_ID,
 };
 use uuid::Uuid;
 
@@ -309,6 +311,8 @@ async fn an_android_key_registers_only_when_the_attestation_puts_it_in_hardware(
 /// StrongBox (security level 2) is refused by `webauthn-rs-core` 0.5.5's
 /// own parser before this crate sees it (`InvalidTag`): pinned, so a library
 /// that starts parsing it shows up here (this crate's rules admit level 2).
+/// The anchored path drops such a statement to `none` instead
+/// (`a_statement_the_library_cannot_verify_is_dropped_on_the_anchored_path`).
 #[tokio::test]
 async fn a_strongbox_key_is_refused_by_the_pinned_parser() {
     let google = TestAttestation::new("Android");
@@ -2105,4 +2109,232 @@ async fn every_unknown_status_list_state_is_refused_on_the_anchored_path() {
     if root_reads_anything {
         eprintln!("running as root: the mode-000 case was not exercised");
     }
+}
+
+// =====================================================================
+// 1f84b161: on the anchored path, a statement the library cannot verify is
+// dropped to `none`, as a browser strips it, not refused
+// =====================================================================
+
+/// A statement `webauthn-rs-core` 0.5.5 refuses, from a genuine device-bound
+/// key: one it cannot verify at all, or one that fails verification.
+#[derive(Clone, Copy, Debug)]
+enum Unverifiable {
+    /// A StrongBox-level `android-key` statement (the parser refuses level 2).
+    StrongBox,
+    /// `android-safetynet`, a registered format the library does not support.
+    SafetyNet,
+    /// A format the library does not know.
+    UnknownFormat,
+    /// A genuine TEE `android-key` statement for a key with a leading zero
+    /// byte in a coordinate (the library's certificate-key comparison).
+    LeadingZero,
+    /// A `packed` self-attestation whose signature does not verify (a format
+    /// the library supports, refused for a reason other than support).
+    BadSignature,
+}
+
+impl Unverifiable {
+    const ALL: [Self; 5] = [
+        Self::StrongBox,
+        Self::SafetyNet,
+        Self::UnknownFormat,
+        Self::LeadingZero,
+        Self::BadSignature,
+    ];
+
+    fn authenticator(self) -> SoftAuthenticator {
+        let key = SoftAuthenticator::new(MODEL).hardware();
+        match self {
+            Self::LeadingZero => key.leading_zero_coordinate(),
+            _ => key,
+        }
+    }
+
+    /// `created` (a `none` registration by `auth`) re-made with this statement.
+    fn statement(
+        self,
+        google: &TestAttestation,
+        auth: &SoftAuthenticator,
+        created: &serde_json::Value,
+    ) -> serde_json::Value {
+        match self {
+            Self::StrongBox => google.android_key_with(
+                auth,
+                created,
+                true,
+                &AndroidKeyOpts {
+                    attestation_level: 2,
+                    keymaster_level: 2,
+                    ..AndroidKeyOpts::default()
+                },
+            ),
+            Self::SafetyNet => restated(
+                created,
+                "android-safetynet",
+                Cbor::Map(vec![
+                    (Cbor::Text("ver".into()), Cbor::Text("233011000".into())),
+                    (
+                        Cbor::Text("response".into()),
+                        Cbor::Bytes(b"e30.e30.c2lnbmF0dXJl".to_vec()),
+                    ),
+                ]),
+            ),
+            Self::UnknownFormat => restated(created, "x-vendor-format", Cbor::Map(vec![])),
+            Self::LeadingZero => google.android_key(auth, created, true),
+            Self::BadSignature => restated(
+                created,
+                "packed",
+                corrupted_signature(&auth.self_attest(created)),
+            ),
+        }
+    }
+}
+
+/// The attestation statement of `registration` with the last byte of its
+/// `sig` flipped: still a well-formed DER signature, over the same data, that
+/// does not verify.
+fn corrupted_signature(registration: &serde_json::Value) -> Cbor {
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let raw = registration["response"]["attestationObject"]
+        .as_str()
+        .expect("base64url")
+        .trim_end_matches('=');
+    let bytes = base64::Engine::decode(&b64, raw).expect("an attestation object");
+    let object: Cbor = ciborium::from_reader(bytes.as_slice()).expect("cbor");
+    let mut stmt = object
+        .as_map()
+        .and_then(|m| m.iter().find(|(k, _)| k.as_text() == Some("attStmt")))
+        .map(|(_, v)| v.clone())
+        .expect("an attStmt");
+    let sig = stmt
+        .as_map_mut()
+        .and_then(|m| m.iter_mut().find(|(k, _)| k.as_text() == Some("sig")))
+        .and_then(|(_, v)| v.as_bytes_mut())
+        .expect("a sig");
+    *sig.last_mut().expect("a non-empty sig") ^= 0x01;
+    stmt
+}
+
+/// On the ANCHORED path a statement the library refuses (one it cannot verify
+/// at all: a StrongBox Android key, `android-safetynet`, an unknown format, an
+/// Android key with a leading-zero coordinate; or one that fails
+/// verification: a `packed` statement with a bad signature) is DROPPED and the
+/// passkey recorded `none`, exactly as a browser asked for `none` would have
+/// stripped it: the nil AAGUID, the stored attestation and format a genuine
+/// `none` registration's, no statement stored beside it (the shape of a
+/// dropped untrusted statement; a genuine `none` keeps its response), never
+/// hardware-attested, so it anchors nothing and holds only through its
+/// anchor; it asserts with its key. The ATTESTED
+/// ceremony still refuses each (the library's refusal). Guards (green before
+/// the change too, by design): the drop removes only the statement, so a
+/// response without user verification, or made for another ceremony's
+/// challenge, is still refused.
+/// Red line: before this change every case was refused on the anchored path
+/// (`Refused`, the library's error), so such a device had no path at all.
+/// Mutations: the fallback removed -> the StrongBox case is refused; the
+/// fallback skipped for a signature error -> the bad-signature case is
+/// refused; the fallback recording the ORIGINAL response beside the
+/// credential -> the stored statement is found.
+#[tokio::test]
+async fn a_statement_the_library_cannot_verify_is_dropped_on_the_anchored_path() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let google = TestAttestation::new("Android");
+    let rp = attested(Some((&vendor, &[MODEL])), Some(&google), true);
+    let person = Uuid::new_v4();
+    let (mut first, first_reg) = packed_first(&rp, &vendor).await;
+    let anchor = confirmed_anchor(&rp, &mut first, &first_reg, person).await;
+    assert_eq!(rp.check_anchor(&anchor), Ok(()), "CALIBRATION: it anchors");
+
+    // CALIBRATION: what a genuine `none` registration stores.
+    let (options, state) = rp.start_anchored_registration(person, "op", "Op").unwrap();
+    let mut plain = SoftAuthenticator::new(MODEL).hardware();
+    let created = plain.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let genuine_none = rp
+        .finish_anchored_registration(&created, &state, &anchor)
+        .expect("CALIBRATION: a device-bound none registers");
+
+    for case in Unverifiable::ALL {
+        let (options, state) = rp.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+        let mut auth = case.authenticator();
+        let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+        match rp.finish_registration(&case.statement(&google, &auth, &created), &state) {
+            Err(PasskeyError::Refused(why)) => assert!(!why.is_empty(), "{case:?}"),
+            other => panic!("{case:?}: the attested ceremony refuses it: {other:?}"),
+        }
+
+        let (options, state) = rp.start_anchored_registration(person, "op", "Op").unwrap();
+        let mut auth = case.authenticator();
+        let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+        let response = case.statement(&google, &auth, &created);
+        let reg = rp
+            .finish_anchored_registration(&response, &state, &anchor)
+            .unwrap_or_else(|e| panic!("{case:?}: registers without its statement: {e:?}"));
+        assert_eq!(
+            (
+                reg.attestation_format.as_str(),
+                reg.aaguid,
+                reg.backup_eligible,
+                reg.user_verified
+            ),
+            ("none", Uuid::nil(), false, true),
+            "{case:?}"
+        );
+        assert_eq!(
+            (
+                &reg.passkey["cred"]["attestation"],
+                &reg.passkey["cred"]["attestation_format"]
+            ),
+            (
+                &genuine_none.passkey["cred"]["attestation"],
+                &genuine_none.passkey["cred"]["attestation_format"]
+            ),
+            "{case:?}: its attestation stored as a none registration's"
+        );
+        assert!(
+            reg.passkey.get(STATEMENT_KEY).is_none(),
+            "{case:?}: the unverified statement is not stored"
+        );
+        assert!(
+            rp.hardware_attested(&reg.passkey, "none", Uuid::nil(), false)
+                .is_err(),
+            "{case:?}"
+        );
+        let stored = StoredPasskey {
+            passkey: reg.passkey.clone(),
+            sign_count: 0,
+        };
+        let (options, state) = rp
+            .start_authentication(std::slice::from_ref(&stored), None)
+            .unwrap();
+        rp.finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
+            .unwrap_or_else(|e| panic!("{case:?}: asserts: {e:?}"));
+        let its_anchor = confirmed_anchor(&rp, &mut auth, &reg, person).await;
+        assert_eq!(
+            rp.check_anchor(&its_anchor),
+            Err(AnchorRefusal::AnchorNotAttested),
+            "{case:?}: it anchors nothing"
+        );
+    }
+
+    // Guards: only the statement is dropped.
+    let (options, state) = rp.start_anchored_registration(person, "op", "Op").unwrap();
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::Skip).await;
+    let response = Unverifiable::SafetyNet.statement(&google, &auth, &created);
+    let r = rp.finish_anchored_registration(&response, &state, &anchor);
+    assert!(
+        matches!(r, Err(PasskeyError::UserNotVerified)),
+        "no user verification: {r:?}"
+    );
+    let (options, _) = rp.start_anchored_registration(person, "op", "Op").unwrap();
+    let (_, other_state) = rp.start_anchored_registration(person, "op", "Op").unwrap();
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let response = Unverifiable::SafetyNet.statement(&google, &auth, &created);
+    let r = rp.finish_anchored_registration(&response, &other_state, &anchor);
+    assert!(
+        matches!(r, Err(PasskeyError::Refused(_))),
+        "another ceremony's challenge: {r:?}"
+    );
 }
