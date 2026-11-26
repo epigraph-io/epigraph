@@ -848,11 +848,31 @@ pub struct HybridPage {
 pub struct HybridCandidates {
     /// Well-matched rows in the fused pool (dense leg union lexical leg).
     pub matched: i64,
-    /// `true` when a leg's cap may have cut well-matched rows off, so that
+    /// `true` when well-matched rows may be missing from the count, so that
     /// `matched` is a lower bound: the lexical leg is full, or the dense leg
-    /// is full and even its farthest row clears the floor. `false` means
-    /// `matched` is every well-matched row the search could return.
+    /// is full and even its farthest row clears the floor, or the dense leg's
+    /// exact retry timed out and the count comes from the iterative first
+    /// pass, which `hnsw.max_scan_tuples` may have cut short (backlog
+    /// 28b79b1e). `false` means `matched` is every well-matched row the search
+    /// could return.
     pub pool_saturated: bool,
+}
+
+impl HybridCandidates {
+    /// The pool counts of one executed hybrid statement: `first_row` is any
+    /// row of its result (every row, including the one NULL row of an empty
+    /// page, carries the same counts), and `dense_retry_fell_back` is `true`
+    /// when the exact retry ran and timed out, so the rows are the short first
+    /// pass's. A fallen-back dense leg is truncated by construction, so the
+    /// count is a lower bound whatever the statement itself reported.
+    fn from_statement(first_row: Option<&HybridPageRow>, dense_retry_fell_back: bool) -> Self {
+        let (matched, sql_saturated) =
+            first_row.map_or((0, false), |r| (r.matched_count, r.pool_saturated));
+        Self {
+            matched,
+            pool_saturated: sql_saturated || dense_retry_fell_back,
+        }
+    }
 }
 
 /// Result row for [`ClaimRepository::latest_in_lineage`].
@@ -5396,25 +5416,18 @@ impl ClaimRepository {
         // dense leg's own size, which does not depend on `offset`, so every
         // page of a walk takes the same path.
         let dense_count = rows.first().map_or(0, |r| r.dense_count);
+        let mut dense_retry_fell_back = false;
         if dense_count < candidate_pool {
             let mut tx = begin_exact_vector_scan(&mut *conn).await?;
             let retried = build!().fetch_all(&mut *tx).await;
             tx.rollback().await?;
+            // Any error but the retry's timeout propagates below, so on the
+            // `Ok` path an error here means the first pass's rows came back.
+            dense_retry_fell_back = retried.is_err();
             rows = exact_retry_or_first_pass(retried, rows, "search_hybrid_scoped_since_in_theme")?;
         }
 
-        // Every row, including the one NULL row of an empty page, carries the
-        // same pool counts.
-        let candidates = rows.first().map_or(
-            HybridCandidates {
-                matched: 0,
-                pool_saturated: false,
-            },
-            |r| HybridCandidates {
-                matched: r.matched_count,
-                pool_saturated: r.pool_saturated,
-            },
-        );
+        let candidates = HybridCandidates::from_statement(rows.first(), dense_retry_fell_back);
         Ok(HybridPage {
             hits: rows
                 .into_iter()
@@ -15758,3 +15771,71 @@ const CANONICAL_HOLDS_KEY_SQL: &str = "SELECT 1 FROM mass_functions k \
         AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id \
         AND k.slot_kind IS NOT DISTINCT FROM mf.slot_kind \
         AND k.slot_id IS NOT DISTINCT FROM mf.slot_id";
+
+#[cfg(test)]
+mod hybrid_candidates_tests {
+    use super::{HybridCandidates, HybridPageRow};
+
+    fn row(matched_count: i64, pool_saturated: bool) -> HybridPageRow {
+        HybridPageRow {
+            dense_count: 3,
+            matched_count,
+            pool_saturated,
+            claim_id: None,
+            rrf_score: None,
+            dense_similarity: None,
+            in_lexical: None,
+        }
+    }
+
+    /// Backlog 8c511f13 with 28b79b1e's residual: when the exact retry times
+    /// out, the dense leg is the iterative first pass, which
+    /// `hnsw.max_scan_tuples` may have cut short even though it holds fewer
+    /// rows than the pool and its own SQL therefore reported "not saturated".
+    /// The count must then read as a lower bound. No integration test can
+    /// force the 3 s timeout deterministically, so the decision is a pure
+    /// function that `search_hybrid_page_conn` calls and this test pins.
+    #[test]
+    fn a_fallen_back_dense_retry_marks_the_pool_saturated() {
+        assert_eq!(
+            HybridCandidates::from_statement(Some(&row(7, false)), true),
+            HybridCandidates {
+                matched: 7,
+                pool_saturated: true
+            }
+        );
+        assert_eq!(
+            HybridCandidates::from_statement(None, true),
+            HybridCandidates {
+                matched: 0,
+                pool_saturated: true
+            },
+            "an empty fallen-back page is still a truncated count"
+        );
+    }
+
+    #[test]
+    fn a_completed_statement_reports_its_own_counts() {
+        assert_eq!(
+            HybridCandidates::from_statement(Some(&row(7, false)), false),
+            HybridCandidates {
+                matched: 7,
+                pool_saturated: false
+            }
+        );
+        assert_eq!(
+            HybridCandidates::from_statement(Some(&row(50, true)), false),
+            HybridCandidates {
+                matched: 50,
+                pool_saturated: true
+            }
+        );
+        assert_eq!(
+            HybridCandidates::from_statement(None, false),
+            HybridCandidates {
+                matched: 0,
+                pool_saturated: false
+            }
+        );
+    }
+}

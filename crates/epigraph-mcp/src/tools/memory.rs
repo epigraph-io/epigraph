@@ -1204,8 +1204,9 @@ struct RecallCoverage {
     /// to [0, 1]; 1.0 when the pool holds no well-matched candidate (nothing
     /// was left out). With `offset`, it is this page's share of the pool.
     coverage_rate: f64,
-    /// A leg's cap may have cut well-matched rows off, so the true total may
-    /// be higher than `n_total_candidates`.
+    /// The true total may be higher than `n_total_candidates`: a leg's cap
+    /// may have cut well-matched rows off, or the dense leg's exact retry
+    /// timed out and the count comes from its possibly short first pass.
     candidate_pool_saturated: bool,
 }
 
