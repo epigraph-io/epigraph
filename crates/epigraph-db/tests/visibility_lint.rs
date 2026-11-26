@@ -3384,7 +3384,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "factor.rs",
         "promote_hypothesis_factors",
-        "WRITE through migration 311's SECURITY DEFINER `epigraph_promote_hypothesis_factors` \
+        "WRITE through migration 345's SECURITY DEFINER `epigraph_promote_hypothesis_factors` \
          on the promotion's STAMPED transaction (`AppState::write_as`): it moves one promoted \
          hypothesis's `factors` (no `visibility` / `owner_group_id`) from \
          `hypothesis_assessment` to `research_validity`, and the definer refuses a session that \

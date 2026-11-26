@@ -46,7 +46,7 @@
 //!   `no_rowless_table_is_app_writable_unless_allowlisted` (`factors` is
 //!   app-writable again and no longer allowlisted). 217's own attack tests are
 //!   in `factors_write_posture.rs`.
-//! * migration 311 (`bp_messages` taken off the application role, backlog
+//! * migration 345 (`bp_messages` taken off the application role, backlog
 //!   9a9d6850) removed: fails
 //!   `no_rowless_table_is_app_writable_unless_allowlisted` (`bp_messages` is
 //!   app-writable and unlisted; NO_WRITE finds INSERT, UPDATE and DELETE) and
@@ -171,12 +171,12 @@ const NO_WRITE: &[&str] = &[
     "author_binding_clients",
     "authorization_votes",
     "authorizers",
-    // Migration 311: belief-propagation messages, written only on a
+    // Migration 345: belief-propagation messages, written only on a
     // maintenance connection (`FactorRepository::upsert_bp_message` /
     // `clear_bp_messages`, the match-candidate retirement); the application
     // role holds SELECT only. It had no row security, so an application write
     // steered propagation over any claims. (`factors` left the allowlist at
-    // 217 and holds no application write since 311 either.)
+    // 217 and holds no application write since 345 either.)
     "bp_messages",
     "entity_merge_candidates",
     "experiment_entities",
@@ -1789,7 +1789,7 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
     assert_eq!(status_of(&pool, id).await, "stale");
 }
 
-/// Migration 311 (backlog 9a9d6850): the application role writes no
+/// Migration 345 (backlog 9a9d6850): the application role writes no
 /// belief-propagation message. Neither the upsert (INSERT ... ON CONFLICT DO
 /// UPDATE) nor the clear runs on it, nor a direct UPDATE or DELETE of another
 /// writer's message; the same repository calls still run on a maintenance

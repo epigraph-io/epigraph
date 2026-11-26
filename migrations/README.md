@@ -5015,11 +5015,11 @@ restart.
   as UPDATE (077's table-level INSERT grant reached the column). Pinned by
   `human_identity_visibility.rs::the_consent_stamp_is_the_setters_alone` (the INSERT case, red
   before). Undo: `DROP POLICY IF EXISTS agents_consent_stamp_definer_only ON public.agents`.
-- **311**: `bp_messages_and_factor_frame_lockdown` (backlog 9a9d6850). 217 left the application
+- **345**: `bp_messages_and_factor_frame_lockdown` (backlog 9a9d6850). 217 left the application
   role two writes on tables without row security: `UPDATE (frame_id)` on `factors` (re-granted
   for the hypothesis promote route) and INSERT / UPDATE / DELETE on `bp_messages` (118's
   derived-BP allowlist entry), so any request-DSN session could move any factor into any frame
-  and write or clear any belief-propagation message. 311 revokes INSERT, UPDATE, DELETE and
+  and write or clear any belief-propagation message. 345 revokes INSERT, UPDATE, DELETE and
   TRUNCATE on `bp_messages` from `epigraph_app` (SELECT kept; no definer replaces it: no
   application path writes a message, and the repository's `upsert_bp_message` /
   `clear_bp_messages` now need a maintenance connection), and revokes `UPDATE (frame_id)` on
@@ -5033,15 +5033,15 @@ restart.
   NULL claim. `POST /api/v1/hypothesis/:id/promote` calls it through
   `FactorRepository::promote_hypothesis_factors` after its status write; the CLI promotion
   runs on the maintenance connection and is unchanged. Registered in `tenancy_backfill`
-  (deferred definers at 311, the grant register). Pinned by
+  (deferred definers at 345, the grant register). Pinned by
   `epigraph-db/tests/factor_frame_promote_definer.rs` (the move and its bounds, the refusals,
   the catalog, the undo), `app_role_table_lockdown.rs` (`bp_messages` in `NO_WRITE`,
   `the_app_role_writes_no_bp_message`), `factors_write_posture.rs` (no application column
   UPDATE) and `epigraph-api/tests/hypothesis_promote_standing_app_role.rs` (the route moves the
-  factor on the application role). Undo: `docs/runbooks/311-undo.sql` (run it BEFORE
+  factor on the application role). Undo: `docs/runbooks/345-undo.sql` (run it BEFORE
   `217-undo.sql`). **Deploy order:** migration and API binary TOGETHER: an older API's direct
-  frame move is refused after 311 (every promotion answers 500 and rolls back), and this API's
-  definer call is 42883 before 311. **Measure first** whether anything writes `bp_messages` on
+  frame move is refused after 345 (every promotion answers 500 and rolls back), and this API's
+  definer call is 42883 before 345. **Measure first** whether anything writes `bp_messages` on
   the application DSN (`pg_stat_user_tables` n_tup_ins / n_tup_upd / n_tup_del for
   `bp_messages`, and `max(updated_at)`); this tree has no such writer.
 

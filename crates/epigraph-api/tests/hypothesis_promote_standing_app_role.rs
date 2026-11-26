@@ -23,16 +23,16 @@
 //! promotion. Every "nothing was written" check reads through the superuser
 //! seeding pool.
 //!
-//! # The factor move (migration 311, backlog 9a9d6850)
+//! # The factor move (migration 345, backlog 9a9d6850)
 //!
 //! The world also holds a factor in `hypothesis_assessment` over the
 //! hypothesis and a second claim, and a bystander factor in the same frame
 //! that does not name it. A promotion moves the first to `research_validity`
-//! and leaves the bystander; a refused one moves neither. Since 311 the
+//! and leaves the bystander; a refused one moves neither. Since 345 the
 //! application role holds no UPDATE on `factors.frame_id`, so the move runs
 //! through `epigraph_promote_hypothesis_factors`.
 //!
-//! Verified to fail: with 311 applied and the route still running its direct
+//! Verified to fail: with 345 applied and the route still running its direct
 //! `UPDATE factors SET frame_id`, the owner's promotion answers 500 (42501 on
 //! `factors`) in `a_group_writer_promotes_on_the_application_role`.
 #![cfg(feature = "db")]
@@ -392,7 +392,7 @@ async fn a_group_writer_promotes_on_the_application_role(pool: PgPool) {
     assert_eq!(
         factor_frame(&w, w.hyp_factor).await,
         Some(w.rv_frame),
-        "the hypothesis's factor moved to research_validity (311's definer)"
+        "the hypothesis's factor moved to research_validity (345's definer)"
     );
     assert_eq!(
         factor_frame(&w, w.bystander_factor).await,

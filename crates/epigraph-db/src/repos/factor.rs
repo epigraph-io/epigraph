@@ -597,7 +597,7 @@ impl FactorRepository {
 
     /// Upsert a BP message (factor↔variable, one direction).
     ///
-    /// Needs a maintenance connection: since migration 311 the application
+    /// Needs a maintenance connection: since migration 345 the application
     /// role holds no write on `bp_messages` (it has no row security, so an
     /// application write would steer propagation over any claims), and this
     /// is refused 42501 there.
@@ -630,7 +630,7 @@ impl FactorRepository {
     /// frame to `research_validity`, on the caller's connection (the
     /// promotion's transaction). Returns the number of factors moved.
     ///
-    /// Runs migration 311's `epigraph_promote_hypothesis_factors` definer:
+    /// Runs migration 345's `epigraph_promote_hypothesis_factors` definer:
     /// the application role holds no UPDATE on `factors.frame_id`. The
     /// definer names both frames itself and moves only factors over
     /// `claim_id`, and it refuses unless the session writes the claim
@@ -738,7 +738,7 @@ impl FactorRepository {
 
     /// Clear all BP messages (reset before new propagation run).
     ///
-    /// Needs a maintenance connection (migration 311; refused 42501 on the
+    /// Needs a maintenance connection (migration 345; refused 42501 on the
     /// application role, as [`Self::upsert_bp_message`] is).
     pub async fn clear_bp_messages(pool: &PgPool) -> Result<u64, crate::DbError> {
         let result = sqlx::query("DELETE FROM bp_messages")

@@ -10,14 +10,14 @@
 //!   the item names. A stamped session that owns nothing in the graph cannot
 //!   INSERT a factor over another writer's edge, cannot rewrite an existing
 //!   factor's pair or potential, and cannot DELETE or TRUNCATE one; since
-//!   migration 311 (backlog 9a9d6850) it cannot move one between frames
+//!   migration 345 (backlog 9a9d6850) it cannot move one between frames
 //!   either, and the catalog leaves it no write on any column.
 //! * [`the_legitimate_writers_still_work_on_the_app_role`]. The writer's own
 //!   edge INSERT still mints 038's factor (the matcher-score override
 //!   included, a superseded endpoint still skipped), and retiring a claim
 //!   still clears its factors. A direct `frame_id` move, which 217 left the
-//!   application role for the promote route, is refused since 311 (the route
-//!   moves a promoted hypothesis's factors through 311's definer,
+//!   application role for the promote route, is refused since 345 (the route
+//!   moves a promoted hypothesis's factors through 345's definer,
 //!   `factor_frame_promote_definer.rs`).
 //! * [`no_session_can_attach_the_factor_definers_to_its_own_table`] and
 //!   [`the_factor_definers_refuse_any_table_but_their_own`]. The two definers
@@ -52,7 +52,7 @@
 //!   the column set).
 //! * 217's §7 deleted: fails `a_foreign_factor_writing_trigger_refuses_217`
 //!   (217 applies over the foreign writer).
-//! * 311's `REVOKE UPDATE (frame_id)` removed: fails
+//! * 345's `REVOKE UPDATE (frame_id)` removed: fails
 //!   `an_app_session_cannot_forge_rewrite_or_drop_a_factor` (the frame move
 //!   succeeds and the catalog lists `frame_id`) and
 //!   `the_legitimate_writers_still_work_on_the_app_role` (the move runs).
@@ -237,7 +237,7 @@ async fn an_app_session_cannot_forge_rewrite_or_drop_a_factor(pool: PgPool) {
             .await,
         "DELETE a factor",
     );
-    // 311: no frame move either (217 left `frame_id` app-updatable).
+    // 345: no frame move either (217 left `frame_id` app-updatable).
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['true', 'false']) RETURNING id",
     )
@@ -266,7 +266,7 @@ async fn an_app_session_cannot_forge_rewrite_or_drop_a_factor(pool: PgPool) {
     );
 
     // The catalog: no INSERT on any column, no DELETE or TRUNCATE, and (since
-    // 311) no UPDATE on any column.
+    // 345) no UPDATE on any column.
     let (insert, delete, truncate): (bool, bool, bool) = sqlx::query_as(
         "SELECT has_any_column_privilege('epigraph_app', 'public.factors', 'INSERT'), \
                 has_table_privilege('epigraph_app', 'public.factors', 'DELETE'), \
@@ -295,7 +295,7 @@ async fn an_app_session_cannot_forge_rewrite_or_drop_a_factor(pool: PgPool) {
 
 /// The writers 217 keeps: the edge trigger on the session's own edge and the
 /// retirement trigger. The promote route's direct frame move, which 217 also
-/// kept, is refused since 311.
+/// kept, is refused since 345.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_legitimate_writers_still_work_on_the_app_role(pool: PgPool) {
     let (writer, group) = fixture::seed_agent_with_group(&pool, "f217-writer").await;
@@ -399,7 +399,7 @@ async fn the_legitimate_writers_still_work_on_the_app_role(pool: PgPool) {
     );
 
     // The hypothesis promote route's move as 217 left it, run directly: refused
-    // since 311 (the route moves through 311's definer).
+    // since 345 (the route moves through 345's definer).
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['true', 'false']) RETURNING id",
     )

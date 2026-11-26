@@ -1,4 +1,4 @@
-//! Migration 311 (backlog 9a9d6850): the application role moves no factor
+//! Migration 345 (backlog 9a9d6850): the application role moves no factor
 //! between frames itself. A promotion moves its hypothesis's factors through
 //! `epigraph_promote_hypothesis_factors`, and that definer moves nothing else.
 //!
@@ -17,13 +17,13 @@
 //!   BPF02 (55000); a NULL claim is 22004; a missing frame is BPF03.
 //! * [`the_definer_is_a_pinned_maintenance_owned_app_executable_function`]
 //!   pins the catalog.
-//! * [`the_311_undo_returns_the_catalog_below_311`]: the runbook.
+//! * [`the_345_undo_returns_the_catalog_below_345`]: the runbook.
 //!
 //! # Verified to fail
 //!
-//! * Migration 311 removed (the tree before this change): every call is 42883
+//! * Migration 345 removed (the tree before this change): every call is 42883
 //!   (no such function), so each test above fails on its first call; the
-//!   undo test's calibration fails (no difference across 311).
+//!   undo test's calibration fails (no difference across 345).
 //! * The BPF01 writes check removed from the body: fails
 //!   `a_session_that_does_not_write_the_claim_is_refused` (the stranger's call
 //!   on the promoted claim moves its factor).
@@ -419,39 +419,39 @@ async fn catalog(pool: &PgPool) -> BTreeSet<String> {
     rows.into_iter().collect()
 }
 
-/// The undo returns the catalog to what it was below 311, and is idempotent.
+/// The undo returns the catalog to what it was below 345, and is idempotent.
 /// Mutation: the undo's `bp_messages` re-grant dropped, or its column
-/// re-grant -> the ACL entries differ from the ones below 311.
+/// re-grant -> the ACL entries differ from the ones below 345.
 #[sqlx::test(migrations = false)]
-async fn the_311_undo_returns_the_catalog_below_311(pool: PgPool) {
-    migrate(&pool, &up_to(310)).await;
+async fn the_345_undo_returns_the_catalog_below_345(pool: PgPool) {
+    migrate(&pool, &up_to(344)).await;
     let before = catalog(&pool).await;
-    migrate(&pool, &up_to(311)).await;
+    migrate(&pool, &up_to(345)).await;
     let through = catalog(&pool).await;
     let added: BTreeSet<&String> = through.difference(&before).collect();
     let removed: BTreeSet<&String> = before.difference(&through).collect();
     assert_eq!(
         added.len(),
         2,
-        "CALIBRATION: 311 adds the definer and narrows the bp_messages ACL: {added:?}"
+        "CALIBRATION: 345 adds the definer and narrows the bp_messages ACL: {added:?}"
     );
     assert_eq!(
         removed.len(),
         2,
-        "CALIBRATION: 311 narrows the bp_messages ACL and drops the frame_id column grant: \
+        "CALIBRATION: 345 narrows the bp_messages ACL and drops the frame_id column grant: \
          {removed:?}"
     );
     assert!(
         removed
             .iter()
             .any(|e| e.starts_with("colacl factors.frame_id epigraph_app=w/")),
-        "CALIBRATION: 311 revokes epigraph_app UPDATE on frame_id: {removed:?}"
+        "CALIBRATION: 345 revokes epigraph_app UPDATE on frame_id: {removed:?}"
     );
 
     let undo = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/311-undo.sql"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/345-undo.sql"),
     )
-    .expect("read the 311 undo runbook");
+    .expect("read the 345 undo runbook");
     for run in ["first", "second"] {
         sqlx::raw_sql(&undo)
             .execute(&pool)
@@ -461,7 +461,7 @@ async fn the_311_undo_returns_the_catalog_below_311(pool: PgPool) {
         assert_eq!(
             after.symmetric_difference(&before).collect::<Vec<_>>(),
             Vec::<&String>::new(),
-            "after the {run} run the catalog is exactly the one below 311"
+            "after the {run} run the catalog is exactly the one below 345"
         );
     }
 }

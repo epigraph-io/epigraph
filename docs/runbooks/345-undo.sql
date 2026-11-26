@@ -1,13 +1,13 @@
 -- ===================================================================
--- 311-undo.sql: take migration 311 (no application writes on `bp_messages`
+-- 345-undo.sql: take migration 345 (no application writes on `bp_messages`
 -- or `factors.frame_id`, backlog 9a9d6850) back out, in ONE transaction, on
 -- the migration (superuser) DSN.
 --
 -- READ FIRST. Once undone, every application session can again INSERT,
 -- UPDATE and DELETE any belief-propagation message and move any factor into
--- any frame. Roll the API binary back FIRST: a 311 binary promotes a
+-- any frame. Roll the API binary back FIRST: a 345 binary promotes a
 -- hypothesis through `epigraph_promote_hypothesis_factors`, which this drops
--- (every promotion then answers 500, 42883). A binary from before 311 runs
+-- (every promotion then answers 500, 42883). A binary from before 345 runs
 -- the direct `UPDATE factors SET frame_id`, which the restored column grant
 -- admits.
 --
@@ -19,9 +19,9 @@
 --   2. Drops `public.epigraph_promote_hypothesis_factors(uuid)`.
 --   3. Restores 217's column grant `UPDATE (frame_id) ON public.factors`.
 --
--- WHAT IT LEAVES: 311's `_sqlx_migrations` row, and every row as it stands
--- (311 wrote none). Re-introducing 311 is a NEW migration (or a re-run of
--- 311's text, which is idempotent). This file is idempotent.
+-- WHAT IT LEAVES: 345's `_sqlx_migrations` row, and every row as it stands
+-- (345 wrote none). Re-introducing 345 is a NEW migration (or a re-run of
+-- 345's text, which is idempotent). This file is idempotent.
 -- ===================================================================
 BEGIN;
 SET LOCAL lock_timeout = '3s';

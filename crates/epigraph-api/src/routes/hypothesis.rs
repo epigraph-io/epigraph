@@ -668,7 +668,7 @@ pub async fn promote_hypothesis(
     .map_err(|e| ApiError::InternalError { message: format!("Failed to add to frame: {e}") })?;
 
     // 3. Move the hypothesis's factors from hypothesis_assessment to
-    //    research_validity. Since migration 311 the application role holds no
+    //    research_validity. Since migration 345 the application role holds no
     //    UPDATE on `factors.frame_id`: the move runs through a definer that
     //    names both frames itself and refuses a session that does not write
     //    this (already promoted, step 0) claim.

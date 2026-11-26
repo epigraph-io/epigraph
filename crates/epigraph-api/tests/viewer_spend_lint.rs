@@ -1021,7 +1021,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // of the caller's own viewer (`detach_scoped`), then writes on ONE
     // transaction stamped with that viewer (`write_as`, backlog b9c4e809), so
     // row security decides every statement below; the two SELECTs are frames
-    // by name. The factor move (migration 311, backlog 9a9d6850) is a
+    // by name. The factor move (migration 345, backlog 9a9d6850) is a
     // definer that reads that stamp: it refuses a session that does not write
     // the promoted claim.
     (

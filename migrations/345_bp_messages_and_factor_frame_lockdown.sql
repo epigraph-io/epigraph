@@ -1,4 +1,4 @@
--- 311: the application role writes neither `bp_messages` nor `factors.frame_id`
+-- 345: the application role writes neither `bp_messages` nor `factors.frame_id`
 -- (backlog 9a9d6850). A promotion moves its hypothesis's factors through one
 -- narrow maintenance-owned definer.
 --
@@ -95,17 +95,17 @@
 -- ===================================================================
 --
 -- Deploy order: migration and API binary TOGETHER. An API binary from before
--- 311 runs the promote route's direct `UPDATE factors SET frame_id` and is
--- refused 42501 after 311 (every promotion of a hypothesis answers 500 and
--- rolls back); a 311 API binary calls the definer and is refused 42883 before
--- 311. The CLI is unaffected (maintenance connection). Nothing in this
+-- 345 runs the promote route's direct `UPDATE factors SET frame_id` and is
+-- refused 42501 after 345 (every promotion of a hypothesis answers 500 and
+-- rolls back); a 345 API binary calls the definer and is refused 42883 before
+-- 345. The CLI is unaffected (maintenance connection). Nothing in this
 -- repository writes `bp_messages` on the application role.
 --
--- UNDO: `docs/runbooks/311-undo.sql`. Run it BEFORE `217-undo.sql` if both
--- are undone (217's undo grants table-level writes back on `factors`; 311's
+-- UNDO: `docs/runbooks/345-undo.sql`. Run it BEFORE `217-undo.sql` if both
+-- are undone (217's undo grants table-level writes back on `factors`; 345's
 -- re-grants the `frame_id` column 217 left).
 --
--- Slot 311 was assigned by the 2026-11-25 backlog triage.
+-- Slot 345 was assigned by the 2026-11-25 backlog triage.
 
 SET LOCAL lock_timeout = '3s';
 
