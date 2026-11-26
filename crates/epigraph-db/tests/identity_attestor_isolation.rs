@@ -268,6 +268,80 @@ async fn migration_350_refuses_an_attestor_that_is_not_isolated(pool: PgPool) {
     assert!(at_350.is_empty(), "a clean cluster migrates: {at_350:?}");
 }
 
+/// 350 refuses to apply (55000, by its precondition, before it re-states
+/// anything) over a function that is not 161's body on 271's path: a later
+/// rewrite of the function would otherwise lose its own arms to 350's
+/// CREATE OR REPLACE. Two cases, each staged on a database at 349 in a
+/// transaction that is rolled back: (a) another body on 271's path (only the
+/// md5 differs), (b) 161's body on another path (only the path differs).
+///
+/// Verified to fail: with 350's precondition block deleted, 350 applies over
+/// case (a) and the test panics at its expect_err.
+#[sqlx::test(migrations = false)]
+async fn migration_350_refuses_a_function_it_does_not_re_state(pool: PgPool) {
+    migrate(&pool, &up_to(349)).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let at_349 = function_row(&pool).await;
+    let path_271 = Some(vec!["search_path=pg_catalog, public, pg_temp".to_string()]);
+    assert_eq!(
+        (at_349.0.as_str(), &at_349.1),
+        ("31cac2063a345bfff500e75b4095c4fa", &path_271),
+        "CALIBRATION: 161's body on 271's path at 349"
+    );
+
+    for (case, stmt, md5_differs) in [
+        (
+            "another body on 271's path",
+            "CREATE OR REPLACE FUNCTION public.epigraph_identity_attestor_faults() \
+             RETURNS text[] LANGUAGE plpgsql STABLE SECURITY INVOKER \
+             SET search_path = pg_catalog, public, pg_temp \
+             AS $f$ BEGIN RETURN '{}'::text[]; END $f$",
+            true,
+        ),
+        (
+            "161's body on another path",
+            "ALTER FUNCTION public.epigraph_identity_attestor_faults() \
+             SET search_path = pg_catalog, pg_temp",
+            false,
+        ),
+    ] {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+        sqlx::query(stmt)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: stage: {e}"));
+        let (md5, config): (String, Option<Vec<String>>) = sqlx::query_as(
+            "SELECT md5(prosrc), proconfig FROM pg_proc \
+              WHERE oid = to_regprocedure('public.epigraph_identity_attestor_faults()')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("staged row");
+        let err = sqlx::raw_sql(M350).execute(&mut *tx).await.expect_err(case);
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            (md5 != at_349.0, config != path_271),
+            (md5_differs, !md5_differs),
+            "CALIBRATION: {case} changes exactly one of the body and the path"
+        );
+        assert_eq!(sqlstate(&err).as_deref(), Some("55000"), "{case}: {err}");
+        assert!(
+            err.to_string()
+                .contains("is not the function 350 re-states"),
+            "{case}: refused by the precondition: {err}"
+        );
+        assert!(
+            !err.to_string().contains("is not isolated"),
+            "{case}: not by the isolation check: {err}"
+        );
+    }
+    assert_eq!(
+        function_row(&pool).await,
+        at_349,
+        "CONTROL: nothing staged survives the rollbacks"
+    );
+}
+
 /// The function's catalog row: md5 of the body, path, owner, ACL, comment.
 async fn function_row(
     pool: &PgPool,
