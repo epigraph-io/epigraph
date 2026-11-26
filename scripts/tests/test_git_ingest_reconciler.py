@@ -41,6 +41,95 @@ class RangeTests(unittest.TestCase):
             sha = subprocess.run(["git","-C",d,"rev-parse","HEAD"],capture_output=True,text=True).stdout.strip()
             self.assertEqual(gir.compute_rev_range(d, sha), f"{sha}~1..{sha}")
 
+def _api_commits(d, shas):
+    """The PR commits API's rows for `shas` (oldest first), built from the
+    repo's own commits: GitHub's rebase merge keeps each commit's author,
+    author date and message, and gives it a new sha."""
+    rows = []
+    for sha in shas:
+        email, date, msg = subprocess.run(
+            ["git", "-C", d, "show", "-s", "--format=%ae%x00%aI%x00%B", sha],
+            capture_output=True, text=True, check=True).stdout.split("\0")
+        rows.append({"sha": "pre-rebase-" + sha[:7],
+                     "commit": {"author": {"email": email, "date": date}, "message": msg}})
+    return rows
+
+class RebaseRangeTests(unittest.TestCase):
+    """Backlog 39dfef78: a rebase-merged PR's commits land on main as a linear
+    run with one parent each, so the one-parent `M~1..M` dropped all but the
+    last of them."""
+    def _git(self, d, *a, env=None):
+        return subprocess.run(["git", "-C", d, *a], check=True, capture_output=True,
+                              text=True, env=env).stdout.strip()
+    def _repo(self, d):
+        self._git(d, "init", "-qb", "main"); self._git(d, "config", "user.email", "t@t")
+        self._git(d, "config", "user.name", "t")
+        Path(d, "a").write_text("0"); self._git(d, "add", "."); self._git(d, "commit", "-qm", "base")
+    def _commit(self, d, f, msg, date):
+        env = dict(os.environ, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+        Path(d, f).write_text(msg); self._git(d, "add", ".")
+        self._git(d, "commit", "-qm", msg, env=env)
+        return self._git(d, "rev-parse", "HEAD")
+
+    def _ingested_range(self, d, pr, commits_rows):
+        """Run the reconciler over one PR whose mirror is `d`, the PR commits
+        API answering `commits_rows`; return the --rev-range ingest_git got."""
+        real_run = subprocess.run
+        seen = []
+        def run(argv, **kw):
+            if argv[0] == "ingest_git":
+                seen.append(argv); return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, **kw)
+        with tempfile.TemporaryDirectory() as st:
+            cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir=st, author_key_file="/k")
+            with mock.patch.object(gir, "ensure_mirror", return_value=d), \
+                 mock.patch.object(gir, "discover_merged_prs", return_value=[pr]), \
+                 mock.patch.object(gir, "fetch_pr_commits", create=True, return_value=commits_rows), \
+                 mock.patch.object(gir.subprocess, "run", side_effect=run):
+                self.assertEqual(gir.run_once(cfg, dry_run=False), (1, 0))
+        (argv,) = seen
+        return argv[argv.index("--rev-range") + 1]
+
+    def test_rebase_merge_ingests_every_pr_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._repo(d)
+            shas = [self._commit(d, f"f{i}", f"feat(x): step {i}", f"2026-06-0{i}T10:00:00+02:00")
+                    for i in (1, 2, 3)]
+            m = shas[-1]
+            pr = gir.PullRequest(9, "feat(x): steps", "", m, "", "u", "2026-06-04T00:00:00Z")
+            rng = self._ingested_range(d, pr, _api_commits(d, shas))
+            self.assertEqual(rng, f"{m}~3..{m}")
+            self.assertEqual(self._git(d, "rev-list", "--reverse", rng).split(), shas)
+
+    def test_squash_merge_of_a_multi_commit_pr_stays_one_commit(self):
+        # The API lists the PR's 3 branch commits, but main holds one squash
+        # commit on top of unrelated history: `M~3..M` would claim two
+        # commits from other PRs.
+        with tempfile.TemporaryDirectory() as d:
+            self._repo(d)
+            self._commit(d, "o1", "fix(y): other pr", "2026-06-01T09:00:00Z")
+            self._commit(d, "o2", "fix(z): another pr", "2026-06-01T09:30:00Z")
+            m = self._commit(d, "sq", "feat(x): steps (#9)", "2026-06-04T00:00:00Z")
+            rows = [{"sha": f"b{i}", "commit": {"author": {"email": "t@t", "date": f"2026-06-0{i}T08:00:00Z"},
+                                                 "message": f"feat(x): step {i}"}} for i in (1, 2, 3)]
+            pr = gir.PullRequest(9, "feat(x): steps", "", m, "", "u", "2026-06-04T00:00:00Z")
+            self.assertEqual(self._ingested_range(d, pr, rows), f"{m}~1..{m}")
+
+    def test_pr_commits_api_cap_falls_back_to_the_tip_commit(self):
+        # The commits API lists at most 250 commits, so an answer that long may
+        # be truncated and cannot prove a rebase run, even one that matches
+        # main; the tip is still ingested. (The cap is lowered to 3 here so the
+        # fixture stays small.)
+        with tempfile.TemporaryDirectory() as d:
+            self._repo(d)
+            shas = [self._commit(d, f"f{i}", f"feat(x): step {i}", f"2026-06-0{i}T10:00:00Z")
+                    for i in (1, 2, 3)]
+            m = shas[-1]
+            with mock.patch.object(gir, "PR_COMMITS_API_CAP", 3), \
+                 self.assertLogs(gir.LOG, level="WARNING"):
+                self.assertEqual(gir.compute_rev_range(d, m, _api_commits(d, shas)), f"{m}~1..{m}")
+            self.assertEqual(gir.compute_rev_range(d, m, _api_commits(d, shas)), f"{m}~3..{m}")
+
 class DiscoverTests(unittest.TestCase):
     def test_filters_to_merged_within_window(self):
         now = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=datetime.timezone.utc)

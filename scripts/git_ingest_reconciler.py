@@ -112,12 +112,45 @@ def ingest_env(token: str | None, default_orchestrator_id: str | None,
         env["EPIGRAPH_DEFAULT_ORCHESTRATOR_ID"] = default_orchestrator_id
     return env
 
-def compute_rev_range(mirror: str, merge_sha: str) -> str:
-    """The PR's own commits. For a --merge commit (2 parents): base..head =
-    `M^1..M^2`. For a squash (1 parent): the single commit `M~1..M`. Rebase
-    merges (the PR's commits as a linear run with one parent each) are not
-    distinguishable from a single squash here; logged by the caller and handled
-    as the squash case for the tip commit."""
+# The PR commits API lists at most this many commits; an answer this long may
+# be truncated, so it cannot prove which commits a rebase merge put on main.
+PR_COMMITS_API_CAP = 250
+
+def _parse_ts(s: str) -> datetime.datetime:
+    return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+def _commit_identity(email: str, date: str, message: str) -> tuple:
+    """What GitHub's rebase merge keeps of a commit (it changes the sha and the
+    committer): the author email, the author date as an instant, and the
+    message's first line."""
+    first = (message or "").strip().split("\n", 1)[0].strip()
+    return ((email or "").strip().lower(), _parse_ts(date), first)
+
+def _first_parent_identities(mirror: str, sha: str, n: int) -> list[tuple]:
+    """The identities of `sha` and its first-parent ancestors, `n` at most,
+    oldest first."""
+    out = subprocess.run(
+        ["git", "-C", mirror, "log", "--first-parent", "-n", str(n),
+         "--format=%x1e%ae%x00%aI%x00%B", sha],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    ids = [_commit_identity(*rec.split("\0", 2)) for rec in out.split("\x1e") if rec.strip()]
+    return list(reversed(ids))
+
+def compute_rev_range(mirror: str, merge_sha: str, pr_commits=None) -> str:
+    """The PR's own commits on the mirror.
+
+    - A --merge commit (2 parents): base..head, `M^1..M^2`.
+    - One parent, a squash or a rebase merge. A rebase merge puts the PR's n
+      commits on main as a linear run ending at M; a squash puts one commit.
+      `pr_commits` is the PR commits API's answer (oldest first), or a
+      zero-argument callable returning it, read only on this path. When the n
+      first-parent commits ending at M carry the API commits' author, author
+      date and first message line, in order, the PR was rebase-merged and the
+      range is `M~n..M`; otherwise it is the single commit `M~1..M`.
+
+    Matching on identity, not on the count alone, keeps a squash of an
+    n-commit PR from claiming the n-1 commits of other PRs below it."""
     out = subprocess.run(
         ["git", "-C", mirror, "rev-list", "--parents", "-n", "1", merge_sha],
         check=True, capture_output=True, text=True,
@@ -125,7 +158,29 @@ def compute_rev_range(mirror: str, merge_sha: str) -> str:
     n_parents = len(out) - 1  # first token is the commit itself
     if n_parents >= 2:
         return f"{merge_sha}^1..{merge_sha}^2"
-    return f"{merge_sha}~1..{merge_sha}"
+    single = f"{merge_sha}~1..{merge_sha}"
+    rows = pr_commits() if callable(pr_commits) else pr_commits
+    n = len(rows or [])
+    if n <= 1:
+        return single
+    if n >= PR_COMMITS_API_CAP:
+        LOG.warning("%s: the PR lists %s+ commits, past what the commits API returns; "
+                    "ingesting only the tip commit", merge_sha, n)
+        return single
+    want = [_commit_identity(((r.get("commit") or {}).get("author") or {}).get("email", ""),
+                             ((r.get("commit") or {}).get("author") or {}).get("date", ""),
+                             (r.get("commit") or {}).get("message", ""))
+            for r in rows]
+    if _first_parent_identities(mirror, merge_sha, n) == want:
+        return f"{merge_sha}~{n}..{merge_sha}"
+    LOG.info("%s: one parent and the PR's %s commits are not on main as a run; "
+             "treating it as a squash merge", merge_sha, n)
+    return single
+
+def fetch_pr_commits(slug: str, number: int, env: dict) -> list[dict]:
+    """The PR's commits as the PR commits API lists them, oldest first."""
+    return _gh_json([f"repos/{slug}/pulls/{number}/commits", "-X", "GET",
+                     "--field", "per_page=100", "--paginate", "--slurp"], env)
 
 @dataclass
 class PullRequest:
@@ -212,13 +267,18 @@ def build_ingest_argv(pr, mirror, endpoint, rev_range, slug, *,
         argv += ["--dry-run"]
     return argv
 
-def ingest_pr(pr, mirror, endpoint, slug, *, env=None,
+def ingest_pr(pr, mirror, endpoint, slug, *, env=None, github_env=None,
               ingest_git_bin="ingest_git", dry_run=False, author_key_file=None) -> int:
     """Compute the PR's commit range from the mirror, build the argv, and run
     `ingest_git` with `env` (from `ingest_env`; None inherits the reconciler's).
-    Returns the subprocess return code; logs (not raises) on a non-zero exit so
-    the caller can isolate per-PR failures."""
-    rng = compute_rev_range(mirror, pr.merge_sha)
+    `github_env` (from `gh_env`) lets a one-parent merge read the PR commits
+    API to tell a rebase merge from a squash; None skips the call and treats it
+    as a squash. Returns the subprocess return code; logs (not raises) on a
+    non-zero exit so the caller can isolate per-PR failures."""
+    commits = None
+    if github_env is not None:
+        commits = lambda: fetch_pr_commits(slug, pr.number, github_env)  # noqa: E731
+    rng = compute_rev_range(mirror, pr.merge_sha, commits)
     argv = build_ingest_argv(pr, mirror, endpoint, rng, slug,
                              ingest_git_bin=ingest_git_bin, dry_run=dry_run,
                              author_key_file=author_key_file)
@@ -258,7 +318,7 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
             LOG.error("repo %s discovery failed: %s", slug, e); fail += 1; continue
         for pr in prs:
             try:
-                rc = ingest_pr(pr, mirror, cfg.endpoint, slug, env=child_env,
+                rc = ingest_pr(pr, mirror, cfg.endpoint, slug, env=child_env, github_env=env,
                                ingest_git_bin=cfg.ingest_git_bin, dry_run=dry_run,
                                author_key_file=key_file)
                 ok += (rc == 0); fail += (rc != 0)
