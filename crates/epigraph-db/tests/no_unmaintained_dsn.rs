@@ -159,14 +159,16 @@ const EXEMPT: &[(&str, &str)] = &[
     ),
     (
         "scripts/subcluster_outliers.py",
-        "Read-only by design on the epigraph_ro role; its docstring states 'script never \
+        "Read-only by design (meant for a read-only login named by DATABASE_URL or \
+         --database-url; no built-in role); its docstring states 'script never \
          writes' as a property callers rely on. Threading MAINTENANCE_DATABASE_URL in would \
          silently escalate it to a writable role whenever a sibling job exports that variable.",
     ),
     (
         "scripts/lib/tiered_enrichment.py",
-        "Single-claim debug lookup by operator-supplied UUID on the read-only role. Not a \
-         corpus enumeration and not a write path, so FORCE has nothing to truncate here.",
+        "Single-claim debug lookup by operator-supplied UUID, on a login the operator names \
+         with --database-url (required; not read from the environment). Not a corpus \
+         enumeration and not a write path, so FORCE has nothing to truncate here.",
     ),
     (
         "scripts/tests/test_migrate_provenance_bba_db.py",

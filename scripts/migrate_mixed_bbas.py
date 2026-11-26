@@ -31,16 +31,13 @@ from psycopg2.extras import RealDictCursor
 
 from maintenance_dsn import maintenance_dsn
 
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
-)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=None,
     )
     parser.add_argument(
         "--execute",
@@ -48,6 +45,9 @@ def main() -> None:
         help="Commit the migration (default: dry-run only)",
     )
     args = parser.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False

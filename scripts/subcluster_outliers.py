@@ -9,7 +9,9 @@ back — operator decides whether the surfaced sub-clusters warrant new
 theme creation via `POST /api/v1/themes/create-with-centroid`.
 
 Adaptation vs V2:
-- Default DATABASE_URL uses `epigraph_ro` (script never writes)
+- Meant for a read-only role such as `epigraph_ro` (script never writes).
+  There is no built-in DSN (backlog 62bdae04): set DATABASE_URL or pass
+  --database-url, or the script refuses to start
 - No other behavioral changes; UMAP + k-means logic preserved
 
 Usage:
@@ -32,14 +34,17 @@ from sklearn.preprocessing import normalize
 
 psycopg2.extras.register_uuid()
 
-# MAINTENANCE-DSN-EXEMPT: read-only by design, on the `epigraph_ro` role, and
+# MAINTENANCE-DSN-EXEMPT: read-only by design, meant for a read-only login, and
 # the module docstring above states "script never writes" as a property callers
 # rely on. Threading MAINTENANCE_DATABASE_URL in would silently escalate it to a
 # writable role whenever that variable is exported for a sibling job — a
 # privilege increase smuggled in as a DSN change. If a FORCEd deployment ever
 # needs this script to see non-public rows, give it its own read-only
-# maintenance role rather than borrowing the writer's.
-DEFAULT_DATABASE_URL = "postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph"
+# maintenance role rather than borrowing the writer's. It has no built-in DSN
+# either (backlog 62bdae04): DATABASE_URL or --database-url, else it refuses.
+# Nothing enforces read-only on the login it is given; the operator chooses it.
+# (DATABASE_URL was already read before 62bdae04: the old default applied only
+# when that variable was unset, so honouring it adds no new exposure.)
 
 
 def load_boundary_claims(conn, cluster_ids, boundary_threshold=0.85,
@@ -146,8 +151,8 @@ def main():
     parser = argparse.ArgumentParser(description="Sub-cluster outlier-heavy UMAP clusters")
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=None,
+        help="Postgres URL of a READ-ONLY role (default: $DATABASE_URL; no built-in default)",
     )
     parser.add_argument("--clusters", default="0,3,6",
                         help="Comma-separated cluster IDs to sub-cluster")
@@ -155,6 +160,10 @@ def main():
     parser.add_argument("--boundary-threshold", type=float, default=0.85)
     parser.add_argument("--distance-percentile", type=float, default=85)
     args = parser.parse_args()
+    args.database_url = args.database_url or os.environ.get("DATABASE_URL")
+    if not args.database_url:
+        parser.error("no database configured: set DATABASE_URL (a read-only role) "
+                     "or pass --database-url; there is no built-in default")
 
     conn = psycopg2.connect(args.database_url)
     cluster_ids = [int(x) for x in args.clusters.split(",")]

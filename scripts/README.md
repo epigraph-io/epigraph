@@ -4,6 +4,37 @@ Operational scripts for the live EpiGraph deployment. Not part of the
 build; invoked manually or by maintenance tasks (see `epiclaw-host`'s
 `schedules.toml`).
 
+## Dependencies and database
+
+There is no `scripts/requirements.txt`. The Python packages these scripts
+import (psycopg2, numpy, scikit-learn, umap-learn, requests, ...) are pinned,
+with hashes, in `tests/requirements-ci.txt`, the file the CI `python` job
+installs and tests them against (edit `tests/requirements-ci.in` and recompile;
+its header says how). Install it into a virtual environment on the host that
+runs them:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --require-hashes --only-binary :all: -r tests/requirements-ci.txt
+```
+
+A script that opens a database connection has no built-in DSN: it connects on
+`--database-url`, else `MAINTENANCE_DATABASE_URL`, else `DATABASE_URL`, and
+refuses to start with none of them (`scripts/maintenance_dsn.py`). Three
+scripts differ:
+
+- `subcluster_outliers.py` is read-only and deliberately stays off the
+  maintenance login: `--database-url` or `DATABASE_URL` only. Give it a
+  read-only login; nothing enforces that.
+- `lib/tiered_enrichment.py --claim-id` takes `--database-url` only (not from
+  the environment), so a privileged `DATABASE_URL` exported for another job is
+  never used for it.
+- `run_assessment_worker.py` has no `--database-url`: it reads on
+  `DATABASE_URL` and writes on `MAINTENANCE_DATABASE_URL`, else
+  `DATABASE_ADMIN_URL`, and exits at startup unless both sides are set. Which jobs to schedule, and with what
+role and cadence, is in `docs/deploy.md`, "Step 10 — Schedule the maintenance
+jobs" (the theme pipeline is there too).
+
 ## audit_claims_content_hash_agent.py
 
 Audits the drifted `uq_claims_content_hash_agent` constraint (migration 013)

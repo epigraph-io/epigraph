@@ -182,3 +182,58 @@ def test_grow_labels_the_database_it_was_given_and_surfaces_failure(monkeypatch)
     assert labelled == ["postgres://u:p@localhost/scratch_test"]
     assert result["status"] == "label_failed"
     assert result["run_id"] == "run-x"
+
+
+def test_a_fresh_grow_dry_run_writes_nothing(monkeypatch):
+    """`grow --dry-run` without --from-run-id used to run base clustering
+    (seed_phase commits a new run and overwrites the reducer file; assign_batch
+    commits claim_clusters) and only checked dry_run afterwards. That run then
+    became the newest one `project` / `discover` pick by default. Every write
+    step is a tripwire here; the dry run must reach none of them."""
+    import argparse
+
+    def tripwire(name):
+        def hit(*_a, **_k):
+            raise AssertionError(f"dry run reached the write step {name}")
+        return hit
+
+    monkeypatch.setattr(T.theme_lib, "new_run_id", tripwire("new_run_id"))
+    monkeypatch.setattr(T.cluster_claims, "seed_phase", tripwire("seed_phase"))
+    monkeypatch.setattr(T.cluster_claims, "assign_batch", tripwire("assign_batch"))
+    monkeypatch.setattr(T.refine_clusters, "auto_refine", tripwire("auto_refine"))
+    monkeypatch.setattr(T.project_to_themes, "project_run", tripwire("project_run"))
+    monkeypatch.setattr(T, "run_label_step", tripwire("run_label_step"))
+    args = argparse.Namespace(
+        from_run_id=None, database_url="postgres://u:p@localhost/scratch_test",
+        sample_size=5000, k=None, all_claims=False, batch_size=20000,
+        min_size=2000, max_size=T.DEFAULT_MAX_SIZE, target_k=72, max_iter=8,
+        dry_run=True,
+    )
+    result = T.grow(None, args)
+    assert result["status"] == "dry-run"
+    assert result["run_id"] is None
+
+
+def test_a_resumed_grow_dry_run_reports_candidates_without_writing(monkeypatch):
+    """With --from-run-id the dry run still inspects the existing run (reads
+    only) and stops before splitting, projecting or labelling."""
+    import argparse
+
+    def tripwire(name):
+        def hit(*_a, **_k):
+            raise AssertionError(f"dry run reached the write step {name}")
+        return hit
+
+    stats = [{"cluster_id": 0, "size": 9000, "p95_dist": 0.01, "mean_boundary": 0.1}]
+    monkeypatch.setattr(T, "cluster_stats", lambda conn, run_id: stats)
+    monkeypatch.setattr(T, "current_k", lambda conn, run_id: 1)
+    monkeypatch.setattr(T.refine_clusters, "auto_refine", tripwire("auto_refine"))
+    monkeypatch.setattr(T.project_to_themes, "project_run", tripwire("project_run"))
+    monkeypatch.setattr(T, "run_label_step", tripwire("run_label_step"))
+    args = argparse.Namespace(
+        from_run_id="run-x", database_url="postgres://u:p@localhost/scratch_test",
+        min_size=2000, max_size=T.DEFAULT_MAX_SIZE, target_k=72, max_iter=8,
+        dry_run=True,
+    )
+    result = T.grow(None, args)
+    assert result == {"status": "dry-run", "run_id": "run-x", "k": 1}

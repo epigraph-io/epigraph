@@ -484,9 +484,14 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
 Nothing in a request process applies cascades or runs jobs. Create these on
 the host that holds the maintenance DSN, each with a 0600 environment file
 holding `MAINTENANCE_DATABASE_URL` and `DATABASE_URL` (naming the same
-database). All of them refuse to start without `DATABASE_URL` (a
-`enqueue_job --dry-run` needs none); the `epigraph-cli` binaries also accept it
-as `--database-url`, while `drain_jobs` reads it from the environment only:
+database). The `epigraph-cli` binaries refuse to start without `DATABASE_URL`
+(a `enqueue_job --dry-run` needs none) and also accept it as `--database-url`,
+while `drain_jobs` reads it from the environment only. The two theme jobs at
+the end of the table are Python scripts from `scripts/`; install their pinned
+dependencies from `tests/requirements-ci.txt` (see `scripts/README.md`). The
+scripts that open a database connection have no built-in DSN: they use
+`MAINTENANCE_DATABASE_URL`, then `DATABASE_URL`, and refuse to start with
+neither.
 
 | Job | Command | Cadence | Notes |
 |---|---|---|---|
@@ -495,12 +500,15 @@ as `--database-url`, while `drain_jobs` reads it from the environment only:
 | Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or retired kind, a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
 | Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY`. `--allow-mock` (deterministic mock vectors, for a smoke run) is refused, exit 1 with nothing read or written, unless the database's name ends in `_test` or `EPIGRAPH_ENV=test` is set: a mock vector in a real database is served by recall as a real one and never refilled. |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
+| Theme maintenance | `assign_unthemed_themes --apply` (`epigraph-cli`), then `python3 scripts/maintain_themes.py` | nightly | Keeps the themes `recall(diverse=true)` samples from current between rebuilds: assigns unthemed claims, reassigns misplaced ones, splits at most three high-variance themes, recomputes the affected centroids. `maintain_themes.py` works over the HTTP API, not a DSN: it needs `EPIGRAPH_API_URL` and `EPIGRAPH_TOKEN`, a token with `claims:write` and `claims:admin` minted through the token endpoint (the script's docstring shows how), and refuses to start without the token. On a row-secured deployment its first phase can only assign claims the token may write, so run `assign_unthemed_themes --apply` first (maintenance DSN; a dry run without `--apply`). Small in memory: a split clusters at most 5,000 2-D projections. `--dry-run` reports without writing. |
+| Theme rebuild | `python3 scripts/theme_pipeline.py grow` | weekly or monthly, and after a large ingest | The full UMAP rebuild `theme_cluster` used to point at: base clustering, split loop, projection onto `claim_themes`, then labelling. Connects on `MAINTENANCE_DATABASE_URL` (an application login under row security clusters only the rows it can see and still exits 0); every statement is bounded at 15 minutes. The label step runs `scripts/label_themes_llm.py --relabel-all`, which calls the `claude` CLI, so the unit's user needs that CLI installed and signed in; when labelling fails the run prints `"status": "label_failed"` and exits 1 with the clustering already committed, and `theme_pipeline.py label` retries just that step. The base assignment alone has taken about 40 minutes; `--from-run-id <run>` resumes the split, projection and label phases on an existing run. Memory: budget about 3 GB. `cluster_claims.py` documents a 620 MB UMAP reducer and a 2.6 GB peak at a 100K batch (this job's default `--batch-size` is 20000), and `refine_clusters.py` fits UMAP on a capped sample; measure the peak on your corpus before you tighten a cgroup limit. Writes the fitted reducer to `data/umap_reducer.pkl` in the checkout. `--dry-run` writes nothing: with `--from-run-id <run>` it lists the clusters the split loop would act on in that run; without it, it only says a fresh run would start with base clustering (base clustering commits a run, so it is not run as a preview). `theme_pipeline.py discover` previews the latest run. |
 
 `replay_deferred_cascades` and `drain_jobs` each take their own session
 advisory lock, so an overlapping or hand-started run prints
-`{"locked": true}`, exits 0 and does nothing. `embed_backfill` and
-`prune_recall_events` take no lock; do not schedule overlapping runs of
-them.
+`{"locked": true}`, exits 0 and does nothing. `embed_backfill`,
+`prune_recall_events` and the two theme jobs take no lock; do not schedule
+overlapping runs of them, and do not let theme maintenance and a theme rebuild
+overlap each other (both write `claim_themes`).
 
 ### Step 11 — Bind writers and arm, when you are ready
 
@@ -661,7 +669,8 @@ not to the API.
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `MAINTENANCE_DATABASE_URL` | the maintenance CLIs | Preferred over `DATABASE_URL`. The fallback WARNs, and some binaries refuse it (section 5). |
+| `MAINTENANCE_DATABASE_URL` | the maintenance CLIs; the database-opening scripts under `scripts/` (`scripts/maintenance_dsn.py`); the WRITES of `scripts/run_assessment_worker.py` | Preferred over `DATABASE_URL`. The fallback WARNs, and some binaries refuse it (section 5). The scripts have no built-in DSN: with neither variable set (and no `--database-url`) they refuse to start ("The Python scripts" below). |
+| `DATABASE_ADMIN_URL` | `scripts/run_assessment_worker.py` only | The worker's writing DSN (its `assessment_queue` status updates) when `MAINTENANCE_DATABASE_URL` is unset. The worker reads on `DATABASE_URL` and writes on `MAINTENANCE_DATABASE_URL`, else this; it has no `--database-url` flag and exits at startup unless both its read and its write DSN are set. It used to fall back to a built-in admin DSN, so a worker environment that sets only `DATABASE_URL` must add one of the two before this release. |
 | `EPIGRAPH_API` | `decompose_claims` and the belief-mode check in `recompute_betp`, `backfill_factors` and `refresh_truth_mirrors` (read before `EPIGRAPH_API_URL`); `epigraph-privatize` (the only API variable it reads); `scripts/reconcile_backlog_labels.py` (`--base-url` default) | The API's base URL, explicit override. |
 | `EPIGRAPH_API_URL` | among them `dekg`, `decompose_claims`, `recompute_betp`, `backfill_factors`, `refresh_truth_mirrors`, `scripts/maintain_themes.py`, `scripts/run_assessment_worker.py` | The API's base URL, for CLIs that call the HTTP API. |
 | `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `ingest_git` (when `--token` is not given; the git-ingest reconciler hands its token over this way), `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
@@ -1204,8 +1213,7 @@ the Rust one. So a script run on an unprivileged role once policies apply
 reads a subset and exits 0 with no warning. The refusal that protects you is
 at the API and CLI boundary only. It is standard library only, so the
 scripts that need the rule but not numpy do not acquire a numpy dependency.
-`scripts/theme_lib.py::maintenance_dsn` binds it to that script family's
-default.
+`scripts/theme_lib.py::maintenance_dsn` re-exports it for the theme scripts.
 
 The precedence carries a refusal that is not optional politeness. Giving
 `MAINTENANCE_DATABASE_URL` precedence means that an operator who points
@@ -1213,20 +1221,28 @@ The precedence carries a refusal that is not optional politeness. Giving
 exported, would otherwise have every write in this family silently
 redirected, and several of these scripts write.
 
-Many scripts under `scripts/` fall back to a hardcoded DSN when neither
-variable is set. Among them are
-`postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph` (also
-spelled with `127.0.0.1`), `epigraph_ro` variants, and
-`postgres://epigraph:epigraph@127.0.0.1:5432/epigraph`. List the candidates
-with:
+**The scripts have no built-in DSN.** A script that opens a database
+connection connects on `--database-url` when given, else on
+`MAINTENANCE_DATABASE_URL`, else on `DATABASE_URL`. With none of them it
+refuses to start (`maintenance_dsn.NoDatabaseConfigured`, a `RuntimeError`
+naming the variables) before it connects to anything. `--help` and an explicit
+`--database-url` work with no environment; an explicit `--database-url` also
+skips the same-database check between the two variables, since the flag is
+not chosen by environment precedence. Earlier releases fell back to hard-coded
+DSNs naming privileged roles on a database named like the production one, so
+a scheduled run whose environment file was missing went there instead of
+failing; set the variable in every scheduled job's environment before
+deploying this release. Three scripts differ:
 
-```bash
-grep -rlE 'postgres(ql)?://[a-z_]+:[a-z_]+@' scripts/
-```
-
-(The hits under `scripts/e2e/` are example DSNs in comments.) This repository
-creates none of those logins. Always set `MAINTENANCE_DATABASE_URL` (or
-`DATABASE_URL`) explicitly when you run a script.
+- `scripts/run_assessment_worker.py` has no `--database-url`. It reads on
+  `DATABASE_URL` and writes on `MAINTENANCE_DATABASE_URL`, else
+  `DATABASE_ADMIN_URL`, and exits at startup unless both are set.
+- `scripts/subcluster_outliers.py` is read-only and stays off the maintenance
+  login: `--database-url` or `DATABASE_URL`. Give it a read-only login;
+  nothing enforces one.
+- `scripts/lib/tiered_enrichment.py --claim-id` takes `--database-url` only and
+  never reads the environment, so a privileged `DATABASE_URL` exported for
+  another job is not used for it.
 
 **Every login that runs the theme scripts needs two grants.** Every theme
 label path (`label_themes_llm.py`, including `--dry-run`, `cluster_claims.py`,

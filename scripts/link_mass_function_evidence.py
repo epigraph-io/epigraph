@@ -72,7 +72,6 @@ import psycopg2
 
 from maintenance_dsn import maintenance_dsn
 
-DEFAULT_DATABASE_URL = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 
 # Match-tolerance for the weight-tie-break path. Sized to admit f64 compose
 # drift on values like `0.85 * 0.3 = 0.255` without admitting the collision
@@ -197,7 +196,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=None,
     )
     parser.add_argument(
         "--execute",
@@ -205,6 +204,9 @@ def main() -> int:
         help="Commit the UPDATE. Default is dry-run (no writes).",
     )
     args = parser.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False
