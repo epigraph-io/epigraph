@@ -53,7 +53,7 @@ reports a BetP for a no-DS claim agrees with the effective score.
 |---|---|---|
 | MCP `get_belief` with no `frame_id` (`epigraph-engine` `belief_query::get_belief_conn`, unframed branch) | the DS cache: Bel, Pl and BetP (BetP falls back to `belief` on old rows) | the least-committed interval above, still `source: "cached"` |
 | MCP `get_belief` with `frame_id` (`belief_query::framed_belief`) | live Dempster combination of the frame's stored BBAs, each discounted by the resolved belief profile | `source: "no_bbas"`: Bel 0, Pl 1, BetP 1/n |
-| MCP `get_belief` with a perspective lens (`lensed_belief`), and MCP `scoped_belief` with `scope_type: perspective` and a `frame_id` (`belief_query::get_perspective_belief_conn`) | the same combination re-discounted from the perspective | `no_bbas` interval, as above |
+| MCP `get_belief` with a perspective lens (the `lensed_belief` response field of `epigraph-mcp` `tools/ds.rs::get_belief_in_mode`), and MCP `scoped_belief` with `scope_type: perspective` and a `frame_id` (`belief_query::get_perspective_belief_conn`) | the same combination re-discounted from the perspective | `no_bbas` interval, as above |
 | MCP `scoped_belief` otherwise, REST `GET /api/v1/claims/:id/belief/scoped` (`ScopedBeliefRepository::get`) | the cached `scoped_beliefs` row for that scope | no row: MCP returns an error, REST returns `null` |
 | REST `GET /api/v1/claims/:id/belief` (`epigraph-api` `routes/belief.rs::get_claim_belief`) | the raw DS cache columns (`ClaimRepository::get_belief_columns`) | every interval field `null`; **no** `truth_value` fallback |
 | REST `GET /api/v1/claims/:id/pignistic` (`routes/belief.rs::get_pignistic`) | live combination over one frame | uniform `1/n` per hypothesis, Bel 0, Pl 1 |
@@ -75,6 +75,3 @@ reports a BetP for a no-DS claim agrees with the effective score.
 - **`MethodRepository::get_evidence_strength` has no both-columns guard.** It uses `COALESCE(pignistic_prob, truth_value)`
   instead of the effective score. A half-written DS row with `pignistic_prob` set but `belief` or
   `plausibility` NULL is therefore authoritative there and not in the gates.
-- **A stale doc comment.** `ClaimRepository::get_belief_columns` still says the unframed
-  `belief_query::get_belief` "reads `truth_value`". Since backlog 152d9af6 that read returns the
-  cached columns, and it reads `truth_value` only when they are NULL, as described above.
