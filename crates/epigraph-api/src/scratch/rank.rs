@@ -30,6 +30,12 @@
 //! | `relevant` | BM25 top [`RELEVANT_BM25_TOP`] over the text plus the speaker's and subjects' names and aliases, plus one hop from the top [`EXPANSION_SEEDS`] over [`EXPANSION_RELS`] at [`HOP_DECAY`] | blended score, then greedy coverage-vs-relevance selection |
 //! | `recent` | atoms from the [`RECENT_TURNS`] turns below `exclude_turns_from` | newer turn, then BetP |
 //! | `open` | CONTESTED atoms with their contradicting partners, each conflict once, then `question` atoms | latest conflict first; newer question first |
+//! | `people` | every non-tool agent with an eligible atom (said by or about it) or an eligible relationship: its relationships and its top [`PEOPLE_TOP_ATOMS`] atoms | most atoms first |
+//!
+//! A relationship is eligible under the same rule as an atom: the turn that
+//! stated it has left the window and is applied. A person's top atoms are
+//! the eligible atoms about them first, then those they said; within each,
+//! standing kinds first, then BetP, then the newer turn.
 //!
 //! Each slice holds at most `k_per_slice` entries. The slices may overlap;
 //! the runner's packer (`digest.ts::packDigest`) removes duplicates and fits
@@ -61,7 +67,9 @@ use uuid::Uuid;
 
 use super::belief::{AtomBelief, BeliefView};
 use super::bm25;
-use super::store::{AgentRole, AtomKind, Evidence, Relationship, ScratchAtom, ScratchStore};
+use super::store::{
+    AgentRole, AtomKind, Direction, Evidence, Relationship, ScratchAtom, ScratchStore,
+};
 
 /// BM25 hits considered for the relevant slice.
 pub const RELEVANT_BM25_TOP: usize = 60;
@@ -93,6 +101,9 @@ pub const RECENT_TURNS: u64 = 8;
 /// Default and largest `k_per_slice`.
 pub const DEFAULT_K_PER_SLICE: usize = 20;
 pub const MAX_K_PER_SLICE: usize = 200;
+
+/// Atoms listed under each person in the people slice.
+pub const PEOPLE_TOP_ATOMS: usize = 3;
 
 /// Kinds that are always shown in the standing slice.
 pub const STANDING_KINDS: [AtomKind; 4] = [
@@ -134,6 +145,9 @@ pub struct DigestItem<'a> {
     pub speaker: &'a str,
     pub speaker_agent: Uuid,
     pub role: AgentRole,
+    /// Display names of the agents the atom is about (chat text).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub about: Vec<&'a str>,
     pub turn: u64,
     /// When the turn happened in the conversation, if the runner said.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,6 +230,32 @@ pub struct Digest<'a> {
     pub recent: Vec<DigestItem<'a>>,
     pub recent_corrections: Vec<RecentCorrection<'a>>,
     pub open: Vec<OpenEntry<'a>>,
+    pub people: Vec<PersonEntry<'a>>,
+}
+
+/// One relationship of a person in the people slice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonRelation<'a> {
+    pub kind: &'a str,
+    /// `out`: this person is the relation's source (`<person> <kind> <other>`).
+    pub direction: Direction,
+    pub other: Uuid,
+    pub other_name: &'a str,
+    pub turn: u64,
+}
+
+/// One person in the people slice.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PersonEntry<'a> {
+    pub id: Uuid,
+    pub display_name: &'a str,
+    pub role: AgentRole,
+    pub aliases: &'a [String],
+    /// Eligible atoms said by or about this person.
+    pub atoms_total: usize,
+    pub relations: Vec<PersonRelation<'a>>,
+    /// The top [`PEOPLE_TOP_ATOMS`] of them.
+    pub atoms: Vec<DigestItem<'a>>,
 }
 
 fn item<'a>(
@@ -236,6 +276,11 @@ fn item<'a>(
         speaker,
         speaker_agent: atom.speaker_agent,
         role,
+        about: atom
+            .about
+            .iter()
+            .filter_map(|id| store.agent(id).map(|a| a.display_name.as_str()))
+            .collect(),
         turn: atom.turn,
         at: atom.at.as_deref(),
         bel: belief.bel,
@@ -328,7 +373,98 @@ pub fn digest<'a>(
         recent: recent(store, &eligible, &beliefs, exclude_turns_from, k_per_slice),
         recent_corrections: recent_corrections(store, &eligible_ids, &applied, exclude_turns_from),
         open: open(store, &eligible, &eligible_ids, &beliefs, k_per_slice),
+        people: people(
+            store,
+            &eligible,
+            &applied,
+            &beliefs,
+            exclude_turns_from,
+            k_per_slice,
+        ),
     }
+}
+
+fn people<'a>(
+    store: &'a ScratchStore,
+    eligible: &[&'a ScratchAtom],
+    applied: &BTreeSet<u64>,
+    beliefs: &BeliefLookup<'_>,
+    exclude_turns_from: u64,
+    k: usize,
+) -> Vec<PersonEntry<'a>> {
+    let relation_ok = |turn: u64| turn < exclude_turns_from && applied.contains(&turn);
+    let mut out: Vec<PersonEntry<'a>> = store
+        .agents()
+        .filter(|agent| agent.role != AgentRole::Tool)
+        .filter_map(|agent| {
+            let relations: Vec<PersonRelation<'a>> = store
+                .relations()
+                .filter(|r| relation_ok(r.turn))
+                .filter_map(|r| {
+                    let (direction, other) = if r.source == agent.id {
+                        (Direction::Out, r.target)
+                    } else if r.target == agent.id {
+                        (Direction::In, r.source)
+                    } else {
+                        return None;
+                    };
+                    let other_agent = store.agent(&other)?;
+                    Some(PersonRelation {
+                        kind: &r.kind,
+                        direction,
+                        other,
+                        other_name: &other_agent.display_name,
+                        turn: r.turn,
+                    })
+                })
+                .collect();
+            // `eligible` is newest first; the stable sort keeps that within ties.
+            let mut atoms: Vec<(&'a ScratchAtom, bool)> = eligible
+                .iter()
+                .copied()
+                .filter_map(|a| {
+                    let about = a.about.contains(&agent.id);
+                    (about || a.speaker_agent == agent.id).then_some((a, about))
+                })
+                .collect();
+            if atoms.is_empty() && relations.is_empty() {
+                return None;
+            }
+            let atoms_total = atoms.len();
+            atoms.sort_by(|(x, x_about), (y, y_about)| {
+                y_about
+                    .cmp(x_about)
+                    .then_with(|| {
+                        STANDING_KINDS
+                            .contains(&y.kind)
+                            .cmp(&STANDING_KINDS.contains(&x.kind))
+                    })
+                    .then_with(|| beliefs.of(&y.id).betp.total_cmp(&beliefs.of(&x.id).betp))
+            });
+            Some(PersonEntry {
+                id: agent.id,
+                display_name: &agent.display_name,
+                role: agent.role,
+                aliases: &agent.aliases,
+                atoms_total,
+                relations,
+                atoms: atoms
+                    .into_iter()
+                    .take(PEOPLE_TOP_ATOMS)
+                    .map(|(a, _)| item(store, a, beliefs.of(&a.id), None))
+                    .collect(),
+            })
+        })
+        .collect();
+    out.sort_by(|x, y| {
+        y.atoms_total
+            .cmp(&x.atoms_total)
+            .then_with(|| x.role.cmp(&y.role))
+            .then_with(|| x.display_name.cmp(y.display_name))
+            .then_with(|| x.id.cmp(&y.id))
+    });
+    out.truncate(k);
+    out
 }
 
 fn standing<'a>(

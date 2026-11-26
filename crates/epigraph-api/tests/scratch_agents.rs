@@ -395,7 +395,7 @@ fn named_graph() -> ScratchStore {
         t(1),
     )
     .unwrap();
-    let mut said = |n: u128, speaker: &str, about: &[&str], text: &str| {
+    let said = |n: u128, speaker: &str, about: &[&str], text: &str| {
         let mut a = atom(n, speaker, about);
         a.text = text.to_string();
         a
@@ -438,4 +438,97 @@ fn a_query_naming_a_person_by_any_of_their_names_retrieves_that_persons_atoms() 
     let mut hits: Vec<Uuid> = d.relevant.iter().map(|i| i.id).collect();
     hits.sort();
     assert_eq!(hits, vec![id(2), id(3)]);
+}
+
+#[test]
+fn the_people_slice_lists_each_person_with_eligible_relationships_and_top_atoms() {
+    use epigraph_api::scratch::belief::BeliefView;
+    use epigraph_api::scratch::rank::{digest, PEOPLE_TOP_ATOMS};
+    use epigraph_api::scratch::store::Direction;
+    let mut s = people();
+    s.put_agents(vec![agent("read_csv", AgentRole::Tool, &[])], t(1))
+        .unwrap();
+    s.relate(
+        vec![
+            relation(1, "Imogen", "family_of", "Rosalind"),
+            // Stated in a turn still quoted (the window starts at 9): not listed.
+            NewRelation {
+                turn: 9,
+                ..relation(2, "Theo", "knows", "Imogen")
+            },
+        ],
+        t(2),
+    )
+    .unwrap();
+    let mk = |n: u128, turn: u64, kind: AtomKind, speaker: &str, about: &[&str], conf: f64| {
+        let mut a = atom(n, speaker, about);
+        a.turn = turn;
+        a.kind = kind;
+        a.seed.confidence = conf;
+        a
+    };
+    s.put_atoms(
+        vec![
+            // About Imogen: four eligible, one in the window.
+            mk(1, 1, AtomKind::Fact, "Rosalind", &["Imogen"], 0.5),
+            mk(2, 2, AtomKind::Fact, "Theo", &["Imogen"], 0.9),
+            mk(3, 3, AtomKind::Preference, "Rosalind", &["Imogen"], 0.3),
+            mk(4, 3, AtomKind::Fact, "Rosalind", &["Imogen"], 0.7),
+            mk(5, 9, AtomKind::Decision, "Rosalind", &["Imogen"], 1.0),
+            // Said by Imogen herself: ranks after every atom about her.
+            mk(6, 2, AtomKind::Decision, "Imogen", &[], 1.0),
+            // A tool's observation: tools are not people.
+            mk(7, 2, AtomKind::Observation, "read_csv", &[], 0.9),
+        ],
+        t(3),
+    )
+    .unwrap();
+    for turn in [1, 2, 3, 9] {
+        s.mark_applied(turn, t(4));
+    }
+    let view = BeliefView::compute(&s).unwrap();
+    let d = digest(&s, &view, "", 9, 20);
+
+    let names: Vec<(&str, usize)> = d
+        .people
+        .iter()
+        .map(|p| (p.display_name, p.atoms_total))
+        .collect();
+    assert_eq!(
+        names,
+        vec![("Imogen", 5), ("Rosalind", 3), ("Theo", 1)],
+        "most atoms first; the tool agent is not a person"
+    );
+    let imogen = &d.people[0];
+    assert_eq!(imogen.aliases, ["Immy".to_string()]);
+    let rels: Vec<(&str, Direction, &str)> = imogen
+        .relations
+        .iter()
+        .map(|r| (r.kind, r.direction, r.other_name))
+        .collect();
+    assert_eq!(
+        rels,
+        vec![("family_of", Direction::Out, "Rosalind")],
+        "the relation stated in a quoted turn is not listed"
+    );
+    // Top atoms: about her first (the preference, then by BetP), never the
+    // window atom, and not her own decision while three atoms about her exist.
+    let top: Vec<Uuid> = imogen.atoms.iter().map(|i| i.id).collect();
+    assert_eq!(top.len(), PEOPLE_TOP_ATOMS);
+    assert_eq!(top, vec![id(3), id(2), id(4)]);
+    assert_eq!(imogen.atoms[1].about, vec!["Imogen"]);
+    assert_eq!(imogen.atoms[1].speaker, "Theo");
+
+    // Rosalind's relation shows from her side too.
+    let rosalind = &d.people[1];
+    assert_eq!(
+        rosalind
+            .relations
+            .iter()
+            .map(|r| (r.kind, r.direction, r.other_name))
+            .collect::<Vec<_>>(),
+        vec![("family_of", Direction::In, "Imogen")]
+    );
+    // k bounds the slice.
+    assert_eq!(digest(&s, &view, "", 9, 1).people.len(), 1);
 }

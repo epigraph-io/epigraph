@@ -39,7 +39,7 @@
 //! | `atom` | `atom_id` | `atom`, `belief: {bel,pl,betp,contested,contested_with}` |
 //! | `neighbors` | `atom_id` | `neighbors: [{edge,relationship,direction,atom:{id,text,kind,speaker_agent,turn,is_current}}]` |
 //! | `snapshot` | — | `bytes` |
-//! | `digest` | `query`, `exclude_turns_from` (the first turn of the verbatim window), `k_per_slice`? (20, at most 200) | `atoms_total`, `eligible`, `turns_archived`, `standing`, `relevant`, `recent`, `recent_corrections`, `open` (see [`super::rank`]) |
+//! | `digest` | `query`, `exclude_turns_from` (the first turn of the verbatim window), `k_per_slice`? (20, at most 200) | `atoms_total`, `eligible`, `turns_archived`, `standing`, `relevant`, `recent`, `recent_corrections`, `open`, `people` (see [`super::rank`]) |
 //!
 //! Three departures from DESIGN §4.2's sketch:
 //!
