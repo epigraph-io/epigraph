@@ -219,19 +219,21 @@ pub async fn create_community(
     )
     .await?;
 
-    // Emit community.formed event
-    let event_store = super::events::global_event_store();
-    event_store
-        .push(
-            "community.formed".to_string(),
-            None,
-            serde_json::json!({
-                "community_id": row.id,
-                "name": row.name,
-                "governance_type": request.governance_type,
-            }),
-        )
-        .await;
+    // Emit community.formed event, persisted (backlog 8fcc36a0: it used to go
+    // to an in-process store that nothing persisted). Best-effort after the
+    // write, on the pool the write used: a failed INSERT is logged and the
+    // community stands.
+    let _ = epigraph_db::EventRepository::publish_or_log(
+        pool,
+        "community.formed",
+        None,
+        &serde_json::json!({
+            "community_id": row.id,
+            "name": row.name,
+            "governance_type": request.governance_type,
+        }),
+    )
+    .await;
 
     Ok((StatusCode::CREATED, Json(community_to_response(row))))
 }

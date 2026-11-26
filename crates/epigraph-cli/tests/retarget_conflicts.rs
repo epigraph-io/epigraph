@@ -282,10 +282,9 @@ async fn count(pool: &PgPool, sql: &str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
 }
 
-/// Row counts of every table an apply could touch, plus the in-process event
-/// store's events that mention this world (the store is process-global and
-/// other tests share it, so only this world's events are counted).
-async fn snapshot(pool: &PgPool, w: &World) -> Vec<(String, i64)> {
+/// Row counts of every table an apply could touch. The route handlers' events
+/// are persisted to `events` (backlog 8fcc36a0), so its count covers them.
+async fn snapshot(pool: &PgPool, _w: &World) -> Vec<(String, i64)> {
     let mut out = Vec::new();
     for t in [
         "edges",
@@ -302,23 +301,6 @@ async fn snapshot(pool: &PgPool, w: &World) -> Vec<(String, i64)> {
             count(pool, &format!("SELECT COUNT(*) FROM {t}")).await,
         ));
     }
-    let (events, _) = epigraph_api::routes::events::global_event_store()
-        .list(&epigraph_api::routes::events::EventFilter {
-            since: None,
-            after_id: None,
-            event_type: None,
-            limit: Some(1000),
-            offset: None,
-        })
-        .await;
-    let mine = events
-        .iter()
-        .filter(|e| {
-            let p = e.payload.to_string();
-            p.contains(&w.source.to_string()) || p.contains(&w.parent_edge.to_string())
-        })
-        .count();
-    out.push(("in_memory_events_for_world".to_string(), mine as i64));
     out
 }
 

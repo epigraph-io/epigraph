@@ -1007,6 +1007,29 @@ pub async fn create_edge(
     // edge, which this caller can neither patch, retract nor delete. Say so.
     let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_id).await?;
 
+    // The `edge.added` staleness event (Task 0.3 / Phase 0), persisted on THIS
+    // transaction (backlog 8fcc36a0): there is no `edge.added` for an edge that
+    // rolled back, and the event survives a restart. SAVEPOINT-wrapped inside
+    // `publish_or_log_conn`, so a refused event cannot abort the edge. A dedup
+    // hit (`was_created` false) emits nothing: see the block after the commit.
+    // Same type and payload as MCP `link_epistemic`'s durable event.
+    if was_created {
+        let _ = epigraph_db::EventRepository::publish_or_log_conn(
+            &mut tx,
+            "edge.added",
+            auth.agent_id,
+            &serde_json::json!({
+                "edge_id": edge_row.id,
+                "source_type": edge_row.source_type,
+                "source_id": edge_row.source_id,
+                "target_type": edge_row.target_type,
+                "target_id": edge_row.target_id,
+                "relationship": edge_row.relationship,
+            }),
+        )
+        .await;
+    }
+
     // COMMIT before the side effects below: each acquires its own connection
     // and could not see an uncommitted edge.
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
@@ -1119,24 +1142,7 @@ pub async fn create_edge(
                 tracing::warn!(edge_id = %edge_id, error = %e, "Failed to record edge provenance");
             }
         }
-
-        // Emit edge.added event (Task 0.3 / Phase 0 — staleness trigger)
-        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
-        let event_store = super::events::global_event_store();
-        event_store
-            .push(
-                "edge.added".to_string(),
-                actor_id,
-                serde_json::json!({
-                    "edge_id": response.id,
-                    "source_type": response.source_type,
-                    "source_id": response.source_id,
-                    "target_type": response.target_type,
-                    "target_id": response.target_id,
-                    "relationship": response.relationship,
-                }),
-            )
-            .await;
+        // The `edge.added` event is on the edge's own transaction, above.
     }
 
     let status = if was_created {
@@ -1214,6 +1220,17 @@ pub async fn delete_edge(
         epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
     )
     .await?;
+    // The `edge.deleted` staleness event (Task 0.3 / Phase 0), persisted on the
+    // retraction's own transaction (backlog 8fcc36a0), as MCP `delete_edge`
+    // does: it shares the retraction's fate, and a refused event cannot abort
+    // it (SAVEPOINT inside `publish_or_log_conn`).
+    let _ = epigraph_db::EventRepository::publish_or_log_conn(
+        &mut tx,
+        "edge.deleted",
+        auth.agent_id,
+        &serde_json::json!({ "edge_id": id }),
+    )
+    .await;
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the retraction: {e}"),
     })?;
@@ -1235,19 +1252,6 @@ pub async fn delete_edge(
         {
             tracing::warn!(edge_id = %id, error = %e, "Failed to record edge delete provenance");
         }
-    }
-
-    // Emit edge.deleted event (Task 0.3 / Phase 0 — staleness trigger)
-    {
-        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
-        let event_store = super::events::global_event_store();
-        event_store
-            .push(
-                "edge.deleted".to_string(),
-                actor_id,
-                serde_json::json!({ "edge_id": id }),
-            )
-            .await;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -1569,6 +1573,43 @@ pub async fn patch_edge(
         )
         .await?;
     }
+    // Emit edge.updated (and edge.retired when valid_to is set). Mirrors
+    // the staleness-trigger pattern used by create_edge (edge.added) and
+    // delete_edge (edge.deleted) — Phase 0 / Task 0.3. Pre-fix, PATCH was
+    // a state change with no event emission, so downstream caches /
+    // staleness watchers never observed in-place lifecycle updates.
+    //
+    // Persisted on the patch's own transaction (backlog 8fcc36a0), as MCP
+    // `patch_edge` does: they share the patch's fate, and a refused event
+    // cannot abort it (SAVEPOINT inside `publish_or_log_conn`).
+    let _ = epigraph_db::EventRepository::publish_or_log_conn(
+        &mut tx,
+        "edge.updated",
+        auth.agent_id,
+        &serde_json::json!({
+            "edge_id": updated.id,
+            "source_type": updated.source_type,
+            "source_id": updated.source_id,
+            "target_type": updated.target_type,
+            "target_id": updated.target_id,
+            "relationship": updated.relationship,
+        }),
+    )
+    .await;
+    // edge.retired is the more specific signal: the lifecycle window
+    // closed. Fires only when the patch sets `valid_to`.
+    if request.valid_to.is_some() {
+        let _ = epigraph_db::EventRepository::publish_or_log_conn(
+            &mut tx,
+            "edge.retired",
+            auth.agent_id,
+            &serde_json::json!({
+                "edge_id": updated.id,
+                "valid_to": updated.valid_to,
+            }),
+        )
+        .await;
+    }
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the patch: {e}"),
     })?;
@@ -1614,45 +1655,6 @@ pub async fn patch_edge(
         valid_from: updated.valid_from,
         valid_to: updated.valid_to,
     };
-
-    // Emit edge.updated (and edge.retired when valid_to is set). Mirrors
-    // the staleness-trigger pattern used by create_edge (edge.added) and
-    // delete_edge (edge.deleted) — Phase 0 / Task 0.3. Pre-fix, PATCH was
-    // a state change with no event emission, so downstream caches /
-    // staleness watchers never observed in-place lifecycle updates.
-    {
-        let actor_id = auth_ctx.as_ref().and_then(|axum::Extension(a)| a.agent_id);
-        let event_store = super::events::global_event_store();
-        event_store
-            .push(
-                "edge.updated".to_string(),
-                actor_id,
-                serde_json::json!({
-                    "edge_id": response.id,
-                    "source_type": response.source_type,
-                    "source_id": response.source_id,
-                    "target_type": response.target_type,
-                    "target_id": response.target_id,
-                    "relationship": response.relationship,
-                }),
-            )
-            .await;
-
-        // edge.retired is the more specific signal: the lifecycle window
-        // closed. Fires only when the patch sets `valid_to`.
-        if request.valid_to.is_some() {
-            event_store
-                .push(
-                    "edge.retired".to_string(),
-                    actor_id,
-                    serde_json::json!({
-                        "edge_id": response.id,
-                        "valid_to": response.valid_to,
-                    }),
-                )
-                .await;
-        }
-    }
 
     Ok(Json(response))
 }
@@ -3817,6 +3819,27 @@ mod db_tests {
             .with_timezone(&chrono::Utc)
     }
 
+    /// The payloads of the PERSISTED `events` rows of `event_type` naming
+    /// `edge_id`, oldest first. The route handlers write these rows on the
+    /// edge's own transaction (backlog 8fcc36a0); they used to push to an
+    /// in-process store that nothing persisted.
+    async fn persisted_edge_events(
+        pool: &PgPool,
+        event_type: &str,
+        edge_id: Uuid,
+    ) -> Vec<serde_json::Value> {
+        sqlx::query_scalar(
+            "SELECT payload FROM events \
+              WHERE event_type = $1 AND payload->>'edge_id' = $2 \
+              ORDER BY graph_version",
+        )
+        .bind(event_type)
+        .bind(edge_id.to_string())
+        .fetch_all(pool)
+        .await
+        .expect("read persisted edge events")
+    }
+
     /// The stored `relationship` of edge `id`.
     async fn stored_relationship(pool: &PgPool, id: Uuid) -> String {
         sqlx::query_scalar("SELECT relationship FROM edges WHERE id = $1")
@@ -3837,8 +3860,6 @@ mod db_tests {
     async fn create_edge_accepts_and_canonicalises_mixed_case(pool: PgPool) {
         let agent_id = ensure_system_agent(&pool).await;
         let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
-        // The event store is a process-wide singleton; read only this test's window.
-        let since = chrono::Utc::now();
 
         for (asked, stored, if_not_exists) in [
             ("Contradicts", "contradicts", false),
@@ -3865,22 +3886,12 @@ mod db_tests {
             );
             // The `edge.added` staleness event names the stored spelling too:
             // a subscriber filtering on `supports` must see a `SUPPORTS` POST.
-            let events = crate::routes::events::global_event_store()
-                .list(&crate::routes::events::EventFilter {
-                    since: Some(since),
-                    after_id: None,
-                    event_type: Some("edge.added".to_string()),
-                    limit: Some(1000),
-                    offset: None,
-                })
-                .await
-                .0;
+            let events = persisted_edge_events(&pool, "edge.added", id).await;
             let event = events
-                .iter()
-                .find(|e| e.payload["edge_id"] == serde_json::json!(id))
+                .first()
                 .unwrap_or_else(|| panic!("{asked}: no edge.added event for {id}"));
             assert_eq!(
-                event.payload["relationship"], stored,
+                event["relationship"], stored,
                 "{asked}: the edge.added event says what is stored"
             );
         }
@@ -4512,7 +4523,10 @@ mod db_tests {
     fn edges_router_with_auth(state: AppState, auth: AuthContext) -> Router {
         Router::new()
             .route("/api/v1/edges", post(create_edge).get(list_edges))
-            .route("/api/v1/edges/:id", axum::routing::patch(patch_edge))
+            .route(
+                "/api/v1/edges/:id",
+                axum::routing::patch(patch_edge).delete(delete_edge),
+            )
             .layer(Extension(auth))
             .with_state(state)
     }
@@ -4849,8 +4863,6 @@ mod db_tests {
     /// but NOT `edge.retired`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn patch_edge_emits_updated_event(pool: PgPool) {
-        use crate::routes::events::{global_event_store, EventFilter};
-
         let agent_id = ensure_system_agent(&pool).await;
         let source = seed_claim(&pool, agent_id, "evt-updated source").await;
         let target = seed_claim(&pool, agent_id, "evt-updated target").await;
@@ -4889,46 +4901,88 @@ mod db_tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // The store is process-wide across the whole test binary, so other
-        // tests may have pushed `edge.updated` events. Filter by edge_id in
-        // the payload to scope the assertion to this test's edge.
-        let store = global_event_store();
-        let (events, _) = store
-            .list(&EventFilter {
-                since: None,
-                after_id: None,
-                event_type: Some("edge.updated".to_string()),
-                limit: Some(1000),
-                offset: None,
-            })
-            .await;
-        let matching: Vec<_> = events
-            .iter()
-            .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
-            .collect();
+        // Read from the persisted `events` table, scoped to this test's edge.
         assert_eq!(
-            matching.len(),
+            persisted_edge_events(&pool, "edge.updated", edge_id)
+                .await
+                .len(),
             1,
-            "expected exactly one edge.updated event for this edge_id"
+            "expected exactly one persisted edge.updated event for this edge_id"
         );
-
-        let (retired_events, _) = store
-            .list(&EventFilter {
-                since: None,
-                after_id: None,
-                event_type: Some("edge.retired".to_string()),
-                limit: Some(1000),
-                offset: None,
-            })
-            .await;
-        let matching_retired: Vec<_> = retired_events
-            .iter()
-            .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
-            .collect();
         assert_eq!(
-            matching_retired.len(),
+            persisted_edge_events(&pool, "edge.retired", edge_id)
+                .await
+                .len(),
             0,
             "edge.retired must NOT fire when valid_to is not set"
+        );
+    }
+
+    /// Backlog 8fcc36a0: `POST /api/v1/edges` and `DELETE /api/v1/edges/:id`
+    /// PERSIST `edge.added` / `edge.deleted` to the `events` table, on the
+    /// edge's own transaction. They used to be pushed to an in-process store
+    /// that nothing persisted, so a restart (a rebuilt `AppState`, a new
+    /// process) lost them and MCP `list_events` never saw them. Read straight
+    /// from the table, not through `GET /api/v1/events`, whose old merge of
+    /// that process-global store would answer the same either way.
+    ///
+    /// A dedup hit (`if_not_exists` on an existing edge) persists nothing more.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_and_delete_edge_persist_their_events(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let source = seed_claim(&pool, agent_id, "evt-persist source").await;
+        let target = seed_claim(&pool, agent_id, "evt-persist target").await;
+
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+        let (status, body) =
+            post_edge(&router, create_edge_body(source, target, "supports", true)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let edge_id = body_id(&body, "id");
+        let (status, body) =
+            post_edge(&router, create_edge_body(source, target, "supports", true)).await;
+        assert_eq!(status, StatusCode::OK, "the dedup hit: {body}");
+        // The state that served the writes is gone; the rows are not.
+        drop(router);
+
+        let added = persisted_edge_events(&pool, "edge.added", edge_id).await;
+        assert_eq!(
+            added,
+            vec![serde_json::json!({
+                "edge_id": edge_id,
+                "source_type": "claim",
+                "source_id": source,
+                "target_type": "claim",
+                "target_id": target,
+                "relationship": "supports",
+            })],
+            "exactly one persisted edge.added, the dedup hit adding none"
+        );
+        let actor: Option<Uuid> = sqlx::query_scalar(
+            "SELECT actor_id FROM events \
+              WHERE event_type = 'edge.added' AND payload->>'edge_id' = $1",
+        )
+        .bind(edge_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("the edge.added actor");
+        assert_eq!(actor, Some(agent_id), "attributed to the caller's agent");
+
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/edges/{edge_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            persisted_edge_events(&pool, "edge.deleted", edge_id).await,
+            vec![serde_json::json!({ "edge_id": edge_id })],
+            "exactly one persisted edge.deleted"
         );
     }
 
@@ -4936,8 +4990,6 @@ mod db_tests {
     /// `edge.retired`.
     #[sqlx::test(migrations = "../../migrations")]
     async fn patch_edge_emits_retired_event_when_valid_to_set(pool: PgPool) {
-        use crate::routes::events::{global_event_store, EventFilter};
-
         let agent_id = ensure_system_agent(&pool).await;
         let source = seed_claim(&pool, agent_id, "evt-retired source").await;
         let target = seed_claim(&pool, agent_id, "evt-retired target").await;
@@ -4969,25 +5021,13 @@ mod db_tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let store = global_event_store();
         for event_type in ["edge.updated", "edge.retired"] {
-            let (events, _) = store
-                .list(&EventFilter {
-                    since: None,
-                    after_id: None,
-                    event_type: Some(event_type.to_string()),
-                    limit: Some(1000),
-                    offset: None,
-                })
-                .await;
-            let matching: Vec<_> = events
-                .iter()
-                .filter(|e| e.payload["edge_id"] == serde_json::json!(edge_id))
-                .collect();
             assert_eq!(
-                matching.len(),
+                persisted_edge_events(&pool, event_type, edge_id)
+                    .await
+                    .len(),
                 1,
-                "expected exactly one {event_type} event for this edge_id"
+                "expected exactly one persisted {event_type} event for this edge_id"
             );
         }
     }

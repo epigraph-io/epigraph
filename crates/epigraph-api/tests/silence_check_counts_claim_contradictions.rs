@@ -466,27 +466,21 @@ async fn a_contradiction_counts_when_only_its_target_is_in_the_frame(
 
 /// `silence.suspicious` events that evidence on `claim` raised for `frame`.
 ///
-/// Read from the process-global in-memory store the `19c` step pushes to,
-/// filtered on both payload ids: every `#[sqlx::test]` in this binary shares
-/// that store, and each test's frame and claim ids are fresh.
-async fn silence_events(frame: Uuid, claim: Uuid) -> usize {
-    let filter = epigraph_api::routes::events::EventFilter {
-        since: None,
-        after_id: None,
-        event_type: Some("silence.suspicious".to_string()),
-        limit: Some(1000),
-        offset: None,
-    };
-    let (events, _) = epigraph_api::routes::events::global_event_store()
-        .list(&filter)
-        .await;
-    events
-        .iter()
-        .filter(|e| {
-            e.payload["frame_id"] == Value::String(frame.to_string())
-                && e.payload["claim_id"] == Value::String(claim.to_string())
-        })
-        .count()
+/// Read from the persisted `events` table the `19c` step writes to (backlog
+/// 8fcc36a0), filtered on both payload ids: each test's frame and claim ids
+/// are fresh.
+async fn silence_events(pool: &PgPool, frame: Uuid, claim: Uuid) -> usize {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events \
+          WHERE event_type = 'silence.suspicious' \
+            AND payload->>'frame_id' = $1 AND payload->>'claim_id' = $2",
+    )
+    .bind(frame.to_string())
+    .bind(claim.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("count persisted silence.suspicious events");
+    usize::try_from(n).expect("a non-negative count")
 }
 
 /// `POST /api/v1/frames/:id/evidence` for `claim`, asserting 201.
@@ -545,7 +539,7 @@ async fn submit_evidence_alarms_only_while_the_frame_has_no_claim_contradiction(
     // the step was skipped.
     submit_evidence(&client, addr, &token, frame, first, agent).await;
     assert_eq!(
-        silence_events(frame, first).await,
+        silence_events(&pool, frame, first).await,
         1,
         "evidence into a 20-claim, 2-source frame with no contradiction must \
          raise silence.suspicious"
@@ -563,13 +557,13 @@ async fn submit_evidence_alarms_only_while_the_frame_has_no_claim_contradiction(
     .await;
     submit_evidence(&client, addr, &token, frame, second, agent).await;
     assert_eq!(
-        silence_events(frame, second).await,
+        silence_events(&pool, frame, second).await,
         0,
         "a frame with a live claim->claim `contradicts` edge is not silent; \
          19c must not raise silence.suspicious"
     );
     assert_eq!(
-        silence_events(frame, first).await,
+        silence_events(&pool, frame, first).await,
         1,
         "(a)'s event stays the only one for this frame"
     );

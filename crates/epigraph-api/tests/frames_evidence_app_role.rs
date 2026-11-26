@@ -237,26 +237,22 @@ fn reported(resp: &Value) -> f64 {
     resp["updated_belief"].as_f64().expect("updated_belief")
 }
 
-/// The `frame_id` of every `belief.updated` event naming `claim`. The event
-/// store is process-global and shared by the tests running in parallel, so
-/// the events are filtered by this test's own claim.
-async fn belief_updated_frames(claim: Uuid) -> Vec<Uuid> {
-    let filter = epigraph_api::routes::events::EventFilter {
-        event_type: Some("belief.updated".to_string()),
-        since: None,
-        after_id: None,
-        limit: Some(100_000),
-        offset: None,
-    };
-    epigraph_api::_test_event_store()
-        .list(&filter)
-        .await
-        .0
-        .into_iter()
-        .filter(|e| e.payload["claim_id"] == serde_json::json!(claim))
-        .map(|e| {
-            serde_json::from_value(e.payload["frame_id"].clone()).expect("the event's frame_id")
-        })
+/// The `frame_id` of every PERSISTED `belief.updated` event naming `claim`,
+/// oldest first (backlog 8fcc36a0: the route used to push it to an in-process
+/// store that nothing persisted). Filtered by this test's own claim.
+async fn belief_updated_frames(pool: &PgPool, claim: Uuid) -> Vec<Uuid> {
+    let frames: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->>'frame_id' FROM events \
+          WHERE event_type = 'belief.updated' AND payload->>'claim_id' = $1 \
+          ORDER BY graph_version",
+    )
+    .bind(claim.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("read persisted belief.updated events");
+    frames
+        .iter()
+        .map(|f| f.parse().expect("the event's frame_id"))
         .collect()
 }
 
@@ -570,7 +566,7 @@ async fn an_owners_submission_on_a_non_owner_frame_keeps_the_binary_truth_cache(
          {before:?} ({text})"
     );
     assert_eq!(
-        belief_updated_frames(w.claim).await,
+        belief_updated_frames(&w.pool, w.claim).await,
         vec![binary],
         "CONTROL: the submission that moved the cache emits belief.updated"
     );
@@ -597,7 +593,7 @@ async fn an_owners_submission_on_a_non_owner_frame_keeps_the_binary_truth_cache(
     // Step 18's event used to report the claim's cache (0.9) moving to this
     // frame's combination (0.6), a move that did not happen.
     assert_eq!(
-        belief_updated_frames(w.claim).await,
+        belief_updated_frames(&w.pool, w.claim).await,
         vec![binary],
         "a submission that leaves the cache as it was must not emit belief.updated"
     );
