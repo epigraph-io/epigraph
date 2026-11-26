@@ -277,7 +277,13 @@ impl TaskRepository {
         Ok(rows)
     }
 
-    /// List all tasks belonging to a workflow.
+    /// List the tasks of a workflow, oldest first (ties broken by id).
+    ///
+    /// `state`, when given, keeps only tasks in exactly that state; it is
+    /// applied in SQL, before `limit`, so a capped listing is the first
+    /// `limit` tasks *in that state* rather than the first `limit` tasks
+    /// filtered afterwards. `limit = None` returns every matching task
+    /// (SQL `LIMIT NULL`); the caller is responsible for bounding it.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -285,12 +291,23 @@ impl TaskRepository {
     pub async fn list_by_workflow(
         pool: &PgPool,
         workflow_id: Uuid,
+        state: Option<&str>,
+        limit: Option<i64>,
     ) -> Result<Vec<TaskRow>, DbError> {
-        let rows: Vec<TaskRow> =
-            sqlx::query_as("SELECT * FROM tasks WHERE workflow_id = $1 ORDER BY created_at ASC")
-                .bind(workflow_id)
-                .fetch_all(pool)
-                .await?;
+        let rows: Vec<TaskRow> = sqlx::query_as(
+            r#"
+            SELECT * FROM tasks
+            WHERE workflow_id = $1
+              AND ($2::text IS NULL OR state = $2)
+            ORDER BY created_at ASC, id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(workflow_id)
+        .bind(state)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
 
         Ok(rows)
     }
@@ -365,6 +382,79 @@ mod tests {
         let none = TaskRepository::list_by_state(&pool, "no-such-state", 100)
             .await
             .expect("list an unknown state");
+        assert!(none.is_empty());
+    }
+
+    /// `list_by_workflow` honours `limit` (oldest first), applies `state`
+    /// before the limit, stays inside the workflow, and with `limit = None`
+    /// returns every task of the workflow.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_by_workflow_filters_state_before_the_optional_limit(pool: sqlx::PgPool) {
+        let mut workflows = Vec::new();
+        for _ in 0..2 {
+            // `tasks.workflow_id` references `workflow_executions(id)`.
+            let id: Uuid = sqlx::query_scalar(
+                r#"
+                WITH a AS (
+                    INSERT INTO agents (public_key)
+                    VALUES (decode(md5(random()::text) || md5(random()::text), 'hex'))
+                    RETURNING id
+                )
+                INSERT INTO workflow_executions (name, created_by)
+                SELECT 'test workflow', id FROM a
+                RETURNING id
+                "#,
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("seed a workflow execution");
+            workflows.push(id);
+        }
+        let (wf, other_wf) = (workflows[0], workflows[1]);
+        let base = Utc::now() - chrono::Duration::hours(1);
+        // Oldest two are `created`; the `completed` ones come after them, so
+        // a limit applied before the state filter would return no
+        // `completed` task at all.
+        let seeded = ["created", "created", "completed", "completed", "completed"];
+        let mut ids = Vec::new();
+        for (i, state) in seeded.iter().enumerate() {
+            let mut t = task(state, 0);
+            t.workflow_id = Some(wf);
+            t.created_at = base + chrono::Duration::seconds(i as i64);
+            ids.push(t.id);
+            TaskRepository::create(&pool, t).await.expect("seed a task");
+        }
+        let mut other = task("completed", 0);
+        other.workflow_id = Some(other_wf);
+        other.created_at = base - chrono::Duration::seconds(10);
+        TaskRepository::create(&pool, other)
+            .await
+            .expect("seed another workflow's task");
+
+        let all = TaskRepository::list_by_workflow(&pool, wf, None, None)
+            .await
+            .expect("list the workflow");
+        assert_eq!(all.iter().map(|t| t.id).collect::<Vec<_>>(), ids);
+
+        let first_two = TaskRepository::list_by_workflow(&pool, wf, None, Some(2))
+            .await
+            .expect("list the workflow, capped");
+        assert_eq!(
+            first_two.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ids[..2].to_vec()
+        );
+
+        let completed = TaskRepository::list_by_workflow(&pool, wf, Some("completed"), Some(2))
+            .await
+            .expect("list completed tasks of the workflow, capped");
+        assert_eq!(
+            completed.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ids[2..4].to_vec()
+        );
+
+        let none = TaskRepository::list_by_workflow(&pool, wf, Some("failed"), None)
+            .await
+            .expect("list a state the workflow has no task in");
         assert!(none.is_empty());
     }
 }
