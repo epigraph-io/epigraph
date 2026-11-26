@@ -5089,6 +5089,10 @@ mod definer_register_tests {
         // accessor of an ingest record's ingester, `properties ->> 'ingested_by'`.
         // It reads no table at all; its owner changes no answer.
         "epigraph_ingest_record_ingester",
+        // 351 (backlog cc71759f): the LEAKPROOF case fold of a document key,
+        // `pg_catalog.lower(p_key)`, that `papers_doi_fold_idx` indexes. It
+        // reads no table at all; its owner changes no answer.
+        "epigraph_document_key_fold",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,

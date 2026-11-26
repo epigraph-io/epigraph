@@ -655,11 +655,12 @@ async fn a_case_variant_prefix_match_keeps_the_suffix_exact_and_prefers_the_exac
 
 // --- The case-variant fallback must not cost an exact hit its index ---------
 //
-// No index serves the case-variant arm. Written as `exact OR case-variant` in
-// one WHERE, it made every lookup scan the whole `papers` table, exact hits
-// included: every re-ingest's `get_or_create`, every `query_paper` probe,
-// every `GET /api/v1/papers?doi=`. The lookup runs the case-variant scan only
-// when no exact spelling is stored, and never for a key that is not a DOI.
+// Before migration 351 no index served the case-variant arm. Written as
+// `exact OR case-variant` in one WHERE, it made every lookup scan the whole
+// `papers` table, exact hits included: every re-ingest's `get_or_create`,
+// every `query_paper` probe, every `GET /api/v1/papers?doi=`. The lookup runs
+// the case-variant arm only when no exact spelling is stored, and never for a
+// key that is not a DOI; since 351 that arm is an index probe as well.
 
 /// Sequential scans of `papers` counted so far in the cluster's statistics,
 /// after flushing the calling backend's pending counts (PG 15+).
@@ -752,17 +753,34 @@ async fn an_exact_key_hit_never_scans_papers(pool: PgPool) {
         "an exact hit (or a non-DOI miss) must stay on the papers.doi index"
     );
 
-    // Control: the instrument sees a scan. A miss on a bare DOI is the one
-    // lookup that must look for a case-variant prefix, which only a scan can.
+    // A miss on a bare DOI is the one lookup that looks for a case-variant
+    // prefix. Since migration 351 that arm probes `papers_doi_fold_idx`
+    // (backlog cc71759f), so it does not scan either.
     assert!(
         PaperRepository::find_by_document_key(&one, "10.5555/repo-index-miss")
             .await
             .expect("find_by_document_key")
             .is_none()
     );
+    assert_eq!(
+        papers_seq_scans(&one).await,
+        before,
+        "a bare-DOI miss must probe the fold index for a case-variant prefix, not scan papers"
+    );
+
+    // Control: the instrument sees a scan. No index serves `title`; seqscan is
+    // re-enabled so the planner does not walk a whole index instead.
+    sqlx::query("SET enable_seqscan = on")
+        .execute(&one)
+        .await
+        .expect("enable seqscan");
+    let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE title = 'no such title'")
+        .fetch_one(&one)
+        .await
+        .expect("control scan");
     assert!(
         papers_seq_scans(&one).await > before,
-        "a bare-DOI miss scans papers for a case-variant prefix"
+        "the instrument counts a papers scan"
     );
 }
 
