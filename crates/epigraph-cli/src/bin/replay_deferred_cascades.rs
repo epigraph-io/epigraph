@@ -25,8 +25,10 @@
 //! candidate was left as it was. The replay carries the request out (flip,
 //! retraction and derived-row deletes in one transaction) only while the
 //! candidate still has the status the deferral recorded; one decided again in
-//! between fails loudly and stays pending until retired below. Read the
-//! pending `match_retire` requests before a run if they need review.
+//! between can never apply, so the run closes it as obsolete (a
+//! `cascade.retired` row with outcome `obsolete`, counted under `obsolete` in
+//! the report, not a failure). Read the pending `match_retire` requests before
+//! a run if they need review.
 //!
 //! # Stuck cascades
 //!

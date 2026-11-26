@@ -833,11 +833,23 @@ pub struct ScopedPool {
     /// The privileged pool [`ScopedPool::unscoped_for_maintenance`] draws from,
     /// when one has been attached by [`ScopedPool::with_maintenance_pool`].
     ///
-    /// `None` means maintenance connections come from `inner` — the pre-PR-15
-    /// behaviour, kept because it is what every test fixture wants (a
-    /// `#[sqlx::test]` database has exactly one DSN and one role) and because
-    /// it is sound for as long as no table is FORCEd.
+    /// `None` means this pool issues NO maintenance connection:
+    /// [`ScopedPool::unscoped_for_maintenance`] refuses with
+    /// [`DbError::MaintenancePoolNotAttached`] (backlog e27ad9b6). It used to
+    /// fall back to `inner`, the application pool, where row security filters
+    /// a bypass viewer to zero rows with no error.
     maintenance: Option<PgPool>,
+    /// TEST SUPPORT ONLY: whether [`ScopedPool::unscoped_for_maintenance`] may
+    /// draw from `inner` when no maintenance pool is attached, the pre-refusal
+    /// behaviour a `#[sqlx::test]` database (one DSN, a superuser role) wants.
+    ///
+    /// Set only by the `test-support` constructors and
+    /// `ScopedPool::with_application_pool_maintenance_for_tests`; every
+    /// production constructor leaves it `false`. Deliberately NOT the same as
+    /// attaching `inner` with [`ScopedPool::with_maintenance_pool`]:
+    /// [`ScopedPool::has_maintenance_pool`] stays `false`, so a request-serving
+    /// surface that gates on it still answers "not served" in tests.
+    application_pool_maintenance_for_tests: bool,
     /// Whether every connection of this pool DECLARES the per-access recorder
     /// ([`ACCESS_RECORDER_GUC`]), i.e. whether it was built by
     /// [`ScopedPool::connect_recording_elevated_access`] (or the test-support
@@ -921,14 +933,15 @@ impl ScopedPool {
         role: &'static str,
     ) -> Result<Self, DbError> {
         plain_role_identifier(role)?;
-        Self::connect_inner(
+        Ok(Self::connect_inner(
             database_url,
             mode,
             ScopedPoolOptions::default(),
             Some(role),
             false,
         )
-        .await
+        .await?
+        .with_application_pool_maintenance_for_tests())
     }
 
     /// TEST SUPPORT ONLY (the `test-support` feature): a pool whose every
@@ -956,7 +969,11 @@ impl ScopedPool {
         if let Some(role) = downgrade_to {
             plain_role_identifier(role)?;
         }
-        Self::connect_inner(database_url, mode, options, downgrade_to, true).await
+        Ok(
+            Self::connect_inner(database_url, mode, options, downgrade_to, true)
+                .await?
+                .with_application_pool_maintenance_for_tests(),
+        )
     }
 
     /// [`Self::connect_with_options`] for a process that RECORDS every
@@ -1100,8 +1117,10 @@ impl ScopedPool {
             inner,
             mode,
             maintenance: None,
+            application_pool_maintenance_for_tests: false,
             records_elevated_access: false,
         }
+        .with_application_pool_maintenance_for_tests()
     }
 
     async fn connect_inner(
@@ -1126,6 +1145,7 @@ impl ScopedPool {
             inner,
             mode,
             maintenance: None,
+            application_pool_maintenance_for_tests: false,
             records_elevated_access: access_recorder,
         })
     }
@@ -1214,33 +1234,59 @@ impl ScopedPool {
     /// that read `MAINTENANCE_DATABASE_URL` itself would silently repoint every
     /// `#[sqlx::test]` fixture in the workspace at whatever DSN happened to be
     /// exported, which is the same "reads nothing, writes nowhere" failure this
-    /// PR exists to remove). `bin/server.rs` attaches one; test fixtures do not,
-    /// and keep the pre-PR-15 behaviour that is correct for a single-role
-    /// throwaway database.
+    /// PR exists to remove). A pool with nothing attached issues no
+    /// maintenance connection at all (see [`Self::unscoped_for_maintenance`]).
+    /// A request-serving process attaches none: it holds no maintenance DSN.
     ///
     /// The pool passed here should itself be built by [`Self::connect`] or
     /// [`Self::connect_with_options`] on the DSN [`maintenance_database_url`]
-    /// returned, and vetted with [`assert_maintenance_privilege`].
+    /// returned, and vetted with [`assert_maintenance_privilege`]. A
+    /// maintenance binary whose WHOLE pool is that vetted maintenance DSN
+    /// attaches its own `inner()` (`epigraph-cli`'s `MaintenancePool` and
+    /// `operator::connect`, `bin/drain_jobs.rs`), after the privilege check.
     #[must_use]
     pub fn with_maintenance_pool(mut self, maintenance: PgPool) -> Self {
         self.maintenance = Some(maintenance);
         self
     }
 
-    /// The pool maintenance connections are drawn from: the attached
-    /// maintenance pool if there is one, otherwise the application pool.
+    /// TEST SUPPORT ONLY (the `test-support` feature, which only
+    /// dev-dependencies enable): let [`Self::unscoped_for_maintenance`] draw
+    /// from the APPLICATION pool when no maintenance pool is attached.
+    ///
+    /// A `#[sqlx::test]` database has one DSN and connects as a superuser, so
+    /// its application pool is privileged and the fallback is sound there. In
+    /// production it is not (row security filters a bypass viewer to zero
+    /// rows, with no error), which is why no production constructor can set
+    /// this. [`Self::has_maintenance_pool`] is unaffected: a surface that
+    /// gates on it still refuses.
+    ///
+    /// The `*_for_tests` constructors set it themselves.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
     #[must_use]
-    pub const fn maintenance_inner(&self) -> &PgPool {
+    pub fn with_application_pool_maintenance_for_tests(mut self) -> Self {
+        self.application_pool_maintenance_for_tests = true;
+        self
+    }
+
+    /// The pool a maintenance connection is drawn from: the attached
+    /// maintenance pool, or (test support only) the application pool.
+    ///
+    /// # Errors
+    /// [`DbError::MaintenancePoolNotAttached`] when neither applies.
+    fn maintenance_source(&self, r: SystemReason) -> Result<&PgPool, DbError> {
         match self.maintenance.as_ref() {
-            Some(p) => p,
-            None => &self.inner,
+            Some(p) => Ok(p),
+            None if self.application_pool_maintenance_for_tests => Ok(&self.inner),
+            None => Err(DbError::MaintenancePoolNotAttached { reason: r.as_str() }),
         }
     }
 
     /// Whether a distinct maintenance pool has been attached.
     ///
-    /// `false` means [`Self::unscoped_for_maintenance`] falls back to the
-    /// application pool.
+    /// `false` means [`Self::unscoped_for_maintenance`] refuses (outside the
+    /// test-support opt-in, which does not change this answer).
     #[must_use]
     pub const fn has_maintenance_pool(&self) -> bool {
         self.maintenance.is_some()
@@ -1476,24 +1522,33 @@ impl ScopedPool {
     /// `async` because it acquires a connection. (Plan §0.5 sketches this as a
     /// synchronous `fn`, which cannot.)
     ///
-    /// **Repointed by PR-15.** This draws from the pool
-    /// [`Self::with_maintenance_pool`] attached, falling back to the
-    /// application pool when none was. Between PR-04 and PR-17 the fallback is
-    /// harmless because no RLS policy is ENABLEd; from PR-17 on it is unsound
-    /// in exactly the way plan §4.3 warns — a bypass viewer emits no predicate
-    /// but the policy still filters, so it returns zero rows. The lease makes
-    /// the coupling unforgeable; it does not make the connection privileged,
-    /// which is why the privilege is checked separately by
-    /// [`assert_maintenance_privilege`] at process start.
+    /// **Repointed by PR-15; fails closed since backlog e27ad9b6.** This
+    /// draws from the pool [`Self::with_maintenance_pool`] attached, and
+    /// REFUSES when none was. It used to fall back to the application pool,
+    /// which is unsound in exactly the way plan §4.3 warns once row security is
+    /// on — a bypass viewer emits no predicate but the policy still filters,
+    /// so it returned zero rows with no error. The only fallback left is the
+    /// test-support opt-in (`with_application_pool_maintenance_for_tests`, `test-support` only).
+    /// The lease makes the coupling unforgeable; it does not make the
+    /// connection privileged, which is why the privilege is checked separately
+    /// by [`assert_maintenance_privilege`] at process start.
     ///
     /// # Errors
-    /// Returns `DbError::ConnectionFailed` if the connection cannot be acquired.
+    /// * [`DbError::MaintenancePoolNotAttached`] when no maintenance pool is
+    ///   attached (and the test-support opt-in is not set).
+    /// * `DbError::ConnectionFailed` if the connection cannot be acquired.
     pub async fn unscoped_for_maintenance(
         &self,
         r: SystemReason,
     ) -> Result<(MaintenanceConn<'_>, MaintenanceLease), DbError> {
-        let conn = self
-            .maintenance_inner()
+        let source = self.maintenance_source(r).inspect_err(|_| {
+            tracing::error!(
+                target: "tenancy.maintenance",
+                reason = r.as_str(),
+                "maintenance connection refused: no maintenance pool is attached"
+            );
+        })?;
+        let conn = source
             .acquire()
             .await
             .map_err(|source| DbError::ConnectionFailed { source })?;
@@ -1558,8 +1613,10 @@ impl ScopedPool {
     /// unchanged and still true.
     ///
     /// # Errors
-    /// Propagates [`Self::unscoped_for_maintenance`]: `DbError::ConnectionFailed`
-    /// if the connection cannot be acquired.
+    /// Propagates [`Self::unscoped_for_maintenance`]:
+    /// [`DbError::MaintenancePoolNotAttached`] when no maintenance pool is
+    /// attached, `DbError::ConnectionFailed` if the connection cannot be
+    /// acquired.
     pub async fn maintenance_session(
         &self,
         r: SystemReason,

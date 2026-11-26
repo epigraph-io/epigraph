@@ -261,7 +261,9 @@ at the 12 rows pinned by `tenancy_coverage.rs::REGISTRY`.
 
 These rows have no tenancy columns and no RLS, and they reference tenancy-bearing rows. A share
 neither moves them nor needs to. Each one is either a leak that already exists whatever a share
-does, or a stale aggregate.
+does, or a stale aggregate. Two exceptions have since gained tenancy columns and row security but
+stay listed here because no share unit moves them: `papers` (migration 246) and
+`harvester_enriched_concepts` (migration 347, which references nothing at all).
 
 | table(s) | references | note |
 |---|---|---|
@@ -270,7 +272,8 @@ does, or a stale aggregate.
 | `graph_cluster_runs`, `graph_clusters`, `cluster_centroids`, `cluster_edges`, `cluster_labels`, `graph_neighborhoods`, `neighborhood_edges` | `claim_cluster_membership`, `claim_neighborhood_membership` | aggregates; section 6.2 |
 | `workflow_executions`, `tasks` | `workflows` (by `workflow_id`, no FK) | execution telemetry; section 3.2 |
 | `events`, `webhook_subscriptions` | event payloads name claim ids | `webhook_subscriptions` is agent-keyed: `routes/webhooks.rs::deliver_event` drops events naming a claim the subscriber cannot read (`ClaimRepository::hidden_claim_ids`); section 6.4 |
-| `provenance_log`, `factors`, `bp_messages`, `trace_parents`, `source_artifacts`, `harvester_enriched_concepts`, `experiment_results`, `analyses`, `gap_analyses`, `edges_staging` | various | not reached by any share unit; listed so that the ratchet's "no columns" set is explicit |
+| `provenance_log`, `factors`, `bp_messages`, `trace_parents`, `source_artifacts`, `experiment_results`, `analyses`, `gap_analyses`, `edges_staging` | various | not reached by any share unit; listed so that the ratchet's "no columns" set is explicit |
+| `harvester_enriched_concepts` | none (no foreign key in or out) | tenanted since migration 347 (root posture: declared at write, row security as `harvester_fragments`), but not reached by any share unit: no claim, fragment or source names a concept, so a share moves none |
 
 ### 2.6 Control plane: never shared (21 tables with RLS, plus credentials)
 

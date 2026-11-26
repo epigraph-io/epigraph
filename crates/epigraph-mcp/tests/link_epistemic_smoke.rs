@@ -14,9 +14,10 @@
 //!     plausibility = 0.9), else `auto_wire_ds_for_edge` short-circuits to
 //!     `SourceFactorless` and writes no BBA;
 //!   * the move is asserted against the target's cached `pignistic_prob`
-//!     column (the column the recompute writes), NOT the unframed
-//!     `belief_query::get_belief`, which reads `truth_value` and would show no
-//!     movement.
+//!     column (the column the recompute writes), read directly, so the
+//!     assertion does not depend on the unframed `belief_query::get_belief_conn`
+//!     path (which reads the same columns and falls back to a `truth_value`
+//!     prior only while they are NULL).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;

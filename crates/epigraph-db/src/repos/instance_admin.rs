@@ -182,12 +182,26 @@ impl InstanceAdminRepository {
     /// `epigraph_is_group_admin` embodies at the SQL level.
     ///
     /// So it must run on a connection that can see the whole roster: the
-    /// **maintenance** connection. On a stamped app connection the two
-    /// `group_memberships` sub-selects are narrowed by migration 077's policy and
-    /// the counts under-report. `epigraph_is_instance_admin` works on either — it
-    /// is `SECURITY DEFINER` and admits `p_agent = epigraph_principal_id() OR
+    /// **maintenance** connection. `epigraph_is_instance_admin` works on either —
+    /// it is `SECURITY DEFINER` and admits `p_agent = epigraph_principal_id() OR
     /// epigraph_bypass()` — which is exactly why the other three facts are the
     /// ones that decide the connection.
+    ///
+    /// # Admins are LIVE admins (backlog a91d957d)
+    ///
+    /// Conditions 3b and 4 read migration 273's
+    /// `epigraph_group_live_roster(target)`, not the raw table: an unrevoked
+    /// `admin` row that no longer counts (164: a verb-made team group's row
+    /// whose human is no longer a live human operator; 235: an allowlisted
+    /// agent's personal-group row whose allowance lapsed) is neither one of
+    /// the "other live admins" nor the caller's own admin role. That is the
+    /// same liveness every viewer resolve applies, so a lapsed admin, who
+    /// reads nothing of the group, can no longer satisfy plurality or the
+    /// target-group-admin condition. The roster answers on a maintenance
+    /// session (`epigraph_bypass()`), the connection this already needs; on a
+    /// stamped app connection it answers only for a group in the stamp, and
+    /// otherwise reads no row (the counts under-report, fail-closed, as
+    /// before).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails. A failure is never
@@ -202,12 +216,10 @@ impl InstanceAdminRepository {
             r#"
             SELECT public.epigraph_is_instance_admin($1),
                    (SELECT g.created_at FROM public.groups g WHERE g.id = $2),
-                   (SELECT count(*) FROM public.group_memberships m
-                     WHERE m.group_id = $2 AND m.role = 'admin'
-                       AND m.revoked_at IS NULL AND m.agent_id <> $1),
-                   EXISTS (SELECT 1 FROM public.group_memberships m
-                            WHERE m.group_id = $2 AND m.agent_id = $1
-                              AND m.role = 'admin' AND m.revoked_at IS NULL),
+                   (SELECT count(*) FROM public.epigraph_group_live_roster($2) r
+                     WHERE r.role = 'admin' AND r.agent_id <> $1),
+                   EXISTS (SELECT 1 FROM public.epigraph_group_live_roster($2) r
+                            WHERE r.agent_id = $1 AND r.role = 'admin'),
                    public.epigraph_role_assignment_for($1, 'role:platform-custodian', now())
             "#,
         )

@@ -112,10 +112,17 @@ pub async fn scoped_pool(pool: &PgPool) -> ScopedPool {
 /// `Transaction` mode is atomic. Anything claiming atomicity has to drive both,
 /// which is why `qual_guc_coherence.rs` factors its filtered-session case over
 /// the mode rather than duplicating it.
+///
+/// Opted in to the TEST-ONLY application-pool maintenance fallback
+/// (`ScopedPool::with_application_pool_maintenance_for_tests`): the test DSN is
+/// the superuser, so [`bypass_viewer`] and every maintenance helper may draw
+/// from it. `has_maintenance_pool()` stays `false`. A production pool with no
+/// maintenance pool attached refuses instead (backlog e27ad9b6).
 pub async fn scoped_pool_with_mode(pool: &PgPool, mode: SessionGucMode) -> ScopedPool {
     ScopedPool::connect(&database_url_for(pool).await, mode)
         .await
         .expect("ScopedPool::connect")
+        .with_application_pool_maintenance_for_tests()
 }
 
 /// A plain [`PgPool`] over the same database as `pool` whose every connection

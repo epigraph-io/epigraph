@@ -9,7 +9,8 @@
 //! verb's audit rows; an active or revoked client is refused with nothing
 //! changed (the definer itself would rewrite or resurrect it); an admin-only
 //! scope is refused while migration 128 is armed; `platform:admin` is refused
-//! before any connection.
+//! before any connection; an `agent` client is approved only with `--owner`,
+//! which becomes its `owner_id` (migration 348, backlog be024524).
 
 mod viewer_fixture;
 
@@ -230,5 +231,132 @@ async fn admin_scopes_are_refused_while_armed_and_platform_admin_always(pool: Pg
     assert!(armed.stderr.contains("armed"), "{}", armed.show());
     assert_eq!(state(&pool, id).await, ("pending".into(), vec![]));
     assert!(audit(&pool, id).await.is_empty());
+    drop_login(&pool, &login).await;
+}
+
+/// A pending agent client with `owner` (what `/oauth/register` writes since
+/// migration 348: none).
+async fn agent_client(pool: &PgPool, owner: Option<Uuid>) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, owner_id) \
+         VALUES ($1, 'approve agent', 'agent', ARRAY['claims:read'], ARRAY[]::text[], \
+                 'pending', $2) RETURNING id",
+    )
+    .bind(hex_id())
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("the agent client")
+}
+
+fn hex_id() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+async fn human_client(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, status) \
+         VALUES ($1, 'owner', 'human', ARRAY['claims:read'], 'active') RETURNING id",
+    )
+    .bind(format!("owner_{}", Uuid::new_v4().simple()))
+    .fetch_one(pool)
+    .await
+    .expect("the human client")
+}
+
+async fn owner_of(pool: &PgPool, id: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT owner_id FROM oauth_clients WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("owner_id")
+}
+
+/// An agent client is approved only with `--owner`, even when its row already
+/// holds an owner (a pre-348 registration's oldest human): without it the verb
+/// refuses with nothing changed; with it the owner is written, printed, and
+/// recorded before and after in the verb's audit row.
+///
+/// Fails on the pre-348 verb: it approves the agent without `--owner`,
+/// keeping whatever owner the row holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_client_is_approved_only_with_its_owner_named(pool: PgPool) {
+    let inherited = human_client(&pool).await;
+    let named = human_client(&pool).await;
+    let ownerless = agent_client(&pool, None).await;
+    let pre_312 = agent_client(&pool, Some(inherited)).await;
+    let (login, dsn) = maintenance_login(&pool).await;
+
+    for id in [ownerless, pre_312] {
+        let r = approve(&["--client", &id.to_string()], &["claims:read"], true, &dsn);
+        assert_eq!(r.code, 1, "{}", r.show());
+        assert!(r.stderr.contains("--owner"), "{}", r.show());
+        assert_eq!(state(&pool, id).await, ("pending".into(), vec![]));
+        assert!(audit(&pool, id).await.is_empty());
+    }
+    assert_eq!(owner_of(&pool, pre_312).await, Some(inherited));
+
+    let named_s = named.to_string();
+    let r = approve(
+        &["--client", &pre_312.to_string(), "--owner", &named_s],
+        &["claims:read"],
+        true,
+        &dsn,
+    );
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(r.stdout.contains(&format!("owner={named}")), "{}", r.show());
+    assert_eq!(
+        state(&pool, pre_312).await,
+        ("active".into(), vec!["claims:read".to_string()])
+    );
+    assert_eq!(owner_of(&pool, pre_312).await, Some(named));
+    let recorded: serde_json::Value = sqlx::query_scalar(
+        "SELECT details->'owner_id' FROM security_events \
+          WHERE event_type = 'oauth.client_approved_cli' AND details->'client'->>'id' = $1::text",
+    )
+    .bind(pre_312)
+    .fetch_one(&pool)
+    .await
+    .expect("the verb's audit row");
+    assert_eq!(
+        recorded,
+        serde_json::json!({ "before": inherited, "after": named })
+    );
+    drop_login(&pool, &login).await;
+}
+
+/// `--owner` is refused for any client that is not an agent, with nothing
+/// changed: the verb would otherwise give a service (or human) client an
+/// owner its tokens then carry as `owner_id`. The client keeps the owner it
+/// was created with (none here).
+///
+/// The verb refuses before calling the definer (its message says to drop
+/// `--owner`); the definer refuses too (22023), which
+/// `oauth_agent_owner_at_approval.rs` pins. Mutation probe: removing the
+/// verb's check leaves only the definer's message, and the `drop --owner`
+/// assertion fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn owner_is_refused_for_a_non_agent_client(pool: PgPool) {
+    let other = human_client(&pool).await;
+    let (id, _) = client(&pool, "pending").await;
+    let (login, dsn) = maintenance_login(&pool).await;
+
+    let r = approve(
+        &["--client", &id.to_string(), "--owner", &other.to_string()],
+        &["claims:read"],
+        true,
+        &dsn,
+    );
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(r.stderr.contains("drop --owner"), "{}", r.show());
+    assert_eq!(state(&pool, id).await, ("pending".into(), vec![]));
+    assert_eq!(owner_of(&pool, id).await, None);
+    assert!(audit(&pool, id).await.is_empty());
+
+    // Control: without --owner the same service is approved.
+    let r = approve(&["--client", &id.to_string()], &["claims:read"], true, &dsn);
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(owner_of(&pool, id).await, None);
     drop_login(&pool, &login).await;
 }

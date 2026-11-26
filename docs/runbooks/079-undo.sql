@@ -153,7 +153,10 @@ DECLARE t text;
           'group_invitations',
           -- ---- paper rows (246) ------------------------------------------
           -- FORCEd by 246 with its tenancy columns, same precedent and reason.
-          'papers'];
+          'papers',
+          -- ---- enriched harvester concepts (347) -------------------------
+          -- FORCEd by 347 with its tenancy columns, same precedent and reason.
+          'harvester_enriched_concepts'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

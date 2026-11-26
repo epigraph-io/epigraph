@@ -409,18 +409,68 @@ pub trait JobHandler: Send + Sync {
     /// # Arguments
     /// * `attempt` - The retry attempt number (0 = first retry)
     fn backoff(&self, attempt: u32) -> Duration {
-        // Exponential backoff: 2^attempt seconds
-        // Cap at 1 hour (3600 seconds) to prevent excessive waits and overflow
-        const MAX_BACKOFF_SECS: u64 = 3600;
-
-        let backoff_secs = if attempt >= 63 {
-            MAX_BACKOFF_SECS
-        } else {
-            2u64.saturating_pow(attempt).min(MAX_BACKOFF_SECS)
-        };
-
-        Duration::from_secs(backoff_secs)
+        default_backoff(attempt)
     }
+}
+
+/// [`JobHandler::backoff`]'s default: `2^attempt` seconds, capped at one hour
+/// (`attempt` 0 = the first retry). Also the backoff the drain's reaper gives a
+/// reset row whose type has no handler in the run
+/// (`PostgresJobQueue::reap_stale_jobs_counting_attempts`).
+#[must_use]
+pub fn default_backoff(attempt: u32) -> Duration {
+    // Cap at 1 hour (3600 seconds) to prevent excessive waits and overflow
+    const MAX_BACKOFF_SECS: u64 = 3600;
+
+    let backoff_secs = if attempt >= 63 {
+        MAX_BACKOFF_SECS
+    } else {
+        2u64.saturating_pow(attempt).min(MAX_BACKOFF_SECS)
+    };
+
+    Duration::from_secs(backoff_secs)
+}
+
+/// How long a retryable failure waits before its retry: the handler's
+/// `backoff`, or, when the failure is [`JobError::RateLimited`], the LONGER of
+/// that backoff and the `retry_after_secs` the rate limit asked for (backlog
+/// 000cca08). A retry inside the provider's window only hits the same limit
+/// and spends another attempt.
+///
+/// The worker loop sleeps this long, capped by [`worker_retry_sleep`], before
+/// it re-enqueues; the drain (`jobs_drain::drain` in `epigraph-api`) stores it as the row's not-before
+/// time (`PostgresJobQueue::requeue_after`, which clamps it to
+/// `PostgresJobQueue::MAX_REQUEUE_DELAY`).
+#[must_use]
+pub fn retry_delay(error: &JobError, backoff: Duration) -> Duration {
+    match error {
+        JobError::RateLimited { retry_after_secs } => {
+            backoff.max(Duration::from_secs(*retry_after_secs))
+        }
+        _ => backoff,
+    }
+}
+
+/// The longest a [`JobRunner`] worker sleeps to honour a rate limit's
+/// `retry_after_secs` before it retries in place: one hour, the default
+/// backoff's own cap ([`default_backoff`]).
+///
+/// The worker sleeps while the job's row is still `running` and writes it back
+/// only after the sleep, so a sleep past a stale-job reaper's threshold (the
+/// drain's `STALE_AFTER`, 90 minutes, in `epigraph-api`) would let the reaper
+/// reset and re-claim the row while this worker still holds it: the job would
+/// run twice and the later write-back would overwrite the other's. A longer
+/// retry-after is therefore cut to this cap here; the drain, which stores the
+/// delay as the row's not-before time instead of sleeping, is not capped by it.
+/// A handler's OWN backoff is never shortened.
+pub const MAX_WORKER_RATE_LIMIT_SLEEP: Duration = Duration::from_secs(3600);
+
+/// How long the [`JobRunner`] worker loop sleeps before a retry: the
+/// [`retry_delay`], with a rate limit's extension beyond the handler's backoff
+/// capped at [`MAX_WORKER_RATE_LIMIT_SLEEP`].
+#[must_use]
+pub fn worker_retry_sleep(error: &JobError, backoff: Duration) -> Duration {
+    retry_delay(error, backoff).min(backoff.max(MAX_WORKER_RATE_LIMIT_SLEEP))
 }
 
 // ============================================================================
@@ -621,9 +671,13 @@ impl JobRunner {
                                 job.started_at = None;
                                 job.updated_at = Utc::now();
 
-                                // Apply backoff before re-enqueueing
-                                let backoff = handler.backoff(job.retry_count - 1);
-                                tokio::time::sleep(backoff).await;
+                                // Apply backoff before re-enqueueing: the
+                                // handler's, or a rate limit's retry-after
+                                // when that is longer, capped below the
+                                // drain reaper's stale threshold.
+                                let delay =
+                                    worker_retry_sleep(&e, handler.backoff(job.retry_count - 1));
+                                tokio::time::sleep(delay).await;
                             }
                             write_back(queue.as_ref(), &job).await;
 
@@ -702,7 +756,8 @@ impl JobRunner {
     /// The worker loop sleeps this long before it re-enqueues; the drain
     /// (`jobs_drain::drain` in `epigraph-api`), which has no loop to sleep in,
     /// stores it as the row's not-before time instead
-    /// ([`PostgresJobQueue::requeue_after`]).
+    /// ([`PostgresJobQueue::requeue_after`]). Both lengthen it to a rate
+    /// limit's retry-after ([`retry_delay`]).
     #[must_use]
     pub fn retry_backoff(&self, job_type: &str, attempt: u32) -> Option<Duration> {
         self.handlers_mut
@@ -3396,6 +3451,72 @@ impl JobQueue for InMemoryJobQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rate limit's retry-after is a floor on the retry delay, not a
+    /// replacement for the handler's backoff: the longer of the two wins, in
+    /// either direction. Any other error waits the backoff alone.
+    /// The worker loop's sleep honours a rate limit up to the cap and no
+    /// further, and never shortens the handler's own backoff.
+    #[test]
+    fn worker_retry_sleep_caps_only_the_rate_limit_extension() {
+        let cap = MAX_WORKER_RATE_LIMIT_SLEEP;
+        let limited = |secs| JobError::RateLimited {
+            retry_after_secs: secs,
+        };
+        assert_eq!(
+            worker_retry_sleep(&limited(600), Duration::ZERO),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            worker_retry_sleep(&limited(u64::MAX), Duration::from_secs(1)),
+            cap
+        );
+        let long = cap + Duration::from_secs(7200);
+        assert_eq!(worker_retry_sleep(&limited(u64::MAX), long), long);
+        assert_eq!(
+            worker_retry_sleep(
+                &JobError::ProcessingFailed {
+                    message: "503".into()
+                },
+                long
+            ),
+            long
+        );
+    }
+
+    #[test]
+    fn retry_delay_is_the_longer_of_retry_after_and_the_backoff() {
+        let limited = JobError::RateLimited {
+            retry_after_secs: 600,
+        };
+        assert_eq!(
+            retry_delay(&limited, Duration::from_secs(1)),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            retry_delay(&limited, Duration::from_secs(3600)),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            retry_delay(
+                &JobError::ProcessingFailed {
+                    message: "503".into()
+                },
+                Duration::from_secs(4)
+            ),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            retry_delay(
+                &JobError::RateLimited {
+                    retry_after_secs: u64::MAX
+                },
+                Duration::ZERO
+            ),
+            Duration::from_secs(u64::MAX),
+            "no overflow; requeue_after clamps the stored delay"
+        );
+    }
 
     #[test]
     fn job_id_display() {

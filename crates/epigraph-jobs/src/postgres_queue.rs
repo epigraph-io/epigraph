@@ -1044,12 +1044,28 @@ impl PostgresJobQueue {
     /// (backlog 1320b4e3). A privatization job failed this way leaves its plan
     /// in `applying` / `reverting`; the operator's recovery is the plan's abort.
     ///
+    /// # A counted reset waits out its backoff
+    ///
+    /// A counted reap that puts the row back to `pending` is a retry like a
+    /// handler error's, so the row gets the same not-before time the drain
+    /// gives a failed attempt ([`Self::requeue_after`]): `run_after = now() +
+    /// backoff(job_type, retry_count - 1)` on the database clock, clamped to
+    /// [`Self::MAX_REQUEUE_DELAY`], in the reap's own transaction (backlog
+    /// 000cca08). `backoff` is the caller's per-type lookup (the drain passes
+    /// its runner's handler backoff, [`crate::default_backoff`] for a type it
+    /// has no handler for). Before this the reset row was due at once, so the
+    /// run that reaped a job killed mid-run handed it straight back out. An
+    /// uncounted re-delivery of a one-attempt row and a row the reap fails get
+    /// no not-before time: a re-delivery is not a retry, and a failed row is
+    /// never claimed.
+    ///
     /// # Errors
     /// `JobError::ProcessingFailed` on a database error or an invalid duration.
-    #[instrument(skip(self))]
+    #[instrument(skip(self, backoff))]
     pub async fn reap_stale_jobs_counting_attempts(
         &self,
         stale_threshold: std::time::Duration,
+        backoff: &(dyn Fn(&str, u32) -> std::time::Duration + Send + Sync),
     ) -> Result<Vec<ReapedJob>, JobError> {
         let cutoff = Utc::now()
             - chrono::Duration::from_std(stale_threshold).map_err(|e| {
@@ -1057,7 +1073,11 @@ impl PostgresJobQueue {
                     message: format!("Invalid duration: {e}"),
                 }
             })?;
-        let rows: Vec<(Uuid, String, String, bool)> = sqlx::query_as(
+        let db_err = |what: &str, e: sqlx::Error| JobError::ProcessingFailed {
+            message: format!("Failed to reap stale jobs ({what}): {e}"),
+        };
+        let mut tx = self.pool.begin().await.map_err(|e| db_err("begin", e))?;
+        let rows: Vec<(Uuid, String, String, bool, i32)> = sqlx::query_as(
             r"
             WITH stale AS (
                 SELECT id,
@@ -1082,21 +1102,48 @@ impl PostgresJobQueue {
                    updated_at       = NOW()
               FROM stale s
              WHERE j.id = s.id
-            RETURNING j.id, j.job_type, j.state, NOT s.counted
+            RETURNING j.id, j.job_type, j.state, NOT s.counted, j.retry_count
             ",
         )
         .bind(cutoff)
         .bind(REAPED_SPENT_MESSAGE)
         .bind(MAX_CRASH_REDELIVERIES)
         .bind(REAPED_REDELIVERIES_SPENT_MESSAGE)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| JobError::ProcessingFailed {
-            message: format!("Failed to reap stale jobs: {e}"),
-        })?;
+        .map_err(|e| db_err("reset", e))?;
+
+        // The counted resets' not-before times: the retry this reap counted is
+        // number `retry_count - 1` (0 = the first), as in the drain.
+        let (due_ids, due_micros): (Vec<Uuid>, Vec<i64>) = rows
+            .iter()
+            .filter(|(_, _, state, one_attempt, _)| state == "pending" && !one_attempt)
+            .map(|(id, job_type, _, _, retry_count)| {
+                let attempt = u32::try_from(retry_count.saturating_sub(1)).unwrap_or(0);
+                let delay = backoff(job_type, attempt).min(Self::MAX_REQUEUE_DELAY);
+                (*id, i64::try_from(delay.as_micros()).unwrap_or(i64::MAX))
+            })
+            .unzip();
+        if !due_ids.is_empty() {
+            sqlx::query(
+                r"
+                UPDATE jobs j
+                   SET run_after = now() + make_interval(secs => d.micros::double precision / 1000000)
+                  FROM unnest($1::uuid[], $2::bigint[]) AS d(id, micros)
+                 WHERE j.id = d.id
+                ",
+            )
+            .bind(&due_ids)
+            .bind(&due_micros)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| db_err("schedule the retries", e))?;
+        }
+        tx.commit().await.map_err(|e| db_err("commit", e))?;
+
         let reaped: Vec<ReapedJob> = rows
             .into_iter()
-            .map(|(id, job_type, state, one_attempt)| ReapedJob {
+            .map(|(id, job_type, state, one_attempt, _)| ReapedJob {
                 id,
                 job_type,
                 failed: state == "failed",

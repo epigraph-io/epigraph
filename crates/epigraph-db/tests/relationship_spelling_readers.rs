@@ -17,11 +17,16 @@
 //! Scope guard: PR-1 only adds lower-case twins to UPPER readers. It does NOT
 //! widen the lower-case-only claim/claim readers to UPPER (scope §4.1 is an
 //! operator ruling), so `semantic_graph_neighbors` keeps ignoring an upper-case
-//! claim/claim `SUPPORTS` row, pinned below.
+//! claim/claim `SUPPORTS` row, pinned below. `SemanticLinkRepository::get_by_type`
+//! is the one claim/claim reader widened since, at backlog be76e301's request
+//! (its row mapping now reads both spellings); `semantic_graph_neighbors` is
+//! unchanged.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+use epigraph_core::SemanticLinkType;
+use epigraph_db::repos::SemanticLinkRepository;
 use epigraph_db::{ClaimRepository, EvidenceRepository, MatchCandidateRepo, StructuralRepository};
 use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet};
@@ -345,5 +350,90 @@ async fn edge_counts_merge_spellings_into_one_coarse_bucket(pool: PgPool) {
         ],
         "folded spellings share one bucket, ordered by count then name; \
          lower-case relates_to is not a coarse type"
+    );
+}
+
+/// `SemanticLinkRepository::get_by_type` (backlog `be76e301`) bound the
+/// lower-case spelling to `relationship = $1`, so a claim->claim `SUPPORTS`
+/// edge (written by the HTTP edge route and the DS evidence writers) was
+/// silently missing, and `str_to_link_type` had no upper-case arm to map it
+/// with. Both spellings must come back, without error; a non-folded
+/// upper-case relationship (`REFINES`, synthesis->synthesis) is a different
+/// relationship and must not leak into `Refines`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_link_get_by_type_sees_both_spellings(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "spelling-semantic-link").await;
+    let a = public_claim(&pool, agent, "semantic link anchor", None).await;
+    let b = public_claim(&pool, agent, "semantic link upper", None).await;
+    let c = public_claim(&pool, agent, "semantic link lower", None).await;
+    let props = serde_json::json!({ "strength": 0.8, "created_by": agent.to_string() });
+    let upper = edge(&pool, a, "claim", b, "claim", "SUPPORTS", props.clone()).await;
+    let lower = edge(&pool, a, "claim", c, "claim", "supports", props.clone()).await;
+    let refines_lower = edge(&pool, b, "claim", c, "claim", "refines", props.clone()).await;
+    // Not a case-folded relationship: `REFINES` is NOT `refines`.
+    edge(&pool, c, "claim", b, "claim", "REFINES", props.clone()).await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let supports: BTreeMap<Uuid, SemanticLinkType> =
+        SemanticLinkRepository::get_by_type(&pool, &viewer, SemanticLinkType::Supports)
+            .await
+            .expect("get_by_type(Supports) must not error on an upper-case row")
+            .into_iter()
+            .map(|l| (l.id.as_uuid(), l.link_type))
+            .collect();
+    assert!(
+        supports.contains_key(&lower),
+        "control: the lower-case `supports` row is read"
+    );
+    assert_eq!(
+        supports,
+        BTreeMap::from([
+            (upper, SemanticLinkType::Supports),
+            (lower, SemanticLinkType::Supports),
+        ]),
+        "an upper-case `SUPPORTS` claim->claim edge is the same support and must be returned"
+    );
+
+    let refines: BTreeSet<Uuid> =
+        SemanticLinkRepository::get_by_type(&pool, &viewer, SemanticLinkType::Refines)
+            .await
+            .expect("get_by_type(Refines)")
+            .into_iter()
+            .map(|l| l.id.as_uuid())
+            .collect();
+    assert_eq!(
+        refines,
+        BTreeSet::from([refines_lower]),
+        "`REFINES` is a different relationship and is not folded into `refines`"
+    );
+}
+
+/// The per-endpoint readers select every claim->claim relationship and map
+/// each row through `str_to_link_type`, so before it learned the upper-case
+/// spellings ONE `SUPPORTS` edge turned the whole call into an error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_link_get_by_source_maps_an_upper_case_row(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "spelling-semantic-source").await;
+    let a = public_claim(&pool, agent, "semantic source anchor", None).await;
+    let b = public_claim(&pool, agent, "semantic source upper", None).await;
+    let c = public_claim(&pool, agent, "semantic source lower", None).await;
+    let props = serde_json::json!({ "created_by": agent.to_string() });
+    let upper = edge(&pool, a, "claim", b, "claim", "CONTRADICTS", props.clone()).await;
+    let lower = edge(&pool, a, "claim", c, "claim", "contradicts", props).await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let got: BTreeMap<Uuid, SemanticLinkType> =
+        SemanticLinkRepository::get_by_source(&pool, &viewer, epigraph_core::ClaimId::from_uuid(a))
+            .await
+            .expect("get_by_source must map an upper-case CONTRADICTS row, not fail the call")
+            .into_iter()
+            .map(|l| (l.id.as_uuid(), l.link_type))
+            .collect();
+    assert_eq!(
+        got,
+        BTreeMap::from([
+            (upper, SemanticLinkType::Contradicts),
+            (lower, SemanticLinkType::Contradicts),
+        ])
     );
 }

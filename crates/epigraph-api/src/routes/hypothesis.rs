@@ -667,23 +667,22 @@ pub async fn promote_hypothesis(
     .await
     .map_err(|e| ApiError::InternalError { message: format!("Failed to add to frame: {e}") })?;
 
-    // 3. Update factors: move from hypothesis_assessment to research_validity
-    sqlx::query(
-        r#"
-        UPDATE factors
-        SET frame_id = $3
-        WHERE frame_id = $1
-          AND $2 = ANY(variable_ids)
-        "#,
-    )
-    .bind(hyp_frame.0)
-    .bind(id)
-    .bind(rv_frame.0)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to update factors: {e}"),
-    })?;
+    // 3. Move the hypothesis's factors from hypothesis_assessment to
+    //    research_validity. Since migration 345 the application role holds no
+    //    UPDATE on `factors.frame_id`: the move runs through a definer that
+    //    names both frames itself and refuses a session that does not write
+    //    this (already promoted, step 0) claim.
+    epigraph_db::FactorRepository::promote_hypothesis_factors(&mut tx, id)
+        .await
+        .map_err(|e| {
+            if crate::errors::db_is_insufficient_privilege(&e) {
+                status_write_refused(id)
+            } else {
+                ApiError::InternalError {
+                    message: format!("Failed to move the hypothesis's factors: {e}"),
+                }
+            }
+        })?;
 
     // 4. The status was written first (step 0).
 

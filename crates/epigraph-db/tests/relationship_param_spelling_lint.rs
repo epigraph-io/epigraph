@@ -160,14 +160,7 @@ fn offenders(src: &str) -> Vec<String> {
 /// Byte-exact sites that are deliberate, as `(path under src, fn, reason)`.
 /// Each entry must still be flagged (a stale entry fails the ratchet), so the
 /// list shrinks when a site is converted.
-const KNOWN_BYTE_EXACT: &[(&str, &str, &str)] = &[(
-    "repos/semantic_link.rs",
-    "get_by_type",
-    "claim->claim reader kept lower-case-only on purpose (see the scope guard in \
-     tests/relationship_spelling_readers.rs); `str_to_link_type` has no upper-case \
-     arms, so widening the match would turn a silent miss of a `SUPPORTS` row into \
-     an error for the whole call. Converting it needs the row mapping changed too.",
-)];
+const KNOWN_BYTE_EXACT: &[(&str, &str, &str)] = &[];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {

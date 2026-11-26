@@ -17,15 +17,17 @@
 //! 4. take the drain's advisory lock on that connection; when another run
 //!    holds it, print `{"locked": true}` and exit 0;
 //! 5. reap `running` rows older than 90 minutes (a counted attempt: back to
-//!    `pending`, or `failed` once the attempts are used up; a one-attempt row,
+//!    `pending` with a not-before time of now plus its handler's backoff, or
+//!    `failed` once the attempts are used up; a one-attempt row,
 //!    `max_retries <= 1`, is reset uncounted and re-delivered at most
 //!    `MAX_CRASH_REDELIVERIES` times, then failed, see
 //!    `PostgresJobQueue::reap_stale_jobs_counting_attempts`), then run
 //!    the oldest pending job of a registered type, one at a time, until none
 //!    is left or `--max-runtime` (default 50min) has elapsed. A job that
 //!    fails retryably goes back to `pending` with a not-before time of now
-//!    plus its handler's backoff (`jobs.run_after`, migration 261), and no
-//!    run claims it before then (`retry_not_before` in the report).
+//!    plus its handler's backoff, or a rate limit's retry-after when that is
+//!    longer (`jobs.run_after`, migration 261), and no run claims it before
+//!    then (`retry_not_before` in the report).
 //!
 //! Exit codes: 0 drained (or locked); 1 a job failed in this run (retryable
 //! or terminal; a failure outranks every other code), or the run could not
@@ -219,7 +221,12 @@ async fn main() {
         return;
     }
 
-    let scoped = Arc::new(scoped);
+    // Vetted above (`privilege.bypass`), and the whole pool is the configured
+    // maintenance DSN, so it is attached as the maintenance pool the job
+    // handlers draw from: `ScopedPool::unscoped_for_maintenance` never falls
+    // back to an unattached pool (backlog e27ad9b6).
+    let maintenance = scoped.inner().clone();
+    let scoped = Arc::new(scoped.with_maintenance_pool(maintenance));
     let queue = epigraph_jobs::PostgresJobQueue::new(scoped.inner().clone());
     let (embedder, provider) = epigraph_api::embedding_restore::embedding_service_from_env();
     let runner = jobs_drain::build_job_runner(

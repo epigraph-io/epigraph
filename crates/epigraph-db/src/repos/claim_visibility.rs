@@ -310,8 +310,15 @@ fn refusal_text(outcome: &str) -> &'static str {
 impl ClaimRepository {
     /// The TEAM groups `agent` may write a claim into, with `"own"` (its own
     /// writer/admin membership) or `"operator"` (its live human writes it,
-    /// owner decision D-V3). Read through migration 206's definer, so it
-    /// answers the same on an unstamped `epigraph_app` connection.
+    /// owner decision D-V3). Read through migration 206's definer on `conn`
+    /// AS IT IS STAMPED: since migration 346 the definer answers only when
+    /// `agent` is the session principal, when the principal is the live human
+    /// operator holding a live (not retired) operator link to `agent`, or on
+    /// a maintenance or superuser session. Asked about anyone else, it
+    /// answers no team (fail-closed). The set-default routes call it on the
+    /// transaction stamped as their caller, which is the agent itself or its
+    /// operator. A write resolving its own author's teams goes through
+    /// [`Self::resolve_visibility_choice`], which stamps the author.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the read fails or migration 206 is absent.
@@ -325,6 +332,50 @@ impl ClaimRepository {
         .bind(agent)
         .fetch_all(&mut *conn)
         .await?)
+    }
+
+    /// [`Self::writable_teams`] for `agent` asked as ITS OWN principal: the
+    /// author of the write being resolved.
+    ///
+    /// Since migration 346 the definer answers only for the session principal
+    /// (or that agent's live operator). The visibility resolution runs on an
+    /// unstamped pool connection before the write's stamped transaction
+    /// exists (the team it picks must be stamped into that transaction), so
+    /// this stamps `agent` as `epigraph.principal_id` for the one read.
+    ///
+    /// The stamp is scoped by a transaction of its own that is always rolled
+    /// back: on a connection outside a transaction that is a `BEGIN` /
+    /// `ROLLBACK` around the read, and on one already inside a transaction
+    /// (sqlx then issues a `SAVEPOINT`) the rollback to the savepoint restores
+    /// the caller's own stamp. So the connection's principal after the call is
+    /// what it was before, in both shapes. Against a database below 346 the
+    /// stamp changes nothing.
+    ///
+    /// As with 236's `list_live_for_agent`, the stamp is a transport, not an
+    /// authority (a holder of the application DSN can set it): what 346
+    /// removes is the ambient answer for an agent the caller did not stamp.
+    /// The callers pass the author of the write they are resolving.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails or migration 206 is absent.
+    async fn writable_teams_as_self(
+        conn: &mut PgConnection,
+        agent: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, DbError> {
+        use sqlx::Connection;
+        let mut scope = conn.begin().await?;
+        let teams = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT t.group_id, t.via \
+               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
+                            AS principal) s \
+              CROSS JOIN LATERAL public.epigraph_writable_teams(s.principal) t \
+              ORDER BY t.group_id",
+        )
+        .bind(agent)
+        .fetch_all(&mut *scope)
+        .await?;
+        scope.rollback().await?;
+        Ok(teams)
     }
 
     /// `agents.default_group_id` of `agent`, else of its live human. Not
@@ -480,7 +531,7 @@ impl ClaimRepository {
                 note: None,
             }),
             VisibilityChoice::Team(Some(g)) => {
-                let teams = Self::writable_teams(&mut *conn, agent).await?;
+                let teams = Self::writable_teams_as_self(&mut *conn, agent).await?;
                 match teams.iter().find(|(t, _)| *t == g) {
                     Some((_, via)) => Ok(team_of(g, via)),
                     None => Err(DbError::Refused {
@@ -505,7 +556,7 @@ impl ClaimRepository {
                         "this agent's own default is private",
                     ));
                 }
-                let teams = Self::writable_teams(&mut *conn, agent).await?;
+                let teams = Self::writable_teams_as_self(&mut *conn, agent).await?;
                 let writable =
                     |d: Option<Uuid>| d.and_then(|d| teams.iter().find(|(t, _)| *t == d));
                 // D-V1's chain, each default checked on its own: the agent's

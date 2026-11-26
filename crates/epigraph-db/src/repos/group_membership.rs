@@ -874,6 +874,17 @@ impl GroupMembershipRepository {
     /// authority it cannot verify, and it never breaks every read of a binary
     /// deployed one step ahead of its migration.
     ///
+    /// # The statement stamps `agent_id` as its own principal (migration 346)
+    ///
+    /// Since migration 346 the definer answers only for the session principal
+    /// (or a maintenance session), as 236's live-membership read does. This
+    /// runs inside `Viewer::resolve`, before any stamp exists, so it stamps
+    /// `agent_id` for its one statement exactly as
+    /// [`Self::list_live_for_agent`] does (`set_config(..., true)`, passed
+    /// to the definer as its argument, gone at the statement's end). Against
+    /// a database below 346 the stamp changes nothing. Callers pass the
+    /// principal they are resolving.
+    ///
     /// # Errors
     /// Returns `DbError` if the query fails for any other reason.
     pub async fn list_operator_readable_teams(
@@ -881,7 +892,11 @@ impl GroupMembershipRepository {
         agent_id: Uuid,
     ) -> Result<Vec<Uuid>, DbError> {
         let rows: Result<Vec<Uuid>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT group_id FROM public.epigraph_readable_teams($1) WHERE via = 'operator'",
+            "SELECT t.group_id \
+               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
+                            AS principal) s \
+              CROSS JOIN LATERAL public.epigraph_readable_teams(s.principal) t \
+              WHERE t.via = 'operator'",
         )
         .bind(agent_id)
         .fetch_all(pool)

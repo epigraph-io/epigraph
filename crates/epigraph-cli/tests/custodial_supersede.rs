@@ -1290,6 +1290,10 @@ async fn a_custodial_supersede_embeds_its_successor(pool: PgPool) {
     let scoped = epigraph_db::ScopedPool::connect(&maint_dsn, epigraph_db::SessionGucMode::Session)
         .await
         .expect("connect as the maintenance login");
+    // As `operator::connect` does: the whole pool is the maintenance login, so
+    // it is attached as the maintenance pool (an unattached pool refuses).
+    let maintenance = scoped.inner().clone();
+    let scoped = scoped.with_maintenance_pool(maintenance);
     let mut session = scoped
         .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
         .await

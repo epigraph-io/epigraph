@@ -47,7 +47,9 @@ use crate::embedding_restore::{ClaimEmbeddingJobService, EmbeddingProviderKind};
 /// a job that outlives the unit's start timeout is killed by systemd, and an
 /// uncounted reset would re-run it and have it killed again forever. The
 /// counted reset bounds that loop by the job's `max_retries`, then fails the
-/// row (a failure of the run: exit 1). A one-attempt row (`max_retries <= 1`:
+/// row (a failure of the run: exit 1). A counted reset back to `pending` waits
+/// out its handler's backoff like any retry, so the run that reaped it does not
+/// claim it again at once. A one-attempt row (`max_retries <= 1`:
 /// the privatization apply, revert and reseal jobs) is reset uncounted and
 /// re-delivered to its handler instead, at most
 /// [`epigraph_jobs::MAX_CRASH_REDELIVERIES`] times (migration 220's
@@ -287,7 +289,9 @@ pub const fn failure_is_terminal(error: &JobError, retry_count: u32, max_retries
 /// # A retry waits out the handler's backoff
 ///
 /// The not-before time is `now() + handler.backoff(retry_count - 1)`, the
-/// same attempt index the in-process `JobRunner` worker loop sleeps for, and
+/// same attempt index the in-process `JobRunner` worker loop sleeps for (or,
+/// for a [`JobError::RateLimited`] failure, `now() + retry_after_secs` when
+/// that is later: [`epigraph_jobs::retry_delay`]), and
 /// no run claims the row before it (backlog 6cf042a9). Nor does THIS run claim
 /// it again even once it is due (it is excluded for the rest of the run, so a
 /// short backoff cannot spin a failing job through its retry budget in one
@@ -340,7 +344,16 @@ pub async fn drain_cancelling(
             ),
         });
     }
-    let reaped = queue.reap_stale_jobs_counting_attempts(STALE_AFTER).await?;
+    // A counted reset waits out the handler's backoff for the retry it counted
+    // (backlog 000cca08); a type with no handler in this run gets the default.
+    let reap_backoff = |job_type: &str, attempt: u32| {
+        runner
+            .retry_backoff(job_type, attempt)
+            .unwrap_or_else(|| epigraph_jobs::default_backoff(attempt))
+    };
+    let reaped = queue
+        .reap_stale_jobs_counting_attempts(STALE_AFTER, &reap_backoff)
+        .await?;
     let mut report = DrainReport {
         recovered_stale: reaped.iter().filter(|r| !r.failed).count() as u64,
         failures: reaped
@@ -412,14 +425,19 @@ pub async fn drain_cancelling(
                     // `process_job` counted this attempt, so the retry about to
                     // be scheduled is number `retry_count - 1` (0 = the first),
                     // as in the worker loop. The handler is registered (the
-                    // claim only hands out registered types).
+                    // claim only hands out registered types). A rate limit's
+                    // retry-after lengthens it (backlog 000cca08).
                     let backoff = runner
                         .retry_backoff(&job.job_type, job.retry_count.saturating_sub(1))
                         .unwrap_or_default();
                     job.state = JobState::Pending;
                     job.started_at = None;
                     retry_next_run.push(job.id.into());
-                    Some(queue.requeue_after(&job, backoff).await?)
+                    Some(
+                        queue
+                            .requeue_after(&job, epigraph_jobs::retry_delay(&e, backoff))
+                            .await?,
+                    )
                 };
                 tracing::warn!(
                     job_id = %job.id,

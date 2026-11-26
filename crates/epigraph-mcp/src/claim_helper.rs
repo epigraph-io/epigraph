@@ -277,7 +277,10 @@ pub fn visibility_caller_error(e: epigraph_db::DbError) -> McpError {
 /// never public unless asked. Runs BEFORE the author-stamped transaction
 /// because a team the author writes only through its human (D-V3) must be
 /// stamped into it ([`begin_author_stamped_tx_for`]). Every read is a migration
-/// 206 or 107 definer, so the unstamped pool answers correctly.
+/// 206 or 107 definer. Since migration 346 the team lists answer only for the
+/// session principal, so `ClaimRepository::resolve_write_decl` stamps `author`
+/// for its one team read on the pool connection (and rolls the stamp back);
+/// callers pass the request's own principal as `author`.
 ///
 /// # Errors
 /// `INVALID_PARAMS` for a malformed or contradictory pair, and the caller

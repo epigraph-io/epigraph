@@ -40,7 +40,11 @@
 //!   maintenance connection, so an applied cross-owner repair never exists
 //!   without the row naming the triggering principal ([`CascadeTrigger`]), the
 //!   cause and what it touched (counts and ids).
-//! * A repair that fails rolls back and writes [`EVENT_FAILED`].
+//! * A repair that fails rolls back and writes [`EVENT_FAILED`], which the
+//!   replay retries. A match-candidate retirement refused because the
+//!   candidate was decided again can never apply: it writes an
+//!   [`EVENT_RETIRED`] row with outcome [`OUTCOME_OBSOLETE`] instead, which
+//!   closes it ([`CascadeState::Obsolete`]).
 //! * The belief re-derivation that follows is best-effort (per claim) and
 //!   writes its own [`EVENT_BELIEF`] row naming the applied row.
 //!
@@ -81,10 +85,11 @@ use uuid::Uuid;
 
 use epigraph_db::repos::admin_cascade::{
     self as audit, EVENT_APPLIED, EVENT_APPLIED_IDS, EVENT_BELIEF, EVENT_BELIEF_IDS, EVENT_FAILED,
+    EVENT_RETIRED,
 };
 use epigraph_db::repos::match_candidate::RetirementOutcome;
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{ClaimRepository, DbError, MatchCandidateRepo};
+use epigraph_db::{ClaimRepository, DbError, MatchCandidateRepo, RefusalKind};
 
 use crate::retraction_cascade::{cascade_after_dedup, cascade_after_supersede, CascadeReport};
 
@@ -303,6 +308,12 @@ pub enum CascadeState {
     /// It started on the maintenance connection and its repair failed and
     /// rolled back. The act committed; the repair is idempotent and replayable.
     Failed,
+    /// It can never apply, so it was CLOSED instead of failed: a
+    /// match-candidate retirement whose candidate was decided again after the
+    /// retirement was requested ([`apply_match_retire`]). Nothing changed, and
+    /// the [`EVENT_RETIRED`] row it writes answers the pending cascade, so the
+    /// replay does not retry it.
+    Obsolete,
 }
 
 /// The `cascade` object a tool or route returns next to the caller's result.
@@ -312,9 +323,10 @@ pub enum CascadeState {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CascadeStatus {
-    /// Applied, deferred or failed.
+    /// Applied, deferred, failed, or (a match-candidate retirement only)
+    /// obsolete.
     pub status: CascadeState,
-    /// Why it was deferred or failed.
+    /// Why it was deferred, failed or closed as obsolete.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The `security_events` row recording it; `None` only when writing that
@@ -636,8 +648,8 @@ async fn failed(
     CascadeStatus {
         status: CascadeState::Failed,
         reason: Some(format!(
-            "{step} failed on the maintenance connection; the caller's act committed, the \
-             repair rolled back and is replayable"
+            "{step} failed on the maintenance connection; {}",
+            failed_consequence(trigger.cause)
         )),
         audit_event_id,
         audit_error,
@@ -645,21 +657,126 @@ async fn failed(
     }
 }
 
+/// What a failed repair of `cause` leaves behind, for the caller's reason
+/// (backlog f58ea02a). A literal per cause: a match-candidate retirement
+/// commits no caller's act (the flip is part of the repair), so the generic
+/// "the caller's act committed" would misdescribe it.
+const fn failed_consequence(cause: CascadeCause) -> &'static str {
+    match cause {
+        CascadeCause::MatchRetire => {
+            "nothing was retired (the retirement runs on that connection or not at all), and \
+             the request is replayable"
+        }
+        CascadeCause::Undedup => {
+            "the un-mark rolled back with it; nothing changed (an un-mark is never deferred, so \
+             it is not replayed: run it again)"
+        }
+        CascadeCause::Supersede
+        | CascadeCause::Dedup
+        | CascadeCause::Consolidate
+        | CascadeCause::EdgeRetract => {
+            "the caller's act committed, the repair rolled back and is replayable"
+        }
+    }
+}
+
+/// `security_events.details.outcome` of the [`EVENT_RETIRED`] row that closes
+/// an obsolete cascade ([`obsolete`]); an operator's retirement records
+/// `retired_by_operator`.
+pub const OUTCOME_OBSOLETE: &str = "obsolete";
+
+/// The `reason_code` of that row.
+pub const OBSOLETE_REASON_CODE: &str = "candidate_decided_again";
+
+/// Close a cascade that can never apply instead of failing it (backlog
+/// f58ea02a): write an [`EVENT_RETIRED`] row, which answers every open
+/// deferred or failed row of the same cause and subject like an applied one
+/// (so [`replay_deferred`] does not retry it), and build the caller's status.
+///
+/// The row is agent-less, as an operator's retirement is
+/// ([`audit::retire_pending`]): privileged and admin sessions read it, the
+/// triggering principal does not, so `reason` may name the subject. It carries
+/// the trigger (and `replay_of`, when the replay closed it) like every cascade
+/// row. `reason` is built by the caller from the trigger, never from the
+/// database's error text. The caller's copy is generic.
+async fn obsolete(
+    admin: &mut sqlx::PgConnection,
+    trigger: &CascadeTrigger,
+    reason: String,
+    caller_reason: &'static str,
+) -> CascadeStatus {
+    tracing::info!(
+        target: "tenancy.admin_cascade",
+        cause = trigger.cause.as_str(),
+        subject = %trigger.subject_id,
+        "{reason}"
+    );
+    let mut details = trigger.audit_details();
+    details["outcome"] = serde_json::json!(OUTCOME_OBSOLETE);
+    details["reason_code"] = serde_json::json!(OBSOLETE_REASON_CODE);
+    details["reason"] = serde_json::Value::String(reason);
+    let (audit_event_id, audit_error) =
+        match audit::record(&mut *admin, EVENT_RETIRED, None, true, &details).await {
+            Ok(id) => (Some(id), None),
+            Err(e) => {
+                tracing::error!(
+                    target: "tenancy.admin_cascade",
+                    cause = trigger.cause.as_str(),
+                    subject = %trigger.subject_id,
+                    error = %e,
+                    "an obsolete cascade could not be closed: its closing row was not written"
+                );
+                (
+                    None,
+                    Some("the audit row could not be written; see the server log".to_string()),
+                )
+            }
+        };
+    CascadeStatus {
+        status: CascadeState::Obsolete,
+        reason: Some(caller_reason.to_string()),
+        audit_event_id,
+        audit_error,
+        ..CascadeStatus::default()
+    }
+}
+
+/// Why a [`repair_with_audit!`] transaction rolled back. The repair's own
+/// error keeps its [`DbError`] kind, so a caller can tell a permanent refusal
+/// from a transient failure (backlog f58ea02a); `Display` is the text
+/// [`failed`] logs.
+#[derive(Debug)]
+enum RepairError {
+    /// The repair returned this error.
+    Repair(DbError),
+    /// The transaction, or an audit row written in it, failed.
+    Around(String),
+}
+
+impl std::fmt::Display for RepairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repair(e) => e.fmt(f),
+            Self::Around(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Run `repair` and write its [`EVENT_APPLIED`] row in ONE transaction on the
 /// maintenance connection. Returns the repair's outcome and the row's id, or
-/// the error text (the transaction rolled back; nothing of the repair or the
-/// row committed).
+/// a [`RepairError`] (the transaction rolled back; nothing of the repair or
+/// the row committed).
 macro_rules! repair_with_audit {
     ($admin:expr, $trigger:expr, |$tx:ident| $repair:expr, |$out:ident| $touched:expr) => {
         repair_with_audit!($admin, $trigger, |$tx| $repair, |$out| $touched, record: None)
     };
     ($admin:expr, $trigger:expr, |$tx:ident| $repair:expr, |$out:ident| $touched:expr,
      record: $record:expr) => {{
-        let res: Result<_, String> = async {
+        let res: Result<_, RepairError> = async {
             let mut $tx = sqlx::Acquire::begin(&mut *$admin)
                 .await
-                .map_err(|e| e.to_string())?;
-            let $out = $repair.await.map_err(|e| e.to_string())?;
+                .map_err(|e| RepairError::Around(e.to_string()))?;
+            let $out = $repair.await.map_err(RepairError::Repair)?;
             let touched: serde_json::Value = $touched;
             let mut details = $trigger.audit_details();
             details["outcome"] = serde_json::json!("applied");
@@ -673,7 +790,7 @@ macro_rules! repair_with_audit {
             let record: Option<serde_json::Value> = $record;
             let id = audit::record(&mut *$tx, EVENT_APPLIED, $trigger.agent_id, true, &details)
                 .await
-                .map_err(|e| format!("the audit row could not be written: {e}"))?;
+                .map_err(|e| RepairError::Around(format!("the audit row could not be written: {e}")))?;
             if has_ids {
                 let ids = serde_json::json!({
                     "cause": $trigger.cause.as_str(),
@@ -683,7 +800,9 @@ macro_rules! repair_with_audit {
                 });
                 audit::record(&mut *$tx, EVENT_APPLIED_IDS, None, true, &ids)
                     .await
-                    .map_err(|e| format!("the applied ids row could not be written: {e}"))?;
+                    .map_err(|e| {
+                        RepairError::Around(format!("the applied ids row could not be written: {e}"))
+                    })?;
             }
             // The revert record names other writers' rows: its own row, which
             // the triggering principal cannot read (`audit::record_dedup_revert`),
@@ -691,9 +810,11 @@ macro_rules! repair_with_audit {
             if let Some(record) = record {
                 audit::record_dedup_revert(&mut *$tx, id, $trigger.subject_id, &record)
                     .await
-                    .map_err(|e| format!("the revert record could not be written: {e}"))?;
+                    .map_err(|e| {
+                        RepairError::Around(format!("the revert record could not be written: {e}"))
+                    })?;
             }
-            $tx.commit().await.map_err(|e| e.to_string())?;
+            $tx.commit().await.map_err(|e| RepairError::Around(e.to_string()))?;
             Ok(($out, id, touched))
         }
         .await;
@@ -1351,7 +1472,9 @@ pub async fn apply_after_consolidate(
 /// ([`MatchCandidateRepo::retire_conn`]), and write its audit row, in ONE
 /// transaction. `trigger.candidate_status`, when set, is the status the
 /// retirement was requested against, and a candidate decided again since is
-/// refused (the status is `failed` and nothing changed).
+/// refused: nothing changes, and the request is CLOSED as obsolete on first
+/// sight (the status is `obsolete`, with an [`EVENT_RETIRED`] row naming the
+/// candidate), never failed, so the replay does not retry it.
 ///
 /// Then, when the retirement withdrew anything (an edge, a factor or an
 /// edge-keyed BBA), the belief of both endpoints is re-derived from the
@@ -1400,6 +1523,36 @@ pub async fn apply_match_retire(
     );
     let (outcome, applied_id, touched) = match repaired {
         Ok(r) => r,
+        // A STATE refusal is permanent: the candidate was decided again since
+        // the retirement was requested, and no replay changes that. Closed as
+        // obsolete on first sight, never failed (a failed row is replayable,
+        // and the replay would retry it up to its failure bound).
+        Err(RepairError::Repair(DbError::Refused {
+            kind: RefusalKind::State,
+            ..
+        })) => {
+            let asked = trigger
+                .candidate_status
+                .as_deref()
+                .unwrap_or("the status recorded with the request");
+            let reason = format!(
+                "match candidate {candidate_id} was {asked} when its retirement was requested \
+                 and has been decided again since, so the retirement would withdraw a decision \
+                 the requester never saw; the request is obsolete and is closed, not retried"
+            );
+            return (
+                obsolete(
+                    admin,
+                    trigger,
+                    reason,
+                    "the candidate was decided again after the retirement was requested; the \
+                     request is obsolete and was not carried out (nothing changed)",
+                )
+                .await,
+                None,
+                CascadeReport::default(),
+            );
+        }
         Err(e) => {
             return (
                 failed(admin, trigger, "the match-candidate retirement", e).await,
@@ -1606,6 +1759,10 @@ pub struct ReplayReport {
     pub applied: usize,
     /// Cascades whose repair failed again (still pending).
     pub failed: usize,
+    /// Cascades closed as obsolete by this run ([`CascadeState::Obsolete`]):
+    /// they can never apply, so they are answered rather than retried. Not a
+    /// failure of the run.
+    pub obsolete: usize,
     /// Rows whose trigger could not be read (left pending, reported).
     pub unreadable: usize,
     /// One entry per row considered.
@@ -1632,7 +1789,9 @@ pub struct ReplayReport {
 /// since undone fails loudly instead of repairing, and is left pending. A
 /// deferred match-candidate retirement is the request itself: the replay
 /// carries it out while the candidate still has the status the deferral
-/// recorded, and fails loudly (left pending) once it was decided again.
+/// recorded, and once it was decided again closes it as obsolete on first
+/// sight ([`CascadeState::Obsolete`], counted in [`ReplayReport::obsolete`]):
+/// that refusal is permanent, so retrying it could only fail again.
 ///
 /// # Errors
 /// Only the pending-row query's error; each cascade's own failure is reported
@@ -1726,7 +1885,8 @@ pub async fn replay_deferred(
         };
         match status.status {
             CascadeState::Applied => report.applied += 1,
-            _ => report.failed += 1,
+            CascadeState::Obsolete => report.obsolete += 1,
+            CascadeState::Deferred | CascadeState::Failed => report.failed += 1,
         }
         report.items.push(ReplayItem {
             deferred_event_id: event_id,

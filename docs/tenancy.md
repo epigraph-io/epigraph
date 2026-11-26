@@ -2045,8 +2045,13 @@ derived-row deletes run together, in one transaction, on the maintenance
 connection, with one `cascade.admin_applied` row naming the caller. Without the
 connection nothing about the candidate changes: the whole retirement is recorded
 as a deferred request, with the candidate's status at that moment, and the
-replay carries it out only while the candidate still has that status (a
-candidate decided again in between fails loudly and stays pending).
+replay carries it out only while the candidate still has that status. A
+candidate decided again in between can never be retired by that request, so
+the request is closed as obsolete on first sight: one agent-less
+`cascade.retired` row with `details.outcome = 'obsolete'` naming the candidate,
+counted under `obsolete` in the replay report (not a failure of the run), and
+never retried. The same refusal on a request path that holds the connection is
+closed the same way.
 
 What the caller is told is filtered to what it may read: `cascade.touched` is
 counts only, and the belief report keeps only claims the caller's viewer can

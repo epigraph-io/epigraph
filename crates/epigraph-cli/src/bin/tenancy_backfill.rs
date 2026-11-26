@@ -2051,8 +2051,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_workflow_name_has_hidden_rows", 202),
     // 206, claim visibility controls. The two READS fail CLOSED and SILENTLY
     // under a non-member owner. `epigraph_writable_teams` reads `groups`
-    // through 077's `groups_tenancy`, which on the unstamped connection it is
-    // called on admits no row, so it answers "no team": every write that names
+    // through 077's `groups_tenancy`, which on the stamped application
+    // connection it is called on (346: it answers only for the session
+    // principal, the principal's operated agent, or a maintenance session)
+    // admits no team row, so it answers "no team": every write that names
     // no visibility lands private instead of in the author's team, and every
     // explicit team write is refused. `epigraph_default_group` reads only
     // `agents` (readable to every role) and 149's `epigraph_human_of`, so its
@@ -2292,6 +2294,9 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_oauth_session_take", 118),
     ("epigraph_oauth_client_lock_for_link", 118),
     ("epigraph_oauth_client_link_agent", 118),
+    // 348 adds a four-argument overload (the approval that names an agent's
+    // owner), also re-owned to the maintenance role; this entry checks every
+    // overload of the name (the worst-owned one is reported).
     ("epigraph_oauth_client_approve", 118),
     ("epigraph_agent_key_set_status", 118),
     // 120, writer-owned edges (D8). The scope predicate is IMMUTABLE SQL and
@@ -2919,6 +2924,25 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // (quiet: a binding change keeps the old owner, the stake 315's entries
     // already report).
     ("epigraph_reown_role_projection_edges", 318),
+    // 345 (backlog 9a9d6850), a promoted hypothesis's factor move from
+    // `hypothesis_assessment` to `research_validity` (the application role
+    // holds no UPDATE on `factors.frame_id`). Under an owner without UPDATE on
+    // `factors` every promotion is refused 42501 (loud, an outage of the
+    // promote route). Under a non-member owner that holds it, its reads of the
+    // FORCEd `claims` and `frames` are filtered to what the caller reads: the
+    // caller writes the claim (checked first), so the status read still sees
+    // it, and a frame the caller cannot read answers BPF03 (closed).
+    ("epigraph_promote_hypothesis_factors", 345),
+    // 346, 077's group-admin predicate re-bodied over 236's bound
+    // `epigraph_live_memberships(principal)`. It is the WITH CHECK of 077's
+    // `group_memberships_tenancy` and an arm of the privatization plan
+    // policies, and 181's re-key mark asks it. Its body reads no table
+    // itself: it calls the bound read, a maintenance-owned definer, so its
+    // answer does not depend on its own owner's row visibility. Under an
+    // owner that may not EXECUTE the bound read every call raises 42501 (every
+    // roster write refused: loud, fail-closed). Registered so the pre-flight
+    // sees an owner the guarded `OWNER TO` failed to set.
+    ("epigraph_is_group_admin", 346),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4183,6 +4207,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "public.epigraph_reown_role_projection_edges(text)",
         false,
     ),
+    // 346: 077's RLS policies on `group_memberships` and the privatization
+    // plans call it on the request DSN (policy expressions run with the
+    // invoker's privileges); without the grant every roster write is 42501.
+    (
+        "epigraph_is_group_admin",
+        "public.epigraph_is_group_admin(uuid)",
+        true,
+    ),
     // 268: the prompt-history listing calls it on the request DSN; without
     // the grant every listing is 42501.
     (
@@ -4195,6 +4227,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_agent_prompt_history_blob",
         "public.epigraph_agent_prompt_history_blob(uuid, bytea)",
+        true,
+    ),
+    // 345: the hypothesis promote route calls it on the request DSN in the
+    // promotion's transaction; without the grant every promotion is 42501
+    // (answered 403 after the status write, and rolled back).
+    (
+        "epigraph_promote_hypothesis_factors",
+        "public.epigraph_promote_hypothesis_factors(uuid)",
         true,
     ),
     // 267: every edge withdrawal on the application role
@@ -5063,7 +5103,8 @@ mod definer_register_tests {
         // both, never added to either.
         "epigraph_derived_require_tenancy",
         "epigraph_root_require_tenancy",
-        "epigraph_is_group_admin",
+        // epigraph_is_group_admin: re-stated and re-owned by 346 (moved to
+        // DEFERRED_DEFINER_FUNCTIONS with its stake).
         // epigraph_live_memberships: re-stated and re-owned by 164 (moved to
         // DEFINER_FUNCTIONS with its stake).
         "epigraph_is_group_creator",

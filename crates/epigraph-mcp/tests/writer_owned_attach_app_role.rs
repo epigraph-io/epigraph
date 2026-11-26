@@ -2026,7 +2026,12 @@ async fn candidate_state(pool: &PgPool, cand: Uuid, edge: Uuid) -> (String, bool
 ///   deferred request (its row records the status it was asked against), and
 ///   the operator's replay carries it out;
 /// * a request whose candidate was decided again before the replay is refused
-///   by the replay, loudly, and changes nothing.
+///   by the replay and changes nothing; the refusal is permanent, so the replay
+///   closes the request as OBSOLETE on first sight (one `cascade.retired` row
+///   naming the re-decided candidate) instead of failing it, and a second
+///   replay has nothing left to retry (backlog f58ea02a). Before the fix the
+///   replay wrote a `cascade.admin_failed` row whose reason called the request
+///   replayable, and retried it up to `DEFAULT_MAX_FAILURES` times.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retire_tool_under_118_runs_on_the_admin_path_and_defers_without_one(pool: PgPool) {
     let (first_server, agent, group, viewer) = app_role_server(&pool).await;
@@ -2116,7 +2121,11 @@ async fn retire_tool_under_118_runs_on_the_admin_path_and_defers_without_one(poo
     )
     .await
     .expect("replay");
-    assert_eq!((report.applied, report.failed), (1, 1), "{report:?}");
+    assert_eq!(
+        (report.applied, report.failed, report.obsolete),
+        (1, 0, 1),
+        "{report:?}"
+    );
     assert_eq!(
         candidate_state(&pool, deferred, deferred_edge).await,
         ("stale".to_string(), false),
@@ -2127,18 +2136,118 @@ async fn retire_tool_under_118_runs_on_the_admin_path_and_defers_without_one(poo
         ("promoted".to_string(), true),
         "the request made against another status changed nothing"
     );
-    let failed = report
+    let refused = report
         .items
         .iter()
         .find(|i| i.subject_id == Some(moved))
         .expect("the refused request is reported");
+    assert_eq!(
+        refused.status.status,
+        epigraph_engine::admin_cascade::CascadeState::Obsolete,
+        "{refused:?}"
+    );
+    let reason = refused.status.reason.as_deref().unwrap_or_default();
     assert!(
-        failed
-            .status
-            .reason
-            .as_deref()
-            .is_some_and(|r| r.contains("failed")),
-        "{failed:?}"
+        reason.contains("decided again") && !reason.contains("replayable"),
+        "the caller's copy must say the request is obsolete, not replayable: {refused:?}"
+    );
+
+    // The audit trail: no failed row for the refused request, and exactly one
+    // closing row, agent-less, naming the candidate, the status the request
+    // was made against, and the deferral it closes.
+    let rows: Vec<(String, Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT event_type::text, agent_id, details FROM security_events \
+          WHERE event_type IN ('cascade.admin_failed', 'cascade.retired') \
+            AND details->>'cause' = 'match_retire' \
+            AND details->'trigger'->>'subject_id' = $1::text",
+    )
+    .bind(moved)
+    .fetch_all(&pool)
+    .await
+    .expect("the refused request's audit rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (event_type, agent, details) = &rows[0];
+    assert_eq!(
+        (event_type.as_str(), *agent),
+        ("cascade.retired", None),
+        "{details}"
+    );
+    assert_eq!(details["outcome"], "obsolete", "{details}");
+    let why = details["reason"].as_str().unwrap_or_default();
+    assert!(
+        why.contains(&moved.to_string())
+            && why.contains("pending")
+            && why.contains("decided again"),
+        "the closing row must name the re-decided candidate and the status it was asked \
+         against: {details}"
+    );
+    assert_eq!(
+        details["replay_of"]["deferred_event_id"],
+        refused.deferred_event_id.to_string(),
+        "{details}"
+    );
+
+    // Closed on first sight: nothing is pending or stuck for the candidate, and
+    // a second replay retries nothing.
+    let again = epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        admin_viewer,
+        "w10-retire-test",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("second replay");
+    assert!(
+        again.items.iter().all(|i| i.subject_id != Some(moved)) && again.stuck.is_empty(),
+        "the obsolete request was replayed again: {again:?}"
+    );
+    assert_eq!(
+        candidate_state(&pool, moved, moved_edge).await,
+        ("promoted".to_string(), true)
+    );
+
+    // The request path's own maintenance connection meets the same refusal
+    // (the candidate decided again between the caller's read and the lock):
+    // obsolete at once, never a replayable failed row.
+    use epigraph_engine::admin_cascade::{apply_match_retire, CascadeCause, CascadeTrigger};
+    let mut direct =
+        CascadeTrigger::new(CascadeCause::MatchRetire, Some(agent2), None, moved, None);
+    direct.candidate_status = Some("rejected".to_string());
+    let (status, outcome, _) =
+        apply_match_retire(conn, admin_viewer, admin_viewer, &direct, moved).await;
+    assert_eq!(
+        status.status,
+        epigraph_engine::admin_cascade::CascadeState::Obsolete,
+        "{status:?}"
+    );
+    assert!(outcome.is_none(), "{outcome:?}");
+    let pending = epigraph_db::repos::admin_cascade::pending_replays(&mut *conn, 50, 5)
+        .await
+        .expect("pending");
+    assert!(
+        pending
+            .iter()
+            .all(|p| p.details["trigger"]["subject_id"] != moved.to_string()),
+        "the request path's refusal left a replayable row: {pending:?}"
+    );
+
+    // Any OTHER failure of a retirement stays replayable, and its reason does
+    // not claim a committed caller's act: a retirement has none (here the
+    // candidate does not exist).
+    let ghost = Uuid::new_v4();
+    let missing = CascadeTrigger::new(CascadeCause::MatchRetire, Some(agent2), None, ghost, None);
+    let (status, _, _) =
+        apply_match_retire(conn, admin_viewer, admin_viewer, &missing, ghost).await;
+    assert_eq!(
+        status.status,
+        epigraph_engine::admin_cascade::CascadeState::Failed,
+        "{status:?}"
+    );
+    let reason = status.reason.as_deref().unwrap_or_default();
+    assert!(
+        !reason.contains("the caller's act committed") && reason.contains("replayable"),
+        "a failed retirement's reason must fit a retirement: {reason}"
     );
 }
 

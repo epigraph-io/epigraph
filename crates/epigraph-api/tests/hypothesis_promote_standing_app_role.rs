@@ -22,6 +22,19 @@
 //! superuser, so seeding cannot fail for a tenancy reason unrelated to the
 //! promotion. Every "nothing was written" check reads through the superuser
 //! seeding pool.
+//!
+//! # The factor move (migration 345, backlog 9a9d6850)
+//!
+//! The world also holds a factor in `hypothesis_assessment` over the
+//! hypothesis and a second claim, and a bystander factor in the same frame
+//! that does not name it. A promotion moves the first to `research_validity`
+//! and leaves the bystander; a refused one moves neither. Since 345 the
+//! application role holds no UPDATE on `factors.frame_id`, so the move runs
+//! through `epigraph_promote_hypothesis_factors`.
+//!
+//! Verified to fail: with 345 applied and the route still running its direct
+//! `UPDATE factors SET frame_id`, the owner's promotion answers 500 (42501 on
+//! `factors`) in `a_group_writer_promotes_on_the_application_role`.
 #![cfg(feature = "db")]
 
 #[allow(dead_code)]
@@ -128,6 +141,33 @@ struct World {
     rv_frame: Uuid,
     /// The `hypothesis_assessment` BBA a promotion would move.
     source_bba: Uuid,
+    /// A `hypothesis_assessment` factor over the hypothesis: a promotion
+    /// moves it to `research_validity`.
+    hyp_factor: Uuid,
+    /// A `hypothesis_assessment` factor that does not name the hypothesis:
+    /// no promotion of it moves this one.
+    bystander_factor: Uuid,
+}
+
+async fn seed_factor(pool: &PgPool, frame: Uuid, a: Uuid, b: Uuid) -> Uuid {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    sqlx::query_scalar(
+        "INSERT INTO factors (factor_type, variable_ids, potential, frame_id) \
+         VALUES ('evidential_support', $1, '{\"strength\": 0.8}', $2) RETURNING id",
+    )
+    .bind(vec![lo, hi])
+    .bind(frame)
+    .fetch_one(pool)
+    .await
+    .expect("seed factor")
+}
+
+async fn factor_frame(w: &World, factor: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT frame_id FROM factors WHERE id = $1")
+        .bind(factor)
+        .fetch_one(&w.pool)
+        .await
+        .expect("read factor frame")
 }
 
 async fn world(pool: PgPool, label: &str) -> World {
@@ -158,6 +198,22 @@ async fn world(pool: PgPool, label: &str) -> World {
             .await
             .expect("source BBA");
     assert_eq!(source.len(), 1, "CALIBRATION: analyze wrote one BBA");
+    let partner = viewer_fixture::seed_group_claim(
+        &pool,
+        owner,
+        group,
+        &format!("{label} partner {}", Uuid::new_v4()),
+    )
+    .await;
+    let other = viewer_fixture::seed_group_claim(
+        &pool,
+        owner,
+        group,
+        &format!("{label} bystander {}", Uuid::new_v4()),
+    )
+    .await;
+    let hyp_factor = seed_factor(&pool, hyp_frame, claim, partner).await;
+    let bystander_factor = seed_factor(&pool, hyp_frame, partner, other).await;
 
     let (addr, shutdown) = spawn_app_role(&pool).await;
     let w = World {
@@ -172,6 +228,8 @@ async fn world(pool: PgPool, label: &str) -> World {
         hyp_frame,
         rv_frame,
         source_bba: source[0],
+        hyp_factor,
+        bystander_factor,
     };
     // CALIBRATION: the hypothesis is promotable, read through the app under
     // test as its owner, so every refusal below is about the caller.
@@ -301,6 +359,11 @@ async fn assert_nothing_moved(w: &World, arm: &str) {
         !bound,
         "{arm}: the claim was not bound to research_validity"
     );
+    assert_eq!(
+        factor_frame(w, w.hyp_factor).await,
+        Some(w.hyp_frame),
+        "{arm}: the hypothesis's factor stayed in hypothesis_assessment"
+    );
 }
 
 /// CALIBRATION for every refusal below: a caller with write authority over the
@@ -326,6 +389,16 @@ async fn a_group_writer_promotes_on_the_application_role(pool: PgPool) {
             .await
             .expect("source BBA");
     assert!(!source_left, "the source BBA was retired");
+    assert_eq!(
+        factor_frame(&w, w.hyp_factor).await,
+        Some(w.rv_frame),
+        "the hypothesis's factor moved to research_validity (345's definer)"
+    );
+    assert_eq!(
+        factor_frame(&w, w.bystander_factor).await,
+        Some(w.hyp_frame),
+        "a factor that does not name the hypothesis stays where it was"
+    );
 }
 
 /// A caller that READS the hypothesis but may not write it is told so: 403

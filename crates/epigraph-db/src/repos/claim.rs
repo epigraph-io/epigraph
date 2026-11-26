@@ -2923,10 +2923,13 @@ impl ClaimRepository {
     /// (`MassFunctionRepository::update_claim_belief`) writes — distinct from
     /// `truth_value`, which the recompute leaves untouched. Callers that need
     /// the *post-wire* combined belief (e.g. the MCP `link_epistemic` readback)
-    /// must read these columns, NOT `truth_value`; the unframed
-    /// `belief_query::get_belief` path reads `truth_value` and so does not
-    /// reflect a recompute. `mass_on_empty` and `mass_on_missing` round out the
-    /// set needed to fully reconstruct a claim's cached DS interval
+    /// must read these columns, NOT `truth_value`. The unframed
+    /// `belief_query::get_belief_conn` path also reads these columns, and
+    /// uses `truth_value` only when `belief` or `plausibility` is NULL (it then
+    /// reports the least-committed interval whose BetP is `truth_value`; see
+    /// `docs/architecture/belief-readers.md`). `mass_on_empty` and
+    /// `mass_on_missing` round out the set needed to fully reconstruct a
+    /// claim's cached DS interval
     /// (mass_on_conflict == mass_on_empty, mass_on_missing).
     ///
     /// Returns `Ok(None)` when the claim does not exist; the columns inside

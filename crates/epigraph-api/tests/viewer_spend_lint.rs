@@ -1021,15 +1021,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // of the caller's own viewer (`detach_scoped`), then writes on ONE
     // transaction stamped with that viewer (`write_as`, backlog b9c4e809), so
     // row security decides every statement below; the two SELECTs are frames
-    // by name.
+    // by name. The factor move (migration 345, backlog 9a9d6850) is a
+    // definer that reads that stamp: it refuses a session that does not write
+    // the promoted claim.
     (
         "hypothesis.rs",
         "promote_hypothesis",
         &[
+            "FactorRepository::promote_hypothesis_factors",
             "MassFunctionRepository::copy_to_frame",
             "hypothesis_status",
             "sqlx::query(INSERT).execute",
-            "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
             "sqlx::query_as(SELECT).fetch_one",
             "sqlx::query_as(SELECT).fetch_one",
@@ -1610,16 +1612,21 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // stamped with this viewer (claim, trace, evidence, edges); the raw-pool
     // read is the packet's author agent (untenanted). `resolve_write_decl`,
     // `Viewer::resolve` and `write_tenancy_report` are `create_claim_core`'s
-    // (above), for the packet's `visibility`; the one `db_pool.acquire` is the
-    // resolution's.
+    // (above), for the packet's `visibility`; one `db_pool.acquire` is the
+    // resolution's. The other, and `author_naming`, refuse a body-named author
+    // the caller may not name BEFORE that resolution (backlog 1c5edc26): a
+    // read of binding facts through app-callable definers (122/149), asked
+    // about the caller and the author, never about any group.
     (
         "submit.rs",
         "persist_packet",
         &[
+            "AgentRepository::author_naming",
             "AgentRepository::get_by_id",
             "ClaimRepository::resolve_write_decl",
             "ClaimRepository::write_tenancy_report",
             "Viewer::resolve",
+            "db_pool.acquire",
             "db_pool.acquire",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",

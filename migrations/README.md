@@ -3469,8 +3469,8 @@ restart.
   upgraded: unset it on every unit for this rollout and apply 236 with `epigraph-migrate`
   only once every viewer-resolving binary is upgraded (or ship the binary change in a
   release before the one that embeds 236). The team lists `epigraph_writable_teams(agent)` /
-  `epigraph_readable_teams(agent)` still answer for any agent on the application role (an
-  open residual for a separate change). **Applied to throwaway databases only, NOT to any
+  `epigraph_readable_teams(agent)` still answer for any agent on the application role (a
+  residual 236 left open; 346 binds both to the principal). **Applied to throwaway databases only, NOT to any
   deployed database.**
 - **237**: public `workflows_update_owner_scope` (backlog 524f89c1). 183's
   `workflows_update` admitted an UPDATE of any row the session READS (public rows, and
@@ -5015,6 +5015,123 @@ restart.
   as UPDATE (077's table-level INSERT grant reached the column). Pinned by
   `human_identity_visibility.rs::the_consent_stamp_is_the_setters_alone` (the INSERT case, red
   before). Undo: `DROP POLICY IF EXISTS agents_consent_stamp_definer_only ON public.agents`.
+- **345**: `bp_messages_and_factor_frame_lockdown` (backlog 9a9d6850). 217 left the application
+  role two writes on tables without row security: `UPDATE (frame_id)` on `factors` (re-granted
+  for the hypothesis promote route) and INSERT / UPDATE / DELETE on `bp_messages` (118's
+  derived-BP allowlist entry), so any request-DSN session could move any factor into any frame
+  and write or clear any belief-propagation message. 345 revokes INSERT, UPDATE, DELETE and
+  TRUNCATE on `bp_messages` from `epigraph_app` (SELECT kept; no definer replaces it: no
+  application path writes a message, and the repository's `upsert_bp_message` /
+  `clear_bp_messages` now need a maintenance connection), and revokes `UPDATE (frame_id)` on
+  `factors`, so the application role holds no write on either table. Adds the SECURITY DEFINER
+  `epigraph_promote_hypothesis_factors(claim) -> bigint` (owned by `epigraph_maintenance`, on
+  `pg_catalog, pg_temp`, EXECUTE for `epigraph_app` and `epigraph_maintenance` only): it moves
+  the factors over `claim` from `hypothesis_assessment` to `research_validity` (both frames
+  resolved by name in the body) and nothing else, and refuses BPF01 (42501) unless the session
+  is privileged or writes the claim's owner group, BPF02 (55000) unless the claim's
+  `hypothesis_status` is `promoted`, BPF03 (P0002) when either frame is missing, 22004 for a
+  NULL claim. `POST /api/v1/hypothesis/:id/promote` calls it through
+  `FactorRepository::promote_hypothesis_factors` after its status write; the CLI promotion
+  runs on the maintenance connection and is unchanged. Registered in `tenancy_backfill`
+  (deferred definers at 345, the grant register). Pinned by
+  `epigraph-db/tests/factor_frame_promote_definer.rs` (the move and its bounds, the refusals,
+  the catalog, the undo), `app_role_table_lockdown.rs` (`bp_messages` in `NO_WRITE`,
+  `the_app_role_writes_no_bp_message`), `factors_write_posture.rs` (no application column
+  UPDATE) and `epigraph-api/tests/hypothesis_promote_standing_app_role.rs` (the route moves the
+  factor on the application role). Undo: `docs/runbooks/345-undo.sql` (run it BEFORE
+  `217-undo.sql`). **Deploy order:** migration and API binary TOGETHER: an older API's direct
+  frame move is refused after 345 (every promotion answers 500 and rolls back), and this API's
+  definer call is 42883 before 345. **Measure first** whether anything writes `bp_messages` on
+  the application DSN (`pg_stat_user_tables` n_tup_ins / n_tup_upd / n_tup_del for
+  `bp_messages`, and `max(updated_at)`); this tree has no such writer.
+- **346**: `membership_definers_principal_bound` (backlogs 1c5edc26, a91d957d). Two decisions in
+  one wave, both re-stating membership definers. (1) 236's `epigraph_writable_teams(agent)` and
+  `epigraph_readable_teams(agent)` answer only for the session principal, a maintenance session
+  or a superuser session, and no rows for anyone else: an application session no longer lists
+  another agent's TEAM groups by naming its id (the residual 236 recorded). The writable list
+  also answers the live human operator holding a live, not retired, operator link to the agent
+  (exactly 209's 'operator' admission to `epigraph_set_agent_default_group`, whose VIS02 check
+  asks the AGENT's list with the operator stamped; the set-default routes read the same list for
+  their response). (2) 077's `epigraph_is_group_admin(group)` is re-bodied over 236's bound
+  `epigraph_live_memberships(principal)` with `role = 'admin'`, so a lapsed admin (164's and
+  235's rules) is no longer an admin for 077's `group_memberships_tenancy` WITH CHECK, the
+  privatization plan policies or 181's re-key mark; derived memberships are never `admin`, so
+  no one gains. On 172's path (the `public` path register shrinks by one); re-owned, so it moves
+  to `tenancy_backfill`'s deferred register with its EXECUTE expectation. The privatization
+  checks about an agent other than the principal (`privatization_authority`'s other-admin count
+  and own-admin row, `is_live_group_admin_conn`) move onto 273's roster in the same change. An
+  md5 precondition refuses to apply over any other body of the three (55000). The binaries stamp
+  the principal they ask about: `list_operator_readable_teams` for its one statement,
+  `resolve_visibility_choice` (the write's author) inside a savepoint it rolls back. Because
+  that resolution answers for a write's AUTHOR, `POST /api/v1/submit/packet` (whose author is a
+  body field) first refuses an author the caller may not name, with the claims trigger's own
+  codes (`AgentRepository::author_naming`; `OPL02` for another human's agent, before any team is
+  read), so the refusals cannot list another human's agent's teams on an armed database. Not
+  changed: 081's privatization triggers still count raw admin rows (the API and job checks now
+  refuse a lapsed admin first). Pinned by `epigraph-db/tests/membership_definers_bound.rs` (the
+  operator arm, 209 on the app role, the viewer resolve and the visibility resolution on the
+  app role, the lapsed admin's predicate, re-key mark and privatization checks, the undo and
+  the precondition), `live_memberships_principal_bound.rs` (the flipped residual test, the
+  caller list) and `epigraph-api/tests/packet_author_team_oracle.rs` (the packet author gate). Undo: `docs/runbooks/346-undo.sql`. **Deploy order: BINARIES FIRST**, as 236: a
+  binary that predates 346 asks both lists on an unstamped pool and gets no rows, so an
+  operated agent stops reading its human's teams and a write that names no visibility lands
+  private (silent, fail-closed). That includes every service linking an older `epigraph-db`
+  (bump its pin first). Unset `EPIGRAPH_MIGRATE_ON_BOOT` for this rollout and apply 346 with
+  `epigraph-migrate` once every such binary is upgraded. **Applied to throwaway databases only,
+  NOT to any deployed database.**
+- **347**: public `harvester_enriched_concepts_tenancy` (backlog f214b84e). Brings
+  `harvester_enriched_concepts`, the one harvester table 173 left out (no generator finds it:
+  no `claim_id`, no FK to `claims`, no FK to or from `harvester_fragments`), under 173's
+  posture. It has NO parent (no foreign key in or out), so there is nothing to derive a row's
+  owner from or to follow: it takes `harvester_sources`'s half of 173, the parentless root.
+  `owner_group_id` and `visibility` NOT NULL with no default; 062's three constraints,
+  validated; 074's root `harvester_enriched_concepts_require_tenancy` (declare both columns, or
+  the seed escape hatch, or 23502); ENABLE + FORCE row security; 077's `<t>_tenancy` (the
+  same expressions as `harvester_fragments_tenancy`), 115's restrictive `<t>_delete_owner` and
+  `<t>_owner_immutable`. Existing rows are stamped `('public', world)`: they had no owner to
+  derive, and that is what every reader saw before (246's precedent for `papers`), so the
+  upgrade hides nothing and publishes nothing. Removes any `tenancy_exempt` row (none was ever
+  registered). No function is added, so no definer register entry; grants unchanged (the
+  application role reads the table and writes none, 118 section 6); no elevated read arm
+  (`elevation_arms_census.rs`'s excluded list, as 173's two). Registered in every FORCE list
+  (`state.rs`'s `FORCE_PROTECTED_SET`, `locked_decisions.rs`, `rls_enforcement.rs`,
+  `docs/runbooks/079-undo.sql`) and the tier-A, root-trigger and delete-policy counts. Pinned
+  by `epigraph-db/tests/harvester_enriched_concepts_tenancy.rs` (a non-member `epigraph_app`
+  session reads no private concept, a member reads its own, an undeclared INSERT is refused by
+  the root body, the upgrade from below 347 stamps `('public', world)`, the undo) and
+  `tenancy_coverage.rs::the_harvester_neighbours_carry_the_fragment_row_security`. Undo:
+  `docs/runbooks/347-undo.sql` (refuses, 55000, while any concept is group-private).
+  **Deploy order:** apply before, or with, the API binary that lists the table in
+  `FORCE_PROTECTED_SET` (that binary refuses a database where the table is not FORCEd).
+  Measure first: `SELECT count(*) FROM harvester_enriched_concepts` (every existing row becomes
+  public, world-owned, as it is read today). Apply as the maintenance role or a superuser (the
+  two triggers need EXECUTE on 074's and 115's bodies, revoked from PUBLIC).
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **348**: `oauth_agent_owner_at_approval` (backlog be024524). `/oauth/register` stamped every
+  self-registered agent client's `owner_id` with the OLDEST ACTIVE HUMAN client (001's
+  `agents_must_have_owner` refused NULL), so the agent's token carried that human as its owner (and
+  `suspend_by_owner` on that human, which nothing calls today, would have suspended every approved
+  self-registered agent); with no active human every agent registration was a 500. Re-states
+  `agents_must_have_owner` as "an ACTIVE agent has an
+  owner" (a pending, suspended or revoked one may have none; precondition: 001's definition, else
+  55000) and adds the overload `epigraph_oauth_client_approve(id, granted_scopes, approved_by,
+  owner) -> boolean` (172's form, owned by `epigraph_maintenance`, no PUBLIC or application EXECUTE):
+  224's body plus the owner. An agent approval must name its owner even when the row holds one (rows
+  registered before 348 hold the oldest human; 22004 otherwise); a named owner is another (22023),
+  existing (23503), active (22023) client of any type; any other client is refused an owner (22023)
+  and keeps the one it was created with; the `oauth.client_approved` row records `owner_id` and
+  `previous_owner_id`. 118's three-argument approval is unchanged (224's ratchet pins it) and now
+  cannot activate an ownerless agent (23514). Data: every PENDING agent client with no `agent_id`
+  (exactly the rows `/oauth/register` wrote; `POST /api/v1/agents` always links its agent, and a
+  client is linked only at its first token mint) has its guessed owner cleared, one
+  `oauth.client_owner_cleared` security event per row keeping `previous_owner_id`. An agent already
+  ACTIVE with the guessed owner keeps it (the CHECK needs an owner; re-owning is an operator
+  decision, with no verb yet). Registered in `tenancy_backfill` by name (the 118 entry covers every
+  overload). Pinned by `epigraph-db/tests/oauth_agent_owner_at_approval.rs`,
+  `epigraph-api/tests/agent_registration_owner.rs` and `epigraph-cli/tests/operator_approve_client.rs`
+  (`approve-client --owner`). Undo: `docs/runbooks/348-undo.sql` (refuses while an agent client has no
+  owner, including the rows 348 cleared). **Deploy order:** migrate BEFORE the API binary of this change (it registers an agent with
+  no owner, which 001's CHECK refuses); an older API runs on 348 unchanged.
 
 ## `-- no-transaction` migrations
 

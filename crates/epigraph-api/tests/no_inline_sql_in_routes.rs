@@ -105,7 +105,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("experiment_loop.rs", 2),
     ("graph.rs", 8),
     ("graph_neighborhood.rs", 1),
-    ("hypothesis.rs", 11),
+    ("hypothesis.rs", 10),
     ("papers.rs", 4),
     ("policies.rs", 4),
     ("revoke_signature.rs", 6),
@@ -157,7 +157,11 @@ const REGISTER: &[(&str, usize)] = &[
 /// named through the disclosure rule (`graph_query_utils.rs` 1 -> 0). (Staging
 /// 2026-11-25-3: the branch's 82 -> 81 and backlog 67c905a3's 82 -> 74 compose
 /// to 73 on the merged tree.)
-const HIGH_WATER: usize = 73;
+/// Lowered to 72 by migration 345 (backlog 9a9d6850): the hypothesis
+/// promotion's factor move became `FactorRepository::promote_hypothesis_factors`
+/// (`hypothesis.rs` 11 -> 10). (Staging 2026-11-26: the PR's 82 -> 81 and the merged
+/// tree's 73 compose to 72.)
+const HIGH_WATER: usize = 72;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

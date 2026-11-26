@@ -2070,9 +2070,10 @@ impl PrivatizationRepository {
     /// connection is established, not on each checkout, and `ScopedPool`'s
     /// `after_release` scrub covers the three tenancy GUCs and nothing else. So
     /// the bound outlived the request and applied to whatever ran next on that
-    /// connection — and `ScopedPool::maintenance_inner()` falls back to the
-    /// APPLICATION pool when no dedicated maintenance pool is attached, which is
-    /// what every fixture does. A privatization preview could therefore pin a
+    /// connection — and the maintenance connection used to be drawn from the
+    /// APPLICATION pool when no dedicated maintenance pool was attached, which is
+    /// what every fixture does (today only through the test-only opt-in;
+    /// production refuses, backlog e27ad9b6). A privatization preview could therefore pin a
     /// 30-second cap on a request-path connection.
     ///
     /// So the prior value is read with `SHOW`, and restored on EVERY exit
@@ -2582,11 +2583,17 @@ impl PrivatizationRepository {
     /// approver guard enforces it on the approving UPDATE and cannot enforce it
     /// afterwards; this is the dispatch-time half.
     ///
-    /// Written as a direct `group_memberships` read rather than through
-    /// `epigraph_is_group_admin`, whose `EXECUTE` is granted to
-    /// `epigraph_maintenance` alone and which reads the SESSION principal rather
-    /// than an argument — the question here is about the APPROVER, who is not
-    /// the session principal on a job connection.
+    /// Not through `epigraph_is_group_admin`, which reads the SESSION
+    /// principal rather than an argument: the question here is about the
+    /// APPROVER, who is not the session principal on a job connection.
+    ///
+    /// LIVE admins only (backlog a91d957d): it reads migration 273's
+    /// `epigraph_group_live_roster(group)`, so an unrevoked `admin` row that no
+    /// longer counts (164's and 235's lapse rules, the ones every viewer
+    /// resolve applies) does not carry an approval to dispatch. The roster
+    /// answers on the maintenance connection the job handler runs on
+    /// (`epigraph_bypass()`); on any connection that may not read the group's
+    /// roster it reads no row and this answers `false` (fail-closed).
     ///
     /// # Errors
     ///
@@ -2599,11 +2606,9 @@ impl PrivatizationRepository {
         sqlx::query_scalar::<_, bool>(
             r#"
             SELECT EXISTS (
-                SELECT 1 FROM public.group_memberships m
-                 WHERE m.group_id = $1
-                   AND m.agent_id = $2
-                   AND m.role = 'admin'
-                   AND m.revoked_at IS NULL)
+                SELECT 1 FROM public.epigraph_group_live_roster($1) r
+                 WHERE r.agent_id = $2
+                   AND r.role = 'admin')
             "#,
         )
         .bind(group_id)

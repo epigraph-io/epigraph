@@ -127,13 +127,14 @@ async fn a1_no_tier_a_tenancy_column_has_a_default_or_is_nullable(pool: PgPool) 
     // `atlas_map_*` tables.
     // 31 -> 32 (backlog 88cf603b): migration 240's `behavioral_executions`.
     // 32 -> 33 (backlog 34864fb5): migration 246's `papers`.
+    // 33 -> 34 (backlog f214b84e): migration 347's `harvester_enriched_concepts`.
     assert_eq!(
-        covered, 33,
+        covered, 34,
         "expected the 25 tier-A tables from migration 062's tier_a array, plus the two \
          harvester neighbours migration 173 brings under tenancy (ruling R-66), \
          migration 183's workflows (ruling R-74), migration 210's three atlas_map_* \
-         tables, migration 240's behavioral_executions and migration 246's papers, to \
-         carry owner_group_id; found \
+         tables, migration 240's behavioral_executions, migration 246's papers and \
+         migration 347's harvester_enriched_concepts, to carry owner_group_id; found \
          {covered}. A different number means the tier-A set \
          moved, which is a D1 change and needs a decision, not a silent edit — and \
          it means A1 above was measured over the wrong population."
@@ -295,14 +296,17 @@ async fn a5_every_tenancy_trigger_is_enabled(pool: PgPool) {
     // 25 -> 26 (ruling R-74): migration 183's `workflows_require_tenancy`.
     // 26 -> 29 (Atlas W2): migration 210's three `atlas_map_*_require_tenancy`.
     // 29 -> 30 (backlog 34864fb5): migration 246's `papers_require_tenancy`.
+    // 30 -> 31 (backlog f214b84e): migration 347's
+    // `harvester_enriched_concepts_require_tenancy`.
     assert_eq!(
         require.len(),
-        30,
-        "expected 30 *_require_tenancy triggers: after migration 074, claims (from \
+        31,
+        "expected 31 *_require_tenancy triggers: after migration 074, claims (from \
          070) plus the 17 claim-derived tables plus the 6 parentless roots, \
          migration 173's harvester_sources_require_tenancy (a seventh root), \
          migration 183's workflows_require_tenancy, migration 210's three \
-         atlas_map_*_require_tenancy and migration 246's papers_require_tenancy. Found \
+         atlas_map_*_require_tenancy, migration 246's papers_require_tenancy and \
+         migration 347's harvester_enriched_concepts_require_tenancy. Found \
          {}: {require:?}. `edges` is deliberately absent — edges_tenancy is already \
          BEFORE ROW and 072's body assigns both columns on every branch.",
         require.len()
