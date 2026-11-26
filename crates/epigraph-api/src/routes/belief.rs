@@ -33,7 +33,11 @@
 //! frame assignment, the claim's cached belief, its Beta parameters, its
 //! global scoped belief and its edges, now go through ONE [`AppState::write_as`]
 //! transaction, and its best-effort derived rows after the commit through a
-//! second; its alias remains for unstamped reads only.) `read_as` is documented
+//! second; its alias remains for unstamped reads and for the best-effort
+//! `events` inserts after the commit, `record_event`, which need no stamp:
+//! `events` carries no row security and the application role holds INSERT on
+//! it. `create_frame`'s `frame.created` event goes through its alias the same
+//! way.) `read_as` is documented
 //! read-only: `ScopedRead::commit`
 //! is not called by `Drop`, so under `SessionGucMode::Transaction` a write
 //! routed through it is rolled back on drop — a 200 with nothing persisted.
