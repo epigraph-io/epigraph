@@ -178,21 +178,36 @@ async fn the_check_names_an_admin_option_holder_and_a_createrole_role(pool: PgPo
 }
 
 /// 161's own case still holds at head: a role that can act as the attestor
-/// (the application role granted it with SET and INHERIT) is named.
+/// (a fresh role granted it with the default options, so INHERIT and SET) is
+/// named, once, as a member and as nothing else.
+///
+/// The grantee is a fresh role, not `epigraph_app`: the MEMBER arm follows
+/// memberships through other roles, and other tests commit logins into
+/// `epigraph_app` (cluster-wide), which would be named beside it. Only the
+/// lines that name the fresh role are compared.
+///
+/// Verified to fail: with 350's MEMBER arm deleted, the default grant (no
+/// ADMIN OPTION) leaves no line naming the role.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_role_that_can_act_as_the_attestor_is_still_named(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire");
+    let member = format!("t350_member_{}", suffix());
     let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
-    sqlx::query(&format!("GRANT {ATTESTOR} TO epigraph_app"))
+    sqlx::query(&format!("CREATE ROLE {member} NOLOGIN"))
+        .execute(&mut *tx)
+        .await
+        .expect("create the member (rolled back)");
+    sqlx::query(&format!("GRANT {ATTESTOR} TO {member}"))
         .execute(&mut *tx)
         .await
         .expect("grant (rolled back)");
     let found = faults(&mut tx).await;
     tx.rollback().await.expect("rollback");
+    let naming: Vec<&String> = found.iter().filter(|f| f.contains(&member)).collect();
     assert_eq!(
-        found,
-        vec![format!("epigraph_app is a member of {ATTESTOR}")],
-        "the member is named"
+        naming,
+        vec![&format!("{member} is a member of {ATTESTOR}")],
+        "the member is named, once, as a member: {found:?}"
     );
 }
 
