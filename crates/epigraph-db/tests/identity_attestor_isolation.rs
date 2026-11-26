@@ -3,7 +3,9 @@
 //! that can act as it now. 161's check asked only for USAGE or SET, so it
 //! passed a role holding ADMIN OPTION alone (on PostgreSQL 16 such a grant
 //! confers neither, but its holder can grant the role to itself) and any
-//! non-superuser CREATEROLE role (which can grant itself the attestor).
+//! non-superuser CREATEROLE role (before 16 it can grant itself any
+//! non-superuser role; on 16 it administers the roles it creates, and 251
+//! names one the same way).
 //!
 //! Every role and grant staged here lives in ONE transaction that is rolled
 //! back: roles are cluster-wide, and a committed one would make 251, 257 and
@@ -166,9 +168,7 @@ async fn the_check_names_an_admin_option_holder_and_a_createrole_role(pool: PgPo
     );
     assert_eq!(
         with_creator,
-        vec![format!(
-            "{creator} is a non-superuser CREATEROLE role (it can grant itself {ATTESTOR})"
-        )],
+        vec![format!("{creator} is a non-superuser CREATEROLE role")],
         "a non-superuser CREATEROLE role is named, once"
     );
     assert!(

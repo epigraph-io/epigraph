@@ -22,8 +22,10 @@
 --     name it, but its holder can `GRANT epigraph_identity_attestor TO
 --     itself` and then register any identity under any parent;
 --   * a non-superuser CREATEROLE role. Before 16 it may grant itself any
---     non-superuser role; on 16 it administers every role it created or
---     holds ADMIN on. Either way it can make itself the attestor.
+--     non-superuser role, the attestor included. On 16 it administers every
+--     role it created or holds ADMIN on, so it can make itself the attestor
+--     only with ADMIN on it (named by the ADMIN arm); it is named anyway, as
+--     251 and 257 name one, because one ALTER ROLE or grant away it is.
 --
 -- 161 left the ADMIN-only grant out on purpose: on 16 a non-superuser
 -- CREATEROLE migration runner receives exactly that grant on a role it
@@ -164,10 +166,10 @@ BEGIN
          ORDER BY 1);
     -- CREATEROLE: before PostgreSQL 16 it grants any non-superuser role,
     -- itself included; on 16 it administers the roles it creates or holds
-    -- ADMIN on. The attestor's own CREATEROLE is reported above.
+    -- ADMIN on (the ADMIN arm above names that case). Named either way, as
+    -- 251 names one. The attestor's own CREATEROLE is reported above.
     v_out := v_out || ARRAY(
-        SELECT r.rolname || ' is a non-superuser CREATEROLE role (it can grant itself '
-               'epigraph_identity_attestor)'
+        SELECT r.rolname || ' is a non-superuser CREATEROLE role'
           FROM pg_catalog.pg_roles r
          WHERE r.rolcreaterole AND NOT r.rolsuper AND r.oid <> v_role
          ORDER BY 1);
