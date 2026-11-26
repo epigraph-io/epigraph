@@ -47,21 +47,30 @@
 --        * a figure passes when it has neither an image (`raw_content`) nor a
 --          caption (`properties->>'caption'`, publisher text too);
 --        * anything else is a passage, and passes only when a `papers` row the
---          WRITER can read, keyed on the row's DOI (as given, its canonical
---          key with any DOI-resolver prefix removed, and that key under each
---          resolver prefix, as `document_key_spellings` lists them), carries a
---          licence (1) permits. Otherwise 23514, constraint
---          `evidence_passage_licence` (the API answers 400).
+--          WRITER can read, keyed on the row's DOI, carries a licence (1)
+--          permits. The DOI is matched as `PaperRepository` finds a paper: as
+--          given, its canonical key with any DOI-resolver prefix removed, and
+--          that key under each resolver prefix (`document_key_spellings`), then
+--          a legacy key spelled with a case variant of a resolver prefix
+--          (`HTTPS://DOI.ORG/...`, the `case_variant_arm_sql` rule, backlog
+--          f3a3ca54). Otherwise 23514, constraint `evidence_passage_licence`
+--          (the API answers 400: `ApiError::from(DbError::CheckViolation)`
+--          for the REST evidence routes, and the packet route maps it too).
 --      INVOKER on purpose: `papers` has row security since 246, so a group's
 --      own paper row counts for that group's writes only, and the refusal is
 --      no oracle for whether another group holds a copy. Ingest reads the
 --      licence of the paper row in its own scope, which the same session
---      reads here, so a write the Rust gate permits is never refused.
+--      reads here, so a passage the Rust gate keeps is admitted. The one
+--      fail-closed exception: a locator-and-hash body whose free-text title or
+--      locator itself contains `Passage: '` is read as a passage, so for a
+--      non-permitting paper that evidence row (and the ingest writing it) is
+--      refused rather than risk admitting a smuggled passage.
 --      An UNSEAL (`PrivatizationRepository`: the row's body is the seal
 --      sentinel `[sealed]` and its ciphertext row exists) restores what was
 --      stored before the seal and is not re-judged.
 --   3. Refuses to apply (`EVP09`, nothing applied) unless both triggers are
---      present and enabled afterwards.
+--      present and enabled afterwards, and `epigraph_app` may EXECUTE (1)
+--      (granted by name: the guard runs as the writer).
 --
 -- No existing row is read or changed. Rows stored before 349, or under a
 -- licence since withdrawn, keep their body; a write that leaves the body, the
@@ -86,9 +95,6 @@
 --     255, provenance against that DSN waits for the elevation batch).
 --   * An unseal of a row a session sealed itself: the unseal arm trusts the
 --     sentinel plus a ciphertext row, both of which the application writes.
---   * A legacy `papers` row keyed on a CASE VARIANT of a resolver prefix
---     (`HTTPS://DOI.ORG/...`) is not matched; such a paper's passages are
---     refused (closed) until its key is canonicalised.
 --
 -- ===================================================================
 -- 3. DEPLOY AND UNDO
@@ -102,13 +108,20 @@
 -- packets carry verbatim passages (or figures) for a DOI with no `papers` row,
 -- or one with no permitting licence, is refused 400; set the licence first
 -- through `epigraph_set_paper_licence` (255) on the maintenance DSN.
--- Measure first (prod): how many literature/figure rows hold a passage for a
--- non-permitting paper (they stay, see above; the strip repair is a separate
--- item):
+-- Measure after applying (prod, as a superuser so every paper row is read;
+-- exact DOI spelling only): the stored literature/figure rows that carry a
+-- passage, image or caption for a paper with no permitting licence. They stay
+-- (see above); the strip repair is a separate data item.
 --   SELECT count(*) FROM evidence e
 --    WHERE e.properties->>'type' IN ('literature', 'figure')
---      AND (e.raw_content IS NOT NULL OR e.properties->>'caption' IS NOT NULL)
---      AND e.raw_content !~ '^Source: .* \(DOI: .*\)\. Locator: .*\. Passage BLAKE3: ';
+--      AND (e.raw_content IS NOT NULL
+--           OR btrim(COALESCE(e.properties->>'caption', '')) <> '')
+--      AND NOT (e.properties->>'type' = 'literature'
+--               AND e.raw_content ~ '^Source: .* \(DOI: .*\)\. Locator: .*\. Passage BLAKE3: [0-9a-f]{64}\. Passage not retained \((licence unknown|licence: .+)\)\.$'
+--               AND strpos(e.raw_content, 'Passage: ''') = 0)
+--      AND NOT EXISTS (SELECT 1 FROM papers p
+--                       WHERE p.doi = e.properties->>'doi'
+--                         AND epigraph_passage_retention_permitted(p.licence));
 -- Undo: docs/runbooks/349-undo.sql.
 
 SET LOCAL lock_timeout = '3s';
@@ -138,6 +151,15 @@ SET search_path = pg_catalog, pg_temp AS $$
                            ' _', '--') AS id) v)
     END
 $$;
+
+-- The guard below is SECURITY INVOKER, so the writing session calls this:
+-- granted by name rather than left to PUBLIC's default (section 6 checks it).
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_passage_retention_permitted(text) '
+                'TO epigraph_app';
+    END IF;
+END $$;
 
 COMMENT ON FUNCTION public.epigraph_passage_retention_permitted(text) IS
     'Whether a source under this licence may have its verbatim text kept in '
@@ -219,6 +241,18 @@ BEGIN
                       AND public.epigraph_passage_retention_permitted(p.licence)) THEN
             RETURN NEW;
         END IF;
+        -- A legacy key spelled with a case variant of a resolver prefix: equal
+        -- to a spelling ignoring case, and ending in the canonical key exactly
+        -- (`case_variant_arm_sql`). No index serves it; it runs only for a
+        -- passage the exact spellings did not admit.
+        IF v_key ~ '^10\.[0-9]{4,9}/'
+           AND EXISTS (SELECT 1 FROM public.papers p
+                        WHERE pg_catalog.lower(p.doi) = ANY (
+                                  SELECT pg_catalog.lower(s) FROM pg_catalog.unnest(v_spellings) s)
+                          AND pg_catalog.right(p.doi, pg_catalog.char_length(v_key)) = v_key
+                          AND public.epigraph_passage_retention_permitted(p.licence)) THEN
+            RETURN NEW;
+        END IF;
     END IF;
 
     RAISE EXCEPTION 'EVP01: evidence for DOI % carries a verbatim source passage (or a figure '
@@ -259,6 +293,13 @@ DO $$
 DECLARE
     v_n integer;
 BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app')
+       AND NOT has_function_privilege('epigraph_app',
+               'public.epigraph_passage_retention_permitted(text)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'EVP09: epigraph_app cannot EXECUTE '
+                        'epigraph_passage_retention_permitted, so every permitted passage would '
+                        'fail 42501; nothing was applied' USING ERRCODE = '55000';
+    END IF;
     SELECT count(*) INTO v_n
       FROM pg_catalog.pg_trigger t
      WHERE t.tgrelid = 'public.evidence'::regclass

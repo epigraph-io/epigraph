@@ -5143,14 +5143,15 @@ restart.
   must be NULL or the locator-and-hash shape both writers emit (`Source: ... (DOI: ...). Locator:
   .... Passage BLAKE3: <hex>. Passage not retained (...).`, no `Passage: '`); a figure must carry no
   image and no caption; anything else is a passage and is admitted only when a `papers` row the
-  writer can read under the row's DOI (as given, canonical, and each resolver-prefixed spelling)
-  carries a permitting licence. Otherwise 23514 with constraint `evidence_passage_licence` (the API
+  writer can read under the row's DOI (as given, canonical, each resolver-prefixed spelling, then
+  a legacy key with a case-variant resolver prefix, as `PaperRepository` finds papers) carries a
+  permitting licence; `epigraph_app` is granted EXECUTE on the mirror by name (EVP09 checks it). Otherwise 23514 with constraint `evidence_passage_licence` (the API
   answers 400). An unseal (body was the `[sealed]` sentinel and a ciphertext row exists) is not
   re-judged. No row is read or changed: stored passages stay, a write that leaves body, type, DOI
   and caption alone does not fire, and the strip rewrite to the locator shape passes. **Not
   closed:** text in rows not typed literature or figure, free text in the admitted shape's title
-  and locator, the maintenance DSN, a legacy paper keyed on a case variant of a resolver prefix
-  (refused, closed). **Operator note:** the CLI's `--allow-verbatim` and its extraction-declared
+  and locator (a title or locator containing `Passage: '` is read as a passage: closed), the
+  maintenance DSN. **Operator note:** the CLI's `--allow-verbatim` and its extraction-declared
   licence no longer override the paper's recorded licence; set it with
   `epigraph_set_paper_licence` (255) first. Pinned by
   `epigraph-mcp/tests/evidence_passage_licence_guard.rs` (refusals on the application role, the

@@ -37,7 +37,15 @@
 //! * the update trigger not firing on a DOI change: the rewrite test, at the
 //!   re-pointed DOI;
 //! * the `-NC` / `-ND` / `-SA` port exclusion dropped from the SQL allowlist:
-//!   the parity test, at `CC-BY-3.0-NC`.
+//!   the parity test, at `CC-BY-3.0-NC`;
+//! * the case-variant arm removed: `a_permitting_licence_admits_the_passage`,
+//!   at the `HTTPS://DOI.ORG/...`-keyed paper;
+//! * that arm's exact-suffix condition removed: the same test, at the DOI
+//!   whose suffix differs in case.
+//!
+//! `another_groups_paper_licence_permits_nothing` also writes as the owning
+//! group, whose passage is admitted, so its refusal is not merely "no group
+//! paper row is readable by anyone".
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -55,10 +63,15 @@ const PASSAGE: &str = "Publisher prose that must not be republished in an eviden
 /// that reads and writes its own group (the five GUCs `ScopedPool` stamps).
 /// Returns the pool, the agent and its group.
 async fn app_pool(pool: &PgPool, label: &str) -> (PgPool, Uuid, Uuid) {
-    use sqlx::Executor;
     let (agent, group) = fixture::seed_agent_with_group(pool, label).await;
+    (stamped_app_pool(pool, agent, group).await, agent, group)
+}
+
+/// An `epigraph_app` pool stamped as `agent` reading and writing `group`.
+async fn stamped_app_pool(pool: &PgPool, agent: Uuid, group: Uuid) -> PgPool {
+    use sqlx::Executor;
     let url = fixture::database_url_for(pool).await;
-    let app = sqlx::postgres::PgPoolOptions::new()
+    sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .after_connect(move |conn, _meta| {
             Box::pin(async move {
@@ -80,8 +93,7 @@ async fn app_pool(pool: &PgPool, label: &str) -> (PgPool, Uuid, Uuid) {
         })
         .connect(&url)
         .await
-        .expect("stamped app pool");
-    (app, agent, group)
+        .expect("stamped app pool")
 }
 
 /// A public `papers` row for `doi` (246's tenancy declared), with `licence`
@@ -365,11 +377,13 @@ async fn the_app_role_cannot_rewrite_evidence_into_a_verbatim_passage(pool: PgPo
 
 /// A group's own paper row grants nothing to a session that cannot read it:
 /// the guard reads `papers` as the writer (SECURITY INVOKER), so another
-/// group's licence is neither consulted nor disclosed.
+/// group's licence is neither consulted nor disclosed. The owning group's own
+/// session reads the row, so ITS passage is admitted (a private ingest of an
+/// open-licensed paper is not refused).
 #[sqlx::test(migrations = "../../migrations")]
 async fn another_groups_paper_licence_permits_nothing(pool: PgPool) {
     let doi = "10.5555/guard.private";
-    let (_owner, owner_group) = fixture::seed_agent_with_group(&pool, "b62-owner").await;
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "b62-owner").await;
     sqlx::query(
         "INSERT INTO papers (doi, title, licence, visibility, owner_group_id) \
          VALUES ($1, $2, 'CC-BY-4.0', 'group', $3)",
@@ -387,6 +401,18 @@ async fn another_groups_paper_licence_permits_nothing(pool: PgPool) {
         insert(&app, claim, "reference", Some(PASSAGE), &literature(doi)).await,
         "passage permitted only by a paper row the writer cannot read",
     );
+
+    let owner_app = stamped_app_pool(&pool, owner, owner_group).await;
+    let owner_claim = group_claim(&pool, owner, owner_group).await;
+    insert(
+        &owner_app,
+        owner_claim,
+        "reference",
+        Some(PASSAGE),
+        &literature(doi),
+    )
+    .await
+    .expect("the owning group's passage under its own open-licensed paper row is admitted");
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +484,37 @@ async fn a_permitting_licence_admits_the_passage(pool: PgPool) {
         .await
         .unwrap_or_else(|e| panic!("figure under {licence} refused: {e}"));
     }
+
+    // A legacy paper keyed on a case variant of a resolver prefix, which
+    // `PaperRepository` finds for the canonical DOI (backlog f3a3ca54).
+    let legacy = "10.5555/guard.legacy-key";
+    seed_paper(
+        &pool,
+        &format!("HTTPS://DOI.ORG/{legacy}"),
+        Some("CC-BY-4.0"),
+    )
+    .await;
+    insert(&app, claim, "reference", Some(PASSAGE), &literature(legacy))
+        .await
+        .unwrap_or_else(|e| panic!("passage of a case-variant-keyed open paper refused: {e}"));
+    // ... but only for the same DOI: the canonical key must match exactly.
+    seed_paper(
+        &pool,
+        "HTTPS://DOI.ORG/10.5555/GUARD.CASE",
+        Some("CC-BY-4.0"),
+    )
+    .await;
+    assert_refused(
+        insert(
+            &app,
+            claim,
+            "reference",
+            Some(PASSAGE),
+            &literature("10.5555/guard.case"),
+        )
+        .await,
+        "a DOI whose suffix differs in case from the open paper's key",
+    );
 
     // The CLI sends the DOI as the extraction spells it; the paper row holds
     // the canonical key. A resolver-prefixed spelling finds the same paper.

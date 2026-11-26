@@ -12,7 +12,8 @@
 --
 -- WHAT IT DOES: drops the two triggers on `public.evidence`, the trigger
 -- function `epigraph_evidence_passage_licence_guard()` and the allowlist
--- mirror `epigraph_passage_retention_permitted(text)`.
+-- mirror `epigraph_passage_retention_permitted(text)` (and with it 349's
+-- EXECUTE grant on it to `epigraph_app`).
 --
 -- WHAT IT LEAVES: 349's `_sqlx_migrations` row and every evidence row as it
 -- stands (349 changed no row). Re-introducing 349 is a NEW migration (or a
