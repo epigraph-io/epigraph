@@ -1195,9 +1195,9 @@ async fn migration_062_refuses_a_nullable_visibility(pool: PgPool) {
 /// The positive half is pinned too: without the `GRANT` to `epigraph_app`,
 /// `ClaimRepository::hidden_claim_ids` raises `42501` on its first call on the
 /// application role, which `routes/webhooks.rs::agent_may_receive` maps to
-/// "suppress" (every delivery silently stops) and
-/// `routes/events.rs::retain_visible_events` maps to a 500. That is fail-closed,
-/// but it is a total outage of both surfaces, and `viewer_fixture.rs`'s
+/// "suppress" (every delivery silently stops), as
+/// `routes/events.rs::retain_visible_events` (deleted by backlog 8fcc36a0) mapped
+/// it to a 500. That is fail-closed, but it is a total outage of the surface, and `viewer_fixture.rs`'s
 /// `grant_app_privileges` grants schema, tables and sequences and NOT functions —
 /// so 086's own `GRANT` is the only thing that makes the call possible at all.
 #[sqlx::test(migrations = "../../migrations")]

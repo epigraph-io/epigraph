@@ -480,6 +480,25 @@ pub async fn supersede_claim(
     #[cfg(feature = "db")]
     let (mut session, deferred) = supersede_session_or_deferral(&state, &mut tx, &trigger).await?;
 
+    // 8b. The staleness event a supersession emits (supersede SPEC K12d,
+    // SF-26), with the same payload keys `POST /api/v1/edges` used for a
+    // `supersedes` edge before K12a made that relationship the act's alone.
+    // Attributed to the acting agent. Persisted on the act's OWN transaction
+    // (backlog 8fcc36a0: it used to be pushed after the commit to an
+    // in-process store nothing persisted), so it commits or rolls back with
+    // the supersession; SAVEPOINT-wrapped inside `publish_or_log_conn`, so a
+    // refused event cannot abort the act.
+    let _ = epigraph_db::EventRepository::publish_or_log_conn(
+        &mut tx,
+        "claim.superseded",
+        Some(acting_agent),
+        &serde_json::json!({
+            "superseded_claim_id": claim_id,
+            "superseded_by_claim_id": new_uuid,
+        }),
+    )
+    .await;
+
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the supersession: {e}"),
     })?;
@@ -494,20 +513,7 @@ pub async fn supersede_claim(
         })
         .await;
 
-    // 9a. The staleness event a supersession emits (supersede SPEC K12d,
-    // SF-26), after the commit, to the same store and with the same payload
-    // keys `POST /api/v1/edges` used for a `supersedes` edge before K12a made
-    // that relationship the act's alone. Attributed to the acting agent.
-    super::events::global_event_store()
-        .push(
-            "claim.superseded".to_string(),
-            Some(acting_agent),
-            serde_json::json!({
-                "superseded_claim_id": claim_id,
-                "superseded_by_claim_id": new_uuid,
-            }),
-        )
-        .await;
+    // 9a. The `claim.superseded` event is on the act's transaction (8b).
 
     // 9a'. Embed the replacement: a current claim with new text and no vector
     // (the act copies none on purpose). Post-commit and best-effort, on the

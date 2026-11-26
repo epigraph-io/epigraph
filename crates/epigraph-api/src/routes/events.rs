@@ -11,12 +11,19 @@
 //!
 //! ## Design
 //!
-//! The in-memory `EventStore` uses a module-level `OnceLock` so that all
-//! handlers share the same store without modifying `AppState`. Each event
-//! receives a monotonically increasing `graph_version`, which orders
-//! [`graph_snapshot`]. Incremental synchronisation through
+//! Under the `db` feature the log is the persisted `events` table
+//! (`epigraph_db::EventRepository`), the one MCP `list_events` reads too, and
+//! every route handler that records an event writes it there (backlog
+//! 8fcc36a0). Each event receives a monotonically increasing `graph_version`,
+//! which orders [`graph_snapshot`]. Incremental synchronisation through
 //! `GET /api/v1/events` is by the `(since, after_id)` cursor instead, and that
 //! cursor is NOT commit-ordered: see [`list_events`] for the contract.
+//!
+//! Without `db` there is no table, and the in-memory `EventStore` (a
+//! module-level `OnceLock`) is the log. It is compiled ONLY under `not(db)`:
+//! a db build used to keep it beside the table as a second, unbounded store
+//! that db handlers pushed to, which nothing persisted and every
+//! `GET /api/v1/events` rescanned in full.
 
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -26,19 +33,21 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(not(feature = "db"))]
 use std::sync::{atomic::AtomicI64, atomic::Ordering, Arc, OnceLock};
+#[cfg(not(feature = "db"))]
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 // ── Event store singleton ────────────────────────────────────────────────────
 
-/// Module-level singleton so all handlers share the same store.
+/// Module-level singleton so all handlers share the same store: the event
+/// log of a build WITHOUT a database.
 ///
-/// Exposed as `pub` so integration tests (and any future cross-crate consumer
-/// that needs to drive the in-memory event bus) can push to the same store
-/// the route handlers read from. The store has no externally observable
-/// state beyond what its own methods expose, so widening visibility doesn't
-/// break encapsulation.
+/// Not compiled under `db`, where the log is the `events` table: a handler
+/// that records an event writes it through `epigraph_db::EventRepository`
+/// (backlog 8fcc36a0), so a db build cannot grow a second, unpersisted store.
+#[cfg(not(feature = "db"))]
 pub fn global_event_store() -> &'static Arc<EventStore> {
     static STORE: OnceLock<Arc<EventStore>> = OnceLock::new();
     STORE.get_or_init(|| Arc::new(EventStore::new()))
@@ -66,15 +75,19 @@ pub struct GraphEvent {
     pub created_at: DateTime<Utc>,
 }
 
-/// Thread-safe, append-only event store backed by a `Vec`.
+/// Thread-safe, append-only event store backed by a `Vec`: the no-db build's
+/// log (see [`global_event_store`]). Uncapped, which is acceptable only
+/// because a no-db build is a development configuration with no durable state.
 ///
 /// The atomic version counter guarantees monotonicity even under
 /// concurrent writes (each event gets a unique, increasing version).
+#[cfg(not(feature = "db"))]
 pub struct EventStore {
     events: RwLock<Vec<GraphEvent>>,
     version_counter: AtomicI64,
 }
 
+#[cfg(not(feature = "db"))]
 impl EventStore {
     /// Create an empty event store starting at version 0.
     pub fn new() -> Self {
@@ -155,6 +168,7 @@ impl EventStore {
     }
 }
 
+#[cfg(not(feature = "db"))]
 impl Default for EventStore {
     fn default() -> Self {
         Self::new()
@@ -188,9 +202,10 @@ impl EventFilter {
     /// cursor. The in-process mirror of the predicate
     /// `epigraph_db::EventRepository::list` applies in SQL — inclusive
     /// `created_at >= since` without `after_id`, the strict keyset
-    /// `(created_at, id) > (since, after_id)` with it — so both halves of the
-    /// `list_events` merge page identically. No `since`: everything is
-    /// admitted (`after_id` alone is rejected by the handler).
+    /// `(created_at, id) > (since, after_id)` with it — so the no-db store
+    /// pages exactly as the table does, and the db route's defensive re-check
+    /// agrees with the SQL. No `since`: everything is admitted (`after_id`
+    /// alone is rejected by the handler).
     pub fn admits(&self, created_at: DateTime<Utc>, id: Uuid) -> bool {
         match (self.since, self.after_id) {
             (None, _) => true,
@@ -204,9 +219,9 @@ impl EventFilter {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventListResponse {
     pub events: Vec<GraphEvent>,
-    /// Size of the merged result before `offset`/`limit`. Under the `db`
-    /// feature its persisted half is capped by an overfetch, so it is NOT a
-    /// count of every matching event (see [`list_events`], "Cursor contract").
+    /// Size of the result before `offset`/`limit`. Under the `db` feature it
+    /// is capped by the route's overfetch, so it is NOT a count of every
+    /// matching event (see [`list_events`], "Cursor contract").
     pub total: usize,
 }
 
@@ -275,9 +290,9 @@ pub const EVENTS_SINCE_OVERLAP_SECS: u64 = 300;
 /// * With a cursor the page is the OLDEST matching events after it (the
 ///   cursor is applied in SQL, not to an already-truncated newest-N window).
 /// * `total` is NOT the number of events after the cursor: it counts the
-///   merged set before paging, whose persisted half is capped by the route's
-///   overfetch. To drain a cursor, page until a page comes back shorter than
-///   `limit`; do not compare against `total`.
+///   rows fetched before paging, which the route's overfetch caps. To drain a
+///   cursor, page until a page comes back shorter than `limit`; do not compare
+///   against `total`.
 ///
 /// **The cursor is NOT commit-ordered.** An event's `created_at` is its
 /// transaction's START time and it becomes visible only at COMMIT, so an event
@@ -300,26 +315,18 @@ pub const EVENTS_SINCE_OVERLAP_SECS: u64 = 300;
 ///
 /// # Tenancy (PR-09)
 ///
-/// **Both** halves of the merge are viewer-scoped, by the same rule.
+/// Under `db` the route reads ONE source, the persisted `events` table,
+/// through `EventRepository::list`, whose doc states the rule: an event is
+/// returned unless some uuid appearing anywhere in its payload names a
+/// `claims` row the caller cannot read.
 ///
-/// * The persisted half goes through `EventRepository::list`, whose doc states
-///   the rule: an event is returned unless some uuid appearing anywhere in its
-///   payload names a `claims` row the caller cannot read.
-/// * The in-process half — `global_event_store()`, a ring buffer with no claim
-///   join to hang a SQL predicate on — is filtered in Rust by
-///   [`retain_visible_events`], which extracts the same uuids with
-///   [`payload_uuids`] and asks `ClaimRepository::hidden_claim_ids` the same
-///   question.
-///
-/// An earlier revision filtered only the persisted half and recorded the merge
-/// as "not fixed, an in-process bus is not SQL" (plan §4.12's rationale for
-/// deferring webhook fan-out to PR-10). That does not transfer: the ring buffer
-/// is not a no-db artefact. `routes/edges.rs` pushes `edge.added` (payload:
-/// `source_id`, `target_id`), `routes/versioning.rs::supersede_claim` pushes
-/// `claim.superseded` (supersede SPEC K12d), `routes/belief.rs` pushes
-/// `frame.created`, and `routes/community.rs` pushes too — all from
-/// `#[cfg(feature = "db")]` handlers. Leaving step 2 open would have made the
-/// merge the trivial bypass for the filter added one function up.
+/// It used to merge a second, in-process store that `#[cfg(feature = "db")]`
+/// handlers pushed to (`edge.added`, `claim.superseded`, `frame.created`,
+/// the evidence and community events) and filter that half in Rust with the
+/// same uuid scan. Those handlers now write the table (backlog 8fcc36a0), so
+/// every event the route serves passes the one SQL rule, and the merge, its
+/// full rescan of an uncapped `Vec` on every call and its Rust filter are
+/// gone. The no-db build has no claims to hide and serves its store as is.
 ///
 /// This is the HTTP twin of MCP `list_events`; both are fixed in the same
 /// change so the two transports agree.
@@ -355,13 +362,12 @@ pub async fn list_events(
         let limit = filter.limit.unwrap_or(100).min(1000);
         let offset = filter.offset.unwrap_or(0);
 
-        // 1. Pull from the persisted events table. Overfetch (limit + offset)
-        //    plus headroom so dedup against the in-memory store doesn't
-        //    starve the page. We still apply the final limit/offset post-merge.
-        //    With `since` the cursor goes INTO the SQL, so the rows returned
-        //    are the OLDEST after it; filtering the newest `overfetch` rows
-        //    afterwards (the pre-U045 shape) lost the oldest whenever more
-        //    than `overfetch` events sat after the cursor.
+        // 1. Pull from the persisted events table, the ONE source under `db`
+        //    (backlog 8fcc36a0). The overfetch below is the window this route
+        //    has always read; with `since` the cursor goes INTO the SQL, so the
+        //    rows returned are the OLDEST after it (filtering the newest
+        //    `overfetch` rows afterwards, the pre-U045 shape, lost the oldest
+        //    whenever more than `overfetch` events sat after the cursor).
         let overfetch = (limit.saturating_add(offset)).saturating_mul(2).max(limit);
         let cursor = filter.since.map(|since| epigraph_db::EventCursor {
             since,
@@ -392,40 +398,16 @@ pub async fn list_events(
             })
             .collect();
 
-        // 2. Drain the in-memory event store, filtered by event_type and
-        //    since. EventStore::list also caps at `limit` internally, so we
-        //    pass a large limit here and re-page after merging.
-        let in_mem_filter = EventFilter {
-            since: filter.since,
-            after_id: filter.after_id,
-            event_type: filter.event_type.clone(),
-            limit: Some(usize::MAX),
-            offset: None,
-        };
-        let (mut in_mem, _) = global_event_store().list(&in_mem_filter).await;
-        // 2b. Apply the SAME visibility rule the persisted half got. See this
-        //     handler's doc: the ring buffer is written by db-build handlers,
-        //     so an unfiltered merge would hand back the private claim ids the
-        //     step-1 filter just withheld.
-        retain_visible_events(&_state.db_pool, &viewer, &mut in_mem).await?;
-        events.extend(in_mem);
-
-        // 3. Defensive cursor filter on the merged set. Both halves already
-        //    applied it; kept so the page cannot depend on either one alone.
+        // 2. Defensive cursor filter. The SQL already applied it; kept so the
+        //    page cannot re-serve the cursor's own event if that ever drifts.
         events.retain(|e| filter.admits(e.created_at, e.id));
 
-        // 4. Dedup by event id. Persisted rows are first in the vec, so
-        //    `retain` keeps the persisted copy when the same id appears in
-        //    both stores.
-        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        events.retain(|e| seen.insert(e.id));
-
-        // 5. Sort by the keyset `(created_at, id)` ascending: oldest first,
+        // 3. Sort by the keyset `(created_at, id)` ascending: oldest first,
         //    and the same total order the SQL cursor uses, so the next cursor
         //    is the last event's `(created_at, id)`.
         events.sort_by_key(|e| (e.created_at, e.id));
 
-        // 6. Apply offset + limit to the merged, sorted, deduped set.
+        // 4. Apply offset + limit to the sorted set.
         let total = events.len();
         let events = events.into_iter().skip(offset).take(limit).collect();
 
@@ -459,12 +441,13 @@ pub async fn list_events(
 /// resumes scanning after the end of each match. This scanner slides over
 /// **every** byte offset, so on a long hex-and-dash run it collects overlapping
 /// windows that Postgres skips. The Rust set is therefore a **superset** of the
-/// SQL set, which means the in-memory half can only drop MORE events than the
-/// persisted half — fail-closed.
+/// SQL set, which means a suppression decided on this scan (the webhook
+/// fan-out, below) can only drop MORE events than `EventRepository::list`
+/// does — fail-closed.
 ///
-/// Narrowing the Rust side to match Postgres exactly would make the in-memory
-/// half the more permissive of the two, which is the direction that produces a
-/// leak. The property to preserve is `rust ⊇ sql`, not `rust == sql`. Both
+/// Narrowing the Rust side to match Postgres exactly would make that
+/// suppression the more permissive of the two, which is the direction that
+/// produces a leak. The property to preserve is `rust ⊇ sql`, not `rust == sql`. Both
 /// sides are pinned by
 /// `payload_uuid_tests::an_over_long_hex_run_yields_its_prefix_in_both_implementations`,
 /// which records the Postgres output verbatim.
@@ -473,13 +456,13 @@ pub async fn list_events(
 ///
 /// `rust ⊇ sql` is a claim about which uuids each side *extracts*, and neither
 /// PR-24 nor PR-25 changed either scanner. It says nothing about what each side
-/// then does with them, and the two halves spent one PR disagreeing about THAT:
+/// then does with them, and the two sides spent one PR disagreeing about THAT:
 /// migration 086 moved `ClaimRepository::hidden_claim_ids` — the suppression
-/// step the in-memory half uses — inside a `SECURITY DEFINER` frame, while the
+/// step the Rust side uses — inside a `SECURITY DEFINER` frame, while the
 /// suppression predicate in `EventRepository::list` still read `claims` directly
 /// on both of its arms. That was
 /// `F-PR24-event-list-existence-arm-collapses-under-force`, and **PR-25 closed
-/// it**: both halves now draw the same authority from the same definer. The
+/// it**: both sides now draw the same authority from the same definer. The
 /// scope caveat itself stands — a future change to either suppression step can
 /// reopen the gap without touching a scanner, so do not read the paragraph
 /// above as covering authority. See the
@@ -489,7 +472,9 @@ pub async fn list_events(
 /// # `pub(crate)` since PR-10 — and the asymmetry above is exactly why
 ///
 /// `routes/webhooks.rs::deliver_event` applies the same rule to the webhook
-/// fan-out. It shares THIS scanner rather than growing its own, and the
+/// fan-out, now this scanner's only caller (`list_events` used it to filter an
+/// in-process store it no longer merges, backlog 8fcc36a0). It shares THIS
+/// scanner rather than growing its own, and the
 /// paragraph above is the reason that matters rather than being mere tidiness:
 /// the fan-out wants the SUPERSET. An extra uuid can only cost it an extra
 /// suppression, never an extra delivery, because
@@ -523,39 +508,6 @@ pub(crate) fn payload_uuids(payload: &serde_json::Value) -> Vec<Uuid> {
     out.sort_unstable();
     out.dedup();
     out
-}
-
-/// Drop every event carrying a uuid that names a claim `viewer` cannot read.
-///
-/// The in-process half of the rule `EventRepository::list` applies in SQL. One
-/// round-trip for the whole batch, and none at all when no event carries a
-/// uuid.
-#[cfg(feature = "db")]
-async fn retain_visible_events(
-    pool: &sqlx::PgPool,
-    viewer: &epigraph_db::Viewer,
-    events: &mut Vec<GraphEvent>,
-) -> Result<(), ApiError> {
-    let per_event: Vec<Vec<Uuid>> = events.iter().map(|e| payload_uuids(&e.payload)).collect();
-    let mut all: Vec<Uuid> = per_event.iter().flatten().copied().collect();
-    all.sort_unstable();
-    all.dedup();
-    if all.is_empty() {
-        return Ok(());
-    }
-    let hidden = epigraph_db::ClaimRepository::hidden_claim_ids(pool, viewer, &all)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to resolve event payload visibility: {e}"),
-        })?;
-    if hidden.is_empty() {
-        return Ok(());
-    }
-    let mut keep = per_event
-        .iter()
-        .map(|ids| !ids.iter().any(|i| hidden.contains(i)));
-    events.retain(|_| keep.next().unwrap_or(true));
-    Ok(())
 }
 
 /// `POST /api/v1/events` - Record a new graph event.
@@ -700,9 +652,10 @@ pub async fn create_event(
 ///
 /// # There is NO Rust backstop on this path (recorded by PR-25)
 ///
-/// Unlike `list_events`, this handler does not merge the in-process ring buffer
-/// and therefore never reaches `retain_visible_events` /
-/// `ClaimRepository::hidden_claim_ids`. The suppression predicate inside
+/// Like `list_events` (which merged an in-process store and filtered it with
+/// `ClaimRepository::hidden_claim_ids` until backlog 8fcc36a0 moved every
+/// route event into the table), this handler reads the table alone and never
+/// reaches a Rust-side filter. The suppression predicate inside
 /// `EventRepository::list` is the *entire* tenancy control over the event ROWS
 /// this handler returns, and `events` itself carries no RLS. That makes this a
 /// third caller of that function — the PR-25 scope recon named only two — and it
@@ -1103,8 +1056,9 @@ mod tests {
 //
 // `payload_uuids` is hand-rolled (no `regex` compile) and must agree with the
 // `regexp_matches(payload::text, '<uuid>', 'g')` in
-// `epigraph_db::EventRepository::list`. It is the half of `list_events`'s
-// visibility rule that a database test cannot reach, so it is pinned here.
+// `epigraph_db::EventRepository::list`. It is the extraction step of the
+// webhook fan-out's visibility rule, which a database test cannot reach, so it
+// is pinned here.
 
 #[cfg(all(test, feature = "db"))]
 mod payload_uuid_tests {
@@ -1216,14 +1170,10 @@ mod payload_uuid_tests {
     }
 }
 
-/// The `(since, after_id)` cursor on the in-process half (drain U045).
-///
-/// Feature-independent, unlike `tests` above: under `not(db)` the in-memory
-/// store is the ONLY cursor implementation, and under `db` it still serves
-/// every event type that is pushed to `global_event_store()` but never
-/// persisted (`edge.added`, belief and community events). The HTTP tests in
-/// `tests/events_unified_test.rs` insert rows through SQL, which filters them
-/// before this code runs, so they cannot see a broken in-process predicate.
+/// The `(since, after_id)` cursor in Rust (drain U045): [`EventFilter::admits`],
+/// the mirror of the SQL predicate, in every configuration, and the no-db
+/// `EventStore`'s paging over it, which under `not(db)` is the ONLY cursor
+/// implementation (the store is not compiled under `db`, backlog 8fcc36a0).
 #[cfg(test)]
 mod cursor_tests {
     use super::*;
@@ -1248,6 +1198,7 @@ mod cursor_tests {
 
     /// A store holding `events` exactly as given — fixed timestamps and ids,
     /// in this insertion order — which `EventStore::push` cannot produce.
+    #[cfg(not(feature = "db"))]
     fn store_with(events: &[(DateTime<Utc>, Uuid)]) -> EventStore {
         let store = EventStore::new();
         let rows = events
@@ -1313,6 +1264,7 @@ mod cursor_tests {
     /// return every event exactly once, in `(created_at, id)` order, although
     /// the store holds them in descending-id insertion order and with a later
     /// event inserted first.
+    #[cfg(not(feature = "db"))]
     #[tokio::test]
     async fn keyset_paging_through_a_same_instant_block_serves_each_event_once() {
         let mut rows = vec![(at(20), id(1))];
@@ -1344,6 +1296,7 @@ mod cursor_tests {
 
     /// `offset`/`limit` under a cursor must page over the keyset order, so
     /// consecutive pages neither overlap nor leave a gap.
+    #[cfg(not(feature = "db"))]
     #[tokio::test]
     async fn offset_paging_under_a_cursor_follows_keyset_order() {
         let rows: Vec<_> = [(30, 3), (10, 9), (20, 1), (10, 2), (20, 7), (10, 5)]

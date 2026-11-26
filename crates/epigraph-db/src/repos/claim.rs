@@ -6546,13 +6546,12 @@ impl ClaimRepository {
     ///
     /// The Rust-callable half of the rule
     /// [`crate::repos::EventRepository::list`] implements in SQL, for callers
-    /// that hold rows the database cannot filter — specifically
-    /// `epigraph-api`'s `list_events`, which merges an in-process ring buffer
-    /// (`global_event_store()`) into the same response as the persisted table.
-    /// Filtering only the SQL half would have left the merge as the trivial
-    /// bypass for the filter, and the ring buffer is not a no-db artefact: the
-    /// `db`-build handlers in `routes/edges.rs`, `routes/belief.rs` and
-    /// `routes/community.rs` all push into it.
+    /// that hold rows the database cannot filter — today `epigraph-api`'s
+    /// webhook fan-out (`routes/webhooks.rs::deliver_event`), which decides on
+    /// an event from the in-process bus before any row exists. `list_events`
+    /// used it too, to filter an in-process store it merged with the table;
+    /// since backlog 8fcc36a0 the route handlers persist their events and
+    /// `list_events` reads the table alone.
     ///
     /// "Cannot read" is deliberately narrower than "is absent from the
     /// result": an id that names **no** row at all is not returned, because
@@ -11800,8 +11799,8 @@ mod tests {
     }
 
     /// `hidden_claim_ids` is the Rust half of `EventRepository::list`'s rule,
-    /// used to filter the in-process event ring buffer in
-    /// `epigraph-api`'s `list_events`. Its contract is narrower than "absent
+    /// used by `epigraph-api`'s webhook fan-out (and, until backlog 8fcc36a0,
+    /// to filter an in-process event store `list_events` merged). Its contract is narrower than "absent
     /// from the visible set": an id naming NO row must not be reported, or the
     /// caller would drop events for hard-deleted claims and agent ids.
     ///

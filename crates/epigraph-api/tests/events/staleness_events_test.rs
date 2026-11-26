@@ -16,21 +16,29 @@
 //!
 //! # Strategy
 //!
-//! The `EventStore` is a process-wide in-memory singleton shared by all
-//! handlers. `epigraph_api::_test_event_store()` exposes a clone of the `Arc`
-//! so tests can drain and inspect it.
+//! The payload-schema tests below drive the no-db build's `EventStore`, a
+//! process-wide in-memory singleton that `epigraph_api::_test_event_store()`
+//! exposes. They compile only under `not(db)`: a db build has no in-memory
+//! store, and its handlers PERSIST these events to the `events` table
+//! (backlog 8fcc36a0), which `routes::edges` db_tests
+//! (`create_and_delete_edge_persist_their_events`, `patch_edge_emits_*`) and
+//! `tests/supersede_emits_claim_superseded_http.rs` read.
 //!
 //! Because the singleton persists across tests in the same binary, each test
 //! filters by event_type and asserts "at least one event with matching payload"
 //! rather than "exactly one event total".
 
+#[cfg(not(feature = "db"))]
 use epigraph_api::_test_event_store;
+#[cfg(not(feature = "db"))]
 use epigraph_api::routes::events::EventFilter;
+#[cfg(not(feature = "db"))]
 use uuid::Uuid;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Collect all events of a given type currently in the store.
+#[cfg(not(feature = "db"))]
 async fn events_of_type(event_type: &str) -> Vec<epigraph_api::routes::events::GraphEvent> {
     let store = _test_event_store();
     let filter = EventFilter {
@@ -50,6 +58,7 @@ async fn events_of_type(event_type: &str) -> Vec<epigraph_api::routes::events::G
 ///
 /// This test also validates the TDD discipline: if the re-export is broken,
 /// this test fails and must be fixed before any handler emission is useful.
+#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_event_store_reexport_observable() {
     let store = _test_event_store();
@@ -72,6 +81,7 @@ async fn test_event_store_reexport_observable() {
 }
 
 /// Verify `edge.added` emission pattern matches the required payload schema.
+#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_edge_added_payload_schema() {
     let store = _test_event_store();
@@ -108,6 +118,7 @@ async fn test_edge_added_payload_schema() {
 // ── edge.deleted ──────────────────────────────────────────────────────────────
 
 /// Verify `edge.deleted` emission pattern.
+#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_edge_deleted_payload_schema() {
     let store = _test_event_store();
@@ -133,6 +144,7 @@ async fn test_edge_deleted_payload_schema() {
 // ── claim.superseded ─────────────────────────────────────────────────────────
 
 /// Verify `claim.superseded` payload schema (superseded_claim_id + superseded_by_claim_id).
+#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_claim_superseded_payload_schema() {
     let store = _test_event_store();

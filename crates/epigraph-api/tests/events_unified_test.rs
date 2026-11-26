@@ -1,9 +1,10 @@
-//! Integration tests for the unified `GET /api/v1/events` endpoint.
+//! Integration tests for `GET /api/v1/events` under the `db` feature.
 //!
-//! The handler drains both the persisted `events` table and the in-process
-//! `EventStore`, deduplicates by event id, and returns time-ordered results.
-//! These tests exercise the merge logic end-to-end via HTTP, against the
-//! same test server fixture used by other db-feature integration tests.
+//! The handler reads the persisted `events` table (its one source since
+//! backlog 8fcc36a0; it used to merge an in-process `EventStore` too) and
+//! returns time-ordered results. These tests exercise it end-to-end via HTTP,
+//! against the same test server fixture used by other db-feature integration
+//! tests.
 
 #![cfg(feature = "db")]
 
@@ -13,130 +14,12 @@ use uuid::Uuid;
 
 mod common;
 
-/// Test 1 — events pushed to the in-memory `EventStore` are visible via
-/// `GET /api/v1/events`. Before this PR, the `feature = "db"` handler read
-/// only from the persisted table, so transient events emitted to the
-/// in-process bus (Task 0.3 emissions, etc.) were invisible to HTTP pollers.
+/// A persisted event is served by `GET /api/v1/events`: the table is the
+/// route's one source under `db` (backlog 8fcc36a0 removed the merge with an
+/// in-process store, and with it the two tests that pushed to that store and
+/// the dedup between the two).
 #[tokio::test(flavor = "multi_thread")]
-async fn list_events_returns_in_memory_events_via_http() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let unique_type = format!("test.unified_inmem_{}", Uuid::new_v4().simple());
-
-    // Push directly to the global in-memory store. The handler shares
-    // this same OnceLock-backed singleton at runtime.
-    let pushed = epigraph_api::routes::events::global_event_store()
-        .push(
-            unique_type.clone(),
-            None,
-            serde_json::json!({"source": "in_memory_test"}),
-        )
-        .await;
-
-    let (addr, _shutdown) = common::spawn_app(&url).await;
-    // PR-03: this route moved to the protected router. The token must carry a
-    // non-null `agent_id`; `mint_token_with_agent` is the only tests/common
-    // helper that sets one.
-    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
-    let resp = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/api/v1/events?event_type={unique_type}"
-        ))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body: Value = resp.json().await.unwrap();
-    let events = body["events"].as_array().expect("events array");
-    assert_eq!(
-        events.len(),
-        1,
-        "expected exactly one in-memory event of type {unique_type}, got {body}"
-    );
-    assert_eq!(events[0]["id"], serde_json::json!(pushed.id));
-    assert_eq!(events[0]["event_type"], unique_type);
-    assert_eq!(events[0]["payload"]["source"], "in_memory_test");
-}
-
-/// Test 2 — when the same event id appears in both the persisted table and
-/// the in-memory store, the unified endpoint returns it exactly once.
-/// Persisted-first ordering means the DB row wins (its `graph_version` is
-/// the canonical one), but either way the consumer must not see duplicates.
-#[tokio::test(flavor = "multi_thread")]
-async fn list_events_dedupes_by_id_when_event_in_both_stores() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-
-    let unique_type = format!("test.unified_dedup_{}", Uuid::new_v4().simple());
-
-    // 1. Push to in-memory first so we capture the auto-generated id.
-    let pushed = epigraph_api::routes::events::global_event_store()
-        .push(
-            unique_type.clone(),
-            None,
-            serde_json::json!({"source": "dedup_test"}),
-        )
-        .await;
-
-    // 2. Insert a row into the DB events table reusing the same id. We
-    //    can't use EventRepository::insert (it generates a fresh uuid), so
-    //    drop to raw SQL — this mirrors how a future shared-id write path
-    //    might land the same event in both stores.
-    sqlx::query(
-        "INSERT INTO events (id, event_type, actor_id, payload, graph_version, created_at) \
-         VALUES ($1, $2, NULL, $3, nextval('events_graph_version_seq'), NOW())",
-    )
-    .bind(pushed.id)
-    .bind(&unique_type)
-    .bind(serde_json::json!({"source": "dedup_test_db_copy"}))
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let (addr, _shutdown) = common::spawn_app(&url).await;
-    // PR-03: this route moved to the protected router. The token must carry a
-    // non-null `agent_id`; `mint_token_with_agent` is the only tests/common
-    // helper that sets one.
-    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
-    let resp = reqwest::Client::new()
-        .get(format!(
-            "http://{addr}/api/v1/events?event_type={unique_type}"
-        ))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body: Value = resp.json().await.unwrap();
-    let events = body["events"].as_array().expect("events array");
-    let matching: Vec<&Value> = events
-        .iter()
-        .filter(|e| e["id"] == serde_json::json!(pushed.id))
-        .collect();
-    assert_eq!(
-        matching.len(),
-        1,
-        "expected exactly one event with id {} after dedup, found {}: {body}",
-        pushed.id,
-        matching.len()
-    );
-    // Persisted row appears first in the merge order, so dedup keeps the
-    // DB copy. Verify by checking the payload reflects the DB-side write.
-    assert_eq!(matching[0]["payload"]["source"], "dedup_test_db_copy");
-}
-
-/// Test 3 — when the in-memory store has no events of a given type but
-/// the DB does, the endpoint returns the persisted rows. This is the
-/// pre-existing behavior; the test guards against regressions in the
-/// merge path that might silently drop persisted-only events.
-#[tokio::test(flavor = "multi_thread")]
-async fn list_events_returns_persisted_only_when_in_memory_empty() {
+async fn list_events_returns_persisted_events() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = PgPoolOptions::new()
         .max_connections(2)
@@ -430,71 +313,4 @@ async fn after_id_without_since_is_rejected() {
         .await
         .unwrap();
     assert_eq!(paired.status().as_u16(), 200, "after_id with since");
-}
-
-/// The `(since, after_id)` cursor must also hold for events that live ONLY in
-/// the in-process `EventStore` — `edge.added`, belief and community events are
-/// pushed to `global_event_store()` and never persisted. The SQL tests above
-/// cannot see that half: the database filters their rows before the route's
-/// in-process predicate and merge sort ever run.
-///
-/// The cursor is the first returned event's `created_at` STRING exactly as the
-/// route serialised it, plus its id. In-memory timestamps carry nanoseconds,
-/// so rebuilding the cursor at microsecond precision would let the cursor
-/// event back in even with a correct predicate. Which of the three pushes
-/// sorts first is not assumed (two `Utc::now()` stamps can tie, and then the
-/// random ids decide): the expectation is "everything after page[0]".
-#[tokio::test(flavor = "multi_thread")]
-async fn after_id_cursor_skips_the_cursor_event_in_the_in_memory_store() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let unique_type = format!("test.inmem_cursor_{}", Uuid::new_v4().simple());
-    for i in 0..3 {
-        epigraph_api::routes::events::global_event_store()
-            .push(unique_type.clone(), None, serde_json::json!({"i": i}))
-            .await;
-    }
-
-    let (addr, _shutdown) = common::spawn_app(&url).await;
-    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
-    let client = reqwest::Client::new();
-    let get = |params: Vec<(&'static str, String)>| {
-        let req = client
-            .get(format!("http://{addr}/api/v1/events"))
-            .query(&params)
-            .bearer_auth(&token);
-        async move {
-            let resp = req.send().await.unwrap();
-            assert_eq!(resp.status().as_u16(), 200);
-            let body: Value = resp.json().await.unwrap();
-            body["events"].as_array().expect("events array").clone()
-        }
-    };
-
-    let all = get(vec![("event_type", unique_type.clone())]).await;
-    assert_eq!(all.len(), 3, "the three in-memory events, got {all:?}");
-    let first = &all[0];
-    let since = first["created_at"]
-        .as_str()
-        .expect("created_at string")
-        .to_string();
-    let after_id = first["id"].as_str().expect("id string").to_string();
-
-    let page = get(vec![
-        ("event_type", unique_type.clone()),
-        ("since", since.clone()),
-        ("after_id", after_id.clone()),
-    ])
-    .await;
-    let ids = |events: &[Value]| -> Vec<String> {
-        events
-            .iter()
-            .map(|e| e["id"].as_str().expect("id string").to_string())
-            .collect()
-    };
-    assert_eq!(
-        ids(&page),
-        ids(&all[1..]),
-        "with cursor (since={since}, after_id={after_id}) the page must be \
-         exactly the events after the cursor event, which must not be re-served"
-    );
 }

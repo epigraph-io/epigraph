@@ -42,7 +42,9 @@ pub use state::{
 /// Test-only re-export of the module-level event store.
 ///
 /// Returns a clone of the `Arc<EventStore>` singleton so integration tests can
-/// drain or inspect events without going through the HTTP API.
+/// drain or inspect events without going through the HTTP API. No-db builds
+/// only: under `db` the event log is the `events` table (backlog 8fcc36a0).
+#[cfg(not(feature = "db"))]
 #[doc(hidden)]
 pub fn _test_event_store() -> std::sync::Arc<crate::routes::events::EventStore> {
     crate::routes::events::global_event_store().clone()
