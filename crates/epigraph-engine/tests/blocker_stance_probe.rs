@@ -397,3 +397,34 @@ async fn dimension_mismatch_and_unembedded_seed_are_skipped(pool: PgPool) {
         .expect("no query errors");
     assert!(got.is_empty(), "{got:?}");
 }
+
+/// `probe_only_routed` counts only probe-only pairs that cleared `bands.mid`.
+/// With the band above every fixture pair's score the probe still retrieves
+/// and keeps the contradicting pair, but nothing is routed, so the report
+/// shows "retrieved, then rejected on score" rather than a routed pair.
+#[sqlx::test(migrations = "../../migrations")]
+async fn probe_only_pair_below_mid_band_is_kept_but_not_routed(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let mut cfg = test_config();
+    cfg.bands.mid = 0.99;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let report = run_pipeline(
+        &pool,
+        RunInputs {
+            seeds: vec![f.seed],
+            cfg,
+            verifier: Box::new(RecordingVerifier { seen: seen.clone() }),
+            auto_promote: false,
+            probe_embedder: Some(Arc::new(LookupEmbedder::probes_for_seed())),
+        },
+    )
+    .await
+    .expect("pipeline");
+    assert!(report.probe_only_kept >= 1, "{report:?}");
+    assert_eq!(
+        report.probe_only_routed, 0,
+        "a pair scored below bands.mid is not routed: {report:?}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(report.rejected >= report.probe_only_kept, "{report:?}");
+}
