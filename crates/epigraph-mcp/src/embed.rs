@@ -6,6 +6,12 @@ use sqlx::PgPool;
 pub const HYBRID_CANDIDATE_POOL: i64 = 50;
 /// Reciprocal Rank Fusion constant `k` (canonical default 60).
 pub const HYBRID_RRF_K: i64 = 60;
+/// Dense-similarity floor (`1 - cosine distance`) above which a hybrid recall
+/// candidate counts toward `recall`'s `n_total_candidates` (backlog 8c511f13).
+/// Lexical candidates always count. 0.40 is the floor the backlog item proposed
+/// as a sensible minimum relevance; it only shapes the reported count, never
+/// which hits are returned.
+pub const RECALL_MATCH_MIN_SIMILARITY: f64 = 0.40;
 
 /// How this embedder is allowed to run its `UPDATE claims SET embedding`.
 ///

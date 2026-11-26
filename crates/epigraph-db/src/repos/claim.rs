@@ -809,6 +809,8 @@ pub struct HybridHit {
 #[derive(Debug, sqlx::FromRow)]
 struct HybridPageRow {
     dense_count: i64,
+    matched_count: i64,
+    pool_saturated: bool,
     claim_id: Option<Uuid>,
     rrf_score: Option<f64>,
     dense_similarity: Option<f64>,
@@ -824,6 +826,33 @@ impl HybridPageRow {
             in_lexical: self.in_lexical?,
         })
     }
+}
+
+/// One page of [`ClaimRepository::search_hybrid_page_conn`]: the fused hits
+/// plus how many well-matched candidates the fused pool held before the
+/// page's `LIMIT`/`OFFSET` (backlog 8c511f13).
+#[derive(Debug, Clone)]
+pub struct HybridPage {
+    pub hits: Vec<HybridHit>,
+    pub candidates: HybridCandidates,
+}
+
+/// The fused candidate pool of one hybrid search, counted before the page cut.
+///
+/// A candidate is well matched when it is in the lexical leg (its text matches
+/// the query) or its dense similarity is at least the caller's floor. Both legs
+/// are capped at `candidate_pool`, so `matched` is at most twice the pool; it
+/// counts only rows the viewer can read (both legs carry the visibility
+/// splice), so it discloses nothing the hits do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridCandidates {
+    /// Well-matched rows in the fused pool (dense leg union lexical leg).
+    pub matched: i64,
+    /// `true` when a leg's cap may have cut well-matched rows off, so that
+    /// `matched` is a lower bound: the lexical leg is full, or the dense leg
+    /// is full and even its farthest row clears the floor. `false` means
+    /// `matched` is every well-matched row the search could return.
+    pub pool_saturated: bool,
 }
 
 /// Result row for [`ClaimRepository::latest_in_lineage`].
@@ -5212,6 +5241,54 @@ impl ClaimRepository {
         since: Option<DateTime<Utc>>,
         theme_id: Option<Uuid>,
     ) -> Result<Vec<HybridHit>, DbError> {
+        // The candidate count is not wanted here; any floor will do.
+        Self::search_hybrid_page_conn(
+            conn,
+            viewer,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            offset,
+            tags,
+            agent_id,
+            since,
+            theme_id,
+            1.0,
+        )
+        .await
+        .map(|page| page.hits)
+    }
+
+    /// [`Self::search_hybrid_scoped_since_in_theme_conn`] plus a count of the
+    /// fused candidate pool before the page cut (backlog 8c511f13), so a
+    /// caller can tell how much of the well-matched pool its page covers.
+    ///
+    /// `match_min_similarity` is the dense-similarity floor (`1 - cosine
+    /// distance`) above which a dense candidate counts as well matched; every
+    /// lexical candidate counts. See [`HybridCandidates`]. The count is taken
+    /// in the same statement as the page, so the exact retry, when it runs,
+    /// replaces both together.
+    ///
+    /// # Errors
+    /// As [`Self::search_hybrid_scoped_since_in_theme`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_page_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+        match_min_similarity: f64,
+    ) -> Result<HybridPage, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -5220,7 +5297,7 @@ impl ClaimRepository {
         // BOTH CTEs are marked. The recursive hazard's flat cousin: filtering
         // only `dense` would let `lex` re-admit a row the viewer cannot read,
         // and the FULL OUTER JOIN would surface it. `splice` asserts both
-        // markers resolve to the same bind ($11).
+        // markers resolve to the same bind ($12).
         let sql = viewer.splice(
             r#"
             WITH dense_scan AS (
@@ -5257,7 +5334,7 @@ impl ClaimRepository {
                 ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id
                 LIMIT $3
             ),
-            fused AS (
+            pool AS (
                 SELECT COALESCE(d.id, l.id) AS claim_id,
                        (COALESCE(1.0/($4 + d.rank), 0)
                         + COALESCE(1.0/($4 + l.rank), 0))::float8 AS rrf_score,
@@ -5265,16 +5342,26 @@ impl ClaimRepository {
                        (l.rank IS NOT NULL) AS in_lexical
                 FROM dense d
                 FULL OUTER JOIN lex l ON d.id = l.id
-                ORDER BY rrf_score DESC, claim_id
+            ),
+            fused AS (
+                SELECT p.* FROM pool p
+                ORDER BY p.rrf_score DESC, p.claim_id
                 LIMIT $5 OFFSET $9
             )
             SELECT (SELECT count(*) FROM dense)::int8 AS dense_count,
+                   (SELECT count(*) FROM pool p
+                     WHERE p.in_lexical OR p.dense_similarity >= $11::float8)::int8
+                       AS matched_count,
+                   ((SELECT count(*) FROM lex) >= $3
+                    OR ((SELECT count(*) FROM dense) >= $3
+                        AND (SELECT min(d.cos) FROM dense d) >= $11::float8))
+                       AS pool_saturated,
                    f.claim_id, f.rrf_score, f.dense_similarity, f.in_lexical
             FROM (SELECT 1) one
             LEFT JOIN fused f ON true
             ORDER BY f.rrf_score DESC, f.claim_id
             "#,
-            11,
+            12,
         );
         // A macro, not a closure: a closure returning a query that borrows its
         // captures, held across `.await`, makes the future not `Send`.
@@ -5290,9 +5377,10 @@ impl ClaimRepository {
                     .bind(agent_id) // $7
                     .bind(since) // $8
                     .bind(offset) // $9
-                    .bind(theme_id); // $10
+                    .bind(theme_id) // $10
+                    .bind(match_min_similarity); // $11
                 if let Some(g) = viewer.group_bind() {
-                    q = q.bind(g); // $11
+                    q = q.bind(g); // $12
                 }
                 q
             }};
@@ -5315,10 +5403,25 @@ impl ClaimRepository {
             rows = exact_retry_or_first_pass(retried, rows, "search_hybrid_scoped_since_in_theme")?;
         }
 
-        Ok(rows
-            .into_iter()
-            .filter_map(HybridPageRow::into_hit)
-            .collect())
+        // Every row, including the one NULL row of an empty page, carries the
+        // same pool counts.
+        let candidates = rows.first().map_or(
+            HybridCandidates {
+                matched: 0,
+                pool_saturated: false,
+            },
+            |r| HybridCandidates {
+                matched: r.matched_count,
+                pool_saturated: r.pool_saturated,
+            },
+        );
+        Ok(HybridPage {
+            hits: rows
+                .into_iter()
+                .filter_map(HybridPageRow::into_hit)
+                .collect(),
+            candidates,
+        })
     }
 
     /// Lexical-only retrieval over current claims (`content_tsv` / GIN), ranked

@@ -16,7 +16,7 @@ use epigraph_db::{
     ClaimRepository, EvidenceRepository, HybridHit, ReasoningTraceRepository, WorkflowRepository,
 };
 
-use crate::embed::{HYBRID_CANDIDATE_POOL, HYBRID_RRF_K};
+use crate::embed::{HYBRID_CANDIDATE_POOL, HYBRID_RRF_K, RECALL_MATCH_MIN_SIMILARITY};
 use epigraph_db::pgvector_literal;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
@@ -617,38 +617,61 @@ async fn recall_post_embed(
     // `theme_filter` and `offset` are threaded into BOTH branches for the same
     // reason: a scope that held on the hybrid path but not on the degrade path
     // would widen to the whole corpus precisely when the embedder is down.
-    let hits: Vec<HybridHit> = match pgvec_opt.as_deref() {
-        Some(pgvec) => ClaimRepository::search_hybrid_scoped_since_in_theme_conn(
-            &mut read,
-            viewer,
-            pgvec,
-            &params.query,
-            HYBRID_CANDIDATE_POOL,
-            HYBRID_RRF_K,
-            limit,
-            offset,
-            tags_opt,
-            agent_filter,
-            params.since,
-            theme_filter,
-        )
-        .await
-        .map_err(internal_error)?,
-        None => ClaimRepository::search_lexical_scoped_since_in_theme(
-            &mut *read,
-            viewer,
-            &params.query,
-            HYBRID_RRF_K,
-            limit,
-            offset,
-            tags_opt,
-            agent_filter,
-            params.since,
-            theme_filter,
-        )
-        .await
-        .map_err(internal_error)?,
-    };
+    //
+    // `candidates` (backlog 8c511f13) is the hybrid pool's well-matched count
+    // before the page cut. The embedder-down path has no ANN candidate pool,
+    // so it reports none and the response omits the coverage fields.
+    let (hits, candidates): (Vec<HybridHit>, Option<epigraph_db::HybridCandidates>) =
+        match pgvec_opt.as_deref() {
+            Some(pgvec) => {
+                let page = ClaimRepository::search_hybrid_page_conn(
+                    &mut read,
+                    viewer,
+                    pgvec,
+                    &params.query,
+                    HYBRID_CANDIDATE_POOL,
+                    HYBRID_RRF_K,
+                    limit,
+                    offset,
+                    tags_opt,
+                    agent_filter,
+                    params.since,
+                    theme_filter,
+                    RECALL_MATCH_MIN_SIMILARITY,
+                )
+                .await
+                .map_err(internal_error)?;
+                (page.hits, Some(page.candidates))
+            }
+            None => (
+                ClaimRepository::search_lexical_scoped_since_in_theme(
+                    &mut *read,
+                    viewer,
+                    &params.query,
+                    HYBRID_RRF_K,
+                    limit,
+                    offset,
+                    tags_opt,
+                    agent_filter,
+                    params.since,
+                    theme_filter,
+                )
+                .await
+                .map_err(internal_error)?,
+                None,
+            ),
+        };
+    // The page's well-matched claims, by the same rule the pool count uses, so
+    // the coverage numerator and denominator count the same kind of row.
+    let matched_on_page: std::collections::HashSet<uuid::Uuid> = hits
+        .iter()
+        .filter(|h| {
+            h.in_lexical
+                || h.dense_similarity
+                    .is_some_and(|s| s >= RECALL_MATCH_MIN_SIMILARITY)
+        })
+        .map(|h| h.claim_id)
+        .collect();
 
     // Captured BEFORE the min_truth / exclude_contested post-filters shrink the
     // page. `hits.len()` is what SQL could supply for this window, so
@@ -1108,6 +1131,19 @@ async fn recall_post_embed(
         });
     }
 
+    // Candidate coverage (backlog 8c511f13), over the claims this response
+    // actually carries (after min_truth, exclude_contested and the diversity
+    // cut; workflow hits are a different id-space and never count).
+    let coverage = candidates.map(|c| {
+        let returned = results
+            .iter()
+            .filter(|r| r.result_type.is_none())
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .filter(|id| matched_on_page.contains(id))
+            .count();
+        RecallCoverage::new(returned, c)
+    });
+
     // Epistemic partitioning (backlog e7736ff6). Runs LAST, on the page every
     // other stage has already settled:
     //
@@ -1147,7 +1183,46 @@ async fn recall_post_embed(
             next_offset: offset + sql_page_len,
             more_available: sql_page_len == limit,
         }),
+        n_total_candidates: coverage.map(|c| c.n_total_candidates),
+        coverage_rate: coverage.map(|c| c.coverage_rate),
+        candidate_pool_saturated: coverage.map(|c| c.candidate_pool_saturated),
     })
+}
+
+/// How much of the well-matched candidate pool a recall response covers
+/// (backlog 8c511f13), so a caller can tell "10 of 12" from "10 of 90" and
+/// decide whether to raise `limit`, page on with `offset`, or narrow the query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RecallCoverage {
+    /// Well-matched candidates in the hybrid pool before `limit`/`offset`:
+    /// every lexical match plus every dense candidate with similarity at least
+    /// [`RECALL_MATCH_MIN_SIMILARITY`]. Bounded by the pool (each leg holds at
+    /// most `HYBRID_CANDIDATE_POOL` rows), so it is a lower bound when
+    /// `candidate_pool_saturated` is set.
+    n_total_candidates: i64,
+    /// Returned well-matched claims divided by `n_total_candidates`, clamped
+    /// to [0, 1]; 1.0 when the pool holds no well-matched candidate (nothing
+    /// was left out). With `offset`, it is this page's share of the pool.
+    coverage_rate: f64,
+    /// A leg's cap may have cut well-matched rows off, so the true total may
+    /// be higher than `n_total_candidates`.
+    candidate_pool_saturated: bool,
+}
+
+impl RecallCoverage {
+    fn new(returned_matched: usize, pool: epigraph_db::HybridCandidates) -> Self {
+        let total = pool.matched.max(0);
+        let coverage_rate = if total == 0 {
+            1.0
+        } else {
+            (returned_matched as f64 / total as f64).clamp(0.0, 1.0)
+        };
+        Self {
+            n_total_candidates: total,
+            coverage_rate,
+            candidate_pool_saturated: pool.pool_saturated,
+        }
+    }
 }
 
 /// The theme a recall was confined to, echoed back so a theme-scoped retrieval
@@ -1203,6 +1278,15 @@ struct RecallEnvelope {
     theme_scope: Option<ThemeScopeOut>,
     #[serde(skip_serializing_if = "Option::is_none")]
     paging: Option<RecallPaging>,
+    /// See [`RecallCoverage`]. The three coverage fields are present on the
+    /// hybrid path and absent on the embedder-down lexical fallback, which has
+    /// no ANN candidate pool to count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_total_candidates: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_pool_saturated: Option<bool>,
 }
 
 #[doc(hidden)]
