@@ -639,9 +639,9 @@ impl Passkeys {
     /// hardware key whose attestation is trusted is recorded attested
     /// ([`Self::finish_anchored_registration`]), so it stands on its own and
     /// is not revoked with its anchor. Synced passkeys answer `none` either
-    /// way, and a statement the library cannot verify is dropped to `none`
-    /// at the finish rather than refused, as the browser would have stripped
-    /// it had the relying party asked for none. No `attestationFormats` hint
+    /// way, and a statement the library refuses is dropped to `none` at the
+    /// finish rather than refusing the registration, as the browser would
+    /// have stripped it had the relying party asked for none. No `attestationFormats` hint
     /// is given (the attested ceremony's options carry one).
     ///
     /// The caller takes the anchored path only when [`Self::check_anchor`]
@@ -722,16 +722,22 @@ impl Passkeys {
     ///   attestation as none). It is then the first case. A statement is
     ///   never recorded unless it is trusted here, so it cannot anchor
     ///   unverified.
-    /// * a statement the library cannot verify at all (a StrongBox-level
-    ///   Android key, which its parser refuses; `android-safetynet` or another
-    ///   format it does not support; an Android key with a leading zero byte
-    ///   in a coordinate): the response is finished again with its statement
-    ///   stripped (`fmt` `none`, an empty `attStmt`, the authenticator data and
-    ///   client data byte-identical), exactly what a browser sends when the
-    ///   relying party asks for none, and the passkey recorded `none` as in
-    ///   the previous case (its standing is never read, so a stale status list
-    ///   does not refuse it). The attested ceremony still refuses such a
-    ///   statement.
+    /// * any statement the library refuses, for whatever reason: one it
+    ///   cannot verify at all (a StrongBox-level Android key, which its
+    ///   parser refuses; `android-safetynet` or another format it does not
+    ///   support; an `android-key` or `apple` statement for a key with a
+    ///   leading zero byte in a coordinate, about one key in 128) and one
+    ///   that fails verification (a bad signature, an untrusted chain): the
+    ///   response is finished again with its statement stripped (`fmt`
+    ///   `none`, an empty `attStmt`, the authenticator data and client data
+    ///   byte-identical), exactly what a browser sends when the relying party
+    ///   asks for none, and the passkey recorded `none` as in the previous
+    ///   case, in the same shape (no statement kept beside it). Its standing
+    ///   is never read, so a stale status list does not refuse it: a
+    ///   leading-zero key that would be attested lands `none` during a status
+    ///   list outage where a sibling key is refused. No trust is gained, since
+    ///   any client may send `none`. The attested ceremony still refuses
+    ///   such a statement.
     ///
     /// # Errors
     /// [`PasskeyError::Config`] (the path is off), [`PasskeyError::Anchor`],
@@ -760,11 +766,11 @@ impl Passkeys {
         let pk = match self.webauthn.finish_passkey_registration(&reg, &st) {
             Ok(pk) => pk,
             Err(first) => {
-                // A statement the library cannot verify at all: finish the
-                // same response with the statement stripped, as a browser
-                // asked for `none` would have sent it. Any other refusal
-                // (origin, challenge, user verification, ...) does not
-                // depend on the statement and recurs on the stripped one.
+                // Any refusal of a response that carries a statement: finish
+                // the same response with the statement stripped, as a
+                // browser asked for `none` would have sent it. A refusal that
+                // does not depend on the statement (origin, challenge, user
+                // verification, ...) recurs on the stripped one.
                 let Some(stripped) = stripped_to_none(&reg) else {
                     return Err(refused(&first));
                 };
@@ -776,8 +782,8 @@ impl Passkeys {
                     target: "passkey.anchor",
                     act = %anchor.act_id,
                     reason = %first,
-                    "an anchored enrollment's attestation statement cannot be verified by the \
-                     library; it is dropped and the passkey recorded `none`"
+                    "the library refused an anchored enrollment's attestation statement; it \
+                     is dropped and the passkey recorded `none`"
                 );
                 return registered_from(without_attestation(
                     serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?,

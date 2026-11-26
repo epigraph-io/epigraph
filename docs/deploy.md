@@ -3630,13 +3630,25 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   or its model is not allowlisted) is revoked with the phone; enroll it again
   and allow the prompt, or enroll it with the setting off, which refuses an
   untrusted key outright.
-  - A statement the WebAuthn library cannot verify at all (a StrongBox-level
-    Android key, an unsupported format such as `android-safetynet`, the
-    one-in-64 Android key with a leading zero byte in a coordinate) is
-    dropped and the passkey recorded `none`, exactly as the browser strips it
-    when asked for none; so it is revoked with the phone like any other
-    `none` backup. The attested path (the setting off) still refuses such a
-    key.
+  - A statement the WebAuthn library refuses, for any reason, is dropped and
+    the passkey recorded `none`, exactly as the browser strips it when asked
+    for none; so it is revoked with the phone like any other `none` backup.
+    That covers a statement the library cannot verify at all (a
+    StrongBox-level Android key, an unsupported format such as
+    `android-safetynet`, the one-in-128 Android key with a leading zero byte
+    in a coordinate) and one that fails verification (for example a bad
+    signature). It grants nothing a client could not get by sending `none`.
+    The enrollment finish answers `attestation_format` `none` with a non-null
+    `anchored_by`, and the drop is logged at INFO with the library's reason.
+    The attested path (the setting off) still refuses such a key.
+    - The leading-zero case is random per key, not per device: a new key on
+      the same device is attested about 127 times in 128. Such a backup
+      recorded `none` can be replaced by one that stands on its own: revoke
+      it (`revoke-passkey --id <backup> --reason <text> --apply`), propose
+      and confirm a new `passkey.register` act, and enroll again. Its standing
+      is never read, so while the status list is stale such a key lands
+      `none` where a sibling key whose statement the library verifies is
+      refused; check `list-passkeys` after a status list outage.
   - The anchored ceremony does not ask the authenticator to enforce the
     credential protection policy as the attested one does. User verification
     is still required at registration and at every assertion.
@@ -3835,7 +3847,7 @@ which revokes it.
      refuses with "older than the 48h maximum", a missing one with "cannot
      be read"; both add "refused until the operator refreshes it". The same
      holds for an Android backup on the anchored ceremony.
-   - About one Android key in 64 is refused by the WebAuthn library with
+   - About one Android key in 128 is refused by the WebAuthn library with
      "The COSEKey contains invalid ECDSA X/Y coordinate data" (a coordinate
      with a leading zero byte). A retry creates a new key and passes.
 7. **Second (synced) passkey.**

@@ -118,7 +118,7 @@ fn p256() -> PKey<Private> {
 /// `android-key` attestation certificate with `COSEKey::try_from((alg,
 /// &X509))`, which refuses a coordinate whose `num_bytes()` is not 32
 /// ("The COSEKey contains invalid ECDSA X/Y coordinate data"): about one
-/// genuine key in 64. That is the library's behaviour (a real device that hits
+/// genuine key in 128. That is the library's behaviour (a real device that hits
 /// it registers on a retry, with a new key); a test that drew such a key would
 /// fail at random, so the test authenticator never does.
 fn credential_key(leading_zero: bool) -> PKey<Private> {
