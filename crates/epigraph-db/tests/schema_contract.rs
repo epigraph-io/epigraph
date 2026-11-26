@@ -1195,9 +1195,9 @@ async fn migration_062_refuses_a_nullable_visibility(pool: PgPool) {
 /// The positive half is pinned too: without the `GRANT` to `epigraph_app`,
 /// `ClaimRepository::hidden_claim_ids` raises `42501` on its first call on the
 /// application role, which `routes/webhooks.rs::agent_may_receive` maps to
-/// "suppress" (every delivery silently stops) and
-/// `routes/events.rs::retain_visible_events` maps to a 500. That is fail-closed,
-/// but it is a total outage of both surfaces, and `viewer_fixture.rs`'s
+/// "suppress" (every delivery silently stops), as
+/// `routes/events.rs::retain_visible_events` (deleted by backlog 8fcc36a0) mapped
+/// it to a 500. That is fail-closed, but it is a total outage of the surface, and `viewer_fixture.rs`'s
 /// `grant_app_privileges` grants schema, tables and sequences and NOT functions —
 /// so 086's own `GRANT` is the only thing that makes the call possible at all.
 #[sqlx::test(migrations = "../../migrations")]
@@ -4207,6 +4207,93 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
             "{trigger} timing/events"
         );
     }
+}
+
+/// Migration 161's attestor isolation check as migration 350 (backlog
+/// cfaa5065) leaves it at head: a SECURITY INVOKER function on 172's
+/// `pg_catalog, pg_temp` path, executable by the maintenance role and by
+/// neither PUBLIC nor the application role, whose body carries the three arms
+/// 251 and 257 apply to their own roles (any MEMBER, an ADMIN OPTION holder,
+/// any non-superuser CREATEROLE role). On a migrated database it returns `{}`,
+/// and the catalog agrees: no non-superuser is a member of the attestor in any
+/// form, holds ADMIN OPTION on it, or is CREATEROLE.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_350_attestor_isolation_check_is_complete(pool: PgPool) {
+    let signature = "public.epigraph_identity_attestor_faults()";
+    let meta: Option<DefinerCatalogRow> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text, \
+                p.proconfig \
+           FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE p.oid = to_regprocedure($1)",
+    )
+    .bind(signature)
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, _owner, vol, acl, config) =
+        meta.unwrap_or_else(|| panic!("{signature} must exist (migration 161)"));
+    assert!(!secdef, "{signature} is SECURITY INVOKER");
+    assert_eq!(vol, "s", "{signature} volatility");
+    assert!(acl.is_some(), "{signature} must carry an EXPLICIT ACL");
+    assert_eq!(
+        config,
+        Some(vec!["search_path=pg_catalog, pg_temp".to_string()]),
+        "{signature} resolves in pg_catalog only, pg_temp last (350)"
+    );
+    for (role, expected) in [
+        ("public", false),
+        ("epigraph_app", false),
+        ("epigraph_maintenance", true),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on {signature}");
+    }
+
+    let body: String =
+        sqlx::query_scalar("SELECT prosrc FROM pg_proc WHERE oid = to_regprocedure($1)")
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("body");
+    for arm in [
+        "pg_catalog.pg_has_role(r.oid, v_role, 'MEMBER')",
+        "m.admin_option AND NOT r.rolsuper",
+        "r.rolcreaterole AND NOT r.rolsuper AND r.oid <> v_role",
+    ] {
+        assert!(
+            body.contains(arm),
+            "{signature} at head lost an isolation arm (350): {arm}"
+        );
+    }
+
+    let faults: Vec<String> = sqlx::query_scalar(&format!("SELECT {signature}"))
+        .fetch_one(&pool)
+        .await
+        .expect("faults");
+    assert!(faults.is_empty(), "the attestor is isolated: {faults:?}");
+    let actors: Vec<String> = sqlx::query_scalar(
+        "SELECT o.rolname::text FROM pg_roles o, pg_roles a \
+          WHERE a.rolname = 'epigraph_identity_attestor' \
+            AND o.oid <> a.oid AND NOT o.rolsuper \
+            AND (pg_has_role(o.oid, a.oid, 'MEMBER') \
+                 OR o.rolcreaterole \
+                 OR EXISTS (SELECT 1 FROM pg_auth_members m \
+                             WHERE m.roleid = a.oid AND m.member = o.oid \
+                               AND m.admin_option)) \
+          ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("actors");
+    assert!(
+        actors.is_empty(),
+        "no role can act as, or make itself, the attestor: {actors:?}"
+    );
 }
 
 /// Migration 194 (H10; SPEC §2.8, §7.1 "New tables"): the purge-grant table is

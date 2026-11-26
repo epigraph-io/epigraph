@@ -29,10 +29,10 @@
 //!
 //! Events mirror the routes' emissions (`edge.updated` always on patch,
 //! `edge.retired` additionally when the patch closes the lifecycle window,
-//! `edge.deleted` on delete) but travel through
+//! `edge.deleted` on delete) and travel through
 //! `EventRepository::publish_or_log_conn` on the mutation's own transaction —
-//! the durable MCP path `link_epistemic` also uses — rather than the
-//! API-crate-local `global_event_store`, which is not reachable from this crate.
+//! the durable path `link_epistemic` and, since backlog 8fcc36a0, the HTTP
+//! routes use too, so both transports write the same `events` rows.
 //!
 //! # Tenancy
 //!

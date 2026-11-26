@@ -5284,6 +5284,7 @@ const REPOS: Surface = Surface {
     state_db_methods: &[],
     viewer_ctors: &["Viewer::resolve("],
     conn_ctors: &[],
+    conn_closure_macros: &[],
     marker_spend: call_spends_viewer,
 };
 
@@ -5492,7 +5493,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // session: as `search_by_embedding_scoped`.
     (
         "claim.rs",
-        "search_hybrid_scoped_since_in_theme_conn",
+        "search_hybrid_page_conn",
         &[
             "?.fetch_all",
             "?.fetch_all",

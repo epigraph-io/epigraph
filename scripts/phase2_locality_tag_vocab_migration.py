@@ -102,14 +102,13 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true", help="commit the migration (default: dry-run)")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(),
-        help="postgres DSN (default: $DATABASE_URL)",
+        default=None,
+        help="postgres DSN (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL; no built-in default)",
     )
     args = parser.parse_args()
-
-    if not args.database_url:
-        print("ERROR: --database-url or $DATABASE_URL required", file=sys.stderr)
-        return 1
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False

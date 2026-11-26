@@ -1,4 +1,4 @@
-import datetime, json, os, subprocess, sys, tempfile, unittest
+import dataclasses, datetime, json, os, subprocess, sys, tempfile, unittest
 from unittest import mock
 from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
@@ -41,6 +41,107 @@ class RangeTests(unittest.TestCase):
             sha = subprocess.run(["git","-C",d,"rev-parse","HEAD"],capture_output=True,text=True).stdout.strip()
             self.assertEqual(gir.compute_rev_range(d, sha), f"{sha}~1..{sha}")
 
+def _api_commits(d, shas):
+    """The PR commits API's rows for `shas` (oldest first), built from the
+    repo's own commits: GitHub's rebase merge keeps each commit's author,
+    author date and message, and gives it a new sha."""
+    rows = []
+    for sha in shas:
+        email, date, msg = subprocess.run(
+            ["git", "-C", d, "show", "-s", "--format=%ae%x00%aI%x00%B", sha],
+            capture_output=True, text=True, check=True).stdout.split("\0")
+        # The API gives author dates in UTC (`...Z`); git gives the author's
+        # own offset, so the match must compare instants, not strings.
+        utc = datetime.datetime.fromisoformat(date).astimezone(datetime.timezone.utc)
+        rows.append({"sha": "pre-rebase-" + sha[:7],
+                     "commit": {"author": {"email": email, "date": utc.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                                "message": msg}})
+    return rows
+
+class RebaseRangeTests(unittest.TestCase):
+    """Backlog 39dfef78: a rebase-merged PR's commits land on main as a linear
+    run with one parent each, so the one-parent `M~1..M` dropped all but the
+    last of them."""
+    def _git(self, d, *a, env=None):
+        return subprocess.run(["git", "-C", d, *a], check=True, capture_output=True,
+                              text=True, env=env).stdout.strip()
+    def _repo(self, d):
+        self._git(d, "init", "-qb", "main"); self._git(d, "config", "user.email", "t@t")
+        self._git(d, "config", "user.name", "t")
+        Path(d, "a").write_text("0"); self._git(d, "add", "."); self._git(d, "commit", "-qm", "base")
+    def _commit(self, d, f, msg, date):
+        env = dict(os.environ, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+        Path(d, f).write_text(msg); self._git(d, "add", ".")
+        self._git(d, "commit", "-qm", msg, env=env)
+        return self._git(d, "rev-parse", "HEAD")
+
+    def _ingested_range(self, d, pr, commits_rows):
+        """Run the reconciler over one PR whose mirror is `d`, the PR commits
+        API answering `commits_rows`; return the --rev-range ingest_git got."""
+        real_run = subprocess.run
+        seen = []
+        def run(argv, **kw):
+            if argv[0] == "ingest_git":
+                seen.append(argv); return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_run(argv, **kw)
+        with tempfile.TemporaryDirectory() as st:
+            cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir=st, author_key_file="/k")
+            with mock.patch.object(gir, "ensure_mirror", return_value=d), \
+                 mock.patch.object(gir, "discover_merged_prs", return_value=[pr]), \
+                 mock.patch.object(gir, "fetch_pr_commits", create=True, return_value=commits_rows), \
+                 mock.patch.object(gir.subprocess, "run", side_effect=run):
+                self.assertEqual(gir.run_once(cfg, dry_run=False), (1, 0))
+        (argv,) = seen
+        return argv[argv.index("--rev-range") + 1]
+
+    def test_rebase_merge_ingests_every_pr_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._repo(d)
+            shas = [self._commit(d, f"f{i}", f"feat(x): step {i}", f"2026-06-0{i}T10:00:00+02:00")
+                    for i in (1, 2, 3)]
+            m = shas[-1]
+            pr = gir.PullRequest(9, "feat(x): steps", "", m, "", "u", "2026-06-04T00:00:00Z")
+            rng = self._ingested_range(d, pr, _api_commits(d, shas))
+            self.assertEqual(rng, f"{m}~3..{m}")
+            self.assertEqual(self._git(d, "rev-list", "--reverse", rng).split(), shas)
+
+    def test_squash_merge_of_a_multi_commit_pr_stays_one_commit(self):
+        # The API lists the PR's 3 branch commits, but main holds one squash
+        # commit on top of unrelated history: `M~3..M` would claim two
+        # commits from other PRs.
+        with tempfile.TemporaryDirectory() as d:
+            self._repo(d)
+            self._commit(d, "o1", "fix(y): other pr", "2026-06-01T09:00:00Z")
+            self._commit(d, "o2", "fix(z): another pr", "2026-06-01T09:30:00Z")
+            m = self._commit(d, "sq", "feat(x): steps (#9)", "2026-06-04T00:00:00Z")
+            rows = [{"sha": f"b{i}", "commit": {"author": {"email": "t@t", "date": f"2026-06-0{i}T08:00:00Z"},
+                                                 "message": f"feat(x): step {i}"}} for i in (1, 2, 3)]
+            pr = gir.PullRequest(9, "feat(x): steps", "", m, "", "u", "2026-06-04T00:00:00Z")
+            self.assertEqual(self._ingested_range(d, pr, rows), f"{m}~1..{m}")
+
+    def test_pr_commits_api_cap_falls_back_to_the_tip_commit(self):
+        # The commits API lists at most 250 commits, so an answer that long may
+        # be truncated and cannot prove a rebase run, even one that matches
+        # main; the tip is still ingested. (The cap is lowered to 3 here so the
+        # fixture stays small.)
+        with tempfile.TemporaryDirectory() as d:
+            self._repo(d)
+            shas = [self._commit(d, f"f{i}", f"feat(x): step {i}", f"2026-06-0{i}T10:00:00Z")
+                    for i in (1, 2, 3)]
+            m = shas[-1]
+            with mock.patch.object(gir, "PR_COMMITS_API_CAP", 3), \
+                 self.assertLogs(gir.LOG, level="WARNING"):
+                self.assertEqual(gir.compute_rev_range(d, m, _api_commits(d, shas)), f"{m}~1..{m}")
+            self.assertEqual(gir.compute_rev_range(d, m, _api_commits(d, shas)), f"{m}~3..{m}")
+
+UTC = datetime.timezone.utc
+
+def _row(n, merged_at, updated_at=None, sha=None):
+    """A merged PR as the pulls API lists it."""
+    return {"number": n, "title": f"fix(x): pr {n}", "body": "", "merge_commit_sha": sha or f"m{n}",
+            "base": {"sha": "b"}, "user": {"login": "u"}, "merged_at": merged_at,
+            "updated_at": updated_at or merged_at}
+
 class DiscoverTests(unittest.TestCase):
     def test_filters_to_merged_within_window(self):
         now = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=datetime.timezone.utc)
@@ -53,57 +154,102 @@ class DiscoverTests(unittest.TestCase):
              "user":{"login":"u"},"merged_at":None},                          # not merged
         ]
         with mock.patch.object(gir, "_gh_json", return_value=rows):
-            prs = gir.discover_merged_prs("epigraph-io/epigraph", {}, window_minutes=60, now=now)
+            prs = gir.discover_merged_prs("epigraph-io/epigraph", {}, now - datetime.timedelta(minutes=60))
         self.assertEqual([p.number for p in prs], [1])
         self.assertEqual(prs[0].merge_sha, "aaa")
         self.assertEqual(prs[0].base_sha, "bbb")
         self.assertEqual(prs[0].author, "u")
 
-    def test_paginated_slurp_pages_parse_through_real_gh_json(self):
-        # Regression for the --paginate + json.loads defect: gh --paginate WITHOUT
-        # --slurp emits one JSON array per page, concatenated ("[...]\n[...]"), which
-        # a single json.loads cannot parse. --slurp wraps all pages in ONE outer
-        # array. This test mocks subprocess.run (NOT _gh_json), so the real parse
-        # path runs against the two-page slurp shape; the older DiscoverTests mocked
-        # _gh_json and never exercised it.
-        now = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=datetime.timezone.utc)
-        page1 = [
-            {"number": 1, "title": "feat: x", "body": "b", "merge_commit_sha": "aaa",
-             "base": {"sha": "bbb"}, "user": {"login": "u"},
-             "merged_at": "2026-06-03T11:30:00Z"},               # in window
-            {"number": 2, "title": "old", "body": "", "merge_commit_sha": "ccc",
-             "base": {"sha": "ddd"}, "user": {"login": "u"},
-             "merged_at": "2026-06-01T00:00:00Z"},                # too old
+    def _paged(self, pages):
+        """A `subprocess.run` that answers `gh api .../pulls ... page=N` with
+        `pages[N-1]` through the real `_gh_json` parse, and fails the test if
+        a page past the given ones is requested."""
+        def run(argv, **kw):
+            page = int(next(a for a in argv if a.startswith("page=")).split("=", 1)[1])
+            self.assertLessEqual(page, len(pages), f"page {page} fetched")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(pages[page - 1]), "")
+        return mock.patch.object(gir.subprocess, "run", side_effect=run)
+
+    def test_paging_stops_once_a_page_ends_before_the_cutoff(self):
+        # Backlog 39dfef78: `--paginate` walked every closed PR the repo ever
+        # had on every run. The listing is ordered by updated_at, newest first,
+        # and a PR's updated_at is never before its merged_at, so once a page
+        # ends before the cutoff, no later page holds a PR merged after it.
+        cutoff = datetime.datetime(2026, 6, 3, 11, 0, tzinfo=UTC)
+        unmerged = {**_row(3, None, "2026-06-03T11:55:00Z"), "merge_commit_sha": None}
+        pages = [
+            [unmerged, _row(1, "2026-06-03T11:50:00Z")],
+            [_row(4, "2026-06-03T11:20:00Z"), _row(2, "2026-06-01T00:00:00Z")],
+            [_row(9, "2026-05-01T00:00:00Z")],  # must not be fetched
         ]
-        page2 = [
-            {"number": 4, "title": "feat: y", "body": "", "merge_commit_sha": "eee",
-             "base": {"sha": "fff"}, "user": {"login": "v"},
-             "merged_at": "2026-06-03T11:45:00Z"},               # in window (page 2)
-            {"number": 3, "title": "open", "body": "", "merge_commit_sha": None,
-             "base": {"sha": "e"}, "user": {"login": "u"}, "merged_at": None},  # not merged
-        ]
-        # --slurp output is one outer array of pages, each page a JSON array.
-        slurp_stdout = json.dumps([page1, page2])
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=slurp_stdout, stderr="")
-        with mock.patch.object(gir.subprocess, "run", return_value=completed) as run:
-            prs = gir.discover_merged_prs("epigraph-io/epigraph", {}, window_minutes=60, now=now)
-        # Both pages' in-window merged PRs survive (1 from page1, 4 from page2); the
-        # too-old #2 and unmerged #3 are dropped. Proves cross-page flattening works.
+        with mock.patch.object(gir, "PULLS_PER_PAGE", 2), self._paged(pages[:2]) as run:
+            prs = gir.discover_merged_prs("o/r", {}, cutoff)
         self.assertEqual(sorted(p.number for p in prs), [1, 4])
-        # The call MUST request --slurp (alongside --paginate); without it the real
-        # gh would emit concatenated arrays and json.loads would raise. This pins
-        # the fix so a future drop of --slurp fails the suite.
-        called_args = run.call_args.args[0]
-        self.assertIn("--paginate", called_args)
-        self.assertIn("--slurp", called_args)
+        # Pages 1 and 2, then the re-read of page 1 a multi-page scan needs
+        # (see test_a_pr_updated_mid_scan_is_not_lost); it ends there because
+        # page 1's last row is older than page 1's newest.
+        pages_read = [next(a for a in c.args[0] if a.startswith("page=")) for c in run.call_args_list]
+        self.assertEqual(pages_read, ["page=1", "page=2", "page=1"])
+        self.assertNotIn("--paginate", run.call_args.args[0])
+
+    def test_a_pr_updated_mid_scan_is_not_lost(self):
+        # Review of 39dfef78: the listing moves while it is paged. PR 5 sits
+        # on page 3; a comment after page 1 was read lifts it to page 1, so
+        # the pages read after that never hold it. The next run's cutoff is
+        # this run's start minus the window, past PR 5's merge, so a scan that
+        # misses it loses it.
+        cutoff = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=UTC)
+        listing = [_row(n, f"2026-06-03T{23 - n:02d}:00:00Z") for n in range(7)]  # 0 newest
+        served = []
+        def gh(args, env):
+            page = int(next(a for a in args if a.startswith("page=")).split("=", 1)[1])
+            served.append(page)
+            if len(served) == 2:  # PR 5 is commented on after page 1 is read
+                pr5 = next(r for r in listing if r["number"] == 5)
+                listing.remove(pr5)
+                listing.insert(0, {**pr5, "updated_at": "2026-06-04T00:00:00Z"})
+            return [dict(r) for r in listing[(page - 1) * 2:page * 2]]
+        with mock.patch.object(gir, "PULLS_PER_PAGE", 2), \
+             mock.patch.object(gir, "_gh_json", side_effect=gh):
+            prs = gir.discover_merged_prs("o/r", {}, cutoff)
+        numbers = [p.number for p in prs]
+        self.assertEqual(sorted(numbers), list(range(7)))  # each PR exactly once
+
+    def test_an_old_pr_updated_recently_does_not_stop_paging(self):
+        # A comment on a PR merged last month moves it to the top of the
+        # listing; its merged_at is no reason to stop, its updated_at is.
+        cutoff = datetime.datetime(2026, 6, 3, 11, 0, tzinfo=UTC)
+        pages = [
+            [{**_row(7, "2026-06-03T11:58:00Z"), "merge_commit_sha": None, "merged_at": None},
+             _row(2, "2026-05-01T00:00:00Z", "2026-06-03T11:55:00Z")],
+            [_row(4, "2026-06-03T11:20:00Z"), _row(1, "2026-05-02T00:00:00Z")],
+        ]
+        with mock.patch.object(gir, "PULLS_PER_PAGE", 2), self._paged(pages):
+            prs = gir.discover_merged_prs("o/r", {}, cutoff)
+        self.assertEqual([p.number for p in prs], [4])
+
+    def test_a_short_page_is_the_last(self):
+        cutoff = datetime.datetime(2026, 6, 3, 11, 0, tzinfo=UTC)
+        with mock.patch.object(gir, "PULLS_PER_PAGE", 2), \
+             self._paged([[_row(1, "2026-06-03T11:50:00Z")]]) as run:
+            self.assertEqual([p.number for p in gir.discover_merged_prs("o/r", {}, cutoff)], [1])
+        self.assertEqual(run.call_count, 1)
 
     def test_concatenated_pages_without_slurp_would_crash(self):
-        # Documents WHY --slurp is required: the pre-fix shape (concatenated
-        # per-page arrays, no outer wrapper) is what plain --paginate emits, and a
-        # single json.loads raises JSONDecodeError ("Extra data") on it.
+        # Why `fetch_pr_commits` keeps --slurp with --paginate: plain --paginate
+        # emits one JSON array per page, concatenated, and a single json.loads
+        # raises JSONDecodeError ("Extra data") on it.
         concatenated = '[{"number": 1}]\n[{"number": 2}]\n'
         with self.assertRaises(json.JSONDecodeError):
             json.loads(concatenated)
+
+    def test_slurped_pages_flatten_through_real_gh_json(self):
+        pages = [[{"sha": "a"}], [{"sha": "b"}]]
+        done = subprocess.CompletedProcess([], 0, json.dumps(pages), "")
+        with mock.patch.object(gir.subprocess, "run", return_value=done) as run:
+            rows = gir.fetch_pr_commits("o/r", 9, {})
+        self.assertEqual([r["sha"] for r in rows], ["a", "b"])
+        self.assertIn("--slurp", run.call_args.args[0])
 
 class MirrorTests(unittest.TestCase):
     def test_clone_then_fetch(self):
@@ -142,9 +288,162 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(val("--endpoint"), "http://127.0.0.1:8080")
         self.assertIn("--dry-run", argv)
 
+class FakeGitHub:
+    """Answers `_gh_json` like GitHub: the closed-PR listing (most recently
+    updated first, one page) and single PRs by number."""
+    def __init__(self, rows):
+        self.rows = rows; self.calls = []
+    def __call__(self, args, env):
+        self.calls.append(args)
+        path = args[0]
+        if path.endswith("/pulls"):
+            if any(a.startswith("page=") and a != "page=1" for a in args):
+                return []
+            return sorted(self.rows, key=lambda r: r["updated_at"], reverse=True)
+        number = int(path.rsplit("/", 1)[1])
+        for r in self.rows:
+            if r["number"] == number:
+                return r
+        raise subprocess.CalledProcessError(1, ["gh", "api", path], stderr="HTTP 404")
+
+class StateTests(unittest.TestCase):
+    """Backlog 39dfef78: the reconciler kept no state, so a PR merged while it
+    was down for longer than the window, or one whose ingest failed, was never
+    ingested. It now keeps a per-repo cursor and a retry list."""
+    T0 = datetime.datetime(2026, 6, 3, 12, 0, tzinfo=UTC)
+
+    def setUp(self):
+        st = tempfile.TemporaryDirectory(); self.addCleanup(st.cleanup)
+        self.cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir=st.name,
+                              window_minutes=60, author_key_file="/k")
+
+    def _run(self, gh, at, results=None, dry_run=False):
+        """One reconciler run at `at`; `results` maps a PR number to its
+        ingest outcome (an int return code, or an exception to raise),
+        default 0. Returns ((ok, fail), [PR numbers attempted])."""
+        attempted = []
+        def ingest(pr, *a, **k):
+            attempted.append(pr.number)
+            res = (results or {}).get(pr.number, 0)
+            if isinstance(res, Exception):
+                raise res
+            return res
+        with mock.patch.object(gir, "ensure_mirror", return_value="/m"), \
+             mock.patch.object(gir, "_gh_json", side_effect=gh), \
+             mock.patch.object(gir, "ingest_pr", side_effect=ingest):
+            return gir.run_once(self.cfg, dry_run=dry_run, now=at), attempted
+
+    def test_a_gap_longer_than_the_window_is_caught_up(self):
+        h = datetime.timedelta(hours=1)
+        gh = FakeGitHub([])
+        self.assertEqual(self._run(gh, self.T0), ((0, 0), []))
+        # Down for 10 h; the PR merged 9 h before the next run, far outside
+        # its 60-minute window.
+        gh.rows = [_row(5, "2026-06-03T13:00:00Z")]
+        self.assertEqual(self._run(gh, self.T0 + 10 * h), ((1, 0), [5]))
+
+    def test_the_first_run_scans_only_the_window(self):
+        gh = FakeGitHub([_row(5, "2026-06-03T09:00:00Z"), _row(6, "2026-06-03T11:30:00Z")])
+        self.assertEqual(self._run(gh, self.T0), ((1, 0), [6]))
+
+    def test_a_failed_pr_is_retried_until_it_is_ingested(self):
+        h = datetime.timedelta(hours=1)
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        # Run 1: the ingest raises (e.g. the range could not be computed).
+        self.assertEqual(self._run(gh, self.T0, {5: RuntimeError("git rev-list failed")}),
+                         ((0, 1), [5]))
+        # Run 2, 3 h later: still inside the cursor's overlap; ingest_git exits 1.
+        self.assertEqual(self._run(gh, self.T0 + 3 * h, {5: 1}), ((0, 1), [5]))
+        # Run 3, 6 h later: the PR is outside the scan (cutoff = run 2 - 60
+        # min), so only the retry list brings it back, and it now succeeds.
+        self.assertEqual(self._run(gh, self.T0 + 6 * h), ((1, 0), [5]))
+        st = gir.load_state(self.cfg.state_dir, "o/r")
+        self.assertEqual(st.retry, {})
+        # Run 4: ingested, so neither scanned nor retried again.
+        self.assertEqual(self._run(gh, self.T0 + 9 * h), ((0, 0), []))
+
+    def test_a_retried_pr_counts_its_attempts_and_keeps_the_run_failing(self):
+        h = datetime.timedelta(hours=1)
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        for i in range(3):
+            self.assertEqual(self._run(gh, self.T0 + 5 * i * h, {5: 1}), ((0, 1), [5]))
+        self.assertEqual(gir.load_state(self.cfg.state_dir, "o/r").retry[5]["attempts"], 3)
+
+    def test_a_repo_whose_discovery_fails_keeps_its_cursor(self):
+        h = datetime.timedelta(hours=1)
+        gh = FakeGitHub([])
+        self._run(gh, self.T0)
+        def down(args, env): raise subprocess.CalledProcessError(1, ["gh"])
+        self.assertEqual(self._run(down, self.T0 + 5 * h), ((0, 1), []))
+        gh.rows = [_row(5, "2026-06-03T13:00:00Z")]  # merged during the outage
+        self.assertEqual(self._run(gh, self.T0 + 10 * h), ((1, 0), [5]))
+
+    def test_a_dry_run_writes_no_state(self):
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        self.assertEqual(self._run(gh, self.T0, {5: 1}, dry_run=True), ((0, 1), [5]))
+        self.assertEqual(list(Path(self.cfg.state_dir).iterdir()), [])
+
+    def test_an_unreadable_state_file_fails_the_repo_instead_of_rescanning(self):
+        # Silently starting over would drop the retry list.
+        Path(self.cfg.state_dir, "o__r.state.json").write_text("{not json")
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        self.assertEqual(self._run(gh, self.T0), ((0, 1), []))
+
+    def test_a_failed_pr_backs_off_before_its_next_attempt(self):
+        # Review of 39dfef78: without a backoff, a PR that keeps failing (an
+        # API that refuses its PR node, a merge commit missing from the
+        # mirror) was re-ingested on every 15-minute run and failed each one.
+        m = datetime.timedelta(minutes=1)
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        self.assertEqual(self._run(gh, self.T0, {5: 1}), ((0, 1), [5]))
+        # 10 min later: inside the first 15-minute backoff, though still in
+        # the scan; neither attempted nor counted as a failure.
+        with self.assertLogs(gir.LOG, level="WARNING") as logs:
+            self.assertEqual(self._run(gh, self.T0 + 10 * m, {5: 1}), ((0, 0), []))
+        self.assertIn("#5", "\n".join(logs.output))
+        self.assertEqual(self._run(gh, self.T0 + 20 * m, {5: 1}), ((0, 1), [5]))
+        # The second failure doubles the wait to 30 min.
+        self.assertEqual(self._run(gh, self.T0 + 45 * m), ((0, 0), []))
+        self.assertEqual(self._run(gh, self.T0 + 50 * m), ((1, 0), [5]))
+
+    def test_a_retry_list_pr_backing_off_is_not_fetched(self):
+        h = datetime.timedelta(hours=1)
+        gir.save_state(self.cfg.state_dir, "o/r", gir.RepoState(
+            cursor=self.T0.isoformat(),
+            retry={5: {"attempts": 9, "last_failed_at": (self.T0 + 2 * h).isoformat()}}))
+        gh = FakeGitHub([_row(5, "2026-06-01T00:00:00Z")])  # outside the scan
+        self.assertEqual(self._run(gh, self.T0 + 3 * h), ((0, 0), []))
+        self.assertFalse([c for c in gh.calls if c[0].endswith("/pulls/5")])
+        # The backoff is capped at a day.
+        self.assertEqual(self._run(gh, self.T0 + 27 * h), ((1, 0), [5]))
+
+    def test_a_cursor_in_the_future_is_clamped_to_now(self):
+        # A clock set back (or a hand-edited state file) must not push the
+        # cutoff past PRs merged in the last window.
+        gir.save_state(self.cfg.state_dir, "o/r",
+                       gir.RepoState(cursor=(self.T0 + datetime.timedelta(days=1)).isoformat()))
+        gh = FakeGitHub([_row(6, "2026-06-03T11:30:00Z")])
+        self.assertEqual(self._run(gh, self.T0), ((1, 0), [6]))
+
+    def test_a_retry_list_pr_that_is_not_merged_is_dropped(self):
+        gir.save_state(self.cfg.state_dir, "o/r", gir.RepoState(
+            cursor=self.T0.isoformat(), retry={7: {"attempts": 1, "last_failed_at": "2026-06-01T00:00:00Z"}}))
+        unmerged = {**_row(7, None, "2026-06-01T00:00:00Z"), "merge_commit_sha": None}
+        with self.assertLogs(gir.LOG, level="WARNING"):
+            self.assertEqual(self._run(FakeGitHub([unmerged]), self.T0), ((0, 0), []))
+        self.assertEqual(gir.load_state(self.cfg.state_dir, "o/r").retry, {})
+
+    def test_a_state_file_that_cannot_be_saved_fails_the_run(self):
+        # The PRs were ingested, but the cursor and the retry list were not
+        # kept: the run must not report success.
+        gh = FakeGitHub([_row(5, "2026-06-03T11:50:00Z")])
+        with mock.patch.object(gir, "save_state", side_effect=OSError(28, "No space left on device")):
+            self.assertEqual(self._run(gh, self.T0), ((1, 1), [5]))
+
 class MainLoopTests(unittest.TestCase):
     def test_runs_all_prs_and_isolates_failures(self):
-        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
+        st = tempfile.TemporaryDirectory(); self.addCleanup(st.cleanup)
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir=st.name,
                          default_orchestrator_id=None, author_key_file="/k")
         prs = [gir.PullRequest(1,"a","",f"s1","b","u","2026-06-03T11:59:00Z"),
                gir.PullRequest(2,"b","",f"s2","b","u","2026-06-03T11:59:00Z")]
@@ -163,6 +462,8 @@ KEYF = "/s/author.key"
 class ChildEnvTests(unittest.TestCase):
     """Backlog 7d9e60c6 (1) and (2): what run_once hands each ingest_git child."""
     def _run(self, cfg, environ, dry_run=False):
+        st = tempfile.TemporaryDirectory(); self.addCleanup(st.cleanup)
+        cfg = dataclasses.replace(cfg, state_dir=st.name)  # no retry list leaks in
         pr = gir.PullRequest(7, "fix(x): y", "body", "s7", "b", "u", "2026-06-03T11:59:00Z")
         seen = []
         def fake_run(argv, **kw):

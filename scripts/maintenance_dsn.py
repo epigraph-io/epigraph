@@ -70,10 +70,34 @@ def require_same_database(dsn_a, name_a, dsn_b, name_b):
         )
 
 
-def maintenance_dsn(default=None):
+class NoDatabaseConfigured(RuntimeError):
+    """Neither `MAINTENANCE_DATABASE_URL` nor `DATABASE_URL` is set.
+
+    A RuntimeError, like the database-mismatch refusal, so a caller that
+    handles one handles both.
+    """
+
+
+NO_DSN_MESSAGE = (
+    "no database configured: set MAINTENANCE_DATABASE_URL (preferred) or "
+    "DATABASE_URL, or pass --database-url. There is no built-in default: a "
+    "default DSN is a live database a run with a forgotten environment file "
+    "would silently read from and write to."
+)
+
+
+def maintenance_dsn():
     """Resolve the DSN a corpus-wide script should connect on.
 
-    `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`, then `default`.
+    `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`. With neither set this
+    RAISES; there is no fallback DSN and no parameter to supply one (backlog
+    62bdae04). These scripts used to fall back to a hard-coded DSN naming the
+    live database under a privileged role, so a run on a host whose environment
+    file was missing went to that database instead of failing. A caller that
+    takes `--database-url` resolves AFTER parsing, never in the argparse
+    default (which runs before the command line is read):
+
+        args.database_url = args.database_url or maintenance_dsn()
 
     THE DATABASE-NAME GUARD IS THE REASON THIS IS A FUNCTION. Giving
     `MAINTENANCE_DATABASE_URL` precedence is a footgun on its own: an operator
@@ -97,12 +121,15 @@ def maintenance_dsn(default=None):
     drift from it. The refusal that matters is at the API and CLI boundary.
 
     Raises:
+        NoDatabaseConfigured: when neither variable is set.
         RuntimeError: when both variables are set and name different databases.
     """
     maintenance = os.environ.get("MAINTENANCE_DATABASE_URL")
     application = os.environ.get("DATABASE_URL")
     if not maintenance:
-        return application if application else default
+        if application:
+            return application
+        raise NoDatabaseConfigured(NO_DSN_MESSAGE)
 
     require_same_database(
         maintenance, "MAINTENANCE_DATABASE_URL", application, "DATABASE_URL"

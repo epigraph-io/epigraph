@@ -4,6 +4,37 @@ Operational scripts for the live EpiGraph deployment. Not part of the
 build; invoked manually or by maintenance tasks (see `epiclaw-host`'s
 `schedules.toml`).
 
+## Dependencies and database
+
+There is no `scripts/requirements.txt`. The Python packages these scripts
+import (psycopg2, numpy, scikit-learn, umap-learn, requests, ...) are pinned,
+with hashes, in `tests/requirements-ci.txt`, the file the CI `python` job
+installs and tests them against (edit `tests/requirements-ci.in` and recompile;
+its header says how). Install it into a virtual environment on the host that
+runs them:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install --require-hashes --only-binary :all: -r tests/requirements-ci.txt
+```
+
+A script that opens a database connection has no built-in DSN: it connects on
+`--database-url`, else `MAINTENANCE_DATABASE_URL`, else `DATABASE_URL`, and
+refuses to start with none of them (`scripts/maintenance_dsn.py`). Three
+scripts differ:
+
+- `subcluster_outliers.py` is read-only and deliberately stays off the
+  maintenance login: `--database-url` or `DATABASE_URL` only. Give it a
+  read-only login; nothing enforces that.
+- `lib/tiered_enrichment.py --claim-id` takes `--database-url` only (not from
+  the environment), so a privileged `DATABASE_URL` exported for another job is
+  never used for it.
+- `run_assessment_worker.py` has no `--database-url`: it reads on
+  `DATABASE_URL` and writes on `MAINTENANCE_DATABASE_URL`, else
+  `DATABASE_ADMIN_URL`, and exits at startup unless both sides are set. Which jobs to schedule, and with what
+role and cadence, is in `docs/deploy.md`, "Step 10 — Schedule the maintenance
+jobs" (the theme pipeline is there too).
+
 ## audit_claims_content_hash_agent.py
 
 Audits the drifted `uq_claims_content_hash_agent` constraint (migration 013)
@@ -148,7 +179,13 @@ across configured repos (read-only GitHub access via the `gh` CLI) and
 runs `ingest_git --pr-ingest` against the localhost EpiGraph API for
 each — continuous, cross-repo, idempotent commit ingestion with no
 external CI and no write-token spray. Stdlib-only; idempotent (Plan
-2.5) and stateless, so it is safe to run repeatedly on a cron.
+2.5), so it is safe to run repeatedly on a cron. Per repo it keeps a
+cursor and a retry list in `<state_dir>/<owner>__<repo>.state.json`: a run
+scans the PRs merged since `cursor - window_minutes` and re-tries every
+PR whose ingest failed (after a backoff of 15 minutes, doubling per failure,
+at most a day), so neither an outage longer than the window nor a failed
+ingest loses a PR. A rebase-merged PR is ingested commit by commit
+(its range is matched against the PR commits API).
 
 **Auth:** set `EPIGRAPH_GIT_INGEST_GITHUB_PAT` to a *read-only* PAT
 (injected as `GH_TOKEN` for the `gh` subprocesses), or leave it unset to

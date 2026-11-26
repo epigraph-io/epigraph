@@ -405,10 +405,10 @@ impl EventRepository {
     /// logging via `tracing::warn!`).
     ///
     /// This is the canonical sink for the MCP `list_events` surface and
-    /// must be used wherever durable event observability is required.
-    /// In-memory pushes to `EventStore::push` are NOT visible to MCP and
-    /// should be paired with — or replaced by — a call to this method
-    /// when MCP visibility is needed.
+    /// for HTTP `GET /api/v1/events`, and must be used wherever durable event
+    /// observability is required. A db build has no other event log: the
+    /// in-memory `EventStore` the REST handlers used to push to was never
+    /// persisted and is compiled only without a database (backlog 8fcc36a0).
     pub async fn publish_or_log(
         pool: &PgPool,
         event_type: &str,

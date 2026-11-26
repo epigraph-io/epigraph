@@ -16,7 +16,11 @@
 //!
 //! * `epigraph-db/src/repos/claim_visibility.rs`, which defines them;
 //! * `epigraph-engine/src/visibility_act.rs`, the one sanctioned caller;
-//! * `epigraph-db/tests/`, whose tests drive the definers directly.
+//! * `epigraph-db/tests/`, whose tests drive the definers directly;
+//! * the exact lines in [`REGISTER_DATA`], which name a function as register
+//!   DATA (the callee string a viewer-call scanner measured in the sanctioned
+//!   caller), not as a call. Only those lines of that file: a call anywhere in
+//!   the same file is still reported.
 //!
 //! It also fails when a non-test source outside the defining file calls either
 //! definer in SQL (`epigraph_publicize_claims($…` /
@@ -48,6 +52,26 @@ const ALLOWED: &[&str] = &[
 
 /// A directory prefix whose files may name the functions and the SQL.
 const ALLOWED_TEST_DIR: &str = "crates/epigraph-db/tests/";
+
+/// `(file, trimmed line)` pairs that name one of [`FUNCTIONS`] as register
+/// data, not as a call. Matched on the WHOLE trimmed line, so a call, or the
+/// same text with anything added, on any other line of the file is still
+/// reported. Each entry must still be in the tree (see
+/// `every_register_data_line_is_still_in_the_tree`).
+///
+/// The engine's viewer-call register (backlog 37e68f5b) records, for
+/// `visibility_act.rs::{publicize_claims, share_claims_with_team}`, the one
+/// callee its scanner measures in each: the sanctioned raw widening act.
+const REGISTER_DATA: &[(&str, &str)] = &[
+    (
+        "crates/epigraph-engine/tests/viewer_calls_register.rs",
+        "&[\"ClaimRepository::publicize_conn\"],",
+    ),
+    (
+        "crates/epigraph-engine/tests/viewer_calls_register.rs",
+        "&[\"ClaimRepository::share_with_team_conn\"],",
+    ),
+];
 
 /// The sanctioned caller, and how many call sites of each function it has.
 const CALLER: &str = "crates/epigraph-engine/src/visibility_act.rs";
@@ -132,7 +156,10 @@ fn violations(files: &BTreeMap<String, String>) -> Vec<String> {
         let allowed = ALLOWED.contains(&rel.as_str()) || rel.starts_with(ALLOWED_TEST_DIR);
         let is_test = rel.starts_with("tests/") || rel.contains("/tests/");
         for (n, line) in code_lines(src) {
-            if !allowed && FUNCTIONS.iter().any(|f| names_ident(line, f)) {
+            let data = REGISTER_DATA
+                .iter()
+                .any(|(f, l)| *f == rel.as_str() && *l == line.trim());
+            if !allowed && !data && FUNCTIONS.iter().any(|f| names_ident(line, f)) {
                 out.push(format!("{rel}:{n}: {}", line.trim()));
             }
             let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
@@ -246,4 +273,55 @@ fn the_detector_reports_a_direct_call() {
                 .to_string(),
         ]
     );
+}
+
+/// The register-data exemption admits only its exact lines of its file: a
+/// call in the same file, a longer line naming the same callee, and the same
+/// line in another file are all still reported.
+#[test]
+fn the_register_data_exemption_admits_only_its_exact_lines() {
+    let mut files = BTreeMap::new();
+    files.insert(
+        "crates/epigraph-engine/tests/viewer_calls_register.rs".to_string(),
+        "        &[\"ClaimRepository::publicize_conn\"],\n\
+         &[\"ClaimRepository::share_with_team_conn\"],\n\
+         let o = ClaimRepository::publicize_conn(&mut tx, &ids, r).await?;\n\
+         &[\"ClaimRepository::share_with_team_conn\", \"sqlx::query(X).execute\"],\n"
+            .to_string(),
+    );
+    files.insert(
+        "crates/epigraph-mcp/tests/viewer_calls_register.rs".to_string(),
+        "&[\"ClaimRepository::publicize_conn\"],\n".to_string(),
+    );
+    let found = violations(&files);
+    assert_eq!(
+        found,
+        vec![
+            "crates/epigraph-engine/tests/viewer_calls_register.rs:3: let o = \
+             ClaimRepository::publicize_conn(&mut tx, &ids, r).await?;"
+                .to_string(),
+            "crates/epigraph-engine/tests/viewer_calls_register.rs:4: \
+             &[\"ClaimRepository::share_with_team_conn\", \"sqlx::query(X).execute\"],"
+                .to_string(),
+            "crates/epigraph-mcp/tests/viewer_calls_register.rs:1: \
+             &[\"ClaimRepository::publicize_conn\"],"
+                .to_string(),
+        ]
+    );
+}
+
+/// Every [`REGISTER_DATA`] line is still in its file, so a stale exemption
+/// cannot linger after the register changes.
+#[test]
+fn every_register_data_line_is_still_in_the_tree() {
+    let files = sources();
+    for (file, line) in REGISTER_DATA {
+        let src = files
+            .get(*file)
+            .unwrap_or_else(|| panic!("{file} not found: remove its REGISTER_DATA entries"));
+        assert!(
+            src.lines().any(|l| l.trim() == *line),
+            "{file} no longer has the line {line}: remove the stale REGISTER_DATA entry"
+        );
+    }
 }

@@ -1,8 +1,8 @@
 #![cfg(feature = "db")]
 //! K12d (supersede SPEC §11 phase 1, SF-26): the `claim.superseded` event
 //! (payload `superseded_claim_id`, `superseded_by_claim_id`) is emitted by the
-//! REST supersession act, `POST /api/v1/claims/:id/supersede`, after its
-//! commit, and by nothing else.
+//! REST supersession act, `POST /api/v1/claims/:id/supersede`, on the act's
+//! own transaction, and by nothing else.
 //!
 //! Its only emitter was the generic `POST /api/v1/edges` route, on a
 //! `supersedes` edge, which K12a removed with that relationship (ruling R-132).
@@ -10,8 +10,9 @@
 //! supersession left no `claim.superseded` behind. MCP acts never emitted it
 //! and gain no emitter here.
 //!
-//! The event store is a process-wide singleton, so each assertion filters by
-//! this test's own claim ids.
+//! The event is read from the persisted `events` table (backlog 8fcc36a0: it
+//! used to be pushed to an in-process store that nothing persisted), filtered
+//! by this test's own claim ids.
 
 mod viewer_fixture;
 
@@ -21,7 +22,6 @@ use axum::Json;
 use epigraph_api::middleware::bearer::AuthContext;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::middleware::ClientType;
-use epigraph_api::routes::events::{EventFilter, GraphEvent};
 use epigraph_api::routes::versioning::{supersede_claim, SupersedeRequest};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::visibility::Viewer;
@@ -84,25 +84,22 @@ async fn supersede_as(
     .map(|(_, Json(resp))| resp.new_claim_id)
 }
 
-/// Every `claim.superseded` event naming `old` as the superseded claim.
-async fn superseded_events_for(old: Uuid) -> Vec<GraphEvent> {
-    let filter = EventFilter {
-        event_type: Some("claim.superseded".to_string()),
-        since: None,
-        after_id: None,
-        limit: Some(100_000),
-        offset: None,
-    };
-    epigraph_api::_test_event_store()
-        .list(&filter)
-        .await
-        .0
-        .into_iter()
-        .filter(|e| e.payload["superseded_claim_id"] == serde_json::json!(old))
-        .collect()
+/// Every PERSISTED `claim.superseded` event naming `old` as the superseded
+/// claim: `(actor_id, payload)`.
+async fn superseded_events_for(pool: &PgPool, old: Uuid) -> Vec<(Option<Uuid>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT actor_id, payload FROM events \
+          WHERE event_type = 'claim.superseded' \
+            AND payload->>'superseded_claim_id' = $1 \
+          ORDER BY graph_version",
+    )
+    .bind(old.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("read persisted claim.superseded events")
 }
 
-/// A REST supersession pushes exactly one `claim.superseded` naming the
+/// A REST supersession persists exactly one `claim.superseded` naming the
 /// retired and the new claim, attributed to the acting agent.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_rest_supersession_emits_one_claim_superseded(pool: PgPool) {
@@ -114,28 +111,22 @@ async fn a_rest_supersession_emits_one_claim_superseded(pool: PgPool) {
         .await
         .unwrap_or_else(|e| panic!("the author supersedes its own claim: {e:?}"));
 
-    let events = superseded_events_for(old).await;
+    let events = superseded_events_for(&pool, old).await;
     assert_eq!(events.len(), 1, "exactly one claim.superseded: {events:?}");
     assert_eq!(
-        events[0].payload,
+        events[0].1,
         serde_json::json!({"superseded_claim_id": old, "superseded_by_claim_id": new}),
         "the payload keys the generic route used"
     );
-    assert_eq!(
-        events[0].actor_id,
-        Some(h),
-        "attributed to the acting agent"
-    );
+    assert_eq!(events[0].0, Some(h), "attributed to the acting agent");
 }
 
-/// A refused supersession pushes none: neither a caller the per-claim rule
+/// A refused supersession persists none: neither a caller the per-claim rule
 /// refuses (a bystander), nor one row security refuses inside the act (a
-/// `claims:admin` caller whose stamp does not write the claim's group), so
-/// the push sits after the act on the success path. Neither refusal happens
-/// after a successful act: no failure between the act and the commit is
-/// reachable at head without fault injection, so the push's placement after
-/// `tx.commit()` (rather than between the act and the commit) is guarded by
-/// its code position, not by this test.
+/// `claims:admin` caller whose stamp does not write the claim's group). The
+/// event is written on the act's transaction after the act succeeded, so a
+/// refused act rolls back before it, and any later failure before the commit
+/// rolls it back with the act.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_refused_supersession_emits_no_claim_superseded(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -170,7 +161,7 @@ async fn a_refused_supersession_emits_no_claim_superseded(pool: PgPool) {
         .expect("is_current");
     assert!(current, "calibration: nothing was superseded");
     assert!(
-        superseded_events_for(old).await.is_empty(),
+        superseded_events_for(&pool, old).await.is_empty(),
         "a refused supersession emits nothing"
     );
 
@@ -178,5 +169,5 @@ async fn a_refused_supersession_emits_no_claim_superseded(pool: PgPool) {
     supersede_as(&pool, &state, h, &["claims:write"], old)
         .await
         .unwrap_or_else(|e| panic!("CONTROL: the owner supersedes: {e:?}"));
-    assert_eq!(superseded_events_for(old).await.len(), 1);
+    assert_eq!(superseded_events_for(&pool, old).await.len(), 1);
 }

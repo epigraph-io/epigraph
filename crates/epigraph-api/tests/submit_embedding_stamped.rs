@@ -256,6 +256,9 @@ fn no_store_refusal(lines: &[&str]) -> Result<(), String> {
 #[traced_test]
 async fn packet_by_an_allowlisted_service_client_embeds_claim_and_figure(pool: PgPool) {
     let (state, bearer, l, h_group) = allowlisted_writer(&pool).await;
+    // A figure is publisher content: since migration 349 the database stores
+    // one only for a paper whose recorded licence permits retention.
+    seed_paper(&pool, "10.1000/test-figure", Some("CC-BY-4.0")).await;
 
     let content = format!("allowlisted packet embedding {}", Uuid::new_v4());
     let figure = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk";
@@ -320,6 +323,70 @@ async fn packet_by_an_allowlisted_service_client_embeds_claim_and_figure(pool: P
         orchestrator.dag().node_count(),
         0,
         "a submitted packet must not be retained in the in-memory propagation DAG"
+    );
+}
+
+/// A public `papers` row for `doi` carrying `licence`, written on the
+/// superuser pool (standing in for the operator's licence definer, 255).
+async fn seed_paper(pool: &PgPool, doi: &str, licence: Option<&str>) {
+    sqlx::query(
+        "INSERT INTO papers (doi, title, licence, visibility, owner_group_id) \
+         VALUES ($1, 'Figure fixture paper', $2, 'public', \
+                 '00000000-0000-0000-0000-000000000000')",
+    )
+    .bind(doi)
+    .bind(licence)
+    .execute(pool)
+    .await
+    .expect("seed paper");
+}
+
+/// Migration 349 (backlog b62ae3f2): a figure (image and caption) for a paper
+/// with no permitting licence is refused by the database whatever the client
+/// sends, and the route answers it as the client's error, not a 500.
+#[sqlx::test(migrations = "../../migrations")]
+async fn packet_with_a_figure_of_an_unlicensed_paper_is_refused_as_a_client_error(pool: PgPool) {
+    let (state, bearer, l, _h_group) = allowlisted_writer(&pool).await;
+    seed_paper(&pool, "10.1000/unlicensed-figure", None).await;
+
+    let content = format!("unlicensed figure packet {}", Uuid::new_v4());
+    let figure = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk";
+    let figure_hash = epigraph_crypto::ContentHasher::to_hex(
+        &epigraph_crypto::ContentHasher::hash(figure.as_bytes()),
+    );
+    let packet = serde_json::json!({
+        "claim": { "content": content, "initial_truth": 0.7, "agent_id": l },
+        "evidence": [{
+            "content_hash": figure_hash,
+            "evidence_type": {
+                "type": "figure",
+                "doi": "10.1000/unlicensed-figure",
+                "figure_id": "Figure 1",
+                "caption": "a publisher's figure caption",
+                "mime_type": "image/png",
+                "page": 1
+            },
+            "raw_content": figure,
+            "signature": null
+        }],
+        "reasoning_trace": {
+            "methodology": "visual_inspection",
+            "inputs": [{"type": "evidence", "index": 0}],
+            "confidence": 0.7,
+            "explanation": "test",
+            "signature": null
+        },
+        "signature": "0".repeat(128)
+    });
+    let (status, body) = send(&state, Some(&bearer), "/api/v1/submit/packet", packet).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("evidence_passage_licence"),
+        "the refusal names the guard: {body}"
+    );
+    assert!(
+        claim_rows(&pool, &content).await.is_empty(),
+        "nothing of the refused packet is stored"
     );
 }
 

@@ -33,7 +33,11 @@
 //! frame assignment, the claim's cached belief, its Beta parameters, its
 //! global scoped belief and its edges, now go through ONE [`AppState::write_as`]
 //! transaction, and its best-effort derived rows after the commit through a
-//! second; its alias remains for unstamped reads only.) `read_as` is documented
+//! second; its alias remains for unstamped reads and for the best-effort
+//! `events` inserts after the commit, `record_event`, which need no stamp:
+//! `events` carries no row security and the application role holds INSERT on
+//! it. `create_frame`'s `frame.created` event goes through its alias the same
+//! way.) `read_as` is documented
 //! read-only: `ScopedRead::commit`
 //! is not called by `Drop`, so under `SessionGucMode::Transaction` a write
 //! routed through it is rolled back on drop — a 200 with nothing persisted.
@@ -370,6 +374,29 @@ async fn finish_savepoint<T>(
         tracing::warn!("submit_evidence: could not close the {what} savepoint: {e}");
     }
     closed
+}
+
+/// Record one of `submit_evidence`'s events (`evidence.submitted`,
+/// `belief.updated`, `conflict.detected`, the CDST and silence / velocity /
+/// divergence signals) in the persisted `events` log, which
+/// `GET /api/v1/events` and MCP `list_events` read (backlog 8fcc36a0).
+///
+/// They used to be pushed to an in-process store that was never persisted:
+/// lost on every restart, invisible to MCP, and growing for the life of the
+/// process. Best-effort, as the push was: every call site is after the
+/// submission's COMMIT, so a failed INSERT is logged by
+/// `EventRepository::publish_or_log` and the request still succeeds.
+/// (`contradiction.predicted`, decided before the transaction opens, is
+/// published ON the transaction instead, step 5b'.)
+#[cfg(feature = "db")]
+async fn record_event(
+    pool: &sqlx::PgPool,
+    event_type: &str,
+    actor_id: Option<Uuid>,
+    payload: serde_json::Value,
+) {
+    let _ =
+        epigraph_db::EventRepository::publish_or_log(pool, event_type, actor_id, &payload).await;
 }
 
 fn default_reliability() -> f64 {
@@ -1103,19 +1130,19 @@ pub async fn create_frame(
     )
     .await?;
 
-    // Emit frame.created event
-    let event_store = super::events::global_event_store();
-    event_store
-        .push(
-            "frame.created".to_string(),
-            None,
-            serde_json::json!({
-                "frame_id": row.id,
-                "name": row.name,
-                "hypothesis_count": request.hypotheses.len(),
-            }),
-        )
-        .await;
+    // Emit frame.created event, persisted (backlog 8fcc36a0), best-effort on
+    // the pool the frame was written on.
+    let _ = epigraph_db::EventRepository::publish_or_log(
+        pool,
+        "frame.created",
+        None,
+        &serde_json::json!({
+            "frame_id": row.id,
+            "name": row.name,
+            "hypothesis_count": request.hypotheses.len(),
+        }),
+    )
+    .await;
 
     Ok((StatusCode::CREATED, Json(frame_to_response(row))))
 }
@@ -1454,6 +1481,10 @@ pub async fn submit_evidence(
     // 4e. Pre-screen for contradiction potential (G8)
     //     Load the claim's edge neighborhood and check if the new evidence
     //     would introduce a contradiction via the Ascent reasoning engine.
+    //     The `contradiction.predicted` payload is HELD here and published on
+    //     the submission's transaction once the BBA is stored (5b'): written
+    //     now it would outlive a submission refused or rolled back below.
+    let mut predicted_contradiction: Option<serde_json::Value> = None;
     {
         use epigraph_engine::reasoning::{ReasoningClaim, ReasoningEdge, ReasoningEngine};
 
@@ -1531,23 +1562,16 @@ pub async fn submit_evidence(
             if let Some(contradiction) =
                 ReasoningEngine::would_contradict(&extended_claims, &reasoning_edges, &new_edge)
             {
-                let event_store = super::events::global_event_store();
-                event_store
-                    .push(
-                        "contradiction.predicted".to_string(),
-                        request.agent_id,
-                        serde_json::json!({
-                            "claim_id": request.claim_id,
-                            "contradicting_claims": [
-                                contradiction.claim_a.to_string(),
-                                contradiction.claim_b.to_string(),
-                            ],
-                            "target": contradiction.target.to_string(),
-                            "support_strength": contradiction.support_strength,
-                            "refute_strength": contradiction.refute_strength,
-                        }),
-                    )
-                    .await;
+                predicted_contradiction = Some(serde_json::json!({
+                    "claim_id": request.claim_id,
+                    "contradicting_claims": [
+                        contradiction.claim_a.to_string(),
+                        contradiction.claim_b.to_string(),
+                    ],
+                    "target": contradiction.target.to_string(),
+                    "support_strength": contradiction.support_strength,
+                    "refute_strength": contradiction.refute_strength,
+                }));
             }
         }
     }
@@ -1683,6 +1707,20 @@ pub async fn submit_evidence(
         None,      // HTTP belief endpoint has no evidence row in scope (issue #197 Phase 3)
     )
     .await?;
+
+    // 5b'. Step 4e's `contradiction.predicted`, on this transaction (backlog
+    //      8fcc36a0): it commits with the BBA it was predicted for, or not at
+    //      all. SAVEPOINT-wrapped inside `publish_or_log_conn`, so a refused
+    //      event cannot abort the submission.
+    if let Some(payload) = &predicted_contradiction {
+        let _ = epigraph_db::EventRepository::publish_or_log_conn(
+            &mut tx,
+            "contradiction.predicted",
+            request.agent_id,
+            payload,
+        )
+        .await;
+    }
 
     // 6. Ensure the claim is assigned to the frame (best-effort, under a
     //    SAVEPOINT: unsavepointed, a refused INSERT would abort the transaction
@@ -2079,36 +2117,35 @@ pub async fn submit_evidence(
 
     // 13c. CDST residual mass analysis
     {
-        let event_store = super::events::global_event_store();
         // High frame incompleteness -> evidence may not cover all relevant hypotheses
         if m_missing > 0.15 {
-            event_store
-                .push(
-                    "frame.incomplete".to_string(),
-                    request.agent_id,
-                    serde_json::json!({
-                        "claim_id": request.claim_id,
-                        "frame_id": frame_id,
-                        "mass_on_missing": m_missing,
-                    }),
-                )
-                .await;
+            record_event(
+                pool,
+                "frame.incomplete",
+                request.agent_id,
+                serde_json::json!({
+                    "claim_id": request.claim_id,
+                    "frame_id": frame_id,
+                    "mass_on_missing": m_missing,
+                }),
+            )
+            .await;
         }
 
         // High genuine conflict with low ignorance -> sources disagree within the frame
         if m_empty > 0.10 && m_missing < 0.05 {
-            event_store
-                .push(
-                    "conflict.genuine".to_string(),
-                    request.agent_id,
-                    serde_json::json!({
-                        "claim_id": request.claim_id,
-                        "frame_id": frame_id,
-                        "mass_on_conflict": m_empty,
-                        "mass_on_missing": m_missing,
-                    }),
-                )
-                .await;
+            record_event(
+                pool,
+                "conflict.genuine",
+                request.agent_id,
+                serde_json::json!({
+                    "claim_id": request.claim_id,
+                    "frame_id": frame_id,
+                    "mass_on_conflict": m_empty,
+                    "mass_on_missing": m_missing,
+                }),
+            )
+            .await;
         }
     }
 
@@ -2242,21 +2279,20 @@ pub async fn submit_evidence(
     drop(scoped_read);
 
     // 17b. Emit evidence.submitted event
-    let event_store = super::events::global_event_store();
-    event_store
-        .push(
-            "evidence.submitted".to_string(),
-            request.agent_id,
-            serde_json::json!({
-                "mass_function_id": mf_id,
-                "claim_id": request.claim_id,
-                "frame_id": frame_id,
-                "agent_id": request.agent_id,
-                "perspective_id": request.perspective_id,
-                "reliability": request.reliability,
-            }),
-        )
-        .await;
+    record_event(
+        pool,
+        "evidence.submitted",
+        request.agent_id,
+        serde_json::json!({
+            "mass_function_id": mf_id,
+            "claim_id": request.claim_id,
+            "frame_id": frame_id,
+            "agent_id": request.agent_id,
+            "perspective_id": request.perspective_id,
+            "reliability": request.reliability,
+        }),
+    )
+    .await;
 
     // 18. Emit belief.updated event, ONLY when step 13 moved the claim's
     //     cache to this frame's combination. `old_belief` is the claim's cache
@@ -2266,24 +2302,24 @@ pub async fn submit_evidence(
     //     reported a move that did not happen (backlog d33a5c9f).
     //     `evidence.submitted` above still records the submission.
     if cache_updated {
-        event_store
-            .push(
-                "belief.updated".to_string(),
-                request.agent_id,
-                serde_json::json!({
-                    "claim_id": request.claim_id,
-                    "frame_id": frame_id,
-                    "old_belief": old_belief,
-                    "new_belief": final_bel,
-                    "old_plausibility": old_plausibility,
-                    "new_plausibility": final_pl,
-                    "pignistic_prob": final_betp,
-                    "combination_method": final_method,
-                    "total_sources": total_sources,
-                    "perspective_id": request.perspective_id,
-                }),
-            )
-            .await;
+        record_event(
+            pool,
+            "belief.updated",
+            request.agent_id,
+            serde_json::json!({
+                "claim_id": request.claim_id,
+                "frame_id": frame_id,
+                "old_belief": old_belief,
+                "new_belief": final_bel,
+                "old_plausibility": old_plausibility,
+                "new_plausibility": final_pl,
+                "pignistic_prob": final_betp,
+                "combination_method": final_method,
+                "total_sources": total_sources,
+                "perspective_id": request.perspective_id,
+            }),
+        )
+        .await;
     }
 
     // 18b. Confidence velocity check — detect monotonic belief increase
@@ -2327,19 +2363,19 @@ pub async fn submit_evidence(
                 .collect();
             let velocity = epigraph_engine::silence_alarm::check_confidence_velocity(&samples, 5);
             if velocity.is_suspicious {
-                event_store
-                    .push(
-                        "velocity.suspicious".to_string(),
-                        request.agent_id,
-                        serde_json::json!({
-                            "claim_id": request.claim_id,
-                            "frame_id": frame_id,
-                            "monotonic_streak": velocity.monotonic_streak,
-                            "total_samples": velocity.total_samples,
-                            "reason": velocity.reason,
-                        }),
-                    )
-                    .await;
+                record_event(
+                    pool,
+                    "velocity.suspicious",
+                    request.agent_id,
+                    serde_json::json!({
+                        "claim_id": request.claim_id,
+                        "frame_id": frame_id,
+                        "monotonic_streak": velocity.monotonic_streak,
+                        "total_samples": velocity.total_samples,
+                        "reason": velocity.reason,
+                    }),
+                )
+                .await;
             }
         }
     }
@@ -2347,18 +2383,18 @@ pub async fn submit_evidence(
     // 19. Emit conflict.detected if conflict exceeds threshold
     if let Some(k) = final_k {
         if k >= request.conflict_threshold {
-            event_store
-                .push(
-                    "conflict.detected".to_string(),
-                    request.agent_id,
-                    serde_json::json!({
-                        "frame_id": frame_id,
-                        "claim_id": request.claim_id,
-                        "conflict_k": k,
-                        "method_used": final_method,
-                    }),
-                )
-                .await;
+            record_event(
+                pool,
+                "conflict.detected",
+                request.agent_id,
+                serde_json::json!({
+                    "frame_id": frame_id,
+                    "claim_id": request.claim_id,
+                    "conflict_k": k,
+                    "method_used": final_method,
+                }),
+            )
+            .await;
 
             // 19b. Auto-create challenge when conflict K >= 0.7 (S4.4 / G14)
             const HIGH_CONFLICT_THRESHOLD: f64 = 0.7;
@@ -2392,20 +2428,20 @@ pub async fn submit_evidence(
                 &epigraph_engine::silence_alarm::SilenceAlarmConfig::default(),
             );
             if silence.is_suspicious {
-                event_store
-                    .push(
-                        "silence.suspicious".to_string(),
-                        request.agent_id,
-                        serde_json::json!({
-                            "frame_id": frame_id,
-                            "claim_id": request.claim_id,
-                            "total_claims": silence.total_claims,
-                            "contradicts_edges": silence.contradicts_edges,
-                            "conflict_rate": silence.conflict_rate,
-                            "reason": silence.reason,
-                        }),
-                    )
-                    .await;
+                record_event(
+                    pool,
+                    "silence.suspicious",
+                    request.agent_id,
+                    serde_json::json!({
+                        "frame_id": frame_id,
+                        "claim_id": request.claim_id,
+                        "total_claims": silence.total_claims,
+                        "contradicts_edges": silence.contradicts_edges,
+                        "conflict_rate": silence.conflict_rate,
+                        "reason": silence.reason,
+                    }),
+                )
+                .await;
             }
         }
     }
@@ -2485,19 +2521,19 @@ pub async fn submit_evidence(
         // submission): its KL measures the empty track, not a disagreement,
         // and `record_divergence` stores no row for it either.
         if kl >= DIVERGENCE_SPIKE_THRESHOLD && !beta_update.cold_start {
-            event_store
-                .push(
-                    "divergence.spike".to_string(),
-                    request.agent_id,
-                    serde_json::json!({
-                        "claim_id": request.claim_id,
-                        "frame_id": frame_id,
-                        "pignistic_prob": final_betp,
-                        "bayesian_posterior": bayesian_posterior,
-                        "kl_divergence": kl,
-                    }),
-                )
-                .await;
+            record_event(
+                pool,
+                "divergence.spike",
+                request.agent_id,
+                serde_json::json!({
+                    "claim_id": request.claim_id,
+                    "frame_id": frame_id,
+                    "pignistic_prob": final_betp,
+                    "bayesian_posterior": bayesian_posterior,
+                    "kl_divergence": kl,
+                }),
+            )
+            .await;
         }
     }
 

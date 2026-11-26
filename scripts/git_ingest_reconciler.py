@@ -3,7 +3,13 @@
 
 Discovers newly-merged PRs across configured repos (read-only GitHub access via
 the `gh` CLI) and runs `ingest_git --pr-ingest` against the localhost EpiGraph
-API for each. Idempotent (Plan 2.5), stateless, safe to run repeatedly on a cron.
+API for each. Idempotent (Plan 2.5), safe to run repeatedly on a cron.
+
+State: per repo, a cursor (the start of the last complete run) and a retry
+list of PRs whose ingest failed (`RepoState`, a JSON file in `state_dir`). A
+run scans the PRs merged since `cursor - window_minutes` and re-tries the
+retry list, so neither an outage longer than the window nor a failed ingest
+loses a PR. A dry run reads the state and writes none.
 
 Auth: EPIGRAPH_GIT_INGEST_GITHUB_PAT (read-only) injected as GH_TOKEN, else the
 host's existing `gh auth` token. Writes go to the localhost API, not GitHub —
@@ -112,12 +118,45 @@ def ingest_env(token: str | None, default_orchestrator_id: str | None,
         env["EPIGRAPH_DEFAULT_ORCHESTRATOR_ID"] = default_orchestrator_id
     return env
 
-def compute_rev_range(mirror: str, merge_sha: str) -> str:
-    """The PR's own commits. For a --merge commit (2 parents): base..head =
-    `M^1..M^2`. For a squash (1 parent): the single commit `M~1..M`. Rebase
-    merges (the PR's commits as a linear run with one parent each) are not
-    distinguishable from a single squash here; logged by the caller and handled
-    as the squash case for the tip commit."""
+# The PR commits API lists at most this many commits; an answer this long may
+# be truncated, so it cannot prove which commits a rebase merge put on main.
+PR_COMMITS_API_CAP = 250
+
+def _parse_ts(s: str) -> datetime.datetime:
+    return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+def _commit_identity(email: str, date: str, message: str) -> tuple:
+    """What GitHub's rebase merge keeps of a commit (it changes the sha and the
+    committer): the author email, the author date as an instant, and the
+    message's first line."""
+    first = (message or "").strip().split("\n", 1)[0].strip()
+    return ((email or "").strip().lower(), _parse_ts(date), first)
+
+def _first_parent_identities(mirror: str, sha: str, n: int) -> list[tuple]:
+    """The identities of `sha` and its first-parent ancestors, `n` at most,
+    oldest first."""
+    out = subprocess.run(
+        ["git", "-C", mirror, "log", "--first-parent", "-n", str(n),
+         "--format=%x1e%ae%x00%aI%x00%B", sha],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    ids = [_commit_identity(*rec.split("\0", 2)) for rec in out.split("\x1e") if rec.strip()]
+    return list(reversed(ids))
+
+def compute_rev_range(mirror: str, merge_sha: str, pr_commits=None) -> str:
+    """The PR's own commits on the mirror.
+
+    - A --merge commit (2 parents): base..head, `M^1..M^2`.
+    - One parent, a squash or a rebase merge. A rebase merge puts the PR's n
+      commits on main as a linear run ending at M; a squash puts one commit.
+      `pr_commits` is the PR commits API's answer (oldest first), or a
+      zero-argument callable returning it, read only on this path. When the n
+      first-parent commits ending at M carry the API commits' author, author
+      date and first message line, in order, the PR was rebase-merged and the
+      range is `M~n..M`; otherwise it is the single commit `M~1..M`.
+
+    Matching on identity, not on the count alone, keeps a squash of an
+    n-commit PR from claiming the n-1 commits of other PRs below it."""
     out = subprocess.run(
         ["git", "-C", mirror, "rev-list", "--parents", "-n", "1", merge_sha],
         check=True, capture_output=True, text=True,
@@ -125,7 +164,29 @@ def compute_rev_range(mirror: str, merge_sha: str) -> str:
     n_parents = len(out) - 1  # first token is the commit itself
     if n_parents >= 2:
         return f"{merge_sha}^1..{merge_sha}^2"
-    return f"{merge_sha}~1..{merge_sha}"
+    single = f"{merge_sha}~1..{merge_sha}"
+    rows = pr_commits() if callable(pr_commits) else pr_commits
+    n = len(rows or [])
+    if n <= 1:
+        return single
+    if n >= PR_COMMITS_API_CAP:
+        LOG.warning("%s: the PR lists %s+ commits, past what the commits API returns; "
+                    "ingesting only the tip commit", merge_sha, n)
+        return single
+    want = [_commit_identity(((r.get("commit") or {}).get("author") or {}).get("email", ""),
+                             ((r.get("commit") or {}).get("author") or {}).get("date", ""),
+                             (r.get("commit") or {}).get("message", ""))
+            for r in rows]
+    if _first_parent_identities(mirror, merge_sha, n) == want:
+        return f"{merge_sha}~{n}..{merge_sha}"
+    LOG.info("%s: one parent and the PR's %s commits are not on main as a run; "
+             "treating it as a squash merge", merge_sha, n)
+    return single
+
+def fetch_pr_commits(slug: str, number: int, env: dict) -> list[dict]:
+    """The PR's commits as the PR commits API lists them, oldest first."""
+    return _gh_json([f"repos/{slug}/pulls/{number}/commits", "-X", "GET",
+                     "--field", "per_page=100", "--paginate", "--slurp"], env)
 
 @dataclass
 class PullRequest:
@@ -148,30 +209,173 @@ def _gh_json(args: list[str], env: dict) -> list | dict:
         return [row for page in data for row in (page if isinstance(page, list) else [page])]
     return data
 
-def discover_merged_prs(slug: str, env: dict, window_minutes: int, now: datetime.datetime) -> list[PullRequest]:
-    cutoff = now - datetime.timedelta(minutes=window_minutes)
-    rows = _gh_json(
-        [f"repos/{slug}/pulls", "-X", "GET",
-         "--field", "state=closed", "--field", "sort=updated",
-         "--field", "direction=desc", "--field", "per_page=50",
-         "--paginate", "--slurp"],
-        env,
+def _pr_from_row(r: dict) -> "PullRequest | None":
+    """A merged PR from a pulls API row; None when the row is not merged."""
+    ma = r.get("merged_at")
+    if not ma or not r.get("merge_commit_sha"):
+        return None
+    return PullRequest(
+        number=int(r["number"]), title=r.get("title") or "",
+        body=r.get("body") or "", merge_sha=r["merge_commit_sha"],
+        base_sha=(r.get("base") or {}).get("sha") or "",
+        author=(r.get("user") or {}).get("login") or "", merged_at=ma,
     )
-    out = []
-    for r in rows:
-        ma = r.get("merged_at")
-        if not ma or not r.get("merge_commit_sha"):
-            continue
-        when = datetime.datetime.fromisoformat(ma.replace("Z", "+00:00"))
-        if when < cutoff:
-            continue
-        out.append(PullRequest(
-            number=int(r["number"]), title=r.get("title") or "",
-            body=r.get("body") or "", merge_sha=r["merge_commit_sha"],
-            base_sha=(r.get("base") or {}).get("sha") or "",
-            author=(r.get("user") or {}).get("login") or "", merged_at=ma,
-        ))
-    return out
+
+PULLS_PER_PAGE = 100  # the pulls API's largest page
+
+def _scan_closed_prs(slug: str, env: dict, stop_before: datetime.datetime,
+                     cutoff: datetime.datetime, found: dict) -> tuple[int, "str | None"]:
+    """Read the closed-PR listing (newest update first) page by page until a
+    short page, or a page whose last row was updated before `stop_before`.
+    Each merged PR with merged_at >= `cutoff` goes into `found` (by number).
+    Returns (pages read, page 1's newest updated_at)."""
+    page, newest = 1, None
+    while True:
+        rows = _gh_json(
+            [f"repos/{slug}/pulls", "-X", "GET",
+             "--field", "state=closed", "--field", "sort=updated",
+             "--field", "direction=desc", "--field", f"per_page={PULLS_PER_PAGE}",
+             "--field", f"page={page}"],
+            env,
+        )
+        if page == 1:
+            stamps = [r["updated_at"] for r in rows if r.get("updated_at")]
+            newest = max(stamps, key=_parse_ts) if stamps else None
+        for r in rows:
+            pr = _pr_from_row(r)
+            if pr is not None and _parse_ts(pr.merged_at) >= cutoff:
+                found.setdefault(pr.number, pr)
+        if len(rows) < PULLS_PER_PAGE:
+            return page, newest
+        last = rows[-1].get("updated_at")
+        if last and _parse_ts(last) < stop_before:
+            return page, newest
+        page += 1
+
+# A re-read only repeats when more than a page of PRs was updated during the
+# previous read; past this many passes, give up and fail the repo (its cursor
+# is kept, so the next run scans the same range).
+MAX_DISCOVERY_PASSES = 5
+
+def discover_merged_prs(slug: str, env: dict, cutoff: datetime.datetime) -> list[PullRequest]:
+    """The repo's PRs merged at or after `cutoff`, each once.
+
+    The closed-PR listing is ordered by updated_at, newest first, and a PR's
+    updated_at is never before its merged_at, so paging stops at the first
+    page that ends before `cutoff` (or is short): no later page holds a PR
+    merged after it. Stopping on updated_at, not merged_at, matters: a comment
+    on a PR merged long ago lifts it to the top of the listing.
+
+    Pages are read one request at a time, so a PR updated while a multi-page
+    scan runs jumps from a page not yet read to page 1, already read, and the
+    scan never sees it. Every such PR was updated after page 1 was read, so its
+    updated_at is at or after page 1's newest one: after a multi-page scan,
+    the listing is read again down to that mark (normally one page), and again
+    if that re-read itself spans pages. A single-page read is one request and
+    needs no re-read. A re-read repeats only while page 1's newest row moves.
+
+    Not covered: a closed, unmerged PR reopened mid-scan leaves the listing,
+    the rows below it move up one place, and the row moved across the page
+    boundary is skipped with its updated_at unchanged. The previous
+    `--paginate` scan had the same gap."""
+    found: dict[int, PullRequest] = {}
+    pages, mark = _scan_closed_prs(slug, env, cutoff, cutoff, found)
+    passes = 1
+    while pages > 1 and mark is not None:
+        if passes >= MAX_DISCOVERY_PASSES:
+            raise RuntimeError(f"{slug}: the closed-PR listing kept moving over "
+                               f"{passes} reads; discovery not trusted")
+        pages, newer = _scan_closed_prs(slug, env, _parse_ts(mark), cutoff, found)
+        passes += 1
+        # Page 1's newest row did not change: no PR was updated during the
+        # re-read, so nothing moved past it.
+        if newer is None or _parse_ts(newer) <= _parse_ts(mark):
+            break
+        mark = newer
+    return list(found.values())
+
+def fetch_pr(slug: str, number: int, env: dict) -> "PullRequest | None":
+    """One PR by number (for the retry list); None when it is not merged."""
+    return _pr_from_row(_gh_json([f"repos/{slug}/pulls/{number}"], env))
+
+# -----------------------------------------------------------------------------
+# Per-repo state: the cursor and the retry list
+# -----------------------------------------------------------------------------
+
+@dataclass
+class RepoState:
+    """What the reconciler keeps per repo between runs, in
+    `<state_dir>/<owner>__<repo>.state.json`.
+
+    `cursor`: the start time of the last run whose discovery succeeded and
+    whose every merged PR was either ingested or put on the retry list. The
+    next run scans PRs merged since `cursor - window_minutes`, so the window is
+    an overlap, not a horizon: a reconciler that was down for a day catches up.
+
+    `retry`: PR number -> {"attempts", "last_failed_at"} for each PR whose
+    ingest failed. Once its backoff (`retry_due`) has run out, a run fetches
+    it by number, wherever it falls relative to the scan, until it is
+    ingested."""
+    cursor: str | None = None
+    retry: dict[int, dict] = field(default_factory=dict)
+
+def _state_path(state_dir: str, slug: str) -> Path:
+    d = _mirror_dir(state_dir, slug)
+    return d.with_name(d.name + ".state.json")
+
+def load_state(state_dir: str, slug: str) -> RepoState:
+    """The repo's state; empty when it has none yet. An unreadable or malformed
+    file raises: starting over would drop the retry list without a word."""
+    p = _state_path(state_dir, slug)
+    if not p.exists():
+        return RepoState()
+    data = json.loads(p.read_text())
+    return RepoState(cursor=data.get("cursor"),
+                     retry={int(k): dict(v) for k, v in (data.get("retry") or {}).items()})
+
+def save_state(state_dir: str, slug: str, st: RepoState) -> None:
+    """Write the repo's state atomically (temp file, then rename)."""
+    p = _state_path(state_dir, slug)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"cursor": st.cursor,
+                       "retry": {str(k): v for k, v in sorted(st.retry.items())}},
+                      indent=2, sort_keys=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=p.name + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body + "\n")
+        os.replace(tmp, p)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+def compute_cutoff(cursor: str | None, now: datetime.datetime, window_minutes: int) -> datetime.datetime:
+    """The earliest merge time a run scans: `window_minutes` before the cursor
+    (before `now` on a first run, or if the cursor is in the future)."""
+    since = now if cursor is None else min(_parse_ts(cursor), now)
+    return since - datetime.timedelta(minutes=window_minutes)
+
+# A failed PR waits RETRY_BACKOFF_BASE before its next attempt, twice as long
+# after each further failure, never longer than RETRY_BACKOFF_CAP: a PR that
+# cannot be ingested yet (an API that refuses it, a merge commit missing from
+# the mirror) is still retried, about daily, without a failed attempt on every
+# run.
+RETRY_BACKOFF_BASE = datetime.timedelta(minutes=15)
+RETRY_BACKOFF_CAP = datetime.timedelta(hours=24)
+
+def retry_due(entry: dict, now: datetime.datetime) -> bool:
+    """Whether a retry-list entry's backoff has run out at `now`."""
+    last = entry.get("last_failed_at")
+    if not last:
+        return True
+    attempts = max(int(entry.get("attempts", 1)), 1)
+    delay = min(RETRY_BACKOFF_BASE * 2 ** min(attempts - 1, 16), RETRY_BACKOFF_CAP)
+    return now >= _parse_ts(last) + delay
+
+def _record_failure(st: RepoState, number: int, now: datetime.datetime) -> None:
+    prev = st.retry.get(number, {})
+    st.retry[number] = {"attempts": int(prev.get("attempts", 0)) + 1,
+                        "last_failed_at": now.isoformat()}
 
 def _mirror_dir(state_dir: str, slug_key: str) -> Path:
     return Path(state_dir) / slug_key.replace("/", "__")
@@ -212,13 +416,18 @@ def build_ingest_argv(pr, mirror, endpoint, rev_range, slug, *,
         argv += ["--dry-run"]
     return argv
 
-def ingest_pr(pr, mirror, endpoint, slug, *, env=None,
+def ingest_pr(pr, mirror, endpoint, slug, *, env=None, github_env=None,
               ingest_git_bin="ingest_git", dry_run=False, author_key_file=None) -> int:
     """Compute the PR's commit range from the mirror, build the argv, and run
     `ingest_git` with `env` (from `ingest_env`; None inherits the reconciler's).
-    Returns the subprocess return code; logs (not raises) on a non-zero exit so
-    the caller can isolate per-PR failures."""
-    rng = compute_rev_range(mirror, pr.merge_sha)
+    `github_env` (from `gh_env`) lets a one-parent merge read the PR commits
+    API to tell a rebase merge from a squash; None skips the call and treats it
+    as a squash. Returns the subprocess return code; logs (not raises) on a
+    non-zero exit so the caller can isolate per-PR failures."""
+    commits = None
+    if github_env is not None:
+        commits = lambda: fetch_pr_commits(slug, pr.number, github_env)  # noqa: E731
+    rng = compute_rev_range(mirror, pr.merge_sha, commits)
     argv = build_ingest_argv(pr, mirror, endpoint, rng, slug,
                              ingest_git_bin=ingest_git_bin, dry_run=dry_run,
                              author_key_file=author_key_file)
@@ -229,9 +438,13 @@ def ingest_pr(pr, mirror, endpoint, slug, *, env=None,
     return res.returncode
 
 def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None) -> tuple[int, int]:
-    """Reconcile every configured repo once. Repo-level failures (mirror/discovery)
-    and per-PR failures are both logged and isolated — one bad repo or PR never
-    aborts the rest — and counted into the failure tally. Returns (ok, fail)."""
+    """Reconcile every configured repo once: the PRs merged since the repo's
+    cutoff (`compute_cutoff`) plus its retry list. Repo-level failures
+    (state/mirror/discovery) and per-PR failures are both logged and isolated —
+    one bad repo or PR never aborts the rest — and counted into the failure
+    tally. A repo-level failure keeps the repo's cursor; a failed PR joins the
+    retry list and is not attempted again until its backoff (`retry_due`) runs
+    out. A dry run reads the state and writes none. Returns (ok, fail)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     env = gh_env()
     key_file = resolve_author_key_file(cfg)
@@ -252,18 +465,49 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
     ok = fail = 0
     for slug in cfg.repos:
         try:
+            state = load_state(cfg.state_dir, slug)
             mirror = ensure_mirror(f"https://github.com/{slug}.git", cfg.state_dir, env, slug_key=slug)
-            prs = discover_merged_prs(slug, env, cfg.window_minutes, now)
-        except Exception as e:  # repo-level failure: log + continue
+            cutoff = compute_cutoff(state.cursor, now, cfg.window_minutes)
+            prs = discover_merged_prs(slug, env, cutoff)
+        except Exception as e:  # repo-level failure: log + continue, cursor kept
             LOG.error("repo %s discovery failed: %s", slug, e); fail += 1; continue
+        # Failed PRs still backing off are neither attempted nor counted.
+        waiting = {n for n, e in state.retry.items() if not retry_due(e, now)}
+        if waiting:
+            LOG.warning("repo %s: %s failed PR(s) wait for their next retry: %s",
+                        slug, len(waiting), ", ".join(f"#{n}" for n in sorted(waiting)))
+        prs = [pr for pr in prs if pr.number not in waiting]
+        found = {pr.number for pr in prs}
+        for number in sorted(set(state.retry) - found - waiting):
+            try:
+                pr = fetch_pr(slug, number, env)
+            except Exception as e:
+                LOG.error("PR #%s (%s) retry lookup failed: %s", number, slug, e)
+                _record_failure(state, number, now); fail += 1; continue
+            if pr is None:
+                LOG.warning("PR #%s (%s) is on the retry list but not merged; dropping it", number, slug)
+                del state.retry[number]; continue
+            LOG.info("retrying PR #%s (%s), attempt %s", number, slug,
+                     state.retry[number].get("attempts", 0) + 1)
+            prs.append(pr)
         for pr in prs:
             try:
-                rc = ingest_pr(pr, mirror, cfg.endpoint, slug, env=child_env,
+                rc = ingest_pr(pr, mirror, cfg.endpoint, slug, env=child_env, github_env=env,
                                ingest_git_bin=cfg.ingest_git_bin, dry_run=dry_run,
                                author_key_file=key_file)
-                ok += (rc == 0); fail += (rc != 0)
             except Exception as e:
-                LOG.error("PR #%s (%s) ingest raised: %s", pr.number, slug, e); fail += 1
+                LOG.error("PR #%s (%s) ingest raised: %s", pr.number, slug, e); rc = None
+            if rc == 0:
+                ok += 1; state.retry.pop(pr.number, None)
+            else:
+                fail += 1; _record_failure(state, pr.number, now)
+        # Every merged PR since the cutoff is now ingested or on the retry list.
+        state.cursor = now.isoformat()
+        if not dry_run:
+            try:
+                save_state(cfg.state_dir, slug, state)
+            except OSError as e:
+                LOG.error("repo %s: cannot save state: %s", slug, e); fail += 1
     return ok, fail
 
 def main(argv=None) -> int:

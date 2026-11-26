@@ -14,8 +14,6 @@ import psycopg2
 
 from maintenance_dsn import maintenance_dsn as _maintenance_dsn
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
-
 # The label stored for a theme no public member can name (`public_label_source`):
 # there is no text every viewer may read. label_themes_llm.is_placeholder_label
 # matches it, so a later labelling run names the theme once a public member
@@ -26,16 +24,17 @@ DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/
 NO_PUBLIC_MEMBER_LABEL = "unnamed-no-public-member"
 
 
-def maintenance_dsn(default=DEFAULT_DATABASE_URL):
+def maintenance_dsn():
     """Resolve the DSN a corpus-wide script should connect on.
 
-    A thin binding of `maintenance_dsn.maintenance_dsn` to this family's
-    default. The RULE — `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`,
-    then `default`, and a refusal when the two name different databases — lives
-    in `scripts/maintenance_dsn.py` and is stated once there, because nineteen
-    scripts share it and nineteen copies of a guard is nineteen places for it to
-    drift. Read that module for why the precedence needs a guard at all and why
-    privilege is deliberately not asserted in Python.
+    `maintenance_dsn.maintenance_dsn`, re-exported for this family. The RULE —
+    `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`, a refusal when the two
+    name different databases, and a refusal (`NoDatabaseConfigured`) when
+    neither is set — lives in `scripts/maintenance_dsn.py` and is stated once
+    there, because nineteen scripts share it and nineteen copies of a guard is
+    nineteen places for it to drift. Read that module for why the precedence
+    needs a guard at all and why privilege is deliberately not asserted in
+    Python.
 
     Why the theme pipeline in particular needs it: it enumerates, re-clusters
     and UPDATEs the whole claim corpus, so once RLS is active (PR-17) an
@@ -43,12 +42,11 @@ def maintenance_dsn(default=DEFAULT_DATABASE_URL):
     subset — the SELECTs see less, the UPDATEs touch nothing, and the script
     exits 0.
 
-    NOTE — pre-existing and NOT changed here: `DEFAULT_DATABASE_URL` hardcodes
-    a production role and database. That is a long-standing property of this
-    script family, not something PR-15 introduced, and changing it would alter
-    where a dozen operator scripts point by default. Flagged, not fixed.
+    There is no default DSN (backlog 62bdae04): this family used to fall back
+    to a hard-coded privileged role on a database named like the live one, so
+    a run with no environment went there instead of failing.
     """
-    return _maintenance_dsn(default)
+    return _maintenance_dsn()
 
 
 def not_intake_owned(alias="c"):
@@ -151,7 +149,8 @@ def public_label_source(alias="c"):
 
 
 def connect(database_url=None):
-    """Open a psycopg2 connection (admin role by default)."""
+    """Open a psycopg2 connection on `database_url`, else `maintenance_dsn()`
+    (which refuses when no DSN is configured)."""
     url = database_url or maintenance_dsn()
     return psycopg2.connect(url)
 

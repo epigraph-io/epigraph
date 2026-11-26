@@ -25,9 +25,6 @@ from _api_client import EpiGraphClient
 
 from maintenance_dsn import maintenance_dsn
 
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
-)
 
 UPDATES = {
     "4d9bf697-e53c-57ac-ad92-526c8e86f06a":
@@ -41,9 +38,12 @@ UPDATES = {
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--database-url", default=maintenance_dsn(DEFAULT_DATABASE_URL))
+    ap.add_argument("--database-url", default=None)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = psycopg2.connect(args.database_url)
     cur = conn.cursor()

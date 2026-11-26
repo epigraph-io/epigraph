@@ -62,7 +62,6 @@ import psycopg2
 
 from maintenance_dsn import maintenance_dsn
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_dev:epigraph_dev@127.0.0.1:5432/epigraph"
 
 CONSTRAINT = "uq_claims_content_hash_agent"
 # Migration 013's exact shape. Option B is an index, not a table constraint,
@@ -315,7 +314,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=None,
     )
     ap.add_argument("--json", action="store_true", help="emit the report as JSON")
     ap.add_argument(
@@ -326,6 +325,9 @@ def main() -> int:
         "migrations/README.md)",
     )
     args = ap.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = psycopg2.connect(args.database_url)
     try:

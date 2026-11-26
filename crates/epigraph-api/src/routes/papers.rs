@@ -282,9 +282,11 @@ pub struct PaginatedPaperResponse {
 /// filling title/journal only where the stored value is NULL (an existing
 /// value is never overwritten; backlog 62ce37ca). A team's or agent's private
 /// copy of the document (a non-public ingest's row, migration 246) is neither
-/// returned nor touched. An empty DOI, or a placeholder such as `"unknown"`
-/// ([`epigraph_core::domain::evidence::is_placeholder_id`]), is refused with
-/// 400 and writes nothing.
+/// returned nor touched. An empty DOI, or a placeholder such as `"unknown"`,
+/// also behind a resolver prefix or with a trailing `/` (`doi:unknown`,
+/// `https://doi.org/unknown`, `unknown/`;
+/// [`epigraph_db::repos::paper::is_placeholder_document_key`]), is refused
+/// with 400 and writes nothing.
 ///
 /// The row is owned by the caller's home group, and written on a transaction
 /// stamped from the caller (`AppState::begin_claim_write`): since migration
@@ -314,9 +316,11 @@ pub async fn create_paper(
     // A placeholder ("unknown", "n/a", ...) means "this document has no DOI";
     // it is not an identity. Keyed on it, every caller posting one got the
     // same row and unrelated documents collapsed onto one paper node
-    // (backlog 8ef80a04). Same test, and same first sentence, as the MCP
-    // ingestion tools' refusal.
-    if epigraph_core::domain::evidence::is_placeholder_id(&request.doi) {
+    // (backlog 8ef80a04). The test peels DOI resolver prefixes and a trailing
+    // `/` first, so `doi:unknown`, `https://doi.org/unknown` and `unknown/`
+    // are placeholders too (backlog cc71759f). Same test, and same first
+    // sentence, as the MCP ingestion tools' refusal.
+    if epigraph_db::repos::paper::is_placeholder_document_key(&request.doi) {
         return Err(ApiError::ValidationError {
             field: "doi".to_string(),
             reason: format!(

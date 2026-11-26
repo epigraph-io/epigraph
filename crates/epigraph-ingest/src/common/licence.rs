@@ -1,6 +1,14 @@
 //! Source-licence policy shared by every ingest path (backlog 8709d128,
 //! 1a462cc1): whether a source's verbatim passages may be republished in
 //! `evidence.raw_content`, or only a locator plus a BLAKE3 hash of them.
+//!
+//! The database enforces the same rule (migration 349, backlog b62ae3f2): a
+//! literature or figure evidence row carrying a passage, image or caption is
+//! refused unless the paper's recorded licence passes
+//! `public.epigraph_passage_retention_permitted`, a SQL mirror of
+//! [`passage_retention_permitted`]. Change the two together: the parity test
+//! `epigraph-mcp/tests/evidence_passage_licence_guard.rs` runs both over one
+//! corpus and fails when they disagree.
 
 /// Whether a source under `licence` may have its verbatim text republished in
 /// `evidence.raw_content` (backlog 8709d128). An exact allowlist, matched

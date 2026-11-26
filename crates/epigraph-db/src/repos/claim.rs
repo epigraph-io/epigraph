@@ -809,6 +809,8 @@ pub struct HybridHit {
 #[derive(Debug, sqlx::FromRow)]
 struct HybridPageRow {
     dense_count: i64,
+    matched_count: i64,
+    pool_saturated: bool,
     claim_id: Option<Uuid>,
     rrf_score: Option<f64>,
     dense_similarity: Option<f64>,
@@ -823,6 +825,55 @@ impl HybridPageRow {
             dense_similarity: self.dense_similarity,
             in_lexical: self.in_lexical?,
         })
+    }
+}
+
+/// One page of [`ClaimRepository::search_hybrid_page_conn`]: the fused hits
+/// plus how many well-matched candidates the fused pool held before the
+/// page's `LIMIT`/`OFFSET` (backlog 8c511f13).
+#[derive(Debug, Clone)]
+pub struct HybridPage {
+    pub hits: Vec<HybridHit>,
+    pub candidates: HybridCandidates,
+}
+
+/// The fused candidate pool of one hybrid search, counted before the page cut.
+///
+/// A candidate is well matched when it is in the lexical leg (its text matches
+/// the query) or its dense similarity is at least the caller's floor. A NaN
+/// similarity (a zero-norm embedding, which only the exact retry reaches) is
+/// below every floor, as it is in Rust; Postgres alone would order NaN above
+/// every number and count it. Both legs are capped at `candidate_pool`, so `matched` is at most twice the pool; it
+/// counts only rows the viewer can read (both legs carry the visibility
+/// splice), so it discloses nothing the hits do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridCandidates {
+    /// Well-matched rows in the fused pool (dense leg union lexical leg).
+    pub matched: i64,
+    /// `true` when well-matched rows may be missing from the count, so that
+    /// `matched` is a lower bound: the lexical leg is full, or the dense leg
+    /// is full and even its farthest row clears the floor, or the dense leg's
+    /// exact retry timed out and the count comes from the iterative first
+    /// pass, which `hnsw.max_scan_tuples` may have cut short (backlog
+    /// 28b79b1e). `false` means `matched` is every well-matched row the search
+    /// could return.
+    pub pool_saturated: bool,
+}
+
+impl HybridCandidates {
+    /// The pool counts of one executed hybrid statement: `first_row` is any
+    /// row of its result (every row, including the one NULL row of an empty
+    /// page, carries the same counts), and `dense_retry_fell_back` is `true`
+    /// when the exact retry ran and timed out, so the rows are the short first
+    /// pass's. A fallen-back dense leg is truncated by construction, so the
+    /// count is a lower bound whatever the statement itself reported.
+    fn from_statement(first_row: Option<&HybridPageRow>, dense_retry_fell_back: bool) -> Self {
+        let (matched, sql_saturated) =
+            first_row.map_or((0, false), |r| (r.matched_count, r.pool_saturated));
+        Self {
+            matched,
+            pool_saturated: sql_saturated || dense_retry_fell_back,
+        }
     }
 }
 
@@ -5060,39 +5111,47 @@ impl ClaimRepository {
     /// return tied rows in a different order per page — showing the caller one
     /// claim twice and another never.
     ///
-    /// ## The tiebreaker is on the FUSED output only, deliberately
+    /// ## Both legs break ties on `claims.id` (backlog 0a986628)
     ///
-    /// The two CTEs' own `ORDER BY`s are left alone. An earlier revision added
-    /// `, c.id` to each CTE's `row_number()` window and `LIMIT` as well, on the
-    /// theory that a deterministic candidate-pool cut is strictly better. It is
-    /// not free: the dense and lexical legs then break their ties on
-    /// *independent* keys, so a claim can be 2nd in one leg and 3rd in the
-    /// other where previously the two arbitrary orders were correlated, and the
-    /// RRF sum flips. That regressed
+    /// Each leg cuts its candidates at `LIMIT $3` and ranks them with
+    /// `row_number()`. Rows that tie on the leg's score (equal `ts_rank_cd`,
+    /// which is common for short texts, or equal distance, as exact duplicates
+    /// have) used to come out in physical scan order. Which tied rows won the
+    /// last pool slots, and which rank each got, was then not a function of
+    /// the data: an `UPDATE` that moved a row on disk could change the page.
+    ///
+    /// Both legs now order by their score, then `c.id`, the key the fused
+    /// `ORDER BY` and [`Self::search_lexical_scoped_since_in_theme`] already
+    /// use. One SHARED key keeps the legs correlated: a group of rows tied in
+    /// both legs (duplicates) is ordered the same way in each, so the lowest
+    /// ids take both legs' pool slots and the group scores `2/(k+r)` in id
+    /// order. Independent tie orders could instead keep a duplicate in one
+    /// leg's pool and drop it from the other's.
+    ///
+    /// The dense cut stays on the HNSW index: `dense_scan` orders by distance
+    /// alone (the order the index yields) and takes `FETCH FIRST $3 ROWS WITH
+    /// TIES`, so the whole tie group at the boundary comes back; `dense` then
+    /// ranks those rows by `(distance, id)` and keeps `$3`. Ordering the scan
+    /// itself by `(distance, id)` would need a sort above the index scan.
+    ///
+    /// An earlier attempt added `, c.id` to both legs and was reverted after
     /// `claim_search_hybrid::hybrid_fuses_both_legs_ranking_the_overlap_first`
-    /// in 2 of 6 runs (6 of 6 green before, 6 of 6 green again after this was
-    /// reverted). Making the pool cut deterministic is a real improvement but
-    /// it is a RANKING change, not a paging one, and it belongs in its own
-    /// commit with its own analysis of which tied row deserves the pool slot.
+    /// failed in 2 of 6 runs. That fixture tied its two lexical matches in BOTH
+    /// legs (equal distance, equal `ts_rank_cd`) and passed only because the
+    /// expected winner was inserted first; with random UUIDs an id key picked
+    /// the other row about half the time. The fixture now has strict orders.
     ///
     /// ## Residual, recorded rather than fixed
     ///
-    /// The fused `ORDER BY` is total WITHIN one execution. A walk spans several
-    /// executions, and across them two things are still arbitrary:
-    ///
-    ///  - which rows of a tie group enter the pool when `candidate_pool`
-    ///    truncates it (needs a tie group straddling the 50th candidate at
-    ///    `HYBRID_CANDIDATE_POOL = 50`); and
-    ///  - the `row_number()` ranks assigned inside a tie group, which feed
-    ///    `rrf_score`, so two executions could in principle score a tied group
-    ///    differently and reorder it.
-    ///
-    /// In practice the legs stay correlated — each sees the same physical scan
-    /// order, so a fully tied group scores `2/(k+r)`, monotone in the same `r`
-    /// — which is why the paging walk is stable. Both hazards predate this
-    /// change; neither is introduced by it. Closing them properly means an
-    /// explicit deterministic key inside each leg, which is the ranking change
-    /// described above.
+    /// The lexical leg's cut is now a function of the data alone. The dense
+    /// leg's is too on the exact pass; on the HNSW pass it is a function of
+    /// the rows the approximate index reaches, and which members of a group of
+    /// identical vectors it reaches depends on the graph's construction
+    /// (insertion history), not on the data alone. The tie order among the
+    /// rows it does reach is by id. One further exception is timing: the
+    /// exact retry below runs under a timeout, so if it finishes for one page
+    /// of a walk and times out for another, those pages rank different dense
+    /// pools.
     ///
     /// ## The dense leg runs with pgvector's iterative HNSW scan (fdd8e494)
     ///
@@ -5209,6 +5268,54 @@ impl ClaimRepository {
         since: Option<DateTime<Utc>>,
         theme_id: Option<Uuid>,
     ) -> Result<Vec<HybridHit>, DbError> {
+        // The candidate count is not wanted here; any floor will do.
+        Self::search_hybrid_page_conn(
+            conn,
+            viewer,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            offset,
+            tags,
+            agent_id,
+            since,
+            theme_id,
+            1.0,
+        )
+        .await
+        .map(|page| page.hits)
+    }
+
+    /// [`Self::search_hybrid_scoped_since_in_theme_conn`] plus a count of the
+    /// fused candidate pool before the page cut (backlog 8c511f13), so a
+    /// caller can tell how much of the well-matched pool its page covers.
+    ///
+    /// `match_min_similarity` is the dense-similarity floor (`1 - cosine
+    /// distance`) above which a dense candidate counts as well matched; every
+    /// lexical candidate counts. See [`HybridCandidates`]. The count is taken
+    /// in the same statement as the page, so the exact retry, when it runs,
+    /// replaces both together.
+    ///
+    /// # Errors
+    /// As [`Self::search_hybrid_scoped_since_in_theme`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_page_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+        match_min_similarity: f64,
+    ) -> Result<HybridPage, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -5217,13 +5324,11 @@ impl ClaimRepository {
         // BOTH CTEs are marked. The recursive hazard's flat cousin: filtering
         // only `dense` would let `lex` re-admit a row the viewer cannot read,
         // and the FULL OUTER JOIN would surface it. `splice` asserts both
-        // markers resolve to the same bind ($11).
+        // markers resolve to the same bind ($12).
         let sql = viewer.splice(
             r#"
-            WITH dense AS (
-                SELECT c.id,
-                       row_number() OVER (ORDER BY c.embedding <=> $1::vector) AS rank,
-                       1 - (c.embedding <=> $1::vector) AS cos
+            WITH dense_scan AS (
+                SELECT c.id, c.embedding <=> $1::vector AS dist
                 FROM claims c
                 WHERE c.embedding IS NOT NULL AND c.is_current
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
@@ -5232,11 +5337,20 @@ impl ClaimRepository {
                   AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
                   /* {VISIBILITY:c} */
                 ORDER BY c.embedding <=> $1::vector
+                FETCH FIRST $3 ROWS WITH TIES
+            ),
+            dense AS (
+                SELECT s.id,
+                       row_number() OVER (ORDER BY s.dist, s.id) AS rank,
+                       1 - s.dist AS cos
+                FROM dense_scan s
+                ORDER BY s.dist, s.id
                 LIMIT $3
             ),
             lex AS (
                 SELECT c.id,
-                       row_number() OVER (ORDER BY ts_rank_cd(c.content_tsv, q) DESC) AS rank
+                       row_number() OVER (
+                           ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id) AS rank
                 FROM claims c, websearch_to_tsquery('english', $2) q
                 WHERE c.content_tsv @@ q AND c.is_current
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
@@ -5244,10 +5358,10 @@ impl ClaimRepository {
                   AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
                   AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
                   /* {VISIBILITY:c} */
-                ORDER BY ts_rank_cd(c.content_tsv, q) DESC
+                ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id
                 LIMIT $3
             ),
-            fused AS (
+            pool AS (
                 SELECT COALESCE(d.id, l.id) AS claim_id,
                        (COALESCE(1.0/($4 + d.rank), 0)
                         + COALESCE(1.0/($4 + l.rank), 0))::float8 AS rrf_score,
@@ -5255,16 +5369,30 @@ impl ClaimRepository {
                        (l.rank IS NOT NULL) AS in_lexical
                 FROM dense d
                 FULL OUTER JOIN lex l ON d.id = l.id
-                ORDER BY rrf_score DESC, claim_id
+            ),
+            fused AS (
+                SELECT p.* FROM pool p
+                ORDER BY p.rrf_score DESC, p.claim_id
                 LIMIT $5 OFFSET $9
             )
             SELECT (SELECT count(*) FROM dense)::int8 AS dense_count,
+                   (SELECT count(*) FROM pool p
+                     WHERE p.in_lexical
+                        OR (p.dense_similarity >= $11::float8
+                            AND p.dense_similarity <> 'NaN'::float8))::int8
+                       AS matched_count,
+                   COALESCE((SELECT count(*) FROM lex) >= $3
+                    OR ((SELECT count(*) FROM dense) >= $3
+                        AND (SELECT bool_and(d.cos >= $11::float8
+                                             AND d.cos <> 'NaN'::float8)
+                               FROM dense d)), false)
+                       AS pool_saturated,
                    f.claim_id, f.rrf_score, f.dense_similarity, f.in_lexical
             FROM (SELECT 1) one
             LEFT JOIN fused f ON true
             ORDER BY f.rrf_score DESC, f.claim_id
             "#,
-            11,
+            12,
         );
         // A macro, not a closure: a closure returning a query that borrows its
         // captures, held across `.await`, makes the future not `Send`.
@@ -5280,9 +5408,10 @@ impl ClaimRepository {
                     .bind(agent_id) // $7
                     .bind(since) // $8
                     .bind(offset) // $9
-                    .bind(theme_id); // $10
+                    .bind(theme_id) // $10
+                    .bind(match_min_similarity); // $11
                 if let Some(g) = viewer.group_bind() {
-                    q = q.bind(g); // $11
+                    q = q.bind(g); // $12
                 }
                 q
             }};
@@ -5298,17 +5427,25 @@ impl ClaimRepository {
         // dense leg's own size, which does not depend on `offset`, so every
         // page of a walk takes the same path.
         let dense_count = rows.first().map_or(0, |r| r.dense_count);
+        let mut dense_retry_fell_back = false;
         if dense_count < candidate_pool {
             let mut tx = begin_exact_vector_scan(&mut *conn).await?;
             let retried = build!().fetch_all(&mut *tx).await;
             tx.rollback().await?;
+            // Any error but the retry's timeout propagates below, so on the
+            // `Ok` path an error here means the first pass's rows came back.
+            dense_retry_fell_back = retried.is_err();
             rows = exact_retry_or_first_pass(retried, rows, "search_hybrid_scoped_since_in_theme")?;
         }
 
-        Ok(rows
-            .into_iter()
-            .filter_map(HybridPageRow::into_hit)
-            .collect())
+        let candidates = HybridCandidates::from_statement(rows.first(), dense_retry_fell_back);
+        Ok(HybridPage {
+            hits: rows
+                .into_iter()
+                .filter_map(HybridPageRow::into_hit)
+                .collect(),
+            candidates,
+        })
     }
 
     /// Lexical-only retrieval over current claims (`content_tsv` / GIN), ranked
@@ -6546,13 +6683,12 @@ impl ClaimRepository {
     ///
     /// The Rust-callable half of the rule
     /// [`crate::repos::EventRepository::list`] implements in SQL, for callers
-    /// that hold rows the database cannot filter — specifically
-    /// `epigraph-api`'s `list_events`, which merges an in-process ring buffer
-    /// (`global_event_store()`) into the same response as the persisted table.
-    /// Filtering only the SQL half would have left the merge as the trivial
-    /// bypass for the filter, and the ring buffer is not a no-db artefact: the
-    /// `db`-build handlers in `routes/edges.rs`, `routes/belief.rs` and
-    /// `routes/community.rs` all push into it.
+    /// that hold rows the database cannot filter — today `epigraph-api`'s
+    /// webhook fan-out (`routes/webhooks.rs::deliver_event`), which decides on
+    /// an event from the in-process bus before any row exists. `list_events`
+    /// used it too, to filter an in-process store it merged with the table;
+    /// since backlog 8fcc36a0 the route handlers persist their events and
+    /// `list_events` reads the table alone.
     ///
     /// "Cannot read" is deliberately narrower than "is absent from the
     /// result": an id that names **no** row at all is not returned, because
@@ -11800,8 +11936,8 @@ mod tests {
     }
 
     /// `hidden_claim_ids` is the Rust half of `EventRepository::list`'s rule,
-    /// used to filter the in-process event ring buffer in
-    /// `epigraph-api`'s `list_events`. Its contract is narrower than "absent
+    /// used by `epigraph-api`'s webhook fan-out (and, until backlog 8fcc36a0,
+    /// to filter an in-process event store `list_events` merged). Its contract is narrower than "absent
     /// from the visible set": an id naming NO row must not be reported, or the
     /// caller would drop events for hard-deleted claims and agent ids.
     ///
@@ -15645,3 +15781,71 @@ const CANONICAL_HOLDS_KEY_SQL: &str = "SELECT 1 FROM mass_functions k \
         AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id \
         AND k.slot_kind IS NOT DISTINCT FROM mf.slot_kind \
         AND k.slot_id IS NOT DISTINCT FROM mf.slot_id";
+
+#[cfg(test)]
+mod hybrid_candidates_tests {
+    use super::{HybridCandidates, HybridPageRow};
+
+    fn row(matched_count: i64, pool_saturated: bool) -> HybridPageRow {
+        HybridPageRow {
+            dense_count: 3,
+            matched_count,
+            pool_saturated,
+            claim_id: None,
+            rrf_score: None,
+            dense_similarity: None,
+            in_lexical: None,
+        }
+    }
+
+    /// Backlog 8c511f13 with 28b79b1e's residual: when the exact retry times
+    /// out, the dense leg is the iterative first pass, which
+    /// `hnsw.max_scan_tuples` may have cut short even though it holds fewer
+    /// rows than the pool and its own SQL therefore reported "not saturated".
+    /// The count must then read as a lower bound. No integration test can
+    /// force the 3 s timeout deterministically, so the decision is a pure
+    /// function that `search_hybrid_page_conn` calls and this test pins.
+    #[test]
+    fn a_fallen_back_dense_retry_marks_the_pool_saturated() {
+        assert_eq!(
+            HybridCandidates::from_statement(Some(&row(7, false)), true),
+            HybridCandidates {
+                matched: 7,
+                pool_saturated: true
+            }
+        );
+        assert_eq!(
+            HybridCandidates::from_statement(None, true),
+            HybridCandidates {
+                matched: 0,
+                pool_saturated: true
+            },
+            "an empty fallen-back page is still a truncated count"
+        );
+    }
+
+    #[test]
+    fn a_completed_statement_reports_its_own_counts() {
+        assert_eq!(
+            HybridCandidates::from_statement(Some(&row(7, false)), false),
+            HybridCandidates {
+                matched: 7,
+                pool_saturated: false
+            }
+        );
+        assert_eq!(
+            HybridCandidates::from_statement(Some(&row(50, true)), false),
+            HybridCandidates {
+                matched: 50,
+                pool_saturated: true
+            }
+        );
+        assert_eq!(
+            HybridCandidates::from_statement(None, false),
+            HybridCandidates {
+                matched: 0,
+                pool_saturated: false
+            }
+        );
+    }
+}

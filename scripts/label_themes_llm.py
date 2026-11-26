@@ -74,7 +74,6 @@ from maintenance_dsn import maintenance_dsn
 
 psycopg2.extras.register_uuid()
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 RESULT_DIR = "/tmp/theme_labels"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CLI_CWD = os.path.dirname(SCRIPT_DIR)  # repo root
@@ -510,8 +509,8 @@ def main():
     parser = argparse.ArgumentParser(description="Label themes with LLM summaries")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=None,
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL; no built-in default)",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -539,6 +538,9 @@ def main():
              "(default: the latest Louvain run, the one the expand route serves)",
     )
     args = parser.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = psycopg2.connect(args.database_url)
     os.makedirs(RESULT_DIR, exist_ok=True)

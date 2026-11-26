@@ -4038,8 +4038,8 @@ restart.
   a `papers` column the request path writes must grant it to `epigraph_app` column-level, and
   one the request path UPDATEs must also extend the allowlist in
   `paper_licence_operator_only.rs` (which fails until it does). **Not closed:** the maintenance DSN can still UPDATE `licence` directly, without
-  the audit row (as in 123); the application role can still write publisher text into
-  `evidence.raw_content` directly; licences set before 255 carry no audit row. Pinned by
+  the audit row (as in 123); the application role could still write publisher text into
+  `evidence.raw_content` directly (closed for literature and figure rows by 349); licences set before 255 carry no audit row. Pinned by
   `epigraph-db/tests/paper_licence_operator_only.rs` (each refusal mutation-tested, the
   `doi`/`id` re-point refused, the application writers as controls, the column ratchet, the
   definer's audit) and
@@ -5132,6 +5132,86 @@ restart.
   (`approve-client --owner`). Undo: `docs/runbooks/348-undo.sql` (refuses while an agent client has no
   owner, including the rows 348 cleared). **Deploy order:** migrate BEFORE the API binary of this change (it registers an agent with
   no owner, which 001's CHECK refuses); an older API runs on 348 unchanged.
+- **349**: `evidence_passage_licence_guard` (backlog b62ae3f2). Closes 255's residual: the
+  licence rule for verbatim passages lived only in Rust, and `POST /api/v1/evidence`,
+  `PUT /api/v1/evidence/:id` and `/api/v1/submit` (the `ingest_literature` CLI's path) store any
+  body a caller sends. Adds `epigraph_passage_retention_permitted(text)` (IMMUTABLE, the SQL mirror
+  of `epigraph_ingest::common::licence::passage_retention_permitted`; change both together) and the
+  SECURITY INVOKER trigger function `epigraph_evidence_passage_licence_guard()` as two BEFORE ROW
+  triggers on `evidence`: every INSERT of a row whose `properties->>'type'` is `literature` or
+  `figure`, and every UPDATE of one that changes its body, type, DOI or caption. A literature body
+  must be NULL or the locator-and-hash shape both writers emit (`Source: ... (DOI: ...). Locator:
+  .... Passage BLAKE3: <hex>. Passage not retained (...).`, no `Passage: '`); a figure must carry no
+  image and no caption; anything else is a passage and is admitted only when a `papers` row the
+  writer can read under the row's DOI (as given, canonical, each resolver-prefixed spelling, then
+  a legacy key with a case-variant resolver prefix, as `PaperRepository` finds papers) carries a
+  permitting licence; `epigraph_app` is granted EXECUTE on the mirror by name (EVP09 checks it). Otherwise 23514 with constraint `evidence_passage_licence` (the API
+  answers 400). An unseal (body was the `[sealed]` sentinel and a ciphertext row exists) is not
+  re-judged. No row is read or changed: stored passages stay, a write that leaves body, type, DOI
+  and caption alone does not fire, and the strip rewrite to the locator shape passes. **Not
+  closed:** text in rows not typed literature or figure; free text in the admitted shape's title,
+  locator and `licence: <licence>` group (the guard is shape-based: only the exact token
+  `Passage: '` is screened, and a title or locator containing it is read as a passage, so it stops
+  well-formed clients and bugs, not a determined application-DSN holder or API client); an unseal
+  (the server cannot verify the plaintext it is handed, so a caller with the `instance:admin`
+  scope and authority over the group can seal a locator-and-hash row and unseal it with a passage
+  body under a paywalled DOI, not re-judged); the maintenance DSN. **Operator note:** the CLI's `--allow-verbatim` and its extraction-declared
+  licence no longer override the paper's recorded licence; set it with
+  `epigraph_set_paper_licence` (255) first. Pinned by
+  `epigraph-mcp/tests/evidence_passage_licence_guard.rs` (refusals on the application role, the
+  accepted bodies built by the production writer, the legacy, strip and unseal writes, and the
+  SQL/Rust allowlist parity) and `epigraph-api/tests/submit_embedding_stamped.rs` (a figure of an
+  unlicensed paper is a 400). Undo: `docs/runbooks/349-undo.sql`. No deploy order: no binary
+  depends on it.
+- **350**: `identity_attestor_isolation_admin_createrole` (backlog cfaa5065). 161's
+  `epigraph_identity_attestor_faults()` named a non-superuser that can act as the attestor NOW
+  (USAGE or SET), so it passed two roles that can make themselves the attestor and then register
+  any agent identity under any parent: a holder of ADMIN OPTION alone (on PostgreSQL 16 `WITH
+  ADMIN TRUE, INHERIT FALSE, SET FALSE` confers neither USAGE nor SET, but its holder can grant
+  the role to itself) and any non-superuser CREATEROLE role. Re-states the function (161's
+  signature, SECURITY INVOKER, owner and ACL; on 172's `pg_catalog, pg_temp` path, every name
+  qualified) with the three arms 251 and 257 apply to their own roles: any non-superuser MEMBER
+  in any form, any non-superuser ADMIN OPTION holder (named once per role), any non-superuser
+  CREATEROLE role other than the attestor. No exemption for the migration runner: 251, which
+  applies first, already refuses a non-superuser migrating login and any non-superuser
+  CREATEROLE role, and every arm excludes superusers. Then refuses (55000, nothing changed)
+  while the attestor exists and is not isolated; a cluster without the role (161 could not
+  create it) is unchanged. Precondition: 161's body (md5 `31cac2063a345bfff500e75b4095c4fa`) on
+  271's path, else 55000. `epigraph-tenancy-backfill verify` now runs the function (skipped
+  with a NOTE before 161 or without the role) and reports each fault. Pinned by
+  `epigraph-db/tests/identity_attestor_isolation.rs` (the ADMIN-only holder, the CREATEROLE
+  role, the superuser and revoke controls, the migrate-time refusal, the undo),
+  `schema_contract.rs::migration_350_attestor_isolation_check_is_complete` and
+  `tenancy_backfill`'s `verify_reports_an_attestor_that_is_not_isolated`. Undo:
+  `docs/runbooks/350-undo.sql` (161's body on 271's path, byte for byte). **Measure first**
+  (350 refuses on any row): `SELECT r.rolname FROM pg_roles r WHERE NOT r.rolsuper AND
+  r.rolname <> 'epigraph_identity_attestor' AND (r.rolcreaterole OR pg_has_role(r.oid,
+  'epigraph_identity_attestor', 'MEMBER'));`. No binary depends on it.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **351**: `papers_document_key_fold_index` (backlog cc71759f). The `papers` document-key lookup
+  (`repos::paper::document_key_rows_in_sql`, under every `get_or_create`) scanned `papers` on a
+  bare-DOI miss (a new paper's first ingest): its case-variant arm folded with `lower`, which no
+  index served. A plain `lower(doi)` index does not serve the application either: `papers` is FORCE
+  RLS (246) and `pg_catalog.lower` is not LEAKPROOF, so under the policy the comparison is no index
+  condition (measured; 335's trap). Adds `public.epigraph_document_key_fold(text)` (`SELECT
+  pg_catalog.lower(p_key)`, `LANGUAGE sql IMMUTABLE STRICT LEAKPROOF PARALLEL SAFE SECURITY
+  INVOKER`, `SET search_path = pg_catalog, pg_temp` so it is never inlined; EXECUTE stays with
+  PUBLIC; owner `epigraph_maintenance` when present, registered in `tenancy_backfill`'s
+  `INVOKER_EXEMPT`) and `papers_doi_fold_idx ON papers (epigraph_document_key_fold(doi))`.
+  LEAKPROOF holds because `doi` is bounded: every value is already a btree key (246), so it sits
+  far below `lower`'s value-dependent allocation errors; the function is for such bounded columns
+  only (its COMMENT says so). The
+  lookup's arm folds with the function (the per-row recall filter keeps `lower`). Transactional, not
+  CONCURRENTLY (one slot for the function and the index): the build holds a SHARE lock on `papers`
+  (writes wait) for one pass over `doi`, behind `SET LOCAL lock_timeout = '3s'`. Precondition LKP02
+  (42501): the runner is a superuser (only a superuser may declare LEAKPROOF). Pinned by
+  `epigraph-db/tests/papers_document_key_fold_index.rs` (the plan under `SET ROLE epigraph_app`,
+  with a plain-`lower` calibration). Measure first: `SELECT count(*),
+  pg_size_pretty(pg_relation_size('papers')) FROM papers` (bounds the lock) and `SELECT
+  max(octet_length(doi)), max(octet_length(lower(doi))) FROM papers` (lowercasing can lengthen a
+  key; one near the btree tuple limit would fail the build, or later an INSERT with 54000). Undo:
+  `docs/runbooks/351-undo.sql` (roll the binary back first). **Deploy order:** migrate BEFORE the
+  binary of this change (its lookup names the function); an older binary runs on 351 unchanged.
 
 ## `-- no-transaction` migrations
 

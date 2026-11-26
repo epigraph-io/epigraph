@@ -732,6 +732,7 @@ const TOOLS: Surface = Surface {
         "admin_session_or_deferral(",
         "supersede_session_or_deferral(",
     ],
+    conn_closure_macros: &[],
     marker_spend: call_spends_viewer,
 };
 
@@ -758,9 +759,12 @@ fn call_spends_viewer(region: &str) -> bool {
 /// [`viewer_carrier_structs_are_reviewed`]). The `#[tool]` methods
 /// in `server.rs` are not in it: each resolves the viewer and hands it to a fn
 /// here, and none touches a pool, a connection or a repository itself
-/// (measured 2026-11-22). Viewer-taking fns in other crates a tool calls
-/// (`epigraph-engine`, `epigraph-ingest-executor`) are not followed either: a
-/// call that hands one the viewer counts as viewed here.
+/// (measured 2026-11-22). Viewer-taking fns in other crates a tool calls are
+/// not followed: a call that hands one the viewer counts as viewed here, and
+/// the callee's own body is measured by its crate's register
+/// (`epigraph-engine/tests/viewer_calls_register.rs`,
+/// `epigraph-ingest-executor/tests/viewer_calls_register.rs`, backlog
+/// 37e68f5b; the repo layer's is `epigraph-db/tests/visibility_lint.rs`).
 ///
 /// Asserted as an exact multiset per fn. The comment above each entry is the
 /// review, by reason class:

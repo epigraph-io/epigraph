@@ -71,7 +71,6 @@ from maintenance_dsn import maintenance_dsn  # noqa: E402  (same sys.path assump
 
 psycopg2.extras.register_uuid()
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 REDUCER_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "umap_reducer.pkl")
 UMAP_DIM = 32  # n_components of the UMAP fit; cluster_centroids.umap_centroid is vector(32)
 
@@ -499,8 +498,8 @@ def main():
         description="UMAP-based claim clustering with coordinate frame")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=None,
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL; no built-in default)",
     )
     parser.add_argument("--sample-size", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=100000)
@@ -514,6 +513,9 @@ def main():
     parser.add_argument("--all-claims", action="store_true",
                         help="Seed from all current claims (default: atomic leaves only)")
     args = parser.parse_args()
+    # No built-in default (backlog 62bdae04): with no flag and no
+    # environment, maintenance_dsn() refuses instead of reaching a live database.
+    args.database_url = args.database_url or maintenance_dsn()
 
     conn = psycopg2.connect(args.database_url)
     theme_lib.set_statement_timeout(conn, ms=900000)  # 15 min ceiling per statement

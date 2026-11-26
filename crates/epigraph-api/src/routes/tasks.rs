@@ -199,14 +199,24 @@ pub async fn get_task(
 #[cfg(feature = "db")]
 const DEFAULT_TASK_LIMIT: i64 = 50;
 
-/// The page size a `limit` query value resolves to: the default when absent,
-/// clamped to the bounds the other list handlers use. A negative or zero value
-/// used to reach SQL `LIMIT` as written, and a large one was unbounded.
+/// The page size a `limit` query value resolves to for the state and pending
+/// listings: the default when absent, clamped to the bounds the other list
+/// handlers use. A negative or zero value used to reach SQL `LIMIT` as
+/// written, and a large one was unbounded.
 #[cfg(feature = "db")]
 fn list_limit(requested: Option<i64>) -> i64 {
     requested
         .unwrap_or(DEFAULT_TASK_LIMIT)
         .clamp(super::claims::MIN_PAGE_LIMIT, super::claims::MAX_PAGE_LIMIT)
+}
+
+/// The cap a `limit` query value puts on a `workflow_id` listing: none when
+/// absent (a workflow listing has always returned every task of the
+/// workflow, and defaulting a cap would silently truncate it), otherwise the
+/// same clamp as [`list_limit`]. The value used to be ignored on this branch.
+#[cfg(feature = "db")]
+fn workflow_list_limit(requested: Option<i64>) -> Option<i64> {
+    requested.map(|limit| list_limit(Some(limit)))
 }
 
 /// List tasks
@@ -218,8 +228,11 @@ fn list_limit(requested: Option<i64>) -> i64 {
 /// - `state` alone returns tasks in exactly that state; with no `state` and no
 ///   `workflow_id` the pending tasks (`created` / `queued`) are returned.
 /// - `limit` (default 50) is clamped to `[MIN_PAGE_LIMIT, MAX_PAGE_LIMIT]` and
-///   applies to those two listings. A `workflow_id` listing returns every task
-///   of the workflow, as before.
+///   applies to those two listings.
+/// - `workflow_id` returns the workflow's tasks oldest first, only those in
+///   `state` when it is also given. A `limit` there is clamped the same way
+///   and applied after the state filter; with no `limit` every matching task
+///   of the workflow is returned, as before.
 ///
 /// Requires `tasks:read`; a request with no `AuthContext` is refused (401).
 #[cfg(feature = "db")]
@@ -235,23 +248,28 @@ pub async fn list_tasks(
     };
     crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
 
-    let limit = list_limit(params.limit);
-
     let rows = match (params.state.as_deref(), params.workflow_id) {
-        // Filter by workflow_id
-        (None, Some(wf_id)) => TaskRepository::list_by_workflow(&state.db_pool, wf_id).await?,
+        // Filter by workflow_id (and by state when given), in SQL. `limit`
+        // used to be ignored here, and the state filter ran in memory after
+        // the fetch, so a cap could not have been applied correctly.
+        (state_filter, Some(wf_id)) => {
+            TaskRepository::list_by_workflow(
+                &state.db_pool,
+                wf_id,
+                state_filter,
+                workflow_list_limit(params.limit),
+            )
+            .await?
+        }
         // Filter by state: exactly the requested state. This arm used to
         // ignore the value and return the pending list for every state.
         (Some(state_filter), None) => {
-            TaskRepository::list_by_state(&state.db_pool, state_filter, limit).await?
+            TaskRepository::list_by_state(&state.db_pool, state_filter, list_limit(params.limit))
+                .await?
         }
         // No filters — return pending tasks up to limit
-        (None, None) => TaskRepository::list_pending(&state.db_pool, limit).await?,
-        // Both filters — workflow takes precedence, then we filter by state in memory
-        (Some(state_filter), Some(wf_id)) => {
-            let wf_rows = TaskRepository::list_by_workflow(&state.db_pool, wf_id).await?;
-            let sf = state_filter.to_string();
-            wf_rows.into_iter().filter(|r| r.state == sf).collect()
+        (None, None) => {
+            TaskRepository::list_pending(&state.db_pool, list_limit(params.limit)).await?
         }
     };
 
@@ -442,5 +460,15 @@ mod tests {
         assert_eq!(list_limit(Some(1_000_000)), MAX_PAGE_LIMIT);
         assert_eq!(list_limit(Some(0)), 1);
         assert_eq!(list_limit(Some(-5)), 1);
+    }
+
+    /// A workflow listing is uncapped without `limit` and clamped with it.
+    #[test]
+    fn workflow_list_limit_is_optional_and_clamped() {
+        assert_eq!(workflow_list_limit(None), None);
+        assert_eq!(workflow_list_limit(Some(10)), Some(10));
+        assert_eq!(workflow_list_limit(Some(1_000_000)), Some(MAX_PAGE_LIMIT));
+        assert_eq!(workflow_list_limit(Some(0)), Some(1));
+        assert_eq!(workflow_list_limit(Some(-5)), Some(1));
     }
 }

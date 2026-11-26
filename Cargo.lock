@@ -1830,6 +1830,7 @@ dependencies = [
  "ciborium",
  "openssl",
  "serde",
+ "serde_cbor_2",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
