@@ -80,6 +80,16 @@ struct Args {
     /// burning LLM tokens. Forces --dry-run.
     #[arg(long)]
     count_only: bool,
+
+    /// Skip the stance-seeking probe stage (a04248cf). By default, when
+    /// `OPENAI_API_KEY` is set, each seed is rewritten into negated and
+    /// direction-inverted probe texts, which are embedded with the model that
+    /// produced `claims.embedding` and ANN-searched, so a contradicting claim
+    /// outside the seed's own neighbourhood can still be retrieved. Without the
+    /// key the stage is skipped. An embedding failure fails the run (nonzero
+    /// exit, seeds not stamped); pass this flag to sweep without probes.
+    #[arg(long)]
+    no_stance_probe: bool,
 }
 
 #[tokio::main]
@@ -147,6 +157,22 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Box::new(RerankBridgesClient::new(pool.clone()))
     };
+    // Only the OpenAI provider: it is the model `claims.embedding` was
+    // written with, and a probe embedded in any other space would retrieve
+    // noise. `embedding_service()` returns None without a key, never a mock.
+    let probe_embedder = if args.no_stance_probe {
+        None
+    } else {
+        epigraph_cli::embedding_service()
+    };
+    eprintln!(
+        "cross_source_sweep: stance-probe stage {}",
+        match (&probe_embedder, args.no_stance_probe) {
+            (Some(_), _) => "on",
+            (None, true) => "off (--no-stance-probe)",
+            (None, false) => "off (OPENAI_API_KEY unset)",
+        }
+    );
     let report = run_pipeline(
         &pool,
         RunInputs {
@@ -154,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
             cfg,
             verifier,
             auto_promote,
-            probe_embedder: None,
+            probe_embedder,
         },
     )
     .await?;
@@ -184,6 +210,18 @@ async fn main() -> anyhow::Result<()> {
             "retrieved_pairs":     report.retrieved_pairs,
             "ineligible_dropped":  report.ineligible_dropped,
             "same_source_dropped": report.same_source_dropped,
+            // Stance-probe stage (a04248cf): what the probes retrieved, what
+            // only they retrieved, and how much of that survived the filters
+            // and the score band. probe_only_kept - probe_only_routed were
+            // retrieved and then rejected on score.
+            "stance_probe":          report.stance_probe_enabled,
+            "probe_seeds":           report.stance_probe.seeds_probed,
+            "probe_texts":           report.stance_probe.probe_texts,
+            "probe_seeds_skipped":   report.stance_probe.seeds_skipped,
+            "probe_retrieved_pairs": report.probe_retrieved_pairs,
+            "probe_only_pairs":      report.probe_only_pairs,
+            "probe_only_kept":       report.probe_only_kept,
+            "probe_only_routed":     report.probe_only_routed,
             // Precision stage.
             "scanned_pairs": report.scanned_pairs,
             "promoted":      report.promoted,
