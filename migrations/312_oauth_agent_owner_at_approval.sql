@@ -10,16 +10,17 @@
 -- 'active' ORDER BY created_at LIMIT 1`, its error swallowed). Nothing about
 -- the registration names that human: the request is unauthenticated. It ran
 -- only because 001's `agents_must_have_owner` CHECK refuses an agent row with
--- a NULL owner. Two consequences:
+-- a NULL owner. Consequences:
 --
---   * the token minted for the agent once approved carries that human's
+--   * LIVE: the token minted for the agent once approved carries that human's
 --     `oauth_clients.id` as its `owner_id` (the `require_owner_or_admin`
 --     principal, and the principal a few legacy routes fall back to);
---   * `OAuthClientRepository::suspend_by_owner(<that human>)` suspends every
---     approved self-registered agent with it.
---
--- And when no human was active, the swallowed lookup returned NULL and the
--- CHECK made every agent registration a 500.
+--   * LATENT: `OAuthClientRepository::suspend_by_owner(<that human>)` would
+--     suspend every approved self-registered agent with it. That function
+--     has no caller in this repository today (the operator's
+--     `suspend-client` suspends one row), so nothing has done so yet;
+--   * when no human was active, the swallowed lookup returned NULL and the
+--     CHECK made every agent registration a 500.
 --
 -- Agent registrations are `pending` since PR-02 and are approved only by a
 -- maintenance session through `epigraph_oauth_client_approve` (188), so the

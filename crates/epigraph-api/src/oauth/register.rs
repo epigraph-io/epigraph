@@ -316,10 +316,10 @@ pub async fn register_endpoint(
             // owner_id: NONE, for every client type (backlog be024524). The
             // request is unauthenticated, so nothing in it names who answers
             // for the client. The agent arm used to stamp the OLDEST ACTIVE
-            // HUMAN client here, so suspending that human
-            // (`OAuthClientRepository::suspend_by_owner`) suspended every
-            // approved self-registered agent, and the agent's token carried
-            // that human as its `owner_id`. The operator names the owner at
+            // HUMAN client here, so the agent's token carried that human as
+            // its `owner_id` (and `OAuthClientRepository::suspend_by_owner`
+            // on that human, which nothing calls today, would have suspended
+            // every approved self-registered agent). The operator names the owner at
             // approval instead: migration 312's
             // `epigraph_oauth_client_approve(id, scopes, approved_by, owner)`
             // refuses an agent approval without one, and 312's

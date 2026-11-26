@@ -3,11 +3,13 @@
 //!
 //! Before 312, `/oauth/register` stamped every self-registered agent with the
 //! OLDEST ACTIVE HUMAN client as its `owner_id` (001's `agents_must_have_owner`
-//! refused a NULL), so `OAuthClientRepository::suspend_by_owner(<that human>)`
-//! suspended every approved self-registered agent, and the agent's token
-//! carried that human as its owner. 312 lets a NOT-YET-ACTIVE agent have no
-//! owner and adds a four-argument `epigraph_oauth_client_approve` that must
-//! name the owner of an agent.
+//! refused a NULL), so the agent's token carried that human as its owner, and
+//! `OAuthClientRepository::suspend_by_owner(<that human>)` (no caller today)
+//! would have suspended every approved self-registered agent. 312 lets a
+//! NOT-YET-ACTIVE agent have no owner, adds a four-argument
+//! `epigraph_oauth_client_approve` that must name the owner of an agent (and
+//! only of an agent), and clears the guessed owner of every pending
+//! self-registered agent it finds.
 //!
 //! What is pinned, each on a database migrated 001 -> head:
 //! * the approval naming an owner writes it (over an inherited one too), and

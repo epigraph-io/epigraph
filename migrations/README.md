@@ -4734,9 +4734,10 @@ restart.
   nothing changes.
 - **312**: `oauth_agent_owner_at_approval` (backlog be024524). `/oauth/register` stamped every
   self-registered agent client's `owner_id` with the OLDEST ACTIVE HUMAN client (001's
-  `agents_must_have_owner` refused NULL), so suspending that human by owner suspended every approved
-  self-registered agent, and the agent's token carried that human as its owner; with no active human
-  every agent registration was a 500. Re-states `agents_must_have_owner` as "an ACTIVE agent has an
+  `agents_must_have_owner` refused NULL), so the agent's token carried that human as its owner (and
+  `suspend_by_owner` on that human, which nothing calls today, would have suspended every approved
+  self-registered agent); with no active human every agent registration was a 500. Re-states
+  `agents_must_have_owner` as "an ACTIVE agent has an
   owner" (a pending, suspended or revoked one may have none; precondition: 001's definition, else
   55000) and adds the overload `epigraph_oauth_client_approve(id, granted_scopes, approved_by,
   owner) -> boolean` (172's form, owned by `epigraph_maintenance`, no PUBLIC or application EXECUTE):

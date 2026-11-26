@@ -4,10 +4,11 @@
 //!
 //! The agent arm used to stamp `owner_id` with the OLDEST ACTIVE HUMAN client
 //! (an inline lookup whose error it swallowed). The request is
-//! unauthenticated, so nothing about it names that human; yet suspending that
-//! human (`OAuthClientRepository::suspend_by_owner`) suspended every approved
-//! self-registered agent, and the agent's token carried that human as its
-//! owner. Now the registration writes no owner, and the operator names one at
+//! unauthenticated, so nothing about it names that human; yet the agent's
+//! token carried that human as its owner (and
+//! `OAuthClientRepository::suspend_by_owner` on that human, which nothing
+//! calls today, would have suspended every approved self-registered agent).
+//! Now the registration writes no owner, and the operator names one at
 //! approval (312's four-argument `epigraph_oauth_client_approve`).
 //!
 //! Fails on the old registration: the row's owner is the oldest human, the
