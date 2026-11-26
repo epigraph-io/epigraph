@@ -874,15 +874,15 @@ impl GroupMembershipRepository {
     /// authority it cannot verify, and it never breaks every read of a binary
     /// deployed one step ahead of its migration.
     ///
-    /// # The statement stamps `agent_id` as its own principal (migration 309)
+    /// # The statement stamps `agent_id` as its own principal (migration 346)
     ///
-    /// Since migration 309 the definer answers only for the session principal
+    /// Since migration 346 the definer answers only for the session principal
     /// (or a maintenance session), as 236's live-membership read does. This
     /// runs inside `Viewer::resolve`, before any stamp exists, so it stamps
     /// `agent_id` for its one statement exactly as
     /// [`Self::list_live_for_agent`] does (`set_config(..., true)`, passed
     /// to the definer as its argument, gone at the statement's end). Against
-    /// a database below 309 the stamp changes nothing. Callers pass the
+    /// a database below 346 the stamp changes nothing. Callers pass the
     /// principal they are resolving.
     ///
     /// # Errors

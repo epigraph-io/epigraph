@@ -19,7 +19,7 @@
 //!   team that is not active, a group that is not a team or community;
 //! * `epigraph_readable_teams` answers `own` for the agent's own teams and
 //!   `operator` only for the human's, and is EXECUTE-able by `epigraph_app`
-//!   (answering, since migration 309, only for the stamped principal).
+//!   (answering, since migration 346, only for the stamped principal).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -246,7 +246,7 @@ async fn readable_teams_says_own_or_operator_and_lists_teams_only(pool: PgPool) 
     );
 }
 
-/// `epigraph_app` may execute the definer, and since migration 309 it answers
+/// `epigraph_app` may execute the definer, and since migration 346 it answers
 /// only for the session principal: stamped as the agent it lists the agent's
 /// one readable team, unstamped it lists nothing.
 #[sqlx::test(migrations = "../../migrations")]

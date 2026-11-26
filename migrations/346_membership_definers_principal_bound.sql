@@ -1,4 +1,4 @@
--- 309: the team lists `epigraph_writable_teams(agent)` /
+-- 346: the team lists `epigraph_writable_teams(agent)` /
 -- `epigraph_readable_teams(agent)` answer only for the session principal (the
 -- writable list also for the principal's operated agent), and
 -- `epigraph_is_group_admin(group)` decides on the principal's LIVE
@@ -107,7 +107,7 @@
 --
 -- A binary built before this file calls `epigraph_readable_teams` (every
 -- viewer resolve) and `epigraph_writable_teams` (every claim write's
--- visibility resolution) on an UNSTAMPED pool. On a database with 309 it gets
+-- visibility resolution) on an UNSTAMPED pool. On a database with 346 it gets
 -- no rows: an operated agent silently stops reading its human's teams, every
 -- write that names no visibility lands private instead of in the author's
 -- team, and every explicit team write is refused (fail-closed, but a silent
@@ -135,7 +135,7 @@
 -- role-guarded as every such block since 060.
 --
 -- ===================================================================
--- UNDO: `docs/runbooks/309-undo.sql` (re-states the three predecessor bodies).
+-- UNDO: `docs/runbooks/346-undo.sql` (re-states the three predecessor bodies).
 -- Roll the binaries back only AFTER the undo if they predate this file.
 -- **Applied to throwaway databases only, NOT to any deployed database.**
 -- ===================================================================
@@ -155,7 +155,7 @@ BEGIN
     SELECT md5(p.prosrc) INTO v_admin FROM pg_catalog.pg_proc p
      WHERE p.oid = to_regprocedure('public.epigraph_is_group_admin(uuid)');
     IF v_writable IS DISTINCT FROM 'd675bc199f78f07db83e1268ef9c5eaf' THEN
-        RAISE EXCEPTION '309: epigraph_writable_teams(uuid) is not the body 309 re-states '
+        RAISE EXCEPTION '346: epigraph_writable_teams(uuid) is not the body 346 re-states '
                         '(236''s, md5 d675bc199f78f07db83e1268ef9c5eaf); found md5 %. Another '
                         'migration re-bodied it; nothing was changed',
                         COALESCE(v_writable, '(absent)')
@@ -164,7 +164,7 @@ BEGIN
                          'deltas instead of this one.';
     END IF;
     IF v_readable IS DISTINCT FROM 'd98f6b56fa1fb3b40d831501a0a44106' THEN
-        RAISE EXCEPTION '309: epigraph_readable_teams(uuid) is not the body 309 re-states '
+        RAISE EXCEPTION '346: epigraph_readable_teams(uuid) is not the body 346 re-states '
                         '(236''s, md5 d98f6b56fa1fb3b40d831501a0a44106); found md5 %. Another '
                         'migration re-bodied it; nothing was changed',
                         COALESCE(v_readable, '(absent)')
@@ -173,7 +173,7 @@ BEGIN
                          'deltas instead of this one.';
     END IF;
     IF v_admin IS DISTINCT FROM 'd7cd46f92f9d8b93d7562ace0d547205' THEN
-        RAISE EXCEPTION '309: epigraph_is_group_admin(uuid) is not the body 309 re-states '
+        RAISE EXCEPTION '346: epigraph_is_group_admin(uuid) is not the body 346 re-states '
                         '(077''s, md5 d7cd46f92f9d8b93d7562ace0d547205); found md5 %. Another '
                         'migration re-bodied it; nothing was changed',
                         COALESCE(v_admin, '(absent)')
@@ -201,7 +201,7 @@ SET search_path = pg_catalog, pg_temp AS $$
            CASE WHEN g.id IN (SELECT o.group_id FROM own o) THEN 'own' ELSE 'operator' END
       FROM public.groups g, h
      WHERE p_agent IS NOT NULL
-       -- 309: only for the session principal, the live human operator holding
+       -- 346: only for the session principal, the live human operator holding
        -- a live operator link to `p_agent` (209's 'operator' admission), a
        -- maintenance session, or a superuser session; anyone else gets no rows.
        AND COALESCE(
@@ -248,7 +248,7 @@ SET search_path = pg_catalog, pg_temp AS $$
            CASE WHEN g.id IN (SELECT o.group_id FROM own o) THEN 'own' ELSE 'operator' END
       FROM public.groups g
      WHERE p_agent IS NOT NULL
-       -- 309: only for the session principal, a maintenance session, or a
+       -- 346: only for the session principal, a maintenance session, or a
        -- superuser session; anyone else gets no rows.
        AND COALESCE(
              p_agent = public.epigraph_principal_id()
@@ -290,7 +290,7 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_is_group_admin(uuid) '
                 'OWNER TO epigraph_maintenance';
     ELSE
-        RAISE NOTICE 'epigraph tenancy: role epigraph_maintenance absent; the 309 function '
+        RAISE NOTICE 'epigraph tenancy: role epigraph_maintenance absent; the 346 function '
                      'bodies stay owned by the migration runner.';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN

@@ -1,9 +1,9 @@
 -- ===================================================================
--- 309-undo.sql: take migration 309 (the team lists bound to the session
+-- 346-undo.sql: take migration 346 (the team lists bound to the session
 -- principal; `epigraph_is_group_admin` over live membership) back out, in ONE
 -- transaction, on the migration (superuser) DSN.
 --
--- WHAT IT DOES: re-states the three bodies 309 replaced, verbatim from their
+-- WHAT IT DOES: re-states the three bodies 346 replaced, verbatim from their
 -- predecessors (CREATE OR REPLACE keeps owner and grants):
 --   * `epigraph_writable_teams` (236's body: answers for ANY agent id again,
 --     on the application role too);
@@ -11,14 +11,14 @@
 --   * `epigraph_is_group_admin` (077's body: a raw unrevoked admin row, a
 --     lapsed one included, on 077's `public, pg_temp` path).
 --
--- ORDER: binaries built with 309 work against the restored bodies unchanged
+-- ORDER: binaries built with 346 work against the restored bodies unchanged
 -- (they stamp the principal they ask about, which 236's bodies ignore). Roll
--- back binaries that predate 309 only AFTER this file: on a database still at
--- 309 an operated agent loses its human's teams and writes resolve no team.
+-- back binaries that predate 346 only AFTER this file: on a database still at
+-- 346 an operated agent loses its human's teams and writes resolve no team.
 --
--- It leaves 309's `_sqlx_migrations` row. Re-introducing the bind is a NEW
--- migration, never a re-run of 309 (or delete the row:
---   DELETE FROM _sqlx_migrations WHERE version = 309;).
+-- It leaves 346's `_sqlx_migrations` row. Re-introducing the bind is a NEW
+-- migration, never a re-run of 346 (or delete the row:
+--   DELETE FROM _sqlx_migrations WHERE version = 346;).
 -- ===================================================================
 
 BEGIN;

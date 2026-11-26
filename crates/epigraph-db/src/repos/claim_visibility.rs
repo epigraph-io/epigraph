@@ -311,7 +311,7 @@ impl ClaimRepository {
     /// The TEAM groups `agent` may write a claim into, with `"own"` (its own
     /// writer/admin membership) or `"operator"` (its live human writes it,
     /// owner decision D-V3). Read through migration 206's definer on `conn`
-    /// AS IT IS STAMPED: since migration 309 the definer answers only when
+    /// AS IT IS STAMPED: since migration 346 the definer answers only when
     /// `agent` is the session principal, when the principal is the live human
     /// operator holding a live (not retired) operator link to `agent`, or on
     /// a maintenance or superuser session. Asked about anyone else, it
@@ -337,7 +337,7 @@ impl ClaimRepository {
     /// [`Self::writable_teams`] for `agent` asked as ITS OWN principal: the
     /// author of the write being resolved.
     ///
-    /// Since migration 309 the definer answers only for the session principal
+    /// Since migration 346 the definer answers only for the session principal
     /// (or that agent's live operator). The visibility resolution runs on an
     /// unstamped pool connection before the write's stamped transaction
     /// exists (the team it picks must be stamped into that transaction), so
@@ -348,11 +348,11 @@ impl ClaimRepository {
     /// `ROLLBACK` around the read, and on one already inside a transaction
     /// (sqlx then issues a `SAVEPOINT`) the rollback to the savepoint restores
     /// the caller's own stamp. So the connection's principal after the call is
-    /// what it was before, in both shapes. Against a database below 309 the
+    /// what it was before, in both shapes. Against a database below 346 the
     /// stamp changes nothing.
     ///
     /// As with 236's `list_live_for_agent`, the stamp is a transport, not an
-    /// authority (a holder of the application DSN can set it): what 309
+    /// authority (a holder of the application DSN can set it): what 346
     /// removes is the ambient answer for an agent the caller did not stamp.
     /// The callers pass the author of the write they are resolving.
     ///

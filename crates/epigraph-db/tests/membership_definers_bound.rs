@@ -1,4 +1,4 @@
-//! Migration 309: the team lists answer only for the session principal (the
+//! Migration 346: the team lists answer only for the session principal (the
 //! writable list also for the principal's operated agent), and group-admin
 //! decisions follow LIVE membership. Backlogs 1c5edc26 and a91d957d.
 //!
@@ -508,7 +508,7 @@ async fn a_lapsed_admin_is_not_a_group_admin_on_the_app_role(pool: PgPool) {
 /// GRM06 guard on `groups`) and no mark on it ever lands; what this pins is
 /// the ADMIN GATE, which runs before that guard: the lapsed admin is refused
 /// there (GRA01), and the live owner passes it and is stopped only by the
-/// later guard (GRM06). Before 309 the lapsed admin passed the gate too.
+/// later guard (GRM06). Before 346 the lapsed admin passed the gate too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_lapsed_admin_cannot_mark_the_reseal_obligation(pool: PgPool) {
     let a = admins(&pool, "reseal").await;
@@ -630,15 +630,15 @@ fn read_repo_file(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// `docs/runbooks/309-undo.sql` restores the three predecessor bodies (the
-/// md5s 309's precondition reads), owners kept; after it an unstamped
+/// `docs/runbooks/346-undo.sql` restores the three predecessor bodies (the
+/// md5s 346's precondition reads), owners kept; after it an unstamped
 /// application session reads another agent's teams again and a lapsed admin
 /// is an admin again (236's and 077's behaviour, which is what an undo
-/// means). 309's own file then applies cleanly over the restored bodies, and
+/// means). 346's own file then applies cleanly over the restored bodies, and
 /// refuses (55000, nothing changed) over a body it was not written from.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_309_undo_restores_the_predecessors_and_309_reapplies_over_them(pool: PgPool) {
-    sqlx::raw_sql(&read_repo_file("docs/runbooks/309-undo.sql"))
+async fn the_346_undo_restores_the_predecessors_and_346_reapplies_over_them(pool: PgPool) {
+    sqlx::raw_sql(&read_repo_file("docs/runbooks/346-undo.sql"))
         .execute(&pool)
         .await
         .expect("apply the undo");
@@ -662,18 +662,18 @@ async fn the_309_undo_restores_the_predecessors_and_309_reapplies_over_them(pool
         "after the undo a lapsed admin row decides again"
     );
 
-    let forward = read_repo_file("migrations/309_membership_definers_principal_bound.sql");
+    let forward = read_repo_file("migrations/346_membership_definers_principal_bound.sql");
     sqlx::raw_sql(&forward)
         .execute(&pool)
         .await
-        .expect("309 applies over the bodies the undo restores");
+        .expect("346 applies over the bodies the undo restores");
     assert!(teams_as(&pool, "epigraph_app", None, WRITABLE, w.agent)
         .await
         .is_empty());
     assert!(!is_admin_as(&pool, a.lapsed, a.group).await);
 
     // Over any other body: refused, nothing changed.
-    sqlx::raw_sql(&read_repo_file("docs/runbooks/309-undo.sql"))
+    sqlx::raw_sql(&read_repo_file("docs/runbooks/346-undo.sql"))
         .execute(&pool)
         .await
         .expect("undo again");
@@ -688,7 +688,7 @@ async fn the_309_undo_restores_the_predecessors_and_309_reapplies_over_them(pool
     let refused = sqlx::raw_sql(&forward)
         .execute(&pool)
         .await
-        .expect_err("309 refuses a body it was not written from");
+        .expect_err("346 refuses a body it was not written from");
     let code = match &refused {
         sqlx::Error::Database(e) => e.code().map(|c| c.to_string()),
         _ => None,

@@ -14,7 +14,7 @@
 //! principal for its one statement and must leave nothing on the connection),
 //! the definer callers that ask about another agent (`epigraph_writable_teams`,
 //! `epigraph_readable_teams`, re-pointed at the unbound twin, and bound to the
-//! principal themselves since migration 309), and a maintenance session.
+//! principal themselves since migration 346), and a maintenance session.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -305,11 +305,11 @@ async fn viewer_resolve_stamps_its_principal_for_one_statement_only(pool: PgPool
 }
 
 /// The team lists ask the unbound twin for the agent they are given, and since
-/// migration 309 (backlog 1c5edc26) they are bound themselves: on an
+/// migration 346 (backlog 1c5edc26) they are bound themselves: on an
 /// application session, unstamped or stamped as another agent A,
 /// `epigraph_writable_teams(B)` and `epigraph_readable_teams(B)` answer no
 /// rows; stamped as B they name B's team (`own`), and so does a maintenance
-/// session. Before 309 every application session read B's team here (236
+/// session. Before 346 every application session read B's team here (236
 /// pinned that residual in this test).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_team_definers_answer_only_the_principal_on_an_app_session(pool: PgPool) {
@@ -430,7 +430,7 @@ async fn the_unbound_twin_is_maintenance_only_and_every_caller_is_listed(pool: P
     assert_eq!(
         callers("%epigraph\\_live\\_memberships(%").await,
         vec![
-            // 309: the principal's live admin rows.
+            // 346: the principal's live admin rows.
             "epigraph_is_group_admin(uuid)".to_string(),
             // 263: the caller's own groups, read for epigraph_principal_id().
             "epigraph_my_groups()".to_string(),

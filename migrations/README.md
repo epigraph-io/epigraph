@@ -3470,7 +3470,7 @@ restart.
   only once every viewer-resolving binary is upgraded (or ship the binary change in a
   release before the one that embeds 236). The team lists `epigraph_writable_teams(agent)` /
   `epigraph_readable_teams(agent)` still answer for any agent on the application role (a
-  residual 236 left open; 309 binds both to the principal). **Applied to throwaway databases only, NOT to any
+  residual 236 left open; 346 binds both to the principal). **Applied to throwaway databases only, NOT to any
   deployed database.**
 - **237**: public `workflows_update_owner_scope` (backlog 524f89c1). 183's
   `workflows_update` admitted an UPDATE of any row the session READS (public rows, and
@@ -5044,7 +5044,7 @@ restart.
   definer call is 42883 before 345. **Measure first** whether anything writes `bp_messages` on
   the application DSN (`pg_stat_user_tables` n_tup_ins / n_tup_upd / n_tup_del for
   `bp_messages`, and `max(updated_at)`); this tree has no such writer.
-- **309**: `membership_definers_principal_bound` (backlogs 1c5edc26, a91d957d). Two decisions in
+- **346**: `membership_definers_principal_bound` (backlogs 1c5edc26, a91d957d). Two decisions in
   one wave, both re-stating membership definers. (1) 236's `epigraph_writable_teams(agent)` and
   `epigraph_readable_teams(agent)` answer only for the session principal, a maintenance session
   or a superuser session, and no rows for anyone else: an application session no longer lists
@@ -5072,11 +5072,11 @@ restart.
   operator arm, 209 on the app role, the viewer resolve and the visibility resolution on the
   app role, the lapsed admin's predicate, re-key mark and privatization checks, the undo and
   the precondition), `live_memberships_principal_bound.rs` (the flipped residual test, the
-  caller list) and `epigraph-api/tests/packet_author_team_oracle.rs` (the packet author gate). Undo: `docs/runbooks/309-undo.sql`. **Deploy order: BINARIES FIRST**, as 236: a
-  binary that predates 309 asks both lists on an unstamped pool and gets no rows, so an
+  caller list) and `epigraph-api/tests/packet_author_team_oracle.rs` (the packet author gate). Undo: `docs/runbooks/346-undo.sql`. **Deploy order: BINARIES FIRST**, as 236: a
+  binary that predates 346 asks both lists on an unstamped pool and gets no rows, so an
   operated agent stops reading its human's teams and a write that names no visibility lands
   private (silent, fail-closed). That includes every service linking an older `epigraph-db`
-  (bump its pin first). Unset `EPIGRAPH_MIGRATE_ON_BOOT` for this rollout and apply 309 with
+  (bump its pin first). Unset `EPIGRAPH_MIGRATE_ON_BOOT` for this rollout and apply 346 with
   `epigraph-migrate` once every such binary is upgraded. **Applied to throwaway databases only,
   NOT to any deployed database.**
 
