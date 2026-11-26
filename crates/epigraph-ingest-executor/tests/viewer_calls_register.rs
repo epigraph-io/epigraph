@@ -34,6 +34,7 @@ const EXECUTOR: Surface = Surface {
     state_db_methods: &[],
     viewer_ctors: &["Viewer::resolve("],
     conn_ctors: &[],
+    conn_closure_macros: &[],
     marker_spend: call_spends_viewer,
 };
 
@@ -269,6 +270,29 @@ fn the_per_call_scanner_sees_the_whole_executor_viewer_surface() {
     assert!(
         calls >= 47,
         "found {calls} database calls in them; measured 47 on 2026-11-26"
+    );
+}
+
+/// No macro under `src/` binds a connection to a closure parameter, so
+/// [`EXECUTOR`] lists none: the scanner sees a call inside such a closure only
+/// when the macro is on the surface (the engine's `repair_with_audit!`). A
+/// new one must be added there.
+#[test]
+fn every_executor_macro_binding_a_closure_connection_is_on_the_surface() {
+    let mut found: Vec<String> = executor_files()
+        .iter()
+        .flat_map(|(_, src)| viewer_calls::closure_conn_macros(&viewer_calls::views(src).0))
+        .collect();
+    found.sort();
+    let want: Vec<String> = EXECUTOR
+        .conn_closure_macros
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect();
+    assert_eq!(
+        found, want,
+        "an executor macro takes a closure-shaped argument (`|$x:ident|`): if it binds a \
+         connection to it, add it to EXECUTOR.conn_closure_macros"
     );
 }
 

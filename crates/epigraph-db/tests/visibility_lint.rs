@@ -5284,6 +5284,7 @@ const REPOS: Surface = Surface {
     state_db_methods: &[],
     viewer_ctors: &["Viewer::resolve("],
     conn_ctors: &[],
+    conn_closure_macros: &[],
     marker_spend: call_spends_viewer,
 };
 

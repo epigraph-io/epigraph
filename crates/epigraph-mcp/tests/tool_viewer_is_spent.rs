@@ -732,6 +732,7 @@ const TOOLS: Surface = Surface {
         "admin_session_or_deferral(",
         "supersede_session_or_deferral(",
     ],
+    conn_closure_macros: &[],
     marker_spend: call_spends_viewer,
 };
 

@@ -75,6 +75,14 @@ pub struct Surface {
     /// Extra connection constructors, beyond [`CONNECTION_CTORS`], whose `let`
     /// binding is a connection (`admin_cascade_session(`).
     pub conn_ctors: &'static [&'static str],
+    /// Macros (`repair_with_audit!`) that open a connection and bind it to the
+    /// parameter of their FIRST closure-shaped argument
+    /// (`repair_with_audit!(admin, trigger, |tx| Repo::f(&mut tx, ..), ..)`).
+    /// In an invocation of one, that parameter is a connection, so a call
+    /// handed `&mut tx` or `tx` inside the closure is a database call. Without
+    /// this the parameter is an unknown name, and only `&mut *tx` is seen.
+    /// [`closure_conn_macros`] lists the candidates a source defines.
+    pub conn_closure_macros: &'static [&'static str],
     /// The per-call marker-spend predicate, run on the RAW text of a call's
     /// region: the lint's `spend_views` (to drop comments) followed by
     /// [`predicate_spend`]. Not the lint's fn-level `spends_viewer`, which
@@ -269,6 +277,63 @@ fn close_of(s: &[u8], open: usize) -> usize {
         }
     }
     s.len() - 1
+}
+
+/// The parameter of the first single-parameter closure (`|tx|`, `|mut tx|`)
+/// in `s[a..z)`, and the offset of its name. `||` (no parameter, or the `or`
+/// operator) and patterns (`|(a, b)|`) are skipped.
+fn first_closure_param(s: &[u8], a: usize, z: usize) -> Option<(String, usize)> {
+    let mut i = a;
+    while i < z {
+        if s[i] == b'|' && s.get(i + 1) != Some(&b'|') && (i == 0 || s[i - 1] != b'|') {
+            let mut j = skip_ws(s, i + 1);
+            if ident_at(s, j) == "mut" {
+                j = skip_ws(s, j + 3);
+            }
+            let name = ident_at(s, j);
+            let k = skip_ws(s, j + name.len());
+            if !name.is_empty() && k < z && s[k] == b'|' {
+                return Some((name.to_string(), j));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Every `macro_rules!` in `code` (the code view) with a closure-shaped
+/// matcher, `|$x:ident|`, as `name!`: the macros that could bind a connection
+/// to a closure parameter. A register lists the ones that do in
+/// [`Surface::conn_closure_macros`], and asserts this set equals that list,
+/// so a new one cannot hide the calls in its closures.
+pub fn closure_conn_macros(code: &str) -> Vec<String> {
+    let s = code.as_bytes();
+    let mut out = Vec::new();
+    for p in words(code, "macro_rules", 0, code.len()) {
+        let bang = skip_ws(s, p + "macro_rules".len());
+        if s.get(bang) != Some(&b'!') {
+            continue;
+        }
+        let at = skip_ws(s, bang + 1);
+        let name = ident_at(s, at).to_string();
+        let open = skip_ws(s, at + name.len());
+        if name.is_empty() || !matches!(s.get(open), Some(b'{' | b'(' | b'[')) {
+            continue;
+        }
+        let body: String = code[open..=close_of(s, open)]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let closure_matcher = body.match_indices("|$").any(|(i, _)| {
+            let rest = &body[i + 2..];
+            let n = rest.bytes().take_while(|&c| is_ident(c)).count();
+            rest[n..].starts_with(":ident|")
+        });
+        if closure_matcher {
+            out.push(format!("{name}!"));
+        }
+    }
+    out
 }
 
 /// Spans of items under `#[cfg(test)]`, `#[cfg(all(test, ..))]` or
@@ -1325,6 +1390,29 @@ pub fn db_calls(
             conns.push(name.clone());
         }
     }
+    // The connection a [`Surface::conn_closure_macros`] macro opens, bound to
+    // the parameter of its first closure-shaped argument. The declaration
+    // itself (`|tx|`) is not a use.
+    let mut closure_decls: Vec<usize> = Vec::new();
+    for mac in surface.conn_closure_macros {
+        let name = mac.trim_end_matches('!');
+        for p in words(code, name, b, e) {
+            let bang = skip_ws(s, p + name.len());
+            if s.get(bang) != Some(&b'!') {
+                continue;
+            }
+            let open = skip_ws(s, bang + 1);
+            if s.get(open) != Some(&b'(') {
+                continue;
+            }
+            if let Some((param, at)) = first_closure_param(s, open + 1, close_of(s, open)) {
+                closure_decls.push(at);
+                if !conns.contains(&param) {
+                    conns.push(param);
+                }
+            }
+        }
+    }
 
     // open-paren offset -> (label, is a plain call whose label needs resolving)
     let mut calls: BTreeMap<usize, (String, bool)> = BTreeMap::new();
@@ -1415,6 +1503,9 @@ pub fn db_calls(
     // `.fetch_one(executor)`).
     for conn in &conns {
         for p in words(code, conn, b, e) {
+            if closure_decls.contains(&p) {
+                continue;
+            }
             let mut k = p;
             while k > b && s[k - 1].is_ascii_whitespace() {
                 k -= 1;

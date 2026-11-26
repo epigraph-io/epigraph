@@ -47,6 +47,8 @@ const ENGINE: Surface = Surface {
     state_db_methods: &[],
     viewer_ctors: &["Viewer::resolve("],
     conn_ctors: &[],
+    // The cascade's repair closures run on the transaction the macro opens.
+    conn_closure_macros: &["repair_with_audit!"],
     marker_spend: call_spends_viewer,
 };
 
@@ -120,17 +122,27 @@ fn call_spends_viewer(region: &str) -> bool {
 /// `workflow_plan::frozen_plan`, hand the viewer to every call they make and
 /// so have no entry. Do not add an entry to make the build pass.
 const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
-    // maintenance: the cascade's failure, belief and obsolete audit rows on
-    // the maintenance connection.
+    // maintenance: the repair itself, inside the `repair_with_audit!` closure
+    // on the transaction the macro opens on the maintenance connection (the
+    // dedup repair, the edge-keyed BBA removal and its open deferrals, the
+    // supersede factor regeneration, the match retirement), and the cascade's
+    // failure, belief and obsolete audit rows. The repair's output reaches the
+    // caller only as `counts_only` in the status, and through the
+    // `report_for_caller` / `retirement_for_caller` filters.
     (
         "admin_cascade.rs",
         "apply_after_dedup",
-        &["failed", "record_belief"],
+        &[
+            "ClaimRepository::repair_marked_duplicate_conn",
+            "failed",
+            "record_belief",
+        ],
     ),
     (
         "admin_cascade.rs",
         "apply_after_edge_retract",
         &[
+            "EdgeRepository::remove_withdrawn_edge_bbas_conn",
             "audit::open_edge_retract_sources",
             "failed",
             "record_belief",
@@ -139,12 +151,21 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     (
         "admin_cascade.rs",
         "apply_after_supersede",
-        &["failed", "record_belief"],
+        &[
+            "ClaimRepository::regenerate_superseded_edge_factors_conn",
+            "failed",
+            "record_belief",
+        ],
     ),
     (
         "admin_cascade.rs",
         "apply_match_retire",
-        &["failed", "obsolete", "record_belief"],
+        &[
+            "MatchCandidateRepo::retire_conn",
+            "failed",
+            "obsolete",
+            "record_belief",
+        ],
     ),
     // maintenance: the un-mark's reversal, its revert record and open
     // cascades, and the caller's precondition (`UnmarkPrecondition::check`,
@@ -489,9 +510,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
 /// (`caller`):
 ///
 /// * under `caller` (handed only `admin_viewer`): the cascade itself, on the
-///   maintenance connection (the module doc's rule), and the un-mark act it
-///   re-reads there. Its result reaches the caller only through
-///   `report_for_caller` / `retirement_for_caller`.
+///   maintenance connection (the module doc's rule), the supersede edge
+///   migration inside its `repair_with_audit!` closure, and the un-mark act it
+///   re-reads there. Their result reaches the caller only as counts and
+///   through `report_for_caller` / `retirement_for_caller`.
 /// * under `admin_viewer` (handed only `caller`): exactly those two filters.
 ///
 /// A fn absent here has no call that only one of its viewers covers. A NEW
@@ -519,7 +541,10 @@ const SPLIT_CALLS: &[(&str, &str, &str, &[&str])] = &[
         "admin_cascade.rs",
         "apply_after_supersede",
         "caller",
-        &["cascade_after_supersede"],
+        &[
+            "ClaimRepository::migrate_superseded_edges_to_head_conn",
+            "cascade_after_supersede",
+        ],
     ),
     (
         "admin_cascade.rs",
@@ -770,8 +795,8 @@ fn the_per_call_scanner_sees_the_whole_engine_viewer_surface() {
         "found {fns} viewer-holding engine fns; measured 140 on 2026-11-26"
     );
     assert!(
-        calls >= 370,
-        "found {calls} database calls in them; measured 378 on 2026-11-26"
+        calls >= 375,
+        "found {calls} database calls in them; measured 383 on 2026-11-26"
     );
 }
 
@@ -888,5 +913,112 @@ pub async fn apply_after_x(
     assert_eq!(
         split.get(&key("admin_viewer")).cloned().unwrap_or_default(),
         vec!["report_for_caller".to_string()],
+    );
+}
+
+/// Every engine macro that takes a closure-shaped argument (`|$x:ident|`) is
+/// on [`ENGINE`]'s `conn_closure_macros`: today `repair_with_audit!`, which
+/// binds the transaction it opens to that parameter. A macro left off the list
+/// hides every call its closures make on `&mut tx`.
+#[test]
+fn every_engine_macro_binding_a_closure_connection_is_on_the_surface() {
+    let mut found: Vec<String> = engine_files()
+        .iter()
+        .flat_map(|(_, src)| viewer_calls::closure_conn_macros(&viewer_calls::views(src).0))
+        .collect();
+    found.sort();
+    let want: Vec<String> = ENGINE
+        .conn_closure_macros
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect();
+    assert_eq!(
+        found, want,
+        "an engine macro takes a closure-shaped argument (`|$x:ident|`): if it binds a \
+         connection to it, add it to ENGINE.conn_closure_macros and review the calls its \
+         closures make"
+    );
+}
+
+/// The calls inside a `repair_with_audit!` closure, on the transaction the
+/// macro opens (`|tx| Repo::f(&mut tx, ..)`), are measured: one handed no
+/// viewer is in the plain register, and one handed only the maintenance
+/// viewer is in the split under `caller`. Without the macro on the surface,
+/// neither is seen (the gap this closes).
+#[test]
+fn the_per_call_scanner_follows_the_transaction_into_a_repair_closure() {
+    let src = r##"
+pub async fn apply_after_x(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    caller: &Viewer,
+    trigger: &CascadeTrigger,
+    id: Uuid,
+) -> R {
+    let repaired = repair_with_audit!(
+        admin,
+        trigger,
+        |tx| async {
+            let leaked = ClaimRepository::get_content(&mut tx, admin_viewer, id).await?;
+            let bare = ClaimRepository::get_by_id(&mut tx, id).await?;
+            Ok::<_, DbError>((leaked, bare))
+        },
+        |r| serde_json::json!({ "n": r.0.len() })
+    );
+    let report = cascade_after_x(&mut *admin, admin_viewer, id).await;
+    Ok((report_for_caller(admin, caller, &report).await, repaired))
+}
+"##;
+    let key = |v: &str| {
+        (
+            "fixture.rs".to_string(),
+            "apply_after_x".to_string(),
+            v.to_string(),
+        )
+    };
+    let fn_key = ("fixture.rs".to_string(), "apply_after_x".to_string());
+
+    let mut plain = Measured::new();
+    viewer_calls::measure_source(
+        "fixture.rs",
+        src,
+        &ENGINE,
+        &mut plain,
+        &mut Population::new(),
+    );
+    assert_eq!(
+        plain.get(&fn_key).cloned().unwrap_or_default(),
+        vec!["ClaimRepository::get_by_id".to_string()],
+        "the viewer-less read in the repair closure is unviewed"
+    );
+    let mut split = BTreeMap::new();
+    let mut multi = BTreeSet::new();
+    split_source("fixture.rs", src, &mut split, &mut multi);
+    assert_eq!(
+        split.get(&key("caller")).cloned().unwrap_or_default(),
+        vec![
+            "ClaimRepository::get_content".to_string(),
+            "cascade_after_x".to_string()
+        ],
+        "the closure's read handed only the maintenance viewer is under `caller`"
+    );
+
+    // The same source with the macro off the surface: the closure's `tx` is an
+    // unknown name, and both reads vanish.
+    let blind = Surface {
+        conn_closure_macros: &[],
+        ..ENGINE
+    };
+    let mut unseen = Measured::new();
+    viewer_calls::measure_source(
+        "fixture.rs",
+        src,
+        &blind,
+        &mut unseen,
+        &mut Population::new(),
+    );
+    assert!(
+        !unseen.contains_key(&fn_key),
+        "without the macro on the surface the closure is not measured: {unseen:?}"
     );
 }
