@@ -256,6 +256,9 @@ fn no_store_refusal(lines: &[&str]) -> Result<(), String> {
 #[traced_test]
 async fn packet_by_an_allowlisted_service_client_embeds_claim_and_figure(pool: PgPool) {
     let (state, bearer, l, h_group) = allowlisted_writer(&pool).await;
+    // A figure is publisher content: since migration 349 the database stores
+    // one only for a paper whose recorded licence permits retention.
+    seed_paper(&pool, "10.1000/test-figure", Some("CC-BY-4.0")).await;
 
     let content = format!("allowlisted packet embedding {}", Uuid::new_v4());
     let figure = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk";
@@ -321,6 +324,21 @@ async fn packet_by_an_allowlisted_service_client_embeds_claim_and_figure(pool: P
         0,
         "a submitted packet must not be retained in the in-memory propagation DAG"
     );
+}
+
+/// A public `papers` row for `doi` carrying `licence`, written on the
+/// superuser pool (standing in for the operator's licence definer, 255).
+async fn seed_paper(pool: &PgPool, doi: &str, licence: Option<&str>) {
+    sqlx::query(
+        "INSERT INTO papers (doi, title, licence, visibility, owner_group_id) \
+         VALUES ($1, 'Figure fixture paper', $2, 'public', \
+                 '00000000-0000-0000-0000-000000000000')",
+    )
+    .bind(doi)
+    .bind(licence)
+    .execute(pool)
+    .await
+    .expect("seed paper");
 }
 
 /// The `AuthContext` the bearer middleware injects for a human operator's

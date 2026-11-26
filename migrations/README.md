@@ -4038,8 +4038,8 @@ restart.
   a `papers` column the request path writes must grant it to `epigraph_app` column-level, and
   one the request path UPDATEs must also extend the allowlist in
   `paper_licence_operator_only.rs` (which fails until it does). **Not closed:** the maintenance DSN can still UPDATE `licence` directly, without
-  the audit row (as in 123); the application role can still write publisher text into
-  `evidence.raw_content` directly; licences set before 255 carry no audit row. Pinned by
+  the audit row (as in 123); the application role could still write publisher text into
+  `evidence.raw_content` directly (closed for literature and figure rows by 349); licences set before 255 carry no audit row. Pinned by
   `epigraph-db/tests/paper_licence_operator_only.rs` (each refusal mutation-tested, the
   `doi`/`id` re-point refused, the application writers as controls, the column ratchet, the
   definer's audit) and
@@ -5132,6 +5132,31 @@ restart.
   (`approve-client --owner`). Undo: `docs/runbooks/348-undo.sql` (refuses while an agent client has no
   owner, including the rows 348 cleared). **Deploy order:** migrate BEFORE the API binary of this change (it registers an agent with
   no owner, which 001's CHECK refuses); an older API runs on 348 unchanged.
+- **349**: `evidence_passage_licence_guard` (backlog b62ae3f2). Closes 255's residual: the
+  licence rule for verbatim passages lived only in Rust, and `POST /api/v1/evidence`,
+  `PUT /api/v1/evidence/:id` and `/api/v1/submit` (the `ingest_literature` CLI's path) store any
+  body a caller sends. Adds `epigraph_passage_retention_permitted(text)` (IMMUTABLE, the SQL mirror
+  of `epigraph_ingest::common::licence::passage_retention_permitted`; change both together) and the
+  SECURITY INVOKER trigger function `epigraph_evidence_passage_licence_guard()` as two BEFORE ROW
+  triggers on `evidence`: every INSERT of a row whose `properties->>'type'` is `literature` or
+  `figure`, and every UPDATE of one that changes its body, type, DOI or caption. A literature body
+  must be NULL or the locator-and-hash shape both writers emit (`Source: ... (DOI: ...). Locator:
+  .... Passage BLAKE3: <hex>. Passage not retained (...).`, no `Passage: '`); a figure must carry no
+  image and no caption; anything else is a passage and is admitted only when a `papers` row the
+  writer can read under the row's DOI (as given, canonical, and each resolver-prefixed spelling)
+  carries a permitting licence. Otherwise 23514 with constraint `evidence_passage_licence` (the API
+  answers 400). An unseal (body was the `[sealed]` sentinel and a ciphertext row exists) is not
+  re-judged. No row is read or changed: stored passages stay, a write that leaves body, type, DOI
+  and caption alone does not fire, and the strip rewrite to the locator shape passes. **Not
+  closed:** text in rows not typed literature or figure, free text in the admitted shape's title
+  and locator, the maintenance DSN, a legacy paper keyed on a case variant of a resolver prefix
+  (refused, closed). **Operator note:** the CLI's `--allow-verbatim` and its extraction-declared
+  licence no longer override the paper's recorded licence; set it with
+  `epigraph_set_paper_licence` (255) first. Pinned by
+  `epigraph-mcp/tests/evidence_passage_licence_guard.rs` (refusals on the application role, the
+  accepted bodies built by the production writer, the legacy, strip and unseal writes, and the
+  SQL/Rust allowlist parity). Undo: `docs/runbooks/349-undo.sql`. No deploy order: no binary
+  depends on it.
 
 ## `-- no-transaction` migrations
 
