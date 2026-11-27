@@ -51,6 +51,27 @@
 //!   `the_app_role_cannot_forge_a_licence_audit_row`.
 //! * the definer's audit INSERT removed: fails
 //!   `the_operator_definer_sets_clears_and_audits_a_licence`.
+//!
+//! # Migration 355
+//!
+//! 355 (backlog 158b7ce4) declares `papers.abstract_text` and
+//! `papers.properties`, which a deployed database carries, with the
+//! application role's INSERT on them (the tests at the end of this file).
+//! Measured, each mutation applied alone:
+//!
+//! * without 355: fails `papers_declares_abstract_text_and_properties_insert_only`
+//!   and `the_app_role_inserts_the_declared_paper_columns_but_never_updates_them`
+//!   (the columns do not exist). `migration_355_keeps_columns_that_predate_255`
+//!   passes there by construction: it adds the columns below 255 itself.
+//! * 355 without its GRANT: fails both, and
+//!   `the_app_role_writes_only_the_allowlisted_paper_columns`.
+//! * 355 granting UPDATE as well: fails all three, and
+//!   `migration_355_keeps_columns_that_predate_255`.
+//! * `properties` added nullable with no default: fails
+//!   `papers_declares_abstract_text_and_properties_insert_only` and the
+//!   behavioural test (a row naming neither column reads NULL, not `{}`).
+//! * `properties` dropped and re-added rather than kept where it exists:
+//!   fails `migration_355_keeps_columns_that_predate_255` (its data is lost).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -520,4 +541,203 @@ async fn the_operator_definer_sets_clears_and_audits_a_licence(pool: PgPool) {
     }
     assert_eq!(licence_of(&pool, doi).await, None);
     assert_eq!(licence_events(&pool).await.len(), 2);
+}
+
+// ===================================================================
+// Migration 355 (backlog 158b7ce4): `papers.abstract_text` and
+// `papers.properties`, which a deployed database carries and no migration
+// before 355 created, are declared with the deployed definitions and the
+// application role's INSERT on them (never UPDATE).
+// ===================================================================
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+fn migrations_up_to(max: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= max)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+/// Run `migrator` on one connection and reset it: 001's pg_dump header leaves
+/// session-level SETs behind.
+async fn run_migrations(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+}
+
+/// `(column, type, NOT NULL, default, app INSERT, app UPDATE)` for the two
+/// declared columns and `licence`, which must stay unwritable.
+type ColumnShape = (String, String, bool, Option<String>, bool, bool);
+
+async fn declared_paper_columns(pool: &PgPool) -> Vec<ColumnShape> {
+    sqlx::query_as(
+        "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
+                pg_get_expr(d.adbin, d.adrelid), \
+                has_column_privilege('epigraph_app', 'public.papers'::regclass, a.attnum, 'INSERT'), \
+                has_column_privilege('epigraph_app', 'public.papers'::regclass, a.attnum, 'UPDATE') \
+           FROM pg_attribute a \
+           LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+          WHERE a.attrelid = 'public.papers'::regclass AND a.attnum > 0 \
+            AND NOT a.attisdropped \
+            AND a.attname IN ('abstract_text', 'properties', 'licence') \
+          ORDER BY a.attname",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("papers column read")
+}
+
+/// The definitions and application-role grants a deployed database carries.
+fn deployed_paper_columns() -> Vec<ColumnShape> {
+    vec![
+        (
+            "abstract_text".into(),
+            "text".into(),
+            false,
+            None,
+            true,
+            false,
+        ),
+        ("licence".into(), "text".into(), false, None, false, false),
+        (
+            "properties".into(),
+            "jsonb".into(),
+            true,
+            Some("'{}'::jsonb".into()),
+            true,
+            false,
+        ),
+    ]
+}
+
+/// On a database migrated from empty, `papers.abstract_text` is nullable
+/// `text` with no default and `papers.properties` is `jsonb NOT NULL DEFAULT
+/// '{}'`, as on a deployed database; `epigraph_app` may INSERT both and
+/// UPDATE neither, and still may neither INSERT nor UPDATE `licence`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn papers_declares_abstract_text_and_properties_insert_only(pool: PgPool) {
+    assert_eq!(
+        declared_paper_columns(&pool).await,
+        deployed_paper_columns(),
+        "papers.abstract_text / papers.properties / papers.licence: \
+         (column, type, NOT NULL, default, app INSERT, app UPDATE)"
+    );
+}
+
+/// Behaviourally, on the stamped application role: an INSERT naming both
+/// declared columns succeeds, one naming neither gets `properties = '{}'`,
+/// and an UPDATE of either is refused 42501 (255's allowlist is `title` and
+/// `journal` only).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_inserts_the_declared_paper_columns_but_never_updates_them(pool: PgPool) {
+    let (app, group) = app_pool(&pool).await;
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, abstract_text, properties, visibility, owner_group_id) \
+         VALUES ($1, 't', 'An abstract.', '{\"year\": 2001}'::jsonb, 'public', $2) \
+         RETURNING id",
+    )
+    .bind("10.9999/t158-declared")
+    .bind(group)
+    .fetch_one(&app)
+    .await
+    .expect("INSERT naming abstract_text and properties on the application role");
+    let bare: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, visibility, owner_group_id) \
+         VALUES ($1, 't', 'public', $2) RETURNING id",
+    )
+    .bind("10.9999/t158-bare")
+    .bind(group)
+    .fetch_one(&app)
+    .await
+    .expect("INSERT naming neither on the application role");
+
+    for set in [
+        "abstract_text = 'Rewritten.'",
+        "properties = '{\"year\": 1999}'::jsonb",
+    ] {
+        let r = sqlx::query(&format!("UPDATE papers SET {set} WHERE id = $1"))
+            .bind(id)
+            .execute(&app)
+            .await;
+        assert_eq!(sqlstate(r).as_deref(), Some("42501"), "UPDATE SET {set}");
+    }
+
+    let rows: Vec<(Uuid, Option<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, abstract_text, properties FROM papers WHERE id = ANY($1) ORDER BY doi",
+    )
+    .bind(vec![id, bare])
+    .fetch_all(&pool)
+    .await
+    .expect("read back");
+    assert_eq!(
+        rows,
+        vec![
+            (bare, None, serde_json::json!({})),
+            (
+                id,
+                Some("An abstract.".to_string()),
+                serde_json::json!({ "year": 2001 })
+            ),
+        ]
+    );
+}
+
+/// Where both columns predate 255 (as on a deployed database, whose 255 then
+/// granted INSERT on them from the catalog), migrating through 355 changes
+/// neither column, keeps the data in them, and ends in the same definitions
+/// and grants as a database migrated from empty.
+#[sqlx::test(migrations = false)]
+async fn migration_355_keeps_columns_that_predate_255(pool: PgPool) {
+    run_migrations(&pool, &migrations_up_to(254)).await;
+    sqlx::query(
+        "ALTER TABLE public.papers ADD COLUMN abstract_text text, \
+             ADD COLUMN properties jsonb NOT NULL DEFAULT '{}'::jsonb",
+    )
+    .execute(&pool)
+    .await
+    .expect("the deployed columns, before 255");
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, abstract_text, properties) \
+         VALUES ('10.9999/t158-predates', 't', 'Kept.', '{\"year\": 2001}'::jsonb) \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("a paper with both columns filled");
+
+    run_migrations(&pool, &MIGRATOR).await;
+
+    assert_eq!(
+        declared_paper_columns(&pool).await,
+        deployed_paper_columns(),
+        "(column, type, NOT NULL, default, app INSERT, app UPDATE) after 355 over \
+         pre-existing columns"
+    );
+    let kept: (Option<String>, serde_json::Value) =
+        sqlx::query_as("SELECT abstract_text, properties FROM papers WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read back");
+    assert_eq!(
+        kept,
+        (
+            Some("Kept.".to_string()),
+            serde_json::json!({ "year": 2001 })
+        )
+    );
 }
