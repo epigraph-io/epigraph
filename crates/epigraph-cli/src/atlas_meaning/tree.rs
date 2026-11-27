@@ -444,6 +444,173 @@ fn resolve_node(
     }
 }
 
+/// The subtree under `node` of `tree`, as a shape.
+fn shape_of_node(tree: &MeaningTree, node: &TreeNode) -> anyhow::Result<Shape> {
+    Ok(match &node.body {
+        NodeBody::Leaf(m) => Shape::Leaf(m.clone()),
+        NodeBody::Group(children) => {
+            let mut kids = Vec::with_capacity(children.len());
+            for c in children {
+                let child = tree.node(*c).context("a child missing from the tree")?;
+                kids.push((*c, shape_of_node(tree, child)?));
+            }
+            Shape::Group(kids)
+        }
+    })
+}
+
+/// `parts` (each sorted, disjoint) under one subtree: a leaf for one part, a
+/// group of leaves for up to [`MAX_CHILDREN`], and above that balanced groups
+/// of groups (every group at least two children), each minted by `mint`.
+fn chunk_parts(parts: Vec<Vec<Uuid>>, mint: &dyn Fn(&BTreeSet<Uuid>) -> Uuid) -> Shape {
+    let mut level: Vec<(Uuid, Shape, BTreeSet<Uuid>)> = parts
+        .into_iter()
+        .map(|p| {
+            let s: BTreeSet<Uuid> = p.iter().copied().collect();
+            (mint(&s), Shape::Leaf(p), s)
+        })
+        .collect();
+    while level.len() > MAX_CHILDREN {
+        let n = level.len();
+        let k = n.div_ceil(MAX_CHILDREN);
+        let mut it = level.into_iter();
+        let mut next = Vec::with_capacity(k);
+        for i in 0..k {
+            let size = n / k + usize::from(i < n % k);
+            let kids: Vec<(Uuid, Shape, BTreeSet<Uuid>)> = it.by_ref().take(size).collect();
+            let claims: BTreeSet<Uuid> = kids
+                .iter()
+                .flat_map(|(_, _, s)| s.iter().copied())
+                .collect();
+            let shape = Shape::Group(kids.into_iter().map(|(id, s, _)| (id, s)).collect());
+            next.push((mint(&claims), shape, claims));
+        }
+        level = next;
+    }
+    if level.len() == 1 {
+        if let Some((_, s, _)) = level.pop() {
+            return s;
+        }
+    }
+    Shape::Group(level.into_iter().map(|(id, s, _)| (id, s)).collect())
+}
+
+/// A theme's tree with its members that have NO embedding added as its "not
+/// yet placed" subtree: they cannot be clustered (no vector), so they are
+/// drawn apart from the clustered members rather than left off the map.
+///
+/// `placed` is the theme's resolved tree over its embedded members (`None`
+/// for a theme with no embedded member), `unplaced` the members with no
+/// embedding, and `rows` W3's read holding them. The unplaced members are cut
+/// by W3's [`fallback_split`] (a stable partition by claim id, so the same
+/// members give the same leaves) into leaves that fit `cap`, gathered under
+/// one subtree minted from all of them: a single leaf when they fit one.
+///
+/// * No `placed` tree: that subtree IS the theme (one root leaf when it fits).
+/// * A `placed` root leaf becomes a group of that leaf and the subtree.
+/// * A `placed` root group gains the subtree as its last child; a root that
+///   already has [`MAX_CHILDREN`] children is pushed one level down first.
+///
+/// Returns the tree and the ids of its "not yet placed" leaves (every leaf
+/// holding only unplaced members), which a run records so the nightly can
+/// take them out of the previous tree before it places what was embedded
+/// since. `stats` is updated to the returned tree.
+///
+/// # Errors
+/// No member at all, an unplaced member `rows` does not draw or one already
+/// in `placed`, a `placed` tree of another map, hierarchy or theme, or a tree
+/// deeper than [`MAX_DEPTH`].
+#[allow(clippy::too_many_arguments)]
+pub fn place_unplaced(
+    map: AtlasMap,
+    hierarchy: AtlasHierarchy,
+    theme_id: Uuid,
+    placed: Option<&MeaningTree>,
+    unplaced: &[Uuid],
+    rows: &LeafRows,
+    cap: usize,
+    stats: &mut ResolveStats,
+) -> anyhow::Result<(MeaningTree, Vec<Uuid>)> {
+    let set: BTreeSet<Uuid> = unplaced.iter().copied().collect();
+    if let Some(t) = placed {
+        ensure!(
+            t.map == map && t.hierarchy == hierarchy && t.theme_id == theme_id,
+            "theme {theme_id}: the placed tree is of another map, hierarchy or theme"
+        );
+        if set.is_empty() {
+            return Ok((t.clone(), Vec::new()));
+        }
+        ensure!(
+            t.nodes[0].claims.iter().all(|c| !set.contains(c)),
+            "theme {theme_id}: a member with no embedding is already placed"
+        );
+    }
+    ensure!(!set.is_empty(), "theme {theme_id} has no member");
+    let all: Vec<Uuid> = set.iter().copied().collect();
+    let mut parts = fallback_split(rows, &all, cap)?;
+    for p in &mut parts {
+        p.sort_unstable();
+        let n = fits(rows, p, cap)?
+            .with_context(|| format!("theme {theme_id}: a not-yet-placed part is over the cap"))?;
+        stats.max_leaf_nodes = stats.max_leaf_nodes.max(n);
+    }
+    parts.sort_by(|a, b| a[0].cmp(&b[0]));
+    let covered: BTreeSet<Uuid> = parts.iter().flatten().copied().collect();
+    ensure!(
+        covered == set,
+        "theme {theme_id}: {} of {} members with no embedding are not drawable on this map",
+        set.difference(&covered).count(),
+        set.len()
+    );
+    let mint = |claims: &BTreeSet<Uuid>| group_id(map, hierarchy, theme_id, claims);
+    let fallback = chunk_parts(parts, &mint);
+    let shape = match placed {
+        None => fallback,
+        Some(t) => {
+            let placed_claims: BTreeSet<Uuid> = t.nodes[0].claims.iter().copied().collect();
+            let unplaced_child = (mint(&set), fallback);
+            match shape_of_node(t, &t.nodes[0])? {
+                Shape::Group(mut kids) if kids.len() < MAX_CHILDREN => {
+                    kids.push(unplaced_child);
+                    Shape::Group(kids)
+                }
+                whole => Shape::Group(vec![(mint(&placed_claims), whole), unplaced_child]),
+            }
+        }
+    };
+    let mut nodes = Vec::new();
+    emit(
+        &mut nodes,
+        root_id(map, hierarchy, theme_id),
+        None,
+        0,
+        &shape,
+    );
+    ensure!(
+        nodes.iter().all(|n| n.depth <= MAX_DEPTH),
+        "theme {theme_id}: the not-yet-placed leaves go deeper than {MAX_DEPTH}"
+    );
+    let leaves: Vec<Uuid> = nodes
+        .iter()
+        .filter(|n| matches!(n.body, NodeBody::Leaf(_)) && n.claims.iter().all(|c| set.contains(c)))
+        .map(|n| n.id)
+        .collect();
+    stats.leaves = nodes
+        .iter()
+        .filter(|n| matches!(n.body, NodeBody::Leaf(_)))
+        .count();
+    stats.groups = nodes.len() - stats.leaves;
+    Ok((
+        MeaningTree {
+            map,
+            hierarchy,
+            theme_id,
+            nodes,
+        },
+        leaves,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,5 +847,152 @@ mod tests {
         let (out, stats) = resolve_tree(&tree, &rows, 100).unwrap();
         assert_eq!(out, tree);
         assert_eq!((stats.resplit_leaves, stats.max_leaf_nodes), (0, 61));
+    }
+
+    fn wire_of(t: &MeaningTree) -> Vec<WireGroup> {
+        t.nodes
+            .iter()
+            .map(|n| match &n.body {
+                NodeBody::Leaf(m) => leaf(n.id, n.parent, n.depth, m),
+                NodeBody::Group(k) => group(n.id, n.parent, n.depth, k),
+            })
+            .collect()
+    }
+
+    /// The placed tree over `members`: a root leaf, or a flat root group of
+    /// one leaf per claim.
+    fn placed(members: &[Uuid], flat: bool) -> MeaningTree {
+        let all: BTreeSet<Uuid> = members.iter().copied().collect();
+        let root = root_id(MAP, M, THEME);
+        let wire = if flat {
+            let ids: Vec<Uuid> = members
+                .iter()
+                .map(|m| group_id(MAP, M, THEME, &set(&[*m])))
+                .collect();
+            let mut w = vec![group(root, None, 0, &ids)];
+            for (id, m) in ids.iter().zip(members) {
+                w.push(leaf(*id, Some(root), 1, &[*m]));
+            }
+            w
+        } else {
+            vec![leaf(root, None, 0, members)]
+        };
+        check_tree(MAP, M, THEME, &wire, &all).unwrap()
+    }
+
+    #[test]
+    fn a_theme_with_no_embedded_member_is_one_not_yet_placed_root_leaf() {
+        let rows = rows(5, 1);
+        let all: Vec<Uuid> = rows.claims.keys().copied().collect();
+        let mut stats = ResolveStats::default();
+        let (t, leaves) =
+            place_unplaced(MAP, M, THEME, None, &all, &rows, 100, &mut stats).unwrap();
+        assert_eq!(t.nodes.len(), 1);
+        assert_eq!(t.nodes[0].id, root_id(MAP, M, THEME));
+        assert_eq!(t.nodes[0].body, NodeBody::Leaf(all.clone()));
+        assert_eq!(leaves, vec![t.nodes[0].id]);
+        assert_eq!(
+            (stats.leaves, stats.groups, stats.max_leaf_nodes),
+            (1, 0, 11)
+        );
+    }
+
+    #[test]
+    fn unplaced_members_become_a_sibling_leaf_of_a_placed_root_leaf() {
+        let rows = rows(5, 1);
+        let placed_ids = [c(1), c(2), c(3)];
+        let tree = placed(&placed_ids, false);
+        let mut stats = ResolveStats::default();
+        let (t, leaves) = place_unplaced(
+            MAP,
+            M,
+            THEME,
+            Some(&tree),
+            &[c(5), c(4)],
+            &rows,
+            100,
+            &mut stats,
+        )
+        .unwrap();
+        let fallback = group_id(MAP, M, THEME, &set(&[c(4), c(5)]));
+        assert_eq!(leaves, vec![fallback]);
+        assert_eq!(
+            t.nodes[0].body,
+            NodeBody::Group(vec![group_id(MAP, M, THEME, &set(&placed_ids)), fallback])
+        );
+        let all: BTreeSet<Uuid> = (1..=5).map(c).collect();
+        assert_eq!(check_tree(MAP, M, THEME, &wire_of(&t), &all).unwrap(), t);
+        // Nothing to place: the placed tree as it is.
+        let (same, none) =
+            place_unplaced(MAP, M, THEME, Some(&tree), &[], &rows, 100, &mut stats).unwrap();
+        assert_eq!((same, none), (tree.clone(), Vec::new()));
+        // A member already placed is refused.
+        assert!(
+            place_unplaced(MAP, M, THEME, Some(&tree), &[c(3)], &rows, 100, &mut stats).is_err()
+        );
+    }
+
+    #[test]
+    fn a_full_root_is_pushed_down_before_the_unplaced_leaf_joins_it() {
+        let rows = rows(130, 0);
+        let placed_ids: Vec<Uuid> = (1..=128).map(c).collect();
+        let tree = placed(&placed_ids, true);
+        let mut stats = ResolveStats::default();
+        let (t, leaves) = place_unplaced(
+            MAP,
+            M,
+            THEME,
+            Some(&tree),
+            &[c(129), c(130)],
+            &rows,
+            100,
+            &mut stats,
+        )
+        .unwrap();
+        let NodeBody::Group(top) = &t.nodes[0].body else {
+            panic!("the root is a group")
+        };
+        assert_eq!(
+            top,
+            &vec![
+                group_id(MAP, M, THEME, &set(&placed_ids)),
+                group_id(MAP, M, THEME, &set(&[c(129), c(130)]))
+            ]
+        );
+        assert_eq!(leaves, vec![top[1]]);
+        let all: BTreeSet<Uuid> = (1..=130).map(c).collect();
+        assert_eq!(check_tree(MAP, M, THEME, &wire_of(&t), &all).unwrap(), t);
+        assert_eq!((stats.leaves, stats.groups), (129, 2));
+    }
+
+    #[test]
+    fn more_unplaced_parts_than_one_group_holds_are_chunked_under_balanced_groups() {
+        // 98 evidence rows each: every claim fills a leaf alone, so 130
+        // parts, over the 128 children one group may hold.
+        let rows = rows(130, 98);
+        let all: Vec<Uuid> = rows.claims.keys().copied().collect();
+        let mut stats = ResolveStats::default();
+        let (t, leaves) =
+            place_unplaced(MAP, M, THEME, None, &all, &rows, 100, &mut stats).unwrap();
+        let NodeBody::Group(top) = &t.nodes[0].body else {
+            panic!("the root is a group")
+        };
+        assert_eq!(top.len(), 2, "130 parts in two groups of 65");
+        for g in top {
+            let NodeBody::Group(kids) = &t.node(*g).unwrap().body else {
+                panic!("a chunk is a group")
+            };
+            assert_eq!(kids.len(), 65);
+        }
+        assert_eq!(leaves.len(), 130);
+        assert_eq!(stats.max_leaf_nodes, 100);
+        let members: BTreeSet<Uuid> = all.iter().copied().collect();
+        assert_eq!(
+            check_tree(MAP, M, THEME, &wire_of(&t), &members).unwrap(),
+            t
+        );
+        // The same members give the same tree.
+        let again = place_unplaced(MAP, M, THEME, None, &all, &rows, 100, &mut stats).unwrap();
+        assert_eq!(again.0, t);
     }
 }

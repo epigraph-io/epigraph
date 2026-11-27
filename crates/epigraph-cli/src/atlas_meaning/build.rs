@@ -21,10 +21,16 @@ use super::files::{
     index_attachments, prepare_export_dir, write_index, write_theme, ExportIndex, ExportTheme,
     ResultDoc, ResultTheme, EXPORT_FORMAT,
 };
-use super::tree::{check_tree, map_key, resolve_tree, MeaningTree, ResolveStats};
+use super::tree::{check_tree, map_key, place_unplaced, resolve_tree, MeaningTree, ResolveStats};
 
 /// The `atlas_map_runs.algo` of a run this build writes.
 pub const MEANING_ALGO: &str = "atlas-meaning/1";
+
+/// The run `params` key listing every "not yet placed" leaf of the run, in
+/// both hierarchies ([`place_unplaced`]): the leaves of members with no
+/// embedding. Every builder writes it, and the nightly reads it back to take
+/// those members out of the previous tree before it places them.
+pub const UNPLACED_KEY: &str = "unplaced_leaves";
 
 const HIERARCHY: AtlasHierarchy = AtlasHierarchy::Meaning;
 
@@ -86,7 +92,7 @@ pub async fn export_map(
             AtlasMeaningRepository::theme_members(&mut tx, viewer, opts.map, theme).await?;
         if members.embedded.is_empty() {
             report.push(json!({"theme_id": theme, "claims": 0,
-                               "unembedded": members.unembedded, "exported": false}));
+                               "unembedded": members.unembedded.len(), "exported": false}));
             continue;
         }
         let ids: Vec<Uuid> = members.embedded.iter().map(|(id, _)| *id).collect();
@@ -118,7 +124,7 @@ pub async fn export_map(
             attachment_nodes: nodes,
         });
         report.push(json!({"theme_id": theme, "claims": ids.len(),
-                           "unembedded": members.unembedded, "attachment_nodes": nodes,
+                           "unembedded": members.unembedded.len(), "attachment_nodes": nodes,
                            "exported": true}));
     }
     let index = ExportIndex {
@@ -149,7 +155,11 @@ pub struct ResolvedTheme {
     pub tree: MeaningTree,
     pub stats: ResolveStats,
     pub id_chunk_cuts: u32,
-    pub unembedded: usize,
+    /// The theme's current members with no embedding, sorted: not in the
+    /// computed tree; [`place_unplaced_meaning`] adds them.
+    pub unembedded: Vec<Uuid>,
+    /// The tree's "not yet placed" leaves, once they are added.
+    pub unplaced_leaves: Vec<Uuid>,
 }
 
 /// Check `result` against `map`'s rows in the build's snapshot and resolve
@@ -261,7 +271,89 @@ pub async fn resolve_theme(
         stats,
         id_chunk_cuts: theme.id_chunk_cuts,
         unembedded: members.unembedded,
+        unplaced_leaves: Vec::new(),
     })
+}
+
+/// The themes `map` draws with no embedded member (so no computed tree),
+/// each with its current members, all with no embedding, sorted. Call it on
+/// the build's transaction, after `begin_build_snapshot`.
+///
+/// # Errors
+/// A database error.
+pub async fn unplaced_only_themes(
+    tx: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+) -> anyhow::Result<Vec<(Uuid, Vec<Uuid>)>> {
+    let embedded: BTreeSet<Uuid> =
+        AtlasMeaningRepository::embedded_theme_ids_on_map(tx, viewer, map)
+            .await?
+            .into_iter()
+            .collect();
+    let mut out = Vec::new();
+    for theme in AtlasMeaningRepository::theme_ids_on_map(tx, viewer, map).await? {
+        if embedded.contains(&theme) {
+            continue;
+        }
+        let members = AtlasMeaningRepository::theme_members(tx, viewer, map, theme).await?;
+        if !members.unembedded.is_empty() {
+            out.push((theme, members.unembedded));
+        }
+    }
+    Ok(out)
+}
+
+/// `themes` (resolved over their embedded members) with each theme's members
+/// that have no embedding added in "not yet placed" leaves of the meaning
+/// hierarchy ([`place_unplaced`]), and every theme `map` draws with no
+/// embedded member appended as one such tree, so every current themed claim
+/// the map may draw is in a leaf. Call it on the build's transaction, after
+/// `begin_build_snapshot`.
+///
+/// # Errors
+/// Any refusal of [`place_unplaced`], or a database error.
+pub async fn place_unplaced_meaning(
+    tx: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    themes: Vec<ResolvedTheme>,
+    cap: usize,
+) -> anyhow::Result<Vec<ResolvedTheme>> {
+    let mut out = Vec::with_capacity(themes.len());
+    for mut t in themes {
+        if !t.unembedded.is_empty() {
+            let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &t.unembedded).await?;
+            let (tree, leaves) = place_unplaced(
+                map,
+                HIERARCHY,
+                t.tree.theme_id,
+                Some(&t.tree),
+                &t.unembedded,
+                &rows,
+                cap,
+                &mut t.stats,
+            )?;
+            t.tree = tree;
+            t.unplaced_leaves = leaves;
+        }
+        out.push(t);
+    }
+    for (theme, unplaced) in unplaced_only_themes(tx, viewer, map).await? {
+        let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &unplaced).await?;
+        let mut stats = ResolveStats::default();
+        let (tree, leaves) = place_unplaced(
+            map, HIERARCHY, theme, None, &unplaced, &rows, cap, &mut stats,
+        )?;
+        out.push(ResolvedTheme {
+            tree,
+            stats,
+            id_chunk_cuts: 0,
+            unembedded: unplaced,
+            unplaced_leaves: leaves,
+        });
+    }
+    Ok(out)
 }
 
 /// Write every level document of `themes` into the unfinished run `run_id`
@@ -339,6 +431,7 @@ async fn build_result(
     let mut tx = conn.begin().await.context("begin the build transaction")?;
     let epochs = AtlasMapRepository::begin_build_snapshot(&mut tx, viewer, map).await?;
     let themes = resolve_result(&mut tx, viewer, map, result, cap).await?;
+    let themes = place_unplaced_meaning(&mut tx, viewer, map, themes, cap).await?;
     // A dry run refuses exactly where the apply would.
     refuse_to_hide_links(&mut tx, viewer, map).await?;
 
@@ -356,7 +449,9 @@ async fn build_result(
         "inner_groups": sum(|t| t.stats.groups),
         "resplit_leaves": sum(|t| t.stats.resplit_leaves),
         "id_chunk_cuts": themes.iter().map(|t| u64::from(t.id_chunk_cuts)).sum::<u64>(),
-        "unembedded_members": sum(|t| t.unembedded),
+        "unembedded_members": sum(|t| t.unembedded.len()),
+        UNPLACED_KEY: themes.iter().flat_map(|t| t.unplaced_leaves.iter().copied())
+            .collect::<Vec<Uuid>>(),
     });
     let mut report = json!({
         "map": map_key(map),
