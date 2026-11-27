@@ -1192,6 +1192,11 @@ unused number below the head is not free by default: several are held by
 entries in this list (133-139 for the elevation stack, 155-157 by the drain
 register), and sqlx applies a file numbered below an already-applied head out
 of order (see the **Deploy order** notes on 140 and 141).
+CI enforces the number: `scripts/ci/check_migration_numbers.sh` (the lint job)
+fails a change that adds a `migrations/*.sql` numbered at or below the highest
+number on the target branch, or one sharing its number with another file. The
+only numbers below the head it accepts are those in a block listed under
+[Reserved blocks](#reserved-blocks); none is open.
 Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
@@ -5265,6 +5270,19 @@ restart.
   `docs/runbooks/353-undo.sql`. **Deploy order:** either; a binary without the change runs on 353
   unchanged, and the change's binary runs without 353 (only the concurrent-write backstop is
   missing).
+
+## Reserved blocks
+
+A block of numbers held below the head for a series that has not landed yet.
+`scripts/ci/check_migration_numbers.sh` reads this table: a new migration may
+take a number at or below the head only inside a block listed here (it must
+still be unique), and every other new migration takes a number above the head.
+A row's first cell is one number (`NNN`) or a range (`NNN-MMM`). Add a row only
+with the operator's ruling, in the commit that opens the block, and remove it in
+the commit that closes it. No block is open.
+
+| Block | Held for |
+|-------|----------|
 
 ## `-- no-transaction` migrations
 

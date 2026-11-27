@@ -291,6 +291,23 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # HEAD^1 for the migration-number check below: on a pull request
+          # HEAD is the test merge commit and HEAD^1 the target branch's
+          # current tip; on a push, the commit before it. Depth 2 fetches both.
+          fetch-depth: 2
+      - name: Self-test the migration-number check
+        # Throwaway git repositories: below-head, duplicate and unversioned
+        # names fail, head+1 and reserved-block numbers pass. Proves the next
+        # step can still go red.
+        run: scripts/ci/test_check_migration_numbers.sh
+      - name: New migrations are numbered above the head and unique
+        # Every migrations/*.sql the change adds must be numbered above the
+        # highest number on the target branch and share it with no other file
+        # (migrations/README.md, "Reserved blocks", lists the only
+        # exceptions). Against the target's CURRENT tip, not the branch point,
+        # so a number another change has taken since also fails here.
+        run: scripts/ci/check_migration_numbers.sh HEAD^1
       - name: Self-test the e2e DSN guard
         # scripts/e2e/dsn-guard.sh keeps the hand-run e2e harness off the
         # production cluster (it refuses a DSN with no host, no port, or port
