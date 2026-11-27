@@ -240,8 +240,6 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("policies::decay_sweep", Scope("claims:admin")),
     ("policies::record_outcome", Scope("claims:admin")),
     ("policies::resolve_challenge", Scope("claims:admin")),
-    ("political::create_coalition", Scope("claims:write")),
-    ("political::create_technique", Scope("claims:write")),
     ("privatization::abort_plan", Exempt(INSTANCE_ADMIN)),
     ("privatization::apply_plan", Exempt(INSTANCE_ADMIN)),
     ("privatization::approve_plan", Exempt(INSTANCE_ADMIN)),

@@ -1146,33 +1146,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "workflows::get_or_create_system_agent",
         ],
     ),
-    // untenanted: the agent row; the profile reads are viewer-spliced.
-    (
-        "political.rs",
-        "compare_agents",
-        // stamped: the agent's name through migration 309's disclosure on the
-        // handler's `read_as(viewer)` connection; `redact_agent` is pure.
-        &[
-            "AgentDisclosureRepository::disclosure",
-            "AgentRepository::get_by_id",
-            "epigraph_db::redact_agent",
-        ],
-    ),
-    (
-        "political.rs",
-        "inflation_index",
-        &["AgentRepository::get_by_id"],
-    ),
-    (
-        "political.rs",
-        "originated_claims",
-        &["AgentRepository::get_by_id"],
-    ),
-    (
-        "political.rs",
-        "position_timeline",
-        &["AgentRepository::get_by_id"],
-    ),
     // lifecycle (every privatization.rs entry).
     (
         "privatization.rs",

@@ -88,7 +88,6 @@ pub mod pattern_template;
 pub mod person_team_group;
 pub mod perspective;
 pub mod policy;
-pub mod political;
 pub mod privatization;
 pub mod provenance;
 pub mod provenance_chain;
@@ -277,10 +276,6 @@ pub use paper::{
 };
 pub use perspective::PerspectiveRepository;
 pub use policy::PolicyRepository;
-pub use political::{
-    CoalitionRow, PoliticalRepository, PropagandaTechniqueRow, PropagationStepRow,
-    TimelineClaimRow,
-};
 pub use provenance_chain::{
     ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceNode, MAX_CHAIN_NODES,
     PROVENANCE_INCOMING, PROVENANCE_OUTGOING,

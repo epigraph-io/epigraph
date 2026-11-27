@@ -274,12 +274,6 @@ pub use repos::mass_function::{
 pub use repos::perspective::PerspectiveRow;
 pub use repos::scoped_belief::{CommunityFoldsCleared, ScopedBeliefRow};
 
-// Re-export Political network monitoring types
-pub use repos::political::{
-    CoalitionRow, PoliticalRepository, PropagandaTechniqueRow, PropagationStepRow,
-    TimelineClaimRow,
-};
-
 // Re-export the agent epistemic-profile reads
 pub use repos::agent_profile::{AgentClaimProfileRow, AgentProfileRepository, EvidenceTypeCount};
 

@@ -37,9 +37,9 @@
 //!
 //! # Coverage, stated per HANDLER because the fraction is ambiguous
 //!
-//! Four arms drive 7 of the shard's 17 converted sites — but note the unit
+//! Two arms drive 4 of the shard's converted sites — but note the unit
 //! before re-deriving that number. It counts `.db_pool` SITES, the unit the
-//! ratchet uses (3 + 1 + 2 + 1 across the four arms below); counted as repo
+//! ratchet uses (3 + 1 across the two arms below); counted as repo
 //! FUNCTIONS driven it is a different integer, and an earlier revision of this
 //! section left which one it meant to inference.
 //!
@@ -53,17 +53,19 @@
 //! separable piece of work than the conversion it would cover. Their module
 //! docs say so rather than implying coverage they do not have.
 //!
-//! **THE UNCOVERED SET, NAMED BY HANDLER RATHER THAN BY FILE.** Stating it as
-//! three route files understated it: three converted handlers in `political.rs`
-//! — `position_timeline`, `originated_claims` and `inflation_index` — are also
-//! executed by NO test in this workspace, and a file-level statement hid them
-//! because two of that file's other handlers ARE covered. Adding
-//! `graph_neighborhood.rs::claim_compound_neighborhood`, the uncovered handlers
-//! are those four plus `political.rs::claim_techniques` (separately unassertable,
-//! see below) and the `context.rs` / `perspective.rs` handlers. Every repo method
+//! **THE UNCOVERED SET, NAMED BY HANDLER RATHER THAN BY FILE.**
+//! `graph_neighborhood.rs::claim_compound_neighborhood` and the `context.rs` /
+//! `perspective.rs` handlers are executed by no arm here. Every repo method
 //! they reach was already generic over `PgExecutor`, so `&mut PgConnection`
 //! satisfies it and the change in each is an executor swap — which bounds the
 //! runtime risk but does not make the coverage statement any less owed.
+//!
+//! **The political handlers are gone.** Seven of the shard's 17 sites were in
+//! `routes/political.rs`. The political-monitoring module was deleted from the
+//! kernel (backlog bd13e0e0) and its arms here (`claim_genealogy` twice,
+//! `compare_agents`) went with it; `epistemic_profile`, the one handler a
+//! kernel client reads, moved to `routes/agents.rs` (backlog a1dd9225) and
+//! keeps its arm.
 //!
 //! The asymmetry runs the other way too, and the blanket file-level claim was
 //! CONSERVATIVE for one of them: `graph_neighborhood.rs::expand` is driven
@@ -72,22 +74,9 @@
 //! cannot observe suppression, for the authority reason above — but a `read_as`
 //! refusal in `expand` would have failed them.
 //!
-//! One further site is convertible but not assertable at all:
-//! `political.rs::claim_techniques` reads through
-//! `PoliticalRepository::get_claim_techniques`, which JOINs
-//! `propaganda_techniques` — a relation `migrations/054_entity_types_registry.sql`
-//! states outright "exists only in shared prod, not in epigraph migrations".
-//! Confirmed at migration head 92: `pg_class` has no such relation. A named test
-//! failing on its own assertion cannot be written for it without a fixture
-//! authoring a table the migrations deliberately do not create, and this file
-//! does not author one.
-//!
 //! | route | sites driven | arm |
 //! |---|---|---|
 //! | `agents.rs::epistemic_profile` (moved from `political.rs`, backlog a1dd9225) | `AgentRepository::get_by_id`, `AgentProfileRepository::{get_agent_profile_claims, get_agent_evidence_distribution}` | [`epistemic_profile_counts_the_viewers_own_group_private_claim`] |
-//! | `political.rs::claim_genealogy` | `PoliticalRepository::get_claim_genealogy` | [`claim_genealogy_serves_the_viewers_own_group_private_edge`] |
-//! | `political.rs::claim_genealogy` (existence probe) | `ClaimRepository::visible_claim_ids` | [`claim_genealogy_private_claim_is_404_like_a_missing_one`] |
-//! | `political.rs::compare_agents` | `AgentRepository::get_by_id`, `AgentProfileRepository::get_agent_profile_claims`, over N agents | [`compare_agents_measures_every_agent_against_the_same_corpus`] |
 //! | `structural.rs::get_structural_features` | nine `StructuralRepository` reads on one connection | [`structural_features_counts_the_viewers_own_group_private_claim`] |
 //!
 //! # What IS and is NOT proven here
@@ -117,7 +106,6 @@ mod viewer_fixture;
 use axum::extract::{Path, Query, State};
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::agents::{epistemic_profile, EpistemicProfileParams};
-use epigraph_api::routes::political::{claim_genealogy, compare_agents, CompareAgentsParams};
 use epigraph_api::routes::structural::{get_structural_features, StructuralFeaturesQuery};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_auth::{AuthContext, ClientType};
@@ -253,60 +241,6 @@ fn admin_auth(agent: Uuid) -> AuthContext {
     }
 }
 
-/// A claim -> agent propagation edge with its tenancy columns FORCED to
-/// `(visibility, owner_group_id)`.
-///
-/// File-local rather than a `viewer_fixture` addition because
-/// `viewer_fixture::seed_edge` hardcodes `target_type = 'claim'`, and
-/// `trigger_validate_edge_refs` rejects an agent uuid on that spelling with
-/// `23503`. Widening the shared helper's signature is a change to a fixture
-/// whose reach is the subject of an open entry; a conversion shard is not the
-/// place for it.
-///
-/// The UPDATE after the INSERT is not redundant, for the reason
-/// `seed_edge_owned_by` documents at length: migration 070's trigger is
-/// `BEFORE INSERT OR UPDATE **OF source_id, target_id**`, so it rewrites the
-/// tenancy columns on every INSERT and does not fire for an update that touches
-/// only `visibility` / `owner_group_id`. An edge left to the trigger inherits
-/// its ENDPOINTS' visibility — and an absence assertion built that way is
-/// satisfied by the endpoint predicate alone and stays green with the edge
-/// predicate deleted, which is a mutation proof that reports a false pass.
-/// `co_owner_group_id` is cleared to stay inside migration 072's
-/// `edges_co_owner_shape` check.
-async fn seed_propagation_edge(
-    pool: &PgPool,
-    claim: Uuid,
-    agent: Uuid,
-    relationship: &str,
-    visibility: &str,
-    owner_group_id: Uuid,
-) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-         VALUES ($1, $2, 'claim', $3, 'agent', $4)",
-    )
-    .bind(id)
-    .bind(claim)
-    .bind(agent)
-    .bind(relationship)
-    .execute(pool)
-    .await
-    .expect("seed propagation edge");
-
-    sqlx::query(
-        "UPDATE edges SET visibility = $2, owner_group_id = $3, co_owner_group_id = NULL \
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(visibility)
-    .bind(owner_group_id)
-    .execute(pool)
-    .await
-    .expect("force propagation edge tenancy");
-    id
-}
-
 // ── agents.rs::epistemic_profile (moved out of political.rs, backlog a1dd9225) ──
 
 /// `GET /api/v1/agents/:id/epistemic-profile` — the arm that drives the
@@ -366,226 +300,6 @@ async fn epistemic_profile_counts_the_viewers_own_group_private_claim(pool: PgPo
         out.claim_count > 0,
         "over-suppression check: a conversion that refuses every caller passes any \
          negative assertion, so the positive direction is asserted explicitly"
-    );
-}
-
-// ── political.rs ──
-
-/// `GET /api/v1/claims/:id/genealogy` — the arm over `edges`, which carries the
-/// co-ownership spelling (`EDGE_VISIBILITY`) rather than the claim one.
-///
-/// Both directions are asserted on one response: the viewer's OWN group-private
-/// propagation edge must be present, and a stranger's must be absent. Seeding
-/// the stranger's edge with `seed_edge_owned_by` rather than `seed_edge` is
-/// deliberate — an edge left to migration 070's trigger inherits its endpoints'
-/// visibility, and an absence assertion built that way is satisfied by the
-/// endpoint predicate alone and would stay green with the edge predicate
-/// deleted.
-#[sqlx::test(migrations = "../../migrations")]
-async fn claim_genealogy_serves_the_viewers_own_group_private_edge(pool: PgPool) {
-    let (agent, group) = seed_agent_with_group(&pool, "s5-gen-mine").await;
-    let (stranger, stranger_group) = seed_agent_with_group(&pool, "s5-gen-theirs").await;
-
-    let subject = seed_public_claim(&pool, agent, "s5 gen: the talking point").await;
-
-    // ORIGINATED_BY, owned by the viewer's group.
-    seed_propagation_edge(&pool, subject, agent, "ORIGINATED_BY", "group", group).await;
-
-    // AMPLIFIED_BY, owned by a group the viewer is not in.
-    seed_propagation_edge(
-        &pool,
-        subject,
-        stranger,
-        "AMPLIFIED_BY",
-        "group",
-        stranger_group,
-    )
-    .await;
-
-    let state = split_state(&pool).await;
-    let viewer = viewer_for(&pool, agent).await;
-
-    let out = claim_genealogy(ViewerExtractor(viewer), State(state), Path(subject))
-        .await
-        .expect(
-            "the subject claim is public and the viewer owns one of its propagation \
-             edges, so this must SERVE",
-        )
-        .0;
-
-    let agents: Vec<Uuid> = out.propagation_tree.iter().map(|e| e.agent_id).collect();
-
-    assert!(
-        agents.contains(&agent),
-        "CALIBRATION: a propagation edge owned by a group the viewer BELONGS to must \
-         appear in the genealogy. Absence here is the fail-closed drift a reversion to \
-         the raw pool produces; got {agents:?}"
-    );
-    assert!(
-        !agents.contains(&stranger),
-        "a propagation edge owned by a group the viewer is not in must be ABSENT, not \
-         present with its properties blanked; got {agents:?}"
-    );
-    assert_eq!(
-        agents.len(),
-        1,
-        "exactly one of the two propagation edges on this claim is readable by this \
-         viewer; a different count means the predicate is admitting or dropping rows \
-         for a reason this arm does not model. got {agents:?}"
-    );
-}
-
-/// `GET /api/v1/claims/:id/genealogy` must not be an existence oracle: a claim
-/// the viewer cannot read answers exactly like a claim that does not exist.
-///
-/// The probe that decides 404-vs-200 runs on the stamped connection, and that
-/// connection is a SUPERUSER session in this harness (see the module doc), so
-/// no row policy filters it. Only an in-query visibility predicate on the probe
-/// can turn the stranger's request into a 404 here, which is what this arm
-/// measures: a viewer-less `SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)`
-/// answers 200 with an empty tree for another group's private claim.
-#[sqlx::test(migrations = "../../migrations")]
-async fn claim_genealogy_private_claim_is_404_like_a_missing_one(pool: PgPool) {
-    let (owner, group) = seed_agent_with_group(&pool, "s5-gen-oracle-owner").await;
-    let (stranger, _) = seed_agent_with_group(&pool, "s5-gen-oracle-stranger").await;
-    let private = seed_group_claim(&pool, owner, group, "s5 gen oracle: private").await;
-    let public = seed_public_claim(&pool, owner, "s5 gen oracle: public").await;
-
-    // CALIBRATION: the owner reads its own private claim's genealogy, so a 404
-    // below is the visibility verdict and not a broken handler or fixture.
-    let served = claim_genealogy(
-        ViewerExtractor(viewer_for(&pool, owner).await),
-        State(split_state(&pool).await),
-        Path(private),
-    )
-    .await;
-    assert!(
-        served.is_ok(),
-        "CALIBRATION: the owner must be served its own group-private claim's \
-         genealogy; got {:?}",
-        served.err()
-    );
-
-    // CALIBRATION: the SAME stranger is served a public claim it does not own,
-    // so a 404 below is the private-claim verdict, not a probe that fails
-    // closed for anything outside the caller's own groups.
-    let stranger_public = claim_genealogy(
-        ViewerExtractor(viewer_for(&pool, stranger).await),
-        State(split_state(&pool).await),
-        Path(public),
-    )
-    .await;
-    assert!(
-        stranger_public.is_ok(),
-        "CALIBRATION: a stranger must be served a public claim's genealogy; got {:?}",
-        stranger_public.err()
-    );
-
-    // The reference answer: a UUID naming no claim at all.
-    let missing = claim_genealogy(
-        ViewerExtractor(viewer_for(&pool, stranger).await),
-        State(split_state(&pool).await),
-        Path(Uuid::new_v4()),
-    )
-    .await;
-    assert!(
-        matches!(&missing, Err(epigraph_api::errors::ApiError::NotFound { entity, .. }) if entity == "Claim"),
-        "CALIBRATION: a random UUID must be a Claim NotFound; got {:?}",
-        missing.as_ref().map(|j| j.0.propagation_tree.len())
-    );
-
-    let hidden = claim_genealogy(
-        ViewerExtractor(viewer_for(&pool, stranger).await),
-        State(split_state(&pool).await),
-        Path(private),
-    )
-    .await;
-    match hidden {
-        Err(epigraph_api::errors::ApiError::NotFound { entity, id }) => {
-            assert_eq!(entity, "Claim", "same NotFound entity as a missing claim");
-            assert_eq!(id, private.to_string());
-        }
-        Err(other) => panic!(
-            "another group's private claim must answer NotFound, like a missing \
-             one; got a different error {other:?}"
-        ),
-        Ok(out) => panic!(
-            "another group's private claim answered 200 (tree of {} steps) where a \
-             missing claim answers 404: the existence probe is an oracle",
-            out.0.propagation_tree.len()
-        ),
-    }
-}
-
-/// `GET /api/v1/agents/compare` — the arm that exists because this handler's
-/// conversion was a RESTRUCTURE rather than a swap.
-///
-/// The raw-pool alias this replaced was rebound INSIDE the loop body, so a
-/// mechanical per-site conversion would have called `read_as` once per agent.
-/// Hoisted, every agent in the comparison is measured on ONE connection against
-/// ONE corpus — which is the property that makes a comparison endpoint mean
-/// anything. This arm asserts that property directly: two agents, each with one
-/// public and one group-private claim, compared by a viewer who belongs to only
-/// the FIRST agent's group. If the two profiles came back with equal counts, the
-/// endpoint would be comparing the readable corpus against the full one.
-#[sqlx::test(migrations = "../../migrations")]
-async fn compare_agents_measures_every_agent_against_the_same_corpus(pool: PgPool) {
-    let (agent, group) = seed_agent_with_group(&pool, "s5-cmp-mine").await;
-    let (stranger, stranger_group) = seed_agent_with_group(&pool, "s5-cmp-theirs").await;
-
-    seed_public_claim(&pool, agent, "s5 cmp: my public claim").await;
-    seed_group_claim(&pool, agent, group, "s5 cmp: my group-private claim").await;
-
-    seed_public_claim(&pool, stranger, "s5 cmp: their public claim").await;
-    seed_group_claim(
-        &pool,
-        stranger,
-        stranger_group,
-        "s5 cmp: their group-private claim",
-    )
-    .await;
-
-    let state = split_state(&pool).await;
-    let viewer = viewer_for(&pool, agent).await;
-
-    let out = compare_agents(
-        ViewerExtractor(viewer),
-        State(state),
-        Query(CompareAgentsParams {
-            ids: format!("{agent},{stranger}"),
-        }),
-    )
-    .await
-    .expect("both agents exist and the viewer can read at least their public claims")
-    .0;
-
-    assert_eq!(
-        out.len(),
-        2,
-        "both agents exist, so both must appear; a shorter list means `get_by_id` \
-         failed to find one through the stamped connection"
-    );
-
-    let mine = out
-        .iter()
-        .find(|p| p.agent_id == agent)
-        .expect("the viewer's own profile is in the comparison");
-    let theirs = out
-        .iter()
-        .find(|p| p.agent_id == stranger)
-        .expect("the stranger's profile is in the comparison");
-
-    assert_eq!(
-        mine.claim_count, 2,
-        "CALIBRATION: the viewer belongs to this agent's group, so BOTH its claims are \
-         readable. A count of 1 is the fail-closed drift a reversion to the raw pool \
-         produces, and it would also make the two profiles agree for the wrong reason"
-    );
-    assert_eq!(
-        theirs.claim_count, 1,
-        "the viewer does not belong to the stranger's group, so only the stranger's \
-         PUBLIC claim is readable. A count of 2 means the comparison is scoring one \
-         agent on a corpus the caller cannot see"
     );
 }
 
