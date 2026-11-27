@@ -1,3 +1,5 @@
+#[cfg(feature = "db")]
+pub mod analyze_graph;
 pub mod atlas_layout;
 #[cfg(feature = "db")]
 pub mod atlas_links;

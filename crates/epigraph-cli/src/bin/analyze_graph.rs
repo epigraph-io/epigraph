@@ -33,22 +33,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     // Load claims
     // -----------------------------------------------------------------------
-    let claim_rows =
-        sqlx::query("SELECT id, content, truth_value FROM claims ORDER BY truth_value DESC")
-            .fetch_all(&pool)
-            .await?;
+    // Role-aware (backlog fe1cdcdf): a compound is loaded with no belief and
+    // after the non-compounds; it stays a node of the graph's structure.
+    let loaded = epigraph_cli::analyze_graph::load_claims(&pool).await?;
 
     let mut claim_contents: HashMap<Uuid, String> = HashMap::new();
-    let claims: Vec<ReasoningClaim> = claim_rows
-        .iter()
-        .map(|row| {
-            let id: Uuid = row.get("id");
-            let content: String = row.get("content");
-            let truth_value: f64 = row.get("truth_value");
-            claim_contents.insert(id, content);
-            ReasoningClaim { id, truth_value }
+    let mut beliefs: HashMap<Uuid, Option<f64>> = HashMap::new();
+    let claims: Vec<ReasoningClaim> = loaded
+        .into_iter()
+        .map(|c| {
+            claim_contents.insert(c.id, c.content);
+            beliefs.insert(c.id, c.belief);
+            // The engine reads `claim` for membership only (components,
+            // unsupported claims), never its strength, so a compound's
+            // missing belief enters as 0.0 and is never read.
+            ReasoningClaim {
+                id: c.id,
+                truth_value: c.belief.unwrap_or(0.0),
+            }
         })
         .collect();
+    let belief_of = |id: &Uuid| -> String {
+        epigraph_cli::analyze_graph::belief_label(beliefs.get(id).copied().flatten())
+    };
 
     println!("  Loaded {} claims", claims.len());
 
@@ -396,12 +403,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Show a sample of claims in each component
             let sample_size = comp.len().min(5);
             for id in &comp[..sample_size] {
-                let truth = claims
-                    .iter()
-                    .find(|c| c.id == *id)
-                    .map(|c| c.truth_value)
-                    .unwrap_or(0.0);
-                println!("    [{:.2}] {}", truth, label(id));
+                println!("    [{}] {}", belief_of(id), label(id));
             }
             if comp.len() > sample_size {
                 println!("    ... and {} more claims", comp.len() - sample_size);
@@ -441,16 +443,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  Top 10 most influential claims (support others transitively):");
     for (i, (id, count)) in influence_ranked.iter().take(10).enumerate() {
-        let truth = claims
-            .iter()
-            .find(|c| c.id == **id)
-            .map(|c| c.truth_value)
-            .unwrap_or(0.0);
         let ev = evidence_counts.get(id).unwrap_or(&0);
         println!(
-            "    {}. [{:.2} truth, {} evidence, {} outbound] {}",
+            "    {}. [{} truth, {} evidence, {} outbound] {}",
             i + 1,
-            truth,
+            belief_of(id),
             ev,
             count,
             label(id),
@@ -461,15 +458,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dep_ranked: Vec<_> = target_dependence.iter().collect();
     dep_ranked.sort_by(|a, b| b.1.cmp(a.1));
     for (i, (id, count)) in dep_ranked.iter().take(10).enumerate() {
-        let truth = claims
-            .iter()
-            .find(|c| c.id == **id)
-            .map(|c| c.truth_value)
-            .unwrap_or(0.0);
         println!(
-            "    {}. [{:.2} truth, {} inbound] {}",
+            "    {}. [{} truth, {} inbound] {}",
             i + 1,
-            truth,
+            belief_of(id),
             count,
             label(id),
         );
