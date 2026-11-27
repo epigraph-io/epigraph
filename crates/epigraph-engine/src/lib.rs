@@ -41,10 +41,13 @@
 //! table says the flag is not acted on. Read it there rather than here.
 //!
 //! **Exit criterion.** The legacy per-site folds (and the `LegacyFold` arms
-//! of the atom-cache writer) are deleted once `EPIGRAPH_COMPOUND_BELIEF=strict`
-//! has served on every process for N days with no rollback, N = 30 unless
-//! the operator sets another value at the `strict` flip. That deletes fold
-//! CODE only: stored BBA rows are kept as rollback and attribution input.
+//! of the atom-cache writer) are deleted once the `strict` mode has been
+//! SERVED on every process for N days with no rollback, N = 30 unless the
+//! operator sets another value at the `strict` flip. Served means the mode
+//! [`belief_view::CompoundBeliefMode::current`] resolves, under a build that
+//! wires `strict`; setting `EPIGRAPH_COMPOUND_BELIEF=strict` on this build
+//! does not count, because it still serves `legacy`. That deletes fold CODE
+//! only: stored BBA rows are kept as rollback and attribution input.
 //! The remaining rollout steps and this criterion are tracked in the backlog
 //! (85c03e90).
 
