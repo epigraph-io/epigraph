@@ -1388,7 +1388,7 @@ async fn verify_checks_the_operator_function_grants_to_the_app_role(pool: PgPool
     );
 }
 
-// The F-089-D fragment repair (`run --entity harvester-fragments`), its strict
+// The F-089-D fragment repair (the fragment entity of `run --entity`), its strict
 // and platform `verify` counts and the provenance-key offender listing
 // (backlog d5e6575c) were pinned here until migration 354 dropped the
 // harvester tables and the binary's fragment entity with them.
