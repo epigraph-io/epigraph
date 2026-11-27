@@ -3,10 +3,11 @@
 //! No domain type implements these: the impls on `Claim`, `Evidence` and
 //! `ReasoningTrace` were deleted unused (backlog 8c6fc756). Packet signing
 //! uses the `PacketSignable` structs in `epigraph-api` (`routes/submit.rs`)
-//! and in the `epigraph-cli` ingest binaries, and a stored claim's
-//! `content_hash` is BLAKE3 of its content, computed by the repository. The
-//! traits stay for any future type that really is signed; the tests below
-//! exercise them on local test types.
+//! and in the `epigraph-cli` ingest binaries. A stored claim's
+//! `content_hash` is set by its writer (BLAKE3 of the content on most paths,
+//! a scope-bound compound digest for document- and workflow-ingest nodes),
+//! not by these traits. The traits stay for any future type that really is
+//! signed; the tests below exercise them on local test types.
 
 use epigraph_crypto::{AgentSigner, ContentHasher, CryptoError, SignatureVerifier, SIGNATURE_SIZE};
 use serde::Serialize;

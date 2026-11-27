@@ -5,10 +5,11 @@
 //! # Key Principles
 //!
 //! - A claim's reasoning trace is linked after insert, not at construction:
-//!   `trace_id` is optional at construction and set via
-//!   [`Claim::set_trace_id`] once the trace row exists (the claims <->
-//!   reasoning_traces foreign key is circular); the database does not
-//!   require it
+//!   `trace_id` is optional at construction (the claims <-> reasoning_traces
+//!   foreign key is circular) and the database does not require it. A stored
+//!   row is linked by the repository's `ClaimRepository::update_trace_id`
+//!   once the trace row exists; [`Claim::set_trace_id`] only sets the field
+//!   on the in-memory value
 //! - Truth values are probabilistic [0.0, 1.0], not binary
 //! - Claims can reference the agent who made them, but agent reputation
 //!   NEVER influences the initial truth value (anti-authority bias)
@@ -26,8 +27,8 @@ use serde_with::{serde_as, Bytes};
 /// - `content`: The actual claim text/statement
 /// - `truth_value`: Probabilistic truth in [0.0, 1.0]
 /// - `trace_id`: the reasoning that led to this claim; optional at
-///   construction and linked after insert via `set_trace_id` (circular FK);
-///   the database does not require it
+///   construction (circular FK) and linked after insert by the repository
+///   (`ClaimRepository::update_trace_id`); the database does not require it
 /// - `agent_id`: Who made this claim (for tracking, not for truth calculation)
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,15 +50,19 @@ pub struct Claim {
     #[serde_as(as = "Bytes")]
     pub public_key: [u8; 32],
 
-    /// Content hash (32 bytes): zero on construction; the repository stores
-    /// BLAKE3(content).
+    /// Content hash (32 bytes). `Claim::new` and `Claim::new_with_trace`
+    /// leave it zero; `Claim::with_id` takes it as given. The writer sets it
+    /// before insert: BLAKE3(content) on most paths, but document- and
+    /// workflow-ingest nodes store a scope-bound compound digest (see
+    /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`), so
+    /// `blake3(content) == content_hash` is not an integrity check on its own.
     #[serde_as(as = "Bytes")]
     pub content_hash: [u8; 32],
 
     /// The reasoning trace that supports this claim. Optional at
-    /// construction and linked after insert via `set_trace_id` (the claims
-    /// <-> reasoning_traces foreign key is circular); the database does not
-    /// require it.
+    /// construction (the claims <-> reasoning_traces foreign key is
+    /// circular); a stored row is linked after insert by the repository's
+    /// `ClaimRepository::update_trace_id`. The database does not require it.
     pub trace_id: Option<TraceId>,
 
     /// Ed25519 signature from the agent (64 bytes)
@@ -88,7 +93,8 @@ impl Claim {
     ///
     /// Claims start with `trace_id: None` due to the circular FK between
     /// `claims.trace_id → reasoning_traces` and `reasoning_traces.claim_id → claims`.
-    /// Create the claim first, then the trace, then link via `set_trace_id`.
+    /// Create the claim first, then the trace, then link the stored row with
+    /// `ClaimRepository::update_trace_id` (`set_trace_id` updates only this value).
     ///
     /// # Arguments
     /// * `content` - The claim statement
