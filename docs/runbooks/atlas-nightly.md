@@ -68,6 +68,14 @@ The operator builds (`atlas_meaning apply`, `atlas_links apply`) do the same
 after their checks; the results they apply hold the embedded members only, as
 the export writes them.
 
+If a theme's subtree cannot be added (the reachable case: a root with 128
+children pushed one level down would take a leaf past the contract's depth
+of 16), that theme keeps its clustered trees and its members with no
+embedding stay in no leaf for that build. The theme still builds, and the
+reason is reported: `themes.built[].stats.unplaced_refused` in the nightly's
+report, `unplaced_refused` (theme id and error) in an operator build's
+report. Neither is stored in the run's `params`.
+
 Every run records those leaves in its `params.unplaced_leaves` (both
 hierarchies). The next night takes their claims out of the previous trees
 before it updates them, so a claim embedded since is placed by meaning (the
@@ -174,11 +182,13 @@ The binary prints one JSON summary. Per map, `status` is `written`,
 newer run was published while the night ran; nothing was written) or
 `failed`. Also per map:
 - `themes.built` (per theme: members, added, removed, leaves, resplit leaves,
-  linked, mirrors), `themes.carried`, `themes.dropped`, `themes.unbuilt`;
+  linked, mirrors, and `unplaced_refused` when its members with no embedding
+  could not be placed, above), `themes.carried`, `themes.dropped`,
+  `themes.unbuilt`;
 - `unembedded_members` (current themed claims the map may draw with no
   embedding, in every theme, also one with no embedded member: in the "not
   yet placed" leaves of a theme that built or was carried, in no leaf of one
-  that was dropped or is unbuilt); per theme, `themes.built[].stats.unembedded`;
+  that was dropped, is unbuilt or reports `unplaced_refused`); per theme, `themes.built[].stats.unembedded`;
 - `links` (the cross-group links: `links` read, and what the contract caps
   cut: `dropped_targets`, `dropped_bundles`, `dropped_outgoing`,
   `dropped_links`; also stored in the run's `params`). A cut keeps the

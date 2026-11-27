@@ -32,8 +32,8 @@ use crate::atlas_meaning::build::UNPLACED_KEY;
 use crate::atlas_meaning::docs::level_documents_with_switch;
 use crate::atlas_meaning::files::ResultTheme;
 use crate::atlas_meaning::tree::{
-    check_tree, map_key, place_unplaced, resolve_tree, MeaningTree, NodeBody, ResolveStats,
-    WireGroup, WireKind,
+    check_tree, map_key, place_unplaced, place_unplaced_or_keep, resolve_tree, MeaningTree,
+    NodeBody, ResolveStats, WireGroup, WireKind,
 };
 use crate::atlas_naming::backend::NameBackend;
 use crate::atlas_naming::build::{read_member_texts, read_previous};
@@ -405,50 +405,53 @@ async fn build_theme(
 
     // The members with no embedding, after W5b's checks (which hold for the
     // clustered members): the same "not yet placed" leaves in both trees.
+    // A refusal keeps both trees as clustered and the theme builds, its
+    // members with no embedding in no leaf tonight (else the theme would be
+    // carried, unchanged, every night).
     let mut m_stats = m_stats;
-    let (m_tree, mut waiting) = place_unplaced(
+    let placed = place_unplaced_or_keep(
         map,
-        AtlasHierarchy::Meaning,
         theme,
-        Some(&m_tree),
+        m_tree,
+        Some(l_tree),
         &unplaced,
         &rows,
         cap,
         &mut m_stats,
-    )?;
-    let (l_tree, l_waiting) = place_unplaced(
-        map,
-        AtlasHierarchy::Links,
-        theme,
-        Some(&l_tree),
-        &unplaced,
-        &rows,
-        cap,
         &mut l_stats,
-    )?;
-    waiting.extend(l_waiting);
+    );
+    let m_tree = placed.meaning;
+    let l_tree = placed
+        .links
+        .context("place_unplaced_or_keep returned no links tree")?;
 
     let (docs, edge_cut, renamed) =
         theme_documents(tx, viewer, map, &rows, &m_tree, &l_tree, &all, cap).await?;
+    let mut stats = json!({
+        "members": ids.len(),
+        "unembedded": unplaced.len(),
+        "added": added,
+        "removed": removed,
+        "meaning": {"leaves": m_stats.leaves, "inner": inner(&m_tree),
+                    "resplit_leaves": m_stats.resplit_leaves},
+        "links": {"leaves": l_stats.leaves, "inner": inner(&l_tree),
+                  "resplit_leaves": l_stats.resplit_leaves, "linked": linked.len(),
+                  "mirrors": mirror_count, "joined": l_delta.joined,
+                  "new_link_leaves": l_delta.new_link_leaves,
+                  "new_mirrors": l_delta.new_mirrors},
+        "leaf_edge_cap": edge_cut.json(),
+        "leaf_relationship_names": renamed.json(),
+    });
+    if let Some(why) = placed.refused {
+        // The report (the journal) only: a built theme's stats are not in
+        // the run's params.
+        stats["unplaced_refused"] = json!(why);
+    }
     Ok(ThemeOutcome::Built(BuiltTheme {
         docs,
         mirrors,
-        unplaced: waiting,
-        stats: json!({
-            "members": ids.len(),
-            "unembedded": unplaced.len(),
-            "added": added,
-            "removed": removed,
-            "meaning": {"leaves": m_stats.leaves, "inner": inner(&m_tree),
-                        "resplit_leaves": m_stats.resplit_leaves},
-            "links": {"leaves": l_stats.leaves, "inner": inner(&l_tree),
-                      "resplit_leaves": l_stats.resplit_leaves, "linked": linked.len(),
-                      "mirrors": mirror_count, "joined": l_delta.joined,
-                      "new_link_leaves": l_delta.new_link_leaves,
-                      "new_mirrors": l_delta.new_mirrors},
-            "leaf_edge_cap": edge_cut.json(),
-            "leaf_relationship_names": renamed.json(),
-        }),
+        unplaced: placed.leaves,
+        stats,
         edge_cut,
     }))
 }

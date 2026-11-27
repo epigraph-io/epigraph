@@ -611,6 +611,94 @@ pub fn place_unplaced(
     ))
 }
 
+/// One theme's trees after [`place_unplaced_or_keep`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedTrees {
+    pub meaning: MeaningTree,
+    pub links: Option<MeaningTree>,
+    /// The "not yet placed" leaves of both trees (none when refused).
+    pub leaves: Vec<Uuid>,
+    /// Why the members with no embedding stay out of the trees, when
+    /// [`place_unplaced`] refused either tree.
+    pub refused: Option<String>,
+}
+
+/// [`place_unplaced`] over a theme's meaning tree and (when given) its links
+/// tree, both or neither: when either refuses (a full root pushed down past
+/// [`MAX_DEPTH`] is the reachable case), both trees come back as given with
+/// no "not yet placed" leaf and the refusal, and `m_stats` / `l_stats` are
+/// left as they were. The theme's members with no embedding then stay in no
+/// leaf for this build, as before they were drawn at all, rather than
+/// failing the whole build (an operator's apply) or the theme's night (the
+/// nightly would carry it, unchanged, every night).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn place_unplaced_or_keep(
+    map: AtlasMap,
+    theme_id: Uuid,
+    meaning: MeaningTree,
+    links: Option<MeaningTree>,
+    unplaced: &[Uuid],
+    rows: &LeafRows,
+    cap: usize,
+    m_stats: &mut ResolveStats,
+    l_stats: &mut ResolveStats,
+) -> PlacedTrees {
+    let (mut ms, mut ls) = (*m_stats, *l_stats);
+    let attempt = (|| -> anyhow::Result<(MeaningTree, Option<MeaningTree>, Vec<Uuid>)> {
+        let (m, mut leaves) = place_unplaced(
+            map,
+            AtlasHierarchy::Meaning,
+            theme_id,
+            Some(&meaning),
+            unplaced,
+            rows,
+            cap,
+            &mut ms,
+        )?;
+        let l = match &links {
+            Some(l) => {
+                let (lt, ll) = place_unplaced(
+                    map,
+                    AtlasHierarchy::Links,
+                    theme_id,
+                    Some(l),
+                    unplaced,
+                    rows,
+                    cap,
+                    &mut ls,
+                )?;
+                leaves.extend(ll);
+                Some(lt)
+            }
+            None => None,
+        };
+        Ok((m, l, leaves))
+    })();
+    match attempt {
+        Ok((meaning, links, leaves)) => {
+            (*m_stats, *l_stats) = (ms, ls);
+            PlacedTrees {
+                meaning,
+                links,
+                leaves,
+                refused: None,
+            }
+        }
+        Err(e) => {
+            let why = format!("{e:#}");
+            tracing::warn!(theme = %theme_id, %why,
+                "the theme's members with no embedding stay unplaced");
+            PlacedTrees {
+                meaning,
+                links,
+                leaves: Vec::new(),
+                refused: Some(why),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,5 +1082,107 @@ mod tests {
         // The same members give the same tree.
         let again = place_unplaced(MAP, M, THEME, None, &all, &rows, 100, &mut stats).unwrap();
         assert_eq!(again.0, t);
+    }
+
+    /// A tree of `h` whose root is full (127 one-claim leaves and a chain of
+    /// two-child groups) and whose deepest leaves are at [`MAX_DEPTH`]:
+    /// claims `c(1)..=c(143)`.
+    fn full_and_deep(h: AtlasHierarchy) -> MeaningTree {
+        let mint = |s: &BTreeSet<Uuid>| group_id(MAP, h, THEME, s);
+        let mut n = 0u128;
+        let mut next = || {
+            n += 1;
+            c(n)
+        };
+        let one = |x: Uuid| (mint(&set(&[x])), Shape::Leaf(vec![x]));
+        let (a, b) = (next(), next());
+        let mut claims = set(&[a, b]);
+        let mut chain = Shape::Group(vec![one(a), one(b)]);
+        for _ in 2..MAX_DEPTH {
+            let x = next();
+            chain = Shape::Group(vec![one(x), (mint(&claims), chain)]);
+            claims.insert(x);
+        }
+        let mut kids: Vec<(Uuid, Shape)> = (0..MAX_CHILDREN - 1).map(|_| one(next())).collect();
+        kids.push((mint(&claims), chain));
+        let mut nodes = Vec::new();
+        emit(
+            &mut nodes,
+            root_id(MAP, h, THEME),
+            None,
+            0,
+            &Shape::Group(kids),
+        );
+        MeaningTree {
+            map: MAP,
+            hierarchy: h,
+            theme_id: THEME,
+            nodes,
+        }
+    }
+
+    #[test]
+    fn a_refused_placement_keeps_both_trees_and_their_stats_and_says_why() {
+        let rows = rows(145, 0);
+        let unplaced = [c(144), c(145)];
+        let deep_m = full_and_deep(M);
+        let deep_l = full_and_deep(AtlasHierarchy::Links);
+        assert_eq!(deep_m.nodes[0].claims.len(), 143);
+        assert_eq!(deep_m.nodes.iter().map(|n| n.depth).max(), Some(MAX_DEPTH));
+        // The full root pushed down would go past MAX_DEPTH: refused.
+        let mut s = ResolveStats::default();
+        let err = place_unplaced(MAP, M, THEME, Some(&deep_m), &unplaced, &rows, 100, &mut s)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("deeper than"), "{err:#}");
+
+        let before = ResolveStats {
+            leaves: 7,
+            groups: 3,
+            resplit_leaves: 1,
+            max_leaf_nodes: 2,
+        };
+        let (mut ms, mut ls) = (before, before);
+        let p = place_unplaced_or_keep(
+            MAP,
+            THEME,
+            deep_m.clone(),
+            Some(deep_l.clone()),
+            &unplaced,
+            &rows,
+            100,
+            &mut ms,
+            &mut ls,
+        );
+        assert_eq!((&p.meaning, p.links.as_ref()), (&deep_m, Some(&deep_l)));
+        assert!(p.leaves.is_empty());
+        assert!(p.refused.as_deref().unwrap().contains("deeper than"));
+        assert_eq!((ms, ls), (before, before));
+
+        // Only the links tree refuses: the meaning tree, which would place,
+        // is kept as given too (both trees or neither).
+        let small = placed(&[c(1), c(2)], false);
+        let p = place_unplaced_or_keep(
+            MAP,
+            THEME,
+            small.clone(),
+            Some(deep_l.clone()),
+            &unplaced,
+            &rows,
+            100,
+            &mut ms,
+            &mut ls,
+        );
+        assert_eq!((&p.meaning, p.links.as_ref()), (&small, Some(&deep_l)));
+        assert!(p.leaves.is_empty() && p.refused.is_some());
+        assert_eq!((ms, ls), (before, before));
+
+        // A placement that holds: placed, with its leaf and its stats.
+        let p = place_unplaced_or_keep(
+            MAP, THEME, small, None, &unplaced, &rows, 100, &mut ms, &mut ls,
+        );
+        assert_eq!(p.refused, None);
+        assert_eq!(p.leaves, vec![group_id(MAP, M, THEME, &set(&unplaced))]);
+        assert_eq!(p.meaning.nodes[0].claims.len(), 4);
+        assert_eq!((ms.leaves, ms.groups, ls), (2, 1, before));
     }
 }

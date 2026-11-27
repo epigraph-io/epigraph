@@ -21,7 +21,10 @@ use super::files::{
     index_attachments, prepare_export_dir, write_index, write_theme, ExportIndex, ExportTheme,
     ResultDoc, ResultTheme, EXPORT_FORMAT,
 };
-use super::tree::{check_tree, map_key, place_unplaced, resolve_tree, MeaningTree, ResolveStats};
+use super::tree::{
+    check_tree, map_key, place_unplaced, place_unplaced_or_keep, resolve_tree, MeaningTree,
+    ResolveStats,
+};
 
 /// The `atlas_map_runs.algo` of a run this build writes.
 pub const MEANING_ALGO: &str = "atlas-meaning/1";
@@ -160,6 +163,9 @@ pub struct ResolvedTheme {
     pub unembedded: Vec<Uuid>,
     /// The tree's "not yet placed" leaves, once they are added.
     pub unplaced_leaves: Vec<Uuid>,
+    /// Why `unembedded` stays out of the tree, when placing it was refused
+    /// ([`place_unplaced_or_keep`]).
+    pub unplaced_refused: Option<String>,
 }
 
 /// Check `result` against `map`'s rows in the build's snapshot and resolve
@@ -272,6 +278,7 @@ pub async fn resolve_theme(
         id_chunk_cuts: theme.id_chunk_cuts,
         unembedded: members.unembedded,
         unplaced_leaves: Vec::new(),
+        unplaced_refused: None,
     })
 }
 
@@ -311,8 +318,14 @@ pub async fn unplaced_only_themes(
 /// the map may draw is in a leaf. Call it on the build's transaction, after
 /// `begin_build_snapshot`.
 ///
+/// A theme whose placement is refused keeps its tree as computed, its
+/// members with no embedding in no leaf, and the refusal in
+/// [`ResolvedTheme::unplaced_refused`] ([`place_unplaced_or_keep`]): one
+/// theme does not fail the whole build.
+///
 /// # Errors
-/// Any refusal of [`place_unplaced`], or a database error.
+/// A refusal of [`place_unplaced`] for a theme with no embedded member, or a
+/// database error.
 pub async fn place_unplaced_meaning(
     tx: &mut PgConnection,
     viewer: &Viewer,
@@ -324,18 +337,21 @@ pub async fn place_unplaced_meaning(
     for mut t in themes {
         if !t.unembedded.is_empty() {
             let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &t.unembedded).await?;
-            let (tree, leaves) = place_unplaced(
+            let mut unused = ResolveStats::default();
+            let placed = place_unplaced_or_keep(
                 map,
-                HIERARCHY,
                 t.tree.theme_id,
-                Some(&t.tree),
+                t.tree,
+                None,
                 &t.unembedded,
                 &rows,
                 cap,
                 &mut t.stats,
-            )?;
-            t.tree = tree;
-            t.unplaced_leaves = leaves;
+                &mut unused,
+            );
+            t.tree = placed.meaning;
+            t.unplaced_leaves = placed.leaves;
+            t.unplaced_refused = placed.refused;
         }
         out.push(t);
     }
@@ -351,9 +367,24 @@ pub async fn place_unplaced_meaning(
             id_chunk_cuts: 0,
             unembedded: unplaced,
             unplaced_leaves: leaves,
+            unplaced_refused: None,
         });
     }
     Ok(out)
+}
+
+/// The themes of `themes` whose members with no embedding were refused a
+/// place, each with why, for a build's report.
+#[must_use]
+pub fn unplaced_refusals(themes: &[ResolvedTheme]) -> Vec<serde_json::Value> {
+    themes
+        .iter()
+        .filter_map(|t| {
+            t.unplaced_refused
+                .as_ref()
+                .map(|e| json!({"theme_id": t.tree.theme_id, "error": e}))
+        })
+        .collect()
 }
 
 /// Write every level document of `themes` into the unfinished run `run_id`
@@ -458,6 +489,8 @@ async fn build_result(
         "applied": write,
         "params": params,
         "max_leaf_nodes": themes.iter().map(|t| t.stats.max_leaf_nodes).max().unwrap_or(0),
+        // In the report only (not the run's params): the theme ids and why.
+        "unplaced_refused": unplaced_refusals(&themes),
         "note": "this run holds the meaning hierarchy only; served as the map's latest run it \
                  hides any earlier run's links levels",
     });

@@ -32,12 +32,14 @@ use super::graph::{
     check_mirrors, counted_links, leaf_count, linked_claims, meaning_leaf_of, switch_targets,
 };
 use crate::atlas_meaning::build::{
-    resolve_result, resolve_theme, unplaced_only_themes, ResolvedTheme, UNPLACED_KEY,
+    resolve_result, resolve_theme, unplaced_only_themes, unplaced_refusals, ResolvedTheme,
+    UNPLACED_KEY,
 };
 use crate::atlas_meaning::docs::level_documents_with_switch;
 use crate::atlas_meaning::files::{index_attachments, prepare_export_dir, ResultDoc};
 use crate::atlas_meaning::tree::{
-    check_tree, map_key, place_unplaced, resolve_tree, MeaningTree, ResolveStats,
+    check_tree, map_key, place_unplaced, place_unplaced_or_keep, resolve_tree, MeaningTree,
+    ResolveStats,
 };
 
 /// The `atlas_map_runs.algo` of a run holding both hierarchies.
@@ -320,9 +322,14 @@ pub async fn resolve_links_result(
 /// the build's transaction, after the W5b checks, which hold for the
 /// clustered members only.
 ///
+/// A theme whose placement is refused keeps both trees as computed, its
+/// members with no embedding in no leaf, and the refusal in
+/// [`ResolvedTheme::unplaced_refused`] ([`place_unplaced_or_keep`]).
+///
 /// # Errors
-/// Any refusal of [`place_unplaced`] or [`switch_targets`], two lists of
-/// different themes, or a database error.
+/// A refusal of [`place_unplaced`] for a theme with no embedded member, one
+/// of [`switch_targets`], two lists of different themes, or a database
+/// error.
 pub async fn place_unplaced_both(
     tx: &mut PgConnection,
     viewer: &Viewer,
@@ -345,28 +352,32 @@ pub async fn place_unplaced_both(
         if !m.unembedded.is_empty() {
             let theme = m.tree.theme_id;
             let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &m.unembedded).await?;
-            let (mt, ml) = place_unplaced(
+            let placed = place_unplaced_or_keep(
                 map,
-                AtlasHierarchy::Meaning,
                 theme,
-                Some(&m.tree),
+                m.tree,
+                Some(l.tree),
                 &m.unembedded,
                 &rows,
                 cap,
                 &mut m.stats,
-            )?;
-            let (lt, ll) = place_unplaced(
-                map,
-                HIERARCHY,
-                theme,
-                Some(&l.tree),
-                &m.unembedded,
-                &rows,
-                cap,
                 &mut l.stats,
-            )?;
-            l.switch = switch_targets(&lt, &mt)?;
-            (m.tree, m.unplaced_leaves, l.tree, l.unplaced_leaves) = (mt, ml, lt, ll);
+            );
+            m.tree = placed.meaning;
+            l.tree = placed
+                .links
+                .context("place_unplaced_or_keep returned no links tree")?;
+            if placed.refused.is_none() {
+                l.switch = switch_targets(&l.tree, &m.tree)?;
+                // The record lists each leaf once; its hierarchy is the
+                // tree that holds it.
+                let in_links: BTreeSet<Uuid> = l.tree.nodes.iter().map(|n| n.id).collect();
+                (l.unplaced_leaves, m.unplaced_leaves) = placed
+                    .leaves
+                    .into_iter()
+                    .partition(|id| in_links.contains(id));
+            }
+            m.unplaced_refused = placed.refused;
         }
         m_out.push(m);
         l_out.push(l);
@@ -411,6 +422,7 @@ pub async fn place_unplaced_both(
             id_chunk_cuts: 0,
             unembedded: unplaced,
             unplaced_leaves: ml,
+            unplaced_refused: None,
         });
     }
     Ok((m_out, l_out))
@@ -594,6 +606,8 @@ async fn build_hierarchies(
         "params": params,
         "max_leaf_nodes": meaning_themes.iter().map(|t| t.stats.max_leaf_nodes)
             .chain(links_themes.iter().map(|t| t.stats.max_leaf_nodes)).max().unwrap_or(0),
+        // In the report only (not the run's params): the theme ids and why.
+        "unplaced_refused": unplaced_refusals(&meaning_themes),
     });
     if !write {
         let mut docs = 0;
