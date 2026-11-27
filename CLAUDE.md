@@ -211,9 +211,12 @@ migrate to head (it used to skip silently).
   queues dozens of full runs. Epiclaw's nightly staging run already works
   this way on `integration/<YYYYMMDD>` branches; an ad-hoc batch from a
   session does the same on `staging/<YYYYMMDD>-<tag>`. Use one of those two
-  prefixes: CI runs only the affected shards on other PR heads, and the full
-  plan on `integration/**` and `staging/**`, which is what makes the staging
-  PR the full-suite gate on the combined tree:
+  prefixes: CI runs only the affected shards on other PR heads, only lint and
+  a fixed set of cross-crate ratchets on the burndown's `fix/triage-*` heads
+  (the light plan, `.github/scripts/test-shard.py` `LIGHT_TARGETS`; the
+  `ci:full` label overrides it), and the full plan on `integration/**` and
+  `staging/**`, which is what makes the staging PR the full-suite gate on the
+  combined tree:
   1. Cut the staging branch from current `main`.
   2. Bring in each candidate that is green at its head with
      `git merge --no-ff <head>`, subject `merge(staging): #NNN <its claim>`
