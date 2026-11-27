@@ -148,7 +148,7 @@ class AffectedSelection(unittest.TestCase):
         self.assertNotIn("epigraph-core", kept["partial"])
 
     def test_python_outside_scripts_runs_no_shard(self):
-        d = pr_plan(["services/kanban/board.py", "tests/dedup/test_x.py", "tests/theme/conftest.py"])
+        d = pr_plan(["tools/kanban/board.py", "tests/dedup/test_x.py", "tests/theme/conftest.py"])
         self.assertEqual(d["ids"], [])
 
     def test_a_runbook_read_by_db_tests_runs_only_those_targets(self):

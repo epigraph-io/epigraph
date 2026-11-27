@@ -1,6 +1,6 @@
 """End-to-end tests for the EpiGraph kanban server using stub claude/gh binaries.
 
-    cd services/kanban && python3 -m unittest discover -s tests -v
+    cd tools/kanban && python3 -m unittest discover -s tests -v
 """
 
 import http.client

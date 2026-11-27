@@ -860,7 +860,8 @@ jobs:
         # target without running it. Warnings are not denied, as above.
         run: cargo test -p epigraph-cli --no-default-features --lib --no-run --locked
 
-  # services/kanban is standard-library-only Python with its own end-to-end
+  # tools/kanban (a developer tool for the backlog, not part of the shipped
+  # product) is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
   # patched). Without this job that suite ran only at author time. Nothing in it
   # reaches GitHub, the EpiGraph API or a real `claude`, so it needs no secrets,
@@ -877,7 +878,7 @@ jobs:
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: services/kanban
+        working-directory: tools/kanban
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Python version

@@ -862,7 +862,7 @@ function setBanner(mode, msg) {
   } else {
     b.className = 'banner err';
     append(b, [h('strong', { text: 'Cannot reach the kanban server.' }),
-      h('span', { text: (msg ? msg + ' — ' : '') + 'Retrying every 3s. Start it with: python3 services/kanban/server.py (or open this page with ?demo=1).' })]);
+      h('span', { text: (msg ? msg + ' — ' : '') + 'Retrying every 3s. Start it with: python3 tools/kanban/server.py (or open this page with ?demo=1).' })]);
   }
 }
 
