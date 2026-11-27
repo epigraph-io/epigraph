@@ -404,17 +404,10 @@ pub fn unauthenticated_context(
 }
 
 /// Whether `auth` is the context [`unauthenticated_context`] injects: no token
-/// was presented, so it names no client and no token id.
-///
-/// A context validated from a real token carries the token's `sub` as
-/// `client_id` and a random `jti` (`epigraph_auth::JwtConfig::issue_access_token`),
-/// so both being nil identifies the injected context. A token forged with
-/// both ids nil would only be treated MORE strictly (as principal-less), never
-/// less.
-#[must_use]
-pub fn is_principal_less(auth: &AuthContext) -> bool {
-    auth.client_id.is_nil() && auth.jti.is_nil()
-}
+/// was presented, so it names no client and no token id. Defined in the service
+/// crate beside the write-identity resolver that reads it (backlog 30133ca8);
+/// see `epigraph_service::write_identity::is_principal_less`.
+pub use epigraph_service::write_identity::is_principal_less;
 
 /// Something that can resolve the unauthenticated listener's principal (an
 /// `agents.id`), retrying on failure.

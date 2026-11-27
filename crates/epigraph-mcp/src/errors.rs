@@ -501,11 +501,22 @@ pub fn to_service(e: &McpError) -> ServiceError {
     }
 }
 
-/// The [`McpError`] a [`ServiceError`] is answered with: the inverse of
-/// [`to_service`] on its three codes. The message is designed, caller-facing
-/// text (the service crate's contract), so it is sent as written:
-/// [`invalid_params`], an `INVALID_REQUEST` with no `data`, or
-/// [`internal_error_text`].
+/// The [`McpError`] a [`ServiceError`] is answered with.
+///
+/// * [`ServiceError::InvalidParams`], [`ServiceError::Denied`] and
+///   [`ServiceError::Internal`] carry designed, caller-facing text (the service
+///   crate's contract), sent as written: [`invalid_params`], an
+///   `INVALID_REQUEST` with no `data`, or [`internal_error_text`]. These three
+///   are the inverse of [`to_service`].
+/// * [`ServiceError::InternalLogged`]: [`internal_error_logged`], its message
+///   to the caller and its cause to the server log.
+/// * [`ServiceError::Repository`]: classified from the repository error's type
+///   by [`crate::claim_helper::visibility_caller_error`] (a repository refusal
+///   keeps its text and class, a row the caller cannot see answers as missing,
+///   and everything else takes [`db_caller_error`]).
+/// * [`ServiceError::Fault`]: [`internal_error`] on the typed cause, so a coded
+///   refusal is forwarded as written and anything else is redacted, exactly
+///   as when the call site mapped the error itself.
 ///
 /// A free function rather than a `From` impl: both types are foreign to this
 /// crate (`McpError` is rmcp's `ErrorData`), so the orphan rule allows no impl
@@ -520,6 +531,10 @@ pub fn from_service(e: ServiceError) -> McpError {
             data: None,
         },
         ServiceError::Internal(m) => internal_error_text(m),
+        ServiceError::InternalLogged { message, cause } => internal_error_logged(message, cause),
+        ServiceError::Repository(e) => crate::claim_helper::visibility_caller_error(e),
+        ServiceError::Fault(epigraph_service::errors::Fault::Db(e)) => internal_error(e),
+        ServiceError::Fault(epigraph_service::errors::Fault::Sqlx(e)) => internal_error(e),
     }
 }
 
@@ -1031,15 +1046,21 @@ mod tests {
     /// [`HttpClass`] the service crate gives it.
     #[test]
     fn service_errors_round_trip_through_mcp_errors() {
-        for e in [
-            ServiceError::InvalidParams("bad input".into()),
-            ServiceError::Denied("not yours".into()),
-            ServiceError::Internal("designed fault text".into()),
-        ] {
-            let mcp = from_service(e.clone());
-            assert_eq!(http_class(&mcp), e.http_class(), "{e:?}");
-            assert_eq!(mcp.data, None, "{e:?}");
-            assert_eq!(to_service(&mcp), e);
+        let designed = || {
+            [
+                ServiceError::InvalidParams("bad input".into()),
+                ServiceError::Denied("not yours".into()),
+                ServiceError::Internal("designed fault text".into()),
+            ]
+        };
+        for (e, again) in designed().into_iter().zip(designed()) {
+            let class = e.http_class();
+            let mcp = from_service(e);
+            assert_eq!(http_class(&mcp), class, "{again:?}");
+            assert_eq!(mcp.data, None, "{again:?}");
+            let back = to_service(&mcp);
+            assert_eq!(back.http_class(), class, "{again:?}");
+            assert_eq!(back.message(), again.message());
         }
         assert_eq!(
             from_service(ServiceError::InvalidParams("x".into())).code,
@@ -1052,6 +1073,73 @@ mod tests {
         assert_eq!(
             from_service(ServiceError::Internal("x".into())).code,
             ErrorCode::INTERNAL_ERROR
+        );
+    }
+
+    /// The typed variants are answered as the call sites that used to map the
+    /// error themselves answered it: a logged fault sends its designed message
+    /// and keeps the cause out of the reply, a driver fault is redacted, and a
+    /// repository error is classified from its type, so the MCP class and the
+    /// service crate's HTTP class agree.
+    #[test]
+    fn typed_service_errors_keep_their_mcp_answer() {
+        use epigraph_db::errors::RefusalKind;
+        use epigraph_db::DbError;
+        use epigraph_service::errors::Fault;
+
+        let logged = from_service(ServiceError::InternalLogged {
+            message: "tool: could not acquire a viewer-stamped connection".into(),
+            cause: "secret driver text".into(),
+        });
+        assert_eq!(logged.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            logged.message,
+            "tool: could not acquire a viewer-stamped connection"
+        );
+
+        let fault = from_service(ServiceError::Fault(Fault::Sqlx(sqlx::Error::PoolTimedOut)));
+        assert_eq!(fault.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(fault.message, INTERNAL_ERROR_MESSAGE);
+        let fault = from_service(ServiceError::Fault(Fault::Db(DbError::QueryFailed {
+            source: sqlx::Error::PoolTimedOut,
+        })));
+        assert_eq!(fault.message, INTERNAL_ERROR_MESSAGE);
+
+        let samples = || {
+            vec![
+                DbError::ElevatedReadOnly,
+                DbError::Refused {
+                    kind: RefusalKind::Input,
+                    message: "malformed".into(),
+                },
+                DbError::Refused {
+                    kind: RefusalKind::Authority,
+                    message: "not yours".into(),
+                },
+                DbError::Refused {
+                    kind: RefusalKind::State,
+                    message: "already superseded".into(),
+                },
+                DbError::NotFound {
+                    entity: "group".into(),
+                    id: uuid::Uuid::nil(),
+                },
+                DbError::InvalidData {
+                    reason: "bad label".into(),
+                },
+                DbError::QueryFailed {
+                    source: sqlx::Error::PoolTimedOut,
+                },
+            ]
+        };
+        for (e, again) in samples().into_iter().zip(samples()) {
+            let service_class = ServiceError::Repository(e).http_class();
+            let mcp = from_service(ServiceError::Repository(again));
+            assert_eq!(http_class(&mcp), service_class, "{mcp:?}");
+        }
+        assert_eq!(
+            from_service(ServiceError::Repository(DbError::ElevatedReadOnly)).message,
+            DbError::ElevatedReadOnly.to_string()
         );
     }
 }

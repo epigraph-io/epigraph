@@ -105,7 +105,7 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          it, and one with no declaration refuses (`every_production_embedder_declares_a_store_path`).",
     ),
     (
-        "server.rs",
+        "epigraph-service/ctx.rs",
         "AgentRepository::create_signer",
         1,
         "`agent_id`'s first-boot creation of the server's OWN `agents` row (typed `llm` or \
@@ -114,7 +114,7 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          caller exists to stamp from: this resolves the identity requests are attributed to.",
     ),
     (
-        "server.rs",
+        "epigraph-service/ctx.rs",
         "AgentRepository::set_llm_properties",
         1,
         "`agent_id`'s CREATE branch: annotate the freshly created server agent row with its \
@@ -129,15 +129,23 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          `tools/events.rs` `EventRepository::insert`).",
     ),
     (
+        "epigraph-service/ctx.rs",
+        "self.pool.acquire",
+        1,
+        "`Ctx::agent_id`'s `ensure_personal_group` (moved from `server.rs`, backlog 30133ca8): \
+         migration 105's SECURITY DEFINER provisioning, once per process, of the very group the \
+         server agent's viewer is resolved from (stamping first would be circular). Not a \
+         tenancy row written as a caller.",
+    ),
+    (
         "server.rs",
         "self.pool.acquire",
-        2,
-        "Two connections, neither a tenancy row written as a caller. (a) `agent_id`'s \
-         `ensure_personal_group`: migration 105's SECURITY DEFINER provisioning, once per process, \
-         of the very group the server agent's viewer is resolved from (stamping first would be \
-         circular). (b) `record_auth_lineage`'s OPERATED_BY edge: agent to agent is a structural \
-         edge migration 120 makes ('public', world) whoever writes it, so it is admitted \
-         unstamped; `dedup_probes_app_role.rs` pins that it lands on `epigraph_app`.",
+        1,
+        "`record_auth_lineage`'s OPERATED_BY edge: agent to agent is a structural edge migration \
+         120 makes ('public', world) whoever writes it, so it is admitted unstamped; \
+         `dedup_probes_app_role.rs` pins that it lands on `epigraph_app`. Not a tenancy row \
+         written as a caller. (`agent_id`'s provisioning connection, the other one this entry \
+         counted, moved to the service crate's `ctx.rs` with backlog 30133ca8.)",
     ),
     (
         "tools/matching.rs",
@@ -152,10 +160,11 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          `promote_if_pending_conn` on the author-stamped transaction.",
     ),
     (
-        "claim_helper.rs",
-        "server.pool.acquire",
+        "epigraph-service/ctx.rs",
+        "ctx.pool.acquire",
         1,
-        "`resolve_claim_visibility` (docs/tenancy/claim-visibility-controls.md), the write-time \
+        "`resolve_claim_visibility` (docs/tenancy/claim-visibility-controls.md; moved from \
+         `claim_helper.rs` with backlog 30133ca8), the write-time \
          visibility resolution of `submit_claim` / `memorize` / `batch_submit_claims` / \
          `resolve_backlog_item`. It must run BEFORE the author-stamped transaction, because a \
          team the author writes only through its live human (D-V3) has to be stamped INTO that \
@@ -374,15 +383,17 @@ const WRITE_TOKENS: &[&str] = &[
 
 /// The field accesses that name a raw pool. `server.pool` is a tool's handle on
 /// `EpiGraphMcpFull::pool`; `self.pool` is the same field inside
-/// `EpiGraphMcpFull`'s own methods (`server.rs`), and `McpEmbedder`'s pool in
-/// `embed.rs`.
+/// `EpiGraphMcpFull`'s own methods (`server.rs`), `McpEmbedder`'s pool in
+/// `embed.rs`, and `Ctx`'s in the service crate's `ctx.rs`; `ctx.pool` is a
+/// service helper's handle on its host's `Ctx` (backlog 30133ca8 moved the
+/// field there; the tools still read it as `server.pool` through `Deref`).
 ///
 /// `self.pool` joined in the raw-pool residual review: `record_auth_lineage`'s
 /// `OPERATED_BY` edge and `agent_id`'s provisioning writes ran on it and no entry
 /// here named them, because the scan matched the literal `server.pool` only.
 /// The broadening ADDED register entries for sites that already existed; it
 /// did not add writes.
-const POOL_NEEDLES: &[&str] = &["server.pool", "self.pool"];
+const POOL_NEEDLES: &[&str] = &["server.pool", "self.pool", "ctx.pool"];
 
 /// Remove `//` line comments and (nestable) `/* */` block comments.
 ///
@@ -551,110 +562,125 @@ fn alias_regions(stripped: &str) -> Vec<(String, usize, usize)> {
 
 /// `(relative file, normalized callee) -> occurrences`, over comment-stripped
 /// source under `crates/epigraph-mcp/src`.
-fn scan() -> BTreeMap<(String, String), usize> {
-    let root = mcp_src_root();
-    let mut found: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for path in rust_files(&root) {
-        let rel = path
-            .strip_prefix(&root)
-            .expect("strip prefix")
-            .to_string_lossy()
-            .replace('\\', "/");
-        let stripped = strip_comments(&std::fs::read_to_string(&path).expect("read source"));
-        let chars: Vec<char> = stripped.chars().collect();
-        for needle_text in POOL_NEEDLES {
-            let needle: Vec<char> = needle_text.chars().collect();
-            let mut i = 0;
-            while i + needle.len() <= chars.len() {
-                if chars[i..i + needle.len()] != needle[..]
-                    || chars
-                        .get(i + needle.len())
-                        .is_some_and(|c| c.is_alphanumeric() || *c == '_')
-                    || (i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'))
-                {
-                    i += 1;
-                    continue;
-                }
-                let after: String = chars[i + needle.len()..]
-                    .iter()
-                    .take(48)
-                    .collect::<String>();
-                // `Repo::new(server.pool.clone())`: the pool is CAPTURED by a
-                // struct whose methods then run on it (`MatchCandidateRepo`'s
-                // `promote_if_pending` wrote its matcher edge that way, and this
-                // scan could not see it). Counted whatever the struct's name, so
-                // every write behind such a capture is registered at the
-                // capture site.
-                let captured = after
-                    .starts_with(".clone()")
-                    .then(|| callee_before(&chars, i))
-                    .flatten()
-                    .filter(|callee| callee.ends_with("::new"));
-                if let Some(callee) = captured {
-                    *found
-                        .entry((rel.clone(), format!("{}(pool.clone())", normalize(&callee))))
-                        .or_insert(0) += 1;
-                    i += needle.len();
-                    continue;
-                }
-                let name = if after.starts_with('.') {
-                    // `server.pool.begin()` — a method ON the pool.
-                    after
-                        .trim_start_matches('.')
-                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                        .next()
-                        .filter(|s| !s.is_empty())
-                        .map(|m| format!("{needle_text}.{m}"))
-                } else {
-                    callee_before(&chars, i)
-                };
-                if let Some(name) = name {
-                    let norm = normalize(&name);
-                    let short = norm.rsplit("::").next().unwrap_or(&norm).to_string();
-                    if WRITE_TOKENS.iter().any(|t| short.contains(t)) {
-                        *found.entry((rel.clone(), norm)).or_insert(0) += 1;
-                    }
-                }
-                i += needle.len();
-            }
-        }
+/// The service crate's source, scanned beside this crate's: the tenancy entry
+/// points the tools reach `server.pool` through (`agent_id`'s provisioning,
+/// `resolve_claim_visibility`'s connection) moved there with `Ctx` (backlog
+/// 30133ca8). Its files are keyed `epigraph-service/<path>`.
+fn service_src_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../epigraph-service/src")
+}
 
-        // Writes reached through a `let alias = &server.pool;` binding. See
-        // `alias_regions`.
-        for (alias, bstart, bend) in alias_regions(&stripped) {
-            let cstart = stripped[..bstart].chars().count();
-            let cend = stripped[..bend].chars().count();
-            let a: Vec<char> = alias.chars().collect();
-            let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-            // Skip the binding's own `let alias` token.
-            let mut i = cstart + 4 + a.len();
-            while i + a.len() <= cend {
-                let hit = chars[i..i + a.len()] == a[..]
-                    && (i == 0 || !(is_ident(chars[i - 1]) || chars[i - 1] == '.'))
-                    && !chars.get(i + a.len()).is_some_and(|c| is_ident(*c));
-                if !hit {
-                    i += 1;
-                    continue;
-                }
-                let after: String = chars[i + a.len()..].iter().take(48).collect();
-                let name = if after.starts_with('.') {
-                    after
-                        .trim_start_matches('.')
-                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                        .next()
-                        .filter(|s| !s.is_empty())
-                        .map(|m| format!("server.pool.{m}"))
-                } else {
-                    callee_before(&chars, i)
-                };
-                if let Some(name) = name {
-                    let norm = normalize(&name);
-                    let short = norm.rsplit("::").next().unwrap_or(&norm).to_string();
-                    if WRITE_TOKENS.iter().any(|t| short.contains(t)) {
-                        *found.entry((rel.clone(), norm)).or_insert(0) += 1;
+fn scan() -> BTreeMap<(String, String), usize> {
+    let mut found: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let roots = [
+        (mcp_src_root(), ""),
+        (service_src_root(), "epigraph-service/"),
+    ];
+    for (root, prefix) in &roots {
+        for path in rust_files(root) {
+            let rel = format!(
+                "{prefix}{}",
+                path.strip_prefix(root)
+                    .expect("strip prefix")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
+            let stripped = strip_comments(&std::fs::read_to_string(&path).expect("read source"));
+            let chars: Vec<char> = stripped.chars().collect();
+            for needle_text in POOL_NEEDLES {
+                let needle: Vec<char> = needle_text.chars().collect();
+                let mut i = 0;
+                while i + needle.len() <= chars.len() {
+                    if chars[i..i + needle.len()] != needle[..]
+                        || chars
+                            .get(i + needle.len())
+                            .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                        || (i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'))
+                    {
+                        i += 1;
+                        continue;
                     }
+                    let after: String = chars[i + needle.len()..]
+                        .iter()
+                        .take(48)
+                        .collect::<String>();
+                    // `Repo::new(server.pool.clone())`: the pool is CAPTURED by a
+                    // struct whose methods then run on it (`MatchCandidateRepo`'s
+                    // `promote_if_pending` wrote its matcher edge that way, and this
+                    // scan could not see it). Counted whatever the struct's name, so
+                    // every write behind such a capture is registered at the
+                    // capture site.
+                    let captured = after
+                        .starts_with(".clone()")
+                        .then(|| callee_before(&chars, i))
+                        .flatten()
+                        .filter(|callee| callee.ends_with("::new"));
+                    if let Some(callee) = captured {
+                        *found
+                            .entry((rel.clone(), format!("{}(pool.clone())", normalize(&callee))))
+                            .or_insert(0) += 1;
+                        i += needle.len();
+                        continue;
+                    }
+                    let name = if after.starts_with('.') {
+                        // `server.pool.begin()` — a method ON the pool.
+                        after
+                            .trim_start_matches('.')
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .map(|m| format!("{needle_text}.{m}"))
+                    } else {
+                        callee_before(&chars, i)
+                    };
+                    if let Some(name) = name {
+                        let norm = normalize(&name);
+                        let short = norm.rsplit("::").next().unwrap_or(&norm).to_string();
+                        if WRITE_TOKENS.iter().any(|t| short.contains(t)) {
+                            *found.entry((rel.clone(), norm)).or_insert(0) += 1;
+                        }
+                    }
+                    i += needle.len();
                 }
-                i += a.len();
+            }
+
+            // Writes reached through a `let alias = &server.pool;` binding. See
+            // `alias_regions`.
+            for (alias, bstart, bend) in alias_regions(&stripped) {
+                let cstart = stripped[..bstart].chars().count();
+                let cend = stripped[..bend].chars().count();
+                let a: Vec<char> = alias.chars().collect();
+                let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+                // Skip the binding's own `let alias` token.
+                let mut i = cstart + 4 + a.len();
+                while i + a.len() <= cend {
+                    let hit = chars[i..i + a.len()] == a[..]
+                        && (i == 0 || !(is_ident(chars[i - 1]) || chars[i - 1] == '.'))
+                        && !chars.get(i + a.len()).is_some_and(|c| is_ident(*c));
+                    if !hit {
+                        i += 1;
+                        continue;
+                    }
+                    let after: String = chars[i + a.len()..].iter().take(48).collect();
+                    let name = if after.starts_with('.') {
+                        after
+                            .trim_start_matches('.')
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .map(|m| format!("server.pool.{m}"))
+                    } else {
+                        callee_before(&chars, i)
+                    };
+                    if let Some(name) = name {
+                        let norm = normalize(&name);
+                        let short = norm.rsplit("::").next().unwrap_or(&norm).to_string();
+                        if WRITE_TOKENS.iter().any(|t| short.contains(t)) {
+                            *found.entry((rel.clone(), norm)).or_insert(0) += 1;
+                        }
+                    }
+                    i += a.len();
+                }
             }
         }
     }

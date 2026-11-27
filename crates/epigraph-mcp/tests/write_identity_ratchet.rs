@@ -22,7 +22,10 @@
 //! 3. **No tool module resolves the write identity with a `None` token.**
 //! 4. **Only the resolver constructs a `WriteIdentity`** (batch H-b review):
 //!    `from_resolved` is `pub(crate)`, and the review measured a tool module
-//!    minting one from the signer that passed scans 1-3.
+//!    minting one from the signer that passed scans 1-3. Since backlog 30133ca8
+//!    the type lives in `epigraph_service::write_identity`, so `from_resolved`
+//!    is private to the service crate and no file here may name it; in the
+//!    service crate only `Ctx`'s two resolvers (`ctx.rs`) call it.
 //! 5. **The signer accessor only ever names a signer** (batch H-b review):
 //!    `signer_agent_id()` returns the same agent `server.agent_id()` does, so
 //!    scan 1 alone let a tool author as the shared signer through it.
@@ -31,7 +34,8 @@
 //!    forgot the token entirely was invisible.
 //! 7. **Only `begin_claim_act` borrows the server agent's stamp** (batch OA1
 //!    merge review): `admin_borrowed_server_identity` is `pub(crate)`, and scan 4
-//!    cannot see a second caller because the constructor stays in `server.rs`.
+//!    cannot see a second caller because the constructor stays in the resolver
+//!    (`epigraph_service::Ctx`, which `server.rs`'s delegate calls).
 //!
 //! Verified load-bearing by reverting: re-adding `let agent_id =
 //! server.agent_id().await?;` to `tools/memory.rs` fails scan 1, and changing
@@ -82,9 +86,19 @@ fn no_tool_module_resolves_the_server_agent_as_an_author() {
         let text = strip_line_comments(&std::fs::read_to_string(&path).expect("read"));
         for (i, line) in text.lines().enumerate() {
             // `.agent_id()` preceded by a receiver, but not `signer_agent_id()`.
-            let hit = ["server.agent_id()", "self.agent_id()", ".server_agent_id()"]
-                .iter()
-                .any(|needle| line.contains(needle));
+            // The server's context (`epigraph_service::Ctx`, backlog 30133ca8)
+            // resolves the same agent, so reaching it through the context is
+            // the same bypass.
+            let hit = [
+                "server.agent_id()",
+                "self.agent_id()",
+                ".server_agent_id()",
+                "Ctx::agent_id(",
+                "ctx().agent_id()",
+                "ctx.agent_id()",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle));
             if hit {
                 offenders.push(format!("tools/{name}:{}: {}", i + 1, line.trim()));
             }
@@ -223,6 +237,33 @@ fn src_files() -> Vec<(String, String)> {
     out
 }
 
+/// Every file under the service crate's `src/` (backlog 30133ca8 moved
+/// `WriteIdentity`, its constructor and both resolvers there), as
+/// `(path relative to that src, comment-stripped text)`.
+fn service_src_files() -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../epigraph-service/src");
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read service src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("under service src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let text = strip_line_comments(&std::fs::read_to_string(&path).expect("read"));
+                out.push((rel, text));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Scan 4 (batch H-b review, authority-attack low-medium). `WriteIdentity`'s
 /// private field is only half of the ratchet: its constructor
 /// `WriteIdentity::from_resolved` is `pub(crate)`, so any module could mint an
@@ -243,23 +284,52 @@ fn only_the_resolver_constructs_a_write_identity() {
         "the scan must see src/; saw {}",
         files.len()
     );
+    // Since backlog 30133ca8 the type and its constructor live in the service
+    // crate (`epigraph_service::write_identity`), where `from_resolved` is
+    // private to that crate: no file of THIS crate may name it at all.
     let offenders: Vec<String> = files
         .iter()
-        .filter(|(rel, _)| rel != "write_identity.rs" && rel != "server.rs")
         .filter(|(_, text)| text.contains("from_resolved("))
         .map(|(rel, _)| rel.clone())
         .collect();
-    let in_server = files
+    // In the service crate, only the two resolvers on `Ctx` (`ctx.rs`) call it,
+    // and `write_identity.rs` defines it.
+    let service = service_src_files();
+    assert!(
+        service.iter().any(|(rel, _)| rel == "ctx.rs"),
+        "the scan must see the service crate's ctx.rs"
+    );
+    let service_offenders: Vec<String> = service
         .iter()
-        .find(|(rel, _)| rel == "server.rs")
+        .filter(|(rel, _)| rel != "ctx.rs" && rel != "write_identity.rs")
+        .filter(|(_, text)| text.contains("from_resolved("))
+        .map(|(rel, _)| format!("epigraph-service/src/{rel}"))
+        .collect();
+    let defined = service
+        .iter()
+        .find(|(rel, _)| rel == "write_identity.rs")
+        .map_or(0, |(_, t)| t.matches("from_resolved(").count());
+    assert_eq!(
+        defined, 1,
+        "epigraph-service's write_identity.rs defines from_resolved and calls it nowhere"
+    );
+    let in_ctx = service
+        .iter()
+        .find(|(rel, _)| rel == "ctx.rs")
         .map_or(0, |(_, t)| t.matches("from_resolved(").count());
     // EXACTLY three (batch OA1 merge review): `write_identity`'s stdio arm and
     // its HTTP arm, and `admin_borrowed_server_identity`. A fourth constructor
-    // in server.rs would be a new way to mint an identity that none of the
-    // scans here pins; add it only with a scan of its own.
+    // would be a new way to mint an identity that none of the scans here pins;
+    // add it only with a scan of its own.
     assert_eq!(
-        in_server, 3,
-        "server.rs constructs a WriteIdentity in a place this ratchet does not know"
+        in_ctx, 3,
+        "epigraph-service's ctx.rs constructs a WriteIdentity in a place this ratchet does \
+         not know"
+    );
+    assert!(
+        service_offenders.is_empty(),
+        "a service-crate module constructs a WriteIdentity outside the resolvers:\n{}",
+        service_offenders.join("\n")
     );
     assert!(
         offenders.is_empty(),
@@ -289,15 +359,28 @@ fn only_begin_claim_act_borrows_the_server_stamp() {
         .filter(|(_, n)| *n > 0)
         .collect();
     calls.sort();
+    // server.rs: the delegate's definition and its one call into
+    // `epigraph_service::Ctx::admin_borrowed_server_identity` (backlog 30133ca8).
     assert_eq!(
         calls,
         vec![
-            ("server.rs".to_string(), 1),
+            ("server.rs".to_string(), 2),
             ("tools/supersede.rs".to_string(), 1)
         ],
-        "admin_borrowed_server_identity may be defined in server.rs and called only from \
-         tools/supersede.rs::begin_claim_act; a new borrower of the server agent's stamp \
-         needs its own review"
+        "admin_borrowed_server_identity may be defined in server.rs (as a delegate of the \
+         service crate's Ctx) and called only from tools/supersede.rs::begin_claim_act; a new \
+         borrower of the server agent's stamp needs its own review"
+    );
+    let service_calls: Vec<(String, usize)> = service_src_files()
+        .iter()
+        .map(|(rel, text)| (rel.clone(), text.matches(NEEDLE).count()))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    assert_eq!(
+        service_calls,
+        vec![("ctx.rs".to_string(), 1)],
+        "the service crate only defines admin_borrowed_server_identity (on Ctx); nothing there \
+         may call it"
     );
     let supersede = &files
         .iter()

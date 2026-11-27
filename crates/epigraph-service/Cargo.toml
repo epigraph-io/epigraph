@@ -12,7 +12,26 @@ repository.workspace = true
 # `crates/epigraph-api/tests/crate_layering_ratchet.rs` refuses an edge from
 # here to any of the three.
 [dependencies]
+epigraph-auth = { workspace = true }  # AuthContext: the write-identity resolver reads the caller's token
+epigraph-core = { workspace = true }
+epigraph-crypto = { workspace = true }  # AgentSigner
+epigraph-db = { workspace = true }
+sqlx = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# This crate's own `test-support` (`Ctx::seed_agent_id_for_tests`) for its
+# integration tests; dev-only.
+epigraph-service = { path = ".", features = ["test-support"] }
+
+[features]
+# `Ctx::seed_agent_id_for_tests`: lets a test fill the resolved-agent cell
+# without a database. Enabled only by dev-dependencies, so no release build
+# contains it.
+test-support = []
 
 [lints]
 workspace = true

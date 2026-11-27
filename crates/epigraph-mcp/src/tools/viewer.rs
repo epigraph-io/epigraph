@@ -552,39 +552,20 @@ fn delegation_check_failed(
 
 impl EpiGraphMcpFull {
     /// A connection stamped with `viewer`'s tenancy context, for a tool's
-    /// READS: the MCP twin of `epigraph_api::AppState::read_as`.
+    /// READS: `epigraph_service::Ctx::read_as` (backlog 30133ca8 moved it there
+    /// verbatim; its doc carries the rationale), answered in this server's
+    /// error type.
     ///
     /// A content-reading tool resolves its [`Viewer`] (above) and then reads
     /// on what this returns, `&mut *read` into the repo layer, never on the
-    /// server's plain application pool. That pool's connections carry EMPTY
-    /// tenancy GUCs, and row security, FORCEd on the application login, then
-    /// admits public rows only: the in-query predicate admits a member's
-    /// group-private row and the session's policy drops it, so a member read
-    /// its own group's rows as absent, with no error. Measured on production
-    /// 2026-11-05: every MCP caller saw public rows only. CI did not see it
-    /// because it connects as a BYPASSRLS superuser, on which the policy filters
-    /// nothing (`tests/mcp_reads_are_stamped_app_role.rs` reads as the
-    /// application role instead).
-    ///
-    /// One per tool call where a tool makes several reads: take it once, keep
-    /// it short-lived, and take it AFTER any embedder round trip rather than
-    /// holding a pooled connection across one. Elevated viewers are handled by
-    /// [`epigraph_db::ScopedPool::read_as`] itself (a `BEGIN READ ONLY` arm
-    /// under transaction-mode pooling). Call [`epigraph_db::ScopedRead::commit`]
-    /// at the end when convenient; dropping it instead is safe for a read (the
-    /// transaction arm rolls back) and costs one wasted round trip.
-    ///
-    /// This is for reads. Writes take `ScopedPool::begin_as` through
-    /// `claim_helper`'s stamped-transaction helpers.
+    /// server's plain application pool, where row security admits public rows
+    /// only. Writes take `ScopedPool::begin_as` through `claim_helper`'s
+    /// stamped-transaction helpers.
     ///
     /// # It REFUSES rather than falling back to the plain pool
     ///
-    /// For the reason `AppState::read_as` documents: a fallback would be the
-    /// only branch a fixture without a `ScopedPool` takes and the one branch a
-    /// deployed server never takes, so no test could tell a stamped read from
-    /// an unstamped one, and on a deployed server it would hide rows from their
-    /// own owners without an error. `tool` names the caller in the refusal and
-    /// in the log line.
+    /// A server built without [`Self::with_scoped_pool`] is refused with an
+    /// internal error naming the fix, never read on the plain pool.
     ///
     /// # Errors
     /// An MCP internal error naming the fix when this server was not built
@@ -596,25 +577,9 @@ impl EpiGraphMcpFull {
         viewer: &Viewer,
         tool: &'static str,
     ) -> Result<epigraph_db::ScopedRead<'_>, McpError> {
-        let scoped = self.scoped.as_ref().ok_or_else(|| {
-            tracing::error!(
-                target: "tenancy.scoped_read",
-                tool,
-                "read refused: this MCP process was not built from a ScopedPool"
-            );
-            crate::errors::internal_error_text(format!(
-                "{tool}: this MCP server was not built from a ScopedPool, so this read cannot \
-                 be stamped with the caller's tenancy context. Refusing rather than reading on \
-                 the plain application pool, where row security admits public rows only and \
-                 the caller's own group-private rows would be silently missing. Nothing was \
-                 read. Construct the server with EpiGraphMcpFull::with_scoped_pool."
-            ))
-        })?;
-        scoped.read_as(viewer).await.map_err(|e| {
-            crate::errors::internal_error_logged(
-                format!("{tool}: could not acquire a viewer-stamped connection"),
-                e,
-            )
-        })
+        epigraph_service::ServiceHost::ctx(self)
+            .read_as(viewer, tool)
+            .await
+            .map_err(crate::errors::from_service)
     }
 }

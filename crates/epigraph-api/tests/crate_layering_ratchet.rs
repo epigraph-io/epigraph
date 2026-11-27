@@ -113,11 +113,10 @@ const REFERENCE_CEILINGS: &[(&str, usize)] = &[
     ("crates/epigraph-cli/src/operator/bind.rs", 1),
     ("crates/epigraph-cli/src/operator/link.rs", 1),
     ("crates/epigraph-cli/src/operator/privatization.rs", 1),
-    ("crates/epigraph-mcp/src/server.rs", 3),
+    ("crates/epigraph-mcp/src/server.rs", 2),
     ("crates/epigraph-mcp/src/tools/claims.rs", 1),
     ("crates/epigraph-mcp/src/tools/link_hierarchical.rs", 1),
     ("crates/epigraph-mcp/src/tools/supersede.rs", 1),
-    ("crates/epigraph-mcp/src/tools/viewer.rs", 1),
 ];
 
 /// The crate path a crate's source uses for a package (`epigraph-mcp` ->

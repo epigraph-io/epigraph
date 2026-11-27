@@ -1860,7 +1860,16 @@ dependencies = [
 name = "epigraph-service"
 version = "0.3.0"
 dependencies = [
+ "epigraph-auth",
+ "epigraph-core",
+ "epigraph-crypto",
+ "epigraph-db",
+ "epigraph-service",
+ "sqlx",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

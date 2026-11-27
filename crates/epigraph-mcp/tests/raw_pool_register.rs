@@ -27,8 +27,9 @@
 //! # What counts as a site
 //!
 //! Over production source (comments, string literals and every `#[cfg(test)]`
-//! item blanked out first), in `crates/epigraph-mcp/src` and
-//! `crates/epigraph-engine/src`:
+//! item blanked out first), in `crates/epigraph-mcp/src`,
+//! `crates/epigraph-engine/src` and `crates/epigraph-service/src` (where the
+//! MCP server's tenancy entry points live since backlog 30133ca8):
 //!
 //! 1. a field access `<expr>.pool` (`server.pool`, `self.pool`, `srv.pool`,
 //!    `x.pool.clone()`), once per occurrence;
@@ -243,7 +244,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     // ── epigraph-mcp: identity, auth, plumbing ───────────────────────────
     ("epigraph-mcp/src/auth.rs", "is_revoked", 1, PRE_VIEWER),
     (
-        "epigraph-mcp/src/claim_helper.rs",
+        "epigraph-service/src/ctx.rs",
         "begin_author_stamped_tx_for",
         1,
         DELEGATES_THE_STAMP,
@@ -255,7 +256,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         DELEGATES_THE_STAMP,
     ),
     (
-        "epigraph-mcp/src/claim_helper.rs",
+        "epigraph-service/src/ctx.rs",
         "resolve_claim_visibility",
         1,
         DEFINER_RESOLUTION,
@@ -307,7 +308,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         PRE_VIEWER,
     ),
-    ("epigraph-mcp/src/server.rs", "agent_id", 4, NO_CALLER),
+    // `Ctx::agent_id`, moved from `epigraph-mcp/src/server.rs` (backlog
+    // 30133ca8); the server's `agent_id` delegates to it.
+    ("epigraph-service/src/ctx.rs", "agent_id", 4, NO_CALLER),
     (
         "epigraph-mcp/src/server.rs",
         "emit_tool_invoked",
@@ -502,7 +505,15 @@ const HIGH_WATER: usize = 59;
 // The scanner.
 // ===========================================================================
 
-const SCAN_ROOTS: &[&str] = &["epigraph-mcp/src", "epigraph-engine/src"];
+/// `epigraph-service/src` since backlog 30133ca8: the tenancy entry points
+/// (`agent_id`, the author-stamped transaction, the write-time visibility
+/// resolution) moved there from this crate with `Ctx`, and the MCP server
+/// delegates to them, so they are still this crate's raw-pool sites.
+const SCAN_ROOTS: &[&str] = &[
+    "epigraph-mcp/src",
+    "epigraph-engine/src",
+    "epigraph-service/src",
+];
 
 fn crates_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -993,13 +1004,23 @@ fn the_scanner_is_not_vacuous() {
         "only {} functions measured; the matcher broke",
         measured.len()
     );
-    // Arm 1 (field access): the server agent's own provisioning.
+    // Arm 1 (field access): the server agent's own provisioning, in the
+    // service crate's `Ctx` since backlog 30133ca8.
+    assert!(
+        measured.contains_key(&(
+            "epigraph-service/src/ctx.rs".to_string(),
+            "agent_id".to_string()
+        )),
+        "ctx.rs::agent_id reads self.pool; the field-access arm or the service scan root \
+         is broken"
+    );
+    // Arm 1 in this crate too: the server's own lineage edge.
     assert!(
         measured.contains_key(&(
             "epigraph-mcp/src/server.rs".to_string(),
-            "agent_id".to_string()
+            "record_auth_lineage".to_string()
         )),
-        "server.rs::agent_id reads self.pool; the field-access arm is broken"
+        "server.rs::record_auth_lineage reads self.pool; the field-access arm is broken"
     );
     // Arm 3 (pool parameter beside a Viewer) somewhere in the engine.
     assert!(

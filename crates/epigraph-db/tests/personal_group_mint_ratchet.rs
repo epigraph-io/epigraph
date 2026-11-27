@@ -53,7 +53,8 @@
 //!   register, and its own mint runs only after a stamped read proved the
 //!   agent has no row at all (`scripts/e2e/probe-unit-e.sh`'s REVOKED/READER
 //!   arms). The wrappers deliberately NOT expanded, each with its own pin:
-//!   - `EpiGraphMcpFull::agent_id` has a call site in nearly every tool; its
+//!   - `EpiGraphMcpFull::agent_id` (since backlog 30133ca8 a delegate of
+//!     `epigraph_service::Ctx::agent_id`) has a call site in nearly every tool; its
 //!     one `ensure_personal_group` call runs once per PROCESS
 //!     (`SessionFactory` shares the cell), pinned by `server.rs`'s
 //!     `session_factory_tests`. The outcome (no revival, no ingest) is pinned
@@ -209,19 +210,21 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          or reader membership is refused, never revived (migration 105).",
     ),
     (
-        "epigraph-mcp/src/server.rs",
+        "epigraph-service/src/ctx.rs",
         "ensure_personal_group",
         1,
-        "`EpiGraphMcpFull::agent_id` (PR-09). Once per PROCESS since `SessionFactory` shares the \
-         cell (F1); a revoked row is refused and warned, the id still resolves \
+        "`Ctx::agent_id` (PR-09; moved verbatim from `EpiGraphMcpFull::agent_id`, which now \
+         delegates, backlog 30133ca8). Once per PROCESS since `SessionFactory` shares the \
+         context's cell (F1); a revoked row is refused and warned, the id still resolves \
          (`per_session_agent_resolution`).",
     ),
     (
-        "epigraph-mcp/src/claim_helper.rs",
+        "epigraph-service/src/ctx.rs",
         "resolve_write_decl",
         1,
-        "`resolve_claim_visibility`, every MCP claim write's visibility resolution, on a pool \
-         connection. Definer answer, as `create_claim_core`'s; the refusal maps through \
+        "`resolve_claim_visibility` (moved from the MCP crate's `claim_helper.rs`, backlog \
+         30133ca8), every MCP claim write's visibility resolution, on a pool connection. \
+         Definer answer, as `create_claim_core`'s; the MCP server maps the refusal through \
          `visibility_caller_error`.",
     ),
     (

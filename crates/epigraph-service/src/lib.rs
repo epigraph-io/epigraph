@@ -29,7 +29,18 @@
 //!   operation returns, and [`HttpClass`](errors::HttpClass), the HTTP status
 //!   class a front end answers it with. Each front end converts it into its
 //!   own error type (the MCP server's JSON-RPC error, the API's `ApiError`).
+//! * [`ctx`]: [`Ctx`](ctx::Ctx), the context a shared operation runs in (the
+//!   pools, the signer, the process's own agent), with the tenancy entry
+//!   points: the stamped read, the author-stamped write transaction, the write
+//!   identity resolver and the write-time visibility resolution.
+//! * [`write_identity`]: [`WriteIdentity`](write_identity::WriteIdentity), the
+//!   agent a write authors and stamps as, constructible only by `Ctx`.
+//! * [`background`]: the detached tasks a `Ctx` tracks.
 
+pub mod background;
+pub mod ctx;
 pub mod errors;
+pub mod write_identity;
 
+pub use ctx::{Ctx, ServiceHost};
 pub use errors::{HttpClass, ServiceError};
