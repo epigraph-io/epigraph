@@ -3136,10 +3136,14 @@ both must be active `team` or `community` groups (see **Who** above).
    the dry run's `ELIGIBLE-WORKFLOW-ROWS` (generations, not lineages).
 1. Before the move, add the reader principal's agent to the target group
    (`epigraph-operator group-member add --group <target> --agent <reader agent>
-   --role <role per operator ruling> --reason "<why>" --apply`). The role is
-   the operator's ruling, not this runbook's: the target group's membership
-   policy may admit new members as writers only, and an operated agent is a
-   member only where its operator writes. Check the non-member principal is not in the
+   --role reader --reason "<why>" --apply`). The plan reader needs read only;
+   a writer membership would let it ingest workflows into the group (backlog
+   `b15754b0`, ruling `63b0da6e`). Give it this direct `reader` row, not a
+   writer row and not a group-role binding. `group-member add` is the
+   operator's own audited membership verb on the maintenance session, so it
+   writes the `reader` row even where the group's members otherwise join as
+   writers; do not grant writer to fit that. An operated agent is still a
+   member only where its operator writes (`GRP03`). Check the non-member principal is not in the
    target (`epigraph-operator group-roster --group <target>`). If the client
    publishes new generations, its publishing agent needs a writer membership
    of the target too.
