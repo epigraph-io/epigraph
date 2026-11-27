@@ -1,0 +1,45 @@
+-- no-transaction
+--
+-- Backlog 41d7b27a: `related_to` is a loose, SYMMETRIC see-also between two
+-- workflows, written by MCP `link_hierarchical` (workflow -> workflow only).
+-- `{W1, W2}` is one reference whichever end the caller names first, so the
+-- writer (`EdgeRepository::create_symmetric_if_absent_returning_signed_conn`)
+-- skips the INSERT when the pair already carries one in force, in either
+-- order. That guard is a `WHERE NOT EXISTS` in the INSERT statement, which is
+-- not a lock: two concurrent writes of one pair both see an empty guard and
+-- both insert (090's case 1). This unique index is the backstop, as 042/091's
+-- `edges_alternative_of_symmetric_uniq` is for `alternative_of` (which has no
+-- endpoint-type conjunct, so a workflow `alternative_of` is already covered
+-- there and needs nothing here).
+--
+-- NARROW PREDICATE, as 090 argued for its own: workflow endpoints only (the
+-- one pair the writers admit; nothing has established `related_to` is
+-- symmetric for any other entity type), and `valid_to IS NULL` so a
+-- retracted reference does not hold the slot (091's rule: a uniqueness
+-- constraint over edges must exclude retracted rows). A row with a FUTURE
+-- `valid_to` is in force yet outside the index; the writer's in-force guard
+-- still sees it (090's accepted residual).
+--
+-- Not a registry change: `workflow` is already an `entity_types` row and in
+-- `edges_entity_types_valid` (020), and edge relationships are free text.
+--
+-- CONCURRENTLY, so the build does not block edge writes while it scans
+-- `edges`. A UNIQUE CONCURRENTLY build FAILS on an existing duplicate and
+-- leaves an INVALID index behind. MEASURE FIRST (expected zero rows; no
+-- writer stored `related_to` before this change):
+--   SELECT LEAST(source_id, target_id), GREATEST(source_id, target_id), count(*)
+--     FROM public.edges
+--    WHERE relationship = 'related_to' AND source_type = 'workflow'
+--      AND target_type = 'workflow' AND valid_to IS NULL
+--    GROUP BY 1, 2 HAVING count(*) > 1;
+--
+-- INVALID-INDEX TRAP: a cancelled or failed CONCURRENTLY build leaves an
+-- INVALID index of this name, and IF NOT EXISTS then skips it on a re-run.
+-- Recovery: DROP INDEX CONCURRENTLY edges_related_to_symmetric_uniq, re-apply.
+--
+-- Exactly one statement (see 312).
+-- Undo: docs/runbooks/353-undo.sql
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS edges_related_to_symmetric_uniq
+    ON public.edges (LEAST(source_id, target_id), GREATEST(source_id, target_id))
+    WHERE relationship = 'related_to' AND source_type = 'workflow'
+      AND target_type = 'workflow' AND valid_to IS NULL;

@@ -1304,6 +1304,7 @@ impl EdgeRepository {
             None,
             a,
             b,
+            "claim",
             relationship,
             properties,
         )
@@ -1314,6 +1315,11 @@ impl EdgeRepository {
     /// INSERTS attested at INSERT by `key` (ruling R-50; see
     /// [`Self::create_signed_conn`]). A dedup hit writes nothing.
     ///
+    /// Both endpoints are of `endpoint_type`: `"claim"` for the claim links,
+    /// `"workflow"` for the symmetric workflow references (`related_to` and a
+    /// workflow `alternative_of`, backlog 41d7b27a). The dedup matches the
+    /// unordered pair by id alone, as before (ids are unique across tables).
+    ///
     /// # Errors
     /// As [`Self::create_symmetric_if_absent_returning`], and
     /// `DbError::InvalidData` if the stored row cannot be attested.
@@ -1323,11 +1329,20 @@ impl EdgeRepository {
         key: Option<EdgeSigningKey<'_>>,
         a: Uuid,
         b: Uuid,
+        endpoint_type: &str,
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<(Uuid, bool), DbError> {
         if let Some(key) = key {
-            let att = new_attestation(a, "claim", b, "claim", relationship, properties, None);
+            let att = new_attestation(
+                a,
+                endpoint_type,
+                b,
+                endpoint_type,
+                relationship,
+                properties,
+                None,
+            );
             if let Some(row) =
                 insert_attested_conn(conn, key, att, None, SymmetricGuard::InForce, true).await?
             {
@@ -1342,7 +1357,7 @@ impl EdgeRepository {
         let insert = format!(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
-             SELECT $1, 'claim', $2, 'claim', $3, $4
+             SELECT $1, $6, $2, $6, $3, $4
              WHERE NOT EXISTS (
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
@@ -1359,6 +1374,7 @@ impl EdgeRepository {
             .bind(canonical_relationship(relationship))
             .bind(Json(properties))
             .bind(relationship_spellings(relationship))
+            .bind(endpoint_type)
             .fetch_optional(&mut *conn)
             .await?;
 

@@ -10,7 +10,8 @@
 //! - `relationship` must be one of `HIERARCHICAL_RELATIONSHIPS` (claim to
 //!   claim), `WORKFLOW_REFERENCE_RELATIONSHIPS` (backlogs 03d87e3a and
 //!   41d7b27a: `executes` workflow -> claim, `invokes` workflow|claim ->
-//!   workflow, `depends_on` workflow -> workflow) or
+//!   workflow, `depends_on` workflow -> workflow, `related_to` workflow <->
+//!   workflow) or
 //!   `AGENT_ATTRIBUTION_RELATIONSHIPS` (backlog c6949159: `asserts` agent ->
 //!   claim),
 //! - both endpoints must exist and be readable; their types default to
@@ -20,16 +21,17 @@
 //!   (`require_workflow_authority`, the gate `add_step` uses), and the write
 //!   is recorded as that gate's writes are. A step-claim source of `invokes`
 //!   requires that authority over every workflow executing the step, and a
-//!   claim no workflow executes is refused,
+//!   claim no workflow executes is refused. A symmetric `related_to` requires
+//!   it over BOTH workflows, since both readers list it as `mutual`,
 //! - `executes` writes from the HEAD generation of a lineage only (as
 //!   `add_step` does), so a frozen older generation's plan is not extended;
 //!   its target is a claim of the plan's own lineage (any level: the repair
 //!   path), or a workflow STEP the caller or the submitter wrote
 //!   (`WorkflowRepository::is_step_shaped`, backlog 298317a7),
-//! - `invokes` and `depends_on` refuse a NON-PUBLIC workflow endpoint: the
-//!   edges trigger derives an edge's tenancy from its claim endpoints only
-//!   (a workflow endpoint counts as public), so such an edge would be stored
-//!   public and name the private workflow to every reader,
+//! - `invokes`, `depends_on` and `related_to` refuse a NON-PUBLIC workflow
+//!   endpoint: the edges trigger derives an edge's tenancy from its claim
+//!   endpoints only (a workflow endpoint counts as public), so such an edge
+//!   would be stored public and name the private workflow to every reader,
 //! - `asserts` credits its source agent with the claim, so only that agent or
 //!   the human operating it through a live binding may write it
 //!   (`AgentRepository::speaks_for`, the HTTP route's rule, no admin arm); an
@@ -43,7 +45,10 @@
 //! - `properties` may not carry a reserved key
 //!   (`epigraph_db::RESERVED_EDGE_PROPERTIES`), refused with the HTTP edges
 //!   route's text (`epigraph_db::reserved_edge_property_refusal`),
-//! - the call is idempotent on `(source, target, relationship)`.
+//! - the call is idempotent on `(source, target, relationship)`; a symmetric
+//!   reference (`related_to`, [`is_symmetric_reference`]) is idempotent on the
+//!   UNORDERED pair, as `link_alternative` is (migration 353's unique index
+//!   backs the dedup), so `B related_to A` returns `A related_to B`'s edge.
 //!
 //! Intentionally side-effect-free vs the generic POST: no DS recomputation,
 //! no factor inserts, no `edge.added` event, no provenance. These structural
@@ -75,7 +80,8 @@ pub const HIERARCHICAL_RELATIONSHIPS: &[&str] =
 /// The workflow references (backlogs 03d87e3a, 41d7b27a), all structural and
 /// belief-neutral. Kept apart from [`HIERARCHICAL_RELATIONSHIPS`], which
 /// mirrors the HTTP hierarchical route's claim-only list.
-pub const WORKFLOW_REFERENCE_RELATIONSHIPS: &[&str] = &["executes", "invokes", "depends_on"];
+pub const WORKFLOW_REFERENCE_RELATIONSHIPS: &[&str] =
+    &["executes", "invokes", "depends_on", "related_to"];
 
 /// The agent attribution this tool writes (backlog c6949159): `asserts`,
 /// agent -> claim, the edge that attributes a claim to the agent asserting it.
@@ -94,6 +100,7 @@ pub const AGENT_ATTRIBUTION_RELATIONSHIPS: &[&str] = &["asserts"];
 /// - `invokes`: a sub-workflow reference, from a workflow or from one of its
 ///   step claims;
 /// - `depends_on`: a prerequisite workflow;
+/// - `related_to`: a loose, symmetric see-also between two workflows;
 /// - `asserts`: an agent asserts a claim (its attribution).
 #[must_use]
 pub fn endpoint_types_for(relationship: &str) -> &'static [(&'static str, &'static str)] {
@@ -101,7 +108,7 @@ pub fn endpoint_types_for(relationship: &str) -> &'static [(&'static str, &'stat
         "decomposes_to" | "section_follows" | "continues_argument" => &[("claim", "claim")],
         "executes" => &[("workflow", "claim")],
         "invokes" => &[("workflow", "workflow"), ("claim", "workflow")],
-        "depends_on" => &[("workflow", "workflow")],
+        "depends_on" | "related_to" => &[("workflow", "workflow")],
         "asserts" => &[("agent", "claim")],
         _ => &[],
     }
@@ -129,7 +136,17 @@ pub fn cycle_walk_for(relationship: &str) -> Option<&'static [&'static str]> {
 /// step claim's tenancy, as `add_step`'s edges do).
 #[must_use]
 pub fn requires_public_workflow_endpoints(relationship: &str) -> bool {
-    matches!(relationship, "invokes" | "depends_on")
+    matches!(relationship, "invokes" | "depends_on" | "related_to")
+}
+
+/// Whether `relationship` is symmetric: `{a, b}` is one edge whichever end is
+/// named first, written through the symmetric dedup
+/// (`EdgeRepository::create_symmetric_if_absent_returning_signed_conn`) and
+/// backed by migration 353's unique index. Not cycle-checked: a see-also
+/// carries no order.
+#[must_use]
+pub fn is_symmetric_reference(relationship: &str) -> bool {
+    relationship == "related_to"
 }
 
 fn is_hierarchical_relationship(s: &str) -> bool {
@@ -365,8 +382,14 @@ pub async fn do_link_hierarchical(
     // step-claim source of `invokes` is that step's workflows' reference
     // ([`cycle_walk_for`]), so it takes the same authority over EVERY
     // workflow that executes the step's lineage; a claim no workflow executes
-    // is not a step and is refused.
-    let governed: Vec<uuid::Uuid> = if source_type == "workflow" {
+    // is not a step and is refused. A SYMMETRIC reference is a statement
+    // about BOTH workflows (each reader lists it as `mutual`), so it takes
+    // that authority over both ends: otherwise any agent could pin a
+    // see-also naming its own workflow onto another agent's, readable on
+    // every search for it and retractable by neither.
+    let governed: Vec<uuid::Uuid> = if is_symmetric_reference(&params.relationship) {
+        vec![source_id, target_id]
+    } else if source_type == "workflow" {
         vec![source_id]
     } else if params.relationship == "invokes" {
         let executing =
@@ -535,21 +558,37 @@ pub async fn do_link_hierarchical(
     }
 
     // Attested at INSERT by this server's key (R-49/R-50); a dedup hit
-    // returns the existing edge unchanged.
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_signed_conn(
-        &mut tx,
-        Some(edge_key),
-        source_id,
-        source_type,
-        target_id,
-        target_type,
-        &params.relationship,
-        properties,
-        None,
-        None,
-    )
-    .await
-    .map_err(internal_error)?;
+    // returns the existing edge unchanged. A symmetric reference dedups on
+    // the unordered pair (both ends are workflows: `endpoint_types_for`).
+    let (edge_id, was_created) = if is_symmetric_reference(&params.relationship) {
+        EdgeRepository::create_symmetric_if_absent_returning_signed_conn(
+            &mut tx,
+            Some(edge_key),
+            source_id,
+            target_id,
+            source_type,
+            &params.relationship,
+            properties.unwrap_or_else(|| serde_json::json!({})),
+        )
+        .await
+        .map_err(internal_error)?
+    } else {
+        let (edge_row, was_created) = EdgeRepository::create_if_not_exists_signed_conn(
+            &mut tx,
+            Some(edge_key),
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            &params.relationship,
+            properties,
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
+        (edge_row.id, was_created)
+    };
     for (workflow_id, grant) in grants {
         crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
@@ -559,7 +598,7 @@ pub async fn do_link_hierarchical(
             workflow_id,
             grant,
             serde_json::json!({
-                "edge_id": edge_row.id,
+                "edge_id": edge_id,
                 "source_id": source_id,
                 "source_type": source_type,
                 "relationship": params.relationship,
@@ -570,13 +609,13 @@ pub async fn do_link_hierarchical(
         )
         .await?;
     }
-    let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_row.id)
+    let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_id)
         .await
         .map_err(internal_error)?;
     tx.commit().await.map_err(internal_error)?;
 
     success_json(&LinkHierarchicalResponse {
-        edge_id: edge_row.id.to_string(),
+        edge_id: edge_id.to_string(),
         created: was_created,
         owned_by_caller,
     })

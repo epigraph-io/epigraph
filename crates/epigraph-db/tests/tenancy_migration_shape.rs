@@ -81,6 +81,12 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "333_idx_security_events_countersigned.sql",
         "idx_security_events_countersigned",
     ),
+    // Backlog 41d7b27a: the symmetric-dedup backstop for workflow
+    // `related_to` references.
+    (
+        "353_edges_related_to_symmetric_uniq.sql",
+        "edges_related_to_symmetric_uniq",
+    ),
 ];
 
 /// `-- no-transaction` index files whose index no longer exists at head: 312 and

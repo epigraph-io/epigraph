@@ -1357,11 +1357,18 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claims::require_owner_or_admin",
         ],
     ),
-    // write: `EdgeRepository::create_symmetric_if_absent_returning_signed_conn`.
+    // write: `EdgeRepository::create_symmetric_if_absent_returning_signed_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; audit: `workflow_authority::record_workflow_write`
+    // (a rival-workflow pair, backlog 41d7b27a; its gate `rival_workflows_gate` reads both
+    // workflows through the viewer).
     (
         "link_alternative.rs",
         "do_link_alternative",
-        &["EdgeRepository::create_symmetric_if_absent_returning_signed_conn"],
+        &[
+            "EdgeRepository::create_symmetric_if_absent_returning_signed_conn",
+            "claim_helper::begin_author_stamped_tx",
+            "workflow_authority::record_workflow_write",
+        ],
     ),
     // write: `EdgeRepository::create_if_not_exists_signed_conn`,
     // `EdgeRepository::create_symmetric_if_absent_oriented_signed_conn`; opener:
@@ -1379,7 +1386,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::begin_author_stamped_tx",
         ],
     ),
-    // write: `EdgeRepository::create_if_not_exists_signed_conn`; opener:
+    // write: `EdgeRepository::create_if_not_exists_signed_conn`,
+    // `EdgeRepository::create_symmetric_if_absent_returning_signed_conn` (the symmetric
+    // `related_to`, backlog 41d7b27a); opener:
     // `claim_helper::begin_author_stamped_tx`; authority: `AgentRepository::speaks_for` (the
     // `asserts` verb's source-agent rule, an allow or refuse over untenanted `agents` and operator
     // links), `EdgeRepository::owned_by_session`, `WorkflowRepository::submitter_of`; stamped:
@@ -1395,6 +1404,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         &[
             "AgentRepository::speaks_for",
             "EdgeRepository::create_if_not_exists_signed_conn",
+            "EdgeRepository::create_symmetric_if_absent_returning_signed_conn",
             "EdgeRepository::owned_by_session",
             "EdgeRepository::reaches_in_force_conn",
             "EntityTypeRepository::get_by_name_conn",

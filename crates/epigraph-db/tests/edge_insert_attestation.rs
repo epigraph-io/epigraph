@@ -287,6 +287,7 @@ async fn every_signed_primitive_attests_its_insert_and_not_a_dedup_hit(pool: PgP
         key,
         c[4],
         c[5],
+        "claim",
         "alternative_of",
         serde_json::json!({}),
     )
@@ -300,6 +301,7 @@ async fn every_signed_primitive_attests_its_insert_and_not_a_dedup_hit(pool: PgP
         key,
         c[5],
         c[4],
+        "claim",
         "alternative_of",
         serde_json::json!({}),
     )
@@ -392,6 +394,7 @@ async fn a_dedup_hit_onto_another_writers_unsigned_edge_stays_unsigned(pool: PgP
         None,
         c[0],
         c[1],
+        "claim",
         "alternative_of",
         serde_json::json!({}),
     )
@@ -439,6 +442,7 @@ async fn a_dedup_hit_onto_another_writers_unsigned_edge_stays_unsigned(pool: PgP
         key,
         c[1],
         c[0],
+        "claim",
         "alternative_of",
         serde_json::json!({}),
     )
@@ -612,6 +616,7 @@ async fn a_signed_insert_stores_and_dedups_the_canonical_relationship_spelling(p
         key,
         c[3],
         c[2],
+        "claim",
         "contradicts",
         serde_json::json!({}),
     )

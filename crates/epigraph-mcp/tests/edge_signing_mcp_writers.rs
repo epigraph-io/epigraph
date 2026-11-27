@@ -257,6 +257,7 @@ async fn the_link_tools_attest_their_edges_and_not_a_dedup_hit(pool: PgPool) {
             claim_b: c[5].to_string(),
             target_claim_id: None,
             rationale: Some("two routes".into()),
+            ..Default::default()
         },
         None,
     )

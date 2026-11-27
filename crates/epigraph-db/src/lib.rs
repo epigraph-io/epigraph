@@ -158,10 +158,10 @@ pub use repos::{
     ThemeSummaryRow, TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
     WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
-    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
-    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
-    SUPERSEDE_ACT_TOOLS,
+    WorkflowReferenceRow, WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED,
+    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    PRUNABLE_EVENT_TYPES, RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED,
+    SUPERSEDE_ACT_PROPERTY, SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{
     create_ingest_written_edge_if_absent_conn, credited_agent_end, ingest_only_edge_refusal,

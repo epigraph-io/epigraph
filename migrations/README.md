@@ -5244,6 +5244,27 @@ restart.
   'public.epigraph_register_system_agent(text, uuid, text)']) AS s(sig) LEFT JOIN pg_proc p ON
   p.oid = to_regprocedure(s.sig)` matches the seven md5s in the file (pinned by
   `the_352_measure_first_query_reads_the_whole_family`).
+- **353**: `edges_related_to_symmetric_uniq` (backlog 41d7b27a). MCP `link_hierarchical` writes
+  `related_to`, a loose symmetric see-also between two workflows, through the symmetric dedup
+  (`EdgeRepository::create_symmetric_if_absent_returning_signed_conn`: `{W1, W2}` is one edge in
+  either order). That dedup is a `WHERE NOT EXISTS` inside the INSERT, which two concurrent writers
+  both pass (090's case 1); this partial unique index on `(LEAST(source_id, target_id),
+  GREATEST(source_id, target_id)) WHERE relationship = 'related_to' AND source_type = 'workflow'
+  AND target_type = 'workflow' AND valid_to IS NULL` is the backstop, as 042/091's
+  `edges_alternative_of_symmetric_uniq` is for `alternative_of` (no type conjunct there, so a
+  workflow `alternative_of` from `link_alternative` is already covered). No registry rows: `workflow`
+  is an `entity_types` row and in `edges_entity_types_valid` (020). `-- no-transaction`, one
+  `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` statement (registered in
+  `tenancy_migration_shape.rs`'s `INDEX_MIGRATIONS`), so the scan of `edges` does not block edge
+  writes; it waits for older transactions (see "Production window" below). Pinned by
+  `epigraph-mcp/tests/workflow_references.rs` (a raw second row for the pair is refused by the
+  index). **Measure first** (expected zero rows; a duplicate fails the build and leaves an INVALID
+  index to drop): `SELECT LEAST(source_id, target_id), GREATEST(source_id, target_id), count(*)
+  FROM edges WHERE relationship = 'related_to' AND source_type = 'workflow' AND target_type =
+  'workflow' AND valid_to IS NULL GROUP BY 1, 2 HAVING count(*) > 1;`. Undo:
+  `docs/runbooks/353-undo.sql`. **Deploy order:** either; a binary without the change runs on 353
+  unchanged, and the change's binary runs without 353 (only the concurrent-write backstop is
+  missing).
 
 ## `-- no-transaction` migrations
 
