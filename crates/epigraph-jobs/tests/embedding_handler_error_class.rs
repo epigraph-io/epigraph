@@ -28,6 +28,10 @@ impl EmbeddingJobService for Service {
         self.text.clone()
     }
 
+    async fn already_embedded(&self, _claim_id: Uuid) -> Result<bool, EmbeddingJobError> {
+        Ok(false)
+    }
+
     async fn generate_and_store(
         &self,
         _claim_id: Uuid,
