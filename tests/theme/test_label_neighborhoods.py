@@ -200,11 +200,11 @@ def test_a_newer_bridge_run_is_not_the_run_labelled(db):
         db.commit()
 
 
-def test_a_compounds_cached_betp_ranks_no_sample(db, script_db, seed_agent):
-    """Backlog fe1cdcdf: the sample order is role-aware. A compound's cached
-    BetP is a fold of its own BBAs, not a belief, so a compound member with a
-    high cache does not head the prompt's samples: non-compounds come first by
-    BetP, compounds after them. The compound is decided by migration 193's
+def test_a_compound_is_no_sample(db, script_db, seed_agent):
+    """Backlog fe1cdcdf: the samples are role-aware. A compound's cached BetP
+    is a fold of its own BBAs, not a belief, so a compound member, even with
+    the highest cache, is neither a prompt sample nor counted: the samples are
+    the non-compounds by BetP. The compound is decided by migration 193's
     definer (IS_COMPOUND_DEFINER_CALL), which the script runs as its own
     (maintenance) login, so this also pins that login's EXECUTE grant."""
     with db.cursor() as cur:
@@ -232,9 +232,8 @@ def test_a_compounds_cached_betp_ranks_no_sample(db, script_db, seed_agent):
         assert order == [
             "role-order atom high",
             "role-order atom low",
-            "role-order compound",
         ], order
-        assert nbrs[0]["claim_count"] == 3
+        assert nbrs[0]["claim_count"] == 2
     finally:
         db.rollback()
         with db.cursor() as cur:
