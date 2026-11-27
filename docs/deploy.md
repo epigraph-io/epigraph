@@ -4897,18 +4897,38 @@ upgrade:
    first use, so the API, the MCP servers and every job or timer binary that
    writes beliefs must restart on the new one, with the same
    `CALIBRATION_PATH`.
-3. **Then recompute the cohort on the maintenance session**, from the NEW
-   build and with the API's `CALIBRATION_PATH` and belief modes (each run
-   loads the calibration itself, and the writing runs check the modes against
-   the API's `/health`):
+3. **Confirm the maintenance session serves the API's calibration.** Each
+   recompute run loads the calibration itself, and nothing checks that it is
+   the API's: the writing runs compare only the belief modes with the API's
+   `/health`, and no calibration identity is served. So, before any writing
+   run, check by hand that the session runs the binaries of the commit the API
+   runs, that its `CALIBRATION_PATH` is the API unit's value (or unset in
+   both), and that the file's checksum (`sha256sum`) equals the one the API
+   reads. A file that does not load is logged (`CALIBRATION_PATH could not be
+   loaded; serving the calibration compiled into this binary`) and the run
+   goes on under the compiled-in calibration: if a run logs that line, stop it
+   and undo what it wrote with `restore_belief_cache --from <its wave file>`.
+4. **Then recompute the cohort on the maintenance session**, from the NEW
+   build and with the API's belief modes:
    * Under `EPIGRAPH_ATOM_FOLD=legacy` (the default): `recompute_claim_belief`
      over every current claim with a cached belief
      (`SELECT id FROM claims WHERE is_current AND pignistic_prob IS NOT NULL`
-     on the maintenance DSN), with `--snapshot <wave file>` and the disk gate
-     ([section 5](#pool-sizing-and-the-recompute-binaries)). A bad run is
-     undone with `restore_belief_cache --from <wave file>`.
-   * Under an atom fold: `recompute_betp` waves (`--role standalone`, then
-     `--role leaf` under `aef`), dry run first, each with its own wave file.
+     on the maintenance DSN), each run with its own `--snapshot <wave file>`
+     and the disk gate ([section 5](#pool-sizing-and-the-recompute-binaries)).
+     It is not a calibration-only refold: it recomputes each claim from its
+     owner frame (the binary's "Frame handling"), so it can also re-point a
+     claim's `belief_frame_id` and pick up drift unrelated to the calibration.
+     Its `--dry-run` only counts the ids, so run a small sample first and
+     read its wave file (`before` and `written`, `belief_frame_id` included)
+     before running the rest. A bad run is undone with
+     `restore_belief_cache --from <wave file>`.
+   * Under an atom fold: `recompute_betp` waves, `--role standalone`, then
+     `--role leaf` under `aef`. Take the baseline S0 first, before any wave
+     writes (`belief_snapshot --out <S0 file>`; it never overwrites a file).
+     Review each wave with `recompute_betp --dry-run --role <role> --s0 <S0
+     file>`, then write it with `--snapshot <wave file> --wave <name>
+     --disk-path <path> (--disk-check-cmd <cmd> | --no-backup-check)`, one
+     wave file per wave.
 
 The recompute refolds the stored rows. It does not rewrite rows built from
 the profile's write-time constants (the edge-factor parameters and the DS
