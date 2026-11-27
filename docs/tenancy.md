@@ -919,6 +919,96 @@ human (`OPL02`).
   override. The census reads authors, not writing principals: it sees writer
   scope only where the author was also the writer.
 
+### Non-interactive service filer
+
+A filing service (for example a daemon beside an experiment orchestrator or an
+instrument driver) writes claims, evidence and edges as ITS OWN agent, shown
+as operated by a named human. It uses arm (c) above. It is never an operator
+link, because a link makes the agent stdio-only and ends its HTTP access
+(migration 107; `operated_agent_token.rs`). The end-to-end test is
+`crates/epigraph-api/tests/service_filer_identity.rs`, which runs armed, on
+the application role, with the token the client really mints.
+
+**Setting one up (operator, in order).**
+
+1. Register a `client_type = 'service'` OAuth client (legal-entity fields,
+   approved to `active`), with `granted_scopes` limited to `claims:read
+   claims:write evidence:write edges:write`. Give it no admin scope. Keep its
+   secret in a file that only the filer process reads.
+2. Mint one `client_credentials` token for it. The first mint creates the
+   client's agent and pins it to the client; an allowance needs that agent.
+3. On the maintenance DSN, run `epigraph-operator allow-author-binding-client
+   --client <oauth client id> --operator <human operator agent id> --reason
+   <text> --apply`. This calls migration 149's
+   `epigraph_allow_author_binding_client`, and the binding it prints must be
+   `client_allowlist`.
+4. Give the agent a `writer` membership of the ONE team it files into:
+   `epigraph-operator group-member add --group <team> --agent <filer agent>
+   --role writer --reason <text> --apply`. The command refuses with `GRP04`
+   before step 3 (the agent belongs to no human yet) and with `GRP03` for a
+   team the operator does not write; the test asserts both.
+
+**Writing.** Call the kernel REST API (for example `POST
+/api/v1/submit/packet`, a claim with its evidence) with the client's bearer
+token, and name the team: `group_id = <team>`.
+* Without `group_id` the route picks a default
+  (`docs/tenancy/claim-visibility-controls.md`). That default can be the
+  agent's own personal group, which is refused `OPL02` once armed
+  ("Authoring as itself" above).
+* The operator's personal group is refused 403, because a personal group is
+  never a team.
+* `GET /api/v1/claims/:id` shows the filer's agent as `authored_by.agent` and
+  the operator as `authored_by.human`.
+
+**What the one membership does and does not confine.** The `OPL01` and
+`OPL02` refusals here hold only once the binding is ARMED ("Arming, and the
+valve" above). Before that, only row security and the route's team-write
+check apply.
+* Armed, a team the operator does not write is refused `OPL02` for claims,
+  even if the agent holds a writer row there. Unarmed, that writer row admits
+  the claim.
+* The filer's CLAIMS can go into EVERY team its operator writes, not only the
+  team of step 4. Migration 206's `epigraph_writable_teams` gives an agent
+  each team its live human writes (owner decision D-V3), and 149 makes the
+  operator that human, so the packet route admits a claim into such a team
+  with no membership of the filer's own. The test pins this as observed.
+* Migration 149 leaves evidence, edge and belief writes outside a packet to
+  the membership, not to the binding (the door gap above). For those writes,
+  the membership is the limit. The test shows it: `POST /api/v1/evidence` on
+  the filer's claim in its own team is written, and on its claim in another
+  team of the operator it is refused 403.
+* So a claim the filer files into another of the operator's teams (for
+  example by omitting or mistyping `group_id`) is stranded: the filer cannot
+  later attach evidence or edges to it outside a packet.
+* To keep a filer's claims out of the operator's other teams, choose an
+  operator who writes only the target team. Whether D-V3 should exclude
+  allowlisted agents is an open question.
+
+**Extensions.** The token exchange (`grant_type` token-exchange at
+`/oauth/token`, audiences in `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES`) works for the
+filer's token. It returns a token for the same agent with the same scopes, for
+at most five minutes, and the kernel refuses that token.
+
+**Not the MCP HTTP listener.** The listener refuses to start, and refuses every
+call, while its SIGNER agent is allowlisted (149). So never run a listener as
+the filer's agent; the filer writes over kernel REST.
+
+**Incident response.** Revoke the allowance AND the client (above). Once the
+binding is armed, the filer's next claim write after the revoke is refused
+`OPL01`. That happens at once, with the same token and its membership still in
+place.
+* Its other writes to the team fail because the membership no longer counts:
+  a membership of a keyless team made by the team verb (step 4, a
+  `did:epigraph:group:` key) counts only while the agent has a live human
+  (migration 236's `epigraph_live_memberships_unbound`), so once the
+  allowance is revoked the team's claims read as missing to the filer (404),
+  armed or not. The test shows this, armed, for an evidence write.
+* A membership of a group with its own key (not made by the team verb) does
+  not lapse that way. Unarmed, revoking the allowance does not stop the
+  writes such a membership admits, so revoke that membership as well,
+  through the group's own membership path (the team verb's `group-member
+  remove` acts only on verb-made teams).
+
 ### Delegated run tokens (dormant until armed)
 
 An operated agent is stdio-only, with ONE carve-out: a delegated run token.
