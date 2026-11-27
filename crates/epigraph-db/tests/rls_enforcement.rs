@@ -3223,8 +3223,8 @@ async fn event_list_still_suppresses_on_the_app_role_under_force(pool: PgPool) {
 //
 // AFTER the claim row has already committed, so each failure leaves a claim with
 // no trace and no evidence. Deployment-state detail for the 2026-09-22 instance
-// of this is held outside this public repository, in
-// ~/ops-private/tenancy-regressions-2026-09-22.md (R4); nothing below depends on
+// of this is held outside this public repository (in private operator notes);
+// nothing below depends on
 // it, because every assertion here is measured on the throwaway.
 // ===========================================================================
 

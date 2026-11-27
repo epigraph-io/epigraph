@@ -614,8 +614,8 @@ fn non_empty(value: Option<String>) -> Option<String> {
 use epigraph_cli::belief_mode_check::resolve_api_base;
 
 /// OAuth token endpoint precedence: explicit `EPIGRAPH_OAUTH_TOKEN_URL`
-/// first (matches the epiclaw-host `container.rs` convention of constructing
-/// it as `{api_url}/oauth/token` and exporting it directly), falling back to
+/// first (a host that spawns this binary may construct it as
+/// `{api_url}/oauth/token` and export it directly), falling back to
 /// `{api_base}/oauth/token` when that specific env var isn't set. Set-but-
 /// empty is treated as absent, same as [`resolve_api_base`].
 fn resolve_token_url(oauth_token_url: Option<String>, api_base: &str) -> String {
@@ -1936,8 +1936,8 @@ mod tests {
 
     // --- resolve_token_url: EPIGRAPH_OAUTH_TOKEN_URL precedence ---
 
-    /// epiclaw-host's `container.rs` documents `EPIGRAPH_OAUTH_TOKEN_URL` as
-    /// the manual-flow env var; the shipped mint never read it and always
+    /// A host that spawns this binary may export `EPIGRAPH_OAUTH_TOKEN_URL`
+    /// as the manual-flow env var; the shipped mint never read it and always
     /// hardcoded `{api_base}/oauth/token`.
     #[test]
     fn resolve_token_url_prefers_an_explicit_oauth_token_url() {
