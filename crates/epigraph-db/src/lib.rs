@@ -11,8 +11,9 @@
 //!   `sqlx::query` / `query_as` / `query_scalar` calls, because
 //!   `Viewer::splice` / `splice_write` produce runtime SQL that a macro's
 //!   fixed literal cannot take, and because many statements are assembled
-//!   dynamically. Runtime statements are checked only by the DB-backed tests;
-//!   see the crate README for when to prefer a macro.
+//!   dynamically. A runtime statement is checked only when it runs, at best by
+//!   a DB-backed test that exercises it (coverage is partial); see the crate
+//!   README for when to prefer a macro.
 //! - **Error Handling**: Comprehensive error types with context
 //!
 //! # Usage

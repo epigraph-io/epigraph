@@ -9,8 +9,9 @@ statements (under one in ten, measured in November 2026 as about 90 `query!` /
 `query_scalar!` macro calls against about 1,200 runtime `sqlx::query` /
 `query_as` / `query_scalar` calls under `src/`) use the sqlx macros that sqlx
 verifies against a database schema at build time. The rest are runtime
-statements, checked only when they run (by the DB-backed tests), for these
-reasons:
+statements. A malformed runtime statement fails only when it runs: at best in
+a DB-backed test that exercises it, otherwise (test coverage is partial) first
+in production. The macros are a minority for these reasons:
 
 - **Visibility and write splicing.** A tenancy-scoped read or write marks its
   SQL with `/* {VISIBILITY:<alias>} */` or `/* {WRITABLE:<alias>} */` and
@@ -75,9 +76,10 @@ cargo build -p epigraph-db
 ## Features
 
 - **SQL checking**: compile-time verification only for the minority of
-  statements that use the `query!` family; the runtime majority is checked by
-  the DB-backed tests (see Setup for which, and why). New runtime queries
-  should decode through `FromRow`; some older sites still use `Row::get`
+  statements that use the `query!` family; the runtime majority is checked
+  only when run, at best by the DB-backed tests that exercise it (see Setup).
+  New runtime queries should decode through `FromRow`; some older sites still
+  use `Row::get`
 - **Repository pattern**: Clean separation of data access logic
 - **Async/await**: Full async support with tokio
 - **Connection pooling**: Efficient connection management with sqlx
