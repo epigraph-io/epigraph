@@ -1277,14 +1277,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "claim.rs",
         "update_trace_id_conn",
-        "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
-         authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
+        "WRITE, by delegation only: a one-line wrapper over the generic-executor \
+         update_trace_id (EXECUTOR_WITHOUT_VIEWER), kept so callers can pass `&mut tx` by \
+         deref coercion. Same argument as update_labels_conn: an UPDATE on an already-fetched \
+         claim, authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
     ),
     (
         "claim.rs",
         "update_truth_value_conn",
-        "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
-         authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
+        "WRITE, by delegation only: a one-line wrapper over the generic-executor \
+         update_truth_value (EXECUTOR_WITHOUT_VIEWER), kept so callers can pass `&mut tx` by \
+         deref coercion. Same argument as update_labels_conn: an UPDATE on an already-fetched \
+         claim, authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
     ),
     (
         "claim_encryption.rs",
@@ -4283,6 +4287,27 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          connection's GUCs. There is nothing to filter: the caller (hypothesis promotion) read \
          the source row through `get_for_claim_frame` with its own viewer. Generic executor so \
          the promotion's transaction can hold the copy and its `claim_frames` insert together.",
+    ),
+    // Backlog 2dbf45f2: each was a `&PgPool` fn (`sqlx::query!`) beside a
+    // `_conn` twin repeating its UPDATE with runtime `Row::get`; the pair is
+    // now this one generic fn, and the `_conn` form (CONN_WITHOUT_VIEWER) wraps it.
+    (
+        "claim.rs",
+        "update_trace_id",
+        "UPDATE `claims` SET `trace_id` by primary key, RETURNING the row. A write, so the \
+         control is claims_tenancy's WITH CHECK against the connection's GUCs, as for \
+         update_labels_conn: its callers attach a trace to a claim they have just created or \
+         fetched on the same stamped transaction. A `&Viewer` would be spendable only through \
+         splice_write, which is not this change's. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "claim.rs",
+        "update_truth_value",
+        "UPDATE `claims` SET `truth_value` by primary key, RETURNING the row. A write, so the \
+         control is claims_tenancy's WITH CHECK against the connection's GUCs, as for \
+         update_labels_conn: its callers set the truth of a claim they have already fetched \
+         under a viewer. A `&Viewer` would be spendable only through splice_write, which is \
+         not this change's. SCOPE: executor only; the SQL is unchanged.",
     ),
     (
         "claim.rs",
