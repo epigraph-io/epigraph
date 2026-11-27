@@ -785,3 +785,288 @@ async fn a_paraphrase_of_a_claim_that_cannot_take_evidence_is_inserted_not_faile
         .is_empty());
     assert!(authored_edges(&pool, b, a_claim).await.is_empty());
 }
+
+/// The corroborations B made of `claim`: its AUTHORED edges marked
+/// `corroboration: true` (B's own creation edge, if any, is not one).
+async fn corroboration_edges(pool: &PgPool, agent: Uuid, claim: Uuid) -> usize {
+    authored_edges(pool, agent, claim)
+        .await
+        .iter()
+        .filter(|p| p["corroboration"] == true)
+        .count()
+}
+
+/// A and B both WRITE team T; A holds a team claim, and B submits a team
+/// paraphrase of it. B corroborates A's claim inside the team: B's evidence and
+/// BBA are owned by T, one AUTHORED edge records it, the cached belief moves,
+/// and A's truth_value and labels are A's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_team_paraphrase_corroborates_the_team_claim_inside_the_team(pool: PgPool) {
+    binary_truth(&pool).await;
+    let t = team(&pool, "corro-same-team").await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "corro-team-a").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "corro-team-b").await;
+    add_member(&pool, t, a, "writer").await;
+    add_member(&pool, t, b, "writer").await;
+    let server = app_server(&pool).await;
+
+    let original = "The cooling loop drifts two kelvin per shift";
+    let a_claim = parse_uuid_field(
+        &submit_as(
+            &pool,
+            &server,
+            a,
+            submit(original, "loop log A", "team", Some(t), &["thermal"]),
+        )
+        .await,
+        "claim_id",
+    );
+    let before = claim_state(&pool, a_claim).await;
+
+    let paraphrase = "Per shift the cooling loop drifts two kelvin";
+    let b_evidence = "loop log B";
+    let body = submit_as(
+        &pool,
+        &server,
+        b,
+        submit(paraphrase, b_evidence, "team", Some(t), &["b-tag"]),
+    )
+    .await;
+
+    assert_eq!(body["claim_id"], a_claim.to_string(), "{body}");
+    assert_eq!(body["deduplicated"]["by"], "novelty_gate", "{body}");
+    assert!(claims_with_content(&pool, paraphrase).await.is_empty());
+    let evidence = evidence_with_body(&pool, a_claim, b_evidence).await;
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    assert_eq!(
+        (evidence[0].1, evidence[0].2.as_str()),
+        (t, "group"),
+        "B's evidence on the team claim is the team's"
+    );
+    let bba_owner: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT owner_group_id, visibility::text FROM mass_functions \
+          WHERE claim_id = $1 AND source_agent_id = $2",
+    )
+    .bind(a_claim)
+    .bind(b)
+    .fetch_all(&pool)
+    .await
+    .expect("B's BBA");
+    assert_eq!(bba_owner, vec![(t, "group".to_string())]);
+    assert_eq!(corroboration_edges(&pool, b, a_claim).await, 1);
+
+    let after = claim_state(&pool, a_claim).await;
+    assert_eq!(after.truth_value, before.truth_value);
+    assert_eq!(after.labels, before.labels);
+    assert_ne!(
+        after.pignistic_prob, before.pignistic_prob,
+        "B's corroboration is counted in the team claim's belief"
+    );
+}
+
+/// A paraphrases its OWN public claim: the re-occurrence corroborates (a new
+/// evidence row, BBA and edge, no new claim). A second paraphrase carrying the
+/// SAME evidence body writes nothing at all (the group already attached it):
+/// the response says so with a null `evidence_id` and a note.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_self_paraphrase_corroborates_and_a_repeat_of_its_evidence_writes_nothing(pool: PgPool) {
+    binary_truth(&pool).await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "corro-self-a").await;
+    let server = app_server(&pool).await;
+
+    let original = "The glacier retreated forty meters in the dry summer";
+    let a_claim = parse_uuid_field(
+        &submit_as(
+            &pool,
+            &server,
+            a,
+            submit(original, "survey stakes 2023", "public", None, &[]),
+        )
+        .await,
+        "claim_id",
+    );
+    let before = claim_state(&pool, a_claim).await;
+
+    let repeat_evidence = "survey stakes 2024";
+    let first = submit_as(
+        &pool,
+        &server,
+        a,
+        submit(
+            "In the dry summer the glacier retreated forty meters",
+            repeat_evidence,
+            "public",
+            None,
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(first["claim_id"], a_claim.to_string(), "{first}");
+    assert!(
+        first["corroboration"]["evidence_id"].is_string(),
+        "the self-paraphrase attached its evidence: {first}"
+    );
+    let once = claim_state(&pool, a_claim).await;
+    assert_eq!(once.evidence_rows, before.evidence_rows + 1);
+    assert_eq!(once.bba_rows, before.bba_rows + 1);
+    assert_eq!(corroboration_edges(&pool, a, a_claim).await, 1);
+
+    let second = submit_as(
+        &pool,
+        &server,
+        a,
+        submit(
+            "Forty meters the glacier retreated in the dry summer",
+            repeat_evidence,
+            "public",
+            None,
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(second["claim_id"], a_claim.to_string(), "{second}");
+    assert_eq!(second["deduplicated"]["by"], "novelty_gate", "{second}");
+    assert!(
+        second["corroboration"]["evidence_id"].is_null(),
+        "nothing new was attached: {second}"
+    );
+    assert!(
+        second["corroboration"]["note"].is_string(),
+        "the response says why: {second}"
+    );
+    assert_eq!(
+        claim_state(&pool, a_claim).await,
+        once,
+        "the repeat wrote no evidence, BBA or belief change"
+    );
+    assert_eq!(
+        corroboration_edges(&pool, a, a_claim).await,
+        1,
+        "and no second edge"
+    );
+}
+
+/// `batch_submit_claims` reaches the gate through the same submission path:
+/// B's batch entry paraphrasing A's public claim corroborates it, and the
+/// entry reports the corroboration.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_batch_entry_paraphrase_corroborates_the_public_claim(pool: PgPool) {
+    binary_truth(&pool).await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "corro-batch-a").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "corro-batch-b").await;
+    let server = app_server(&pool).await;
+
+    let original = "Night-time traffic noise masks the frog chorus";
+    let a_claim = parse_uuid_field(
+        &submit_as(
+            &pool,
+            &server,
+            a,
+            submit(original, "acoustic recorder 1", "public", None, &[]),
+        )
+        .await,
+        "claim_id",
+    );
+
+    let paraphrase = "The frog chorus masks night-time traffic noise";
+    let b_evidence = "acoustic recorder 2";
+    let entry: epigraph_mcp::types::BatchClaimEntry = serde_json::from_value(serde_json::json!({
+        "content": paraphrase,
+        "methodology": "direct_observation",
+        "evidence_data": b_evidence,
+        "evidence_type": "empirical",
+        "confidence": 0.8,
+        "visibility": "public",
+    }))
+    .expect("batch entry");
+    let out = tools::batch::batch_submit_claims(
+        &server,
+        &viewer(&pool, b).await,
+        epigraph_mcp::types::BatchSubmitClaimsParams {
+            claims: vec![entry],
+        },
+        Some(&token(b)),
+    )
+    .await
+    .expect("batch_submit_claims");
+    let body = first_text(&out);
+    let result = &body["results"][0];
+
+    assert_eq!(result["claim_id"], a_claim.to_string(), "{body}");
+    assert_eq!(result["deduplicated"]["by"], "novelty_gate", "{body}");
+    let evidence = evidence_with_body(&pool, a_claim, b_evidence).await;
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    assert_eq!(
+        result["corroboration"]["evidence_id"],
+        evidence[0].0.to_string(),
+        "{body}"
+    );
+    assert!(claims_with_content(&pool, paraphrase).await.is_empty());
+    assert_eq!(corroboration_edges(&pool, b, a_claim).await, 1);
+}
+
+/// The default visibility (B writes exactly one team, so a write naming no
+/// visibility lands in that team) next to A's PUBLIC claim. Attaching would
+/// publish B's team-scoped memory on A's public claim, so B's memory becomes
+/// B's own TEAM claim, tagged `near-duplicate` (the public match is readable
+/// by the team), and A's public belief does not move. Before corroboration
+/// this call was deduplicated and stored nothing; this pins the change.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_default_visibility_memory_next_to_a_public_claim_becomes_its_own_team_claim(
+    pool: PgPool,
+) {
+    binary_truth(&pool).await;
+    let t = team(&pool, "corro-default-team").await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "corro-default-a").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "corro-default-b").await;
+    add_member(&pool, t, b, "writer").await;
+    let server = app_server(&pool).await;
+
+    let original = "Bee visits to the clover fall sharply above thirty degrees";
+    let a_claim = parse_uuid_field(
+        &submit_as(
+            &pool,
+            &server,
+            a,
+            submit(original, "plot counts", "public", None, &[]),
+        )
+        .await,
+        "claim_id",
+    );
+    let before = claim_state(&pool, a_claim).await;
+
+    let paraphrase = "Above thirty degrees bee visits to the clover fall sharply";
+    let out = tools::memory::memorize(
+        &server,
+        &viewer(&pool, b).await,
+        MemorizeParams {
+            content: paraphrase.to_string(),
+            confidence: Some(0.7),
+            tags: None,
+            novelty_threshold: None,
+            visibility: None,
+            group_id: None,
+        },
+        Some(&token(b)),
+    )
+    .await
+    .expect("memorize");
+    let body = first_text(&out);
+
+    assert_ne!(body["claim_id"], a_claim.to_string(), "{body}");
+    assert!(body.get("deduplicated").is_none(), "{body}");
+    assert_eq!(
+        body["corroboration"]["refused"], "claim visibility differs from this write's",
+        "{body}"
+    );
+    let own = claims_with_content(&pool, paraphrase).await;
+    assert_eq!(own.len(), 1, "{own:?}");
+    let (_, own_owner, own_visibility, own_labels) = own[0].clone();
+    assert_eq!((own_owner, own_visibility.as_str()), (t, "group"));
+    assert!(
+        own_labels.iter().any(|l| l == "near-duplicate"),
+        "{own_labels:?}"
+    );
+    assert_eq!(claim_state(&pool, a_claim).await, before);
+    assert_eq!(corroboration_edges(&pool, b, a_claim).await, 0);
+}
