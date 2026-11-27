@@ -573,7 +573,7 @@ For the others, anything else is off.
 | `EPIGRAPH_JWT_SIGNING_KEY` | unset | Ed25519 seed, 64 hex characters. Set → every token is signed EdDSA and the public key is served at `/.well-known/jwks.json`. Malformed → exit 1, even with `EPIGRAPH_ALLOW_INSECURE_SECRET`. See "Token signing keys". |
 | `EPIGRAPH_ALLOW_INSECURE_SECRET` | off | `1`/`true`/`yes` skips the JWT secret check. Local development and CI only. |
 | `EPIGRAPH_PROVIDERS_CONFIG` | `./providers.toml` | Path to the identity-provider file. Missing → startup panic. |
-| `EPIGRAPH_ENV` | unset = production | `development`, `dev`, `test`, `testing`, `local` or `ci` turn the empty-allowlist refusal into a warning. |
+| `EPIGRAPH_ENV` | unset = production | `development`, `dev`, `test`, `testing`, `local` or `ci` turn the empty-allowlist refusal into a warning. Exactly `production` also makes the library's default JWT config (`AppState` built by an embedder, not this binary) apply the `FATAL` JWT key check above instead of falling back to the development secret. |
 | `EPIGRAPH_ALLOW_ALL_IDENTITIES` | off | Exactly `true` lets any identity an auto-provisioning provider authenticates provision. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `EPIGRAPH_REDIRECT_URI` | — | Read only because `providers.toml.example`'s Google provider names them (`client_id_env`, `client_secret_env`, `audience_env`, `redirect_uri_env`). Missing while the provider is configured → startup refusal (`env var ... not set`). |
 | `EPIGRAPH_PUBLIC_BASE_URL` | `http://localhost:8080` | The public origin, with no trailing slash. |

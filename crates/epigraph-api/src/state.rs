@@ -2217,20 +2217,19 @@ impl AppState {
     /// ([`epigraph_auth::JwtConfig::from_kernel_env`]): EdDSA when
     /// `EPIGRAPH_JWT_SIGNING_KEY` is set (with `EPIGRAPH_JWT_SECRET`, if set,
     /// as the accept-only HS256 window), else HS256 from the secret or the
-    /// dev fallback.
+    /// dev fallback. Under `EPIGRAPH_ENV=production` the dev fallback is
+    /// refused; see [`jwt_config_from_env_values`].
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
-        // NOTE: the dev fallback is intentionally NOT fail-closed. This is
-        // called by test/builder constructors; the production gate lives in
-        // bin/server.rs::main (`epigraph_auth::check_kernel_jwt_keys`), which
-        // refuses a malformed signing key before any state is built, so the
-        // panic below is unreachable from the server binary. A malformed key
-        // must never fall back to shared-secret signing.
         let signing_key = std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR).ok();
         let secret = std::env::var("EPIGRAPH_JWT_SECRET").ok();
-        let config =
-            crate::oauth::JwtConfig::from_kernel_env(signing_key.as_deref(), secret.as_deref())
-                .unwrap_or_else(|reason| panic!("FATAL: {reason}"));
-        Arc::new(config)
+        let env = std::env::var("EPIGRAPH_ENV").ok();
+        let allow_insecure = std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET").ok();
+        jwt_config_from_env_values(
+            signing_key.as_deref(),
+            secret.as_deref(),
+            env.as_deref(),
+            allow_insecure_secret(allow_insecure.as_deref()),
+        )
     }
 
     /// The admin-scope switch for one request (elevation plan EL-10): read on
@@ -3364,6 +3363,74 @@ pub fn admin_cascade_enabled(source: epigraph_db::MaintenanceDsnSource, bypass: 
     source == epigraph_db::MaintenanceDsnSource::Configured && bypass
 }
 
+/// `EPIGRAPH_ALLOW_INSECURE_SECRET`'s truthy set (`1`, `true`, `yes`, any
+/// case): the opt-out from the JWT key check, for local development and CI.
+/// Shared by `bin/server.rs::main`'s boot gate and
+/// [`AppState`]'s default JWT config so both read the flag the same way.
+#[must_use]
+pub fn allow_insecure_secret(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// The refusal printed when [`epigraph_auth::check_kernel_jwt_keys`] rejects
+/// the configured keys. One text for `bin/server.rs::main` and for
+/// [`jwt_config_from_env_values`].
+#[must_use]
+pub fn jwt_key_refusal(reason: &str) -> String {
+    format!(
+        "FATAL: {reason}. Set {} (64 hex characters, an Ed25519 seed) or a real \
+         EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), or set \
+         EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI.",
+        epigraph_auth::JWT_SIGNING_KEY_VAR
+    )
+}
+
+/// Does this `EPIGRAPH_ENV` value declare production, for the JWT dev-secret
+/// refusal? Exactly `production` (trimmed, any case).
+///
+/// Deliberately NOT [`crate::oauth::providers::env_is_production`], which
+/// counts an unset value as production: every test and builder constructor
+/// runs with `EPIGRAPH_ENV` unset and relies on the dev fallback. The server
+/// binary does not depend on this predicate; `bin/server.rs::main` runs
+/// [`epigraph_auth::check_kernel_jwt_keys`] in every environment before any
+/// state is built.
+fn jwt_env_is_production(env: Option<&str>) -> bool {
+    env.is_some_and(|e| e.trim().eq_ignore_ascii_case("production"))
+}
+
+/// [`AppState`]'s JWT config from the raw environment values. Pure, so every
+/// arm is testable without mutating the process environment.
+///
+/// Under `EPIGRAPH_ENV=production` the keys must pass
+/// [`epigraph_auth::check_kernel_jwt_keys`] (the binary's boot gate), so an
+/// embedder that builds `AppState` in production with no key, or with only
+/// the dev secret, gets a panic rather than a config that signs with the
+/// published dev secret. `allow_insecure`
+/// (`EPIGRAPH_ALLOW_INSECURE_SECRET`) opts out exactly as it does for the
+/// binary. Outside production the dev fallback stands.
+///
+/// # Panics
+/// With [`jwt_key_refusal`]'s text when production refuses the keys, and with
+/// `FATAL:` in every environment when a set signing key does not parse (a
+/// malformed key must never fall back to shared-secret signing).
+pub fn jwt_config_from_env_values(
+    signing_key: Option<&str>,
+    secret: Option<&str>,
+    env: Option<&str>,
+    allow_insecure: bool,
+) -> Arc<crate::oauth::JwtConfig> {
+    if jwt_env_is_production(env) {
+        if let Err(reason) =
+            epigraph_auth::check_kernel_jwt_keys(signing_key, secret, allow_insecure)
+        {
+            panic!("{}", jwt_key_refusal(&reason));
+        }
+    }
+    let config = crate::oauth::JwtConfig::from_kernel_env(signing_key, secret)
+        .unwrap_or_else(|reason| panic!("FATAL: {reason}"));
+    Arc::new(config)
+}
+
 /// Whether the API `server` may start, given the value of
 /// `MAINTENANCE_DATABASE_URL` in its environment (operator decision D9).
 ///
@@ -3487,5 +3554,98 @@ impl std::ops::DerefMut for ClaimWriteTx<'_> {
             Self::Stamped(tx) => &mut *tx,
             Self::Unscoped(tx) => &mut *tx,
         }
+    }
+}
+
+#[cfg(test)]
+mod default_jwt_config_tests {
+    //! [`super::jwt_config_from_env_values`], the pure core of
+    //! `AppState::default_jwt_config`. No test here touches the process
+    //! environment.
+    use super::{allow_insecure_secret, jwt_config_from_env_values};
+    use jsonwebtoken::Algorithm;
+
+    /// A valid Ed25519 seed (64 hex characters).
+    const SEED: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    /// A secret `assert_production_secret` admits (>= 32 bytes, not the dev
+    /// literal).
+    const REAL_SECRET: &str = "a-real-production-secret-of-48-bytes-0123456789ab";
+
+    fn dev_secret() -> &'static str {
+        std::str::from_utf8(epigraph_auth::DEV_JWT_SECRET).expect("dev secret is utf-8")
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn production_with_no_key_panics() {
+        let _ = jwt_config_from_env_values(None, None, Some("production"), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "EPIGRAPH_ALLOW_INSECURE_SECRET=1")]
+    fn production_with_only_the_dev_secret_panics() {
+        let _ = jwt_config_from_env_values(None, Some(dev_secret()), Some("production"), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn production_is_matched_trimmed_and_case_insensitively() {
+        let _ = jwt_config_from_env_values(None, None, Some(" Production "), false);
+    }
+
+    #[test]
+    fn production_with_a_valid_signing_key_builds_eddsa() {
+        let cfg = jwt_config_from_env_values(Some(SEED), None, Some("production"), false);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::EdDSA));
+    }
+
+    #[test]
+    fn production_with_a_real_secret_builds_hs256() {
+        let cfg = jwt_config_from_env_values(None, Some(REAL_SECRET), Some("production"), false);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    #[test]
+    fn production_with_the_insecure_opt_out_keeps_the_dev_fallback() {
+        let cfg = jwt_config_from_env_values(None, None, Some("production"), true);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    /// Dev and test behaviour is unchanged: unset, empty and every other value
+    /// keep the dev fallback (the whole suite runs with `EPIGRAPH_ENV` unset).
+    #[test]
+    fn non_production_keeps_the_dev_fallback() {
+        for env in [
+            None,
+            Some(""),
+            Some("test"),
+            Some("development"),
+            Some("prod"),
+        ] {
+            let cfg = jwt_config_from_env_values(None, None, env, false);
+            assert_eq!(
+                cfg.signing_algorithm(),
+                Some(Algorithm::HS256),
+                "env={env:?}"
+            );
+        }
+    }
+
+    /// A malformed signing key never falls back, in any environment.
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn a_malformed_signing_key_panics_outside_production_too() {
+        let _ = jwt_config_from_env_values(Some("not-hex"), None, None, true);
+    }
+
+    #[test]
+    fn the_insecure_opt_out_parses_like_the_boot_gate() {
+        for on in ["1", "true", "TRUE", "yes", "Yes"] {
+            assert!(allow_insecure_secret(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "false", "no", "on"] {
+            assert!(!allow_insecure_secret(Some(off)), "{off:?}");
+        }
+        assert!(!allow_insecure_secret(None));
     }
 }

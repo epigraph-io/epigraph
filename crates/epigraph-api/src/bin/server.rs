@@ -144,12 +144,16 @@ async fn main() {
     // EdDSA tokens) nor a real EPIGRAPH_JWT_SECRET (HS256, or the accept-only
     // window beside a signing key), and with an unset/dev secret when it is
     // the only key; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. A
-    // malformed signing key refuses boot even under the opt-out. The dev
-    // fallback in AppState::default_jwt_config is unchanged so the suite still
-    // compiles and runs.
-    let allow_insecure = std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    // malformed signing key refuses boot even under the opt-out. This gate runs
+    // in EVERY environment. AppState::default_jwt_config applies the same
+    // predicate, flag parse and message only under EPIGRAPH_ENV=production
+    // (state::jwt_config_from_env_values), so a library embedder in production
+    // cannot reach the dev fallback, while the test suite keeps it.
+    let allow_insecure = epigraph_api::state::allow_insecure_secret(
+        std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
+            .ok()
+            .as_deref(),
+    );
     if let Err(reason) = epigraph_auth::check_kernel_jwt_keys(
         std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR)
             .ok()
@@ -157,12 +161,7 @@ async fn main() {
         std::env::var("EPIGRAPH_JWT_SECRET").ok().as_deref(),
         allow_insecure,
     ) {
-        eprintln!(
-            "FATAL: {reason}. Set {} (64 hex characters, an Ed25519 seed) or a real \
-             EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), or set \
-             EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI.",
-            epigraph_auth::JWT_SIGNING_KEY_VAR
-        );
+        eprintln!("{}", epigraph_api::state::jwt_key_refusal(&reason));
         std::process::exit(1);
     }
 
