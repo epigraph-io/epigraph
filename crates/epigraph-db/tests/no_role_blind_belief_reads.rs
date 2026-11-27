@@ -181,8 +181,6 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-api/src/routes/graph_neighborhood.rs", "compound_response", Tag::Todo { pr: "PR-R3", why: "graph neighbourhood compound node BetP is the compound's own cache; SPEC §7.2 derived per viewer" }),
     ("crates/epigraph-api/src/routes/graph_query_utils.rs", "load_subgraph_conn", Tag::Todo { pr: "PR-R5", why: "graph_query / graph / edges subgraph nodes copy the cache columns; SPEC §7.2 BeliefView for compound nodes" }),
     ("crates/epigraph-api/src/routes/hypothesis.rs", "create_hypothesis", Tag::Todo { pr: "PR-W4", why: "hypothesis prior from grounded neighbours' cached Bel/Pl, compounds included (arithmetic: SPEC §7.2 excludes); SPEC §4.1 W13" }),
-    ("crates/epigraph-api/src/routes/policies.rs", "record_outcome", Tag::Writer("one UPDATE moves a policy claim's truth_value from its own value; it serves no belief")),
-    ("crates/epigraph-api/src/routes/policies.rs", "resolve_challenge", Tag::Writer("one UPDATE moves a challenged claim's truth_value from its own value; it serves no belief")),
     ("crates/epigraph-api/src/routes/search.rs", "semantic_search", Tag::Todo { pr: "PR-R5", why: "REST /search/semantic maps c.belief / c.plausibility per hit; SPEC §7.2 BeliefView per hit" }),
     // --- epigraph-cli -------------------------------------------------------
     ("crates/epigraph-cli/src/belief_cache.rs", "cache_equals", Tag::ByDesign("the same operator ruling as write_snapshot: stays role-blind by design; builds restore_wave_with's compare-and-swap probe, every cache column of CACHE_COLUMN_NAMES compared with the wave file's values, and serves no belief")),

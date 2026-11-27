@@ -136,7 +136,7 @@ pub struct AttributedClaim {
     pub attribution: serde_json::Value,
 }
 
-// ---- GET /api/v1/agents/:id/epistemic-profile (political.rs:39-56) -----------
+// ---- GET /api/v1/agents/:id/epistemic-profile (routes/agents.rs) ------------
 
 /// Unbounded upstream (every claim of the agent is loaded), so it can be
 /// slow; the page degrades it independently.

@@ -257,6 +257,8 @@ SELECT DISTINCT tc.table_schema, tc.table_name
 
 Generators A and B do **not** find `harvester_fragments` (no `claim_id`, no FK to `claims`) or `claim_themes` (an aggregate keyed on nothing). That gap is why the registry exists rather than the generators alone:
 
+> **Amendment, 2026-11-27 (migration 354; backlog c7752f07, a6e3dba2).** The five harvester tables this plan brings under tenancy (`harvester_fragments` and `harvester_claim_provenance` here; `harvester_sources` and `harvester_audit_reports` by 173; `harvester_enriched_concepts` by 347) are **dropped**, with their grants, triggers, policies and the stamping functions only they ran. Their writer was an external Python harvester whose in-repo crate and proto were already removed, and the role it connected as was never confirmed (the open question behind finding `F-218-A`). The operator decided to drop them instead of keeping or freezing them, after a read-only measurement of the deployed database on the same day found all five with no live row and no insert, update or delete since their statistics were reset: no external writer, nothing to archive. 354 refuses to run while any of them holds a row; `docs/runbooks/354-undo.sql` recreates them empty. Every reference to them below describes the plan as written, before 354.
+
 ```sql
 -- migration 065
 CREATE TABLE public.tenancy_exempt (

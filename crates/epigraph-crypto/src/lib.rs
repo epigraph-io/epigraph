@@ -30,8 +30,8 @@ pub use did_key::{
     keypair_from_llm_agent_prehashed, DidKey,
 };
 pub use domain::{
-    key_kind_declaration_message, signing_message, SignatureScheme, SignedEntity,
-    KEY_KIND_DECLARATION_V1, SIGNING_DOMAIN_V1,
+    key_kind_declaration_message, oauth_assertion_message, signing_message, SignatureScheme,
+    SignedEntity, KEY_KIND_DECLARATION_V1, OAUTH_ASSERTION_TAG, SIGNING_DOMAIN_V1,
 };
 pub use encryption::{decrypt, encrypt, EncryptedPayload};
 pub use epoch::derive_epoch_key;

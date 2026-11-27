@@ -41,11 +41,13 @@ allowed_domains   = ["example.com"]
 # Scopes granted to every client this provider auto-provisions. Every entry MUST
 # exist in crates/epigraph-core/src/canonical_scopes.rs — a scope that does not
 # is written into granted_scopes and then checked by nothing, which is exactly
-# how `groups:read` became decorative. (PR-02 corrected three phantoms here:
-# `claims:challenge` -> `policy:challenge`, `groups:manage` -> `groups:write`,
-# and `clients:register`, which does not exist at all, removed. `clients:admin`
-# is the real client-management scope and is deliberately NOT granted to an
-# externally provisioned identity.)
+# how `groups:read` became decorative. (PR-02 corrected phantoms here:
+# `groups:manage` -> `groups:write`, and `clients:register`, which does not
+# exist at all, removed. `clients:admin` is the real client-management scope
+# and is deliberately NOT granted to an externally provisioned identity.)
+# The retired scopes (canonical_scopes::RETIRED_SCOPES: claims:challenge,
+# claims:delete, evidence:read, ingest:write, policy:challenge) are checked by
+# nothing and are not granted even if listed; remove them from this list.
 #
 # CEILING, STATED OUT LOUD: `agents:write` below is the strongest entry in this
 # list. POST /api/v1/agents auto-activates a new OAuth client carrying
@@ -57,8 +59,8 @@ allowed_domains   = ["example.com"]
 # people you would give that to; otherwise drop `agents:write` from this list
 # and grant it per-client through the admin approval route.
 default_scopes = [
-  "claims:read", "claims:write", "policy:challenge",
-  "evidence:read", "evidence:submit",
+  "claims:read", "claims:write",
+  "evidence:submit",
   "edges:read", "edges:write",
   "agents:read", "agents:write",
   "groups:read", "groups:write",
@@ -76,7 +78,7 @@ default_scopes = [
 # jwks_url       = "https://your-team.cloudflareaccess.com/cdn-cgi/access/certs"
 # audience_env   = "CF_ACCESS_AUD"
 # auto_provision = true
-# default_scopes = ["claims:read", "claims:write", "evidence:read", "evidence:submit"]
+# default_scopes = ["claims:read", "claims:write", "evidence:submit"]
 # # Authorized external users. The same fail-closed gate applies to EVERY
 # # provider: both lists empty means nobody provisions (and, under
 # # EPIGRAPH_ENV=production, the server refuses to boot) unless

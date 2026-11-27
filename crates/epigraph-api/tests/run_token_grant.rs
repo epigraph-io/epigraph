@@ -506,6 +506,58 @@ async fn a_run_token_never_carries_a_scope_its_delegator_is_not_granted(pool: Pg
     assert_eq!(rows[0].2["reason"], json!("no_scope"), "{rows:?}");
 }
 
+/// A request naming a RETIRED scope (`epigraph_auth::RETIRED_SCOPES`) never
+/// WIDENS a run token: beside a live scope the retired one is dropped, and a
+/// request naming only retired scopes is refused `no_scope` (as one naming
+/// only ungranted scopes is), not answered with everything granted inside
+/// the ceiling. The delegator here is still granted `evidence:read`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_token_request_naming_only_retired_scopes_is_refused_not_widened(pool: PgPool) {
+    let (_d, client_id, key) = world(&pool, "run-token-retired").await;
+    assert!(
+        DELEGATOR_GRANTED.contains(&"evidence:read")
+            && epigraph_auth::is_retired_scope("evidence:read")
+            && epigraph_auth::is_retired_scope("claims:delete"),
+        "PREMISE: the delegator is granted a retired scope"
+    );
+    let st = app_state(&pool, RunTokens::On, &[MODEL]).await;
+
+    let minted = mint(
+        &st,
+        &request(
+            &client_id,
+            &key,
+            json!({"scope": "claims:read evidence:read"}),
+        ),
+    )
+    .await;
+    token_of("a live and a retired scope", &minted);
+    assert_eq!(
+        scopes_of(&minted.1),
+        ["claims:read"],
+        "the retired scope is dropped, nothing is added: {}",
+        minted.1
+    );
+
+    let refused = mint(
+        &st,
+        &request(
+            &client_id,
+            &key,
+            json!({"scope": "evidence:read claims:delete"}),
+        ),
+    )
+    .await;
+    assert_refused(
+        "a request naming only retired scopes",
+        &refused,
+        "invalid_scope",
+    );
+    let rows = events(&pool, "oauth_run_token_refused").await;
+    assert_eq!(rows.len(), 1, "one refusal row: {rows:?}");
+    assert_eq!(rows[0].2["reason"], json!("no_scope"), "{rows:?}");
+}
+
 /// The minted token is the shape the admission sites were proved against.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_minted_run_token_is_a_short_delegated_agent_token_with_no_refresh_token(pool: PgPool) {

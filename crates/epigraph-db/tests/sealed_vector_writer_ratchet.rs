@@ -371,6 +371,7 @@ fn every_vector_writer_filters_sealed_rows_and_locks_the_row_first() {
     for known in [
         "epigraph-db/src/repos/claim.rs::store_embedding",
         "epigraph-db/src/repos/claim.rs::store_embedding_if_unsealed",
+        "epigraph-db/src/repos/claim.rs::store_embedding_if_unsealed_and_missing",
         "epigraph-db/src/repos/evidence.rs::store_embedding_as",
         "epigraph-cli/src/reembed.rs::update_embedding_3072",
     ] {

@@ -8,8 +8,8 @@
 //! operator, and a third group H that is not part of the act.
 //!
 //! * A: `('group', SRC)`, self-contained: its evidence, a reasoning trace, a
-//!   BBA, a claim version, a frame assignment and a harvester fragment it is
-//!   the only provenance of. Everything it carries moves with it.
+//!   BBA, a claim version and a frame assignment. Everything it carries moves
+//!   with it.
 //! * B: `('group', SRC)`, linked to S (`('group', SRC)`, NOT listed, so it
 //!   stays) by a claim edge and by an evidence edge (B's evidence -> S's
 //!   evidence), to a public claim P, and from a group-private workflow in SRC
@@ -112,7 +112,6 @@ struct Fx {
     trace_a: Uuid,
     mf_a: Uuid,
     cv_a: Uuid,
-    frag_a: Uuid,
     b: Uuid,
     ev_b: Uuid,
     s: Uuid,
@@ -270,31 +269,6 @@ async fn seed(pool: &PgPool) -> Fx {
         &[a, frame],
     )
     .await;
-    let source: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
-    )
-    .bind(h32(Uuid::new_v4()))
-    .fetch_one(pool)
-    .await
-    .expect("seed harvester source");
-    let frag_a: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
-                                          visibility) \
-         VALUES ($1, $2, 'A fragment', $3, 'group') RETURNING id",
-    )
-    .bind(source)
-    .bind(h32(Uuid::new_v4()))
-    .bind(src)
-    .fetch_one(pool)
-    .await
-    .expect("seed fragment");
-    exec(
-        pool,
-        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
-        &[a, frag_a],
-    )
-    .await;
-
     // B, S, P and their edges.
     let ev_b = evidence(pool, b, "B's evidence").await;
     let ev_s = evidence(pool, s, "S's evidence").await;
@@ -386,7 +360,6 @@ async fn seed(pool: &PgPool) -> Fx {
         trace_a,
         mf_a,
         cv_a,
-        frag_a,
         b,
         ev_b,
         s,
@@ -428,15 +401,12 @@ const SNAP_TABLES: &[&str] = &[
     "entity_mentions",
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
-    "harvester_claim_provenance",
     "experiment_triples",
     "experiment_entity_mentions",
     "claim_clusters",
     "claim_cluster_membership",
     "claim_neighborhood_membership",
     "claim_signature_revocations",
-    "harvester_fragments",
-    "harvester_sources",
     "edges",
     "factors",
     "evidence_visibility_pins",
@@ -753,7 +723,6 @@ async fn apply_moves_a_self_contained_claim_and_everything_that_follows(pool: Pg
         ("reasoning_traces", fx.trace_a),
         ("mass_functions", fx.mf_a),
         ("claim_versions", fx.cv_a),
-        ("harvester_fragments", fx.frag_a),
     ] {
         assert_eq!(row(&pool, t, id).await, grp(g), "{t} {id}");
     }
@@ -767,13 +736,7 @@ async fn apply_moves_a_self_contained_claim_and_everything_that_follows(pool: Pg
     assert_eq!(cf, grp(g));
     // Nothing else moved.
     let after = snapshot(&pool, true).await;
-    for t in [
-        "groups",
-        "group_memberships",
-        "agents",
-        "frames",
-        "harvester_sources",
-    ] {
+    for t in ["groups", "group_memberships", "agents", "frames"] {
         assert_eq!(before[t], after[t], "{t} changed");
     }
     for c in [fx.b, fx.s, fx.r, fx.v, fx.w, fx.q] {
@@ -808,7 +771,7 @@ async fn apply_moves_a_self_contained_claim_and_everything_that_follows(pool: Pg
         serde_json::from_str(body.lines().next().unwrap()).expect("header");
     assert_eq!(header["operation"], "regroup-claims");
     assert_eq!(header["source_group_id"], fx.src.to_string());
-    for id in [fx.a, fx.ev_a, fx.trace_a, fx.mf_a, fx.cv_a, fx.frag_a] {
+    for id in [fx.a, fx.ev_a, fx.trace_a, fx.mf_a, fx.cv_a] {
         assert!(
             body.lines().any(|l| l.contains(&id.to_string())
                 && l.contains(&fx.src.to_string())
@@ -1131,7 +1094,6 @@ async fn the_operators_own_personal_group_is_a_target_and_the_move_reverses_exac
         ("reasoning_traces", fx.trace_a),
         ("mass_functions", fx.mf_a),
         ("claim_versions", fx.cv_a),
-        ("harvester_fragments", fx.frag_a),
         ("evidence", fx.ev_b),
     ] {
         assert_eq!(row(&pool, t, id).await, grp(g), "{t} {id}");
@@ -1519,9 +1481,8 @@ async fn the_reversal_holds_a_claim_moved_since_or_grown_since(pool: PgPool) {
 /// The shapes a `restrict-claims` run leaves (the case this verb exists for:
 /// claims an earlier restriction put in the wrong team group). Two public
 /// claims X and Y carrying an outsider's public challenge, another writer's
-/// evidence, a fragment X shares with a public claim P, and edges X->Y, X->P,
-/// are restricted into SRC, then regrouped to DST: nothing is held (the
-/// outsider's challenge and the shared fragment are left as they are, the
+/// evidence, and edges X->Y, X->P, are restricted into SRC, then regrouped to
+/// DST: nothing is held (the outsider's challenge is left as it is, the
 /// writer's evidence follows), nothing becomes public, SRC's members lose
 /// everything and DST's gain it. One `reown-reverse` call over both manifests
 /// (newest first) puts every row back byte for byte.
@@ -1542,32 +1503,6 @@ async fn claims_a_restriction_put_in_source_regroup_and_both_acts_reverse(pool: 
     .fetch_one(&pool)
     .await
     .expect("seed the outsider's challenge");
-    let source: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
-    )
-    .bind(h32(Uuid::new_v4()))
-    .fetch_one(&pool)
-    .await
-    .expect("seed harvester source");
-    let frag: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
-                                          visibility) \
-         VALUES ($1, $2, 'shared fragment', $3, 'public') RETURNING id",
-    )
-    .bind(source)
-    .bind(h32(Uuid::new_v4()))
-    .bind(WORLD)
-    .fetch_one(&pool)
-    .await
-    .expect("seed fragment");
-    for c in [x, fx.p] {
-        exec(
-            &pool,
-            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
-            &[c, frag],
-        )
-        .await;
-    }
     let e_xy = fixture::seed_edge(&pool, x, y).await;
     let e_xp = fixture::seed_edge(&pool, x, fx.p).await;
     exec(
@@ -1614,10 +1549,6 @@ async fn claims_a_restriction_put_in_source_regroup_and_both_acts_reverse(pool: 
     .await;
     assert_eq!(rs.code, 0, "{}", rs.show());
     assert_eq!(row(&pool, "claims", x).await, grp(fx.src));
-    assert_eq!(
-        row(&pool, "harvester_fragments", frag).await,
-        (WORLD, "public".into())
-    );
 
     let m_regroup = dir.join("regroup.jsonl");
     let rg = regroup(
@@ -1644,11 +1575,6 @@ async fn claims_a_restriction_put_in_source_regroup_and_both_acts_reverse(pool: 
         row(&pool, "challenges", ch).await,
         (stranger_group, "public".into()),
         "the outsider's challenge is the challenger's"
-    );
-    assert_eq!(
-        row(&pool, "harvester_fragments", frag).await,
-        (WORLD, "public".into()),
-        "a fragment shared with a claim that stays is a node"
     );
     assert_eq!(edge(&pool, e_xy).await, (fx.dst, "group".into(), None));
     assert_eq!(edge(&pool, e_xp).await, (fx.dst, "group".into(), None));
@@ -3072,7 +2998,7 @@ fn longest_lock_hold(stdout: &str) -> Option<(u128, usize)> {
 
 /// Backlog b1e2151c (2): every batch transaction reports how long it held
 /// the LOCKED-PER-BATCH locks, and the result reports the longest, with the
-/// batch size: the per-batch stall a concurrent edge or fragment writer
+/// batch size: the per-batch stall a concurrent edge writer
 /// sees. A dry run reports it too (it takes the same locks).
 ///
 /// The figure is measured, not printed: a concurrent edge writer holds
