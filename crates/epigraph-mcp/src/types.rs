@@ -988,9 +988,9 @@ pub struct RecallParams {
                        read failed; and, when the theme leg ran, theme_leg {themes: [{theme_id, \
                        label}], added: the returned claims that only the theme leg supplied}. \
                        auto and hierarchical are REJECTED with tags, agent_id, offset, \
-                       theme_id or theme_label, which the theme leg cannot honour; since is \
-                       honoured. Themes are only those with at least one current member you may \
-                       read. Unknown values are rejected. Omitted: byte-identical to recall \
+                       theme_id or theme_label, which the theme leg cannot honour, and \
+                       hierarchical also with include_workflows=true; since is honoured. \
+                       Themes are only those with at least one current member you may read. Unknown values are rejected. Omitted: byte-identical to recall \
                        before this parameter existed."
     )]
     #[serde(default)]

@@ -548,6 +548,7 @@ async fn recall_post_embed(
             agent_filter,
             offset,
             params.theme_id.is_some() || params.theme_label.is_some(),
+            params.include_workflows,
         )?;
     }
 
@@ -1322,13 +1323,26 @@ const RECALL_QUERY_DIM: usize = 1536;
 /// and `since`-windowed, but it has no tag, author, offset or pinned-theme
 /// predicate: served anyway, it would hand back claims outside the scope the
 /// caller asked for, the silent widening this tool refuses elsewhere.
+///
+/// `Hierarchical` is also refused beside `include_workflows=true`: it serves
+/// theme members only, and the workflows leg would merge non-member rows into
+/// that page. `Auto` keeps the workflows leg, which merges after the theme
+/// leg exactly as it merges after the plain hybrid page.
 fn refuse_unscoped_theme_route(
     route: RecallRoute,
     tags: &[String],
     agent_filter: Option<uuid::Uuid>,
     offset: i64,
     theme_scoped: bool,
+    include_workflows: bool,
 ) -> Result<(), McpError> {
+    if route == RecallRoute::Hierarchical && include_workflows {
+        return Err(invalid_params(
+            "route=hierarchical cannot be combined with include_workflows=true: hierarchical \
+             serves theme members only, and workflows are not theme members. Drop \
+             include_workflows, or use route=auto or route=similarity.",
+        ));
+    }
     let clash = if !tags.is_empty() {
         Some("tags")
     } else if agent_filter.is_some() {

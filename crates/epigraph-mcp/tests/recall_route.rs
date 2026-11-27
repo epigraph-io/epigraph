@@ -662,6 +662,10 @@ async fn unsupported_route_combinations_are_refused(pool: PgPool) {
             json!({ "route": "hierarchical", "theme_id": c.theme.to_string() }),
             "theme_id",
         ),
+        (
+            json!({ "route": "hierarchical", "include_workflows": true }),
+            "include_workflows",
+        ),
     ] {
         let got = recall_with_pgvec(&server, &viewer, params(extra), Some(query_bucket())).await;
         assert!(
@@ -669,6 +673,19 @@ async fn unsupported_route_combinations_are_refused(pool: PgPool) {
             "a theme route with {what} must be refused, got {got:?}"
         );
     }
+    // `auto` keeps the workflows leg: it merges after the theme leg exactly
+    // as it merges after the plain hybrid page.
+    let auto_wf = recall_with_pgvec(
+        &server,
+        &viewer,
+        params(json!({ "route": "auto", "include_workflows": true })),
+        Some(query_bucket()),
+    )
+    .await;
+    assert!(
+        auto_wf.is_ok(),
+        "auto with include_workflows is served: {auto_wf:?}"
+    );
     let bad: Result<RecallParams, _> =
         serde_json::from_value(json!({ "query": QUERY, "route": "semantic" }));
     assert!(bad.is_err(), "an unknown route must not deserialize");
