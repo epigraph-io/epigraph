@@ -5275,7 +5275,9 @@ restart.
   it missing (so where both exist no ALTER TABLE runs and `papers` is not locked), with the
   deployed definition, then `GRANT INSERT (abstract_text, properties) ON papers TO epigraph_app`
   (no UPDATE: 255's UPDATE allowlist stays `title` and `journal`). **On a deployed database whose
-  columns and grants predate it, 355 changes nothing, so it has nothing to reverse there.** **No
+  columns and grants predate it, 355 changes nothing, so it has nothing to reverse there.** A
+  column that already exists with a different definition is left as it is, without a warning
+  (the `ADD COLUMN IF NOT EXISTS` behaviour); only the end-state catalog check shows it. **No
   undo runbook ships**: an undo would have to DROP the two columns, nothing records which database
   355 created them on, and on a deployed database that would destroy data. Pinned by
   `epigraph-db/tests/paper_licence_operator_only.rs`

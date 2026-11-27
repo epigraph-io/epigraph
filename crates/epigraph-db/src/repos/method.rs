@@ -500,10 +500,11 @@ impl MethodRepository {
     /// was invisible while the route could not take a capability at all
     /// (backlog 97381982). Migration 355 now declares `properties` (`jsonb NOT
     /// NULL DEFAULT '{}'`, with `abstract_text`, as a deployed database carries
-    /// them; backlog 158b7ce4), but no writer fills a year into it and this
-    /// read still does not use it. The fields stay, as `None`, so the response
-    /// shape does not change; a stale flag can only come from a year the
-    /// schema does not store.
+    /// them; backlog 158b7ce4), but no writer in this repository fills a year
+    /// into it and this read still does not use it. A deployed database's
+    /// rows may hold keys written elsewhere; measure them before wiring
+    /// `pub_year` to `properties`. The fields stay, as `None`, so the response
+    /// shape does not change.
     pub async fn get_source_papers<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
