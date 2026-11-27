@@ -263,7 +263,18 @@ pub(crate) async fn submit_claim_response(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<SubmitClaimResponse, McpError> {
     let sub = match prepare_submission(server, viewer, params, auth).await? {
-        PreparedSubmission::Existing(response) => return Ok(*response),
+        PreparedSubmission::NearDuplicate {
+            existing_id,
+            distance,
+            mut sub,
+        } => {
+            match corroborate_submission(server, viewer, existing_id, distance, &mut sub).await? {
+                Some(response) => return Ok(response),
+                // Refused: `sub` now carries the `near-duplicate` label and
+                // the refusal, and is inserted as the caller's own claim.
+                None => *sub,
+            }
+        }
         PreparedSubmission::Fresh(sub) => *sub,
     };
     let mut tx = crate::claim_helper::begin_author_stamped_tx_for(
@@ -286,13 +297,123 @@ pub(crate) async fn submit_claim_response(
     finish_submission(server, viewer, sub, written, "submit_claim").await
 }
 
+/// The novelty gate matched `existing_id`: attach this submission's evidence
+/// to it as corroboration (`novelty_gate::corroborate`, backlog 4f4c6175) and
+/// answer with the existing claim, or, when the caller may not attach there
+/// (backlogs 5578f693, fef24216), flag `sub` `near-duplicate`, record the
+/// refusal on it, and answer `None` so the caller inserts it as its own claim.
+/// `sub.pending_embedding` already holds the gate's vector, so that insert
+/// pays for no second embedding.
+async fn corroborate_submission(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    existing_id: Uuid,
+    distance: Option<f64>,
+    sub: &mut Submission,
+) -> Result<Option<SubmitClaimResponse>, McpError> {
+    let evidence = submission_evidence(server, sub, ClaimId::from_uuid(existing_id));
+    let outcome = crate::tools::novelty_gate::corroborate(
+        server,
+        viewer,
+        sub.author,
+        existing_id,
+        crate::tools::novelty_gate::CorroboratingEvidence {
+            evidence: &evidence,
+            source_url: sub
+                .params
+                .source_url
+                .as_deref()
+                .or_else(|| EvidenceRepository::source_url_of(&evidence.evidence_type)),
+            strength: sub.confidence,
+            evidence_type: &sub.params.evidence_type,
+            tenancy: &sub.tenancy,
+            distance,
+            tool: "submit_claim",
+        },
+    )
+    .await?;
+    let crate::tools::novelty_gate::CorroborationOutcome::Attached { evidence_id } = outcome else {
+        if !sub.params.labels.iter().any(|l| l == "near-duplicate") {
+            sub.params.labels.push("near-duplicate".to_string());
+        }
+        sub.corroboration = Some(outcome.report(existing_id));
+        return Ok(None);
+    };
+    let existing =
+        crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id).await?;
+    Ok(Some(SubmitClaimResponse {
+        claim_id: existing_id.to_string(),
+        // The existing claim's own truth_value: a corroboration never writes it.
+        truth_value: existing.truth_value.value(),
+        content_hash: ContentHasher::to_hex(&existing.content_hash),
+        embedded: false,
+        belief: None,
+        plausibility: None,
+        pignistic_prob: None,
+        frame_id: None,
+        // The caller is TOLD this is not an insert, and what became of each
+        // input it sent (backlog a3e63a12).
+        deduplicated: Some(dedup_block(
+            DedupBy::NoveltyGate,
+            existing_id,
+            &sub.params,
+            evidence_id.is_some(),
+        )),
+        visibility: None,
+        owner_group_id: None,
+        visibility_note: None,
+        // About the SUBMITTED text, on every path.
+        atomicity: crate::types::AtomicityWarning::for_content(&sub.params.content),
+        gate_skipped: None,
+        corroboration: Some(outcome.report(existing_id)),
+    }))
+}
+
+/// This submission's evidence row for `claim_id`, signed by this server: the
+/// submission's own claim, or the existing claim it corroborates.
+fn submission_evidence(server: &EpiGraphMcpFull, sub: &Submission, claim_id: ClaimId) -> Evidence {
+    let evidence_hash = ContentHasher::hash(sub.params.evidence_data.as_bytes());
+    // `Evidence::agent_id` IS `evidence.signer_id` (the table has no author
+    // column), and the digest is signed with THIS SERVER's key below. So it names
+    // the signer, not the author: naming the author recorded a caller's agent as
+    // the signer of a signature it never made, which `SignatureVerifier` then
+    // checks against the wrong public key.
+    let mut e = Evidence::new(
+        AgentId::from_uuid(sub.signer_agent_id),
+        sub.pub_key,
+        evidence_hash,
+        sub.evidence_type.clone(),
+        Some(sub.params.evidence_data.clone()),
+        claim_id,
+    );
+    e.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+    );
+    // The row signature above covers `content_hash` (BLAKE3 of
+    // evidence_data) only. A dataset's structured fields (root, manifest
+    // digest, counts) get a signature of their own, bound to this row's
+    // evidence and claim ids, under the separate `Dataset` signing domain,
+    // so the bytes every existing evidence signature covers are unchanged
+    // (backlog c8beb101). A no-op for any other evidence type.
+    e.evidence_type
+        .attest_dataset(e.id, e.claim_id, &server.signer);
+    e
+}
+
 /// The `deduplicated` block for a `submit_claim` answered with an existing
 /// claim (backlog a3e63a12). Each list is what the path in question ACTUALLY
 /// does with the input, read off the code below, not what one might expect:
 ///
-/// * [`DedupBy::NoveltyGate`] — `prepare_submission` returns before any
-///   transaction opens. Nothing of this call is written: not its wording, not
-///   its labels, not an evidence row, not a trace.
+/// * [`DedupBy::NoveltyGate`] — the submission CORROBORATES the existing claim
+///   (`corroborate_submission`, backlog 4f4c6175): an Evidence row
+///   (evidence_data, evidence_type, a dataset, and source_url in
+///   `evidence.source_url`) and its BBA (confidence) are written on it. Its
+///   wording, methodology, reasoning and labels are written nowhere: no claim
+///   row and no reasoning trace. When `evidence_written` is false (the caller's
+///   group had attached the same evidence body already) nothing is written and
+///   every input is discarded.
 /// * [`DedupBy::ContentHash`] — `write_submission` still runs in full on the
 ///   existing claim: `update_labels_conn` UNIONS the labels in; a new Evidence
 ///   row (evidence_data, evidence_type, and source_url in `evidence.source_url`)
@@ -310,24 +431,34 @@ pub(crate) async fn submit_claim_response(
 /// Only supplied inputs are listed; see `types::Deduplicated`. On a
 /// novelty-gate hit `novelty_threshold` is the input that DECIDED the hit, so
 /// it is listed in neither.
-fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams) -> Deduplicated {
+fn dedup_block(
+    by: DedupBy,
+    existing_claim_id: Uuid,
+    params: &SubmitClaimParams,
+    evidence_written: bool,
+) -> Deduplicated {
     let mut applied: Vec<&'static str> = Vec::new();
     let mut discarded: Vec<&'static str> = Vec::new();
     match by {
         DedupBy::NoveltyGate => {
-            discarded.extend(["content", "methodology", "evidence_data", "evidence_type"]);
-            discarded.push("confidence");
+            discarded.extend(["content", "methodology"]);
+            let evidence_inputs = if evidence_written {
+                &mut applied
+            } else {
+                &mut discarded
+            };
+            evidence_inputs.extend(["evidence_data", "evidence_type", "confidence"]);
             if params.source_url.is_some() {
-                discarded.push("source_url");
+                evidence_inputs.push("source_url");
+            }
+            if params.dataset.is_some() {
+                evidence_inputs.push("dataset");
             }
             if params.reasoning.is_some() {
                 discarded.push("reasoning");
             }
             if !params.labels.is_empty() {
                 discarded.push("labels");
-            }
-            if params.dataset.is_some() {
-                discarded.push("dataset");
             }
         }
         DedupBy::ContentHash => {
@@ -364,9 +495,14 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
 
 /// What [`prepare_submission`] decided.
 enum PreparedSubmission {
-    /// The novelty gate matched an existing claim: this is the response, and
-    /// nothing is to be written.
-    Existing(Box<SubmitClaimResponse>),
+    /// The novelty gate matched `existing_id` at `distance`: the submission
+    /// corroborates it, or, when it may not, is written as its own flagged
+    /// claim (`corroborate_submission`). Nothing is written yet.
+    NearDuplicate {
+        existing_id: Uuid,
+        distance: Option<f64>,
+        sub: Box<Submission>,
+    },
     /// A submission to write.
     Fresh(Box<Submission>),
 }
@@ -393,6 +529,9 @@ struct Submission {
     /// Why the novelty gate could not run, when it should have (backlog
     /// 8482b8fc). Reported on the response.
     gate_skipped: Option<crate::tools::novelty_gate::GateSkip>,
+    /// Why a near-duplicate was inserted instead of corroborating the claim the
+    /// gate matched (backlogs 5578f693, fef24216). Reported on the response.
+    corroboration: Option<crate::types::Corroboration>,
 }
 
 /// What [`write_submission`] wrote.
@@ -500,6 +639,7 @@ async fn prepare_submission(
             .await?;
     let mut pending_embedding: Option<String> = None;
     let mut gate_skipped: Option<crate::tools::novelty_gate::GateSkip> = None;
+    let mut near_duplicate: Option<(Uuid, Option<f64>)> = None;
     if !is_exact_resubmit {
         let novelty_threshold = params
             .novelty_threshold
@@ -521,74 +661,25 @@ async fn prepare_submission(
             Ok(crate::tools::novelty_gate::GateVerdict {
                 decision,
                 embedding: pgvec,
-                ..
+                nearest_distance,
             }) => {
+                // Every decision keeps the already-generated, pgvector-formatted
+                // embedding, so an insert below (a fresh claim, a flagged one,
+                // or a near-duplicate that may not corroborate) stores it
+                // directly instead of paying for a second embedding call.
+                pending_embedding = Some(pgvec);
                 if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) =
                     decision
                 {
-                    // Semantic duplicate: suppress the insert entirely and
-                    // report the existing claim, mirroring the shape of a
-                    // content-hash dedup hit (no new Evidence/Trace/edges/DS).
-                    //
-                    // Two deliberate differences from the content-hash dedup
-                    // this composes with, both intended per the backlog spec
-                    // (nearest_by_embedding scans ALL is_current claims, not
-                    // scoped to this agent):
-                    //   1. `existing_id` can belong to ANOTHER agent's claim —
-                    //      unlike find_by_content_hash_and_agent's same-agent
-                    //      dedup, semantic novelty is corpus-wide. CONCRETE
-                    //      CONSEQUENCE: if agent B asserts a near-paraphrase of
-                    //      a fact agent A already asserted, B's submission is
-                    //      suppressed at the default threshold and B receives
-                    //      A's claim id — with NO independent AUTHORED edge,
-                    //      Evidence, or ReasoningTrace recorded for B. In a
-                    //      Dempster-Shafer system where independent
-                    //      corroboration from a second source is itself
-                    //      evidentiary signal (BBA combination), that is a real
-                    //      loss of corroboration data, not just a dedup nicety.
-                    //      This is what the backlog spec asks for (no agent
-                    //      filter on the ANN query) — flagging it here for a
-                    //      future owner to reconsider, not changing it
-                    //      unilaterally.
-                    //   2. `params.labels` (the CALLER's requested labels on
-                    //      THIS submission) are silently dropped here, since
-                    //      nothing is inserted. `resolve_backlog_item` is
-                    //      unaffected (it hardcodes novelty_threshold=0.0 so
-                    //      this branch never fires for it).
-                    let existing =
-                        crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id)
-                            .await?;
-                    return Ok(PreparedSubmission::Existing(Box::new(
-                        SubmitClaimResponse {
-                            claim_id: existing_id.to_string(),
-                            truth_value: existing.truth_value.value(),
-                            content_hash: ContentHasher::to_hex(&existing.content_hash),
-                            embedded: false,
-                            belief: None,
-                            plausibility: None,
-                            pignistic_prob: None,
-                            frame_id: None,
-                            // The caller is TOLD this is not an insert, and that
-                            // every input it sent was dropped (backlog a3e63a12).
-                            deduplicated: Some(dedup_block(
-                                DedupBy::NoveltyGate,
-                                existing_id,
-                                &params,
-                            )),
-                            visibility: None,
-                            owner_group_id: None,
-                            visibility_note: None,
-                            // About the SUBMITTED text, on every path.
-                            atomicity: crate::types::AtomicityWarning::for_content(&params.content),
-                            gate_skipped: None,
-                        },
-                    )));
+                    // Semantic duplicate. Phase 1 writes nothing (see this
+                    // function's doc): the caller corroborates `existing_id`
+                    // with this submission's evidence, or inserts it flagged
+                    // when it may not (`corroborate_submission`). The match is
+                    // corpus-wide, so `existing_id` may be another agent's
+                    // claim; `resolve_backlog_item` never gets here (it passes
+                    // novelty_threshold = 0.0).
+                    near_duplicate = Some((existing_id, nearest_distance));
                 }
-                // Insert / InsertFlagged: stash the already-generated,
-                // pgvector-formatted embedding so the was_created branch below
-                // can store it directly instead of paying for a second
-                // embedding call via embed_and_store.
-                pending_embedding = Some(pgvec);
                 if matches!(
                     decision,
                     crate::tools::novelty_gate::GateDecision::InsertFlagged
@@ -600,7 +691,7 @@ async fn prepare_submission(
         }
     }
 
-    Ok(PreparedSubmission::Fresh(Box::new(Submission {
+    let sub = Box::new(Submission {
         params,
         author,
         agent_id,
@@ -617,7 +708,16 @@ async fn prepare_submission(
         pending_embedding,
         tenancy,
         gate_skipped,
-    })))
+        corroboration: None,
+    });
+    Ok(match near_duplicate {
+        Some((existing_id, distance)) => PreparedSubmission::NearDuplicate {
+            existing_id,
+            distance,
+            sub,
+        },
+        None => PreparedSubmission::Fresh(sub),
+    })
 }
 
 /// Phase 2 of a submission: every write, on the caller's author-stamped
@@ -640,7 +740,6 @@ async fn write_submission(
         weight,
         claim,
         methodology,
-        evidence_type,
         ..
     } = sub;
     let (agent_id, agent_id_typed, signer_agent_id, pub_key, confidence, weight) = (
@@ -710,37 +809,7 @@ async fn write_submission(
 
     // Build Evidence + Trace from this submission. Both are noun-claims with
     // their own UUIDs and signatures regardless of was_created.
-    let evidence_hash = ContentHasher::hash(params.evidence_data.as_bytes());
-    // `Evidence::agent_id` IS `evidence.signer_id` (the table has no author
-    // column), and the digest is signed with THIS SERVER's key below. So it names
-    // the signer, not the author: naming the author recorded a caller's agent as
-    // the signer of a signature it never made, which `SignatureVerifier` then
-    // checks against the wrong public key.
-    let evidence = Evidence::new(
-        AgentId::from_uuid(signer_agent_id),
-        pub_key,
-        evidence_hash,
-        evidence_type.clone(),
-        Some(params.evidence_data.clone()),
-        claim.id,
-    );
-    let evidence_with_sig = {
-        let mut e = evidence;
-        e.signature = Some(
-            server
-                .signer
-                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
-        );
-        // The row signature above covers `content_hash` (BLAKE3 of
-        // evidence_data) only. A dataset's structured fields (root, manifest
-        // digest, counts) get a signature of their own, bound to this row's
-        // evidence and claim ids, under the separate `Dataset` signing domain,
-        // so the bytes every existing evidence signature covers are unchanged
-        // (backlog c8beb101). A no-op for any other evidence type.
-        e.evidence_type
-            .attest_dataset(e.id, e.claim_id, &server.signer);
-        e
-    };
+    let evidence_with_sig = submission_evidence(server, sub, claim.id);
 
     let explanation = params.reasoning.clone().unwrap_or_else(|| {
         format!(
@@ -922,6 +991,7 @@ async fn finish_submission(
         content_hash,
         mut pending_embedding,
         gate_skipped,
+        corroboration,
         ..
     } = sub;
     let WrittenSubmission {
@@ -1021,13 +1091,14 @@ async fn finish_submission(
         // pre-check: it is what decided whether DS ran, and it also covers a
         // concurrent writer landing the same content between the two.
         deduplicated: (!was_created)
-            .then(|| dedup_block(DedupBy::ContentHash, claim_uuid, &params)),
+            .then(|| dedup_block(DedupBy::ContentHash, claim_uuid, &params, true)),
         visibility: Some(tenancy.visibility.to_string()),
         owner_group_id: Some(tenancy.owner_group_id.to_string()),
         visibility_note: tenancy.note,
         // Warn-only (backlog 72850d43): the claim above is already committed.
         atomicity: crate::types::AtomicityWarning::for_content(&params.content),
         gate_skipped: gate_skipped.map(|reason| crate::types::GateSkipped { reason }),
+        corroboration,
     })
 }
 
@@ -2607,7 +2678,7 @@ pub async fn resolve_backlog_item(
         // so the gate never returns an existing claim for a resolution. Refused
         // rather than trusted, because following it would retire the item
         // against a claim this call did not write.
-        PreparedSubmission::Existing(_) => {
+        PreparedSubmission::NearDuplicate { .. } => {
             return Err(crate::errors::internal_error_text(
                 "resolve_backlog_item: the novelty gate returned an existing claim for a \
                  resolution at threshold 0.0; refusing to retire the item against a claim this \
@@ -2948,7 +3019,7 @@ async fn gate_retirement_label(
 /// \"<table>\""): a tenancy `WITH CHECK` refused the stamp. A CODED `42501` a
 /// trigger raises (a designed refusal with its own text), or a row-security
 /// refusal on any OTHER table, is not this.
-fn refused_by_row_security_on(e: &epigraph_db::DbError, table: &str) -> bool {
+pub(crate) fn refused_by_row_security_on(e: &epigraph_db::DbError, table: &str) -> bool {
     matches!(
         e,
         epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
@@ -3472,11 +3543,9 @@ mod tests {
     // Nested in `tests` because `tests/no_inline_sql_in_tools.rs` requires the first
     // `#[cfg(test)]` in a tools file to introduce `mod tests` and be the last item.
     mod dedup_block_tests {
-        //! The novelty-gate arm of `dedup_block` cannot be reached through
-        //! `EpiGraphMcpFull` in a test process (its embedder hard-codes OpenAI; see
-        //! `tests/novelty_gate_test.rs`), so its list is pinned here. The
-        //! content-hash arm is additionally measured end-to-end in
-        //! `tests/dedup_response_signal.rs`.
+        //! The lists `dedup_block` reports per path. Both arms are also measured
+        //! end-to-end: the content-hash arm in `tests/dedup_response_signal.rs`,
+        //! the novelty-gate arm in `tests/novelty_gate_corroboration_app_role.rs`.
         use super::super::dedup_block;
         use crate::types::{DedupBy, SubmitClaimParams};
 
@@ -3505,9 +3574,37 @@ mod tests {
             }
         }
 
+        /// A corroboration (backlog 4f4c6175) records the evidence inputs on
+        /// the existing claim and drops the claim-level ones.
         #[test]
-        fn a_novelty_gate_hit_discards_every_supplied_input() {
-            let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params());
+        fn a_novelty_gate_corroboration_applies_the_evidence_inputs_only() {
+            let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params(), true);
+            for want in [
+                "evidence_data",
+                "evidence_type",
+                "confidence",
+                "source_url",
+                "dataset",
+            ] {
+                assert!(d.inputs_applied.contains(&want), "{want}: {d:?}");
+                assert!(!d.inputs_discarded.contains(&want), "{want}: {d:?}");
+            }
+            for want in ["content", "methodology", "reasoning", "labels"] {
+                assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
+                assert!(!d.inputs_applied.contains(&want), "{want}: {d:?}");
+            }
+            assert!(
+                !d.inputs_discarded.contains(&"novelty_threshold")
+                    && !d.inputs_applied.contains(&"novelty_threshold"),
+                "the threshold decided the hit; it was not discarded: {d:?}"
+            );
+        }
+
+        /// A repeat of evidence the caller's group had already attached writes
+        /// nothing, so nothing is applied.
+        #[test]
+        fn a_repeated_corroboration_discards_every_supplied_input() {
+            let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params(), false);
             assert!(d.inputs_applied.is_empty(), "{d:?}");
             for want in [
                 "content",
@@ -3522,10 +3619,6 @@ mod tests {
             ] {
                 assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
             }
-            assert!(
-                !d.inputs_discarded.contains(&"novelty_threshold"),
-                "the threshold decided the hit; it was not discarded: {d:?}"
-            );
         }
 
         #[test]
@@ -3537,7 +3630,7 @@ mod tests {
             p.novelty_threshold = None;
             p.dataset = None;
             for by in [DedupBy::NoveltyGate, DedupBy::ContentHash] {
-                let d = dedup_block(by, uuid::Uuid::nil(), &p);
+                let d = dedup_block(by, uuid::Uuid::nil(), &p, true);
                 for absent in [
                     "source_url",
                     "reasoning",

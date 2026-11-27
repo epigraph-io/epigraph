@@ -139,7 +139,7 @@ pub struct SubmitClaimParams {
     pub labels: Vec<String>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting a new claim, and this call's evidence corroborates it (an evidence row, its BBA combined into the claim's belief, an AUTHORED edge from you; the claim's truth_value, labels and content stay its owner's): the response carries deduplicated.by='novelty_gate' and corroboration.evidence_id. If you cannot write that claim, or it has a different visibility than this write, your own claim is inserted labeled 'near-duplicate' and corroboration.refused says why. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never deduplicated by this gate (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -806,7 +806,7 @@ pub struct MemorizeParams {
     pub tags: Option<Vec<String>>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting a new claim, and this memory corroborates it as testimony evidence (an evidence row, its BBA combined into the claim's belief, an AUTHORED edge from you; the claim's truth_value, labels and content stay its owner's): the response carries deduplicated.by='novelty_gate' and corroboration.evidence_id. If you cannot write that claim, or it has a different visibility than this write, your own claim is inserted tagged 'near-duplicate' and corroboration.refused says why. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never deduplicated by this gate (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -1732,6 +1732,47 @@ pub struct SubmitClaimResponse {
     /// claim was inserted WITHOUT a near-duplicate check. See [`GateSkipped`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_skipped: Option<GateSkipped>,
+    /// Present ONLY when the novelty gate matched an existing claim: this
+    /// call's evidence corroborated it, or why it could not. See
+    /// [`Corroboration`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corroboration: Option<Corroboration>,
+}
+
+/// What the novelty gate did with a submission that duplicates an existing
+/// claim within `novelty_threshold` (backlogs 4f4c6175, 5578f693).
+///
+/// The gate used to SUPPRESS such a submission: nothing of it was written, so
+/// a second agent asserting what a first had already asserted left no trace,
+/// and the independent corroboration a Dempster-Shafer belief is built to
+/// count was lost. Now the submission's evidence is attached to the existing
+/// claim instead (`novelty_gate::corroborate`): an evidence row, its BBA
+/// combined into the claim's belief, and an `AUTHORED` edge from the caller
+/// marked `corroboration: true`. No claim row is written, and the existing
+/// claim's `truth_value`, labels and content are its owner's and unchanged.
+///
+/// When the caller may not attach to that claim, or attaching would move its
+/// evidence into a different audience than the one it asked for, its OWN
+/// claim is inserted instead, labelled `near-duplicate`, and this block says
+/// why (`refused`) and which claim was nearest.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Corroboration {
+    /// The evidence was attached to `claim_id` as row `evidence_id`. On a
+    /// repeat of the same evidence by the same group, `evidence_id` is null
+    /// and nothing new was written (`note` says so).
+    Attached {
+        claim_id: String,
+        evidence_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<&'static str>,
+    },
+    /// Not attached: `refused` is the reason, `nearest_claim_id` the claim the
+    /// gate matched. The caller's own claim was inserted, flagged.
+    Refused {
+        refused: &'static str,
+        nearest_claim_id: String,
+    },
 }
 
 /// The novelty gate's visible fail-open (backlog 8482b8fc), on `submit_claim`,
@@ -1790,7 +1831,8 @@ pub enum DedupBy {
     ContentHash,
     /// The write-side semantic novelty gate found an existing current claim
     /// within `novelty_threshold` cosine distance. That claim may belong to
-    /// ANOTHER agent, and nothing from this call was written.
+    /// ANOTHER agent. No claim row was written: this call's evidence
+    /// corroborated the existing claim (see [`Corroboration`]).
     NoveltyGate,
 }
 
@@ -1808,9 +1850,10 @@ pub enum DedupBy {
 /// likewise in neither list (`tools::batch::SuppliedByEntry`), although the
 /// content-hash path still records the default on the trace it writes.
 ///
-/// On EVERY dedup hit the existing claim's belief and truth_value are left
-/// unchanged: this call's confidence and evidence are never combined into the
-/// existing claim's belief, whichever list names them.
+/// On EVERY dedup hit the existing claim's truth_value, labels and content are
+/// left unchanged. On a content-hash hit its belief is unchanged too. On a
+/// novelty-gate hit this call's evidence and confidence ARE combined into the
+/// existing claim's belief as corroboration (see [`Corroboration`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct Deduplicated {
     pub by: DedupBy,
@@ -2083,6 +2126,9 @@ pub struct MemorizeResponse {
     /// See [`SubmitClaimResponse::gate_skipped`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_skipped: Option<GateSkipped>,
+    /// See [`SubmitClaimResponse::corroboration`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corroboration: Option<Corroboration>,
 }
 
 #[derive(Debug, Serialize)]
