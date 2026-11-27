@@ -1,8 +1,8 @@
 # scripts/
 
 Operational scripts for the live EpiGraph deployment. Not part of the
-build; invoked manually or by maintenance tasks (see `epiclaw-host`'s
-`schedules.toml`).
+build; invoked manually or by the deployment's scheduled maintenance tasks
+(a host scheduler of your choice; `docs/deploy.md` step 10 lists the jobs).
 
 ## Dependencies and database
 

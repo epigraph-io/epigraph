@@ -102,8 +102,8 @@ refuses such a label merge instead. Over HTTP the
 WHOLE label mutation needs that ownership, whatever the labels (as
 `patch_claim` and `PATCH /api/v1/claims/:id/labels` do); on stdio every other
 label stays ungated. A stdio agent that shares no operator with the claim's
-author, and is not its delegate, is now refused, including through `release/epiclaw/CLAUDE.md`'s
-`update_labels(original_id, add=["resolved"])` procedure, and so is a stdio
+author, and is not its delegate, is now refused, including through the agent fleet's
+`update_labels(original_id, add=["resolved"])` retirement procedure, and so is a stdio
 server with no declared signer (`--agent-key` or the separate signing key) on any claim it
 did not author. The deploy preconditions this sets for the fleet are in
 `scripts/e2e/README.md` ("Deploy preconditions").

@@ -407,8 +407,8 @@ item additive or a fix (measured by the review, TIP vs BASE, unless noted):
 
 ### Deploy preconditions (record these in the PR body)
 
-1. **Fleet backlog retirement.** The #374 gate removes the workaround
-   `epiclaw-host` `release/epiclaw/CLAUDE.md` step 8 documents
+1. **Fleet backlog retirement.** The #374 gate removes the agent fleet's
+   backlog-retirement workaround, its instructions' step 8
    (`update_labels(original_id, add=["resolved"])`, described there as "not
    ownership-gated over MCP"). If the fleet runs with a declared signer
    (`EPIGRAPH_AGENT_MODEL`) and its agents have no #503 operator links, fleet

@@ -42,7 +42,7 @@ use epigraph_mcp::{tools, EpiGraphMcpFull};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// The status labels the scheduled writers in epiclaw-host `deploy/` attach to
+/// The status labels the host's scheduled agent prompts attach to
 /// their per-run summary claims (norcal-rfp and grant-monitor generators,
 /// reviewers, revisers, cross-generator dedup, the grant run summary), plus
 /// `telemetry` (per-run observations such as url-discovery and A/E filter
