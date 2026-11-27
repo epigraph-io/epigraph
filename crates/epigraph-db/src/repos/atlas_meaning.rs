@@ -22,8 +22,9 @@
 //!
 //! A theme's members on a map are its claims the map may draw that are current
 //! (`COALESCE(is_current, true)`, what the Atlas draws and what W1's cap
-//! counts). Only members with an embedding can be clustered; the others are
-//! counted ([`ThemeMembers::unembedded`]) and left out of the tree.
+//! counts). Only members with an embedding can be clustered; the others
+//! ([`ThemeMembers::unembedded`]) are left out of the clustering, and the
+//! builds put them in their theme's "not yet placed" leaves.
 
 use std::collections::BTreeMap;
 
@@ -40,8 +41,9 @@ pub struct ThemeMembers {
     /// Members with an embedding, sorted by claim id, each with its
     /// embedding in pgvector's text form (`[v,v,...]`).
     pub embedded: Vec<(Uuid, String)>,
-    /// Current members the map draws that have no embedding: not clustered.
-    pub unembedded: usize,
+    /// Current members the map draws that have no embedding, sorted by
+    /// claim id: not clustered.
+    pub unembedded: Vec<Uuid>,
 }
 
 /// The "by meaning" reads. See the module documentation.
@@ -88,9 +90,10 @@ impl AtlasMeaningRepository {
     }
 
     /// Every theme with at least one current, EMBEDDED claim `map` may draw,
-    /// sorted: exactly the themes `export` writes, so the themes a run of the
-    /// map must hold. A theme whose drawable members all lack an embedding
-    /// has no tree.
+    /// sorted: exactly the themes `export` writes, so the themes an operator's
+    /// result for the map must hold. A theme whose drawable members all lack
+    /// an embedding has no computed tree; the builds draw it as one "not yet
+    /// placed" leaf.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the statement fails.
@@ -120,7 +123,8 @@ impl AtlasMeaningRepository {
     }
 
     /// The current members of `theme_id` that `map` may draw: the embedded
-    /// ones with their embeddings, sorted by id, and how many have none.
+    /// ones with their embeddings, sorted by id, and the ids of those with
+    /// none, sorted.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the statement fails.
@@ -152,15 +156,15 @@ impl AtlasMeaningRepository {
         for (id, embedding) in q.fetch_all(&mut *conn).await? {
             match embedding {
                 Some(e) => out.embedded.push((id, e)),
-                None => out.unembedded += 1,
+                None => out.unembedded.push(id),
             }
         }
         Ok(out)
     }
 
     /// How many current, themed claims `map` may draw have no embedding, in
-    /// EVERY theme (also one with no embedded member, which has no tree): the
-    /// claims no leaf of the map holds. Atlas W9's per-map
+    /// EVERY theme (also one with no embedded member): the claims the builds
+    /// put in "not yet placed" leaves rather than cluster. Atlas W9's per-map
     /// `unembedded_members`.
     ///
     /// # Errors

@@ -70,9 +70,9 @@ What apply writes, per theme:
     the cap. So a theme whose embedded members fit in one part, or that has
     none, is still split under the cap. A part holding only unembedded members
     has no centroid (NULL) and a `claim_count` of 0, as `claim_count` and the
-    centroid count embedded members only; the Atlas builds take only themes
-    with an embedded member, so such a part is not drawn until its members
-    are embedded (plan reports `unembedded_only_parts`). A part filled to
+    centroid count embedded members only; the Atlas builds draw such a part
+    as one "not yet placed" tree until its members are embedded
+    (docs/runbooks/atlas-nightly.md; plan reports `unembedded_only_parts`). A part filled to
     exactly the cap goes over it at the next nightly assignment to it. The
     placed members move with their part, so `reverse` restores them too.
   * Refused, with nothing written, when the result no longer matches the live

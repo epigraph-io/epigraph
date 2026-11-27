@@ -23,15 +23,17 @@ use super::incremental::{shape_of, to_wire, update_links, update_meaning, Shape}
 use super::leaves::{contract_edges, fill_leaf, leaf_claims, leaf_shape, node_set, RenamedNames};
 use super::links::{fill_cross_links, LinksReport};
 use super::offbox::OffBox;
-use super::previous::{by_theme, prev_tree};
+use super::previous::{by_theme, prev_tree, PrevTree};
 use crate::atlas_layout::fill::{fill_positions, LayoutRecord, PreviousRun};
 use crate::atlas_links::graph::{
     check_mirrors, counted_links, linked_claims, meaning_leaf_of, switch_targets,
 };
+use crate::atlas_meaning::build::UNPLACED_KEY;
 use crate::atlas_meaning::docs::level_documents_with_switch;
 use crate::atlas_meaning::files::ResultTheme;
 use crate::atlas_meaning::tree::{
-    check_tree, map_key, resolve_tree, MeaningTree, NodeBody, WireGroup, WireKind,
+    check_tree, map_key, place_unplaced, place_unplaced_or_keep, resolve_tree, MeaningTree,
+    NodeBody, ResolveStats, WireGroup, WireKind,
 };
 use crate::atlas_naming::backend::NameBackend;
 use crate::atlas_naming::build::{read_member_texts, read_previous};
@@ -111,8 +113,38 @@ impl EdgeCut {
 struct BuiltTheme {
     docs: Vec<LevelDocument>,
     mirrors: Vec<Uuid>,
+    /// Its "not yet placed" leaves, both hierarchies.
+    unplaced: Vec<Uuid>,
     stats: Value,
     edge_cut: EdgeCut,
+}
+
+/// The previous run's two trees of one theme with the claims of its "not yet
+/// placed" leaves (`recorded`, the run's [`UNPLACED_KEY`]) taken out of both,
+/// so a member embedded since is placed by meaning like any new member rather
+/// than kept where it waited; a tree left with no claim is none. A run with
+/// no record had no such leaf.
+fn previous_trees(
+    prev_rows: &[&RunLevel],
+    recorded: Option<&BTreeSet<Uuid>>,
+) -> anyhow::Result<(Option<PrevTree>, Option<PrevTree>)> {
+    let m = prev_tree(prev_rows, AtlasHierarchy::Meaning)?;
+    let l = prev_tree(prev_rows, AtlasHierarchy::Links)?;
+    let Some(rec) = recorded else {
+        return Ok((m, l));
+    };
+    let waited: BTreeSet<Uuid> = [m.as_ref(), l.as_ref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|t| t.claims_of_leaves(rec))
+        .collect();
+    if waited.is_empty() {
+        return Ok((m, l));
+    }
+    Ok((
+        m.and_then(|t| t.without_claims(&waited)),
+        l.and_then(|t| t.without_claims(&waited)),
+    ))
 }
 
 enum ThemeOutcome {
@@ -257,9 +289,14 @@ async fn real_leaves(
 
 /// One theme's night, on the build's snapshot (the caller runs it inside a
 /// savepoint). `prev_rows` are the theme's levels in the previous run and
-/// `prev_mirrors` that run's mirror record. `computed` is the theme's meaning
-/// tree from the off-box hook, used only when the theme has no previous tree
-/// and does not fit one leaf.
+/// `prev_mirrors` and `prev_unplaced` that run's mirror and "not yet placed"
+/// records. `computed` is the theme's meaning tree from the off-box hook, used
+/// only when the theme has no previous tree and does not fit one leaf.
+///
+/// The members with no embedding are placed after both trees of the
+/// clustered members are built and checked ([`place_unplaced`]): in "not yet
+/// placed" leaves, the same claims in both hierarchies; a theme with no
+/// embedded member is only that.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn build_theme(
     tx: &mut PgConnection,
@@ -268,10 +305,12 @@ async fn build_theme(
     theme: Uuid,
     prev_rows: &[&RunLevel],
     prev_mirrors: Option<&BTreeSet<Uuid>>,
+    prev_unplaced: Option<&BTreeSet<Uuid>>,
     computed: Option<&ResultTheme>,
     cap: usize,
 ) -> anyhow::Result<ThemeOutcome> {
     let members = AtlasMeaningRepository::theme_members(tx, viewer, map, theme).await?;
+    let unplaced = members.unembedded;
     let mut emb: BTreeMap<Uuid, Vec<f32>> = BTreeMap::new();
     for (id, text) in &members.embedded {
         let v = epigraph_embeddings::Normalizer::parse_pgvector(text)
@@ -280,11 +319,16 @@ async fn build_theme(
     }
     let ids: Vec<Uuid> = emb.keys().copied().collect();
     let member_set: BTreeSet<Uuid> = ids.iter().copied().collect();
-    let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &ids).await?;
+    let mut all: Vec<Uuid> = ids.iter().chain(&unplaced).copied().collect();
+    all.sort_unstable();
+    let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &all).await?;
+    let (prev_m, prev_l) = previous_trees(prev_rows, prev_unplaced)?;
+    if ids.is_empty() {
+        let before = prev_m.as_ref().map(PrevTree::claims).unwrap_or_default();
+        return unplaced_only(tx, viewer, map, theme, &unplaced, &rows, before.len(), cap).await;
+    }
     let fits = |part: &[Uuid]| matches!(assemble_leaf(&rows, part, cap), Ok(LeafOutcome::Fits(_)));
     let fits_one = fits(&ids);
-    let prev_m = prev_tree(prev_rows, AtlasHierarchy::Meaning)?;
-    let prev_l = prev_tree(prev_rows, AtlasHierarchy::Links)?;
 
     let (meaning_shape, added, removed) = if fits_one {
         let before = prev_m
@@ -347,7 +391,7 @@ async fn build_theme(
     };
     let wire = to_wire(map, AtlasHierarchy::Links, theme, &links_shape);
     let l_tree = check_tree(map, AtlasHierarchy::Links, theme, &wire, &member_set)?;
-    let (l_tree, l_stats) = resolve_tree(&l_tree, &rows, cap)?;
+    let (l_tree, mut l_stats) = resolve_tree(&l_tree, &rows, cap)?;
     let mirror_count = check_mirrors(&l_tree, &linked, &meaning_leaf_of(&m_tree))?;
     let mirrors: Vec<Uuid> = l_tree
         .leaves()
@@ -359,36 +403,143 @@ async fn build_theme(
         .map(|(n, _)| n.id)
         .collect();
 
-    // Switches both ways by W5's Jaccard rule: a deep meaning level leads to
-    // its best links group, not the links root (W5 finding #4).
-    let m_switch = switch_targets(&m_tree, &l_tree)?;
-    let l_switch = switch_targets(&l_tree, &m_tree)?;
-    let labels = AtlasMeaningRepository::claim_labels(tx, viewer, map, &ids).await?;
-    let mut docs = tree_documents(&m_tree, &labels, &m_switch)?;
-    docs.extend(tree_documents(&l_tree, &labels, &l_switch)?);
-    let (edge_cut, renamed) = real_leaves(tx, viewer, map, &rows, &mut docs, cap).await?;
+    // The members with no embedding, after W5b's checks (which hold for the
+    // clustered members): the same "not yet placed" leaves in both trees.
+    // A refusal keeps both trees as clustered and the theme builds, its
+    // members with no embedding in no leaf tonight (else the theme would be
+    // carried, unchanged, every night).
+    let mut m_stats = m_stats;
+    let placed = place_unplaced_or_keep(
+        map,
+        theme,
+        m_tree,
+        Some(l_tree),
+        &unplaced,
+        &rows,
+        cap,
+        &mut m_stats,
+        &mut l_stats,
+    );
+    let m_tree = placed.meaning;
+    let l_tree = placed
+        .links
+        .context("place_unplaced_or_keep returned no links tree")?;
 
-    let inner = |t: &MeaningTree| {
-        t.nodes
-            .iter()
-            .filter(|n| matches!(n.body, NodeBody::Group(_)))
-            .count()
-    };
+    let (docs, edge_cut, renamed) =
+        theme_documents(tx, viewer, map, &rows, &m_tree, &l_tree, &all, cap).await?;
+    let mut stats = json!({
+        "members": ids.len(),
+        "unembedded": unplaced.len(),
+        "added": added,
+        "removed": removed,
+        "meaning": {"leaves": m_stats.leaves, "inner": inner(&m_tree),
+                    "resplit_leaves": m_stats.resplit_leaves},
+        "links": {"leaves": l_stats.leaves, "inner": inner(&l_tree),
+                  "resplit_leaves": l_stats.resplit_leaves, "linked": linked.len(),
+                  "mirrors": mirror_count, "joined": l_delta.joined,
+                  "new_link_leaves": l_delta.new_link_leaves,
+                  "new_mirrors": l_delta.new_mirrors},
+        "leaf_edge_cap": edge_cut.json(),
+        "leaf_relationship_names": renamed.json(),
+    });
+    if let Some(why) = placed.refused {
+        // The report (the journal) only: a built theme's stats are not in
+        // the run's params.
+        stats["unplaced_refused"] = json!(why);
+    }
     Ok(ThemeOutcome::Built(BuiltTheme {
         docs,
         mirrors,
+        unplaced: placed.leaves,
+        stats,
+        edge_cut,
+    }))
+}
+
+/// The inner groups of a tree.
+fn inner(t: &MeaningTree) -> usize {
+    t.nodes
+        .iter()
+        .filter(|n| matches!(n.body, NodeBody::Group(_)))
+        .count()
+}
+
+/// The real level documents of one theme's two trees: the switches both ways
+/// by W5's Jaccard rule (a deep meaning level leads to its best links group,
+/// not the links root; W5 finding #4), the claim labels of `claims`, and
+/// every leaf made real ([`real_leaves`]).
+#[allow(clippy::too_many_arguments)]
+async fn theme_documents(
+    tx: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    rows: &epigraph_db::repos::atlas_leaf::LeafRows,
+    m_tree: &MeaningTree,
+    l_tree: &MeaningTree,
+    claims: &[Uuid],
+    cap: usize,
+) -> anyhow::Result<(Vec<LevelDocument>, EdgeCut, RenamedNames)> {
+    let m_switch = switch_targets(m_tree, l_tree)?;
+    let l_switch = switch_targets(l_tree, m_tree)?;
+    let labels = AtlasMeaningRepository::claim_labels(tx, viewer, map, claims).await?;
+    let mut docs = tree_documents(m_tree, &labels, &m_switch)?;
+    docs.extend(tree_documents(l_tree, &labels, &l_switch)?);
+    let (edge_cut, renamed) = real_leaves(tx, viewer, map, rows, &mut docs, cap).await?;
+    Ok((docs, edge_cut, renamed))
+}
+
+/// The night of a theme with no embedded member: one "not yet placed" tree in
+/// each hierarchy ([`place_unplaced`]; a single root leaf when the members
+/// fit one). `removed` counts the previous tree's claims, which are all gone
+/// from the clustered tree.
+#[allow(clippy::too_many_arguments)]
+async fn unplaced_only(
+    tx: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    theme: Uuid,
+    unplaced: &[Uuid],
+    rows: &epigraph_db::repos::atlas_leaf::LeafRows,
+    removed: usize,
+    cap: usize,
+) -> anyhow::Result<ThemeOutcome> {
+    let (mut m_stats, mut l_stats) = (ResolveStats::default(), ResolveStats::default());
+    let (m_tree, mut waiting) = place_unplaced(
+        map,
+        AtlasHierarchy::Meaning,
+        theme,
+        None,
+        unplaced,
+        rows,
+        cap,
+        &mut m_stats,
+    )?;
+    let (l_tree, l_waiting) = place_unplaced(
+        map,
+        AtlasHierarchy::Links,
+        theme,
+        None,
+        unplaced,
+        rows,
+        cap,
+        &mut l_stats,
+    )?;
+    waiting.extend(l_waiting);
+    let (docs, edge_cut, renamed) =
+        theme_documents(tx, viewer, map, rows, &m_tree, &l_tree, unplaced, cap).await?;
+    Ok(ThemeOutcome::Built(BuiltTheme {
+        docs,
+        mirrors: Vec::new(),
+        unplaced: waiting,
         stats: json!({
-            "members": ids.len(),
-            "unembedded": members.unembedded,
-            "added": added,
+            "members": 0,
+            "unembedded": unplaced.len(),
+            "added": 0,
             "removed": removed,
-            "meaning": {"leaves": m_stats.leaves, "inner": inner(&m_tree),
-                        "resplit_leaves": m_stats.resplit_leaves},
-            "links": {"leaves": l_stats.leaves, "inner": inner(&l_tree),
-                      "resplit_leaves": l_stats.resplit_leaves, "linked": linked.len(),
-                      "mirrors": mirror_count, "joined": l_delta.joined,
-                      "new_link_leaves": l_delta.new_link_leaves,
-                      "new_mirrors": l_delta.new_mirrors},
+            "meaning": {"leaves": m_stats.leaves, "inner": inner(&m_tree), "resplit_leaves": 0},
+            "links": {"leaves": l_stats.leaves, "inner": inner(&l_tree), "resplit_leaves": 0,
+                      "linked": 0, "mirrors": 0, "joined": 0, "new_link_leaves": 0,
+                      "new_mirrors": 0},
             "leaf_edge_cap": edge_cut.json(),
             "leaf_relationship_names": renamed.json(),
         }),
@@ -498,6 +649,7 @@ struct MapBuild {
     epochs: MapEpochs,
     docs: Vec<LevelDocument>,
     mirrors: Vec<Uuid>,
+    unplaced: Vec<Uuid>,
     themes: Value,
     unembedded: i64,
     links: LinksReport,
@@ -544,11 +696,20 @@ async fn read_and_build(
         .map(|v| serde_json::from_value(v.clone()))
         .transpose()
         .context("params.mirrors is not a list of ids")?;
+    let prev_unplaced: Option<BTreeSet<Uuid>> = prev
+        .params
+        .get(UNPLACED_KEY)
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .with_context(|| format!("params.{UNPLACED_KEY} is not a list of ids"))?;
     let prev_by_theme = by_theme(&levels);
-    let themes = AtlasMeaningRepository::embedded_theme_ids_on_map(&mut tx, viewer, map).await?;
+    // Every theme with a current member, also one with no embedded member
+    // (drawn as one "not yet placed" tree).
+    let themes = AtlasMeaningRepository::theme_ids_on_map(&mut tx, viewer, map).await?;
 
     let mut docs = Vec::new();
     let mut mirrors = Vec::new();
+    let mut unplaced = Vec::new();
     let mut edge_cut = EdgeCut::default();
     let (mut built, mut carried, mut dropped, mut unbuilt) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -563,6 +724,7 @@ async fn read_and_build(
             theme,
             rows,
             prev_mirrors.as_ref(),
+            prev_unplaced.as_ref(),
             computed.get(&theme),
             cap,
         )
@@ -572,6 +734,7 @@ async fn read_and_build(
                 sp.commit().await.context("release a theme savepoint")?;
                 docs.extend(b.docs);
                 mirrors.extend(b.mirrors);
+                unplaced.extend(b.unplaced);
                 edge_cut.add(b.edge_cut);
                 built.push(json!({"theme_id": theme, "stats": b.stats}));
             }
@@ -599,6 +762,12 @@ async fn read_and_build(
                             mirrors.extend(
                                 pm.iter().filter(|m| ids.contains(&(Hierarchy::Links, **m))),
                             );
+                        }
+                        if let Some(pu) = &prev_unplaced {
+                            unplaced.extend(pu.iter().filter(|u| {
+                                ids.contains(&(Hierarchy::Meaning, **u))
+                                    || ids.contains(&(Hierarchy::Links, **u))
+                            }));
                         }
                         docs.extend(kept);
                         carried.push(json!({"theme_id": theme, "error": error}));
@@ -631,8 +800,9 @@ async fn read_and_build(
         .collect();
     let raw = AtlasLeafRepository::map_claim_links(&mut tx, viewer, map, &drawn).await?;
     let links = fill_cross_links(&mut docs, &raw)?;
-    // Every theme's, also one with no embedded member (no tree, so not in
-    // `themes` above) and one carried, dropped or unbuilt.
+    // Every theme's, also one carried, dropped or unbuilt: the claims in "not
+    // yet placed" leaves rather than clustered (or in no leaf, for a theme
+    // that did not build).
     let unembedded =
         AtlasMeaningRepository::unembedded_members_on_map(&mut tx, viewer, map).await?;
     let plan = plan_samples(&docs)?;
@@ -646,6 +816,7 @@ async fn read_and_build(
         epochs,
         docs,
         mirrors,
+        unplaced,
         themes: json!({"built": built, "carried": carried, "dropped": dropped, "unbuilt": unbuilt}),
         unembedded,
         links,
@@ -732,6 +903,7 @@ pub async fn night_for_map(
         epochs,
         mut docs,
         mirrors,
+        unplaced,
         themes,
         unembedded,
         links,
@@ -826,6 +998,7 @@ pub async fn night_for_map(
         "links": links,
         "leaf_edge_cap": edge_cut.json(),
         MIRRORS_KEY: mirrors,
+        UNPLACED_KEY: unplaced,
     });
     // Errors stay in the report (the journal), not in a row the map's
     // readers can read: keep only the theme ids in the run's params.

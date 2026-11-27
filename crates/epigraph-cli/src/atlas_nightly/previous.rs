@@ -34,6 +34,46 @@ impl PrevTree {
         matches!(self.nodes.get(&self.root), Some(PrevBody::Leaf(_)))
     }
 
+    /// The claims of the leaves among `leaves` (ids of any level; the ones
+    /// this tree does not hold as leaves are ignored).
+    #[must_use]
+    pub fn claims_of_leaves(&self, leaves: &BTreeSet<Uuid>) -> BTreeSet<Uuid> {
+        leaves
+            .iter()
+            .filter_map(|id| match self.nodes.get(id) {
+                Some(PrevBody::Leaf(c)) => Some(c.iter().copied()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// This tree with `drop` taken out of every leaf (a leaf may be left
+    /// empty; the incremental update drops it), or `None` when no claim is
+    /// left: a theme whose previous tree held only those claims has no
+    /// previous tree to update.
+    #[must_use]
+    pub fn without_claims(&self, drop: &BTreeSet<Uuid>) -> Option<Self> {
+        let nodes: BTreeMap<Uuid, PrevBody> = self
+            .nodes
+            .iter()
+            .map(|(id, b)| {
+                let b = match b {
+                    PrevBody::Leaf(c) => {
+                        PrevBody::Leaf(c.iter().filter(|x| !drop.contains(x)).copied().collect())
+                    }
+                    PrevBody::Group(k) => PrevBody::Group(k.clone()),
+                };
+                (*id, b)
+            })
+            .collect();
+        let out = Self {
+            root: self.root,
+            nodes,
+        };
+        (!out.claims().is_empty()).then_some(out)
+    }
+
     /// Every claim of every leaf.
     #[must_use]
     pub fn claims(&self) -> BTreeSet<Uuid> {
@@ -223,6 +263,25 @@ mod tests {
         let l = prev_tree(&refs, AtlasHierarchy::Links).unwrap().unwrap();
         assert!(l.root_is_leaf());
         assert_eq!(l.claims().len(), 3);
+    }
+
+    #[test]
+    fn recorded_leaves_are_emptied_and_a_tree_left_with_no_claim_is_none() {
+        let rows = [
+            row("meaning", 1, None, group(&[3, 2])),
+            row("meaning", 2, Some(1), leaf(&[12, 11])),
+            row("meaning", 3, Some(1), leaf(&[13])),
+        ];
+        let refs: Vec<&RunLevel> = rows.iter().collect();
+        let t = prev_tree(&refs, AtlasHierarchy::Meaning).unwrap().unwrap();
+        let rec: BTreeSet<Uuid> = [id(3), id(1), id(42)].into_iter().collect();
+        let gone = t.claims_of_leaves(&rec);
+        assert_eq!(gone, [id(13)].into_iter().collect());
+        let kept = t.without_claims(&gone).unwrap();
+        assert_eq!(kept.nodes[&id(3)], PrevBody::Leaf(Vec::new()));
+        assert_eq!(kept.nodes[&id(2)], t.nodes[&id(2)]);
+        assert_eq!(kept.claims(), [id(11), id(12)].into_iter().collect());
+        assert!(t.without_claims(&t.claims()).is_none());
     }
 
     #[test]

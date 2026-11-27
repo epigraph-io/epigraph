@@ -24,7 +24,10 @@
 //! * `apply` re-reads everything in one snapshot, refuses a result whose
 //!   leaves are not exactly each theme's members now or whose ids are not the
 //!   minted ones, re-counts every leaf with W3 and splits one over the cap,
-//!   and (with `--apply`) writes one finished run of the map. DRY RUN BY
+//!   adds each theme's current members with no embedding in "not yet placed"
+//!   leaves (a theme with no embedded member is one such root leaf; see
+//!   `docs/runbooks/atlas-nightly.md`), and (with `--apply`) writes one
+//!   finished run of the map. DRY RUN BY
 //!   DEFAULT: without `--apply` it builds every document and writes nothing.
 //!
 //! The run holds the meaning hierarchy only; as the map's latest finished run
