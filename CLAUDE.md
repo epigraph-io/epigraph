@@ -123,7 +123,9 @@ A daily reconciler (`scripts/reconcile_backlog_labels.py`) catches free-text
 "Resolves <UUID>" claims filed without `resolve_backlog_item` and back-fills
 the label patch. Ambiguous matches go to `docs/superpowers/reports/reconciler-needs-review.log`.
 
-Full spec: `docs/conventions/backlog-retirement.md`.
+Full spec: `docs/conventions/backlog-retirement.md`. How every other table
+retires a row, and the filter each reader applies:
+`docs/conventions/no-longer-in-force.md`.
 
 ## Schema, migrations, claim mechanics
 

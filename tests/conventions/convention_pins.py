@@ -180,6 +180,23 @@ PINS: tuple[Pin, ...] = (
         ),
         incident="d543f045",
     ),
+    # --- Per-table retirement vocabulary, linked from both backlog docs -----
+    Pin(
+        id="backlog-retirement-links-no-longer-in-force",
+        file="docs/conventions/backlog-retirement.md",
+        section_start="## Retiring a backlog item",
+        section_end="## Who may retire an item",
+        needle="`docs/conventions/no-longer-in-force.md`",
+        incident="64eeca4e",
+    ),
+    Pin(
+        id="claude-md-links-no-longer-in-force",
+        file="CLAUDE.md",
+        section_start="## Retiring backlog items",
+        section_end="## Schema, migrations, claim mechanics",
+        needle="`docs/conventions/no-longer-in-force.md`",
+        incident="64eeca4e",
+    ),
     # --- CLAUDE.md, "Test database" ----------------------------------------
     Pin(
         id="test-db-fresh-and-migrated-from-empty",

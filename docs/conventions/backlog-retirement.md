@@ -55,6 +55,11 @@ Do NOT:
 If you find yourself reaching for raw SQL or `update_labels` after a resolution,
 that's a sign you should be using `resolve_backlog_item` instead.
 
+The `resolved` label is the backlog's own retirement mechanism. How every
+other table retires a row (`is_current`, `retracted_at`, `valid_to`, `retired`,
+the workflow sentinel), and the filter each reader must apply, is in
+`docs/conventions/no-longer-in-force.md`.
+
 ## Who may retire an item
 
 `resolved` is the one label with retirement semantics, so it is gated on every
