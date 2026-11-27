@@ -3370,8 +3370,14 @@ pub async fn undecomposed_claims_page(
             let id = c.id.as_uuid();
             let looks_atomic = epigraph_core::atomicity::looks_atomic(&c.content);
             // Advisory conjunct count (backlog `72850d43`): reported next to
-            // `looks_atomic`, never used to filter or to override it.
-            let conjuncts = epigraph_core::atomicity::conjunct_estimate(&c.content);
+            // `looks_atomic`, never used to filter or to override it. The
+            // count is `conjunct_screen`'s, the one canonical count every
+            // surface reports (backlog `74580d03`), so this row and
+            // `screen_claim_atomicity` cannot disagree on the same text.
+            // `conjunct_estimate`'s own rules ride along as diagnostic
+            // signals only.
+            let count = epigraph_core::atomicity::conjunct_screen(&c.content).conjunct_count;
+            let signals = epigraph_core::atomicity::conjunct_estimate(&c.content).signals;
             let claim = ClaimResponse {
                 id: id.to_string(),
                 content: c.content.clone(),
@@ -3391,8 +3397,8 @@ pub async fn undecomposed_claims_page(
             crate::types::UndecomposedClaimResponse {
                 claim,
                 looks_atomic,
-                conjunct_estimate: conjuncts.count,
-                conjunct_signals: conjuncts.signals,
+                conjunct_estimate: count,
+                conjunct_signals: signals,
             }
         })
         .collect();

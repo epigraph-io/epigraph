@@ -1685,13 +1685,24 @@ pub struct UndecomposedClaimResponse {
     /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
     /// backlog and not a defect.
     pub looks_atomic: bool,
-    /// `epigraph_core::atomicity::conjunct_estimate(content).count`: the
-    /// estimated number of independent assertions (backlog `72850d43`).
-    /// Advisory. It does not change `looks_atomic` or what `decompose_claims`
-    /// selects, and the two can disagree on a short coordinated sentence.
+    /// The claim's conjunct count: `epigraph_core::atomicity::conjunct_screen
+    /// (content).conjunct_count`, the one canonical count of independent
+    /// assertions, the same number `screen_claim_atomicity` and
+    /// `query_compound_claims` report as `conjunct_count` (backlog
+    /// `74580d03`). The field keeps its old name for compatibility; it used
+    /// to carry `conjunct_estimate(content).count`, a second counter with its
+    /// own rules (backlog `72850d43`). Advisory. It does not change
+    /// `looks_atomic` or what `decompose_claims` selects, and the two can
+    /// disagree (`"X rose, but Y fell."` looks atomic and counts 2).
     pub conjunct_estimate: usize,
-    /// The rules behind an estimate above 1 (`sentences`, `semicolon`,
-    /// `coordination`, `enumeration`, `respectively`); empty otherwise.
+    /// DIAGNOSTIC ONLY: the rules of the retired second counter
+    /// (`epigraph_core::atomicity::conjunct_estimate`) that fire on the text
+    /// (`sentences`, `semicolon`, `coordination`, `enumeration`,
+    /// `respectively`), empty when that counter reads at most 1. They do not
+    /// explain [`Self::conjunct_estimate`], which is `conjunct_screen`'s
+    /// count, and they may fire on a text that count reads as 1 (a
+    /// finite-verb coordination without a comma, `"The test passed and the
+    /// build failed."`).
     pub conjunct_signals: Vec<&'static str>,
 }
 

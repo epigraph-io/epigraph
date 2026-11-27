@@ -15,11 +15,18 @@
 //! `atomicity_sweep` label and `decompose_claims --redecompose`). A claim can
 //! look atomic and still screen compound ("X rose, but Y fell.").
 //!
-//! [`conjunct_estimate`] (backlog `72850d43`) is a second, independent count
+//! **[`conjunct_screen`] is the one canonical conjunct count** (backlog
+//! `74580d03`): every surface that reports a count of a claim's independent
+//! assertions reports `ConjunctScreen::conjunct_count`, including
+//! `query_undecomposed_claims`' `conjunct_estimate` field (kept under that
+//! name for compatibility).
+//!
+//! [`conjunct_estimate`] (backlog `72850d43`) is an older, independent counter
 //! with its own rules (finite-verb coordination, enumerations,
-//! `respectively`); it feeds only `query_undecomposed_claims`'
-//! `conjunct_estimate` / `conjunct_signals` fields. The two counters can
-//! disagree on the same text; neither changes what [`looks_atomic`] decides.
+//! `respectively`). It no longer sets any reported count: its matched rules
+//! are served only as DIAGNOSTIC signals (`query_undecomposed_claims`'
+//! `conjunct_signals`), which may fire on a text the screen counts as one
+//! assertion. Neither changes what [`looks_atomic`] decides.
 
 /// Longest claim, in Unicode scalar values, that [`looks_atomic`] may call
 /// atomic. Chosen by the operator brief (2026-09-24): "one sentence and ≤ 160
@@ -625,6 +632,11 @@ impl ConjunctEstimate {
 /// sentence such as `"The test passed and the build failed."` is
 /// `looks_atomic` (terminal by the 2026-10-14 ruling) and has an estimate
 /// of 2.
+///
+/// DIAGNOSTIC since backlog `74580d03`: no surface reports this count. The
+/// canonical count is [`conjunct_screen`]'s, and only this function's
+/// [`ConjunctEstimate::signals`] are served (as `query_undecomposed_claims`'
+/// `conjunct_signals`).
 ///
 /// Deterministic, no model, no lexicon beyond the closed word lists in this
 /// file. Per sentence (the boundaries are [`sentence_count`]'s) the estimate
