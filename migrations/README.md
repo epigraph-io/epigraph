@@ -5212,6 +5212,39 @@ restart.
   key; one near the btree tuple limit would fail the build, or later an INSERT with 54000). Undo:
   `docs/runbooks/351-undo.sql` (roll the binary back first). **Deploy order:** migrate BEFORE the
   binary of this change (its lookup names the function); an older binary runs on 351 unchanged.
+- **354**: `drop_harvester_tables` (backlog a6e3dba2, c7752f07). Drops `harvester_sources`,
+  `harvester_fragments`, `harvester_audit_reports`, `harvester_claim_provenance` and
+  `harvester_enriched_concepts` (001; kept under tenancy by 062-079, 089, 115, 173, 215, 218, 242,
+  284 and 347). Their writer (the Python harvester; its crate and proto are gone) has no code in
+  this repository, and the operator decided on 2026-11-27 to drop them after a read-only check of
+  the deployed database found all five with no live row and no insert, update or delete since the
+  statistics reset. Guards, each refusing with nothing changed: (a) 284's
+  `epigraph_propagate_tenancy`, `epigraph_publicize_claims` and `epigraph_share_claims_with_team`
+  and 127's `epigraph_record_elevated_access` still hold the bodies 354 re-states (md5 of
+  `prosrc`, 55000); (b) the session reads every row (superuser, BYPASSRLS or the maintenance role;
+  42501), since the tables are FORCEd; (c) all five tables are empty (55000; it archives nothing).
+  Re-states those four bodies without their harvester arms (propagation: the provenance entry of
+  `derived[]` and arm (d)'s fragment statement; publicize and share: 242's fragment hold and 215's
+  source rule, and the audit keys `harvester_fragments_held`, `harvester_sources_moved`,
+  `harvester_sources_held`; their audit rows now record `migration: 354`; the recorder: its
+  `harvester_fragments` arm), then `DROP TABLE` (RESTRICT, foreign-key order) the five and
+  `DROP FUNCTION` the three trigger functions only they ran
+  (`epigraph_inherit_fragment_tenancy_stmt`, `epigraph_audit_report_inherit_tenancy`,
+  `epigraph_fragment_audit_reports_follow`). No surviving function body names a harvester table.
+  The binary, operator CLI, tenancy backfill, ratchets and censuses drop the tables in the same
+  change (`state.rs`'s FORCE list and the 070/074/089/173 trigger tiers, the seal, the operator's
+  cascade model, `epigraph-tenancy-backfill`'s fragment entity and ownership register). Pinned by
+  `epigraph-db/tests/harvester_tables_dropped.rs` (no harvester relation, function or body at
+  head, with a calibration below 354; the three guards; the undo). Undo:
+  `docs/runbooks/354-undo.sql` re-creates the five tables EMPTY in their 347 shape (columns,
+  constraints, indexes, triggers, FORCEd row security, policies, grants, comments) and the
+  replaced bodies and dropped functions byte for byte; it refuses (55000) over a body a later
+  migration re-stated. **Measure first** (guard (c)): `SELECT count(*)` of each table as a
+  superuser. **Deploy order:** the binary of this change with the migration (`epigraph-migrate`
+  as ExecStartPre): it boots on either side of 354, while an OLDER binary refuses to boot on a
+  migrated database (it requires `harvester_claim_provenance_inherit_tenancy`, 070's tier) and
+  its seal would fail (42P01). The operator CLI of this change refuses a database below 354.
+  Apply as a superuser. **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
