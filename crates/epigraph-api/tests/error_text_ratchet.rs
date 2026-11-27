@@ -34,9 +34,10 @@
 //! an error value by the receiver names `e`, `err`, `error`, `source` and
 //! `db_err`. A per-item `error` built in a helper the constructing function
 //! calls is out of reach, unless that helper also builds the type, as
-//! `belief.rs::pair_conflict` does. The JSON `"error"` rule covers 5xx bodies
-//! only: its one allowed file, `routes/submit.rs`, is allowed whole, so a 4xx
-//! body there is not checked.
+//! `belief.rs::pair_conflict` does. The JSON `"error"` rule has no allowed
+//! file: `routes/submit.rs`, the one that had its own 5xx choke point, answers
+//! through `ApiError` now (backlog 23db186a), so a JSON `"error"` field
+//! rendering an error's text is refused everywhere under `src/`.
 //!
 //! Comments are stripped by this file's own [`strip_comments`], not the shared
 //! `lint_text` one, which drops the byte that follows a backslash inside a
@@ -93,11 +94,12 @@ const UNFILTERED_REPORT_FNS: &[&str] = &[
 
 /// A JSON `"error": e.to_string()` is allowed only where the body is a 5xx that
 /// a choke point redacts: `(path under src/, sentinel in that file)`.
-const JSON_ERROR_FIELD_REDACTED_AT: &[(&str, &str)] = &[(
-    "routes/submit.rs",
-    // `error_response` sends a 4xx as built and redacts every 5xx.
-    "if !status.is_server_error() {\n        return (status, Json(error)).into_response();",
-)];
+///
+/// Empty: `routes/submit.rs`'s private `error_response` choke point was its
+/// one entry, and that route's 5xx now go through `ApiError`'s redaction
+/// (backlog 23db186a). A new entry needs a choke point of its own; prefer
+/// `ApiError::InternalError`, which logs the text and never sends it.
+const JSON_ERROR_FIELD_REDACTED_AT: &[(&str, &str)] = &[];
 
 const ERROR_RECEIVERS: &[&str] = &["e", "err", "error", "source", "db_err"];
 
