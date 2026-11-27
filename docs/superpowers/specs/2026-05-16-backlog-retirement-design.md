@@ -1,7 +1,8 @@
 # Backlog Retirement Convention & Tooling
 
 **Date:** 2026-05-16
-**Status:** Design — awaiting review
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). `resolve_backlog_item`, `scripts/cleanup_backlog_labels.py`, `scripts/reconcile_backlog_labels.py`, `docs/conventions/backlog-retirement.md`.
+**Original status:** Design — awaiting review
 **Author:** Jeremy Barton (with Claude)
 
 ## Problem

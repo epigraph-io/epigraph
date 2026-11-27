@@ -6,7 +6,8 @@
 
 **Date:** 2026-04-26
 **Branch:** `feat/s3a-mcp-writer-migration` (created off `chore/migration-renumber-2026-04-25` so S1 helpers are the base); separate PR from #6
-**Status:** Approved for spec → plan → implementation
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). Landed as #17 (`crates/epigraph-mcp/src/claim_helper.rs`).
+**Original status:** Approved for spec → plan → implementation
 **Sub-project of:** Noun-Claims and Verb-Edges architecture (S3a — first writer migration after S1 foundation)
 
 ---

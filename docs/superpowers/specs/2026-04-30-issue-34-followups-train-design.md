@@ -7,6 +7,7 @@
 
 **Date:** 2026-04-30
 **Author:** brainstorming with the user, captured here
+**Status:** implemented-with-deviations (checked against origin/main ad30094c5, 2026-11-27). The five fixes landed as separate PRs (#82, #85 and direct commits), not one train; build-from-corpus was later retired with the k-means prototype.
 
 ## Problem
 

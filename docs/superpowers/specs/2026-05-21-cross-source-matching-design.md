@@ -1,7 +1,8 @@
 ---
 title: Cross-Source Matching
 date: 2026-05-21
-status: draft
+status: implemented (checked against origin/main ad30094c5, 2026-11-27). Phase 1 (migration 036, the three matching tools, the cross_source_matches route, the sweep and calibration binaries); Phase 2 is deferred by this spec.
+original_status: draft
 authors: [Jeremy Barton]
 ---
 

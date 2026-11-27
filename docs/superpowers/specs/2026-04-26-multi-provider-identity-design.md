@@ -6,7 +6,8 @@
 
 **Date:** 2026-04-26
 **Branch:** to be created at plan time (likely `feat/multi-provider-identity`, forked off `main`)
-**Status:** Draft for user review (post-brainstorm)
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). Landed as #24 (`crates/epigraph-api/src/oauth/providers/`).
+**Original status:** Draft for user review (post-brainstorm)
 
 ---
 
