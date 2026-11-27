@@ -192,6 +192,19 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: the agent row; its claims are read through the viewer.
     ("agents.rs", "agent_claims", &["AgentRepository::get_by_id"]),
+    // untenanted: the agent row; the two profile reads
+    // (`AgentProfileRepository`) are viewer-spliced. stamped: the agent's name
+    // through migration 309's disclosure on the handler's `read_as(viewer)`
+    // connection; `redact_agent` is pure.
+    (
+        "agents.rs",
+        "epistemic_profile",
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+            "epigraph_db::redact_agent",
+        ],
+    ),
     // stamped: `AgentDisclosureRepository::disclosure` runs on the handler's
     // `read_as(viewer)` connection and migration 309's
     // `epigraph_agent_disclosure` decides on that stamp (a definer that
@@ -1139,44 +1152,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "workflows::get_or_create_system_agent",
         ],
     ),
-    // untenanted: the agent row; the profile reads are viewer-spliced.
-    (
-        "political.rs",
-        "compare_agents",
-        // stamped: the agent's name through migration 309's disclosure on the
-        // handler's `read_as(viewer)` connection; `redact_agent` is pure.
-        &[
-            "AgentDisclosureRepository::disclosure",
-            "AgentRepository::get_by_id",
-            "epigraph_db::redact_agent",
-        ],
-    ),
-    (
-        "political.rs",
-        "epistemic_profile",
-        // stamped: the agent's name through migration 309's disclosure on the
-        // handler's `read_as(viewer)` connection; `redact_agent` is pure.
-        &[
-            "AgentDisclosureRepository::disclosure",
-            "AgentRepository::get_by_id",
-            "epigraph_db::redact_agent",
-        ],
-    ),
-    (
-        "political.rs",
-        "inflation_index",
-        &["AgentRepository::get_by_id"],
-    ),
-    (
-        "political.rs",
-        "originated_claims",
-        &["AgentRepository::get_by_id"],
-    ),
-    (
-        "political.rs",
-        "position_timeline",
-        &["AgentRepository::get_by_id"],
-    ),
     // lifecycle (every privatization.rs entry).
     (
         "privatization.rs",
@@ -1218,13 +1193,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "Connection::begin",
             "PrivatizationRepository::create_previewed_plan",
             "PrivatizationRepository::select",
-            "PrivatizationRepository::shared_fragment_count_conn",
             "authors_losing_own_claims",
             "boundary_edge_counts",
             "freeze_into",
             "instance_authz::require_instance_admin_for_group",
             "lifecycle_served",
-            "maintenance",
             "omitted_edge_types",
             "record_custodial_act",
             "resolve_seeds",

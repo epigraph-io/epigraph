@@ -1279,7 +1279,6 @@ mod concurrency_tests {
 mod wrong_scope_with_malformed_body_tests {
     use crate::middleware::bearer::{AuthContext, ClientType};
     use crate::routes::crud::reassign_claim;
-    use crate::routes::policies::record_outcome;
     use crate::routes::webhooks::register_webhook;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
@@ -1343,9 +1342,10 @@ mod wrong_scope_with_malformed_body_tests {
     // until PR-14 deleted both routes. The extractor-ordering property they
     // pinned — a wrong-scope token plus a malformed body must be rejected by
     // the scope gate (403), not by JSON parsing (422) — is NOT abandoned: it is
-    // still asserted by the `reassign_claim`, `record_outcome` and
-    // `register_webhook` cases in this same module, which is why these two were
-    // deleted with their handlers rather than retargeted at a surviving route.
+    // still asserted by the `register_webhook` case in this same module (a
+    // `record_outcome` case went with that handler, backlog ec968070), which is
+    // why these two were deleted with their handlers rather than retargeted at
+    // a surviving route.
 
     // ------------------------------------------------------------------
     // reassign_claim: claims:admin required → wrong-scope must 403
@@ -1399,35 +1399,6 @@ mod wrong_scope_with_malformed_body_tests {
 
         let resp = router
             .oneshot(post_malformed("/api/v1/webhooks"))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::FORBIDDEN,
-            "wrong-scope token + malformed body must return 403, not 422"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // record_outcome: claims:admin required → wrong-scope must 403
-    //
-    // The plan originally listed `claims:write` for this endpoint, but the
-    // existing handler enforces `claims:admin` (line 104 pre-fix). Plan
-    // was wrong; current scope preserved.
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn record_outcome_wrong_scope_with_malformed_body_returns_403_not_422() {
-        let claim_id = Uuid::new_v4();
-        let router = Router::new()
-            .route("/api/v1/policies/:claim_id/outcome", post(record_outcome))
-            .layer(Extension(read_only_auth()))
-            .with_state(test_state());
-
-        let resp = router
-            .oneshot(post_malformed(&format!(
-                "/api/v1/policies/{claim_id}/outcome"
-            )))
             .await
             .unwrap();
         assert_eq!(

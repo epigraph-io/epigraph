@@ -41,7 +41,10 @@ const ADMIN_ONLY: &[&str] = &[
 /// `scope_map::CLAIMS_ADMIN` (one literal) instead of spelling it (X04).
 /// 69 -> 68: `build_themes_from_corpus`'s `check_scopes(&auth, &["claims:admin"])`
 /// went with the retired k-means route (backlog a0ed0180).
-const HIGH_WATER: usize = 68;
+/// 68 -> 66: `resolve_challenge`'s and `decay_sweep`'s
+/// `check_scopes(&auth, &["claims:admin"])` went with the deleted admin
+/// policy write handlers (backlog ec968070).
+const HIGH_WATER: usize = 66;
 
 /// The gate module: the chokepoint itself spells the scopes.
 const GATE: &str = "epigraph-auth/src/lib.rs";

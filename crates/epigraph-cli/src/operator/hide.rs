@@ -83,8 +83,7 @@
 //! non-member, on a privileged pool and under RLS. NOT hidden, by design or
 //! as known limits, and reported per plan as `HIDE-SURFACE` lines:
 //!
-//! * the claim's own text (`claims.content`) and any harvester fragment text,
-//!   which stay public — hiding evidence does not hide what the claim says;
+//! * the claim's own text (`claims.content`), which stays public — hiding evidence does not hide what the claim says;
 //! * edges touching a hidden row: their ids, relationship and properties stay
 //!   readable where their endpoints were (a hide must not change other rows);
 //! * `mass_functions` rows naming the hidden row (`evidence_id`,
@@ -631,7 +630,7 @@ async fn print_surfaces(
     )?;
     writeln!(
         out,
-        "HIDE-SURFACE\tnot hidden\tthe claims' own text and harvester fragments stay public; \
+        "HIDE-SURFACE\tnot hidden\tthe claims' own text stays public; \
          any BYPASSRLS or superuser connection reads every row; content emitted before the \
          hide (events, caches, exports, search results) is not retracted"
     )?;
@@ -1296,7 +1295,6 @@ mod tests {
             },
             writer: None,
             endpoints_public: None,
-            shared_outside: false,
             neighbours: BTreeSet::new(),
             writer_owned: None,
             evidence_type: Some(t.into()),

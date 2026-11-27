@@ -1306,9 +1306,9 @@ pub(crate) async fn create_claim_core(
     // Guarded on `was_created` for the same reason the properties write above
     // is: on an `if_not_exists` dedup hit this handler returns a row
     // it did not create, and a caller-supplied label array must not rewrite that
-    // row's labels. `policies.rs` uses `'policy:active' = ANY(labels)` as an
-    // UPDATE predicate, so an unguarded write here silently detaches a policy
-    // claim from its own state machine. Mirrors `submit.rs`, which already
+    // row's labels. `policies.rs` keys on `'policy:active' = ANY(labels)`, so
+    // an unguarded write here silently detaches a policy claim from the policy
+    // list. Mirrors `submit.rs`, which already
     // guards the identical statement with `was_created && !labels.is_empty()`.
     if was_created && !request.labels.is_empty() {
         sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")

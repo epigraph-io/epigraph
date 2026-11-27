@@ -51,11 +51,12 @@ pub async fn authorization_server_metadata(State(state): State<AppState>) -> Jso
         // one. If it drifts from `epigraph_core::canonical_scopes`, fix it there
         // and here together; a scope advertised here and unknown to
         // canonical_scopes is decorative, which is exactly how `groups:read`
-        // ended up checked by nothing.
+        // ended up checked by nothing. No retired scope
+        // (`canonical_scopes::RETIRED_SCOPES`) is listed: none is issued.
         "scopes_supported": [
-            "claims:read", "claims:write", "evidence:read", "evidence:write",
+            "claims:read", "claims:write", "evidence:write",
             "edges:read", "edges:write", "agents:read", "analysis:belief",
-            "analysis:propagation", "ingest:write"
+            "analysis:propagation"
         ]
     });
     // Only a kernel that signs EdDSA has a key to publish; an HS256 kernel's

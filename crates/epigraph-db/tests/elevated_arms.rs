@@ -371,8 +371,10 @@ async fn the_elevated_read_arm_admits_every_row_of_every_armed_table(pool: PgPoo
     .fetch_all(&pool)
     .await
     .expect("armed tables");
+    // 25: 126's arms less the two on harvester tables (`harvester_claim_provenance`,
+    // `harvester_fragments`) that migration 354 drops with their tables.
     assert!(
-        armed.len() >= 27,
+        armed.len() >= 25,
         "CALIBRATION: 126's arms ({})",
         armed.len()
     );

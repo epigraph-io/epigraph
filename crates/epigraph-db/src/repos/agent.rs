@@ -1005,9 +1005,11 @@ impl AgentRepository {
     /// # Tenancy: takes an executor, and deliberately takes no `Viewer`
     ///
     /// Widened from `&PgPool` to `E: PgExecutor` by conversion shard 5 so that
-    /// the five `routes/political.rs` handlers which call it alongside a
-    /// viewer-spliced `PoliticalRepository` read can run BOTH statements on one
-    /// viewer-stamped connection. The SQL, its binds and the projected row shape
+    /// the five `routes/political.rs` handlers which called it alongside a
+    /// viewer-spliced `PoliticalRepository` read could run BOTH statements on
+    /// one viewer-stamped connection (the module is deleted, backlog bd13e0e0;
+    /// `routes/agents.rs::epistemic_profile` still does this with
+    /// `AgentProfileRepository`). The SQL, its binds and the projected row shape
     /// are unchanged; nothing else about this function was re-derived.
     ///
     /// **MOTIVATION IS NOT REACH, and the reach is wider than the motivation.**

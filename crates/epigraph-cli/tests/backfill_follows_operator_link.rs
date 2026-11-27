@@ -286,7 +286,7 @@ async fn a_platform_run_repairs_a_world_edge_onto_a_private_endpoint(pool: PgPoo
 ///
 /// Verified to fail, each alone: the `continue 'passes` rewind removed ->
 /// the carried-cursor run exits 1 with residue; `wants` ignoring `--entity` ->
-/// the harvester-fragments run stamps the claims; `Deadline::expired` always
+/// the recall-events run stamps the claims; `Deadline::expired` always
 /// false -> the budgeted run exits 0.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_claims_walk_resumes_rewinds_and_honours_its_budget(pool: PgPool) {
@@ -303,7 +303,7 @@ async fn the_claims_walk_resumes_rewinds_and_honours_its_budget(pool: PgPool) {
             "--legacy-owner",
             "operator",
             "--entity",
-            "harvester-fragments",
+            "recall-events",
         ],
     )
     .await;

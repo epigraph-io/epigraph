@@ -39,7 +39,7 @@
 //!   known limit, printed by `hide-evidence` as a `HIDE-SURFACE edge_factor`
 //!   line and listed in `epigraph_cli::operator::hide`'s B-H3 section. Stage-3
 //!   review audited the other unlisted read sites; all splice the viewer
-//!   predicate (`lineage.rs`, `political.rs::get_agent_evidence_distribution`,
+//!   predicate (`lineage.rs`, `agent_profile.rs::get_agent_evidence_distribution`,
 //!   `corpus_stats.rs`, `claim.rs::{count_all_evidence_for_claim,
 //!   claim_ids_by_evidence_type}`).
 //! * Maintenance and operator binaries on a privileged pool, which see every
@@ -66,8 +66,7 @@
 //! MEASURED as known surfaces in
 //! [`the_surfaces_outside_the_content_reads_are_measured`]: the claim's own
 //! text and an edge touching the hidden row stay readable to a non-member.
-//! NOT covered here: `harvester_fragments.content_text`,
-//! `mass_functions.evidence_type`, a BYPASSRLS or superuser connection with a
+//! NOT covered here: `mass_functions.evidence_type`, a BYPASSRLS or superuser connection with a
 //! bypass viewer, and anything emitted before a row was hidden. Hiding is
 //! forward-only.
 

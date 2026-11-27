@@ -333,9 +333,6 @@ pub struct SideEffects {
     /// **Seal mode only.** What the kept rows are and who can still read them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kept_rows: Option<&'static str>,
-    /// **Seal mode only.** The one loss that is not re-derivable at all.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unrecoverable: Option<&'static str>,
     /// **Seal mode only.** That the server cannot undo this by itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reversibility: Option<&'static str>,
@@ -383,21 +380,6 @@ pub const SEAL_KEPT_ROWS: &str = "an OUTSIDER's challenge (challenges.writer_own
      plaintext, readable only by sessions that can read the sealed claim. Insider (inherited) \
      challenges are deleted as destroys_derived_rows says";
 
-/// What a seal takes that no unseal returns.
-///
-/// The second clause is not decoration. A source fragment is linked to claims
-/// `(claim_id, fragment_id)`, so one fragment can back several claims, and
-/// blanking it takes the source text away from every claim that cites it —
-/// including claims outside this plan. The alternative, skipping a shared
-/// fragment, would leave the SEALED claim's own source text in the corpus in
-/// plaintext, which §6.5.4 calls worse than not sealing at all. So the loss is
-/// real, it is chosen, and it is stated here before the admin clicks.
-const SEAL_UNRECOVERABLE: &str = "harvester_fragments source text (content_text and \
-     context_window) is blanked and is NOT restored by unseal; re-extraction cannot recover it \
-     because the fragment text is the source. A fragment cited by claims OUTSIDE this plan is \
-     blanked for those claims too: the fragment is one row, and leaving it would leave the sealed \
-     claim's own source text readable";
-
 /// What a seal costs that a restrict does not.
 const SEAL_NOT_SERVER_REVERSIBLE: &str = "a seal is not server-reversible: the server holds no \
      key, so only a key-holding admin can unseal, and until every item is unsealed this plan \
@@ -433,28 +415,6 @@ pub struct PreviewCounts {
     pub not_visible_to_actor: i64,
     /// `depth -> count`.
     pub by_depth: std::collections::BTreeMap<i32, i64>,
-    /// **Seal plans only**: how many distinct source fragments this plan would
-    /// blank that are ALSO cited by a claim outside it.
-    ///
-    /// `None` means NOT MEASURED, and covers two cases the client does not need
-    /// to tell apart: a `restrict` plan, where the question does not arise, and
-    /// a seal plan whose count could not be taken. The plan itself is already
-    /// committed by the time this is read, and `privatization_plans` has no
-    /// DELETE surface, so failing the request over a preview nicety would leave
-    /// an undeletable plan behind and invite a retry that creates a second one.
-    /// [`SEAL_UNRECOVERABLE`] states the property unconditionally either way;
-    /// that sentence, not this integer, is the consent surface.
-    ///
-    /// The magnitude behind [`SEAL_UNRECOVERABLE`], which states the property
-    /// unconditionally and therefore reads identically for a plan that shares
-    /// one fragment and a plan that shares four hundred. A COUNT, with no ids:
-    /// the claims that make a fragment shared are by definition outside this
-    /// plan, and naming them would disclose the very rows the actor has no
-    /// authority over.
-    ///
-    /// Fragments, not affected claims. The fragment is the row that loses its
-    /// text, so one fragment cited by fifty outside claims is one loss.
-    pub shared_source_fragments: Option<i64>,
 }
 
 /// One rendered sample item. Present ONLY because the actor can read it.
@@ -1193,55 +1153,6 @@ pub async fn create_plan(
     // the wrong one.
     drop(session);
 
-    // The magnitude behind the seal preview's `unrecoverable` sentence. On a
-    // maintenance connection because the claims that make a fragment SHARED are
-    // outside this plan by definition, so a filtered count would report zero
-    // sharing to an operator whose seal shares plenty — understating the very
-    // loss the sentence exists to disclose. Only an integer crosses the
-    // boundary.
-    //
-    // ONE MAINTENANCE CONNECTION AT A TIME. The session above is dropped first,
-    // for the reason `seal_manifest` gives: the maintenance pool is the
-    // smallest in the process, and two requests each holding one while
-    // acquiring a second is a deadlock the pool size makes reachable.
-    //
-    // Read after the commit, so it ranges over the persisted items rather than
-    // over a selection the freeze may have narrowed.
-    //
-    // A DEGRADED PREVIEW, NOT A FAILED REQUEST. Everything below is fallible
-    // and none of it is load-bearing: the plan is committed, the row cannot be
-    // deleted, and a 500 here would strand it and invite a retry that commits a
-    // second. `None` is the field's "not measured", and `unrecoverable` says
-    // the thing that needs saying with or without the number. This is also a
-    // READ, so it is not mapped through `plan_write_error` — that helper's
-    // `42501` arm names a write authority the caller demonstrably has.
-    let shared_source_fragments = if mode == "seal" {
-        let counted: Result<i64, String> = async {
-            let mut counting = maintenance(&state).await.map_err(|e| e.to_string())?;
-            let (maint, _bypass) = counting.split();
-            let n = PrivatizationRepository::shared_fragment_count_conn(&mut *maint, plan_id)
-                .await
-                .map_err(|e| e.to_string());
-            drop(counting);
-            n
-        }
-        .await;
-        match counted {
-            Ok(n) => Some(n),
-            Err(e) => {
-                tracing::warn!(
-                    target: "tenancy.privatization",
-                    error = %e,
-                    %plan_id,
-                    "seal preview: shared-fragment count unavailable; reporting it as not measured"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let mut read = state.read_as(&viewer).await.map_err(scoped_read_error)?;
     let visible = selection
         .visible_count(&mut read, &viewer)
@@ -1297,7 +1208,6 @@ pub async fn create_plan(
             authors_losing_own_claims: authors_losing,
             not_visible_to_actor: not_visible,
             by_depth: selection.by_depth(),
-            shared_source_fragments,
         },
         sample: sample
             .into_iter()
@@ -1322,7 +1232,6 @@ pub async fn create_plan(
             destroys_derived_rows: (mode == "seal").then_some(SEAL_DESTROYS),
             keeps_writer_owned_rows: (mode == "seal").then_some(SEAL_KEEPS),
             kept_rows: (mode == "seal").then_some(SEAL_KEPT_ROWS),
-            unrecoverable: (mode == "seal").then_some(SEAL_UNRECOVERABLE),
             reversibility: (mode == "seal").then_some(SEAL_NOT_SERVER_REVERSIBLE),
         },
     };
