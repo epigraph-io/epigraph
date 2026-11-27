@@ -1577,6 +1577,81 @@ async fn an_operator_build_draws_members_with_no_embedding_in_not_yet_placed_lea
     assert_waiting_leaves(&pool, &c, t4, &in_t1, &in_t4).await;
 }
 
+/// Review finding (029392cb): a theme carried from the previous run keeps
+/// that run's record of its "not yet placed" leaves. Night 2 fails `t1`,
+/// which has a member waiting with no embedding, so `t1`'s levels are
+/// carried: the run records both of its waiting leaves (exactly the
+/// previous run's). Once `t1` builds again and the waiting member has an
+/// embedding, the next night places it by meaning: a record that dropped the
+/// carried leaves would keep it in the leaf where it waited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_carried_theme_keeps_its_not_yet_placed_record(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let in_t1 = bare(&pool, c.t1, c.fa, c.a_team, 1).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let backend = namer();
+    let waiting: BTreeSet<Uuid> = [M, L]
+        .into_iter()
+        .map(|h| group_id(a_map, h, c.t1, &set(&in_t1)))
+        .collect();
+
+    let first = night(&pool, &viewer, &backend, &opts()).await;
+    assert_eq!(map_report(&first, a_map)["status"], "written", "{first:#}");
+    let run = latest(&pool, a_map).await;
+    assert_eq!(unplaced_record(&run_params(&pool, run).await), waiting);
+
+    break_t1_and_grow_t2(&pool, &c).await;
+    let second = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&second, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    let carried = r["themes"]["carried"].as_array().unwrap();
+    assert_eq!(carried.len(), 1, "{r:#}");
+    assert_eq!(carried[0]["theme_id"], serde_json::json!(c.t1));
+    let run = latest(&pool, a_map).await;
+    assert_eq!(
+        unplaced_record(&run_params(&pool, run).await),
+        waiting,
+        "the carried theme's waiting leaves, both hierarchies"
+    );
+    let at = leaf_of_claim(&leaves_of(&pool, run, M).await);
+    assert_eq!(at[&in_t1[0]], group_id(a_map, M, c.t1, &set(&in_t1)));
+
+    // `t1` builds again (the claim that broke it is retired) and the
+    // waiting member has an embedding: placed next to its nearest claims.
+    let n = sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL \
+          WHERE theme_id = $1 AND id IN (SELECT id FROM evidence)",
+    )
+    .bind(c.t1)
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(n, 1, "the claim that shares its id with an evidence row");
+    sqlx::query("UPDATE claims SET embedding = $2::vector WHERE id = $1")
+        .bind(in_t1[0])
+        .bind(vector(0, 99))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let third = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&third, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert!(
+        r["themes"]["carried"].as_array().unwrap().is_empty(),
+        "{r:#}"
+    );
+    let run = latest(&pool, a_map).await;
+    let at = leaf_of_claim(&leaves_of(&pool, run, M).await);
+    assert_eq!(
+        at[&in_t1[0]], at[&c.a[0]],
+        "placed next to its nearest claims"
+    );
+    assert!(unplaced_record(&run_params(&pool, run).await).is_empty());
+}
+
 // ── cross-group links ───────────────────────────────────────────────────────
 
 /// A stored claim-to-claim edge; returns its id.
