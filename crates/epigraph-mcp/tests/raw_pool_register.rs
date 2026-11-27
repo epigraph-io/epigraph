@@ -100,12 +100,6 @@ const PRE_VIEWER: &str = "PRE_VIEWER: resolves an identity or a viewer (Viewer::
      a viewer exists to stamp from; the definer reads answer without a stamp, so stamping \
      first would be circular.";
 
-/// The arm a server built WITHOUT a `ScopedPool` takes (a development
-/// superuser, or a test fixture). A deployed server always has one.
-const NO_SCOPED_POOL_FALLBACK: &str = "NO_SCOPED_POOL_FALLBACK: the arm taken only when the \
-     server has no ScopedPool (a development superuser or a fixture). Every deployed server \
-     is built with_scoped_pool, so this arm never runs on epigraph_app.";
-
 /// A write registered, with its own reason, in `residual_unstamped_writes.rs`.
 const REGISTERED_WRITE: &str = "REGISTERED_WRITE: an unstamped write carried, with its own \
      measured reason, by residual_unstamped_writes.rs's RESIDUAL_UNSTAMPED_WRITES; this row \
@@ -413,12 +407,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         REGISTERED_WRITE,
     ),
     (
-        "epigraph-mcp/src/tools/workflow_ingest.rs",
-        "store_workflow_goal_embedding",
-        1,
-        REGISTERED_WRITE,
-    ),
-    (
         "epigraph-mcp/src/tools/workflows.rs",
         "refresh_workflow_promotion",
         1,
@@ -443,12 +431,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         FIXTURE_ENTRY,
     ),
     (
-        "epigraph-mcp/src/tools/workflow_ingest.rs",
-        "lineage_max_generation",
-        1,
-        NO_SCOPED_POOL_FALLBACK,
-    ),
-    (
         "epigraph-mcp/src/tools/recall.rs",
         "detect_centroid_dim",
         1,
@@ -456,23 +438,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          wrapper taking `&PgPool` so a #[sqlx::test] can pin the centroid-dimension decision; \
          no tool routes through it (the tool's own detect_centroid_dim takes the stamped \
          read).",
-    ),
-    (
-        "epigraph-mcp/src/tools/evolve_step.rs",
-        "evolve_step",
-        1,
-        "REGISTERED_WRITE: the server.pool.begin() fallback for a server with no ScopedPool (a \
-         fixture; every deployed server is built with_scoped_pool). The step-name resolution \
-         that was the second site now runs on the caller's stamped read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "report_workflow_outcome",
-        1,
-        "One NO_SCOPED_POOL_FALLBACK (WorkflowRepository::exists without a ScopedPool; with one \
-         the existence check is viewer_reads_row on read_as). The run row \
-         (BehavioralExecutionRepository::create) moved onto the author's stamp when migration \
-         240 gave behavioral_executions its workflow's tenancy (backlog 88cf603b).",
     ),
     (
         "epigraph-mcp/src/unauthenticated_reader.rs",
@@ -526,7 +491,12 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// Backlog bdc96181 moved the HTTP workflow gate's view of the row
 /// (`workflow_authority::caller_view_of`) onto the request viewer, read on
 /// the act's own transaction: 64 -> 63.
-const HIGH_WATER: usize = 63;
+/// Backlog 4cbd4192 (partial) deleted the no-ScopedPool fallback arms of
+/// `evolve_step`, `lineage_max_generation`, `report_workflow_outcome` and
+/// `store_workflow_goal_embedding`: a server with no ScopedPool is now refused
+/// by the stamped path's own guard instead, removing four rows and the
+/// NO_SCOPED_POOL_FALLBACK class: 63 -> 59.
+const HIGH_WATER: usize = 59;
 
 // ===========================================================================
 // The scanner.

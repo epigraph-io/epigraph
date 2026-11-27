@@ -6,7 +6,14 @@
 //!
 //! - **Pool Management**: Connection pooling with `sqlx::PgPool`
 //! - **Repository Pattern**: Each domain entity has a dedicated repository
-//! - **Type Safety**: Compile-time SQL verification with `sqlx::query!` macro
+//! - **Query checking**: only a minority of statements (under one in ten) use
+//!   the compile-time-checked `sqlx::query!` family. Most are runtime
+//!   `sqlx::query` / `query_as` / `query_scalar` calls, because
+//!   `Viewer::splice` / `splice_write` produce runtime SQL that a macro's
+//!   fixed literal cannot take, and because many statements are assembled
+//!   dynamically. A runtime statement is checked only when it runs, at best by
+//!   a DB-backed test that exercises it (coverage is partial); see the crate
+//!   README for when to prefer a macro.
 //! - **Error Handling**: Comprehensive error types with context
 //!
 //! # Usage
@@ -129,28 +136,28 @@ pub use repos::{
     EntityTypeRepository, EpistemicEdgePairRow, EventCursor, EventRepository, EventRow,
     EvidenceAtTimeRow, EvidenceClaimLink, EvidenceDetailRow, EvidenceDirection, EvidenceEdge,
     EvidenceEdgeRow, EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceListFilter,
-    EvidenceListRow, EvidenceRepository, EvidenceSearchResult, EvolveStepResult,
+    EvidenceListRow, EvidenceRepository, EvidenceSearchResult, EvidenceTenancy, EvolveStepResult,
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
     FactorRepository, FlatPage, FlatRanking, FlatWorkflowClaim, FrameClaimBeliefHit,
     FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord, GapRepository,
     GraphExpansionHit, GraphViewRepository, GroundedNeighbor, GroupKeyEpochRepository,
     GroupMembershipRepository, GroupRepository, GroupRow, HierarchicalOutcomeCounters,
     HierarchicalOutcomeRecord, HierarchicalOutcomeResult, HierarchicalWorkflowRow,
-    HybridCandidates, HybridHit, HybridPage, IndexCounts, InstanceAdminRepository,
-    InstanceAdminRow, KeyEpochRow, LabelFamilyRow, LabelQuery, LearningEventRepository,
-    LearningEventRow, LevelAndSourceType, LineageHead, LineageRepository, MarkedDuplicateRow,
-    MarkedDuplicates, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow,
-    MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
-    MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
-    MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage, NewHierarchicalOutcomeReport,
-    NewRecallEvent, NonceConsumption, OAuthClientRepository, OAuthClientRow, OperatorLink,
-    OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
-    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProfileVisibility,
-    ProfileVisibilitySet, PromotionStanding, ProvenanceChain, ProvenanceChainRepository,
-    ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
-    ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshCheck,
-    RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository, RefreshTokenRow,
-    ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
+    HybridCandidates, HybridHit, HybridPage, IncidentEdgeTenancy, IndexCounts,
+    InstanceAdminRepository, InstanceAdminRow, KeyEpochRow, LabelFamilyRow, LabelQuery,
+    LearningEventRepository, LearningEventRow, LevelAndSourceType, LineageHead, LineageRepository,
+    MarkedDuplicateRow, MarkedDuplicates, MassFunctionRepository, MatchCandidateRepo,
+    MatchCandidateRow, MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength,
+    MethodFailureModes, MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult,
+    MethodSourcePaper, MethodUsageExample, MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage,
+    NewHierarchicalOutcomeReport, NewRecallEvent, NonceConsumption, OAuthClientRepository,
+    OAuthClientRow, OperatorLink, OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff,
+    PatchClaimInput, PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository,
+    ProfileVisibility, ProfileVisibilitySet, PromotionStanding, ProvenanceChain,
+    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
+    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
+    RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
+    RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
     RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
     SecurityEventRepository, SecurityEventRow, SemanticFlatPage, SemanticSelectedClaim,
     SheafRepository, SortDirection, StructuralRepository, SupersedeActor, SupersedeEdgeMigration,
@@ -158,10 +165,10 @@ pub use repos::{
     ThemeSummaryRow, TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
     WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
-    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
-    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
-    SUPERSEDE_ACT_TOOLS,
+    WorkflowReferenceRow, WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED,
+    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    PRUNABLE_EVENT_TYPES, RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED,
+    SUPERSEDE_ACT_PROPERTY, SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{
     create_ingest_written_edge_if_absent_conn, credited_agent_end, ingest_only_edge_refusal,
@@ -172,6 +179,10 @@ pub use repos::{
     INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED, INGEST_RECORD_RELATIONSHIP,
     INGEST_WRITTEN_BY_FIELD, INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY,
     INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
+};
+pub use repos::{
+    preview_refusal, ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant,
+    VisibilityActOutcome, WriteTenancyReport,
 };
 pub use repos::{
     record_standing_refusal, AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony,
@@ -185,10 +196,6 @@ pub use repos::{
 pub use repos::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
 pub use repos::{AuthorNaming, AuthorNamingFacts};
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
-pub use repos::{
-    ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome,
-    WriteTenancyReport,
-};
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{CountersignDecision, CountersignRepository, CountersignedRow};
 pub use repos::{
@@ -265,7 +272,7 @@ pub use repos::mass_function::{
 // `ownership` table on this line. The export came in from main, which still
 // carries the module, and is dropped rather than resurrected.
 pub use repos::perspective::PerspectiveRow;
-pub use repos::scoped_belief::ScopedBeliefRow;
+pub use repos::scoped_belief::{CommunityFoldsCleared, ScopedBeliefRow};
 
 // Re-export Political network monitoring types
 pub use repos::political::{

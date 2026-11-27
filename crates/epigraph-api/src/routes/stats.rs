@@ -41,6 +41,12 @@ pub struct StatsResponse {
     /// Claims carrying the `workflow` label — the definition MCP
     /// `system_stats` reports, not a count of `workflows` rows.
     pub workflows: i64,
+    /// Readable claims carrying a signature (backlog 953d5707): presence,
+    /// not verification, so an upper bound on verifiable claims.
+    pub claims_signed: i64,
+    /// Readable claims with no signature. Read in the same scan as
+    /// `claims`, so `claims_signed + claims_unsigned == claims`.
+    pub claims_unsigned: i64,
     /// When these counts were read. They are not a consistent snapshot: the
     /// queries behind them are not in one transaction under
     /// `SessionGucMode::Session`.
@@ -82,6 +88,8 @@ pub async fn corpus_stats(
         agents,
         frames: counts.frames,
         workflows: counts.workflow_claims.unwrap_or_default(),
+        claims_signed: counts.signed_claims.unwrap_or_default(),
+        claims_unsigned: counts.unsigned_claims.unwrap_or_default(),
         computed_at: Utc::now(),
     }))
 }

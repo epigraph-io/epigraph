@@ -10,6 +10,9 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 epigraph-core = { workspace = true }
+# The claim-act refusal kinds (`claim_act::ClaimActRefusal`) both transports
+# map, and the OAuth principal a cascade's audit row names.
+epigraph-auth = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-db = { workspace = true }
 # The Atlas level contract: `atlas_flow` returns its `Edge` list (Atlas W7).

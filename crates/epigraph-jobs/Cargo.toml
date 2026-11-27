@@ -8,9 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-epigraph-core = { workspace = true }
-epigraph-db = { workspace = true }  # PostgreSQL repos for DB-backed reputation service
-epigraph-engine = { workspace = true }  # For PropagationOrchestrator and Bayesian updates
+epigraph-db = { workspace = true }  # privatization repos and the statement-timeout helper
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -19,15 +17,13 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }  # For async trait definitions
-hmac = { workspace = true }  # HMAC for webhook signatures
-sha2 = { workspace = true }  # SHA-256 for HMAC-SHA256
-hex = { workspace = true }  # Hex encoding for signatures
 petgraph = { workspace = true }
 rand = { workspace = true }  # used by Louvain to break ties between equal-modularity moves
 sqlx = { workspace = true }  # PostgreSQL persistence for job queue
 url = "2"  # WHATWG URL parsing for the webhook egress guard (already in graph via reqwest)
-# The one sanctioned webhook HTTP client (`egress::pinned_client`, `PinnedHttpClient`).
-# Same spec as epigraph-api's, so it adds a dependency edge and no new TLS stack.
+# The one sanctioned webhook HTTP client construction (`egress::pinned_client`),
+# used by epigraph-api's delivery dispatcher. Same spec as epigraph-api's, so it
+# adds a dependency edge and no new TLS stack.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]

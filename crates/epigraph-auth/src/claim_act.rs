@@ -135,9 +135,9 @@ pub const CASCADE_DEFERRAL_REFUSAL_CODE: &str = "CX03";
 
 /// Whether a database refusal, by its SQLSTATE and message, is the
 /// cascade-deferral definer's CX03 (SQLSTATE `42501`, message opening
-/// `CX03:`). Both transports' supersede refusal mappers ask this one
-/// question, so CX03 is recognised by the same rule on MCP and HTTP; each
-/// then answers it as its own error type with
+/// `CX03:`). [`ClaimActRefusal`] asks this one question for both transports'
+/// supersede refusal mappers, so CX03 is recognised by the same rule on MCP
+/// and HTTP; each then answers it as its own error type with
 /// [`supersede_not_recorded_message`]. Taking the two strings, not a database
 /// error, keeps this crate free of the database layer.
 #[must_use]
@@ -159,6 +159,94 @@ pub fn supersede_not_recorded_message(claim_id: Uuid) -> String {
          recorded: the session acting on it does not write the group that owns the claim; \
          nothing was written"
     )
+}
+
+/// Whether `message` opens with a database refusal code: two to five ASCII
+/// capitals, two digits and a colon (`CX03:`, `OPL01:`, `TEN01:`). Row
+/// security's own refusal ("new row violates row-level security policy ...")
+/// and an engine refusal such as "permission denied for function ..." carry
+/// no code. The grammar is the code SHAPE, not a reviewed list: whether a
+/// coded refusal's text may be sent is each transport's own question.
+#[must_use]
+pub fn is_coded_refusal(message: &str) -> bool {
+    let b = message.as_bytes();
+    let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
+    (2..=5).contains(&caps)
+        && b.len() > caps + 2
+        && b[caps].is_ascii_digit()
+        && b[caps + 1].is_ascii_digit()
+        && b[caps + 2] == b':'
+}
+
+/// What a database refusal of a claim act means, decided once for both
+/// transports (HTTP `POST /api/v1/claims/:id/supersede`, MCP
+/// `supersede_claim`). Each transport only maps a kind onto its own error
+/// type; neither re-inspects the SQLSTATE or the message.
+///
+/// The kinds read the database's `(SQLSTATE, message)` pair, not a database
+/// error type, which keeps this crate free of the database layer. An error
+/// that is not a database error at all is `(None, "")`: [`Self::Other`] for an
+/// act, [`Self::DeployFault`] for a deferral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimActRefusal {
+    /// Migration 120's cascade-deferral definer refused: SQLSTATE `42501`,
+    /// message opening `CX03:` ([`is_cascade_deferral_refusal`]). On the
+    /// supersede path the act runs first in the same transaction, so the only
+    /// reachable reason is that the session does not write the claim's group;
+    /// both transports answer it with [`supersede_not_recorded_message`].
+    Cx03,
+    /// Row security refused the act: an UNCODED `42501` (`claims_tenancy`'s
+    /// `WITH CHECK`; the session's stamp does not write the claim's owner
+    /// group). The caller's denial, with the group-write words.
+    NotWriter,
+    /// A `42501` whose message opens with a refusal code other than CX03
+    /// ([`is_coded_refusal`]): a definer's own named refusal. It keeps its
+    /// code where the transport may send its text; it is never rewritten to
+    /// the uncoded group-write denial on a transport that may send it.
+    CodedDenial,
+    /// A cascade DEFERRAL failed for a reason other than CX03: the server's
+    /// fault (e.g. a missing `EXECUTE` grant on the definer, an uncoded
+    /// `42501` that is NOT row security refusing the caller), never a denial.
+    DeployFault,
+    /// Anything else an act raised: the transport's general mapping of a
+    /// database error decides.
+    Other,
+}
+
+impl ClaimActRefusal {
+    /// Classify the database's refusal of a supersede ACT
+    /// (`supersede_act_conn`): [`Self::Cx03`], then [`Self::NotWriter`] or
+    /// [`Self::CodedDenial`] for any other `42501`, else [`Self::Other`].
+    /// Never [`Self::DeployFault`].
+    #[must_use]
+    pub fn of_act(sqlstate: Option<&str>, message: &str) -> Self {
+        if is_cascade_deferral_refusal(sqlstate, message) {
+            Self::Cx03
+        } else if sqlstate == Some("42501") {
+            if is_coded_refusal(message) {
+                Self::CodedDenial
+            } else {
+                Self::NotWriter
+            }
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Classify the database's refusal of a supersede's cascade DEFERRAL
+    /// (`epigraph_record_cascade_deferral`): [`Self::Cx03`], the same denial
+    /// the act's own CX03 is, or else [`Self::DeployFault`]. Not
+    /// [`Self::of_act`]: an uncoded `42501` here is a deploy fault, not row
+    /// security refusing the caller, so it must not read as the group-write
+    /// denial.
+    #[must_use]
+    pub fn of_deferral(sqlstate: Option<&str>, message: &str) -> Self {
+        if is_cascade_deferral_refusal(sqlstate, message) {
+            Self::Cx03
+        } else {
+            Self::DeployFault
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +306,99 @@ mod tests {
             assert!(
                 !is_cascade_deferral_refusal(code, message),
                 "{code:?} {message:?} is not CX03"
+            );
+        }
+    }
+
+    /// The refusal-code grammar: two to five capitals, two digits, a colon.
+    #[test]
+    fn a_coded_refusal_is_exactly_the_code_grammar() {
+        for msg in [
+            "CX03: the act",
+            "OPL01: unbound",
+            "ABCDE12: five capitals",
+            "AB12:",
+            "SR09: a reviewed supersede code",
+        ] {
+            assert!(is_coded_refusal(msg), "{msg:?} is coded");
+        }
+        for msg in [
+            "A12: one capital",
+            "ABCDEF12: six capitals",
+            "FA4: one digit",
+            "FA123: three digits",
+            "FA04 no colon",
+            "FA04",
+            " CX03: leading space",
+            "cx03: lower case",
+            "new row violates row-level security policy for table \"claims\"",
+            "permission denied for function epigraph_record_cascade_deferral",
+            "",
+        ] {
+            assert!(!is_coded_refusal(msg), "{msg:?} is not coded");
+        }
+    }
+
+    /// Every refusal kind of a supersede ACT, by `(SQLSTATE, message)`.
+    #[test]
+    fn a_supersede_act_refusal_is_classified_once() {
+        use ClaimActRefusal::{CodedDenial, Cx03, NotWriter, Other};
+        let rls = "new row violates row-level security policy for table \"claims\"";
+        for (code, message, want) in [
+            (
+                Some("42501"),
+                "CX03: not recorded as one this session made",
+                Cx03,
+            ),
+            (Some("42501"), rls, NotWriter),
+            (
+                Some("42501"),
+                "permission denied for table claims",
+                NotWriter,
+            ),
+            (Some("42501"), "", NotWriter),
+            (Some("42501"), "TEN01: a reviewed refusal", CodedDenial),
+            (Some("42501"), "ZZ99: an unreviewed refusal", CodedDenial),
+            // CX03's text on another SQLSTATE is not CX03, and not 42501.
+            (Some("P0001"), "CX03: the act", Other),
+            (Some("P0001"), rls, Other),
+            (Some("55000"), "SR09: a state refusal", Other),
+            (None, "CX03: the act", Other),
+            // Not a database error at all.
+            (None, "", Other),
+        ] {
+            assert_eq!(
+                ClaimActRefusal::of_act(code, message),
+                want,
+                "{code:?} {message:?}"
+            );
+        }
+    }
+
+    /// A DEFERRAL is CX03 or a fault: never the act's group-write denial.
+    #[test]
+    fn a_cascade_deferral_refusal_is_cx03_or_a_deploy_fault() {
+        use ClaimActRefusal::{Cx03, DeployFault};
+        for (code, message, want) in [
+            (
+                Some("42501"),
+                "CX03: not recorded as one this session made",
+                Cx03,
+            ),
+            // The missing EXECUTE grant: uncoded 42501, a fault here.
+            (
+                Some("42501"),
+                "permission denied for function epigraph_record_cascade_deferral",
+                DeployFault,
+            ),
+            (Some("42501"), "ZZ99: a coded refusal", DeployFault),
+            (Some("P0001"), "CX03: the act", DeployFault),
+            (None, "", DeployFault),
+        ] {
+            assert_eq!(
+                ClaimActRefusal::of_deferral(code, message),
+                want,
+                "{code:?} {message:?}"
             );
         }
     }

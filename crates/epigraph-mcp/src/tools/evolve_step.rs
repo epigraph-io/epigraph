@@ -176,11 +176,10 @@ pub async fn evolve_step(
     // The step claim is written on a transaction STAMPED with its author's
     // viewer, so migration 122's claims trigger sees the writing principal:
     // once the database is armed it refuses a claim written by an application
-    // session with no principal, which is what the raw pool is. The raw-pool
-    // form remains only for a server built without a ScopedPool (test
-    // fixtures); on such a process's application role the database refuses the
-    // write once armed, so it cannot fail open.
-    let (result, cascade, belief_cascade) = if server.scoped.is_some() {
+    // session with no principal, which is what the raw pool is. A server built
+    // without a ScopedPool is refused by `begin_author_stamped_tx` with nothing
+    // written (backlog 4cbd4192); it used to write on `server.pool.begin()`.
+    let (result, cascade, belief_cascade) = {
         let mut tx =
             crate::claim_helper::begin_author_stamped_tx(server, identity, "evolve_step").await?;
         let grants =
@@ -218,7 +217,7 @@ pub async fn evolve_step(
             let trigger = CascadeTrigger::new(
                 CascadeCause::Supersede,
                 Some(agent_id),
-                crate::tools::supersede::oauth_principal(auth),
+                auth.map(epigraph_engine::admin_cascade::OauthPrincipal::from),
                 parent_uuid,
                 Some(r.new_claim_id),
             );
@@ -244,30 +243,6 @@ pub async fn evolve_step(
             };
             (r, Some(cascade), Some(belief))
         }
-    } else {
-        // No ScopedPool (test fixtures): the act only, as before; there is no
-        // maintenance session to run the cascade on. The authority gate runs
-        // here too, on the act's own transaction, so a server built without a
-        // ScopedPool is not a way around it.
-        let mut tx = server.pool.begin().await.map_err(internal_error)?;
-        let grants =
-            require_lineage_authority_locked(server, &mut tx, auth, identity, viewer, parent_uuid)
-                .await?;
-        let r = epigraph_db::ClaimRepository::evolve_step_conn(
-            &mut tx,
-            Some(edge_key),
-            parent,
-            &params.content,
-            &params.edge_type,
-            params.rationale.as_deref(),
-            level,
-            agent_id,
-        )
-        .await
-        .map_err(evolve_caller_error)?;
-        record_lineage_writes(&mut tx, auth, identity, &grants, write_details(&r)).await?;
-        tx.commit().await.map_err(internal_error)?;
-        (r, None, None)
     };
 
     // The new step is a current claim with no vector: embed it post-commit,

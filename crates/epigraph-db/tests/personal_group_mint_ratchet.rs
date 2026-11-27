@@ -305,9 +305,19 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-api/src/routes/conventions.rs",
+        "default_decl_for_author",
+        1,
+        "`learn_convention`'s convention claim (backlog 1c822492): the CALLER's own \
+         declaration, on the `AppState::write_as` transaction stamped from the caller's own \
+         viewer, so a rollback takes anything the resolution provisioned with it. Definer \
+         answer: a revoked or reader membership is refused, never revived (migration 105).",
+    ),
+    (
+        "epigraph-api/src/routes/conventions.rs",
         "default_decl_for_author_pool",
-        2,
-        "Two conventions writes on `state.db_pool` (unstamped). Definer answer.",
+        1,
+        "`share_skill`'s shared copy on `state.db_pool` (unstamped), as the system agent. \
+         Definer answer.",
     ),
     (
         "epigraph-api/src/routes/hypothesis.rs",

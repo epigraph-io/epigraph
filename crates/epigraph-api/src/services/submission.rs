@@ -207,7 +207,9 @@ impl SubmissionService {
         if evidence_count == 0 {
             // With no evidence, truth is very low regardless of methodology
             // Base uncertainty (0.1) + small methodology bonus (max 0.1)
-            let methodology_factor = methodology.weight_modifier() / 1.2; // Normalize to [0, 1]
+            // Normalize to [0, 1] by core's top weight, not a copy of it.
+            let methodology_factor =
+                methodology.weight_modifier() / epigraph_core::Methodology::MAX_WEIGHT_MODIFIER;
             let confidence_factor = confidence * 0.1; // Max 0.1 contribution
             return (0.1 + methodology_factor * confidence_factor).min(0.25);
         }
@@ -218,7 +220,8 @@ impl SubmissionService {
 
         // Normalize to [0, 1] for evidence weight
         // Apply more aggressive scaling for weak methodologies
-        let normalized_weight = (effective_weight / 1.2).min(1.0);
+        let normalized_weight =
+            (effective_weight / epigraph_core::Methodology::MAX_WEIGHT_MODIFIER).min(1.0);
 
         // Apply additional penalty for weak methodologies (< 1.0 weight modifier)
         // This ensures weak evidence with weak methodology doesn't inflate truth
@@ -345,6 +348,23 @@ mod tests {
             truth <= 0.6,
             "No evidence should not produce high truth, got {}",
             truth
+        );
+    }
+
+    /// The no-evidence bonus normalizes the methodology weight by core's top
+    /// weight (`Methodology::MAX_WEIGHT_MODIFIER`), not a copied `1.2`: the
+    /// top methodology at full confidence earns exactly the 0.1 maximum,
+    /// whatever core sets that weight to (backlog 19e46f05).
+    #[test]
+    fn the_top_methodology_normalizes_to_exactly_one_without_evidence() {
+        let truth = SubmissionService::calculate_truth_from_evidence(
+            0,
+            MethodologySubmission::FormalProof,
+            1.0,
+        );
+        assert!(
+            (truth - 0.2).abs() < 1e-12,
+            "formal_proof at full confidence must earn the whole 0.1 bonus: got {truth}"
         );
     }
 

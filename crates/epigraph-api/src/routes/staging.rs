@@ -345,27 +345,38 @@ pub async fn analyze_rejection(
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
+/// The weight a staging claim's free-form `methodology` string earns: the
+/// core table's, `epigraph_core::Methodology::weight_modifier` (backlog
+/// 19e46f05), so staging keeps no copy of it.
+///
+/// The string is read as core's wire name (`formal_proof`,
+/// `visual_inspection`, `bayesian_inference`, ...), plus the legacy staging
+/// alias `bayesian`. Anything else weighs as `heuristic`, as it always did.
+fn staging_methodology_weight(methodology: &str) -> f64 {
+    use epigraph_core::Methodology;
+    use serde::de::{value::StrDeserializer, IntoDeserializer};
+    let name = if methodology == "bayesian" {
+        "bayesian_inference"
+    } else {
+        methodology
+    };
+    let de: StrDeserializer<'_, serde::de::value::Error> = name.into_deserializer();
+    Methodology::deserialize(de)
+        .unwrap_or(Methodology::Heuristic)
+        .weight_modifier()
+}
+
 /// Calculate initial truth for staging claims.
 /// Mirrors the main submission logic: no evidence → low truth.
 fn calculate_staging_truth(evidence_count: usize, methodology: &str, confidence: f64) -> f64 {
-    let methodology_weight = match methodology {
-        "formal_proof" => 1.2,
-        "deductive" => 1.1,
-        "bayesian" => 1.0,
-        "inductive" => 0.9,
-        "instrumental" => 0.85,
-        "extraction" => 0.75,
-        "abductive" => 0.7,
-        "heuristic" => 0.5,
-        _ => 0.5,
-    };
+    let methodology_weight = staging_methodology_weight(methodology);
 
     if evidence_count == 0 {
         return (0.1_f64 + methodology_weight * 0.1).min(0.25);
     }
 
     let evidence_factor = 1.0 - (-0.3 * evidence_count as f64).exp();
-    let method_factor = methodology_weight / 1.2;
+    let method_factor = methodology_weight / epigraph_core::Methodology::MAX_WEIGHT_MODIFIER;
     let conf_factor = confidence.clamp(0.0, 1.0);
 
     (0.3 + evidence_factor * 0.5 * method_factor * conf_factor).clamp(0.0, 1.0)
@@ -521,6 +532,104 @@ mod tests {
     fn truth_bounded_zero_one() {
         let truth = calculate_staging_truth(100, "formal_proof", 1.0);
         assert!((0.0..=1.0).contains(&truth), "Truth out of bounds: {truth}");
+    }
+
+    /// `visual_inspection` is a methodology the core table weighs at 0.8,
+    /// above `heuristic`'s 0.5. Staging's own string match had no arm for it,
+    /// so it fell to the `_ => 0.5` default and scored as a heuristic
+    /// (backlog 19e46f05).
+    #[test]
+    fn visual_inspection_outweighs_heuristic_in_staging() {
+        let visual = calculate_staging_truth(3, "visual_inspection", 0.8);
+        let heuristic = calculate_staging_truth(3, "heuristic", 0.8);
+        assert!(
+            visual > heuristic,
+            "visual_inspection must not score as a heuristic: {visual} vs {heuristic}"
+        );
+    }
+
+    /// Core's wire name `bayesian_inference` weighs what the legacy staging
+    /// alias `bayesian` does; before, only the alias was known and the wire
+    /// name scored as a heuristic.
+    #[test]
+    fn bayesian_inference_and_its_alias_weigh_the_same_in_staging() {
+        assert_eq!(
+            calculate_staging_truth(3, "bayesian_inference", 0.8),
+            calculate_staging_truth(3, "bayesian", 0.8),
+        );
+    }
+
+    /// The methodology weight table is ONE table: core's
+    /// `Methodology::weight_modifier`. The packet route's
+    /// `MethodologySubmission::weight_modifier` and staging's string lookup
+    /// must answer exactly what core answers for every variant, by core's
+    /// wire name (backlog 19e46f05).
+    #[test]
+    fn the_core_submit_and_staging_methodology_weights_agree() {
+        use crate::routes::submit::MethodologySubmission;
+        use epigraph_core::Methodology as M;
+        let all = [
+            M::Deductive,
+            M::Inductive,
+            M::Abductive,
+            M::Instrumental,
+            M::Extraction,
+            M::BayesianInference,
+            M::VisualInspection,
+            M::FormalProof,
+            M::Heuristic,
+        ];
+        for m in all {
+            // Exhaustive: a new variant fails to compile here until `all`
+            // lists it.
+            match m {
+                M::Deductive
+                | M::Inductive
+                | M::Abductive
+                | M::Instrumental
+                | M::Extraction
+                | M::BayesianInference
+                | M::VisualInspection
+                | M::FormalProof
+                | M::Heuristic => {}
+            }
+            let wire = serde_json::to_value(m).expect("serialize");
+            let name = wire.as_str().expect("a unit variant is a string");
+            let submitted: MethodologySubmission =
+                serde_json::from_value(wire.clone()).expect("the packet route accepts core's name");
+            assert_eq!(submitted.as_domain(), m, "{name}");
+            assert_eq!(submitted.weight_modifier(), m.weight_modifier(), "{name}");
+            assert_eq!(
+                staging_methodology_weight(name),
+                m.weight_modifier(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            staging_methodology_weight("bayesian"),
+            M::BayesianInference.weight_modifier(),
+            "the legacy staging alias"
+        );
+        assert_eq!(
+            staging_methodology_weight("no_such_methodology"),
+            M::Heuristic.weight_modifier(),
+            "an unknown string weighs as heuristic"
+        );
+    }
+
+    /// Staging normalizes a methodology weight by core's top weight
+    /// (`Methodology::MAX_WEIGHT_MODIFIER`), not a copied `1.2`: the top
+    /// methodology at full confidence contributes the whole evidence factor,
+    /// whatever core sets that weight to (backlog 19e46f05).
+    #[test]
+    fn the_top_methodology_normalizes_to_exactly_one_in_staging() {
+        let evidence_factor = 1.0 - (-0.3_f64 * 3.0).exp();
+        let want = 0.3 + evidence_factor * 0.5;
+        let got = calculate_staging_truth(3, "formal_proof", 1.0);
+        assert!(
+            (got - want).abs() < 1e-12,
+            "formal_proof at full confidence must normalize to 1: got {got}, want {want}"
+        );
     }
 
     #[test]

@@ -1,31 +1,54 @@
-//! `EpiGraph` Core: Label Property Graph Primitives
+//! `EpiGraph` Core: the kernel's shared domain vocabulary
 //!
-//! This crate provides the foundational types for `EpiGraph`'s epistemic knowledge graph,
-//! built on a Label Property Graph (LPG) model that enables dynamic ontology evolution.
+//! The types every other crate agrees on: typed ids, the domain structs a
+//! write path builds before it reaches the database, the tenancy declaration
+//! every tier-A write carries, and the names edges are stored under. Storage
+//! lives in `epigraph-db` (claims, evidence, agents and edges are rows, not
+//! in-memory graph objects); this crate has no database dependency, so the
+//! API's `--no-default-features` build can still name every type here.
 //!
-//! # Design Philosophy
+//! # Ids
 //!
-//! Unlike traditional fixed-schema approaches, the LPG model stores:
-//! - Node types as **labels** (data, not schema)
-//! - Edge types as **relationship names** (data, not ENUMs)
-//! - Properties as **typed key-value maps** on both nodes and edges
+//! [`domain::ids`] wraps each entity's UUID in its own newtype ([`AgentId`],
+//! [`ClaimId`], [`EvidenceId`], [`TraceId`]), so a claim id cannot be passed
+//! where an agent id is expected.
 //!
-//! This enables the ontology to evolve with the data without DDL migrations.
+//! # Domain structs
 //!
-//! # Core Types
+//! [`domain`] holds the entities: [`Agent`], [`Claim`] (with its
+//! [`TruthValue`], see [`truth`]), [`Evidence`], [`ReasoningTrace`],
+//! [`SemanticLink`], [`Activity`] and [`LearningEvent`]. Around them:
 //!
-//! ## Graph Primitives
-//! - [`NodeId`] / [`EdgeId`]: Type-safe identifiers
-//! - [`Label`]: Validated ontology term for node classification
-//! - [`PropertyValue`] / [`PropertyMap`]: Typed property storage
-//! - [`Node`]: Graph vertex with labels and properties
-//! - [`Edge`]: Directed relationship with type and properties
+//! - [`labels`] holds [`Label`], the validated term stored in a row's
+//!   `labels`.
+//! - [`prov`] holds [`ProvAgentType`], the W3C PROV-O agent type read off
+//!   labels.
+//! - [`traits`] holds [`Signable`], [`Verifiable`] and [`ContentAddressable`],
+//!   the hooks between domain types and `epigraph-crypto`.
+//! - [`challenge`] holds [`Challenge`] and [`ChallengeService`], disputes
+//!   against an existing claim.
+//! - [`atomicity`] holds the heuristic deciding whether a claim is already one
+//!   atomic proposition.
+//! - [`projection`] holds the deterministic 2-D projection served in place of
+//!   raw embeddings.
+//! - [`errors`] holds [`CoreError`].
 //!
-//! ## Domain Models
-//! - [`domain::Agent`]: Entity that makes claims
-//! - [`domain::Claim`]: Epistemic assertion with truth value
-//! - [`domain::Evidence`]: Supporting material for claims
-//! - [`domain::ReasoningTrace`]: Logical derivation path
+//! # Tenancy
+//!
+//! In [`tenancy`], [`TenancyDecl`] is what a write path says about who owns the
+//! row it creates and at what [`Visibility`]; [`tenancy::consolidate_tenancy`]
+//! derives the tenancy of a row merged from several claims, refusing a merge
+//! across groups.
+//!
+//! [`canonical_scopes`] holds the scope sets of the service roles, and
+//! [`extensions`] re-exports the [`PolicyGate`] extension point (deny-all by
+//! default).
+//!
+//! # Relationship vocabulary
+//!
+//! [`edge::relationships`] names the relationships edges are stored under,
+//! and decides which spelling a writer stores and which spellings a reader
+//! matches. Downstream crates import it by that path.
 
 pub mod atomicity;
 pub mod canonical_scopes;
@@ -34,24 +57,16 @@ pub mod domain;
 pub mod edge;
 pub mod errors;
 pub mod extensions;
-pub mod graph;
-pub mod ids;
 pub mod labels;
-pub mod node;
 pub mod projection;
-pub mod properties;
 pub mod prov;
 pub mod tenancy;
 pub mod traits;
 pub mod truth;
 
 // Re-export primary types at crate root
-pub use edge::Edge;
 pub use errors::CoreError;
-pub use ids::{EdgeId, NodeId};
 pub use labels::Label;
-pub use node::Node;
-pub use properties::{PropertyMap, PropertyValue};
 pub use prov::ProvAgentType;
 pub use tenancy::{
     consolidate_owner, consolidate_tenancy, ConsolidateTenancyError, SourceTenancy, TenancyDecl,

@@ -145,11 +145,56 @@
 //!   evidence write (the BetP after it against the posterior after it), and
 //!   the act is not one; the claim's next live evidence write records its row
 //!   against the rebuilt track (see "The Beta track").
+//!
+//! # Selections and dry runs (backlog 02d9e9a1)
+//!
+//! Besides an explicit id list, either act takes a [`Selection`]: a root
+//! claim, the edge types to follow (default `decomposes_to` and `supports`),
+//! a direction (default `outgoing`) and a depth (default 3, at most 10).
+//! [`plan`] walks it on the caller's own stamped connection, through
+//! [`EdgeRepository::claim_neighbors_for_selection`] (the caller's viewer:
+//! a claim or edge the caller cannot read is never followed or named), and
+//! asks the act's own definer how it would classify every claim it reaches
+//! ([`ClaimRepository::preview_publicize_conn`] /
+//! [`ClaimRepository::preview_share_with_team_conn`], which never act). So the
+//! walk decides nothing about authority: a claim the definer would move joins
+//! the plan and the walk goes on from it (for publicize, an `already_public`
+//! claim too); any other claim is a BOUNDARY, reported with the definer's
+//! reason and not walked through, and so is a superseded claim
+//! (`not_current`). Boundaries are reported, never moved.
+//!
+//! [`act`] then hands the planned claims to [`publicize_claims`] /
+//! [`share_claims_with_team`] unchanged: the same definer, the same cascade
+//! per claim, the same refold, all or nothing, one audit row naming every
+//! moved id. A plan over [`MAX_ACT_CLAIMS`] claims, or a walk that reaches
+//! more than [`MAX_WALK_CLAIMS`] claims in all, is refused whole. A root the
+//! caller cannot read answers as a missing claim, exactly as the id form
+//! does. `dry_run` returns the plan and changes nothing (the previews roll
+//! back to a savepoint, and the transports drop the transaction). When the
+//! act would run, the dry run also runs it once inside a savepoint it rolls
+//! back, and reports what it did to the planned claims' edges and evidence
+//! as far as the caller can read them ([`PlanEffects`]: edges widened or
+//! kept as narrow, evidence moved or kept behind).
+//!
+//! The effects name no group the caller is not in. They cover only the
+//! claims the act would MOVE (`publicize` / `share`), never an
+//! `already_public` claim the walk passed through (someone else's public
+//! claim is no business of this act's report), and every stored
+//! `owner_group_id` / `co_owner_group_id` outside the caller's own groups is
+//! withheld (`null`, with `*_withheld: true`): no claim read surface returns
+//! another group's id, and a dry run must not be one. For an elevated
+//! session "the caller's own groups" are its writable groups only. With no
+//! claim to move, the dry run runs no trial and its effects are empty.
+//!
+//! Workflow lineages are not walked (their moves stay an operator act).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use epigraph_db::errors::RefusalKind;
-use epigraph_db::{ClaimRepository, DbError, ScopedBeliefRepository, VisibilityActOutcome};
+use epigraph_db::{
+    ClaimRepository, DbError, EdgeRepository, EvidenceRepository, ScopedBeliefRepository,
+    VisibilityActOutcome,
+};
 use uuid::Uuid;
 
 use crate::edge_factor;
@@ -462,4 +507,895 @@ pub async fn rebuild_moved_beta_tracks(
         });
     }
     Ok(report)
+}
+
+// ── Selections and dry runs (backlog 02d9e9a1; module doc) ──────────────────
+
+/// The most claims one act moves: the definers' own cap (migration 206).
+pub const MAX_ACT_CLAIMS: usize = 500;
+
+/// The most claims a selection walk reaches (moved and boundaries) before it
+/// stops as capped. Bounds the walk's reads and previews.
+pub const MAX_WALK_CLAIMS: usize = 2_000;
+
+/// The deepest a selection walks.
+pub const MAX_SELECTION_DEPTH: u32 = 10;
+
+/// A selection's depth when it names none.
+pub const DEFAULT_SELECTION_DEPTH: u32 = 3;
+
+/// The edge types a selection follows when it names none.
+pub const DEFAULT_SELECTION_EDGE_TYPES: &[&str] = &["decomposes_to", "supports"];
+
+/// The claim-to-claim relationships a selection may follow: the structural
+/// and epistemic links that put claims into one body of work. `supersedes`
+/// (a version chain), the contradiction edges and the paper and workflow
+/// links are not among them.
+pub const SELECTION_EDGE_TYPES: &[&str] = &[
+    "decomposes_to",
+    "supports",
+    "corroborates",
+    "elaborates",
+    "specializes",
+    "generalizes",
+    "refines",
+    "section_follows",
+    "continues_argument",
+];
+
+/// Which way a selection follows an edge from a claim it has reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SelectionDirection {
+    /// From the edge's source to its target (`R decomposes_to C`: R to C).
+    Outgoing,
+    /// From the edge's target to its source (`E supports R`: R to E).
+    Incoming,
+    /// Both.
+    Both,
+}
+
+impl SelectionDirection {
+    /// `outgoing`, `incoming` or `both`.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "outgoing" => Some(Self::Outgoing),
+            "incoming" => Some(Self::Incoming),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    const fn outgoing(self) -> bool {
+        matches!(self, Self::Outgoing | Self::Both)
+    }
+
+    const fn incoming(self) -> bool {
+        matches!(self, Self::Incoming | Self::Both)
+    }
+}
+
+/// A root claim and the closure to walk from it (module doc, "Selections").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Selection {
+    /// The claim the walk starts from; part of the plan if the act may move it.
+    pub root: Uuid,
+    /// Relationships followed, canonical spelling, each in
+    /// [`SELECTION_EDGE_TYPES`].
+    pub edge_types: Vec<String>,
+    /// Which way edges are followed.
+    pub direction: SelectionDirection,
+    /// Edges followed from the root at most (0: the root alone).
+    pub max_depth: u32,
+}
+
+impl Selection {
+    /// A selection from a request's raw fields, with the defaults for those
+    /// it omits.
+    ///
+    /// # Errors
+    /// A message naming the bad field: an edge type outside
+    /// [`SELECTION_EDGE_TYPES`], an empty `edge_types`, a direction other
+    /// than `outgoing` / `incoming` / `both`, or a depth over
+    /// [`MAX_SELECTION_DEPTH`].
+    pub fn new(
+        root: Uuid,
+        edge_types: Option<&[String]>,
+        direction: Option<&str>,
+        max_depth: Option<u32>,
+    ) -> Result<Self, String> {
+        let edge_types: Vec<String> = match edge_types {
+            None => DEFAULT_SELECTION_EDGE_TYPES
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect(),
+            Some(raw) => {
+                let mut out: Vec<String> = Vec::with_capacity(raw.len());
+                for t in raw {
+                    let canonical =
+                        epigraph_core::edge::relationships::canonical_relationship(t.trim());
+                    if !SELECTION_EDGE_TYPES.contains(&canonical) {
+                        return Err(format!(
+                            "selection.edge_types: {t:?} is not followed by a selection; \
+                             use any of {}",
+                            SELECTION_EDGE_TYPES.join(", ")
+                        ));
+                    }
+                    if !out.iter().any(|o| o == canonical) {
+                        out.push(canonical.to_string());
+                    }
+                }
+                if out.is_empty() {
+                    return Err(
+                        "selection.edge_types: name at least one edge type, or omit \
+                                it for decomposes_to and supports"
+                            .to_string(),
+                    );
+                }
+                out
+            }
+        };
+        let direction = match direction.map(str::trim).filter(|d| !d.is_empty()) {
+            None => SelectionDirection::Outgoing,
+            Some(d) => SelectionDirection::parse(d).ok_or_else(|| {
+                format!("selection.direction: {d:?} is not outgoing, incoming or both")
+            })?,
+        };
+        let max_depth = max_depth.unwrap_or(DEFAULT_SELECTION_DEPTH);
+        if max_depth > MAX_SELECTION_DEPTH {
+            return Err(format!(
+                "selection.max_depth: {max_depth} is deeper than {MAX_SELECTION_DEPTH}"
+            ));
+        }
+        Ok(Self {
+            root,
+            edge_types,
+            direction,
+            max_depth,
+        })
+    }
+}
+
+/// Which widening act a plan is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WideningAct {
+    /// `publicize_claims`: group to public.
+    Publicize,
+    /// `share_claims_with_team` into `group_id`.
+    ShareWithTeam {
+        /// The team.
+        group_id: Uuid,
+    },
+}
+
+impl WideningAct {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Publicize => "publicize_claims",
+            Self::ShareWithTeam { .. } => "share_claims_with_team",
+        }
+    }
+
+    /// The definer's own classification of `ids`, without acting.
+    async fn preview(
+        self,
+        conn: &mut sqlx::PgConnection,
+        ids: &[Uuid],
+    ) -> Result<Vec<VisibilityActOutcome>, DbError> {
+        match self {
+            Self::Publicize => ClaimRepository::preview_publicize_conn(conn, ids).await,
+            Self::ShareWithTeam { group_id } => {
+                ClaimRepository::preview_share_with_team_conn(conn, ids, group_id).await
+            }
+        }
+    }
+}
+
+/// Whether the definer would act on (or, `already_public`, accept) a claim
+/// it classified so.
+fn accepted(outcome: &str) -> bool {
+    matches!(outcome, "publicize" | "already_public" | "share")
+}
+
+/// What an act takes: the explicit ids of #784, or a selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActTarget {
+    /// 1 to [`MAX_ACT_CLAIMS`] claim ids.
+    Ids(Vec<Uuid>),
+    /// A root and the closure to walk from it.
+    Selection(Selection),
+}
+
+/// A claim the act would take, and how the walk reached it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlannedClaim {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// Edges from the root (0 for the root and for an explicit id).
+    pub depth: u32,
+    /// The definer's classification: `publicize`, `already_public` or `share`.
+    pub outcome: String,
+    /// The claim the walk came from, absent at depth 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reached_from: Option<Uuid>,
+    /// The relationship of the edge it came over, absent at depth 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<String>,
+}
+
+/// A claim the act would NOT take, and why: the walk stopped there. Never
+/// moved by the act.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlanBoundary {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// Edges from the root.
+    pub depth: u32,
+    /// The definer's refusal (`refused_not_author`, `refused_not_private`,
+    /// `refused_sealed`, `refused_not_admin`, `refused_not_team_writer`,
+    /// `refused_not_human`), `not_found` (no longer readable), or
+    /// `not_current` (a superseded claim, not walked into).
+    pub reason: String,
+    /// The reason in words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<&'static str>,
+    /// The claim the walk came from, absent at depth 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reached_from: Option<Uuid>,
+    /// The relationship of the edge it came over, absent at depth 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<String>,
+}
+
+/// What an act would do: the claims it would take and the boundaries where it
+/// stops. Built by [`plan`] from the definer's own classification.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VisibilityPlan {
+    /// The selection walked, absent for an explicit id list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<Selection>,
+    /// Claims the act would take, in the order reached.
+    pub claims: Vec<PlannedClaim>,
+    /// Claims where the walk stopped, in the order reached.
+    pub boundaries: Vec<PlanBoundary>,
+    /// The walk reached more than [`MAX_ACT_CLAIMS`] claims to take or more
+    /// than [`MAX_WALK_CLAIMS`] in all, and stopped: the plan is incomplete
+    /// and the act refuses it.
+    pub capped: bool,
+    /// On a dry run the act would carry out (claims to take, not capped, and
+    /// for an id list no refused id): what it would do to the edges and
+    /// evidence of the planned claims the caller can read, measured by
+    /// running the act and rolling it back ([`PlanEffects`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effects: Option<PlanEffects>,
+}
+
+/// One stored tenancy: `visibility`, `owner_group_id`, `co_owner_group_id`.
+///
+/// A group the caller is not in is never named: its id is `None` and the
+/// matching `*_withheld` flag is set ([`Self::withhold_foreign`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StoredTenancy {
+    /// `group` or `public`.
+    pub visibility: Option<String>,
+    /// The owner group, when it is one of the caller's.
+    pub owner_group_id: Option<Uuid>,
+    /// An edge's co-owner group (the other endpoint's), when it has one and
+    /// it is one of the caller's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub co_owner_group_id: Option<Uuid>,
+    /// The owner group is set but is not one of the caller's, so it is not
+    /// named.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub owner_group_withheld: bool,
+    /// The co-owner group is set but is not one of the caller's, so it is
+    /// not named.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub co_owner_group_withheld: bool,
+}
+
+impl StoredTenancy {
+    const fn stored(
+        visibility: Option<String>,
+        owner_group_id: Option<Uuid>,
+        co_owner_group_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            visibility,
+            owner_group_id,
+            co_owner_group_id,
+            owner_group_withheld: false,
+            co_owner_group_withheld: false,
+        }
+    }
+
+    /// Withhold every group id not in `own` (the caller's groups).
+    fn withhold_foreign(mut self, own: &HashSet<Uuid>) -> Self {
+        if self.owner_group_id.is_some_and(|g| !own.contains(&g)) {
+            self.owner_group_id = None;
+            self.owner_group_withheld = true;
+        }
+        if self.co_owner_group_id.is_some_and(|g| !own.contains(&g)) {
+            self.co_owner_group_id = None;
+            self.co_owner_group_withheld = true;
+        }
+        self
+    }
+}
+
+/// The groups a dry run's report may name for `viewer`: the groups it reads
+/// as a member and the groups it writes (an elevated viewer binds no read
+/// set, so only its writable groups), and the nil owner of a public row no
+/// writer owns (it names no group).
+fn own_groups(viewer: &epigraph_db::visibility::Viewer) -> HashSet<Uuid> {
+    viewer
+        .group_bind()
+        .unwrap_or_default()
+        .iter()
+        .chain(viewer.writable_groups())
+        .copied()
+        .chain([Uuid::nil()])
+        .collect()
+}
+
+/// A selection's boundary reason for a superseded claim (root or reached).
+const NOT_CURRENT: &str = "not_current";
+const NOT_CURRENT_DETAIL: &str =
+    "the claim is superseded; a selection does not move it or walk from it";
+
+/// Whether the act would MOVE a claim it classified so (not merely accept
+/// it, as `already_public`).
+fn moves(outcome: &str) -> bool {
+    matches!(outcome, "publicize" | "share")
+}
+
+/// An edge with a planned claim as an endpoint, before and after the act.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlannedEdge {
+    /// The edge.
+    pub edge_id: Uuid,
+    /// Its source.
+    pub source_id: Uuid,
+    /// Its source's type.
+    pub source_type: String,
+    /// Its target.
+    pub target_id: Uuid,
+    /// Its target's type.
+    pub target_type: String,
+    /// Its relationship.
+    pub relationship: String,
+    /// Its tenancy now.
+    pub before: StoredTenancy,
+    /// Its tenancy after the act; `None` when the caller can no longer read
+    /// the edge after it (then it is reported kept: nothing the caller reads
+    /// says it widened).
+    pub after: Option<StoredTenancy>,
+}
+
+/// An evidence row of a planned claim, as the act would leave it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlannedEvidence {
+    /// The evidence row.
+    pub evidence_id: Uuid,
+    /// Its claim.
+    pub claim_id: Uuid,
+    /// Its tenancy, now and after the act.
+    pub tenancy: StoredTenancy,
+}
+
+/// What a dry run's trial of the act did to the edges and evidence of the
+/// planned claims it MOVES (not an `already_public` one), as far as the
+/// caller can read them, naming no group the caller is not in (backlog
+/// 02d9e9a1, the
+/// plan's "edges that widen or stay narrowed, evidence that stays pinned").
+/// The act's own cascade decided it (migration 206's re-meet, 110's pins,
+/// 284's declared edges); the trial is rolled back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PlanEffects {
+    /// Incident edges the act widens: public after and not before, or no
+    /// longer requiring a group they required (an edge is read by the
+    /// members of its owner group AND of its co-owner group). Re-met to the
+    /// moved claims' new audience.
+    pub edges_widened: Vec<PlannedEdge>,
+    /// Incident edges the act leaves as narrow as they were, or narrower:
+    /// unchanged, or still requiring every group they required (an edge to a
+    /// claim that stays behind keeps that claim's group; a declared edge
+    /// keeps its declaration).
+    pub edges_kept: Vec<PlannedEdge>,
+    /// Evidence rows that move with their claim.
+    pub evidence_moved: usize,
+    /// Evidence rows that stay where they are (pinned private, migration
+    /// 110).
+    pub evidence_kept: Vec<PlannedEvidence>,
+    /// More than [`MAX_EFFECT_ROWS`] incident edges or evidence rows: the
+    /// lists cover the first of them by id only.
+    pub truncated: bool,
+}
+
+/// The most incident edges, and evidence rows, a dry run's trial reports.
+pub const MAX_EFFECT_ROWS: usize = 5_000;
+
+impl VisibilityPlan {
+    /// The ids of [`Self::claims`].
+    #[must_use]
+    pub fn claim_ids(&self) -> Vec<Uuid> {
+        self.claims.iter().map(|c| c.claim_id).collect()
+    }
+}
+
+/// An act's answer: the definer's outcomes when it ran, the plan when one was
+/// made (a selection, or a dry run).
+#[derive(Debug, Clone)]
+pub struct ActReport {
+    /// The plan, for a selection or a dry run; `None` for an explicit id list
+    /// that was acted on (the #784 shape).
+    pub plan: Option<VisibilityPlan>,
+    /// The act's per-claim outcomes; empty on a dry run.
+    pub results: Vec<VisibilityActOutcome>,
+}
+
+fn boundary(
+    o: &VisibilityActOutcome,
+    depth: u32,
+    reached_from: Option<Uuid>,
+    relationship: Option<String>,
+) -> PlanBoundary {
+    PlanBoundary {
+        claim_id: o.claim_id,
+        depth,
+        reason: o.outcome.clone(),
+        detail: o.refusal_text(),
+        reached_from,
+        relationship,
+    }
+}
+
+/// What `act` would do on `target` for the caller on `conn` (its own stamped
+/// transaction), without doing it. See the module doc, "Selections".
+///
+/// # Errors
+/// [`VisibilityActError::Db`]: `NotFound` when the root (or an explicit id)
+/// is a claim the caller cannot read or that does not exist, answered as the
+/// act answers it; the definer's whole-call refusals (`VIS01`, `VIS03`); a
+/// database fault.
+pub async fn plan(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    act: WideningAct,
+    target: &ActTarget,
+) -> Result<VisibilityPlan, VisibilityActError> {
+    let selection = match target {
+        ActTarget::Ids(ids) => {
+            let outcomes = act.preview(&mut *conn, ids).await?;
+            if let Some(o) = outcomes.iter().find(|o| o.outcome == "not_found") {
+                return Err(DbError::NotFound {
+                    entity: "claim".to_string(),
+                    id: o.claim_id,
+                }
+                .into());
+            }
+            let (claims, boundaries): (Vec<_>, Vec<_>) =
+                outcomes.iter().partition(|o| accepted(&o.outcome));
+            return Ok(VisibilityPlan {
+                selection: None,
+                claims: claims
+                    .into_iter()
+                    .map(|o| PlannedClaim {
+                        claim_id: o.claim_id,
+                        depth: 0,
+                        outcome: o.outcome.clone(),
+                        reached_from: None,
+                        relationship: None,
+                    })
+                    .collect(),
+                boundaries: boundaries
+                    .into_iter()
+                    .map(|o| boundary(o, 0, None, None))
+                    .collect(),
+                capped: ids.len() > MAX_ACT_CLAIMS,
+                effects: None,
+            });
+        }
+        ActTarget::Selection(s) => s,
+    };
+
+    let mut out = VisibilityPlan {
+        selection: Some(selection.clone()),
+        claims: Vec::new(),
+        boundaries: Vec::new(),
+        capped: false,
+        effects: None,
+    };
+    // The root first: unreadable answers as missing, exactly as the id form.
+    let root = act
+        .preview(&mut *conn, std::slice::from_ref(&selection.root))
+        .await?;
+    let Some(root) = root.into_iter().find(|o| o.claim_id == selection.root) else {
+        return Err(DbError::NotFound {
+            entity: "claim".to_string(),
+            id: selection.root,
+        }
+        .into());
+    };
+    if root.outcome == "not_found" {
+        return Err(DbError::NotFound {
+            entity: "claim".to_string(),
+            id: selection.root,
+        }
+        .into());
+    }
+    let mut seen: HashSet<Uuid> = HashSet::from([selection.root]);
+    let mut frontier: Vec<Uuid> = Vec::new();
+    // A superseded root is a boundary as a superseded child is: the walk
+    // neither takes it nor starts from it. (Readable: the preview found it.)
+    let root_current =
+        ClaimRepository::are_all_current(&mut *conn, viewer, std::slice::from_ref(&selection.root))
+            .await?;
+    if !root_current {
+        out.boundaries.push(PlanBoundary {
+            claim_id: selection.root,
+            depth: 0,
+            reason: NOT_CURRENT.to_string(),
+            detail: Some(NOT_CURRENT_DETAIL),
+            reached_from: None,
+            relationship: None,
+        });
+    } else if accepted(&root.outcome) {
+        out.claims.push(PlannedClaim {
+            claim_id: root.claim_id,
+            depth: 0,
+            outcome: root.outcome,
+            reached_from: None,
+            relationship: None,
+        });
+        frontier.push(selection.root);
+    } else {
+        out.boundaries.push(boundary(&root, 0, None, None));
+    }
+
+    let types: Vec<&str> = selection.edge_types.iter().map(String::as_str).collect();
+    let limit = i64::try_from(MAX_WALK_CLAIMS + 1).unwrap_or(i64::MAX);
+    for depth in 1..=selection.max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+        let rows = EdgeRepository::claim_neighbors_for_selection(
+            &mut *conn,
+            viewer,
+            &frontier,
+            &types,
+            selection.direction.outgoing(),
+            selection.direction.incoming(),
+            limit,
+        )
+        .await?;
+        if rows.len() > MAX_WALK_CLAIMS {
+            out.capped = true;
+            break;
+        }
+        // First edge to each claim not yet reached, in the read's order.
+        let mut reached: Vec<(Uuid, Uuid, String)> = Vec::new();
+        let mut superseded: Vec<(Uuid, Uuid, String)> = Vec::new();
+        for (from, to, relationship, is_current) in rows {
+            if !seen.insert(to) {
+                continue;
+            }
+            if is_current {
+                reached.push((to, from, relationship));
+            } else {
+                superseded.push((to, from, relationship));
+            }
+        }
+        for (to, from, relationship) in superseded {
+            out.boundaries.push(PlanBoundary {
+                claim_id: to,
+                depth,
+                reason: NOT_CURRENT.to_string(),
+                detail: Some(NOT_CURRENT_DETAIL),
+                reached_from: Some(from),
+                relationship: Some(relationship),
+            });
+        }
+        let ids: Vec<Uuid> = reached.iter().map(|r| r.0).collect();
+        let classified: HashMap<Uuid, VisibilityActOutcome> = act
+            .preview(&mut *conn, &ids)
+            .await?
+            .into_iter()
+            .map(|o| (o.claim_id, o))
+            .collect();
+        let mut next = Vec::new();
+        for (to, from, relationship) in reached {
+            let o = classified
+                .get(&to)
+                .cloned()
+                .unwrap_or_else(|| VisibilityActOutcome {
+                    claim_id: to,
+                    outcome: "not_found".to_string(),
+                });
+            if accepted(&o.outcome) {
+                out.claims.push(PlannedClaim {
+                    claim_id: to,
+                    depth,
+                    outcome: o.outcome,
+                    reached_from: Some(from),
+                    relationship: Some(relationship),
+                });
+                next.push(to);
+            } else {
+                out.boundaries
+                    .push(boundary(&o, depth, Some(from), Some(relationship)));
+            }
+        }
+        if out.claims.len() > MAX_ACT_CLAIMS || seen.len() > MAX_WALK_CLAIMS {
+            out.capped = true;
+            break;
+        }
+        frontier = next;
+    }
+    Ok(out)
+}
+
+/// `act` on `target` for the caller on `conn`, or (`dry_run`) only its plan.
+///
+/// * An explicit id list, not a dry run: [`publicize_claims`] /
+///   [`share_claims_with_team`] exactly as before, no plan.
+/// * A dry run: [`plan`], and nothing changes.
+/// * A selection: [`plan`], then the act on the planned claims, all or
+///   nothing. Refused whole, with nothing changed, when the plan is capped or
+///   when the root itself is a boundary (with the act's own refusal for it).
+///
+/// # Errors
+/// As [`plan`] and [`publicize_claims`]; a capped selection is
+/// [`RefusalKind::Input`].
+pub async fn act(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    act: WideningAct,
+    target: &ActTarget,
+    reason: &str,
+    dry_run: bool,
+) -> Result<ActReport, VisibilityActError> {
+    if let (ActTarget::Ids(ids), false) = (target, dry_run) {
+        return Ok(ActReport {
+            plan: None,
+            results: apply(conn, viewer, act, ids, reason).await?,
+        });
+    }
+    let planned = plan(&mut *conn, viewer, act, target).await?;
+    if dry_run {
+        let mut planned = planned;
+        let would_act = !planned.capped
+            && !planned.claims.is_empty()
+            && (matches!(target, ActTarget::Selection(_)) || planned.boundaries.is_empty());
+        if would_act {
+            // Report only on the claims the act would move: an
+            // `already_public` claim (someone else's, as like as not) is
+            // passed to the act, which leaves it, and is no part of the
+            // report. With nothing to move there is nothing to try.
+            let movers: Vec<Uuid> = planned
+                .claims
+                .iter()
+                .filter(|c| moves(&c.outcome))
+                .map(|c| c.claim_id)
+                .collect();
+            planned.effects = Some(if movers.is_empty() {
+                PlanEffects::default()
+            } else {
+                trial(
+                    &mut *conn,
+                    viewer,
+                    act,
+                    &planned.claim_ids(),
+                    &movers,
+                    reason,
+                )
+                .await?
+            });
+        }
+        return Ok(ActReport {
+            plan: Some(planned),
+            results: Vec::new(),
+        });
+    }
+    if planned.capped {
+        return Err(DbError::Refused {
+            kind: RefusalKind::Input,
+            message: format!(
+                "{}: refused, and nothing was changed: the selection reaches more than \
+                 {MAX_ACT_CLAIMS} claims to move (or more than {MAX_WALK_CLAIMS} claims in \
+                 all). Narrow it (max_depth, edge_types) or move part of it by claim_ids.",
+                act.name()
+            ),
+        }
+        .into());
+    }
+    if planned.claims.is_empty() {
+        // Only the root can leave the plan empty: it is a boundary. A
+        // superseded root is refused as such; any other, as the act refuses
+        // it.
+        if planned
+            .boundaries
+            .iter()
+            .any(|b| b.depth == 0 && b.reason == NOT_CURRENT)
+        {
+            return Err(DbError::Refused {
+                kind: RefusalKind::State,
+                message: format!(
+                    "{}: refused, and nothing was changed: the selection's root is superseded; \
+                     select from its current version",
+                    act.name()
+                ),
+            }
+            .into());
+        }
+        let root: Vec<VisibilityActOutcome> = planned
+            .boundaries
+            .iter()
+            .filter(|b| b.depth == 0)
+            .map(|b| VisibilityActOutcome {
+                claim_id: b.claim_id,
+                outcome: b.reason.clone(),
+            })
+            .collect();
+        return Err(epigraph_db::preview_refusal(act.name(), &root)
+            .unwrap_or_else(|| DbError::Refused {
+                kind: RefusalKind::State,
+                message: format!("{}: refused, and nothing was changed", act.name()),
+            })
+            .into());
+    }
+    let results = apply(conn, viewer, act, &planned.claim_ids(), reason).await?;
+    Ok(ActReport {
+        plan: Some(planned),
+        results,
+    })
+}
+
+/// Run the act on `ids` (the whole plan, exactly what the act would be
+/// handed) inside a savepoint, read the incident edges and the evidence of
+/// `movers` (the planned claims it would move) through the caller's viewer
+/// before and after, and roll the savepoint back whatever happened: the dry
+/// run's report of what the act would do to them ([`PlanEffects`]), naming
+/// no group the caller is not in. An act that would fail fails the dry run
+/// with the same error, with nothing changed.
+async fn trial(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    act: WideningAct,
+    ids: &[Uuid],
+    movers: &[Uuid],
+    reason: &str,
+) -> Result<PlanEffects, VisibilityActError> {
+    let limit = i64::try_from(MAX_EFFECT_ROWS + 1).unwrap_or(i64::MAX);
+    let edges_before =
+        EdgeRepository::tenancy_incident_to_claims(&mut *conn, viewer, movers, limit).await?;
+    let evidence_before =
+        EvidenceRepository::tenancy_for_claims(&mut *conn, viewer, movers, limit).await?;
+    sqlx::query("SAVEPOINT epigraph_visibility_trial")
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+    let ran = trial_body(&mut *conn, viewer, act, ids, movers, reason, limit).await;
+    // Always back to before the act, whatever it did.
+    sqlx::query("ROLLBACK TO SAVEPOINT epigraph_visibility_trial")
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+    sqlx::query("RELEASE SAVEPOINT epigraph_visibility_trial")
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+    let (edges_after, evidence_after) = ran?;
+
+    let mut out = PlanEffects {
+        truncated: edges_before.len() > MAX_EFFECT_ROWS || evidence_before.len() > MAX_EFFECT_ROWS,
+        ..PlanEffects::default()
+    };
+    // Classified on the stored values, THEN stripped of every group id the
+    // caller is not in.
+    let own = own_groups(viewer);
+    let after: HashMap<Uuid, &epigraph_db::IncidentEdgeTenancy> =
+        edges_after.iter().map(|e| (e.id, e)).collect();
+    let tenancy_of = |e: &epigraph_db::IncidentEdgeTenancy| {
+        StoredTenancy::stored(e.visibility.clone(), e.owner_group_id, e.co_owner_group_id)
+    };
+    for e in edges_before.iter().take(MAX_EFFECT_ROWS) {
+        let before = tenancy_of(e);
+        let after = after.get(&e.id).map(|a| tenancy_of(a));
+        let widened = after.as_ref().is_some_and(|a| widens(&before, a));
+        let planned = PlannedEdge {
+            edge_id: e.id,
+            source_id: e.source_id,
+            source_type: e.source_type.clone(),
+            target_id: e.target_id,
+            target_type: e.target_type.clone(),
+            relationship: e.relationship.clone(),
+            before: before.withhold_foreign(&own),
+            after: after.map(|a| a.withhold_foreign(&own)),
+        };
+        if widened {
+            out.edges_widened.push(planned);
+        } else {
+            out.edges_kept.push(planned);
+        }
+    }
+    let after: HashMap<Uuid, epigraph_db::EvidenceTenancy> =
+        evidence_after.into_iter().map(|e| (e.id, e)).collect();
+    for ev in evidence_before.into_iter().take(MAX_EFFECT_ROWS) {
+        let moved = after.get(&ev.id).is_some_and(|a| {
+            a.visibility != ev.visibility || a.owner_group_id != ev.owner_group_id
+        });
+        if moved {
+            out.evidence_moved += 1;
+        } else {
+            out.evidence_kept.push(PlannedEvidence {
+                evidence_id: ev.id,
+                claim_id: ev.claim_id,
+                tenancy: StoredTenancy::stored(ev.visibility, ev.owner_group_id, None)
+                    .withhold_foreign(&own),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Whether an edge's audience may grow from `before` to `after`: it becomes
+/// public, or a group it required (owner or co-owner) is no longer
+/// required. An edge that only gains a required group narrows.
+fn widens(before: &StoredTenancy, after: &StoredTenancy) -> bool {
+    let public = |t: &StoredTenancy| t.visibility.as_deref() == Some("public");
+    if public(before) {
+        return false;
+    }
+    if public(after) {
+        return true;
+    }
+    let required = |t: &StoredTenancy| -> HashSet<Uuid> {
+        [t.owner_group_id, t.co_owner_group_id]
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    !required(before).is_subset(&required(after))
+}
+
+/// [`trial`]'s act on `ids` and its reads of `movers` after, inside the
+/// savepoint.
+async fn trial_body(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    act: WideningAct,
+    ids: &[Uuid],
+    movers: &[Uuid],
+    reason: &str,
+    limit: i64,
+) -> Result<
+    (
+        Vec<epigraph_db::IncidentEdgeTenancy>,
+        Vec<epigraph_db::EvidenceTenancy>,
+    ),
+    VisibilityActError,
+> {
+    apply(&mut *conn, viewer, act, ids, reason).await?;
+    let edges =
+        EdgeRepository::tenancy_incident_to_claims(&mut *conn, viewer, movers, limit).await?;
+    let evidence =
+        EvidenceRepository::tenancy_for_claims(&mut *conn, viewer, movers, limit).await?;
+    Ok((edges, evidence))
+}
+
+async fn apply(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    act: WideningAct,
+    ids: &[Uuid],
+    reason: &str,
+) -> Result<Vec<VisibilityActOutcome>, VisibilityActError> {
+    match act {
+        WideningAct::Publicize => publicize_claims(conn, viewer, ids, reason).await,
+        WideningAct::ShareWithTeam { group_id } => {
+            share_claims_with_team(conn, viewer, ids, group_id, reason).await
+        }
+    }
 }

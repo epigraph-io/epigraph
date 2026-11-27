@@ -53,6 +53,13 @@ pub enum Methodology {
 }
 
 impl Methodology {
+    /// The largest [`Self::weight_modifier`], the methodology with the most
+    /// weight (`FormalProof`). A truth formula that normalizes a methodology
+    /// weight to `[0, 1]` divides by this, so it never copies the top weight
+    /// as a literal (backlog 19e46f05). The test
+    /// `max_weight_modifier_is_the_largest_weight` keeps it the maximum.
+    pub const MAX_WEIGHT_MODIFIER: f64 = Self::FormalProof.weight_modifier();
+
     /// Returns a weight modifier for truth calculation
     ///
     /// Formal proofs get bonuses (> 1.0), heuristics get penalties (< 1.0)
@@ -549,6 +556,54 @@ mod tests {
         assert!(!Methodology::BayesianInference.description().is_empty());
         assert!(!Methodology::VisualInspection.description().is_empty());
         assert!(!Methodology::Heuristic.description().is_empty());
+    }
+
+    /// Every variant, listed through an exhaustive match so a new variant
+    /// does not compile until it is added here.
+    fn every_methodology() -> [Methodology; 9] {
+        let all = [
+            Methodology::Deductive,
+            Methodology::Inductive,
+            Methodology::Abductive,
+            Methodology::Instrumental,
+            Methodology::Extraction,
+            Methodology::BayesianInference,
+            Methodology::VisualInspection,
+            Methodology::FormalProof,
+            Methodology::Heuristic,
+        ];
+        for m in all {
+            match m {
+                Methodology::Deductive
+                | Methodology::Inductive
+                | Methodology::Abductive
+                | Methodology::Instrumental
+                | Methodology::Extraction
+                | Methodology::BayesianInference
+                | Methodology::VisualInspection
+                | Methodology::FormalProof
+                | Methodology::Heuristic => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn max_weight_modifier_is_the_largest_weight() {
+        let all = every_methodology();
+        for m in all {
+            assert!(
+                m.weight_modifier() <= Methodology::MAX_WEIGHT_MODIFIER,
+                "{m:?} weighs {} above MAX_WEIGHT_MODIFIER {}",
+                m.weight_modifier(),
+                Methodology::MAX_WEIGHT_MODIFIER
+            );
+        }
+        assert!(
+            all.iter()
+                .any(|m| m.weight_modifier() == Methodology::MAX_WEIGHT_MODIFIER),
+            "MAX_WEIGHT_MODIFIER is no methodology's weight"
+        );
     }
 
     #[test]

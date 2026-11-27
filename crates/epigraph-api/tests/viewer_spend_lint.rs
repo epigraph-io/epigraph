@@ -518,10 +518,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
         ],
     ),
+    // ... and, when the removal applied, the delete of the community's stale
+    // stored scoped beliefs on the SAME stamped transaction
+    // (`clear_stale_community_folds`, backlog 8d720490): FORCE'd row security
+    // against that transaction's GUCs limits it to rows the caller may write.
     (
         "community.rs",
         "remove_member",
-        &["CommunityRepository::remove_member"],
+        &[
+            "CommunityRepository::remove_member",
+            "clear_stale_community_folds",
+        ],
     ),
     // narrows: an `apply` run keeps the cache-admissible rows of the BBAs it
     // read through the viewer (`get_for_claims`); a read-only run filters them
@@ -556,30 +563,26 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
-    // The convention claim, its labels, trace and structural edges are the
-    // SYSTEM agent's, written on the raw pool as before (the caller does not
-    // write that agent's group). The evidence and its signed `supports` edge
-    // (backlog 73d4f7ff) are ONE write on a transaction stamped with the
-    // caller's viewer (`state.write_as(&viewer, ..)`, passed as `&mut *tx`), as
-    // in `forget_convention`: migration 114 owns the evidence by the caller's
-    // group and migration 120 the edge. `embed_created_claim` stores the
-    // claim's vector where the claim was written.
+    // stamped + write (backlog 1c822492): every statement runs on ONE
+    // transaction from `state.write_as(&viewer, ..)`, passed as `&mut tx`, so
+    // the claims / evidence / edges triggers and `WITH CHECK` decide each row
+    // by the caller's writable set. The caller authors the convention: its
+    // agent row (`get_by_id`, agents are untenanted) supplies the key, and
+    // `default_decl_for_author` (a definer) names its home group. None of
+    // these reads anything for display. The embed after the commit goes
+    // through `AppState::embed_claim_as`, which receives the viewer.
     (
         "conventions.rs",
         "learn_convention",
         &[
-            "AgentRepository::create",
-            "AgentRepository::get_by_public_key",
-            "ClaimRepository::create",
-            "ClaimRepository::default_decl_for_author_pool",
-            "ClaimRepository::update_trace_id",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
+            "AgentRepository::get_by_id",
+            "ClaimRepository::create_signed_reporting_conn",
+            "ClaimRepository::default_decl_for_author",
+            "ClaimRepository::update_labels_conn",
+            "ClaimRepository::update_trace_id_conn",
+            "EdgeRepository::create_signed_conn",
             "EvidenceRepository::create",
             "ReasoningTraceRepository::create",
-            "embed_created_claim",
-            "sqlx::query(UPDATE).execute",
         ],
     ),
     // `embed_created_claim` (backlog 56d2430b): the best-effort embed of the
@@ -831,7 +834,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (operator ruling R-51: `require_experiment_hypothesis` reads the
     // experiment's hypothesis through the viewer, requires it writable and the
-    // result to belong to `:eid`) then the untenanted result row it named.
+    // result to belong to `:eid`) then the untenanted result row it named, on
+    // the caller's stamped transaction (backlog 30c84267).
     (
         "experiment_loop.rs",
         "add_measurements",
@@ -846,14 +850,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // hypothesis is the same `result` 404 as a missing result, before
     // anything is written; until
     // backlog 4815dcf7 and ruling R-51 neither held) then untenanted reads
-    // (experiments, experiment_results, frames by name) and writes against it.
+    // (experiment_results, frames by name) and writes against it, all on ONE
+    // stamped transaction (backlog 30c84267), so the edges and the BBA, which
+    // take the hypothesis's tenancy, are checked against the caller's
+    // writable set. The hypothesis id is the gate's answer, not a second
+    // `experiments` read.
     (
         "experiment_loop.rs",
         "analyze_result",
         &[
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
-            "ExperimentRepository::get",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
             "ExperimentRepository::update_status",
             "ExperimentRepository::update_status",
             "ExperimentResultRepository::get",
@@ -865,12 +872,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (R-51: `require_hypothesis` reads the body's hypothesis through
     // the viewer and requires it writable) then write: the untenanted
-    // experiment row and its `tests_hypothesis` edge onto that hypothesis.
+    // experiment row and its `tests_hypothesis` edge onto that hypothesis, on
+    // ONE stamped transaction (backlog 30c84267).
     (
         "experiment_loop.rs",
         "create_experiment",
         &[
-            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed_conn",
             "ExperimentRepository::create",
         ],
     ),
@@ -891,14 +899,25 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (R-51: `require_experiment_hypothesis`, write access) then writes
     // on untenanted rows: the result, its `result_of` edge to the experiment,
-    // and the experiment's status.
+    // and the experiment's status, on ONE stamped transaction (backlog
+    // 30c84267).
     (
         "experiment_loop.rs",
         "submit_results",
         &[
-            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed_conn",
             "ExperimentRepository::update_status",
             "ExperimentResultRepository::create",
+        ],
+    ),
+    // untenanted: the method catalog (`methods`, `method_capabilities`), on
+    // the caller's stamped transaction (backlog 30c84267).
+    (
+        "experiments.rs",
+        "add_method",
+        &[
+            "MethodRepository::insert",
+            "MethodRepository::link_capability",
         ],
     ),
     // untenanted: methods.
@@ -906,6 +925,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "experiments.rs",
         "design_experiment",
         &["MethodRepository::get"],
+    ),
+    // untenanted: the method catalog, on the caller's stamped read (backlog
+    // 30c84267).
+    (
+        "experiments.rs",
+        "find_methods",
+        &[
+            "MethodRepository::find_by_embedding",
+            "MethodRepository::get_capabilities",
+        ],
     ),
     (
         "experiments.rs",
@@ -1566,7 +1595,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "AgentRepository::get_by_id",
             "ClaimEncryptionRepository::insert_conn",
-            "ClaimRepository::create_strict",
+            "ClaimRepository::create_strict_signed",
             "ClaimRepository::lock_content_hash_agent",
             "ClaimRepository::resolve_write_decl",
             "ClaimRepository::write_tenancy_report",

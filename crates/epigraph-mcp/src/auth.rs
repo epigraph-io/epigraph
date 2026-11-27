@@ -207,7 +207,8 @@ pub async fn bearer_auth_middleware(
 
 /// Build the RFC 9728 `WWW-Authenticate` challenge `HeaderValue`. Returns `None`
 /// when the interpolated `resource_metadata_url` produces a value `HeaderValue`
-/// rejects (control chars / non-ASCII). The single source of the challenge
+/// rejects (control characters; it accepts bytes >= 0x80, which
+/// [`validate_resource_metadata_url`] refuses first). The single source of the challenge
 /// format, shared by [`unauthorized`] (per-request) and
 /// [`validate_resource_metadata_url`] (boot-time fail-fast) so the two cannot drift.
 fn challenge_header(resource_metadata_url: Option<&str>, error: &str) -> Option<HeaderValue> {
@@ -218,16 +219,50 @@ fn challenge_header(resource_metadata_url: Option<&str>, error: &str) -> Option<
     challenge.parse().ok()
 }
 
-/// Validate an operator-supplied `--resource-metadata-url` at startup by building
-/// the challenge it would produce. A malformed URL (control chars / non-ASCII)
-/// would otherwise make every 401 fail to attach the header; failing fast at boot
+/// Validate an operator-supplied `--resource-metadata-url` at startup. A value
+/// that cannot be advertised (empty, non-ASCII, a TAB, not an absolute
+/// http(s) URL, or a control character) would otherwise make every 401 drop
+/// the challenge or carry one clients cannot use; failing fast at boot
 /// surfaces the misconfiguration before the listener accepts traffic.
+///
+/// The first four rules are
+/// [`epigraph_auth::resource_metadata::resource_metadata_url_rule`], shared
+/// with the HTTP API's `EPIGRAPH_RESOURCE_METADATA_URL` check: the header
+/// round trip alone accepts every byte >= 0x80, an empty value and a TAB. The
+/// round trip below, through [`challenge_header`], stays as the backstop for
+/// control characters and CR/LF header injection.
+///
+/// # Errors
+/// A human-readable message naming the rule the URL broke.
 pub fn validate_resource_metadata_url(resource_metadata_url: &str) -> Result<(), String> {
-    challenge_header(Some(resource_metadata_url), INVALID_TOKEN)
+    use epigraph_auth::resource_metadata::{resource_metadata_url_rule, ResourceMetadataUrlRule};
+    let url = resource_metadata_url;
+    if let Some(rule) = resource_metadata_url_rule(url) {
+        return Err(match rule {
+            ResourceMetadataUrlRule::Empty => "--resource-metadata-url is set but empty; omit \
+                 it (and unset EPIGRAPH_RESOURCE_METADATA_URL), or give it a URL"
+                .to_string(),
+            ResourceMetadataUrlRule::NonAscii => format!(
+                "--resource-metadata-url contains non-ASCII bytes ({url:?}). HeaderValue \
+                 accepts them but the resulting WWW-Authenticate value is not decodable as a \
+                 str and strict clients reject it; percent-encode the host and path \
+                 (IDNA/punycode for the host)"
+            ),
+            ResourceMetadataUrlRule::Tab => "--resource-metadata-url contains a TAB, which is a \
+                 legal header byte but not a legal URL character"
+                .to_string(),
+            ResourceMetadataUrlRule::NotHttp => format!(
+                "--resource-metadata-url must be an absolute http(s) URL; got {url:?}. A \
+                 client reads it out of the challenge and fetches it directly, so a relative \
+                 or scheme-less value is unfetchable"
+            ),
+        });
+    }
+    challenge_header(Some(url), INVALID_TOKEN)
         .map(|_| ())
         .ok_or_else(|| {
             "--resource-metadata-url is not a valid HTTP header value \
-             (control characters or non-ASCII bytes?)"
+             (control characters, or an embedded CR/LF?)"
                 .to_string()
         })
 }
@@ -643,6 +678,65 @@ pub async fn inject_unauthenticated_context(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── --resource-metadata-url at boot ──
+
+    /// The values the header round trip alone let through (an empty value,
+    /// a non-ASCII byte, a TAB, a scheme-less or non-http(s) URL) are refused
+    /// at boot by the rules shared with the HTTP API
+    /// (`epigraph_auth::resource_metadata`), each in words naming this
+    /// server's flag. Control characters stay the round trip's to refuse.
+    #[test]
+    fn validate_resource_metadata_url_refuses_what_headervalue_accepts() {
+        assert_eq!(
+            validate_resource_metadata_url("https://mcp.example/.well-known/x"),
+            Ok(())
+        );
+        assert_eq!(
+            validate_resource_metadata_url("http://127.0.0.1:8080/.well-known/x"),
+            Ok(())
+        );
+        let tab = "--resource-metadata-url contains a TAB, which is a legal header byte but \
+                   not a legal URL character";
+        let not_http = |got: &str| {
+            format!(
+                "--resource-metadata-url must be an absolute http(s) URL; got {got:?}. A \
+                 client reads it out of the challenge and fetches it directly, so a relative \
+                 or scheme-less value is unfetchable"
+            )
+        };
+        for (url, want) in [
+            (
+                "",
+                "--resource-metadata-url is set but empty; omit it (and unset \
+                 EPIGRAPH_RESOURCE_METADATA_URL), or give it a URL"
+                    .to_string(),
+            ),
+            (
+                "https://exämple.test/x",
+                "--resource-metadata-url contains non-ASCII bytes (\"https://exämple.test/x\"). \
+                 HeaderValue accepts them but the resulting WWW-Authenticate value is not \
+                 decodable as a str and strict clients reject it; percent-encode the host and \
+                 path (IDNA/punycode for the host)"
+                    .to_string(),
+            ),
+            ("https://mcp.example/\tx", tab.to_string()),
+            (
+                "mcp.example/.well-known/x",
+                not_http("mcp.example/.well-known/x"),
+            ),
+            ("/.well-known/x", not_http("/.well-known/x")),
+            ("ftp://mcp.example/x", not_http("ftp://mcp.example/x")),
+            (
+                "https://mcp.example/\r\nX-Evil: 1",
+                "--resource-metadata-url is not a valid HTTP header value (control characters, \
+                 or an embedded CR/LF?)"
+                    .to_string(),
+            ),
+        ] {
+            assert_eq!(validate_resource_metadata_url(url), Err(want), "{url:?}");
+        }
+    }
 
     // ── The unauthenticated listener's principal is re-resolved, not frozen ──
 

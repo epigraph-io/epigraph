@@ -19,8 +19,8 @@ token endpoint the server decides the scopes (the request intersected with the
 client's grants) and the `agent_id` (the client's own agent), so a script can
 do only what its OAuth client was granted.
 
-Per feedback_no_raw_sql.md: bootstrap scripts should call the API, not write
-raw SQL.
+Bootstrap scripts call the API rather than writing raw SQL, so every write
+passes the server's authorization and provenance checks.
 
 Environment:
     EPIGRAPH_API_BASE           e.g. "http://127.0.0.1:8080"

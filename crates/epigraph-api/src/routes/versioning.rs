@@ -473,7 +473,7 @@ pub async fn supersede_claim(
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Supersede,
         viewer.principal(),
-        Some(oauth_principal(&auth)),
+        Some(epigraph_engine::admin_cascade::OauthPrincipal::from(&auth)),
         claim_id,
         Some(new_uuid),
     );
@@ -564,55 +564,57 @@ pub async fn supersede_claim(
     ))
 }
 
-/// The OAuth principal behind an authenticated request, for the cascade audit.
-#[cfg(feature = "db")]
-pub(crate) fn oauth_principal(
-    auth: &crate::middleware::bearer::AuthContext,
-) -> epigraph_engine::admin_cascade::OauthPrincipal {
-    epigraph_engine::admin_cascade::OauthPrincipal {
-        client_id: Some(auth.client_id),
-        owner_id: auth.owner_id,
-        agent_id: auth.agent_id,
-    }
-}
-
 /// The answer `supersede_claim` gives when the database refuses its act on
-/// `claim_id` (`supersede_act_conn`) (supersede SPEC K5). Its first arm, CX03,
-/// is also the answer to a refused cascade deferral
-/// ([`supersede_deferral_refusal`]), so CX03 reads the same whichever
-/// statement raised it. A denial is 403 with its code in the reason, and
-/// nothing was written (the act and its deferral share one transaction):
+/// `claim_id` (`supersede_act_conn`) (supersede SPEC K5). The refusal's KIND
+/// is decided once, for both transports, by
+/// `epigraph_engine::admin_cascade::supersede_act_refusal`
+/// (`epigraph_auth::claim_act::ClaimActRefusal::of_act`); this only answers
+/// each kind as an `ApiError` ([`claim_act_refusal`]). A denial is 403 with
+/// its code in the reason, and nothing was written (the act and its deferral
+/// share one transaction):
 ///
-/// 1. migration 120's CX03 (SQLSTATE `42501`, message `CX03: ...`), recognised
-///    by its message code BEFORE the generic `42501` arm, which would drop the
-///    code: the session does not write the claim's group
-///    ([`epigraph_auth::claim_act::supersede_not_recorded_message`]);
-/// 2. a reviewed caller-refusal code (`epigraph_db::caller_refusal_code`),
-///    through `From<DbError>`, keeping its code;
-/// 3. row security's `42501`: the group-write refusal;
-/// 4. `WriteRefused`, a repo `Refused`, "not found";
-/// 5. everything else through `From<DbError> for ApiError`, which answers
-///    OPL01 / OPL02 / ROL01 as 403 with their codes and a fault as a 500.
+/// 1. `Cx03`: the session does not write the claim's group
+///    ([`epigraph_auth::claim_act::supersede_not_recorded_message`]), the same
+///    text as a refused deferral's CX03 ([`supersede_deferral_refusal`]);
+/// 2. `NotWriter`, row security's uncoded `42501`: the group-write refusal;
+/// 3. `CodedDenial`, a coded `42501`: a reviewed caller-refusal code
+///    (`epigraph_db::caller_refusal_code`) keeps its code through
+///    `From<DbError>`; an UNLISTED one is the group-write refusal, because its
+///    text is unreviewed and `From` would redact it to a 500;
+/// 4. `Other`: a reviewed code on another SQLSTATE through `From`;
+///    `WriteRefused`, a repo `Refused`, "not found"; and everything else
+///    through `From<DbError> for ApiError`, which answers OPL01 / OPL02 /
+///    ROL01 as 403 with their codes and a fault as a 500.
 #[cfg(feature = "db")]
 pub fn supersede_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
-    if let Some(denial) = cx03_denial(claim_id, &e) {
-        return denial;
-    }
-    // A reviewed caller-refusal code (`epigraph_db::caller_refusal_code`) keeps
-    // its code: `From<DbError>` answers it 403 with the database's reviewed
-    // text, as the MCP twin's `db_caller_error` path keeps it. Before the
-    // generic 42501 arm, which would drop the code. An UNLISTED coded 42501
-    // still takes that arm (its text is unreviewed, and `From` would redact it
-    // to a 500).
-    if let epigraph_db::DbError::QueryFailed {
-        source: sqlx::Error::Database(d),
-    } = &e
-    {
-        if epigraph_db::caller_refusal_code(d.message()).is_some() {
-            return ApiError::from(e);
-        }
-    }
-    if crate::errors::db_is_insufficient_privilege(&e) {
+    let kind = epigraph_engine::admin_cascade::supersede_act_refusal(&e);
+    claim_act_refusal(kind, claim_id, e)
+}
+
+/// The answer to a failed supersede DEFERRAL
+/// (`epigraph_engine::admin_cascade::cascade_deferral_refusal`): CX03 is the
+/// caller's 403 ([`supersede_refusal`]'s first arm, the same text); anything
+/// else is a `DeployFault`, the 500 [`admin_session_or_deferral`] gives the
+/// other claim acts. An uncoded `42501` here is a missing EXECUTE grant on the
+/// definer, not row security refusing the caller, so it must not read as the
+/// group-write 403.
+#[cfg(feature = "db")]
+pub fn supersede_deferral_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
+    let kind = epigraph_engine::admin_cascade::cascade_deferral_refusal(&e);
+    claim_act_refusal(kind, claim_id, e)
+}
+
+/// A claim act's refusal of kind `kind` (classified by `epigraph-auth`, once
+/// for both transports) as this transport's error. The MCP twin maps the same
+/// kinds onto `McpError`.
+#[cfg(feature = "db")]
+fn claim_act_refusal(
+    kind: epigraph_auth::claim_act::ClaimActRefusal,
+    claim_id: Uuid,
+    e: epigraph_db::DbError,
+) -> ApiError {
+    use epigraph_auth::claim_act::ClaimActRefusal;
+    let group_write_refused = |e: &epigraph_db::DbError| {
         tracing::warn!(
             target: "tenancy.scoped_write",
             handler = "supersede_claim",
@@ -620,7 +622,50 @@ pub fn supersede_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
             error = %e,
             "the database refused the supersession"
         );
-        return crate::errors::write_refused("claim");
+        crate::errors::write_refused("claim")
+    };
+    match kind {
+        ClaimActRefusal::Cx03 => {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "supersede_claim",
+                claim = %claim_id,
+                error = %e,
+                "the cascade deferral refused the supersession"
+            );
+            ApiError::Forbidden {
+                reason: epigraph_auth::claim_act::supersede_not_recorded_message(claim_id),
+            }
+        }
+        ClaimActRefusal::NotWriter => group_write_refused(&e),
+        ClaimActRefusal::CodedDenial if has_reviewed_code(&e) => ApiError::from(e),
+        ClaimActRefusal::CodedDenial => group_write_refused(&e),
+        ClaimActRefusal::DeployFault => deferral_failed(e),
+        ClaimActRefusal::Other => other_act_refusal(claim_id, e),
+    }
+}
+
+/// Whether a database refusal opens with a reviewed caller-refusal code
+/// (`epigraph_db::caller_refusal_code`): `From<DbError>` then answers it with
+/// the database's reviewed text and its code, as the MCP twin's
+/// `db_caller_error` keeps it.
+#[cfg(feature = "db")]
+fn has_reviewed_code(e: &epigraph_db::DbError) -> bool {
+    matches!(
+        e,
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } if epigraph_db::caller_refusal_code(d.message()).is_some()
+    )
+}
+
+/// [`claim_act_refusal`]'s `Other` arm: an act refusal that is neither CX03
+/// nor a `42501`.
+#[cfg(feature = "db")]
+fn other_act_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
+    // A reviewed caller-refusal code on another SQLSTATE keeps its code.
+    if has_reviewed_code(&e) {
+        return ApiError::from(e);
     }
     // The session reads the claim as current but its retirement matched
     // no row (an UPDATE policy that hides it): a denial, and the act wrote
@@ -649,51 +694,6 @@ pub fn supersede_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
     // The operator binding's OPL01 / OPL02 and 166's ROL01 are 403 with their
     // codes there; a fault stays a redacted 500.
     ApiError::from(e)
-}
-
-/// Migration 120's CX03 (SQLSTATE `42501`, message `CX03: ...`) as the
-/// caller's 403, or `None` for any other error.
-///
-/// The definer raises CX03 when the deferral names no committed act of the
-/// session's own: either the act did not land, or the session does not write
-/// both claims' group. On the supersede path the act runs first in the same
-/// transaction, so only the authority arm is reachable there, and that is what
-/// [`epigraph_auth::claim_act::supersede_not_recorded_message`] says.
-///
-/// The predicate is [`epigraph_auth::claim_act::is_cascade_deferral_refusal`],
-/// shared with the MCP tool's twin, so CX03 is recognised by one rule.
-#[cfg(feature = "db")]
-fn cx03_denial(claim_id: Uuid, e: &epigraph_db::DbError) -> Option<ApiError> {
-    let epigraph_db::DbError::QueryFailed {
-        source: sqlx::Error::Database(d),
-    } = e
-    else {
-        return None;
-    };
-    if !epigraph_auth::claim_act::is_cascade_deferral_refusal(d.code().as_deref(), d.message()) {
-        return None;
-    }
-    tracing::warn!(
-        target: "tenancy.scoped_write",
-        handler = "supersede_claim",
-        claim = %claim_id,
-        detail = %d.message(),
-        "the cascade deferral refused the supersession"
-    );
-    Some(ApiError::Forbidden {
-        reason: epigraph_auth::claim_act::supersede_not_recorded_message(claim_id),
-    })
-}
-
-/// The answer to a failed supersede DEFERRAL: CX03 is the caller's 403
-/// ([`supersede_refusal`]'s first arm, the same text); anything else is the
-/// server's fault, the 500 [`admin_session_or_deferral`] gives the other claim
-/// acts. Not the act mapper: an uncoded `42501` here is a deploy fault (a
-/// missing EXECUTE grant on the definer), not row security refusing the
-/// caller, so it must not read as the group-write 403.
-#[cfg(feature = "db")]
-pub fn supersede_deferral_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
-    cx03_denial(claim_id, &e).unwrap_or_else(|| deferral_failed(e))
 }
 
 /// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
@@ -731,7 +731,7 @@ pub async fn supersede_session_or_deferral<'s>(
 /// viewer, so `security_events_append` admits the row) and return that status:
 /// the act and its audit row then commit together. The core is
 /// `epigraph_engine::admin_cascade::session_or_record_deferral`, shared with
-/// the MCP tools; this answers its error as a database error.
+/// the MCP tools; this answers its error as a `DeployFault`: a database error.
 ///
 /// # Errors
 /// The deferral INSERT's error, as a database error: nothing commits.
@@ -747,13 +747,20 @@ pub(crate) async fn admin_session_or_deferral<'s>(
     ),
     ApiError,
 > {
+    let claim_id = trigger.subject_id;
     epigraph_engine::admin_cascade::session_or_record_deferral(
         state.admin_cascade_session().await,
         tx,
         trigger,
     )
     .await
-    .map_err(deferral_failed)
+    .map_err(|e| {
+        claim_act_refusal(
+            epigraph_auth::claim_act::ClaimActRefusal::DeployFault,
+            claim_id,
+            e,
+        )
+    })
 }
 
 /// The generic answer to a failed deferral INSERT: a database error.
@@ -946,7 +953,7 @@ pub async fn mark_duplicate(
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Dedup,
         viewer.principal(),
-        Some(oauth_principal(&auth)),
+        Some(epigraph_engine::admin_cascade::OauthPrincipal::from(&auth)),
         dup_id,
         Some(req.canonical_id),
     );
@@ -1265,7 +1272,7 @@ pub async fn unmark_duplicate(
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Undedup,
         viewer.principal(),
-        Some(oauth_principal(&auth)),
+        Some(epigraph_engine::admin_cascade::OauthPrincipal::from(&auth)),
         dup_id,
         Some(canonical_id),
     );
@@ -1749,5 +1756,228 @@ mod unmark_refusal_tests {
         let (status, body) = dedup_answer(role).await;
         assert_eq!(status, 403, "{body}");
         assert!(body.contains("ROL01"), "{body}");
+    }
+}
+
+/// The supersede refusal mappers, pinned byte for byte by refusal kind
+/// (`epigraph_auth::claim_act::ClaimActRefusal`): each row is a database
+/// error as the driver raises it and the exact `ApiError` (variant and text)
+/// the caller gets.
+#[cfg(all(test, feature = "db"))]
+mod refusal_table {
+    use super::{supersede_deferral_refusal, supersede_refusal};
+    use crate::errors::ApiError;
+    use std::borrow::Cow;
+    use uuid::Uuid;
+
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: &'static str,
+        message: String,
+    }
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+    impl std::error::Error for FakeDbError {}
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db(code: &'static str, message: &str) -> epigraph_db::DbError {
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(Box::new(FakeDbError {
+                code,
+                message: message.to_string(),
+            })),
+        }
+    }
+
+    const RLS: &str = "new row violates row-level security policy for table \"claims\"";
+    const NO_EXECUTE: &str = "permission denied for function epigraph_record_cascade_deferral";
+
+    fn forbidden(reason: impl Into<String>) -> ApiError {
+        ApiError::Forbidden {
+            reason: reason.into(),
+        }
+    }
+
+    fn group_write() -> ApiError {
+        forbidden("no write authority over the group that owns this claim; nothing was written")
+    }
+
+    fn not_recorded(claim: Uuid) -> ApiError {
+        forbidden(format!(
+            "CX03: the supersession of claim {claim} cannot be recorded: the session acting on \
+             it does not write the group that owns the claim; nothing was written"
+        ))
+    }
+
+    fn redacted_500() -> ApiError {
+        ApiError::DatabaseError {
+            message: "A database error occurred".to_string(),
+        }
+    }
+
+    /// `ApiError` has no `PartialEq`; its `Debug` names the variant and every
+    /// field, which is what the response is rendered from.
+    fn same(got: &ApiError, want: &ApiError, row: &str) {
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{row}");
+    }
+
+    /// The ACT: CX03, row security's uncoded 42501 (not writer), a coded
+    /// 42501 (reviewed, then unlisted), a reviewed code on another SQLSTATE,
+    /// CX03's text on another SQLSTATE, and the repo-layer arms.
+    #[test]
+    fn every_act_refusal_kind_maps_to_its_exact_answer() {
+        let c = Uuid::new_v4();
+        let rows: Vec<(&str, epigraph_db::DbError, ApiError)> = vec![
+            (
+                "cx03",
+                db("42501", "CX03: not recorded as one this session made"),
+                not_recorded(c),
+            ),
+            ("not writer: row security", db("42501", RLS), group_write()),
+            (
+                "not writer: uncoded engine 42501",
+                db("42501", "permission denied for table claims"),
+                group_write(),
+            ),
+            (
+                "coded denial, reviewed: keeps its code, 403",
+                db("42501", "TEN01: a reviewed refusal"),
+                forbidden("TEN01: a reviewed refusal"),
+            ),
+            (
+                "coded denial, unlisted: the group-write 403, the text withheld",
+                db("42501", "ZZ99: a probe refusal"),
+                group_write(),
+            ),
+            (
+                "other: a reviewed code on another SQLSTATE keeps its code, 400",
+                db("P0001", "GRM05: a reviewed refusal"),
+                ApiError::BadRequest {
+                    message: "GRM05: a reviewed refusal".to_string(),
+                },
+            ),
+            (
+                "other: CX03's text on another SQLSTATE is a redacted fault",
+                db("P0001", "CX03: raised elsewhere"),
+                redacted_500(),
+            ),
+            (
+                "other: an uncoded fault",
+                db("XX000", "internal driver detail"),
+                redacted_500(),
+            ),
+            (
+                "other: a write row security hid",
+                epigraph_db::DbError::WriteRefused {
+                    entity: "claim".into(),
+                    id: c,
+                    action: "supersede".into(),
+                },
+                forbidden(format!(
+                    "supersede of claim {c} was refused: this session may read it but not \
+                     supersede it; nothing was changed"
+                )),
+            ),
+            (
+                "other: a repo refusal by its kind",
+                epigraph_db::DbError::Refused {
+                    kind: epigraph_db::RefusalKind::State,
+                    message: "already superseded".into(),
+                },
+                ApiError::Conflict {
+                    reason: "already superseded".to_string(),
+                },
+            ),
+            (
+                "other: not found names the claim",
+                epigraph_db::DbError::NotFound {
+                    entity: "claims".into(),
+                    id: Uuid::nil(),
+                },
+                ApiError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: c.to_string(),
+                },
+            ),
+        ];
+        for (row, e, want) in rows {
+            same(&supersede_refusal(c, e), &want, row);
+        }
+    }
+
+    /// Every REVIEWED code raised as a `42501` keeps its own coded answer
+    /// (`From<DbError>`), never the group-write 403. The act's classifier
+    /// only routes a `42501` to the reviewed-code arm when the message has
+    /// the code SHAPE (`epigraph_auth::claim_act::is_coded_refusal`), so a
+    /// reviewed list entry outside that grammar (say `SR100`) would silently
+    /// read as the group-write refusal; this ties the two lists to it.
+    #[test]
+    fn every_reviewed_code_raised_as_42501_keeps_its_coded_answer() {
+        let c = Uuid::new_v4();
+        for code in epigraph_db::CALLER_REFUSAL_CODES
+            .iter()
+            .chain(epigraph_db::SUPERSEDE_REFUSAL_CODES)
+        {
+            let message = format!("{code}: a reviewed refusal");
+            assert!(
+                epigraph_auth::claim_act::is_coded_refusal(&message),
+                "{code} is outside the refusal-code grammar"
+            );
+            let got = supersede_refusal(c, db("42501", &message));
+            same(&got, &ApiError::from(db("42501", &message)), code);
+            assert_ne!(
+                format!("{got:?}"),
+                format!("{:?}", group_write()),
+                "{code} read as the group-write refusal"
+            );
+        }
+    }
+
+    /// The DEFERRAL: CX03 is the act's own 403, byte for byte; any other
+    /// refusal (the missing EXECUTE grant's uncoded 42501 included) is the
+    /// deferral's 500 with the error, never the group-write 403.
+    #[test]
+    fn every_deferral_refusal_kind_maps_to_its_exact_answer() {
+        let c = Uuid::new_v4();
+        same(
+            &supersede_deferral_refusal(c, db("42501", "CX03: not recorded")),
+            &not_recorded(c),
+            "cx03",
+        );
+        for (row, e) in [
+            ("deploy fault: missing EXECUTE", db("42501", NO_EXECUTE)),
+            ("deploy fault: coded", db("42501", "ZZ99: a probe refusal")),
+            (
+                "deploy fault: uncoded",
+                db("XX000", "internal driver detail"),
+            ),
+        ] {
+            let want = ApiError::DatabaseError {
+                message: format!("Failed to record the deferred cascade: {e}"),
+            };
+            same(&supersede_deferral_refusal(c, e), &want, row);
+        }
     }
 }

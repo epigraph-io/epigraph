@@ -2737,14 +2737,9 @@ pub async fn resolve_backlog_item(
 }
 
 /// Relationship byte string for a closure-basis edge: resolution → basis.
-///
-/// LOWERCASE, and the same literal on both surfaces. `epigraph-api`'s
-/// `is_valid_relationship` matches `VALID_RELATIONSHIPS` case-sensitively and
-/// carries both spellings of several names (`DERIVED_FROM` and `derived_from`),
-/// so a mismatch here would make an edge this tool writes unreachable through
-/// `POST /api/v1/edges`. Lowercase matches the claim→claim cluster it belongs
-/// with: `alternative_of`, `asserts`, `decomposes_to`.
-pub const JUSTIFIES_RELATIONSHIP: &str = "justifies";
+/// Defined once in `epigraph-auth`, which `epigraph-api`'s allow-list reads
+/// too, so the edge this tool writes is one `POST /api/v1/edges` accepts.
+pub use epigraph_auth::relationships::JUSTIFIES_RELATIONSHIP;
 
 /// The one label that carries RETIREMENT semantics.
 ///
@@ -2801,8 +2796,8 @@ pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 ///
 /// The populations this newly refuses: a stdio agent retiring a claim by an
 /// agent it shares no operator with (unlinked fleet agents included) — the
-/// `release/epiclaw/CLAUDE.md` procedure that relabels cross-agent items with
-/// `update_labels` now works only between agents linked to one operator — and
+/// agent fleet's retirement procedure, which relabels cross-agent items with
+/// `update_labels`, now works only between agents linked to one operator — and
 /// an undeclared-signer stdio server retiring anything it did not author.
 ///
 /// Removing `backlog` also takes an item out of the open-backlog query and is

@@ -37,7 +37,9 @@ pub const THEME_CLUSTER_RETIRED: &str = "theme_cluster is retired: the k-means t
      ran was removed (backlog a0ed0180). Use the UMAP theme pipeline instead: \
      scripts/maintain_themes.py for incremental maintenance (assign-unthemed, reassign, \
      split-candidates, recompute-centroids over /api/v1/themes/*), and theme_pipeline.py grow \
-     on the host for a periodic full rebuild. Read themes with list_themes / get_theme. \
+     run by an operator on the host for a full rebuild (not on a timer: it replaces every theme \
+     id and needs --i-understand-full-rebuild and the rebuild steps in \
+     docs/ops/theme-v2-promotion-runbook.md). Read themes with list_themes / get_theme. \
      Nothing was written; do not retry.";
 
 /// The refusal every `theme_cluster` call gets: JSON-RPC `INVALID_REQUEST`

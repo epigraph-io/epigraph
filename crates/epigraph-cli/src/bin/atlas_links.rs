@@ -19,7 +19,9 @@
 //!   leaf as an integer, and the LINKED claims' embeddings. No text, no agent,
 //!   evidence or edge id. It writes nothing to the database.
 //! * `apply` checks the meaning result (W4) and the links result against the
-//!   rows in one snapshot, and (with `--apply`) writes ONE finished run of
+//!   rows in one snapshot, adds each theme's current members with no
+//!   embedding in "not yet placed" leaves of both hierarchies (see
+//!   `docs/runbooks/atlas-nightly.md`), and (with `--apply`) writes ONE finished run of
 //!   the map holding BOTH hierarchies: the serving read takes the latest
 //!   finished run, and every level's switch names a level of the other
 //!   hierarchy, so a links-only run would hide the meaning levels. DRY RUN BY

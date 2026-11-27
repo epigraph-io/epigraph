@@ -49,6 +49,11 @@ concurrency:
 jobs:
   msrv:
     name: Build on the declared rust-version
+    # Not on the burndown's fix/triage-* pull requests (operator ruling
+    # 2026-11-27, "light CI on fix PRs"; ci.yml LIGHT PLAN): they reach main
+    # only through a staging PR, which runs this check when it touches a
+    # manifest. The `ci:full` label (read from the event) still runs it there.
+    if: ${{ !startsWith(github.head_ref, 'fix/triage-') || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:

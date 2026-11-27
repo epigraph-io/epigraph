@@ -894,12 +894,16 @@ async fn forget_convention_attributes_evidence_to_caller() {
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
 
-    // 1. Create a convention via the API (requires claims:admin).
+    // 1. Create a convention via the API (requires claims:admin). The caller
+    // authors it, so its token must name a provisioned agent (backlog
+    // 1c822492): a seeded client, not `admin_token()`'s bare principal.
     // Use a UUID-suffixed content to avoid content_hash collisions across test runs.
     let unique_suffix = uuid::Uuid::new_v4();
+    let (learn_token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:admin"]).await;
     let learn_resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/conventions"))
-        .bearer_auth(admin_token())
+        .bearer_auth(&learn_token)
         .json(&serde_json::json!({
             "content": format!("attribution-test convention {unique_suffix}"),
             "evidence": "seeded for attribution test"

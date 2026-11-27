@@ -36,9 +36,9 @@ pub struct ExperimentResultRow {
 pub struct ExperimentRepository;
 
 impl ExperimentRepository {
-    #[instrument(skip(pool))]
-    pub async fn create(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         hypothesis_id: Uuid,
         created_by: Uuid,
         method_ids: Option<&[Uuid]>,
@@ -57,16 +57,19 @@ impl ExperimentRepository {
         .bind(method_ids)
         .bind(protocol)
         .bind(protocol_source)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(row.0)
     }
 
-    #[instrument(skip(pool))]
-    pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<ExperimentRow>, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<ExperimentRow>, DbError> {
         let row = sqlx::query_as::<_, ExperimentRow>("SELECT * FROM experiments WHERE id = $1")
             .bind(id)
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?;
         Ok(row)
     }
@@ -272,9 +275,9 @@ impl ExperimentRepository {
 pub struct ExperimentResultRepository;
 
 impl ExperimentResultRepository {
-    #[instrument(skip(pool, raw_measurements))]
-    pub async fn create(
-        pool: &PgPool,
+    #[instrument(skip(executor, raw_measurements))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         experiment_id: Uuid,
         data_source: &str,
         raw_measurements: &serde_json::Value,
@@ -291,18 +294,21 @@ impl ExperimentResultRepository {
         .bind(data_source)
         .bind(raw_measurements)
         .bind(measurement_count)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(row.0)
     }
 
-    #[instrument(skip(pool))]
-    pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<ExperimentResultRow>, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<ExperimentResultRow>, DbError> {
         let row = sqlx::query_as::<_, ExperimentResultRow>(
             "SELECT * FROM experiment_results WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row)
     }
@@ -322,9 +328,9 @@ impl ExperimentResultRepository {
     }
 
     /// Add measurements to an existing result, recomputing effective_random_error.
-    #[instrument(skip(pool, new_measurements))]
-    pub async fn add_measurements(
-        pool: &PgPool,
+    #[instrument(skip(executor, new_measurements))]
+    pub async fn add_measurements<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         new_measurements: &serde_json::Value,
         new_count: i32,
@@ -343,7 +349,7 @@ impl ExperimentResultRepository {
         .bind(new_measurements)
         .bind(new_count)
         .bind(effective_random_error)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }

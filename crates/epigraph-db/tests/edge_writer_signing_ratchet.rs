@@ -369,10 +369,13 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
+    // 3 -> 1 (backlog 1c822492): the AUTHORED / TRACES / HAS_TRACE edges are
+    // one signed `create_signed_conn` call in a loop over the three, on the
+    // caller's stamped transaction. Still three signed edges per request.
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "learn_convention",
-        3,
+        1,
         Signed,
     ),
     site(
@@ -696,10 +699,12 @@ const REGISTER: &[Site] = &[
         2,
         Signed,
     ),
+    // The directional references, and the symmetric `related_to` (backlog
+    // 41d7b27a) through the symmetric writer; both signed at INSERT.
     site(
         "crates/epigraph-mcp/src/tools/link_hierarchical.rs",
         "do_link_hierarchical",
-        1,
+        2,
         Signed,
     ),
     site(

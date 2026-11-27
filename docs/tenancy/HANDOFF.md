@@ -173,7 +173,8 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   file that *builds* an unmaintained pool; it is blind to a file that builds
   nothing, mints a bypass viewer, and runs the statement on an injected
   `PgPool`. Calibration cases: `epigraph-jobs/src/db_reputation_service.rs::get_claim_outcomes`
-  (still has the shape; no production constructor) and
+  (had the shape with no production constructor; deleted with the unregistered
+  reputation job handler, backlog 47bb548f) and
   `epigraph-api/src/routes/claims.rs::find_claims_needing_embeddings` (had it,
   fixed in PR-15 by making the repo method executor-generic).
 - **PR-17 owes** an answer on DERIVED-ROW visibility. `ClusterGraphHandler` and

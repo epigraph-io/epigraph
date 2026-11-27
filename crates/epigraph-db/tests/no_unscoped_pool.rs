@@ -887,7 +887,24 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// gone (`routes/tasks.rs` 15 -> 14). Removed, not converted. No file reached
 /// zero. (Staging 2026-11-26-2: the PR did not lower this register; its own
 /// CI failed on it.)
-const HIGH_WATER: usize = 150;
+/// 150 -> 130 (backlog 30c84267): every experiment-loop write
+/// (`create_experiment`, `start_experiment`, `submit_results`,
+/// `add_measurements`, `analyze_result`) runs on ONE `AppState::write_as`
+/// transaction and `list_experiments` reads on the caller's stamped
+/// connection; `routes/experiment_loop.rs` 20 -> 0, key DELETED
+/// (`HIGH_WATER_FILES` falls by one with it).
+/// 130 -> 126 (backlog 30c84267): `add_method` writes its method and
+/// capability links on ONE `AppState::write_as` transaction and `find_methods`
+/// reads on the caller's stamped connection, both now holding a `Viewer`;
+/// `routes/experiments.rs` 4 -> 0, key DELETED (`HIGH_WATER_FILES` falls by
+/// one with it).
+/// 126 -> 125 (backlog 1c822492; staging 2026-11-27 (2): #1136 measured
+/// 150 -> 149 against main, where the base had already lowered this to 126):
+/// `learn_convention` writes its convention
+/// claim, labels, evidence, trace and structural edges on ONE caller-stamped
+/// `AppState::write_as` transaction, authored by the caller and owned by its
+/// home group (`routes/conventions.rs` 3 -> 2). No file reached zero.
+const HIGH_WATER: usize = 125;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -963,7 +980,9 @@ const HIGH_WATER: usize = 150;
 /// 34 -> 33 when `routes/assess.rs` reached zero (backlog 74feb76b).
 /// 33 -> 32 when `routes/computation.rs` reached zero (backlog 52b96600).
 /// 32 -> 31 when `routes/clusters.rs` reached zero (backlog 67c905a3).
-const HIGH_WATER_FILES: usize = 31;
+/// 31 -> 30 when `routes/experiment_loop.rs` reached zero (backlog 30c84267).
+/// 30 -> 29 when `routes/experiments.rs` reached zero (backlog 30c84267).
+const HIGH_WATER_FILES: usize = 29;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1067,9 +1086,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 4 before conversion shard 7, which moved `list_skills` onto
     // `AppState::read_as` through the same `WorkflowRepository::list` widening
     // that serves `routes/workflows.rs::list_workflows` — one signature change
-    // for two converted sites in two files. The three that remain
-    // (`learn_convention`, `forget_convention`, `share_skill`) all WRITE.
-    ("routes/conventions.rs", 3),
+    // for two converted sites in two files. 3 -> 2 (backlog 1c822492):
+    // `learn_convention` writes every row on the caller's `AppState::write_as`
+    // transaction and holds no `pool` alias. The two that remain
+    // (`forget_convention`, `share_skill`) both WRITE.
+    ("routes/conventions.rs", 2),
     // 7 until U012 (concurrent match-candidate decides), which removed the
     // promote arm's own `EdgeRepository::create_symmetric_if_absent(&state.db_pool, …)`:
     // the edge is now written inside `MatchCandidateRepo::promote_if_pending`,
@@ -1141,12 +1162,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // store, so its `retain_visible_events` call on `state.db_pool` is gone with
     // it. Removed, not converted; the DO-NOT-CONVERT hold above stands.
     ("routes/events.rs", 5),
-    ("routes/experiment_loop.rs", 20),
-    // 8 -> 4 (HTTP public-only reads, 2026-11-05): `hypothesize` (2) and
-    // `design_experiment` (2) moved onto `AppState::read_as`. The 4 that remain
-    // hold no `Viewer`: `add_method` (writes) and `find_methods` (reads
-    // `methods` / `method_capabilities`, which carry no row security).
-    ("routes/experiments.rs", 4),
+    // `routes/experiment_loop.rs` was 20 and is GONE (backlog 30c84267): its
+    // five write handlers each run on ONE `AppState::write_as` transaction and
+    // `list_experiments` reads on the caller's stamped connection.
+    // `routes/experiments.rs` was 4 and is GONE (backlog 30c84267; 8 -> 4 by
+    // the HTTP public-only reads of 2026-11-05): `add_method` writes on
+    // `AppState::write_as` and `find_methods` reads on `AppState::read_as`,
+    // both now holding a `Viewer`.
     // UNCHANGED at 5, deliberately (HTTP public-only reads, 2026-11-05).
     // `gap_analysis` holds a `Viewer` and its claim search is a read, but the
     // result feeds `GapRepository::store_gap_analysis`, which persists claim

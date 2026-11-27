@@ -3,15 +3,13 @@
 This file is loaded into any Claude Code / agent session opened in this repo.
 Project-wide rules below; module-specific rules live next to their code.
 
-## Adding MCP tools — `epigraph-tools` is not the extension point
+## Adding MCP tools — the two extension points
 
-`crates/epigraph-tools` defines a `Tool` trait and a `ToolRegistry`. Despite the
-names, that is **not** how tools reach the MCP server, and no crate in this
-workspace depends on it.
-
-`epigraph-mcp` has no extension trait — zero `pub trait` declarations, and a
-compile-time `#[tool_router]` impl block. Its router and `scope_map` are a
-closed set by design.
+There is no in-process tool trait or registry to implement. `epigraph-mcp` has
+no extension trait — zero `pub trait` declarations, and a compile-time
+`#[tool_router]` impl block. Its router and `scope_map` are a closed set by
+design: a tool reaches the MCP server either as a kernel tool or as a
+downstream product's federated tool.
 
 - **Kernel tool** → add it to the `#[tool_router] impl` in
   `epigraph-mcp/src/server.rs` *and* to `SCOPE_MAP` in `scope_map.rs` (a
@@ -102,8 +100,8 @@ refuses such a label merge instead. Over HTTP the
 WHOLE label mutation needs that ownership, whatever the labels (as
 `patch_claim` and `PATCH /api/v1/claims/:id/labels` do); on stdio every other
 label stays ungated. A stdio agent that shares no operator with the claim's
-author, and is not its delegate, is now refused, including through `release/epiclaw/CLAUDE.md`'s
-`update_labels(original_id, add=["resolved"])` procedure, and so is a stdio
+author, and is not its delegate, is now refused, including through the agent fleet's
+`update_labels(original_id, add=["resolved"])` retirement procedure, and so is a stdio
 server with no declared signer (`--agent-key` or the separate signing key) on any claim it
 did not author. The deploy preconditions this sets for the fleet are in
 `scripts/e2e/README.md` ("Deploy preconditions").
@@ -137,7 +135,15 @@ Full spec: `docs/conventions/backlog-retirement.md`.
 - After adding or modifying a `sqlx::query!` / `sqlx::query_as!` macro
   call, run `DATABASE_URL=... cargo sqlx prepare --workspace -- --tests`
   and commit `.sqlx/` so `SQLX_OFFLINE=true cargo check --workspace`
-  passes in CI.
+  passes in CI. Removing a macro call leaves its `.sqlx/` entry orphaned;
+  delete it.
+- Most repo SQL is runtime, not macro-checked (under one in ten statements
+  use the macros; `crates/epigraph-db/README.md`, "Setup"). Prefer the macro
+  only for a static statement that no `Viewer::splice` / `splice_write`
+  marker will ever need to reach, since a macro cannot take a spliced
+  literal. Otherwise decode a runtime query through `query_as` into a
+  `FromRow` struct, never `Row::get`, which panics on a missing column or a
+  type mismatch.
 - `claim_from_row` has ~20 callers in `crates/epigraph-db/src/repos/claim.rs`.
   Do not widen its signature — extend the relevant `SELECT` in the caller
   and post-fix the returned `Claim` (see `list_by_labels` and `get_by_id`
@@ -211,9 +217,12 @@ migrate to head (it used to skip silently).
   queues dozens of full runs. Epiclaw's nightly staging run already works
   this way on `integration/<YYYYMMDD>` branches; an ad-hoc batch from a
   session does the same on `staging/<YYYYMMDD>-<tag>`. Use one of those two
-  prefixes: CI runs only the affected shards on other PR heads, and the full
-  plan on `integration/**` and `staging/**`, which is what makes the staging
-  PR the full-suite gate on the combined tree:
+  prefixes: CI runs only the affected shards on other PR heads, only lint and
+  a fixed set of cross-crate ratchets on the burndown's `fix/triage-*` heads
+  (the light plan, `.github/scripts/test-shard.py` `LIGHT_TARGETS`; the
+  `ci:full` label overrides it), and the full plan on `integration/**` and
+  `staging/**`, which is what makes the staging PR the full-suite gate on the
+  combined tree:
   1. Cut the staging branch from current `main`.
   2. Bring in each candidate that is green at its head with
      `git merge --no-ff <head>`, subject `merge(staging): #NNN <its claim>`
@@ -280,7 +289,8 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `add_step`** and **HTTP `POST /api/v1/workflows/steps`** — embed when `AddStepResult::inserted_content` is `Some` (a new step, or a reused one revived from a workflow deprecation)
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
-- **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
+- **HTTP `POST /api/v1/conventions`** — embeds the convention claim after `tx.commit()` on the caller's stamp (`AppState::embed_claim_as`); the claim and everything attached to it are written on that caller's stamped transaction; `crates/epigraph-api/src/routes/conventions.rs::learn_convention`
+- **HTTP `POST /api/v1/skills/share`** — embeds the shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool the handler writes the claim on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
 - **HTTP `POST /api/v1/policy-challenges`** — embeds a NEW challenge after `tx.commit()` on the caller's stamp (`AppState::store_claim_embedding_as`); a repeat request creates nothing and embeds nothing; `crates/epigraph-api/src/routes/policies.rs::embed_new_challenge`
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs::submit_packet` (the `if !was_duplicate` block; stored through `AppState::store_claim_embedding_as`)
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
@@ -529,3 +539,21 @@ only the non-merge commits a change adds. It refuses:
 It only warns about a subject outside `<type>(<scope>): <text>` (W2) and a
 message with none of the three sections (W3). Output is redacted, never the
 offending value.
+
+**Citing commits.** Cite a commit by sha only once it is on `main`, or when it
+is an earlier commit of the same change. Cite anything else (a commit on
+another open PR's branch, or one a rebase will rewrite) by **PR number and
+subject**, e.g. `#1234 "fix(db): ..."`: a branch sha stops resolving once the
+branch is rebased or squashed, and the citation is then a dead link for every
+later reader. After each merge, the `Cited sha check` workflow
+(`.github/workflows/cited-sha-check.yml`, `commit-message-lint.py --cited-shas`)
+warns (W4) about each cited sha that names no commit reachable from `main`.
+Write a sha so the check can read it: **at least 9 hex characters** (git's
+default abbreviation here, as `git log --oneline` prints it), or a 7-8 hex short
+sha right after `commit`, `commit hash`, `sha`, `revert(s|ed)` or
+`cherry-pick(ed)` (also through a list: "commits a, b and c"). A bare 7-8 hex
+token is not checked, because it cannot be told from an 8-hex backlog or
+claim-id prefix. A sha-like token is lowercase hex holding a digit and a letter,
+not part of a UUID or a longer hex run, not right after `@`, not 32 long and not
+labelled as a `sha256`/`blake3`/`md5`/`hash` digest. W4 is a warning only and
+does not run on pull requests.

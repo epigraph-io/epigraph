@@ -215,22 +215,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          the inherited inventory listed it and a reader deserves to know why it is not a defect.",
     ),
     (
-        "tools/evolve_step.rs",
-        "server.pool.begin",
-        1,
-        "`evolve_step`'s FALLBACK for a server built without a ScopedPool (test fixtures). On \
-         a scoped server (every deployed one) the tool writes on `begin_author_stamped_tx` + \
-         `ClaimRepository::evolve_step_conn` (operator-binding delta review: migration 122 \
-         refuses a claim written by an application session with no principal once armed). The \
-         fallback runs the same `evolve_step_conn` on a `server.pool.begin()` transaction (it \
-         used to call `ClaimRepository::evolve_step`, which opened that transaction itself), so \
-         the lineage-wide workflow authority gate and its provenance rows run on the act's own \
-         transaction there too. History: surfaced when `evolve` joined WRITE_TOKENS (batch H-a \
-         review); MEASURED refused on a clean migrate (config A, 42501 on claims) unstamped. The \
-         stamp is the step's AUTHOR (the caller), so a parent owned by a group the caller does \
-         not write is still refused by row security there.",
-    ),
-    (
         "tools/ingestion.rs",
         "server.pool.begin",
         1,
@@ -265,16 +249,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`create_perspective`. `perspectives` is another of the four instance-wide registries, so \
          the static `instance_wide()` arm admits it unstamped.",
-    ),
-    (
-        "tools/workflow_ingest.rs",
-        "WorkflowRepository::set_goal_embedding",
-        1,
-        "`store_workflow_goal_embedding`'s fallback for a server with no `ScopedPool` (a \
-         development superuser), the only case without a stamp. With one, every goal embed \
-         (`ingest_workflow`, `improve_workflow_hierarchy`, `store_workflow`) runs on the ingest \
-         system agent's stamp, since migration 183 gave `workflows` row security keyed on the \
-         plan's tenancy.",
     ),
     (
         "tools/workflows.rs",

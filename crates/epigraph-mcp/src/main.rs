@@ -827,9 +827,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Fail fast on a malformed --resource-metadata-url. The value is interpolated
-    // into the 401 WWW-Authenticate challenge (an HTTP header), which rejects
-    // control chars / non-ASCII. Validating here surfaces an operator typo at boot
-    // instead of letting it fail to attach the header on every 401.
+    // into the 401 WWW-Authenticate challenge (an HTTP header), so it must be a
+    // non-empty, ASCII, TAB-free absolute http(s) URL with no control characters
+    // (the rules the HTTP API applies to the same value). Validating here
+    // surfaces an operator typo at boot instead of on every 401.
     if let Some(url) = cli.resource_metadata_url.as_deref() {
         if let Err(reason) = epigraph_mcp::auth::validate_resource_metadata_url(url) {
             eprintln!("ERROR: {reason}");

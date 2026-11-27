@@ -636,7 +636,10 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // with the caller's viewer (`AppState::store_claim_embedding_as`).
     ("claims.rs", 3),
     ("computation.rs", 2),
-    ("conventions.rs", 2),
+    // 2 -> 1 (backlog 1c822492): `learn_convention`'s inline
+    // `UPDATE claims SET labels` became `ClaimRepository::update_labels_conn`
+    // on the caller's stamped transaction. `share_skill`'s remains.
+    ("conventions.rs", 1),
     ("hypothesis.rs", 2),
     ("policies.rs", 4),
     // 2 -> 0, key removed (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding`

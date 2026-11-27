@@ -20,11 +20,15 @@ Background for the features named here is in [`docs/tenancy.md`](tenancy.md)
 migration's own header is the authoritative record of what it does. This
 runbook gives the order in which to do things.
 
-Throughout, `<placeholders>` stand for values from your own deployment. No
-unit files, container images or host paths ship in this repository. Where a
-refusal message names a unit (`epigraph-cascade-replay.timer`,
-`epigraph-jobs-drain.timer`), those are the names the code suggests, and you
-may use others.
+Throughout, `<placeholders>` stand for values from your own deployment. This
+runbook does not prescribe your hosts' layout, and no container image for the
+kernel ships here. Template systemd units do ship, in
+[`deploy/systemd/`](../deploy/systemd/), for four of the maintenance jobs of
+step 10 (as `<unit>.example`) and for the Atlas nightly. Their binary path,
+service user and environment file are placeholders to replace, and nothing
+installs them. Where a refusal message names a unit
+(`epigraph-cascade-replay.timer`, `epigraph-jobs-drain.timer`), that is the
+installed name of the template; you may install it under another.
 
 ## Contents
 
@@ -497,11 +501,23 @@ neither.
 |---|---|---|---|
 | Cascade replay | `replay_deferred_cascades --max-failures 20` | every 90 s (the binary's own documentation) | Exit 2 while a cascade is stuck: read the report and `--retire <event id> --reason <text>` it. `--report-only` is a read-only staleness check that takes no lock. |
 | Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 5 a privatization plan is stranded in `applying` or `reverting` with no job to finish it (the report's `stranded_privatization_plans` names each; reported on every run until it is recovered, see `docs/tenancy.md`, "A plan stranded in `applying` or `reverting`"), 4 pending jobs of a type this run has no handler for are waiting (the report's `pending_unregistered` names each type and its count; typically `embedding_generation` on an instance whose embedding provider may not write `claims.embedding`, which wait until a drain that registers the type runs), 3 out of time with work pending. Treat 4 and 5 as failures (do not add either to `SuccessExitStatus=`). On an instance that will never register the type, clear it once by hand with `drain_jobs --cancel-pending <TYPE>` (repeatable): that run sets the type's pending jobs `cancelled`, lists them in `cancelled_unregistered`, and refuses (exit 1, nothing written) a type it has a handler for. Cancelling an `embedding_generation` job leaves its claim's `claims.embedding` NULL; `embed_backfill` refills missing vectors, and needs an OpenAI key. `epigraph-cli reembed` does NOT restore them: it writes `embedding_3072`. |
-| Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or retired kind, a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
+| Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or removed kind, a retired kind with no handler (`TruthPropagation`, `ReputationUpdate`, `WebhookNotification`, `DataCleanup`), a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
 | Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY`. `--allow-mock` (deterministic mock vectors, for a smoke run) is refused, exit 1 with nothing read or written, unless the database's name ends in `_test` or `EPIGRAPH_ENV=test` is set: a mock vector in a real database is served by recall as a real one and never refilled. |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 | Theme maintenance | `assign_unthemed_themes --apply` (`epigraph-cli`), then `python3 scripts/maintain_themes.py` | nightly | Keeps the themes `recall(diverse=true)` samples from current between rebuilds: assigns unthemed claims, reassigns misplaced ones, splits at most three high-variance themes, recomputes the affected centroids. `maintain_themes.py` works over the HTTP API, not a DSN: it needs `EPIGRAPH_API_URL` and `EPIGRAPH_TOKEN`, a token with `claims:write` and `claims:admin` minted through the token endpoint (the script's docstring shows how), and refuses to start without the token. On a row-secured deployment its first phase can only assign claims the token may write, so run `assign_unthemed_themes --apply` first (maintenance DSN; a dry run without `--apply`). Small in memory: a split clusters at most 5,000 2-D projections. `--dry-run` reports without writing. |
-| Theme rebuild | `python3 scripts/theme_pipeline.py grow` | weekly or monthly, and after a large ingest | The full UMAP rebuild `theme_cluster` used to point at: base clustering, split loop, projection onto `claim_themes`, then labelling. Connects on `MAINTENANCE_DATABASE_URL` (an application login under row security clusters only the rows it can see and still exits 0); every statement is bounded at 15 minutes. The label step runs `scripts/label_themes_llm.py --relabel-all`, which calls the `claude` CLI, so the unit's user needs that CLI installed and signed in; when labelling fails the run prints `"status": "label_failed"` and exits 1 with the clustering already committed, and `theme_pipeline.py label` retries just that step. The base assignment alone has taken about 40 minutes; `--from-run-id <run>` resumes the split, projection and label phases on an existing run. Memory: budget about 3 GB. `cluster_claims.py` documents a 620 MB UMAP reducer and a 2.6 GB peak at a 100K batch (this job's default `--batch-size` is 20000), and `refine_clusters.py` fits UMAP on a capped sample; measure the peak on your corpus before you tighten a cgroup limit. Writes the fitted reducer to `data/umap_reducer.pkl` in the checkout. `--dry-run` writes nothing: with `--from-run-id <run>` it lists the clusters the split loop would act on in that run; without it, it only says a fresh run would start with base clustering (base clustering commits a run, so it is not run as a preview). `theme_pipeline.py discover` previews the latest run. |
+| Theme rebuild | `python3 scripts/theme_pipeline.py grow --i-understand-full-rebuild` | on demand, run by an operator (for example monthly, or after a large ingest); not a timer job | The full UMAP rebuild `theme_cluster` used to point at: base clustering, split loop, projection onto `claim_themes`, then labelling. It replaces every theme, so do not put it on a timer. Once `claim_themes` has rows, a run without `--i-understand-full-rebuild` refuses before it clusters anything and exits 1 with nothing written, printing the theme count and the rows it would drop (a first run on an empty `claim_themes` needs no flag). A confirmed run mints new theme ids, and the `ON DELETE CASCADE` foreign keys on `claim_themes` delete every graph neighbourhood, every Atlas layout position and every level of every Atlas map (the public map and each team map) with the old themes; nothing rebuilds them by itself. Run the rebuild steps it prints (stdout `rebuild_next`) straight after, in order: `docs/ops/theme-v2-promotion-runbook.md`, "A projection is a full rebuild". Never store a theme id across a rebuild. Connects on `MAINTENANCE_DATABASE_URL` (an application login under row security clusters only the rows it can see and still exits 0); every statement is bounded at 15 minutes. The label step runs `scripts/label_themes_llm.py --relabel-all`, which calls the `claude` CLI, so the unit's user needs that CLI installed and signed in; when labelling fails the run prints `"status": "label_failed"` and exits 1 with the clustering already committed, and `theme_pipeline.py label` retries just that step. The base assignment alone has taken about 40 minutes; `--from-run-id <run>` resumes the split, projection and label phases on an existing run. Memory: budget about 3 GB. `cluster_claims.py` documents a 620 MB UMAP reducer and a 2.6 GB peak at a 100K batch (this job's default `--batch-size` is 20000), and `refine_clusters.py` fits UMAP on a capped sample; measure the peak on your corpus before you tighten a cgroup limit. Writes the fitted reducer to `data/umap_reducer.pkl` in the checkout. `--dry-run` writes nothing: with `--from-run-id <run>` it lists the clusters the split loop would act on in that run; without it, it only says a fresh run would start with base clustering (base clustering commits a run, so it is not run as a preview). `theme_pipeline.py discover` previews the latest run. |
+
+Template units for the first, second, fourth and fifth rows ship in
+[`deploy/systemd/`](../deploy/systemd/): `epigraph-cascade-replay.timer.example`,
+`epigraph-jobs-drain.timer.example`, `epigraph-embed-backfill.timer.example`
+and `epigraph-prune-recall-events.timer.example`, each with its
+`.service.example`. Each service is a oneshot that runs the binary with the
+command and exit-code handling of this table, reads one environment file
+(`/etc/epigraph/maintenance.env`, a placeholder) and runs as a placeholder
+service user. Install each without the `.example` suffix (for example as
+`/etc/systemd/system/epigraph-cascade-replay.timer`), replace the placeholders,
+and enable the timers; the comments in each file say what to change. The other
+rows have no template; schedule them the same way.
 
 `replay_deferred_cascades` and `drain_jobs` each take their own session
 advisory lock, so an overlapping or hand-started run prints
@@ -561,7 +577,7 @@ For the others, anything else is off.
 | `EPIGRAPH_ALLOW_ALL_IDENTITIES` | off | Exactly `true` lets any identity an auto-provisioning provider authenticates provision. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `EPIGRAPH_REDIRECT_URI` | — | Read only because `providers.toml.example`'s Google provider names them (`client_id_env`, `client_secret_env`, `audience_env`, `redirect_uri_env`). Missing while the provider is configured → startup refusal (`env var ... not set`). |
 | `EPIGRAPH_PUBLIC_BASE_URL` | `http://localhost:8080` | The public origin, with no trailing slash. |
-| `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that cannot go in an HTTP header → exit 1. |
+| `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that is empty, non-ASCII, contains a TAB, is not an absolute `http(s)://` URL, or cannot go in an HTTP header → exit 1. |
 | `EPIGRAPH_PORT` | `8080` | The application port. |
 | `EPIGRAPH_BIND_ADDR` | `0.0.0.0` | The IP address the application listener binds (for example `127.0.0.1` behind a reverse proxy on the same host, or `::`). An IP address only; the port is `EPIGRAPH_PORT`. Not an IP address → exit 1. |
 | `EPIGRAPH_REQUEST_TIMEOUT_SECS` | `300` | Seconds a request may take before the server answers it `408 Request Timeout` and drops the handler. `0` turns the timeout off (warned at boot). The bound covers the time to the response headers, not a streamed body. A timeout that fires after a handler committed answers 408 for a write that happened, so keep it above your slowest legitimate request. Not a whole number → exit 1. |
@@ -580,8 +596,8 @@ For the others, anything else is off.
 | `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot, on a short-lived pool on `MIGRATION_DATABASE_URL` (falling back to `DATABASE_URL` with a WARN, as `epigraph-migrate` does), closed before it serves. A migration DSN it cannot reach → exit 1, naming the variable; a failed migration panics. The DDL credential is then in the server's environment for as long as it runs, so the supported path is `epigraph-migrate`. |
 | `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD` | off | The deliberate-rollback opt-in, for any entry point that migrates (section 4). |
 | `EPIGRAPH_REQUIRE_SIGNATURES` | off | Enforces Ed25519 payload signatures on `POST /api/v1/submit/packet` only (section 7). |
-| `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 edge-signing key, as 64 hex characters. Unset → HTTP edges are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
-| `EPIGRAPH_API_SIGNING_KEY_RECHECK_SECS` | `30` | How often, in seconds, the running server re-checks that the edge verifier still admits its signing key (clamped to 1..=300). A key no longer admitted (revoked, rotated out, window closed), or whose recorded window ends within the stop lead, logs an ERROR and stops the server; a revocation is seen at the next check, so a shorter interval narrows the window in which edges carry a refused signature. Only read with `EPIGRAPH_API_SIGNING_KEY_FILE` set. |
+| `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 signing key, as 64 hex characters. The API attests the edges its routes write and the claims `POST /api/v1/claims` and `/api/v1/claims/batch` write with it. Unset → those edges and claims are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
+| `EPIGRAPH_API_SIGNING_KEY_RECHECK_SECS` | `30` | How often, in seconds, the running server re-checks that the edge verifier still admits its signing key (clamped to 1..=300). A key no longer admitted (revoked, rotated out, window closed), or whose recorded window ends within the stop lead, logs an ERROR and stops the server; a revocation is seen at the next check, so a shorter interval narrows the window in which edges and claims carry a refused signature. Only read with `EPIGRAPH_API_SIGNING_KEY_FILE` set. |
 | `EPIGRAPH_WEBAUTHN_RP_ID`, `EPIGRAPH_WEBAUTHN_ORIGIN` | unset | The passkey relying party. Both unset → passkeys off, and the ceremonies answer 503. A partial or malformed configuration → exit 1. The RP id is effectively permanent: a passkey registered under one never asserts under another. |
 | `EPIGRAPH_WEBAUTHN_AAGUIDS`, `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` | — | The attestation allowlist (authenticator model UUIDs) and the PEM file of the roots they chain to: `packed` and `tpm` attestation by a listed model. Both or neither; required unless `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` is set. |
 | `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` | unset | A PEM file of Android hardware attestation roots. They are trusted for EVERY key they attest, but only in the `android-key` format, for a device-bound (not backup-eligible), user-verified credential whose attestation puts it in a TEE or StrongBox on a device with a locked bootloader and a Verified boot; any other format chaining to them is refused. Usable alone or with the allowlist. Requires `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`. An unreadable file, one with no certificate, a certificate that does not parse, or a root also in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` → exit 1. Section 10, "Android hardware keys and a synced second passkey". |
@@ -621,7 +637,7 @@ For the others, anything else is off.
 | `--allowed-host` / `EPIGRAPH_MCP_ALLOWED_HOSTS` | — | Extra `Host`/`Origin` names for the HTTP listener. |
 | `--read-only` | off | Query tools only. |
 | `--operator-id` / `EPIGRAPH_OPERATOR_ID` | unset | Records `signer --OPERATED_BY--> operator` at startup. stdio only, with a declared identity. The link function is maintenance-only, so the startup fails on an application DSN; run `epigraph-operator link` from the host instead (section 9). |
-| `--resource-metadata-url` / `EPIGRAPH_RESOURCE_METADATA_URL` | unset | Advertised in the HTTP listener's 401 challenges. |
+| `--resource-metadata-url` / `EPIGRAPH_RESOURCE_METADATA_URL` | unset | Advertised in the HTTP listener's 401 challenges. Set but empty, non-ASCII, containing a TAB, not an absolute `http(s)://` URL, or not a valid HTTP header value → exit 1 at boot. |
 | `EPIGRAPH_PUBLIC_BASE_URL` | unset | The API's public origin. HTTP transport only. `sudo` and `propose_admin_act` refuse without it. |
 | `EPIGRAPH_MCP_CONNECTOR_ELEVATION` | off | `on` lets the HTTP transport elevate connector-mode sessions. Leave it unset (section 10). |
 | `EPIGRAPH_RUN_TOKENS` | `off` | As for the API. |
@@ -1468,6 +1484,26 @@ The MCP tool `system_stats` is a different aggregate (corpus counts,
 viewer-scoped, `claims:read`) from `GET /api/v1/admin/stats`. The
 `require_signatures` field of the admin stats body keeps its name on the wire.
 
+### `POST /api/v1/claims`: the raw claim write
+
+This route is not the HTTP twin of MCP `submit_claim`. It writes what it is
+given, and it skips two steps that the MCP submission tools (`submit_claim`,
+`batch_submit_claims` and `memorize`) run before their claim write:
+
+- **No novelty gate.** MCP suppresses a new claim whose embedding lies within
+  `novelty_threshold` cosine distance of an existing claim, and returns that
+  claim's id instead. This route inserts the near-duplicate. Its only dedup is
+  exact, on `(content_hash, agent_id)`: a 409 by default, or the existing row
+  with `if_not_exists: true`.
+- **No calibrated truth seeding.** MCP seeds `truth_value` from `confidence`
+  times the calibrated weight of the `evidence_type`, clamped to
+  `[0.01, 0.99]`. This route stores `initial_truth` as given, or 0.5 when it
+  is omitted, and applies no weight.
+
+This split is intended: the gate and the seeding are MCP-side steps. A client
+that wants either one calls MCP or applies it before posting.
+`POST /api/v1/claims/batch` has the same contract.
+
 ### `POST /api/v1/claims/batch`
 
 Each item goes through the same code as `POST /api/v1/claims`, on its own
@@ -1598,10 +1634,12 @@ than reading zero.
 Defaults to `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource`,
 which is the document the API serves, so most deployments need nothing. Set
 it only when the metadata document is served from a different host. A value
-that cannot go into an HTTP header (control characters, non-ASCII, an
-embedded newline) makes the process `exit(1)` at boot, rather than silently
-dropping the challenge from every 401. `epigraph-mcp`'s
-`--resource-metadata-url` fails fast the same way.
+that is empty, contains non-ASCII bytes or a TAB, is not an absolute
+`http://` / `https://` URL, or cannot go into an HTTP header (control
+characters, an embedded newline) makes the process `exit(1)` at boot, rather
+than silently dropping the challenge from every 401 or advertising one a
+client cannot use. `epigraph-mcp`'s `--resource-metadata-url` (which also
+reads this variable) applies the same rules.
 
 ### `EPIGRAPH_REQUIRE_SIGNATURES`
 
@@ -1616,8 +1654,9 @@ request-signing middleware and no `X-Signature` / `X-Public-Key` /
 ### Webhook egress guard
 
 One shared module, `epigraph_jobs::egress`, decides whether a webhook
-destination may be dialled: for `POST /api/v1/webhooks`, for the API's
-delivery dispatcher, and for `epigraph-jobs`' `ConfigurableWebhookHandler`.
+destination may be dialled: for `POST /api/v1/webhooks` and for the API's
+delivery dispatcher. Webhooks are delivered only by that dispatcher; there is
+no webhook job.
 
 **Registration resolves the host, and refuses it if any answer is internal.**
 `POST /api/v1/webhooks` validates the URL (scheme `http`/`https`, a parseable
@@ -1697,15 +1736,11 @@ that routes outbound webhook traffic through a proxy must allow direct egress
 from the API process instead**, on the webhook ports its subscribers use.
 Other outbound HTTP from the process is unaffected.
 
-`epigraph-jobs` ships one sanctioned production `HttpClient`,
-`PinnedHttpClient`. It builds each request's client with
-`epigraph_jobs::egress::pinned_client`, the same function the API's dispatcher
-uses, so both paths dial only the vetted addresses, never resolve the name
-again (a fallback resolver refuses every other name), and follow no redirects
-or proxies. Nothing in this repository wires `ConfigurableWebhookHandler` into
-a runner. Anything that does should pass `PinnedHttpClient`. The `HttpClient`
-trait stays open for test mocks, so a second production implementation is a
-review red flag, not a compile error.
+The dispatcher builds each request's client with
+`epigraph_jobs::egress::pinned_client`, so it dials only the vetted addresses,
+never resolves the name again (a fallback resolver refuses every other name),
+and follows no redirects or proxies. Any future webhook sender must build its
+client there too.
 
 ### Tokens for the in-repo Python helpers
 
@@ -5052,7 +5087,8 @@ Do not improvise it against a live database without that entry's context.
 | `failed to build providers registry: "providers.toml not found at ..."` | Create `providers.toml` (empty is valid) or set `EPIGRAPH_PROVIDERS_CONFIG`. The template is `providers.toml.example`. |
 | `failed to build providers registry: "provider '...': auto_provision is enabled with no allowed_emails/allowed_domains ..."` | Populate the allowlists, or set `EPIGRAPH_ALLOW_ALL_IDENTITIES=true`. `EPIGRAPH_ENV` unset counts as production. |
 | `failed to build providers registry: ... env var GOOGLE_CLIENT_ID not set` | A configured provider names environment variables that are unset. |
-| `EPIGRAPH_RESOURCE_METADATA_URL is unusable; refusing to start` | The value cannot go in an HTTP header. |
+| `EPIGRAPH_RESOURCE_METADATA_URL is unusable; refusing to start` (API) | The value is empty, non-ASCII, contains a TAB, is not an absolute `http://` / `https://` URL, or cannot go in an HTTP header; the logged `error` names which. Fix the value, or unset it to use the default. |
+| `ERROR: --resource-metadata-url is set but empty ...` / `... contains non-ASCII bytes ...` / `... contains a TAB ...` / `... must be an absolute http(s) URL ...` / `... is not a valid HTTP header value ...` (MCP) | The same rules for `epigraph-mcp`. A set-but-empty `EPIGRAPH_RESOURCE_METADATA_URL` counts as set: unset it, or give an absolute ASCII `http(s)://` URL. |
 | A passkey configuration error at boot (`ERROR: ...`), or `passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the enrollment ceremony answers 503` | Set both `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`, or neither. |
 | `FATAL: session GUCs do not survive between statements on one pooled connection. ...` | A transaction-mode pooler. Use a session-mode endpoint, or `EPIGRAPH_SESSION_GUC_MODE=transaction` (section 6). |
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |

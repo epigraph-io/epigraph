@@ -1277,14 +1277,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "claim.rs",
         "update_trace_id_conn",
-        "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
-         authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
+        "WRITE, by delegation only: a one-line wrapper over the generic-executor \
+         update_trace_id (EXECUTOR_WITHOUT_VIEWER), kept so callers can pass `&mut tx` by \
+         deref coercion. Same argument as update_labels_conn: an UPDATE on an already-fetched \
+         claim, authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
     ),
     (
         "claim.rs",
         "update_truth_value_conn",
-        "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
-         authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
+        "WRITE, by delegation only: a one-line wrapper over the generic-executor \
+         update_truth_value (EXECUTOR_WITHOUT_VIEWER), kept so callers can pass `&mut tx` by \
+         deref coercion. Same argument as update_labels_conn: an UPDATE on an already-fetched \
+         claim, authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
     ),
     (
         "claim_encryption.rs",
@@ -2177,6 +2181,30 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE through 206's definer `epigraph_share_claims_with_team` on a STAMPED \
          transaction: as `publicize_conn`, classified against the session's readable groups, \
          the principal's home group and its writable teams, all or nothing, audited.",
+    ),
+    (
+        "claim_visibility.rs",
+        "preview_publicize_conn",
+        "CLASSIFY through 206's definer `epigraph_publicize_claims` on a STAMPED transaction, \
+         never acting (backlog 02d9e9a1): `preview_conn` adds one id that names no claim, so \
+         the definer returns its classification before it writes, inside a savepoint that is \
+         always rolled back. The classification is the definer's own, against the session's \
+         readable groups (an unreadable id is `not_found`); it returns only ids the caller \
+         passed, with an outcome word. The viewer is spent on the stamp.",
+    ),
+    (
+        "claim_visibility.rs",
+        "preview_share_with_team_conn",
+        "CLASSIFY through 206's definer `epigraph_share_claims_with_team`, as \
+         `preview_publicize_conn`: never acting, always rolled back, the definer's own \
+         classification of the ids the caller passed.",
+    ),
+    (
+        "claim_visibility.rs",
+        "preview_conn",
+        "The private body of `preview_publicize_conn` and `preview_share_with_team_conn` \
+         (above): the same definer call on the same STAMPED transaction, in chunks of 499 ids \
+         plus the sentinel, each under its own always-rolled-back savepoint.",
     ),
     (
         "claim_visibility.rs",
@@ -4230,6 +4258,17 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "scoped_belief.rs",
+        "clear_community_folds_of_member",
+        "DELETE of one community's stored `ds_combined_beliefs` folds on the keys where a \
+         removed member perspective holds a live BBA, with a count of the matching rows the \
+         session can see. A cache cleanup the membership removal runs on the caller's stamped \
+         transaction; its control is the table's FORCE'd RLS (077 tenancy, 115 owner-scoped \
+         DELETE, 126 elevated refusal) against that transaction's GUCs, so it deletes only rows \
+         the caller may write and reports the rest as left. Pinned on the application role by \
+         `epigraph-api/tests/community_membership_scope_test.rs`.",
+    ),
+    (
+        "scoped_belief.rs",
         "upsert",
         "INSERT INTO `ds_combined_beliefs` (ON CONFLICT on `(frame_id, claim_id, scope_type, \
          scope_id)` DO UPDATE); a WRITE with no FROM for a viewer splice. Its control is the \
@@ -4260,6 +4299,40 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          connection's GUCs. There is nothing to filter: the caller (hypothesis promotion) read \
          the source row through `get_for_claim_frame` with its own viewer. Generic executor so \
          the promotion's transaction can hold the copy and its `claim_frames` insert together.",
+    ),
+    // Backlog 2dbf45f2: each was a `&PgPool` fn (`sqlx::query!`) beside a
+    // `_conn` twin repeating its UPDATE with runtime `Row::get`; the pair is
+    // now this one generic fn, and the `_conn` form (CONN_WITHOUT_VIEWER) wraps it.
+    (
+        "claim.rs",
+        "update_trace_id",
+        "UPDATE `claims` SET `trace_id` by primary key, RETURNING the row. A write; the \
+         control depends on the connection. The update_trace_id_conn wrapper's non-test \
+         callers pass the stamped transaction that created or fetched the claim, so there it \
+         is claims_tenancy's WITH CHECK against that connection's GUCs, as for \
+         update_labels_conn. The one non-test raw-pool caller, \
+         routes/conventions.rs::learn_convention, is NOT under a stamped WITH CHECK: it \
+         attaches the trace to the convention claim the same request has just created as the \
+         SYSTEM agent on the raw pool (viewer_spend_lint's learn_convention row), so its \
+         control is that the id is a row the handler itself wrote. A new \
+         raw-pool caller needs its own gate. A `&Viewer` would be spendable only through \
+         splice_write, which is not this change's. SCOPE: executor only; the SQL is \
+         unchanged.",
+    ),
+    (
+        "claim.rs",
+        "update_truth_value",
+        "UPDATE `claims` SET `truth_value` by primary key, RETURNING the row. A write; the \
+         control depends on the connection. The update_truth_value_conn wrapper's non-test \
+         callers pass their stamped transaction, so there it is claims_tenancy's WITH CHECK \
+         against that connection's GUCs, as for update_labels_conn. The one non-test raw-pool \
+         caller, routes/conventions.rs::forget_convention, is NOT under a stamped WITH CHECK: \
+         its gate is the handler's earlier ClaimRepository::get_by_id(pool, &viewer, ..), \
+         which refuses a claim the caller cannot see before this write runs \
+         (viewer_spend_lint's forget_convention row). A new \
+         raw-pool caller needs its own gate. A `&Viewer` would be spendable only through \
+         splice_write, which is not this change's. SCOPE: executor only; the SQL is \
+         unchanged.",
     ),
     (
         "claim.rs",
@@ -4702,6 +4775,85 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `compound_write_guard::decide`, first checks the claim is visible to the caller \
          (`visible_claim_ids`, viewer-spliced) and answers an unreadable claim as not-a-compound, \
          so the bit is never learned about a claim the caller cannot read.",
+    ),
+    // Backlog 30c84267: the experiment-loop and method-catalog handlers run
+    // every statement on the caller's stamped transaction or read, so the repo
+    // functions they reach on it take a generic executor. Every `&PgPool`
+    // caller (the `epigraph-cli` binaries) compiles unchanged.
+    // `ExperimentRepository::create` and `ExperimentResultRepository::create`
+    // (one row: the lint keys on file and name).
+    (
+        "experiment.rs",
+        "create",
+        "INSERT of one `experiments` or `experiment_results` row. Neither relation carries a \
+         `visibility` or `owner_group_id` column (see `get_for_hypothesis`), so a `&Viewer` would \
+         be a parameter the statement could not spend; the API's callers gate on the hypothesis \
+         first. Widened so `routes/experiment_loop.rs` writes the row with its edge on ONE \
+         stamped transaction. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    // `ExperimentRepository::get` and `ExperimentResultRepository::get`.
+    (
+        "experiment.rs",
+        "get",
+        "READ of one `experiments` or `experiment_results` row by id; the FROM is that table \
+         alone and it joins nothing, and neither carries tenancy columns or row security. \
+         `routes/experiment_loop.rs` reads the RESULT row (`ExperimentResultRepository::get`) on \
+         the caller's stamped transaction after `require_experiment_hypothesis` has read the \
+         hypothesis through the viewer and tied the result to the experiment. No API route reads \
+         the experiment row through `ExperimentRepository::get` any more (the gate reads it); \
+         that function shares this row because the lint keys on file and name, and its only \
+         caller is the CLI on `&PgPool`. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "experiment.rs",
+        "add_measurements",
+        "UPDATE of one `experiment_results` row by id (appends measurements). The relation \
+         carries no `visibility` or `owner_group_id` column and no row security; \
+         `routes/experiment_loop.rs::add_measurements` runs it after the hypothesis write gate, \
+         on the caller's stamped transaction. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "method.rs",
+        "insert",
+        "INSERT of one `methods` row. `methods` is global reference data with no tenancy columns \
+         and no row security (see `method.rs::get`), so there is no predicate for a viewer to \
+         add. Widened so `routes/experiments.rs::add_method` writes the method and its capability \
+         links on ONE stamped transaction. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "method.rs",
+        "link_capability",
+        "UPSERT of one `method_capabilities` row. The relation has no tenancy columns and no row \
+         security, like `methods` (see `get_methods_for_capability`). Widened so \
+         `routes/experiments.rs::add_method` links capabilities on the transaction that wrote \
+         the method. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "method.rs",
+        "find_by_embedding",
+        "READ of `methods` ranked by vector similarity; the FROM is `methods` and a one-row \
+         query-vector CTE, nothing else. `methods` has no tenancy columns and no row security \
+         (see `method.rs::get`). Widened so `routes/experiments.rs::find_methods` reads on the \
+         caller's stamped connection. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "method.rs",
+        "get_capabilities",
+        "READ of `method_capabilities` by `method_id`; the FROM is that table alone. It has no \
+         tenancy columns and no row security (see `get_methods_for_capability`). Widened so \
+         `routes/experiments.rs::find_methods` reads it on the connection that found the methods. \
+         SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "mass_function.rs",
+        "store",
+        "The `perspective_id = NULL` wrapper over `store_with_perspective` (same INSERT, same \
+         write-side control: `mass_functions` takes its claim's tenancy and `WITH CHECK` admits \
+         only a writer of that group). Widened so \
+         `routes/experiment_loop.rs::analyze_result` stores its error-derived BBA on the \
+         caller's stamped transaction, where that check sees the caller's writable set; on the \
+         unstamped application pool it refused every group-owned hypothesis. SCOPE: executor \
+         only; the SQL is unchanged.",
     ),
 ];
 

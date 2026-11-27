@@ -21,7 +21,9 @@
 //! `conventions.rs::forget_convention` (evidence -> claim REFUTES): both
 //! handlers hold a `Viewer`, and every other statement they make autocommits on
 //! the raw pool, so moving the one edge statement onto `AppState::write_as`
-//! splits no transaction. None of the sites below holds a stamped transaction
+//! splits no transaction. Nor is `conventions.rs::learn_convention` (backlog
+//! 1c822492): its claim, evidence, trace and AUTHORED / TRACES / HAS_TRACE
+//! edges are one write on the caller's stamped transaction. None of the sites below holds a stamped transaction
 //! where it writes. Each in-scope site's disposition is in the table: a
 //! STRUCTURAL site (an agent, trace, frame, context, span, perspective or
 //! community endpoint) is administrative by D8's own rule, and stamping it
@@ -41,21 +43,14 @@
 //! | claims.rs | create_claim | claim -> trace HAS_TRACE | no | structural |
 //! | claims.rs | create_claim | claim -> evidence DERIVED_FROM | yes | holds a `Viewer`; a post-commit best-effort statement; conversion deferred (no direct test harness for the signed create path yet) |
 //! | community.rs | add_member | perspective -> community MEMBER_OF | no | structural |
-//! | conventions.rs | learn_convention | agent -> claim AUTHORED | no | structural |
-//! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
-//! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
 //! | spans.rs | close_span | span -> claim generated | no |
 //! | spans.rs | close_span | span -> claim uses_evidence | no |
-//! | experiment_loop.rs | create_experiment | experiment -> claim tests_hypothesis | no |
-//! | experiment_loop.rs | submit_results | experiment_result -> experiment result_of | no |
-//! | experiment_loop.rs | analyze_result | analysis -> experiment_result analyzes | no |
-//! | experiment_loop.rs | analyze_result | analysis -> claim provides_evidence | no |
 //!
-//! The four `experiment_loop.rs` rows are not new writes: they were that file's
-//! raw `INSERT INTO edges` statements (the second register), moved onto
-//! `EdgeRepository::create_signed` so the API key attests them (ruling R-50),
-//! on the same raw pool as before. Stamping them is still to do.
+//! `experiment_loop.rs` once had four rows here (its raw `INSERT INTO edges`
+//! statements, moved onto `EdgeRepository::create_signed` under ruling R-50 on
+//! the same raw pool). The D1127c-03 conversion put those writes on the
+//! caller's viewer-stamped transaction, so the file no longer appears.
 //!
 //!
 //! # The second register: raw `INSERT INTO edges` in a route file
@@ -150,15 +145,18 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // public claim's one pool call is left here.
     ("claims.rs", 1),
     ("community.rs", 1),
-    // 6 before the W12b revise, which stamped `share_skill`'s and
-    // `forget_convention`'s in-scope edge statements.
-    ("conventions.rs", 3),
+    // `conventions.rs` (3) is gone (backlog 1c822492): `learn_convention`'s
+    // AUTHORED / TRACES / HAS_TRACE edges are written on the caller's stamped
+    // transaction with the claim. 6 before the W12b revise, which stamped
+    // `share_skill`'s and `forget_convention`'s in-scope edge statements.
     // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
     // "What this file does NOT see").
     // R-50: moved here from RAW_INSERTS (its four raw INSERTs became
     // `EdgeRepository::create_signed` on the same raw pool); not new writes.
-    ("experiment_loop.rs", 4),
+    // `experiment_loop.rs` (4) left with the D1127c-03 conversion: `create_experiment`,
+    // `submit_results` and `analyze_result` write their edges on the caller's
+    // viewer-stamped transaction, so the file has no raw-pool edge write to count.
     ("perspective.rs", 1),
     // 3 -> 2 (backlog 1dea9589): `create_span`'s attributed_to edge is written
     // on the caller's stamped transaction. `close_span`'s two remain.
@@ -188,7 +186,10 @@ const UNSTAMPED: &[(&str, usize)] = &[
 /// written on the caller's stamped transaction (`spans.rs` 3 -> 2).
 /// 23 -> 20 (backlog 74feb76b; 25 -> 22 on its own branch): `assess_claim`
 /// was stamped and its `assess.rs` row (3) deleted.
-const HIGH_WATER: usize = 20;
+/// 20 -> 17 (backlog 1c822492): `learn_convention` writes its convention claim
+/// and its three structural edges on the caller's stamped transaction, and
+/// the `conventions.rs` row (3) was deleted.
+const HIGH_WATER: usize = 17;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

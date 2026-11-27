@@ -123,6 +123,15 @@ async fn counts_track_the_rows_that_were_seeded(pool: PgPool) {
     // `seed_claim` also inserts a system agent per call, so claims and agents
     // move together; assert the deltas rather than absolute numbers.
     assert_eq!(count(&after, "claims") - count(&before, "claims"), 3);
+    // Backlog 953d5707: the seeders sign nothing, so all three are unsigned.
+    assert_eq!(
+        count(&after, "claims_unsigned") - count(&before, "claims_unsigned"),
+        3
+    );
+    assert_eq!(
+        count(&after, "claims_signed") - count(&before, "claims_signed"),
+        0
+    );
     assert_eq!(count(&after, "edges") - count(&before, "edges"), 1);
     assert_eq!(count(&after, "evidence") - count(&before, "evidence"), 1);
     assert_eq!(count(&after, "frames") - count(&before, "frames"), 1);
@@ -153,6 +162,8 @@ async fn the_response_has_exactly_the_documented_keys(pool: PgPool) {
         vec![
             "agents",
             "claims",
+            "claims_signed",
+            "claims_unsigned",
             "computed_at",
             "edges",
             "embeddings",
@@ -163,6 +174,8 @@ async fn the_response_has_exactly_the_documented_keys(pool: PgPool) {
     );
     for key in [
         "claims",
+        "claims_signed",
+        "claims_unsigned",
         "edges",
         "evidence",
         "embeddings",

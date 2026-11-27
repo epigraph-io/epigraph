@@ -171,14 +171,15 @@ def test_grow_labels_the_database_it_was_given_and_surfaces_failure(monkeypatch)
 
     monkeypatch.setattr(T, "cluster_stats", lambda conn, run_id: [])
     monkeypatch.setattr(T, "current_k", lambda conn, run_id: 5)
-    monkeypatch.setattr(T.project_to_themes, "project_run", lambda conn, run_id: None)
+    monkeypatch.setattr(T.project_to_themes, "check_full_rebuild", lambda conn, confirm: None)
+    monkeypatch.setattr(T.project_to_themes, "project_run", lambda conn, run_id, **kw: None)
     monkeypatch.setattr(T, "run_label_step", fake_label)
     args = argparse.Namespace(
         from_run_id="run-x", database_url="postgres://u:p@localhost/scratch_test",
         min_size=2000, max_size=T.DEFAULT_MAX_SIZE, target_k=72, max_iter=8,
-        dry_run=False,
+        dry_run=False, confirm_full_rebuild=False,
     )
-    result = T.grow(None, args)
+    result = T.grow(_Conn([]), args)
     assert labelled == ["postgres://u:p@localhost/scratch_test"]
     assert result["status"] == "label_failed"
     assert result["run_id"] == "run-x"
@@ -237,3 +238,127 @@ def test_a_resumed_grow_dry_run_reports_candidates_without_writing(monkeypatch):
     )
     result = T.grow(None, args)
     assert result == {"status": "dry-run", "run_id": "run-x", "k": 1}
+
+
+# --- the full-rebuild guard (backlog 18ae37e7) ---------------------------------
+
+class _Conn:
+    """A connection stand-in that records the calls made on it into `log`."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def rollback(self):
+        self.log.append("rollback")
+
+
+def _grow_args(**kw):
+    import argparse
+    base = dict(
+        from_run_id=None, database_url="postgres://u:p@localhost/scratch_test",
+        sample_size=5000, k=None, all_claims=False, batch_size=20000,
+        min_size=2000, max_size=T.DEFAULT_MAX_SIZE, target_k=72, max_iter=8,
+        dry_run=False, confirm_full_rebuild=False,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_grow_refuses_an_unconfirmed_rebuild_before_clustering(monkeypatch):
+    """grow projects at the very END of a long clustering run; the guard has
+    to fire before the run starts, not after it has been paid for."""
+    import pytest
+
+    def tripwire(name):
+        def hit(*_a, **_k):
+            raise AssertionError(f"an unconfirmed grow reached {name}")
+        return hit
+
+    def refuse(conn, confirm):
+        assert confirm is False
+        raise T.project_to_themes.FullRebuildRefused("claim_themes: 9 themes")
+
+    monkeypatch.setattr(T.project_to_themes, "check_full_rebuild", refuse)
+    monkeypatch.setattr(T.theme_lib, "new_run_id", tripwire("new_run_id"))
+    monkeypatch.setattr(T.cluster_claims, "seed_phase", tripwire("seed_phase"))
+    monkeypatch.setattr(T.cluster_claims, "assign_batch", tripwire("assign_batch"))
+    monkeypatch.setattr(T, "cluster_stats", tripwire("cluster_stats"))
+    monkeypatch.setattr(T.project_to_themes, "project_run", tripwire("project_run"))
+    with pytest.raises(T.project_to_themes.FullRebuildRefused):
+        T.grow(None, _grow_args())
+    with pytest.raises(T.project_to_themes.FullRebuildRefused):
+        T.grow(None, _grow_args(from_run_id="run-x"))
+
+
+def test_grow_forwards_the_confirmation_to_the_projection(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(T.project_to_themes, "check_full_rebuild",
+                        lambda conn, confirm: seen.setdefault("checked", confirm))
+    monkeypatch.setattr(T, "cluster_stats", lambda conn, run_id: [])
+    monkeypatch.setattr(T, "current_k", lambda conn, run_id: 5)
+
+    def fake_project_run(conn, run_id, *, confirm_full_rebuild=False):
+        seen["projected"] = confirm_full_rebuild
+
+    monkeypatch.setattr(T.project_to_themes, "project_run", fake_project_run)
+    monkeypatch.setattr(T, "run_label_step", lambda url: 0)
+    result = T.grow(_Conn([]), _grow_args(from_run_id="run-x", confirm_full_rebuild=True))
+    assert seen == {"checked": True, "projected": True}
+    assert result["status"] == "grown"
+
+
+def test_grow_ends_the_checks_read_transaction_before_clustering(monkeypatch):
+    """The check reads claim_themes and every table cascading from it. Left
+    open, its transaction would hold those locks through the whole UMAP fit."""
+    log = []
+
+    class Stop(Exception):
+        pass
+
+    def stop_at_seed(*_a, **_k):
+        log.append("seed_phase")
+        raise Stop
+
+    monkeypatch.setattr(T.project_to_themes, "check_full_rebuild",
+                        lambda conn, confirm: log.append("check"))
+    monkeypatch.setattr(T.theme_lib, "new_run_id", lambda: "run-new")
+    monkeypatch.setattr(T.cluster_claims, "seed_phase", stop_at_seed)
+    import pytest
+    with pytest.raises(Stop):
+        T.grow(_Conn(log), _grow_args(confirm_full_rebuild=True))
+    assert log == ["check", "rollback", "seed_phase"]
+
+
+def test_pipeline_cli_takes_the_flag_and_exits_nonzero_on_a_refusal(monkeypatch, capsys):
+    import pytest
+    seen = {}
+
+    class Conn:
+        def rollback(self):
+            seen["rolled_back"] = True
+
+        def close(self):
+            seen["closed"] = True
+
+    def refuse(conn, run_id, *, confirm_full_rebuild=False):
+        seen["confirm"] = confirm_full_rebuild
+        raise T.project_to_themes.FullRebuildRefused("claim_themes: 4 themes")
+
+    monkeypatch.setattr(T.theme_lib, "connect", lambda url: Conn())
+    monkeypatch.setattr(T.theme_lib, "set_statement_timeout", lambda conn, ms: None)
+    monkeypatch.setattr(T.project_to_themes, "project_run", refuse)
+    monkeypatch.setattr(T.sys, "argv", ["theme_pipeline.py", "project", "--run-id", "r1",
+                                        "--database-url", "postgres://u:p@localhost/x"])
+    with pytest.raises(SystemExit) as exc:
+        T.main()
+    assert exc.value.code == 1
+    assert seen == {"confirm": False, "rolled_back": True, "closed": True}
+    assert "claim_themes: 4 themes" in capsys.readouterr().err
+
+    monkeypatch.setattr(T.sys, "argv", ["theme_pipeline.py", "project", "--run-id", "r1",
+                                        "--database-url", "postgres://u:p@localhost/x",
+                                        "--i-understand-full-rebuild"])
+    seen.clear()
+    with pytest.raises(SystemExit):
+        T.main()
+    assert seen["confirm"] is True

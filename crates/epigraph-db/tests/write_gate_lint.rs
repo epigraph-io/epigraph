@@ -171,8 +171,13 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
         "claim.rs::migrate_superseded_edges",
         "caller-supplied ids, privileged session only (the edge half of `supersede_conn`, split by batch W10; not a new write)",
     ),
-    ("claim.rs::update_trace_id_conn", "caller-supplied id"),
-    ("claim.rs::update_truth_value_conn", "caller-supplied id"),
+    // Were `claim.rs::update_trace_id_conn` / `update_truth_value_conn`, each
+    // beside a `sqlx::query!` twin of the same UPDATE in the pool form (two
+    // `MACRO_WRITE_SITES` rows, now gone). Backlog 2dbf45f2 folded each pair
+    // into the generic-executor base fn with the runtime statement, and the
+    // `_conn` forms only wrap it. A rename, not a new ungated write.
+    ("claim.rs::update_trace_id", "caller-supplied id"),
+    ("claim.rs::update_truth_value", "caller-supplied id"),
     ("edge.rs::retract", "caller-supplied id"),
     (
         "frame.rs::write_property",
@@ -303,8 +308,6 @@ const MACRO_WRITE_SITES: &[(&str, &str)] = &[
         "claim.rs::set_properties_conn",
         "sqlx::query! (body moved from `set_properties`, which now delegates; not a new write)",
     ),
-    ("claim.rs::update_trace_id", "sqlx::query!"),
-    ("claim.rs::update_truth_value", "sqlx::query!"),
     ("edge.rs::retract_between", "sqlx::query!"),
     ("edge.rs::retract_by_id", "sqlx::query!"),
     ("edge.rs::update_valid_to_and_properties", "sqlx::query!"),
