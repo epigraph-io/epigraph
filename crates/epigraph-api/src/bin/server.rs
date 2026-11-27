@@ -688,6 +688,7 @@ async fn main() {
             .with_legacy_redirect_uri(std::env::var("EPIGRAPH_REDIRECT_URI").ok())
             .with_token_exchange_audiences(token_exchange_audiences_from_env())
             .with_oauth_redirect_origins(oauth_redirect_origins_from_env())
+            .with_assertion_v1(assertion_v1_from_env())
             .with_bp_apply(bp_apply_from_env())
             .with_bp_max_concurrent(bp_max_concurrent_from_env())
             .with_guest_reads(guest_reads)
@@ -1150,6 +1151,22 @@ fn oauth_redirect_origins_from_env() -> epigraph_api::oauth::redirect::RedirectO
         );
     }
     origins
+}
+
+/// `EPIGRAPH_ASSERTION_V1`, read once at boot: whether a version-1 agent
+/// assertion (bound to no issuer) is still accepted. Unset is `accept`; a
+/// value that is neither `accept` nor `refuse` REFUSES the boot, so a typo
+/// never silently changes which assertions authenticate. Logged when `refuse`.
+#[cfg(feature = "db")]
+fn assertion_v1_from_env() -> epigraph_api::oauth::assertion::AssertionV1Policy {
+    let policy = epigraph_api::oauth::assertion::AssertionV1Policy::from_env()
+        .unwrap_or_else(|e| panic!("refusing to start: {e}"));
+    tracing::info!(
+        policy = policy.as_str(),
+        "version-1 agent assertions (bound to no issuer): {}",
+        policy.as_str()
+    );
+    policy
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a

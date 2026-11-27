@@ -554,7 +554,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        21,
+        22,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
@@ -582,7 +582,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          verify and the nonce record, one read of `agents.key_kind` (universally readable by \
          policy, untenanted) for the verified key, refusing a key held by an agent that is not \
          a signature verifier (any kind but `ed25519`), before anything is minted: the same \
-         pre-authentication reason.",
+         pre-authentication reason. The twenty-second is `record_v1_assertion` (backlog \
+         bada894d): after a VERSION-1 agent assertion verified and its nonce was spent, one \
+         `security_events` row (`oauth_agent_assertion_v1_accepted`, `agent_id` NULL, which \
+         migration 077's append policy admits from any session, and not under 118's reserved \
+         `oauth.` prefix) counting it, before anything \
+         is minted; it reads nothing: the same pre-authentication reason.",
     ),
     (
         "oauth/token_exchange.rs",

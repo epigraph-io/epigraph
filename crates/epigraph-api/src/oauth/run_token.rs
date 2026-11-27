@@ -421,6 +421,11 @@ async fn decide(
     // Scopes: asked-for (or all granted) ∩ granted ∩ the delegated ceiling,
     // then the mint chokepoint. The ceiling holds no admin-only scope, so the
     // chokepoint's would-strip recorder never sees one.
+    // A retired scope (`epigraph_auth::RETIRED_SCOPES`) asked for is outside
+    // the ceiling, so it is dropped like any other; a request naming ONLY
+    // retired scopes is refused `no_scope` below, never widened to everything
+    // granted (a run token is minted for someone else, so it never carries
+    // more than was asked for).
     let asked: Vec<String> = match req.scope.as_deref() {
         Some(s) => s.split_whitespace().map(str::to_string).collect(),
         None => client.granted_scopes.clone(),

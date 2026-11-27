@@ -500,6 +500,12 @@ pub struct AppState {
     /// classes. EMPTY in every constructor; `bin/server.rs` sets it at boot.
     pub oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins,
 
+    /// Whether the token endpoint still accepts a VERSION-1 agent assertion
+    /// (bound to no issuer; `crate::oauth::assertion`). `Accept` (the default)
+    /// in every constructor; `bin/server.rs` sets it from
+    /// `EPIGRAPH_ASSERTION_V1` at boot.
+    pub assertion_v1: crate::oauth::assertion::AssertionV1Policy,
+
     /// entity_types registry cache: `type_name` -> resolved [`EntityTypeEntry`].
     ///
     /// The single source of truth (in-process) for BOTH edge entity-type
@@ -1334,6 +1340,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
         }
     }
 
@@ -1396,6 +1403,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -1430,6 +1438,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
         }
     }
 
@@ -2025,6 +2034,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -2061,6 +2071,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
         }
     }
 
@@ -2112,6 +2123,7 @@ impl AppState {
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -2844,6 +2856,14 @@ impl AppState {
         origins: crate::oauth::redirect::RedirectOrigins,
     ) -> Self {
         self.oauth_redirect_origins = origins;
+        self
+    }
+
+    /// Set whether a version-1 agent assertion is still accepted; see
+    /// [`Self::assertion_v1`].
+    #[must_use]
+    pub fn with_assertion_v1(mut self, policy: crate::oauth::assertion::AssertionV1Policy) -> Self {
+        self.assertion_v1 = policy;
         self
     }
 

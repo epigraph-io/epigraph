@@ -124,10 +124,28 @@ pub const ADMIN_ONLY_SCOPES: &[&str] = &[
 /// nowhere but the elevate grant.
 pub const PLATFORM_ADMIN_SCOPE: &str = "platform:admin";
 
+/// Scopes RETIRED from issuance (backlog 7b2e8e26, from the 8d5c8d50 scope
+/// census): grantable once, but required by no route, middleware or MCP gate.
+/// They are in no canonical role, no registration set, the delegated ceiling
+/// or `scopes_supported`, and no grant mints them. Clients and tokens that
+/// already carry one keep working: a HELD retired scope is ignored, and a
+/// REQUESTED one is dropped from the request, so a refresh or exchange naming
+/// one narrows it away instead of failing `invalid_scope`.
+///
+/// `epigraph-auth` spells the same list (`epigraph_auth::RETIRED_SCOPES`; it
+/// does not depend on this crate) and owns the request and ceiling rules; a
+/// test in `epigraph-api` pins the two equal.
+pub const RETIRED_SCOPES: &[&str] = &[
+    "claims:challenge",
+    "claims:delete",
+    "evidence:read",
+    "ingest:write",
+    "policy:challenge",
+];
+
 /// Read scopes. These are included in all three roles.
 pub const READ_SCOPES: &[&str] = &[
     "claims:read",
-    "evidence:read",
     "edges:read",
     "agents:read",
     "groups:read",
@@ -145,14 +163,11 @@ pub const READ_SCOPES: &[&str] = &[
 /// Write scopes. Included in `admin` and `wo`; excluded from `ro`.
 pub const WRITE_SCOPES: &[&str] = &[
     "claims:write",
-    "claims:delete",
     "evidence:write",
     "evidence:submit",
     "edges:write",
     "agents:write",
     "tasks:write",
-    "ingest:write",
-    "policy:challenge",
     "webhooks:write",
     // Gates POST /api/v1/groups. Any read-write principal may create a group;
     // it becomes that group's sole `role='admin'` member by construction
@@ -173,7 +188,6 @@ pub const WRITE_SCOPES: &[&str] = &[
 /// pins the subset relation; nothing pins equality, and nothing should.
 pub const PUBLIC_CLIENT_READ_SCOPES: &[&str] = &[
     "claims:read",
-    "evidence:read",
     "edges:read",
     "agents:read",
     "groups:read",
@@ -194,8 +208,8 @@ pub const PUBLIC_CLIENT_READ_SCOPES: &[&str] = &[
 /// read+write on claims, edges and evidence, plus `agents:read`.
 ///
 /// A **strict subset** of `READ_SCOPES ∪ WRITE_SCOPES`, and not any canonical
-/// union — in particular it carries no `ingest:write`, no analysis scopes and
-/// no `agents:write`, so a provisioned agent client cannot mint further agents.
+/// union — in particular it carries no analysis scopes and no
+/// `agents:write`, so a provisioned agent client cannot mint further agents.
 /// It is also the set `/oauth/register`'s `client_type: "agent"` arm now
 /// proposes as `allowed_scopes` while granting **none** of them: an admin must
 /// approve before any become effective.
@@ -204,7 +218,6 @@ pub const AGENT_PROVISION_SCOPES: &[&str] = &[
     "claims:write",
     "edges:read",
     "edges:write",
-    "evidence:read",
     "evidence:write",
     "agents:read",
 ];
@@ -429,18 +442,37 @@ mod tests {
             AGENT_PROVISION_SCOPES.len() < rw.len(),
             "AGENT_PROVISION_SCOPES must be a STRICT subset of read_write_scopes()"
         );
-        // Least privilege: an auto-provisioned agent cannot mint further agents,
-        // cannot bulk-ingest, and holds no admin scope.
-        for s in [
-            "agents:write",
-            "ingest:write",
-            "claims:admin",
-            "groups:admin",
-        ] {
+        // Least privilege: an auto-provisioned agent cannot mint further agents
+        // and holds no admin scope.
+        for s in ["agents:write", "claims:admin", "groups:admin"] {
             assert!(
                 !AGENT_PROVISION_SCOPES.contains(&s),
                 "AGENT_PROVISION_SCOPES must NOT include {s}"
             );
         }
+    }
+
+    /// No retired scope is in a canonical role, a registration set or the
+    /// admin-only set: none is handed out any more (backlog 7b2e8e26).
+    #[test]
+    fn no_retired_scope_is_issued() {
+        for (name, set) in [
+            ("READ_SCOPES", READ_SCOPES),
+            ("WRITE_SCOPES", WRITE_SCOPES),
+            ("ADMIN_ONLY_SCOPES", ADMIN_ONLY_SCOPES),
+            ("PUBLIC_CLIENT_READ_SCOPES", PUBLIC_CLIENT_READ_SCOPES),
+            ("AGENT_PROVISION_SCOPES", AGENT_PROVISION_SCOPES),
+        ] {
+            for s in set {
+                assert!(!RETIRED_SCOPES.contains(s), "{name} still issues {s}");
+            }
+        }
+        for name in CANONICAL_CLIENT_NAMES {
+            let scopes = scopes_for(name).expect("canonical");
+            for s in &scopes {
+                assert!(!RETIRED_SCOPES.contains(&s.as_str()), "{name} gets {s}");
+            }
+        }
+        assert!(!RETIRED_SCOPES.contains(&PLATFORM_ADMIN_SCOPE));
     }
 }
