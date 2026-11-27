@@ -1827,29 +1827,18 @@ pub async fn submit_packet(
     // Embedding generation is non-blocking: if the service is unavailable
     // or fails, the claim submission still succeeds.
     //
-    // Skip host-provenance telemetry (epiclaw-host signs every observable
-    // event as a signed claim for tamper-evidence; embedding sentence-shaped
-    // operational events like "Container X exited code 0 after Yms" has no
-    // semantic value and costs an OpenAI call per event).
+    // Skip telemetry-shaped claims (backlog d323bc31): a `telemetry` label or
+    // any non-null `properties.event`. Hosts sign every observable event as a
+    // claim for tamper-evidence; embedding sentence-shaped operational events
+    // like "Container X exited code 0 after Yms" has no semantic value and
+    // costs an embedding call per event. The rule is
+    // `epigraph_db::is_telemetry_shaped`, the Rust twin of the SQL predicate
+    // the embedding backfill enumerates, NOT a list of known event names: a
+    // name list here embedded every event a host added later, which the
+    // backfill then treated as outside the population anyway.
     #[cfg(feature = "db")]
-    let is_host_telemetry = packet
-        .claim
-        .properties
-        .as_ref()
-        .and_then(|p| p.get("event"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|e| {
-            matches!(
-                e,
-                "container_spawned"
-                    | "container_exited"
-                    | "agent_output"
-                    | "task_scheduled"
-                    | "task_executed"
-                    | "message_received"
-                    | "message_sent"
-            )
-        });
+    let is_host_telemetry =
+        epigraph_db::is_telemetry_shaped(&packet.claim.labels, packet.claim.properties.as_ref());
 
     // Skip re-embedding on a duplicate submit (§5): the canonical claim already
     // carries its embedding from the create path; re-running the (paid) embed

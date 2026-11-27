@@ -120,9 +120,9 @@ pub use repos::{
     PaperIngest, PaperRef, PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use repos::{
-    carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
-    AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository, AgentKeyRow,
-    AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
+    carries_dedup_identity_key, is_telemetry_shaped, reserved_edge_property_refusal,
+    ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository,
+    AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
     AnalysisRecord, AnalysisRepository, AssertionNonceRepository, AttestedKeyRow, AuthorOperator,
     BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, BetaTrackInput, ChallengeRepository, ChallengeRow,

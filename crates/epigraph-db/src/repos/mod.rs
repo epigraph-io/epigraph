@@ -173,14 +173,15 @@ pub use authored_by::{
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    carries_dedup_identity_key, reserved_edge_property_refusal, AdminClaimAction, AdminClaimWrite,
-    AdminToken, BeliefBoundedClaimHit, BeliefSort, BetaTrackInput, ClaimBeliefColumns,
-    ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance,
-    ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode,
-    ConsolidateResult, CreatedWindow, DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance,
-    EdgeTenancy, EmbeddingSeedScope, EvolveStepResult, FlatPage, FlatRanking, FrameClaimBeliefHit,
-    GraphExpansionHit, GroundedNeighbor, HybridCandidates, HybridHit, HybridPage, LabelFamilyRow,
-    LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow, MarkedDuplicates, MovedBba,
+    carries_dedup_identity_key, is_telemetry_shaped, reserved_edge_property_refusal,
+    AdminClaimAction, AdminClaimWrite, AdminToken, BeliefBoundedClaimHit, BeliefSort,
+    BetaTrackInput, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimListFilter,
+    ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField, ClaimSortOrder,
+    ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult, CreatedWindow, DedupRepair,
+    DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
+    EvolveStepResult, FlatPage, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit,
+    GroundedNeighbor, HybridCandidates, HybridHit, HybridPage, LabelFamilyRow, LabelQuery,
+    LevelAndSourceType, LineageHead, MarkedDuplicateRow, MarkedDuplicates, MovedBba,
     NearestClaimHit, PatchClaimDiff, PatchClaimInput, PromotionStanding, SemanticFlatPage,
     SemanticSelectedClaim, SortDirection, SupersedeActor, SupersedeEdgeMigration, SupersedeTool,
     SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,

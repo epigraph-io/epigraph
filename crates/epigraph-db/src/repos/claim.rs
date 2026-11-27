@@ -59,12 +59,36 @@ pub(crate) const EFFECTIVE_BELIEF_SCORE_SQL: &str =
 /// embedded population" and "is its vector missing right now" are different
 /// questions, and `claim_text_for_embedding`'s caller already holds a row it
 /// intends to (re)embed.
+///
+/// The two telemetry clauses (`'telemetry' = ANY(labels)`, `properties->>'event'
+/// IS NOT NULL`) are ONE rule with [`is_telemetry_shaped`], which applies them
+/// to a claim that is not a row yet (the `POST /submit/packet` embed). Change
+/// both together: a write path that skipped less than this predicate would pay
+/// to embed claims the enumerator never would, and one that skipped more would
+/// leave a gap the enumerator then fills.
 const EMBEDDABLE_POPULATION: &str = "COALESCE(is_current, true) = true \
      AND NOT ('telemetry' = ANY(labels)) \
      AND (properties->>'event') IS NULL \
      AND NOT EXISTS ( \
          SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
      )";
+
+/// Whether a claim with these `labels` and `properties` is telemetry-shaped,
+/// and so outside the embedded population: it carries the exact label
+/// `telemetry`, or its `properties` is a JSON object with a non-null `event`
+/// key (any value, of any JSON type).
+///
+/// The in-memory half of [`EMBEDDABLE_POPULATION`]'s two telemetry clauses, one
+/// rule in two languages: `'telemetry' = ANY(labels)` is the label test, and
+/// `(properties->>'event') IS NOT NULL` is the event test (`->>` yields NULL for
+/// a missing key, a JSON `null`, and a non-object `properties`, and text for any
+/// other value). Change both together.
+pub fn is_telemetry_shaped(labels: &[String], properties: Option<&serde_json::Value>) -> bool {
+    labels.iter().any(|l| l == "telemetry")
+        || properties
+            .and_then(|p| p.get("event"))
+            .is_some_and(|e| !e.is_null())
+}
 
 /// `hnsw.ef_search` for a hybrid dense leg of `candidate_pool` rows: the pool
 /// itself, clamped to pgvector's default (40) below and its maximum (1000)
@@ -11605,6 +11629,41 @@ pub struct ClaimDispute {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`is_telemetry_shaped`] against the cases on which `EMBEDDABLE_POPULATION`'s
+    /// telemetry clauses decide: exact-case label, an `event` of any non-null
+    /// JSON type, a JSON-null `event`, and a `properties` that is not an object.
+    #[test]
+    fn is_telemetry_shaped_matches_the_population_predicate() {
+        use serde_json::json;
+        let none: &[String] = &[];
+        let labelled = ["src:host".to_string(), "telemetry".to_string()];
+        let cases: [(&[String], Option<serde_json::Value>, bool); 12] = [
+            (none, None, false),
+            (none, Some(json!({})), false),
+            (none, Some(json!({"kind": "note"})), false),
+            (none, Some(json!({"event": null})), false),
+            (none, Some(json!({"event": "some_future_event"})), true),
+            (none, Some(json!({"event": "container_exited"})), true),
+            (none, Some(json!({"event": 0})), true),
+            (none, Some(json!({"event": false})), true),
+            (none, Some(json!({"event": {"kind": "x"}})), true),
+            (none, Some(json!(["event"])), false),
+            (&labelled, None, true),
+            (
+                &["Telemetry".to_string(), "telemetry-adjacent".to_string()],
+                None,
+                false,
+            ),
+        ];
+        for (labels, properties, expected) in cases {
+            assert_eq!(
+                is_telemetry_shaped(labels, properties.as_ref()),
+                expected,
+                "labels {labels:?}, properties {properties:?}"
+            );
+        }
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_claim_crud(_pool: sqlx::PgPool) {
