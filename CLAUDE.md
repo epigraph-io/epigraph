@@ -64,6 +64,14 @@ and tenancy are the extension's own job; see
 Never register a first-party route under `/api/v1/ext`
 (`tests/router_extension_seam_lint.rs` fails if you do).
 
+## Crate layering
+
+`epigraph-api`, `epigraph-mcp` and `epigraph-cli` are front ends; an operation
+more than one of them needs goes into `epigraph-service`, never into
+`epigraph-mcp`, and no front end may gain a dependency on another. The rule,
+the composition-target exception and the ratchet that enforces it are in
+`docs/architecture/crate-layering.md`.
+
 ## Retiring backlog items
 
 When you complete or refute a claim labelled `backlog`, **always use
