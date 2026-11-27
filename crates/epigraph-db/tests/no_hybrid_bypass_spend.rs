@@ -619,7 +619,9 @@ fn the_positive_control_is_still_clean() {
 /// would pass the register test. This fixture has the exact shape that row had
 /// (a bypass minted from the privileged pool, the read run on `self.pool`), and
 /// it goes through [`hybrids_in`], the per-file path [`scan`] uses, so a broken
-/// stripper, region splitter or match list fails here. The same function with
+/// stripper, region splitter or match list fails here. Its second function,
+/// `store`, runs on `self.pool` WITHOUT minting a bypass, so a scanner that
+/// dropped the [`MINTS`] half of the match would flag it and fail here too. The same function with
 /// the read moved onto the maintenance session, and the same body inside a
 /// `#[cfg(test)]` module or a comment, must NOT be flagged.
 #[test]
@@ -632,7 +634,10 @@ impl ReputationJobService for DbReputationService {
         Ok(rows)
     }
 
-    async fn store(&self) -> Result<(), E> { Ok(()) }
+    async fn store(&self, row: Outcome) -> Result<(), E> {
+        sqlx::query("INSERT INTO outcomes VALUES ($1)").bind(row).execute(&self.pool).await?;
+        Ok(())
+    }
 }
 "#;
     assert_eq!(
