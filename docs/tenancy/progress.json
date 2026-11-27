@@ -2499,11 +2499,11 @@
       "id": "F-218-A",
       "where": "public.harvester_claim_provenance grants (epigraph_app keeps INSERT; migrations 077, 115, 218) together with public.epigraph_propagate_tenancy (arm (d), last defined in migrations/218_fragment_tenancy_most_restrictive.sql)",
       "what": "The accepted harvester trust model (F-089-F) is enforced at the INSERT-time stamp but not on every path: an application-role session may still INSERT a provenance link, and arm (d) re-stamps a fragment from a linked claim's later tenancy change without regard to who wrote the link.",
-      "status": "OPEN and PRE-EXISTING: migration 168's arm (d) behaves the same. Measured 2026-11-14 on fresh databases while reviewing migration 218, which was revised so that it does not widen this (its stamp ranks only its own statement's rows, and its arm (d) never moves a fragment to a claim the statement did not change). Analysis held outside this repository.",
-      "owner": "unassigned - needs an operator decision. The candidate repair is to revoke INSERT on public.harvester_claim_provenance from epigraph_app, which matches the documented trust model and has no in-tree writer, but would break the external harvester if it connects on an application DSN; which role it connects as can only be confirmed on the deployment.",
-      "disposition": "OPERATOR-DECISION",
-      "disposition_note": "Recorded at the level this repository's disclosure rule allows for an unfixed gap: an id, a location and an owner. Not fixed in migration 218 because the repair depends on a deployment fact this tree cannot measure.",
-      "disposition_date": "2026-11-14"
+      "status": "CLOSED 2026-11-27, MOOT: migration 354 drops public.harvester_claim_provenance (with the other four harvester tables, their grants, triggers and policies) and re-states public.epigraph_propagate_tenancy without arm (d)'s fragment statement, so there is no provenance link left to insert and no fragment for arm (d) to re-stamp. Was: OPEN and PRE-EXISTING (migration 168's arm (d) behaves the same; measured 2026-11-14 on fresh databases while reviewing migration 218).",
+      "owner": "none (closed). The open question was which role the external harvester connected as. The operator's 2026-11-27 decision (backlog c7752f07, a6e3dba2) answered it by measurement instead: a read-only check of the deployed database found all five harvester tables with no live row and no insert, update or delete since their statistics were reset, so no external writer, and the tables were dropped (migration 354) rather than the INSERT revoked.",
+      "disposition": "CLOSED",
+      "disposition_note": "Closed by migration 354 (backlog a6e3dba2; decision item c7752f07), which supersedes the candidate repair (revoke INSERT on public.harvester_claim_provenance from epigraph_app, backlog 39255d17). Pinned by crates/epigraph-db/tests/harvester_tables_dropped.rs (no harvester relation, function or function body at head). Undo: docs/runbooks/354-undo.sql recreates the tables empty, with the pre-354 grants (epigraph_app INSERT included).",
+      "disposition_date": "2026-11-27"
     },
     {
       "id": "F-SEC14-A",

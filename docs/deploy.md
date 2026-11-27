@@ -2813,11 +2813,10 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   traces, BBAs, beliefs, versions, challenges, triples, revocations) and its
   LINK rows (edges, cluster / frame / neighbourhood assignments, entity
   mentions, provenance links) narrow. A node at the other end (another claim
-  or its evidence, a frame, a cluster, an entity) is never written. A
-  harvester fragment narrows only if every claim it is the provenance of is
-  restricted into the target; otherwise it keeps its tuple. The
-  classification is `restrict::TABLE_ROLES`, and an unclassified table is
-  refused.
+  or its evidence, a frame, a cluster, an entity) is never written. (A
+  harvester fragment was the one shared node the cascade reached until
+  migration 354 dropped the harvester tables.) The classification is
+  `restrict::TABLE_ROLES`, and an unclassified table is refused.
 - **Edges with an evidence endpoint** (claim→evidence, evidence→evidence)
   are not re-met by the tenancy trigger, so the tool narrows them itself: an
   edge is no more visible than its least visible endpoint. Each takes the
@@ -2825,15 +2824,13 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   is already at least as narrow. Each is recorded and restored like every
   other edge. The plan counts them (`EVIDENCE-ENDPOINT-EDGES`).
 - **Locks**: each batch, dry runs and reversal included, holds `SHARE ROW
-  EXCLUSIVE` on `edges`, `harvester_fragments` and the derived tables with no
-  key to claims (`LOCKED-PER-BATCH`), as `regroup-claims` does. An edge
-  inserted on a claim being restricted therefore either lands before the
-  batch reads its rows (and is narrowed with them) or is stamped after the
-  move; it can no longer commit public on a restricted claim. (A fragment was
-  already safe: it is stamped through a `harvester_claim_provenance` insert,
-  whose foreign key to `claims` waits on the batch's row lock; its table lock
-  is defence in depth.) Every write to those tables on the instance waits for
-  the batch; keep `--batch-size` small on a busy instance.
+  EXCLUSIVE` on `edges` and the derived tables with no key to claims
+  (`LOCKED-PER-BATCH`), as `regroup-claims` does. An edge inserted on a
+  claim being restricted therefore either lands before the batch reads its
+  rows (and is narrowed with them) or is stamped after the move; it can no
+  longer commit public on a restricted claim. Every write to those tables on
+  the instance waits for the batch; keep `--batch-size` small on a busy
+  instance.
 - **Not covered (outside the reversal contract)**: `claims.updated_at`. Its
   trigger (migration 001, unconditional `BEFORE UPDATE`) stamps `now()` on the
   apply and again on the reverse, so a reversal does not restore it, and both
@@ -2929,8 +2926,8 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
     restriction, the privatization pipeline's re-meet) puts such an edge back
     on the trigger's meet.
 - **Locks**: each batch, dry runs included, holds `SHARE ROW EXCLUSIVE` on
-  `edges`, `harvester_fragments` and the derived tables with no key to claims
-  (`LOCKED-PER-BATCH`), so an edge or fragment inserted on a moving claim
+  `edges` and the derived tables with no key to claims
+  (`LOCKED-PER-BATCH`), so an edge inserted on a moving claim
   while the batch runs either lands before the batch reads its rows or is
   stamped after the move. Every write to those tables on the instance waits
   for the batch; keep `--batch-size` small on a busy instance. Each `BATCH`
@@ -4768,6 +4765,7 @@ here. Each migration's header is authoritative and holds its full undo.
 | 347 | `harvester_enriched_concepts` comes under tenancy and FORCE (existing rows become `('public', world)`, what every reader saw). Apply before, or with, the API binary that lists it in `FORCE_PROTECTED_SET`: that binary refuses to serve where the table exists and is not FORCEd. An older binary is unaffected. Undo: `docs/runbooks/347-undo.sql` (refuses while a concept is group-private). |
 | 348 | `/oauth/register` gives a self-registered agent no owner; the owner is named at approval. **Migrate BEFORE** the API binary of this change (it writes `owner_id = NULL` for an agent, which 001's CHECK refuses: every agent registration a 500); an older API runs on 348 unchanged. The `approve-client` verb of this change calls 348's four-argument approval (`42883` below 348). 348 clears the owner `/oauth/register` guessed for every PENDING self-registered agent (`agent_id` NULL), one `oauth.client_owner_cleared` security event per row with the previous owner. Any other tool that approves clients with a hand-written three-argument `epigraph_oauth_client_approve` keeps working for non-agent clients; on an agent it fails for an ownerless one (`23514`) and keeps the existing owner of any other without naming it, so approve agents with the four-argument form and the owner named. An agent ALREADY ACTIVE with a guessed owner keeps it: count active agent clients whose `agent_id` is NULL or links a `derived` agent and whose owner is the oldest active human client, and decide each one's owner. Undo: `docs/runbooks/348-undo.sql` (refuses while an agent client has no owner, including the rows 348 cleared). |
 | 350 | `epigraph_identity_attestor_faults()` also names any non-superuser member of the attestor in any form (an ADMIN-only grant included), any non-superuser holder of ADMIN OPTION on it, and any non-superuser CREATEROLE role (section 9). No order against the binaries. **Measure first:** where the attestor role exists, 350 refuses (`55000`, nothing changed) while any such role exists; the query is in the migration header, and any row it returns must be revoked (an ADMIN grant an older non-superuser migration runner still holds is a real fault) before migrating. **Precondition** (`55000`, nothing changed): the function must still be 161's body (`md5(prosrc)` `31cac2063a345bfff500e75b4095c4fa`) on 271's path `pg_catalog, public, pg_temp`; a database where it was re-stated otherwise needs a reconciling migration instead. `epigraph-tenancy-backfill verify` of this release runs the function and fails once per fault, before 350 is applied too (it then reports 161's narrower set). Undo: `docs/runbooks/350-undo.sql` (restores 161's body on 271's path). |
+| 354 | The five harvester tables (`harvester_sources`, `harvester_fragments`, `harvester_audit_reports`, `harvester_claim_provenance`, `harvester_enriched_concepts`) are dropped with their grants, triggers and policies, and the four shared definers that named them are re-stated without those arms. **Measure first:** `SELECT count(*)` of each as a superuser; 354 refuses (`55000`, nothing changed) while any holds a row. **Migrate FIRST, then the API binary of this change**: that binary's seal no longer blanks harvester fragment text, so it must not serve a database below 354 that holds harvester rows. An older binary boots on 354 but its seal fails (`42P01`). The operator CLI of this change refuses a database below 354. Apply as a superuser. Undo: `docs/runbooks/354-undo.sql` (recreates the tables empty; run it before any older runbook that names them). |
 
 The md5 values above are copied from the migrations' own preconditions. They
 are properties of the public function bodies, not of any deployment.
