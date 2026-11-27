@@ -76,7 +76,7 @@ which is the same gate recorded in claim `aabbb75c`. Run this yourself:
 ```bash
 MAINTENANCE_DATABASE_URL="$(sudo sed -n 's/^MAINTENANCE_DATABASE_URL=//p' /etc/epiclaw/epigraph-maintenance.env)" \
 systemd-run --user --scope -p MemoryMax=1900M \
-  --working-directory=/home/jeremy/epigraph-wt-themev2 \
+  --working-directory=<checkout> \
   python3 scripts/theme_pipeline.py grow --batch-size 2000 --target-k 72 --max-size 8000
 ```
 
