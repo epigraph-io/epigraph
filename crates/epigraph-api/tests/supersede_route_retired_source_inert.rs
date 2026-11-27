@@ -212,8 +212,9 @@ async fn an_http_supersede_invalidates_the_retired_refuters_edge_bba() {
     );
     assert_eq!(
         betp(&pool, lonely).await,
-        None,
-        "a claim whose only BBA came from the retired claim is unbacked"
+        Some(0.5),
+        "a claim whose only BBA came from the retired claim is unbacked: the explicit \
+         vacuous cache, never NULL (backlog 75726018)"
     );
     assert_eq!(
         report_ids(&body, "unbacked"),

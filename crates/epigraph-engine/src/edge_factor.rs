@@ -2244,15 +2244,7 @@ pub async fn recompute_atom_cache_with(
         if !has_cache {
             return Ok(AtomCacheOutcome::KeptEmpty);
         }
-        let written = write_atom_cache(
-            conn,
-            viewer,
-            claim_id,
-            &crate::atom_items::EvidencedInterval::unproven(),
-            false,
-            &thresholds,
-        )
-        .await?;
+        let written = write_vacuous_cache(conn, viewer, claim_id).await?;
         if written {
             tracing::warn!(
                 target: "epigraph::atom_cache::scope_vacate",
@@ -2273,15 +2265,7 @@ pub async fn recompute_atom_cache_with(
     if rows.is_empty() {
         let lost_input = matches!(cause, CacheWriteCause::EvidenceRemoved(b) if b.had_input);
         if lost_input && settings.vacate_on_evidence_removal {
-            let written = write_atom_cache(
-                conn,
-                viewer,
-                claim_id,
-                &crate::atom_items::EvidencedInterval::unproven(),
-                false,
-                &thresholds,
-            )
-            .await?;
+            let written = write_vacuous_cache(conn, viewer, claim_id).await?;
             if written {
                 tracing::warn!(
                     target: "epigraph::atom_cache::vacate",
@@ -2362,10 +2346,41 @@ pub async fn vacate_atom_cache(
         }
         return Ok(refused);
     }
-    let ctx = crate::belief_query::FramedBeliefContext::global();
+    let written = write_vacuous_cache(conn, viewer, claim_id).await?;
+    Ok(VacateOutcome::Vacated { written })
+}
+
+/// THE vacate write: give `claim_id`'s cache the explicit vacuous value
+/// (Bel 0, Pl 1, BetP .5, no conflict or missing mass, stamped
+/// `binary_truth`), with the classification the classifier gives it
+/// (`not_enough_info`) when the cache took it. It reads back as `unproven`,
+/// and it is the value ruling R-80's vacate and the atom-cache writer's
+/// vacates write. **Never NULL** (backlog 75726018: a cache is vacated, not
+/// cleared, on every path that empties a claim's evidence).
+///
+/// Writes unconditionally: the CALLER decides that the claim is to be
+/// vacated, and that it holds a cache to vacate (a vacuous value written
+/// where there was none would tell readers that an unseen BBA exists).
+/// [`vacate_atom_cache`] and the retraction cascade's unbacked arm
+/// (`crate::retraction_cascade`) call it after their own checks.
+///
+/// Returns whether the cache took it: `false` when the database declined the
+/// write (migration 114's non-owner rule, see
+/// `MassFunctionRepository::update_claim_belief`).
+///
+/// # Errors
+/// A database read or write.
+pub async fn write_vacuous_cache(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
     // The classifier reads the same profile the fold runs under.
-    let thresholds = ctx.profile().classifier.thresholds();
-    let written = write_atom_cache(
+    let thresholds = crate::belief_query::FramedBeliefContext::global()
+        .profile()
+        .classifier
+        .thresholds();
+    write_atom_cache(
         conn,
         viewer,
         claim_id,
@@ -2373,8 +2388,7 @@ pub async fn vacate_atom_cache(
         false,
         &thresholds,
     )
-    .await?;
-    Ok(VacateOutcome::Vacated { written })
+    .await
 }
 
 /// Why [`vacate_atom_cache`] refuses `claim_id` (the outcome it returns

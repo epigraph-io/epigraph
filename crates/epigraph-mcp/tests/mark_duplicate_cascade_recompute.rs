@@ -475,11 +475,24 @@ async fn target_of_both_a_collision_delete_and_a_resourced_edge_is_recomputed_la
     );
 
     let cascade = &json["belief_cascade"];
+    let v_cache: (Option<f64>, Option<f64>, Option<f64>, Option<String>) = sqlx::query_as(
+        "SELECT belief, plausibility, pignistic_prob, classification FROM claims WHERE id = $1",
+    )
+    .bind(v)
+    .fetch_one(&pool)
+    .await
+    .expect("read V's cache");
     assert_eq!(
-        cached_betp(&pool, v).await,
-        None,
+        v_cache,
+        (
+            Some(0.0),
+            Some(1.0),
+            Some(0.5),
+            Some("not_enough_info".to_string())
+        ),
         "V's last supporter was invalidated by phase 2 and never replaced, so \
-         its cache must be cleared (C6's unbacked marker). A `visited` set \
+         its cache must be vacated (C6's unbacked marker: the explicit vacuous \
+         cache, never NULL, backlog 75726018). A `visited` set \
          shared between the two phases marks V during phase 1 and then skips \
          it, leaving V believed at a number no surviving BBA produces — while \
          the report claims it was repaired: {cascade}"

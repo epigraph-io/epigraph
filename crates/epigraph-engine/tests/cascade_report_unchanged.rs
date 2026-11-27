@@ -278,12 +278,13 @@ async fn plant_frameless(pool: &PgPool, id: Uuid) {
     .expect("plant a frameless cache");
 }
 
-/// CLEAR DECLINED (definer): a public, BBA-free claim with a cache recording
-/// no frame. On a non-owner app-role session the clear goes through migration
-/// 114's definer, which refuses a cache with no recorded frame and answers 0
-/// rows. The claim is listed under `unchanged` with its cache kept, beside a
-/// BBA-free, cache-free candidate that stays absent. The privileged control
-/// clears the same cache and reports it `unbacked`, so the decline is the
+/// VACATE DECLINED (definer): a public, BBA-free claim with a cache recording
+/// no frame. On a non-owner app-role session the vacate (the explicit vacuous
+/// cache, backlog 75726018) goes through migration 114's definer, which does
+/// not let a non-owner re-point a cache with no recorded frame and writes
+/// nothing. The claim is listed under `unchanged` with its cache kept, beside
+/// a BBA-free, cache-free candidate that stays absent. The privileged control
+/// vacates the same cache and reports it `unbacked`, so the decline is the
 /// session's.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_cache_clear_migration_114_declines_is_reported_unchanged(pool: PgPool) {
@@ -321,23 +322,30 @@ async fn a_cache_clear_migration_114_declines_is_reported_unchanged(pool: PgPool
         "the declined clear leaves the cache as it was"
     );
 
-    // Control: the privileged connection clears it.
+    // Control: the privileged connection vacates it, and leaves the
+    // never-cached candidate NULL.
     let mut conn = pool.acquire().await.expect("acquire");
     let control = cascade_after_edge_withdrawal(&mut conn, &bypass, &[claim, bare], 0).await;
     assert_eq!(
         control.unbacked,
         vec![claim],
-        "CALIBRATION: the owner-class session clears the same cache: {control:?}"
+        "CALIBRATION: the owner-class session vacates the same cache: {control:?}"
     );
     assert!(control.unchanged.is_empty(), "{control:?}");
-    assert_eq!(cache(&pool, claim).await, (None, None, None, None));
+    let (binary, _) = frames(&pool).await;
+    assert_eq!(
+        cache(&pool, claim).await,
+        (Some(0.0), Some(1.0), Some(0.5), Some(binary)),
+        "the explicit vacuous cache, never NULL (backlog 75726018)"
+    );
+    assert_eq!(cache(&pool, bare).await, (None, None, None, None));
 }
 
-/// CLEAR REFUSED (row-level security): a BBA-free group claim with a cache,
+/// VACATE REFUSED (row-level security): a BBA-free group claim with a cache,
 /// read by a `reader` member of its group. The session sees the claim but may
-/// not write it: the clear's UPDATE fails row-level security's check and
+/// not write it: the vacate's UPDATE fails row-level security's check and
 /// raises, so the claim is reported in `errors` (and `targets`), in no other
-/// bucket, with its cache kept. Its owner's session clears it (the control).
+/// bucket, with its cache kept. Its owner's session vacates it (the control).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_cache_clear_row_security_refuses_is_reported_as_an_error(pool: PgPool) {
     let (author, group) = fixture::seed_agent_with_group(&pool, "rls-clear-author").await;
@@ -373,16 +381,21 @@ async fn a_cache_clear_row_security_refuses_is_reported_as_an_error(pool: PgPool
     assert_eq!(
         cache(&pool, claim).await,
         before,
-        "the refused clear leaves the cache as it was"
+        "the refused vacate leaves the cache as it was"
     );
 
-    // Control: the owner's own session clears it.
+    // Control: the owner's own session vacates it.
     let control = cascade_as(&pool, author, &[claim]).await;
     assert!(control.errors.is_empty(), "{control:?}");
     assert_eq!(
         control.unbacked,
         vec![claim],
-        "CALIBRATION: the owner clears the same cache: {control:?}"
+        "CALIBRATION: the owner vacates the same cache: {control:?}"
+    );
+    assert_eq!(
+        cache(&pool, claim).await.2,
+        Some(0.5),
+        "the explicit vacuous cache, never NULL (backlog 75726018)"
     );
 }
 

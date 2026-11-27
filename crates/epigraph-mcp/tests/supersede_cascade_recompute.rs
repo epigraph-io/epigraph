@@ -309,11 +309,14 @@ async fn cascade_does_not_touch_unrelated_bbas_or_claims(pool: PgPool) {
 /// backing it at all, while every "did the cascade run" assertion passes
 /// (PREREGISTRATION F5 / BCH-EG-K04).
 ///
-/// The implementation's documented choice is **(ii) explicit unbacked marker**:
-/// the derived scalars are NULLed, which is exactly the state a claim carries
-/// before it ever acquires a BBA (see `link_epistemic_smoke`'s "target must
-/// start with NULL pignistic_prob"). A reader can then distinguish "unbacked"
-/// from "believed at 0.79".
+/// The unbacked marker is the **explicit vacuous cache** (backlog 75726018,
+/// aligning the cascade with ruling R-80 and the atom-cache writer): Bel 0,
+/// Pl 1, BetP 0.5, no conflict or missing mass, classification
+/// `not_enough_info`, NOT NULL. It reads back as `unproven`, so a reader can
+/// still distinguish "unbacked" from "believed at 0.79". (Before 75726018 the
+/// scalars were NULLed; NULL stays the state of a claim that never had a
+/// cache, pinned by
+/// `sole_supporter_retraction_leaves_a_never_cached_claim_null`.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn sole_supporter_retraction_does_not_leave_frozen_belief(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -354,9 +357,71 @@ async fn sole_supporter_retraction_does_not_leave_frozen_belief(pool: PgPool) {
     );
     assert_eq!(
         (bel, pl, betp, empty, missing),
-        (None, None, None, None, None),
-        "documented semantics (ii): a claim with no surviving BBA is marked \
-         unbacked (NULL scalars), not reset to a fabricated 0.5"
+        (Some(0.0), Some(1.0), Some(0.5), Some(0.0), Some(0.0)),
+        "backlog 75726018: a claim with no surviving BBA is marked unbacked by \
+         the explicit vacuous cache (Bel 0, Pl 1, BetP 0.5), never NULLed"
+    );
+    let (classification, frame): (Option<String>, Option<Uuid>) =
+        sqlx::query_as("SELECT classification, belief_frame_id FROM claims WHERE id = $1")
+            .bind(b)
+            .fetch_one(&pool)
+            .await
+            .expect("read classification");
+    assert_eq!(
+        classification.as_deref(),
+        Some("not_enough_info"),
+        "the CDST classification is derived from the same evidence: a surviving \
+         'supported' label would be an orphaned derived record, and the vacated \
+         cache carries ignorance's label"
+    );
+    let binary: Uuid = sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
+        .fetch_one(&pool)
+        .await
+        .expect("binary_truth frame");
+    assert_eq!(
+        frame,
+        Some(binary),
+        "the vacated cache is stamped binary_truth"
+    );
+}
+
+/// The other half of 75726018's rule: a claim that NEVER had a cache is not
+/// given one. A downstream claim whose only BBA is retracted, but whose cache
+/// was empty, stays NULL and is not reported `unbacked` (a vacuous value
+/// written where there was none would tell readers an unseen BBA exists).
+#[sqlx::test(migrations = "../../migrations")]
+async fn sole_supporter_retraction_leaves_a_never_cached_claim_null(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+
+    let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let b = seed_claim(&pool, "sole-supported claim B, never cached", 0.5).await;
+    wire_supports(&pool, &server, a, b).await;
+    // Empty B's cache by hand, leaving its one BBA: the shape of a claim
+    // whose BBA was stored but whose cache was never written.
+    sqlx::query(
+        "UPDATE claims SET belief = NULL, plausibility = NULL, pignistic_prob = NULL, \
+         classification = NULL, belief_frame_id = NULL WHERE id = $1",
+    )
+    .bind(b)
+    .execute(&pool)
+    .await
+    .expect("empty B's cache");
+
+    supersede(&pool, &server, &viewer, a)
+        .await
+        .expect("supersede_claim succeeds");
+
+    let (bel, pl, betp, _, _) = read_scalars(&pool, b).await;
+    assert_eq!(
+        (bel, pl, betp),
+        (None, None, None),
+        "a never-cached claim must stay NULL after its only BBA is retracted"
     );
     let classification: Option<String> =
         sqlx::query_scalar("SELECT classification FROM claims WHERE id = $1")
@@ -364,12 +429,7 @@ async fn sole_supporter_retraction_does_not_leave_frozen_belief(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("read classification");
-    assert_eq!(
-        classification, None,
-        "the CDST classification is derived from the same evidence and must be \
-         cleared with it — a surviving 'supported' label is an orphaned \
-         derived record"
-    );
+    assert_eq!(classification, None);
 }
 
 // ── C7 ──────────────────────────────────────────────────────────────────────

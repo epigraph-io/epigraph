@@ -36,25 +36,29 @@
 //! change": a claim whose sole supporter was retracted would keep believing its
 //! pre-retraction number with zero evidence behind it.
 //!
-//! **Decision: such a claim is marked _unbacked_** — `belief`, `plausibility`,
-//! `pignistic_prob`, `mass_on_empty`, `mass_on_missing` and `classification`
-//! are set to `NULL` ([`MassFunctionRepository::clear_claim_belief`]), but
-//! **only if it had a derived cache to begin with**: that repo call is guarded
-//! on at least one derived column being non-NULL, because `mass_on_empty` and
-//! `mass_on_missing` are `DEFAULT 0.0` and clearing them unconditionally would
-//! mutate (and bump `updated_at` on) claims the retraction never touched —
-//! both endpoints of every BBA-free `mark_duplicate`, at bulk-sweep scale. A
-//! claim with nothing to clear is left alone and is absent from the report,
-//! rather than being announced as `unbacked`. A claim that holds a cache whose
-//! clear migration 114's definer declined keeps its cache and is reported
-//! under [`CascadeReport::unchanged`]. NULL is
-//! the state a claim carries before it ever acquires a BBA, so readers can
-//! distinguish "unbacked" from "believed at 0.79". The rejected alternative —
-//! resetting to a vacuous `(0, 1, 0.5)` — writes a number the combine pipeline
-//! can also legitimately produce, making the two indistinguishable.
+//! **Decision: such a claim is marked _unbacked_ by an explicit vacuous
+//! cache** (backlog 75726018, aligning this cascade with ruling R-80 and the
+//! atom-cache writer, under which a cache is vacated and never NULLed): Bel
+//! 0, Pl 1, BetP 0.5, no conflict or missing mass, stamped `binary_truth`,
+//! classification `not_enough_info`
+//! ([`crate::edge_factor::write_vacuous_cache`], the one vacate write those
+//! paths share). It reads back as `unproven`, so a reader still tells
+//! "unbacked" from "believed at 0.79".
+//!
+//! **Only a claim that had a derived cache to begin with is vacated**: the
+//! cascade first reads whether one of `belief`, `plausibility`,
+//! `pignistic_prob` or `classification` is non-NULL. Writing the vacuous value
+//! where there was no cache would tell readers that an unseen BBA exists, and
+//! would mutate (and bump `updated_at` on) claims the retraction never
+//! touched: both endpoints of every BBA-free `mark_duplicate`, at bulk-sweep
+//! scale. A claim with nothing to vacate is left alone (a never-cached claim
+//! stays NULL) and is absent from the report, rather than being announced as
+//! `unbacked`. A claim that holds a cache whose vacate migration 114's
+//! non-owner rule declined keeps its cache and is reported under
+//! [`CascadeReport::unchanged`].
 //!
 //! Claims that still hold BBAs on some *other* frame are left alone: the cached
-//! scalars are frame-agnostic and last-writer-wins, so nulling them would
+//! scalars are frame-agnostic and last-writer-wins, so vacating them would
 //! discard a live cross-frame result. They are reported under
 //! [`CascadeReport::unchanged`], so the caller can see the cache was kept.
 //!
@@ -147,7 +151,7 @@ pub struct CascadeReport {
     /// out to have no derived record at all (no BBA and no cache, as the
     /// cascade's session reads it) is absent from every field. A candidate
     /// that still has BBAs but whose refold wrote nothing, or that holds a
-    /// cache whose clear the database declined, is not here either: it is in
+    /// cache whose vacate the database declined, is not here either: it is in
     /// [`Self::unchanged`].
     ///
     /// So every repair candidate that holds a BBA or a cache the session can
@@ -159,8 +163,10 @@ pub struct CascadeReport {
     /// Targets whose belief was recomputed from a non-empty surviving BBA set.
     pub recomputed: Vec<Uuid>,
     /// Targets that **had** a cached belief and were left with no BBA at all,
-    /// so their cached scalars were NULLed. Distinguished from `recomputed`
-    /// precisely so "the cache was cleared because nothing backs it" is not
+    /// so their cache was set to the explicit vacuous value (Bel 0, Pl 1,
+    /// BetP 0.5, `not_enough_info`; see the module doc). Distinguished from
+    /// `recomputed` precisely so "the cache was vacated because nothing backs
+    /// it" is not
     /// reported as "nothing to do" — and never populated for a claim that
     /// never had a cache in the first place, which would be the mirror-image
     /// lie.
@@ -170,11 +176,12 @@ pub struct CascadeReport {
     /// on the repaired frame (the claim is backed only on another frame), a
     /// fold that admitted none of them with nothing to vacate, a write the
     /// database declined because the session does not own the claim's cache
-    /// (migration 114), or a clear of a cache with no BBA behind it that
-    /// migration 114's definer declined (it refuses a cache with no recorded
-    /// frame, or a claim backed by BBAs the viewer cannot see). A clear that
-    /// row-level security refuses on a claim the session can read but not
-    /// write raises an error instead, so that claim is in `errors`. Listed so a caller can tell that the cache of such a claim may
+    /// (migration 114), or a vacate of a cache with no BBA behind it that
+    /// migration 114's non-owner rule declined (a non-owner may not re-point a
+    /// cache recorded on another frame, or with no recorded frame, to
+    /// `binary_truth`). A vacate that row-level security refuses on a claim
+    /// the session can read but not write raises an error instead, so that
+    /// claim is in `errors`. Listed so a caller can tell that the cache of such a claim may
     /// still fold the retired evidence, instead of the claim silently
     /// vanishing from the report. Not part of `targets` (nothing was written),
     /// and disjoint from `recomputed`, `unbacked` and the claims in `errors`.
@@ -316,7 +323,7 @@ pub async fn cascade_after_supersede(
 /// own edge-keyed BBAs the edge's owner deleted in its act; `invalidated` is
 /// how many the administrative removal deleted (recorded in the report, not
 /// re-derived). Each target is
-/// recomputed from its surviving BBAs, or has its cache cleared when none
+/// recomputed from its surviving BBAs, or has its cache vacated when none
 /// remain. Never fails: see the module docs on best-effort semantics.
 pub async fn cascade_after_edge_withdrawal(
     conn: &mut sqlx::PgConnection,
@@ -376,8 +383,8 @@ pub async fn cascade_after_dedup(
     //
     // Deliberately silent — no `repair_targets`. Reporting (and the unbacked
     // decision) belongs to phase 3, once every row-level mutation is done;
-    // deciding `canonical` is unbacked here would also NULL the very interval
-    // phase 2 is about to read.
+    // deciding `canonical` is unbacked here would also vacate the very
+    // interval phase 2 is about to read.
     match conn.begin().await {
         Ok(mut sp) => {
             match recompute_claim_belief_on_frame(&mut sp, viewer, canonical_id, frame_id).await {
@@ -919,12 +926,12 @@ pub async fn sweep_retired_source_bbas(
 }
 
 /// PROBE whether this caller can repair `target_id`: run the same writes
-/// [`repair_targets`] would (recompute it from its surviving BBAs, or clear its
-/// cache when none survive) inside a nested savepoint that is ALWAYS rolled
-/// back. Used inside an edge's savepoint to decide whether the edge's
+/// [`repair_targets`] would (recompute it from its surviving BBAs, or vacate
+/// its cache when none survive) inside a nested savepoint that is ALWAYS
+/// rolled back. Used inside an edge's savepoint to decide whether the edge's
 /// invalidation may commit; see [`invalidate_and_rewire`]. Rolled back rather
 /// than kept so that `repair_targets` still makes (and reports) the one final
-/// write strictly last, and a cleared cache is still reported as `unbacked`.
+/// write strictly last, and a vacated cache is still reported as `unbacked`.
 async fn repair_one(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -941,10 +948,13 @@ async fn repair_one(
             Ok(false) => {
                 match MassFunctionRepository::get_for_claim(&mut *probe, viewer, target_id).await {
                     Ok(rows) if rows.is_empty() => {
-                        MassFunctionRepository::clear_claim_belief(&mut *probe, target_id)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| format!("clear unbacked belief: {e}"))
+                        match claim_holds_belief_cache(&mut probe, target_id).await {
+                            Ok(true) => vacate_unbacked(&mut probe, viewer, target_id)
+                                .await
+                                .map(|_| ()),
+                            Ok(false) => Ok(()),
+                            Err(e) => Err(format!("read the cache of {target_id}: {e}")),
+                        }
                     }
                     Ok(_) => Ok(()),
                     Err(e) => Err(format!("check surviving BBAs: {e}")),
@@ -971,8 +981,9 @@ async fn repair_one(
 /// [`CascadeReport::unchanged`], not under `targets`: no BBAs on `frame_id`, a
 /// fold that admitted none with nothing to vacate, or a write migration 114
 /// declined for a session that does not own the claim's cache. Its cache is
-/// left as it was. So is a candidate with no BBA left whose cache clear the
-/// database declined ([`UnbackedOutcome::ClearDeclined`]). Before the recompute reported whether it wrote (backlog
+/// left as it was. So is a candidate with no BBA left whose cache vacate the
+/// database declined ([`UnbackedOutcome::VacateDeclined`]). Before the
+/// recompute reported whether it wrote (backlog
 /// 8d720490 (2)), the last two were listed under `recomputed`, which claimed a
 /// write that did not happen; after that, until backlog 541d7104, they were
 /// absent from the report altogether.
@@ -1003,7 +1014,7 @@ async fn repair_targets(
             }
             Ok(false) => {
                 match mark_unbacked_if_evidence_free(&mut sp, viewer, target_id, report).await {
-                    UnbackedOutcome::Cleared => {
+                    UnbackedOutcome::Vacated => {
                         report.targets.push(target_id);
                         report.unbacked.push(target_id);
                         true
@@ -1012,7 +1023,7 @@ async fn repair_targets(
                         report.targets.push(target_id);
                         false
                     }
-                    UnbackedOutcome::BbasLeft | UnbackedOutcome::ClearDeclined => {
+                    UnbackedOutcome::BbasLeft | UnbackedOutcome::VacateDeclined => {
                         report.unchanged.push(target_id);
                         true
                     }
@@ -1035,16 +1046,16 @@ async fn repair_targets(
     }
 }
 
-/// `Ok(false)` from the recompute means "no BBAs **on this frame**". Only NULL
-/// the cache when the claim has no BBAs on *any* frame: the cached scalars are
-/// frame-agnostic, so a claim still backed on another frame must keep the value
-/// that frame's recompute wrote.
+/// `Ok(false)` from the recompute means "no BBAs **on this frame**". Only
+/// vacate the cache when the claim has no BBAs on *any* frame: the cached
+/// scalars are frame-agnostic, so a claim still backed on another frame must
+/// keep the value that frame's recompute wrote.
 ///
-/// Reports [`UnbackedOutcome::Cleared`] only when a cache actually existed and
-/// was cleared. `MassFunctionRepository::clear_claim_belief` refuses to touch a
-/// claim whose derived columns are already NULL, so "unbacked" keeps its
-/// intended meaning — *had* a cache, now has no evidence — instead of
-/// degenerating into "never had one".
+/// Reports [`UnbackedOutcome::Vacated`] only when a cache actually existed and
+/// was vacated: the cache is read first ([`claim_holds_belief_cache`]), and a
+/// claim with none is left NULL, so "unbacked" keeps its intended meaning
+/// (*had* a cache, now has no evidence) instead of degenerating into "never
+/// had one".
 async fn mark_unbacked_if_evidence_free(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1053,23 +1064,22 @@ async fn mark_unbacked_if_evidence_free(
 ) -> UnbackedOutcome {
     match MassFunctionRepository::get_for_claim(&mut *conn, viewer, claim_id).await {
         Ok(rows) if !rows.is_empty() => UnbackedOutcome::BbasLeft,
-        Ok(_) => match MassFunctionRepository::clear_claim_belief(&mut *conn, claim_id).await {
-            // 0 rows is either "there was no cache" or "the database declined
-            // the clear": migration 114's definer returns 0 for a cache with
-            // no recorded frame or for a claim backed by BBAs this viewer
-            // cannot see. Tell them apart by reading the cache back (backlog
-            // 541d7104).
-            Ok(0) => match claim_holds_belief_cache(&mut *conn, claim_id).await {
-                Ok(true) => UnbackedOutcome::ClearDeclined,
-                Ok(false) => UnbackedOutcome::NothingToClear,
+        Ok(_) => match claim_holds_belief_cache(&mut *conn, claim_id).await {
+            Ok(false) => UnbackedOutcome::NothingToClear,
+            Ok(true) => match vacate_unbacked(&mut *conn, viewer, claim_id).await {
+                Ok(true) => UnbackedOutcome::Vacated,
+                // The database declined the write: migration 114's non-owner
+                // rule (a cache recorded on another frame, or on none, is not
+                // re-pointed to `binary_truth` by a non-owner). Backlog
+                // 541d7104: reported, not silently dropped.
+                Ok(false) => UnbackedOutcome::VacateDeclined,
                 Err(e) => {
-                    report.note_error(&format!("read back the cache of {claim_id}"), e);
+                    report.note_error(&format!("vacate unbacked belief on {claim_id}"), e);
                     UnbackedOutcome::Failed
                 }
             },
-            Ok(_) => UnbackedOutcome::Cleared,
             Err(e) => {
-                report.note_error(&format!("clear unbacked belief on {claim_id}"), e);
+                report.note_error(&format!("read the cache of {claim_id}"), e);
                 UnbackedOutcome::Failed
             }
         },
@@ -1080,10 +1090,24 @@ async fn mark_unbacked_if_evidence_free(
     }
 }
 
+/// The unbacked arm's write: the explicit vacuous cache
+/// ([`crate::edge_factor::write_vacuous_cache`]), never NULL. The caller has
+/// established that the claim has no BBA left and holds a cache. Returns
+/// whether the cache took it.
+async fn vacate_unbacked(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
+    crate::edge_factor::write_vacuous_cache(conn, viewer, claim_id).await
+}
+
 /// Whether `claim_id` still holds a derived belief cache, as this session
-/// reads it: the same columns `MassFunctionRepository::clear_claim_belief`'s
-/// guard tests. A claim the session cannot read at all reads as `false`: its
-/// cache is not observable through this session, so it is not reported.
+/// reads it: `belief`, `plausibility`, `pignistic_prob` or `classification`
+/// non-NULL (not `mass_on_empty` / `mass_on_missing`, which default to 0.0 on
+/// a claim that never had a cache). A claim the session cannot read at all
+/// reads as `false`: its cache is not observable through this session, so it
+/// is neither vacated nor reported.
 async fn claim_holds_belief_cache(
     conn: &mut sqlx::PgConnection,
     claim_id: Uuid,
@@ -1100,26 +1124,26 @@ async fn claim_holds_belief_cache(
 }
 
 /// What [`mark_unbacked_if_evidence_free`] did, so the caller can distinguish
-/// "the cache was cleared", "BBAs are left, so nothing was cleared", "the
-/// database declined the clear", "there was no cache to clear" and "the
+/// "the cache was vacated", "BBAs are left, so nothing was written", "the
+/// database declined the vacate", "there was no cache to vacate" and "the
 /// attempt failed" — states a `bool` would collapse into two.
 enum UnbackedOutcome {
-    /// A derived cache existed and is now NULL.
-    Cleared,
+    /// A derived cache existed and now holds the explicit vacuous value.
+    Vacated,
     /// The claim still has BBAs (on another frame, or ones the refold did not
     /// write from). Nothing was written; reported as
     /// [`CascadeReport::unchanged`].
     BbasLeft,
     /// This session sees no BBA, the claim holds a derived cache, and the
-    /// clear wrote nothing: migration 114's definer declined it (it refuses a
-    /// cache with no recorded frame, or a claim backed by BBAs the viewer
-    /// cannot see). The cache is left as it was; reported as
+    /// vacate wrote nothing: migration 114's non-owner rule declined it (a
+    /// non-owner does not re-point a cache recorded on another frame, or on
+    /// none, to `binary_truth`). The cache is left as it was; reported as
     /// [`CascadeReport::unchanged`].
-    ClearDeclined,
+    VacateDeclined,
     /// The claim has no BBA (as this session sees it) and no derived cache
     /// this session can read. Nothing was written and nothing is reported.
     NothingToClear,
-    /// The check or the clear errored; already recorded in
+    /// The check or the vacate errored; already recorded in
     /// [`CascadeReport::errors`].
     Failed,
 }

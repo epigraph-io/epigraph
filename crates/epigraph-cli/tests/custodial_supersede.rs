@@ -813,8 +813,10 @@ async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_rep
         .await
         .expect("target cache");
     assert_eq!(
-        target_belief, None,
-        "the target's cache, backed by nothing now, is re-derived (cleared)"
+        target_belief,
+        Some(0.0),
+        "the target's cache, backed by nothing now, is re-derived (vacated to the explicit \
+         vacuous cache, never NULL: backlog 75726018)"
     );
     let pending: i64 = {
         let r = Command::new(REPLAY)
