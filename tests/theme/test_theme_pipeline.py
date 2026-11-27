@@ -179,7 +179,7 @@ def test_grow_labels_the_database_it_was_given_and_surfaces_failure(monkeypatch)
         min_size=2000, max_size=T.DEFAULT_MAX_SIZE, target_k=72, max_iter=8,
         dry_run=False, confirm_full_rebuild=False,
     )
-    result = T.grow(None, args)
+    result = T.grow(_Conn([]), args)
     assert labelled == ["postgres://u:p@localhost/scratch_test"]
     assert result["status"] == "label_failed"
     assert result["run_id"] == "run-x"
@@ -242,6 +242,16 @@ def test_a_resumed_grow_dry_run_reports_candidates_without_writing(monkeypatch):
 
 # --- the full-rebuild guard (backlog 18ae37e7) ---------------------------------
 
+class _Conn:
+    """A connection stand-in that records the calls made on it into `log`."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def rollback(self):
+        self.log.append("rollback")
+
+
 def _grow_args(**kw):
     import argparse
     base = dict(
@@ -292,9 +302,31 @@ def test_grow_forwards_the_confirmation_to_the_projection(monkeypatch):
 
     monkeypatch.setattr(T.project_to_themes, "project_run", fake_project_run)
     monkeypatch.setattr(T, "run_label_step", lambda url: 0)
-    result = T.grow(None, _grow_args(from_run_id="run-x", confirm_full_rebuild=True))
+    result = T.grow(_Conn([]), _grow_args(from_run_id="run-x", confirm_full_rebuild=True))
     assert seen == {"checked": True, "projected": True}
     assert result["status"] == "grown"
+
+
+def test_grow_ends_the_checks_read_transaction_before_clustering(monkeypatch):
+    """The check reads claim_themes and every table cascading from it. Left
+    open, its transaction would hold those locks through the whole UMAP fit."""
+    log = []
+
+    class Stop(Exception):
+        pass
+
+    def stop_at_seed(*_a, **_k):
+        log.append("seed_phase")
+        raise Stop
+
+    monkeypatch.setattr(T.project_to_themes, "check_full_rebuild",
+                        lambda conn, confirm: log.append("check"))
+    monkeypatch.setattr(T.theme_lib, "new_run_id", lambda: "run-new")
+    monkeypatch.setattr(T.cluster_claims, "seed_phase", stop_at_seed)
+    import pytest
+    with pytest.raises(Stop):
+        T.grow(_Conn(log), _grow_args(confirm_full_rebuild=True))
+    assert log == ["check", "rollback", "seed_phase"]
 
 
 def test_pipeline_cli_takes_the_flag_and_exits_nonzero_on_a_refusal(monkeypatch, capsys):

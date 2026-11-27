@@ -194,6 +194,9 @@ def grow(conn, args):
         # The projection at the end replaces every theme. Refuse an unconfirmed
         # one now, before the clustering is paid for, not after it.
         project_to_themes.check_full_rebuild(conn, args.confirm_full_rebuild)
+        # End the check's read transaction: left open, it would hold its
+        # catalog and table locks through the whole clustering run.
+        conn.rollback()
 
     # --from-run-id resumes the split/project/label phases on an existing base
     # run (skips the ~40-min base assign); otherwise start a fresh consolidated run.
