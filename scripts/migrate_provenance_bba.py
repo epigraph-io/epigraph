@@ -73,7 +73,8 @@ WHY DIRECT SQL RATHER THAN submit_ds_evidence
 ---------------------------------------------
 The MCP write path mints a fresh perspective per call. At corpus scale that would
 add hundreds of thousands of junk perspective rows and make the G4 problem
-permanent. This follows the precedent of scripts/migrate_mixed_bbas.py.
+permanent. This follows the precedent of the mixed-BBA migration (commit
+2d67ad99e, since deleted as a completed one-shot).
 
 DOES NOT RUN recompute_beliefs
 ------------------------------

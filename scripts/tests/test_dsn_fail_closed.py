@@ -207,7 +207,6 @@ _SCRIPTS = [
     ("audit_mixed_bbas.py", [], "MAINTENANCE_DATABASE_URL"),
     ("audit_claims_content_hash_agent.py", [], "MAINTENANCE_DATABASE_URL"),
     ("backfill_locality_tag.py", [], "MAINTENANCE_DATABASE_URL"),
-    ("migrate_mixed_bbas.py", [], "MAINTENANCE_DATABASE_URL"),
     ("link_mass_function_evidence.py", [], "MAINTENANCE_DATABASE_URL"),
     # Resolved through theme_lib.maintenance_dsn.
     ("theme_pipeline.py", ["discover"], "MAINTENANCE_DATABASE_URL"),
