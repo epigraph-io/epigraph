@@ -110,8 +110,15 @@ impl ServiceError {
 
 /// The [`HttpClass`] of a repository error a caller may have caused
 /// ([`ServiceError::Repository`]): the classification the MCP server's
-/// `visibility_caller_error` / `db_caller_error` make by JSON-RPC code, and
-/// `epigraph-api`'s `From<DbError> for ApiError` by status.
+/// `visibility_caller_error` / `db_caller_error` make by JSON-RPC code, which
+/// the MCP tools' HTTP twins answer with.
+///
+/// It is NOT `epigraph-api`'s `From<DbError> for ApiError`, which answers
+/// `NotFound` with 404, `Conflict` with 409 and `DuplicateKey` with 400, where
+/// this answers 400, 500 and 500 ([`HttpClass`] has no 404 or 409). Nothing
+/// answers an API route through it yet; a route that starts to must choose its
+/// status per variant rather than inherit this one, or a missing row moves
+/// from 404 to 400.
 ///
 /// * a repository refusal of the caller's input, a row the caller cannot see
 ///   (answered as missing), and invalid data: the caller's input, a 400;
@@ -227,6 +234,30 @@ mod tests {
             class(DbError::QueryFailed {
                 source: sqlx::Error::PoolTimedOut
             }),
+            HttpClass::Internal
+        );
+    }
+
+    /// The three variants where this classification and the HTTP API's own
+    /// `From<DbError> for ApiError` (404, 409, 400) part ways, as the doc of
+    /// [`repository_class`] says. A change to either side must update that doc.
+    #[test]
+    fn where_the_classification_differs_from_the_api_status() {
+        use epigraph_db::DbError;
+        let class = |e| ServiceError::Repository(e).http_class();
+        assert_eq!(
+            class(DbError::NotFound {
+                entity: "claim".into(),
+                id: uuid::Uuid::nil()
+            }),
+            HttpClass::BadRequest
+        );
+        assert_eq!(
+            class(DbError::Conflict { reason: "x".into() }),
+            HttpClass::Internal
+        );
+        assert_eq!(
+            class(DbError::DuplicateKey { entity: "x".into() }),
             HttpClass::Internal
         );
     }
