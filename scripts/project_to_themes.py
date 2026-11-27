@@ -62,43 +62,121 @@ class FullRebuildRefused(RuntimeError):
     """A projection over existing themes without --i-understand-full-rebuild."""
 
 
-def cascading_tables(conn):
-    """Every (schema, table) whose rows are deleted when claim_themes rows are:
-    the referencing foreign keys declared ON DELETE CASCADE, read from the
-    catalog so a table added later is counted without editing this list."""
+def _cascade_edges(conn):
+    """Every foreign key declared ON DELETE CASCADE in the database, as
+    (child oid, schema, table, parent oid, child columns), read from the
+    catalog so a table added later is followed without editing this script."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT DISTINCT n.nspname::text, c.relname::text
+            SELECT k.conrelid::oid, n.nspname::text, c.relname::text, k.confrelid::oid,
+                   array_agg(a.attname::text ORDER BY u.ord)
             FROM pg_catalog.pg_constraint k
             JOIN pg_catalog.pg_class c ON c.oid = k.conrelid
             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL unnest(k.conkey) WITH ORDINALITY AS u(attnum, ord)
+            JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.attnum
             WHERE k.contype = 'f' AND k.confdeltype = 'c'
-              AND k.confrelid = 'public.claim_themes'::regclass
-            ORDER BY 1, 2
+            GROUP BY k.oid, k.conrelid, n.nspname, c.relname, k.confrelid
         """)
-        return [tuple(r) for r in cur.fetchall()]
+        return [(r[0], r[1], r[2], r[3], list(r[4])) for r in cur.fetchall()]
+
+
+def _cascade_plan(conn):
+    """The tables an emptied claim_themes reaches through ON DELETE CASCADE,
+    directly or through a table that itself cascades (graph_neighborhoods ->
+    claim_neighborhood_membership, ...), each after every parent it has on the
+    path: a list of (oid, schema, table, [(parent oid, child columns)])."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT 'public.claim_themes'::regclass::oid")
+        root = cur.fetchone()[0]
+    edges = _cascade_edges(conn)
+    names, into = {}, {}
+    for child, schema, table, parent, cols in edges:
+        names[child] = (schema, table)
+        into.setdefault(child, []).append((parent, cols))
+    reached, frontier = set(), [root]
+    while frontier:
+        parent = frontier.pop()
+        for child, _s, _t, p, _c in edges:
+            if p == parent and child != root and child not in reached:
+                reached.add(child)
+                frontier.append(child)
+    plan, done = [], {root}
+    while len(done) < len(reached) + 1:
+        ready = sorted(
+            (t for t in reached - done
+             if all(p in done or p == t for p, _ in into[t] if p in reached or p == root)),
+            key=lambda t: names[t])
+        # A cascade cycle between tables: break it at the first by name (its
+        # unprocessed parent then counts as partly emptied: an upper bound).
+        ready = ready or sorted(reached - done, key=lambda t: names[t])[:1]
+        for t in ready:
+            plan.append((t, *names[t], [(p, c) for p, c in into[t] if p in reached or p == root]))
+            done.add(t)
+    return root, plan
+
+
+def cascading_tables(conn):
+    """Every (schema, table) whose rows are deleted when claim_themes is
+    emptied: the tables with an ON DELETE CASCADE foreign key to it, and the
+    tables that cascade from those, found from the catalog."""
+    _root, plan = _cascade_plan(conn)
+    return [(schema, table) for _oid, schema, table, _parents in plan]
+
+
+def _any_fk_set(fks):
+    """True for a row whose columns of any of `fks` are all non-null: such a
+    row references a parent row (MATCH SIMPLE checks nothing else)."""
+    if not fks:
+        return sql.SQL("false")
+    return sql.SQL(" OR ").join(
+        sql.SQL("({})").format(sql.SQL(" AND ").join(
+            sql.SQL("{} IS NOT NULL").format(sql.Identifier(c)) for c in cols))
+        for cols in fks)
 
 
 def rebuild_impact(conn):
     """What emptying claim_themes drops right now: the theme count, the rows
-    of each cascading table, and the Atlas maps that lose their levels."""
-    tables = cascading_tables(conn)
+    of each cascading table, and the Atlas maps that lose their levels.
+
+    Emptying claim_themes deletes every row that references one, so a table
+    loses exactly its rows with a cascading key to it set; a table every row
+    of which goes is emptied in turn, and the same holds one level down. A
+    table whose cascading parent is only partly emptied gets an upper bound
+    (its rows with a key to that parent set), listed under "approximate"."""
+    root, plan = _cascade_plan(conn)
+    emptied = {root}
+    cascade, approximate = {}, []
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM claim_themes")
         themes = cur.fetchone()[0]
-        cascade = {}
-        for schema, table in tables:
-            cur.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(schema, table)))
-            cascade[f"{schema}.{table}"] = cur.fetchone()[0]
+        for oid, schema, table, parents in plan:
+            full = [cols for p, cols in parents if p in emptied]
+            partial = [cols for p, cols in parents if p not in emptied]
+            cur.execute(sql.SQL(
+                "SELECT count(*) FILTER (WHERE {full}), count(*) FILTER (WHERE {any}), "
+                "count(*) FROM {table}"
+            ).format(full=_any_fk_set(full), any=_any_fk_set(full + partial),
+                     table=sql.Identifier(schema, table)))
+            exact, bound, total = cur.fetchone()
+            name = f"{schema}.{table}"
+            if exact == total:
+                emptied.add(oid)
+                cascade[name] = total
+            elif bound > exact:
+                cascade[name] = bound
+                approximate.append(name)
+            else:
+                cascade[name] = exact
         maps = []
-        if ("public", "atlas_map_levels") in tables:
+        if any((s, t) == ("public", "atlas_map_levels") for _o, s, t, _p in plan):
             cur.execute("""
                 SELECT DISTINCT CASE WHEN visibility = 'public' THEN 'public'
                                      ELSE 'team:' || owner_group_id::text END
                 FROM public.atlas_map_levels ORDER BY 1
             """)
             maps = [r[0] for r in cur.fetchall()]
-    return {"themes": themes, "cascade": cascade, "maps": maps}
+    return {"themes": themes, "cascade": cascade, "approximate": approximate, "maps": maps}
 
 
 def _plural(n, word):
@@ -106,8 +184,10 @@ def _plural(n, word):
 
 
 def describe_impact(impact):
+    approx = set(impact.get("approximate", ()))
     lines = [f"  claim_themes: {_plural(impact['themes'], 'theme')} (every theme id changes)"]
-    lines += [f"  {table}: {_plural(n, 'row')}" for table, n in impact["cascade"].items()]
+    lines += [f"  {table}: {'up to ' if table in approx else ''}{_plural(n, 'row')}"
+              for table, n in impact["cascade"].items()]
     lines.append("  maps losing their levels: " + (", ".join(impact["maps"]) or "none"))
     return "\n".join(lines)
 
