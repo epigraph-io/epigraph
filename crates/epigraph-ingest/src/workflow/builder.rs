@@ -446,6 +446,31 @@ mod tests {
         );
     }
 
+    /// A whitespace-only summary is as blank as an empty one (backlog
+    /// c08b1937): the guard is `summary.trim().is_empty()`, so spaces, a tab
+    /// or a newline alone fall back to the title too. An untrimmed check
+    /// would plan a whitespace-only phase claim, which
+    /// `claims_content_not_empty` (`length(trim(content)) > 0`) then refuses,
+    /// failing the whole ingest.
+    #[test]
+    fn phase_with_whitespace_summary_falls_back_to_title() {
+        for blank in ["   ", "\t\n"] {
+            let mut extraction = extraction_with_empty_phase_summary();
+            extraction.phases[0].summary = blank.to_string();
+            let plan = build_ingest_plan(&extraction);
+
+            let phase_claim = plan
+                .claims
+                .iter()
+                .find(|c| c.level == 1)
+                .expect("expected a level-1 phase claim");
+            assert_eq!(
+                phase_claim.content, extraction.phases[0].title,
+                "a whitespace-only summary ({blank:?}) must fall back to the phase title"
+            );
+        }
+    }
+
     /// A Phase with a non-empty summary must continue to use the summary as
     /// content (no regression).
     #[test]

@@ -1465,15 +1465,21 @@ mod tests {
         assert_eq!(result.new_generation, 1);
 
         // 4. Verify the phase claim actually has the title as content (not empty).
-        let phase_content: String = sqlx::query_scalar(
-            "SELECT content FROM claims \
-             WHERE properties->>'kind' = 'workflow_step' \
-               AND properties->>'level' = '1' \
-             ORDER BY created_at DESC LIMIT 1",
+        //    Read by key (backlog c08b1937): the level-1 claims the NEW
+        //    generation's workflow row executes, not the most recent one anywhere.
+        let workflow_id = Uuid::parse_str(&result.workflow_id).expect("workflow id");
+        let phases: Vec<String> = sqlx::query_scalar(
+            "SELECT c.content FROM claims c \
+             JOIN edges e ON e.target_id = c.id \
+             WHERE e.source_id = $1 AND e.relationship = 'executes' \
+               AND c.properties->>'level' = '1'",
         )
-        .fetch_one(&pool)
+        .bind(workflow_id)
+        .fetch_all(&pool)
         .await
-        .expect("phase claim must exist");
+        .expect("read the workflow's phase claims");
+        assert_eq!(phases.len(), 1, "one phase executed: {phases:?}");
+        let phase_content = &phases[0];
 
         assert_eq!(
             phase_content, "Capability Review Phase",
