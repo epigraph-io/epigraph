@@ -695,6 +695,27 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 ///   refused 403)
 /// - encryption_epoch must match the group's current epoch
 /// - Claim + encryption metadata are written atomically in a transaction
+///
+/// # Transport contract: this route is the RAW write (backlog 9cd904df)
+///
+/// It runs no semantic novelty gate and no calibrated truth seeding. MCP
+/// `submit_claim` (and `batch_submit_claims` and `memorize`, which go through
+/// the same gate) differ on both, and that difference is deliberate:
+///
+/// - **Novelty gate.** MCP suppresses a new claim that lies within
+///   `novelty_threshold` cosine distance of an existing one and returns the
+///   existing id (`epigraph_mcp::tools::novelty_gate::decide`). This route
+///   inserts it. Its only dedup is exact: `(content_hash, agent_id)`, a 409
+///   by default or the existing row with `if_not_exists: true`.
+/// - **Truth seeding.** MCP seeds `truth_value` from `confidence` times the
+///   calibrated evidence-type weight (`CalibrationConfig::get_evidence_type_weight`),
+///   clamped to `[0.01, 0.99]`. This route stores `initial_truth` as given,
+///   or 0.5 when it is omitted, and applies no weight.
+///
+/// The gate and the seeding are MCP-side steps that run before the claim
+/// write. A client that wants either one calls MCP or applies it itself. The
+/// same contract holds for `POST /api/v1/claims/batch`, which runs this
+/// route's code once per item.
 #[cfg(feature = "db")]
 pub async fn create_claim(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -719,6 +740,10 @@ pub async fn create_claim(
 /// The body of `POST /api/v1/claims`, shared with `POST /api/v1/claims/batch`
 /// (one call per item) so the two cannot drift. Opens and commits its own
 /// transaction.
+///
+/// It runs no novelty gate and no calibrated truth seeding; see
+/// [`create_claim`]'s "Transport contract" (backlog 9cd904df). Do not add
+/// either one here without changing that documented contract.
 #[cfg(feature = "db")]
 pub(crate) async fn create_claim_core(
     state: &AppState,

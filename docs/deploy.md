@@ -1468,6 +1468,26 @@ The MCP tool `system_stats` is a different aggregate (corpus counts,
 viewer-scoped, `claims:read`) from `GET /api/v1/admin/stats`. The
 `require_signatures` field of the admin stats body keeps its name on the wire.
 
+### `POST /api/v1/claims`: the raw claim write
+
+This route is not the HTTP twin of MCP `submit_claim`. It writes what it is
+given, and it skips two steps that the MCP submission tools (`submit_claim`,
+`batch_submit_claims` and `memorize`) run before their claim write:
+
+- **No novelty gate.** MCP suppresses a new claim whose embedding lies within
+  `novelty_threshold` cosine distance of an existing claim, and returns that
+  claim's id instead. This route inserts the near-duplicate. Its only dedup is
+  exact, on `(content_hash, agent_id)`: a 409 by default, or the existing row
+  with `if_not_exists: true`.
+- **No calibrated truth seeding.** MCP seeds `truth_value` from `confidence`
+  times the calibrated weight of the `evidence_type`, clamped to
+  `[0.01, 0.99]`. This route stores `initial_truth` as given, or 0.5 when it
+  is omitted, and applies no weight.
+
+This split is intended: the gate and the seeding are MCP-side steps. A client
+that wants either one calls MCP or applies it before posting.
+`POST /api/v1/claims/batch` has the same contract.
+
 ### `POST /api/v1/claims/batch`
 
 Each item goes through the same code as `POST /api/v1/claims`, on its own
