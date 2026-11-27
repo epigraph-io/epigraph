@@ -39,7 +39,7 @@
 //!
 //! **2. `#[cfg(test)]`.** Test modules are **counted**, not exempt. Same rule
 //! as `visibility_lint.rs::repo_files`, which reads each file entire. Exempting
-//! them would have let `workflow_ingest.rs` (10 sites, all in its test module)
+//! them would have let `workflow_ingest.rs` (11 sites, all in its test module)
 //! and `novelty_gate.rs` (2, likewise) report zero, and "passes at zero" would
 //! then mean nothing. The prod/test split is recorded per file in
 //! [`EXPECTED_INLINE_SQL`] and asserted separately by
@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 /// * **One-line read-backs (`ds.rs`, `ds_auto.rs`, `link_epistemic.rs`,
 ///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
 ///   caller just wrote, or probes existence by id. Not content reads.
-/// * **Test modules (`workflow_ingest.rs` 10, `novelty_gate.rs` 2,
+/// * **Test modules (`workflow_ingest.rs` 11, `novelty_gate.rs` 2,
 ///   `workflow_hierarchical.rs` 17).** Fixture assertions inside
 ///   `#[cfg(test)] mod tests`. Counted so the total means something.
 const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
@@ -115,7 +115,10 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // Test sites 14 -> 17 (backlog 9928b61f): the report-row read-back, and
     // the idempotency race test's holder lock and lock-wait poll. Fixture SQL.
     ("workflow_hierarchical.rs", 0, 17),
-    ("workflow_ingest.rs", 0, 10),
+    // 10 -> 11 (backlog 4cbd4192, merged by the 2026-11-27 staging run): the
+    // test module gained one fixture read-back, `goal_embedding IS NOT NULL`,
+    // asserting that a server with no `ScopedPool` stores no goal embedding.
+    ("workflow_ingest.rs", 0, 11),
     // 2 -> 1 (ruling R-74, migration 183): `report_workflow_outcome`'s
     // routing probe moved to the repo layer
     // (`WorkflowRepository::viewer_reads_row`, viewer-spliced, on the caller's

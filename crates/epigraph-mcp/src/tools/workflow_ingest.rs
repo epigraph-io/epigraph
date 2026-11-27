@@ -1501,7 +1501,15 @@ mod tests {
         let signer = epigraph_crypto::AgentSigner::from_bytes(&[0x4Cu8; 32]).expect("signer");
         let embedder = crate::embed::McpEmbedder::new(pool.clone(), None);
         let unscoped = EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
-        let caller = crate::write_identity::WriteIdentity::from_resolved(Uuid::new_v4());
+        // This test is the stdio caller: there is no request token, so the
+        // resolver's stdio arm names the server's own signer, as it would for a
+        // stdio client. (Tool bodies forward the request's `auth`; the ratchet
+        // keeps a literal `None` out of them, and this test has no request.)
+        let auth: Option<&epigraph_auth::AuthContext> = None;
+        let caller = unscoped
+            .write_identity(auth, &viewer)
+            .await
+            .expect("the stdio identity of the server under test");
         store_workflow_goal_embedding(&unscoped, caller, workflow_id, &[0.25_f32; 1536]).await;
 
         let stored: bool =
