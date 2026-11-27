@@ -3,7 +3,7 @@
 //! EpiGraph Full-Framework MCP Server — exposes all workspace crates as MCP tools.
 //!
 //! Connects to the EpiGraph PostgreSQL backend and provides the kernel MCP tools
-//! (the count is derived from the router, see `server_instructions`), including
+//! (clients enumerate them with `list_mcp_tools` / `tools/list`), including
 //! full CDST support (6 combination methods), scoped beliefs, and DS-vs-Bayesian divergence.
 //!
 //! ## Usage

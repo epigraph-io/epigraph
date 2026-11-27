@@ -49,6 +49,15 @@ use serde::Serialize;
 /// review. When counting narrows to the plan authority's reports (backlog
 /// b446d2a4) this value should change with it, so a consumer can tell the two
 /// bases apart.
+///
+/// The basis is attached when a verdict is read, not stored with it. That is
+/// exact while this is the only basis that has ever existed: every verdict
+/// stored so far counted all callers' reports. Changing this value therefore
+/// requires, in the same change: `refresh_workflow_promotion` writes
+/// `promotion_basis` into the stored `properties.promotion`, and
+/// [`label_promotion_basis`] and `find_workflow` prefer that stored value,
+/// falling back to `"self_reported"` for verdicts stored without one.
+/// Otherwise an old all-callers verdict would be shown under the new basis.
 pub const PROMOTION_BASIS: &str = "self_reported";
 
 /// Label a stored `properties.promotion` verdict with [`PROMOTION_BASIS`],
