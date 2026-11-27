@@ -15,6 +15,10 @@
 //! What is pinned:
 //! * a dry run lists the claims that would move and every boundary with its
 //!   reason, and changes nothing (tenancy, audit rows);
+//! * a dry run the act would carry out reports, from a trial it rolls back,
+//!   which incident edges the act widens and which it leaves, and which
+//!   evidence moves and which stays behind (pinned), and the act then does
+//!   exactly that;
 //! * the act moves exactly the plan: boundary claims, claims beyond a
 //!   boundary, claims over an edge type or in a direction not followed and
 //!   superseded claims stay where they were;
@@ -259,6 +263,57 @@ fn boundary_of(plan: &serde_json::Value, claim: Uuid) -> serde_json::Value {
         .unwrap_or_else(|| panic!("{claim} is not a boundary: {plan}"))
 }
 
+/// Every planned edge's predicted `after`, as `(edge_id, visibility,
+/// owner_group_id, co_owner_group_id)`.
+fn predicted(effects: &serde_json::Value) -> Vec<(Uuid, String, Uuid, Option<Uuid>)> {
+    ["edges_widened", "edges_kept"]
+        .iter()
+        .flat_map(|k| effects[*k].as_array().cloned().unwrap_or_default())
+        .map(|e| {
+            (
+                e["edge_id"].as_str().unwrap().parse().unwrap(),
+                e["after"]["visibility"].as_str().unwrap().to_string(),
+                e["after"]["owner_group_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+                e["after"]["co_owner_group_id"]
+                    .as_str()
+                    .map(|c| c.parse().unwrap()),
+            )
+        })
+        .collect()
+}
+
+/// The act did to each edge what the dry run predicted.
+async fn assert_predicted(pool: &PgPool, predicted: &[(Uuid, String, Uuid, Option<Uuid>)]) {
+    assert!(!predicted.is_empty());
+    for (id, visibility, owner, co_owner) in predicted {
+        let actual: (String, Uuid, Option<Uuid>) = sqlx::query_as(
+            "SELECT visibility::text, owner_group_id, co_owner_group_id FROM edges WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("edge");
+        assert_eq!(
+            actual,
+            (visibility.clone(), *owner, *co_owner),
+            "edge {id}: the act did not do what the dry run said"
+        );
+    }
+}
+
+/// The `edge_id`s of a list of planned edges.
+fn edge_ids(list: &serde_json::Value) -> BTreeSet<Uuid> {
+    list.as_array()
+        .unwrap_or_else(|| panic!("not a list: {list}"))
+        .iter()
+        .map(|e| e["edge_id"].as_str().expect("edge_id").parse().unwrap())
+        .collect()
+}
+
 /// The audit row's `claim_ids`, as a set.
 fn audited_ids(details: &serde_json::Value) -> BTreeSet<Uuid> {
     details["claim_ids"]
@@ -311,13 +366,14 @@ async fn a_share_selection_moves_the_closure_and_stops_at_boundaries(pool: PgPoo
         .execute(&pool)
         .await
         .expect("supersede o");
-    edge(&pool, r, a, "decomposes_to").await;
-    edge(&pool, a, b, "supports").await;
-    edge(&pool, a, p, "decomposes_to").await;
+    let ra = edge(&pool, r, a, "decomposes_to").await;
+    let ab = edge(&pool, a, b, "supports").await;
+    let ap = edge(&pool, a, p, "decomposes_to").await;
     edge(&pool, p, q, "decomposes_to").await;
-    edge(&pool, r, o, "decomposes_to").await;
-    edge(&pool, r, x, "elaborates").await;
-    edge(&pool, e, r, "supports").await;
+    let ro = edge(&pool, r, o, "decomposes_to").await;
+    let rx = edge(&pool, r, x, "elaborates").await;
+    let er = edge(&pool, e, r, "supports").await;
+    let a_evidence = fixture::seed_evidence(&pool, a, "observation").await;
     let private = [r, a, b, q, o, x, e];
 
     // The dry run.
@@ -336,6 +392,36 @@ async fn a_share_selection_moves_the_closure_and_stops_at_boundaries(pool: PgPoo
     assert!(at_p["detail"].as_str().is_some(), "{plan}");
     assert_eq!(boundary_of(plan, o)["reason"], "not_current", "{plan}");
     assert_eq!(plan["capped"], false, "{plan}");
+    // What the act would do to the planned claims' edges and evidence,
+    // measured by a trial it rolled back: the edges among R, A, B and to the
+    // public P are re-met into the team; the edges to O, X and E (which stay
+    // private) keep requiring alice's home group; A's evidence moves.
+    let effects = &plan["effects"];
+    assert_eq!(
+        edge_ids(&effects["edges_widened"]),
+        set(&[ra, ab, ap]),
+        "{plan}"
+    );
+    assert_eq!(
+        edge_ids(&effects["edges_kept"]),
+        set(&[ro, rx, er]),
+        "{plan}"
+    );
+    for w in effects["edges_widened"].as_array().unwrap() {
+        assert_eq!(w["after"]["owner_group_id"], t.to_string(), "{w}");
+    }
+    assert_eq!(effects["evidence_moved"], 1, "{plan}");
+    assert_eq!(effects["evidence_kept"], serde_json::json!([]), "{plan}");
+    let prediction = predicted(effects);
+    assert_eq!(
+        sqlx::query_scalar::<_, Uuid>("SELECT owner_group_id FROM evidence WHERE id = $1")
+            .bind(a_evidence)
+            .fetch_one(&pool)
+            .await
+            .expect("evidence"),
+        home,
+        "the trial was rolled back"
+    );
     for c in private {
         assert_eq!(tenancy(&pool, c).await, ("group".to_string(), home));
     }
@@ -373,6 +459,7 @@ async fn a_share_selection_moves_the_closure_and_stops_at_boundaries(pool: PgPoo
     for c in private {
         assert!(!reads(&pool, &s, carol, c).await, "a non-member reads {c}");
     }
+    assert_predicted(&pool, &prediction).await;
     let rows = audits(&pool, "claim.shared_with_team").await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, Some(alice));
@@ -468,9 +555,20 @@ async fn a_publicize_selection_stops_at_a_claim_the_caller_does_not_administer(p
     let a = claim(&pool, eve, t, "group", "team step").await;
     let st = claim(&pool, eve, u, "group", "the other team's step").await;
     let w = claim(&pool, eve, t, "group", "beyond the other team").await;
-    edge(&pool, r, a, "decomposes_to").await;
-    edge(&pool, a, st, "supports").await;
+    let ra = edge(&pool, r, a, "decomposes_to").await;
+    let ast = edge(&pool, a, st, "supports").await;
     edge(&pool, st, w, "decomposes_to").await;
+    let hidden = fixture::seed_evidence(&pool, r, "observation").await;
+    let shown = fixture::seed_evidence(&pool, a, "observation").await;
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test hide')",
+    )
+    .bind(hidden)
+    .bind(eve)
+    .execute(&pool)
+    .await
+    .expect("pin");
 
     let body = publicize(&pool, &s, eve, selection(r), true)
         .await
@@ -484,6 +582,22 @@ async fn a_publicize_selection_stops_at_a_claim_the_caller_does_not_administer(p
     );
     assert!(audits(&pool, "claim.publicized").await.is_empty());
     assert!(!reads(&pool, &s, carol, r).await);
+    // The trial: R-A goes public; A-S (team T to team U) stays U's but no
+    // longer needs T as well, so it widens to U; R's pinned evidence stays
+    // behind, A's goes with it.
+    let effects = &body["plan"]["effects"];
+    assert_eq!(
+        edge_ids(&effects["edges_widened"]),
+        set(&[ra, ast]),
+        "{body}"
+    );
+    assert_eq!(effects["edges_kept"], serde_json::json!([]), "{body}");
+    assert_eq!(effects["evidence_moved"], 1, "{body}");
+    let kept = effects["evidence_kept"].as_array().expect("kept");
+    assert_eq!(kept.len(), 1, "{body}");
+    assert_eq!(kept[0]["evidence_id"], hidden.to_string(), "{body}");
+    assert_eq!(kept[0]["tenancy"]["visibility"], "group", "{body}");
+    let prediction = predicted(effects);
 
     let body = publicize(&pool, &s, eve, selection(r), false)
         .await
@@ -495,6 +609,19 @@ async fn a_publicize_selection_stops_at_a_claim_the_caller_does_not_administer(p
     }
     assert_eq!(tenancy(&pool, st).await, ("group".to_string(), u));
     assert_eq!(tenancy(&pool, w).await, ("group".to_string(), t));
+    let evidence_vis = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT visibility::text FROM evidence WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("evidence")
+        }
+    };
+    assert_eq!(evidence_vis(hidden).await, "group", "as the dry run said");
+    assert_eq!(evidence_vis(shown).await, "public", "as the dry run said");
+    assert_predicted(&pool, &prediction).await;
     for c in [st, w] {
         assert!(!reads(&pool, &s, carol, c).await, "a stranger reads {c}");
     }
@@ -683,4 +810,61 @@ async fn a_malformed_selection_is_refused(pool: PgPool) {
     .expect_err("ids and a selection");
     assert!(err.message.contains("not both"), "{err:?}");
     assert_eq!(tenancy(&pool, r).await, ("group".to_string(), home));
+}
+
+/// The engine's dry run changes nothing even on a transaction its caller
+/// COMMITS: the previews and the trial of the act each roll back to their
+/// own savepoint (the transports also drop a dry run's transaction, which
+/// would hide a leak from the tool-level tests above).
+///
+/// Verified to fail with the trial's rollback removed (the claims move and
+/// the audit row is written) and with the preview's sentinel and rollback
+/// removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_engine_dry_run_committed_by_its_caller_changes_nothing(pool: PgPool) {
+    use epigraph_engine::visibility_act::{act, ActTarget, Selection, WideningAct};
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "sel-alice").await;
+    add_member(&pool, t, alice, "writer").await;
+    let r = claim(&pool, alice, home, "group", "root").await;
+    let a = claim(&pool, alice, home, "group", "child").await;
+    let ra = edge(&pool, r, a, "decomposes_to").await;
+    let ev = fixture::seed_evidence(&pool, a, "observation").await;
+
+    let v = viewer(&pool, alice).await;
+    let mut tx = s.scoped.begin_as(&v).await.expect("stamped tx");
+    let report = act(
+        &mut tx,
+        &v,
+        WideningAct::ShareWithTeam { group_id: t },
+        &ActTarget::Selection(Selection::new(r, None, None, None).expect("selection")),
+        "a dry run its caller commits",
+        true,
+    )
+    .await
+    .expect("dry run");
+    tx.commit().await.expect("commit");
+    let plan = report.plan.expect("plan");
+    assert_eq!(plan.claim_ids().len(), 2, "{plan:?}");
+    let effects = plan.effects.expect("effects");
+    assert_eq!(effects.edges_widened.len(), 1, "{effects:?}");
+    assert_eq!(effects.edges_widened[0].edge_id, ra);
+    assert_eq!(effects.evidence_moved, 1, "{effects:?}");
+    assert!(report.results.is_empty());
+
+    for c in [r, a] {
+        assert_eq!(tenancy(&pool, c).await, ("group".to_string(), home), "{c}");
+    }
+    let (edge_owner, ev_owner): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT (SELECT owner_group_id FROM edges WHERE id = $1), \
+                (SELECT owner_group_id FROM evidence WHERE id = $2)",
+    )
+    .bind(ra)
+    .bind(ev)
+    .fetch_one(&pool)
+    .await
+    .expect("owners");
+    assert_eq!((edge_owner, ev_owner), (home, home));
+    assert!(audits(&pool, "claim.shared_with_team").await.is_empty());
 }

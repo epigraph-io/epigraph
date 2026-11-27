@@ -225,7 +225,7 @@ pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use countersign::{CountersignDecision, CountersignRepository, CountersignedRow};
 pub use divergence::DivergenceRepository;
-pub use edge::EdgeRepository;
+pub use edge::{EdgeRepository, IncidentEdgeTenancy};
 pub use ego::{EgoEdgeRow, EgoEdges, EgoEntity, EgoRepository};
 pub use elevated_access::ElevatedAccess;
 pub use elevation_ceremony::{
@@ -238,7 +238,7 @@ pub use event::{EventCursor, EventRepository, EventRow};
 pub use evidence::{
     DatasetEvidence, DerivationEvidence, EvidenceAtTimeRow, EvidenceClaimLink, EvidenceDetailRow,
     EvidenceDirection, EvidenceEdge, EvidenceEdgeRow, EvidenceListFilter, EvidenceListRow,
-    EvidenceRepository, EvidenceSearchResult,
+    EvidenceRepository, EvidenceSearchResult, EvidenceTenancy,
 };
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,

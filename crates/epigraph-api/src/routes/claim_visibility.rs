@@ -136,7 +136,8 @@ pub struct VisibilityActResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<bool>,
     /// Present for a selection or a dry run: `{selection, claims,
-    /// boundaries, capped}` (`epigraph_engine::visibility_act::VisibilityPlan`).
+    /// boundaries, capped, effects?}`
+    /// (`epigraph_engine::visibility_act::VisibilityPlan`).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Object>)]
     pub plan: Option<serde_json::Value>,

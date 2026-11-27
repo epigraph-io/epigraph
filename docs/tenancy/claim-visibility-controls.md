@@ -410,9 +410,20 @@ The walk (`epigraph_engine::visibility_act::plan`) adds no authority:
 * A plan of more than 500 claims, or a walk reaching more than 2,000 claims in all, is refused
   whole (input, 400); its dry run reports `capped: true`.
 
+When the act would run (claims to move, not capped, and for an id list no refused id), the dry run
+also runs the act once inside a savepoint it rolls back, and reports what it did to the planned
+claims' edges and evidence, as far as the caller can read them (`plan.effects`):
+`edges_widened` (public after and not before, or no longer requiring a group it required),
+`edges_kept` (still requiring every group it required: an edge to a claim that stays behind, a
+declared edge), each with its `before` and `after` tenancy; `evidence_moved` (a count) and
+`evidence_kept` (rows that stay behind, such as evidence pinned private by migration 110). The
+act's own cascade decides all of it, so the report cannot drift from the act. Lists stop at
+5,000 rows each (`truncated`).
+
 The response is the usual `{results}` plus, for a selection or a dry run,
 `{dry_run, plan: {selection, claims: [{claim_id, depth, outcome, reached_from?, relationship?}],
-boundaries: [{claim_id, depth, reason, detail?, reached_from?, relationship?}], capped}}`.
+boundaries: [{claim_id, depth, reason, detail?, reached_from?, relationship?}], capped,
+effects?}}`.
 
 Moving workflow lineages stays out of scope; it remains an operator act. Tests:
 `epigraph-mcp/tests/visibility_selection_app_role.rs` and

@@ -488,6 +488,18 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "plan",
         &["preview", "preview", "preview"],
     ),
+    // session: the savepoint a dry run's trial of the act runs in, always
+    // rolled back and released (backlog 02d9e9a1); the act and the reads
+    // before and after it are handed the viewer.
+    (
+        "visibility_act.rs",
+        "trial",
+        &[
+            "sqlx::query(RELEASE).execute",
+            "sqlx::query(ROLLBACK).execute",
+            "sqlx::query(SAVEPOINT).execute",
+        ],
+    ),
     // privileged: refuses a non-bypass viewer before any statement.
     (
         "visibility_act.rs",

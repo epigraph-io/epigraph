@@ -90,6 +90,30 @@ pub const EDGE_IN_FORCE: &str = "(e.valid_to IS NULL OR e.valid_to > now())";
 /// `EDGE_IN_FORCE`.
 pub const EDGE_IN_FORCE_UNALIASED: &str = "(valid_to IS NULL OR valid_to > now())";
 
+/// One edge's endpoints and stored tenancy, as
+/// [`EdgeRepository::tenancy_incident_to_claims`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct IncidentEdgeTenancy {
+    /// The edge.
+    pub id: Uuid,
+    /// Its source.
+    pub source_id: Uuid,
+    /// Its source's type.
+    pub source_type: String,
+    /// Its target.
+    pub target_id: Uuid,
+    /// Its target's type.
+    pub target_type: String,
+    /// Its relationship, as stored.
+    pub relationship: String,
+    /// `visibility`.
+    pub visibility: Option<String>,
+    /// `owner_group_id`.
+    pub owner_group_id: Option<Uuid>,
+    /// `co_owner_group_id`.
+    pub co_owner_group_id: Option<Uuid>,
+}
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {
@@ -1954,6 +1978,42 @@ impl EdgeRepository {
             .bind(&spellings)
             .bind(outgoing)
             .bind(incoming)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Every edge `viewer` can read with a claim of `claim_ids` as an
+    /// endpoint, with its stored tenancy, ordered by id, at most `limit`
+    /// rows. A widening act's dry run reads it before and after a trial of the
+    /// act it rolls back (`epigraph_engine::visibility_act`, backlog
+    /// 02d9e9a1), to report which edges the act widens and which it leaves.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn tenancy_incident_to_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<IncidentEdgeTenancy>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
+                    e.relationship, e.visibility::text AS visibility, e.owner_group_id, \
+                    e.co_owner_group_id \
+               FROM edges e \
+              WHERE ((e.source_type = 'claim' AND e.source_id = ANY($1::uuid[])) \
+                  OR (e.target_type = 'claim' AND e.target_id = ANY($1::uuid[]))) \
+                /* {EDGE_VISIBILITY:e} */ \
+              ORDER BY e.id \
+              LIMIT $2",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, IncidentEdgeTenancy>(&sql)
+            .bind(claim_ids)
             .bind(limit);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);

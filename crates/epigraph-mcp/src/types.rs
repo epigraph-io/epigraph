@@ -3735,7 +3735,7 @@ pub struct PublicizeClaimsParams {
     pub selection: Option<SelectionParams>,
 
     #[schemars(
-        description = "true: change nothing and return the plan ({claims, boundaries, capped}) the call would carry out. Run it first on a selection."
+        description = "true: change nothing and return the plan ({claims, boundaries, capped}) the call would carry out and, when it would run, its effects (edges_widened, edges_kept, evidence_moved, evidence_kept), measured by running it and rolling it back. Run it first on a selection."
     )]
     #[serde(default)]
     pub dry_run: Option<bool>,
@@ -3761,7 +3761,7 @@ pub struct ShareClaimsWithTeamParams {
     pub selection: Option<SelectionParams>,
 
     #[schemars(
-        description = "true: change nothing and return the plan ({claims, boundaries, capped}) the call would carry out. Run it first on a selection."
+        description = "true: change nothing and return the plan ({claims, boundaries, capped}) the call would carry out and, when it would run, its effects (edges_widened, edges_kept, evidence_moved, evidence_kept), measured by running it and rolling it back. Run it first on a selection."
     )]
     #[serde(default)]
     pub dry_run: Option<bool>,
