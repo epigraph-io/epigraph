@@ -330,19 +330,27 @@ pub fn without_retired_scopes(mut scopes: Vec<String>) -> Vec<String> {
 }
 
 /// A grant's whitespace-separated `scope` request with every
-/// [`RETIRED_SCOPES`] entry dropped. `None` when it names nothing else (absent,
-/// blank, or only retired scopes): the request then means "as granted", the
-/// meaning an absent `scope` already has on every grant, so naming a retired
-/// scope never turns a request into `invalid_scope`.
+/// [`RETIRED_SCOPES`] entry dropped.
+///
+/// * `None` when there is no request, or when it named scopes and ALL of them
+///   are retired: the request then means "as granted", the meaning an absent
+///   `scope` already has on every grant, so naming only retired scopes never
+///   turns a request into `invalid_scope`.
+/// * `Some` of the rest otherwise. A blank request (`Some("")`) names nothing
+///   and stays `Some(vec![])`, so each grant keeps its own meaning for it.
 #[must_use]
 pub fn requested_scopes(raw: Option<&str>) -> Option<Vec<String>> {
-    let named: Vec<String> = raw
-        .unwrap_or_default()
-        .split_whitespace()
+    let raw = raw?;
+    let named: Vec<&str> = raw.split_whitespace().collect();
+    let live: Vec<String> = named
+        .iter()
         .filter(|s| !is_retired_scope(s))
-        .map(str::to_string)
+        .map(|s| (*s).to_string())
         .collect();
-    (!named.is_empty()).then_some(named)
+    if live.is_empty() && !named.is_empty() {
+        return None;
+    }
+    Some(live)
 }
 
 /// Whether `scope` is one of [`ADMIN_ONLY_SCOPES`].
@@ -1658,11 +1666,13 @@ mod tests {
     }
 
     /// A request's retired scopes are dropped; one naming nothing else is
-    /// "as granted" (`None`), like an absent or blank one.
+    /// "as granted" (`None`), like an absent one. A blank one is left to the
+    /// grant (`Some(vec![])`), as before the retirement.
     #[test]
     fn a_request_naming_only_retired_scopes_means_as_granted() {
         assert_eq!(requested_scopes(None), None);
-        assert_eq!(requested_scopes(Some("  ")), None);
+        assert_eq!(requested_scopes(Some("  ")), Some(Vec::new()));
+        assert_eq!(requested_scopes(Some("")), Some(Vec::new()));
         assert_eq!(requested_scopes(Some("claims:delete evidence:read")), None);
         assert_eq!(
             requested_scopes(Some("claims:read claims:delete edges:read")),
