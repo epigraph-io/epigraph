@@ -358,9 +358,9 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   `EPIGRAPH_RATE_LIMIT_RPM`. The boot log says `per-address rate limiter ON`
   or `OFF`.
 - **The production posture** (backlog `67b1ab86`, provisional ruling
-  `6bd77743`): production sets `EPIGRAPH_RATE_LIMIT_RPM` and
-  `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` from measured peak request rates with
-  about 3x headroom, and leaves `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` unset (no
+  `6bd77743`), a policy: production is to set `EPIGRAPH_RATE_LIMIT_RPM` and
+  `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` from its measured peak request rates with
+  about 3x headroom, and to leave `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` unset (no
   instance-wide ceiling). Revisit a global ceiling only if load data justifies
   it. The values are a deployment's own and are not recorded here.
 - **A handler that panics** is answered `500` with the body `Service
@@ -594,7 +594,7 @@ For the others, anything else is off.
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
 | `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
 | `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
-| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. Production leaves it unset (Step 8, "The production posture"). |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. Production is to leave it unset (Step 8, "The production posture"). |
 | `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` | unset (no per-address limit) | Requests a minute per client address, counted before authentication and routing, so 401s and unknown-path 404s are limited too (Step 8, "Per-address rate limiting"). Independent of `EPIGRAPH_RATE_LIMIT_RPM`; `EPIGRAPH_RATE_LIMIT=off` turns it off. Not a positive whole number → exit 1. |
 | `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. It does not turn rate limiting on. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
