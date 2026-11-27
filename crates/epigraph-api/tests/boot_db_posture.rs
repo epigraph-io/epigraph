@@ -91,3 +91,40 @@ async fn a_database_without_pgvector_is_refused_first(pool: PgPool) {
         "{refusal}"
     );
 }
+
+/// The last gate: the RLS posture verdict. A half-applied FORCE (some
+/// protected tables FORCEd, some not) is refused whatever role connects, so
+/// it reaches the refusal on a test pool too. The precondition is checked
+/// first: at head every protected table is FORCEd, so un-FORCEing one leaves
+/// a strict subset.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_half_applied_force_is_refused_by_the_rls_gate(pool: PgPool) {
+    let before = epigraph_api::state::AppState::probe_rls_posture_on(&pool)
+        .await
+        .expect("read the RLS posture");
+    assert!(
+        before.protected_count > 1 && before.forced_count == before.protected_count,
+        "precondition: every protected table is FORCEd at head; got {} of {}",
+        before.forced_count,
+        before.protected_count
+    );
+
+    sqlx::query("ALTER TABLE public.claims NO FORCE ROW LEVEL SECURITY")
+        .execute(&pool)
+        .await
+        .expect("un-FORCE one protected table");
+
+    let refusal = check_db_posture(&pool, OPTS)
+        .await
+        .expect_err("a half-applied FORCE must not serve");
+    assert!(
+        matches!(refusal, BootRefusal::RlsPosture(_)),
+        "refused for the wrong reason: {refusal:?}"
+    );
+    let line = refusal.to_string();
+    assert!(
+        line.starts_with("refusing to serve: RLS posture assertion failed")
+            && line.contains("FORCE ROW LEVEL SECURITY is applied to"),
+        "the refusal must say what is wrong; got: {line}"
+    );
+}
