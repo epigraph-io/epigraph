@@ -3,6 +3,7 @@
 
     .github/scripts/commit-message-lint.py <base> <head>
     .github/scripts/commit-message-lint.py --cited-shas <base> <head>
+    PR_TITLE=... PR_BODY=... .github/scripts/commit-message-lint.py --pr-text
 
 Reads the NON-MERGE commits in <base>..<head> (only <head> when <base> is empty
 or all zeros) and reports per commit. ERRORS fail the run (exit 1):
@@ -25,6 +26,15 @@ WARNINGS never change the exit status: W2 a subject outside
 sections. Offending values are NEVER printed (public CI logs): each finding is
 redacted, and a subject that itself holds an error is withheld. Run from the
 repository root.
+
+`--pr-text` lints a pull request's title and body instead of commits, read
+from the PR_TITLE and PR_BODY environment variables (a workflow passes them
+through `env:`, never interpolated into a shell line): E1, E2, E3 and E6 as
+above, on every line (trailer-shaped lines included), exit 1 on any finding.
+The PR text is as public as a commit message, and it can be edited after the
+commits were checked (.github/workflows/pr-text-lint.yml runs on each edit).
+Each finding names only the rule, `title` or the body line number, and the
+redacted description; no line of the title or body is printed.
 
 `--cited-shas` runs ONLY W4 and always exits 0 (a workflow on every push to
 main runs it, .github/workflows/cited-sha-check.yml): W4 a token in a message
@@ -142,10 +152,11 @@ def deny_terms():
 DENY = deny_terms()
 
 
-def scan_deny(line):
-    """Return the redacted E6 findings of one line (any line, trailers included)."""
+def scan_deny(line, deny=None):
+    """Return the redacted E6 findings of one line (any line, trailers included).
+    <deny> is a list from deny_terms(); None means the list read at start-up."""
     return [("E6", f"deny-listed term (entry {i + 1} of the private list)")
-            for i, rx in enumerate(DENY) if rx.search(line)]
+            for i, rx in enumerate(DENY if deny is None else deny) if rx.search(line)]
 
 
 def verification_not_run(message):
@@ -242,6 +253,35 @@ def lint(subject, message):
     return errors, warnings
 
 
+def lint_pr_text(title, body, deny):
+    """`--pr-text`: the redacted E1, E2, E3 and E6 findings of a pull request's
+    title and body, as (where, class, description), where is `title` or
+    `body line <n>`. Every line is read, trailer-shaped ones included: a PR body
+    has no git attribution to protect, so an address there is a leak like any
+    other. CRLF (the web editor's line ending) splits like LF."""
+    found = []
+    parts = [("title", l) for l in re.split(r"\r\n|\r|\n", title or "")]
+    parts += [(f"body line {n}", l)
+              for n, l in enumerate(re.split(r"\r\n|\r|\n", body or ""), 1)]
+    for where, line in parts:
+        found += [(where, cls, text) for cls, text in scan_line(line) + scan_deny(line, deny)]
+    return found
+
+
+def main_pr_text(env):
+    """`--pr-text`: lint PR_TITLE and PR_BODY from <env>; exit 1 on any finding.
+    Neither the title nor any line of the body is ever printed."""
+    deny = deny_terms()
+    print(f"commit-message-lint --pr-text: private deny-list {'configured' if deny else 'not configured'}")
+    body = env.get("PR_BODY", "")
+    findings = lint_pr_text(env.get("PR_TITLE", ""), body, deny)
+    for where, cls, text in findings:
+        print(f"error {cls} {where}: {text}")
+    n_lines = len(re.split(r"\r\n|\r|\n", body)) if body else 0
+    print(f"commit-message-lint --pr-text: title and {n_lines} body line(s), {len(findings)} error(s)")
+    return 1 if findings else 0
+
+
 def cited_shas(message):
     """The sha-like tokens a message cites (W4), in order, trailers skipped. A
     token needs a digit and a letter: an all-digit run is a number or a date,
@@ -305,8 +345,10 @@ def main_cited(base, head):
 def main(argv):
     if len(argv) == 4 and argv[1] == "--cited-shas":
         return main_cited(argv[2], argv[3])
+    if len(argv) == 2 and argv[1] == "--pr-text":
+        return main_pr_text(os.environ)
     if len(argv) != 3:
-        print("usage: commit-message-lint.py [--cited-shas] <base> <head>", file=sys.stderr)
+        print("usage: commit-message-lint.py [--cited-shas] <base> <head> | --pr-text", file=sys.stderr)
         return 2
     n = n_err = n_warn = 0
     print(f"commit-message-lint: private deny-list {'configured' if DENY else 'not configured'}")

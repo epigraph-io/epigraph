@@ -540,6 +540,14 @@ It only warns about a subject outside `<type>(<scope>): <text>` (W2) and a
 message with none of the three sections (W3). Output is redacted, never the
 offending value.
 
+**Pull request title and body.** The `PR text lint` workflow
+(`.github/workflows/pr-text-lint.yml`, `commit-message-lint.py --pr-text`)
+applies E1, E2, E3 and E6 to the PR's title and body on every open, edit and
+push, and fails on a finding. Every line is read, trailer-shaped lines included
+(a PR body has no git attribution to protect). A finding names the rule and
+`title` or `body line <n>`, never the text. It checks new and edited PR text
+only; it does not rewrite PR bodies that were already published.
+
 **Citing commits.** Cite a commit by sha only once it is on `main`, or when it
 is an earlier commit of the same change. Cite anything else (a commit on
 another open PR's branch, or one a rebase will rewrite) by **PR number and
