@@ -67,13 +67,14 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
 pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
 
 /// Relationships whose uniqueness the SCHEMA enforces DIRECTION-AGNOSTICALLY
-/// on claim/claim edges, through a partial unique index keyed on
-/// `(LEAST(source_id, target_id), GREATEST(source_id, target_id))` with no
-/// further conjunct a merge could step outside of:
+/// on in-force claim/claim edges, through a partial unique index keyed on
+/// `(LEAST(source_id, target_id), GREATEST(source_id, target_id))`:
 ///
 /// - `alternative_of`: `edges_alternative_of_symmetric_uniq` (migration 042,
-///   narrowed to in-force rows by 091);
-/// - `shifted_to`: `edges_shifted_to_pair_uniq` (migration 358).
+///   narrowed to in-force rows by 091; it has no endpoint-type conjunct, so
+///   it also covers a non-claim pair);
+/// - `shifted_to`: [`SHIFTED_TO_PAIR_INDEX`] (migration 358, claim/claim
+///   in-force rows only, which is exactly the set the merge paths re-point).
 ///
 /// What a relation MEANS is a different question. `alternative_of` is
 /// symmetric; `shifted_to` (temporal succession: the source held earlier, the
@@ -101,6 +102,25 @@ pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
 ///   dedup every operator-written `contradicts` pair by direction-agnostic key
 ///   as well. That index's own merge exposure is a separate question.
 pub const PAIR_UNIQUE_RELATIONSHIPS: &[&str] = &["alternative_of", "shifted_to"];
+
+/// Migration 358's anti-symmetric pair index on in-force claim/claim
+/// `shifted_to` edges. A unique violation of THIS index is a designed
+/// refusal, not a fault: `From<sqlx::Error> for DbError` answers it as
+/// [`DbError::Refused`] of kind `State` with [`SHIFTED_TO_PAIR_REFUSAL`],
+/// so every writer (the document ingest, which copies a caller's
+/// relationship verbatim, included) tells the caller why, rather than
+/// returning an opaque duplicate-key or internal error.
+///
+/// [`DbError::Refused`]: crate::DbError::Refused
+pub const SHIFTED_TO_PAIR_INDEX: &str = "edges_shifted_to_pair_uniq";
+
+/// The caller-facing text of a [`SHIFTED_TO_PAIR_INDEX`] refusal. It names
+/// no edge or claim id and does not say which direction holds: the colliding
+/// row may be one the caller cannot read.
+pub const SHIFTED_TO_PAIR_REFUSAL: &str =
+    "relationship `shifted_to` refused: these two claims already carry an in-force `shifted_to` \
+     edge, in one direction or the other, and a pair of claims carries at most one (a duplicate \
+     says nothing new, and the reversal would say each value succeeded the other)";
 
 /// SQL predicate selecting edges that are currently in force.
 ///

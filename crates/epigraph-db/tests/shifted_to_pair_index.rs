@@ -7,10 +7,14 @@
 //! RETRACTED row does not hold the pair (091's rule, the one deliberate
 //! divergence from the ported source). The undo runbook drops the index.
 
+use epigraph_crypto::AgentSigner;
+use epigraph_db::repos::edge::EdgeRepository;
+use epigraph_db::repos::edge_signature::EdgeSigningKey;
+use epigraph_db::{DbError, RefusalKind, SHIFTED_TO_PAIR_INDEX, SHIFTED_TO_PAIR_REFUSAL};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const INDEX: &str = "edges_shifted_to_pair_uniq";
+const INDEX: &str = SHIFTED_TO_PAIR_INDEX;
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
@@ -56,6 +60,46 @@ async fn try_edge(
     .bind(rel)
     .fetch_one(pool)
     .await
+}
+
+/// The document ingest's edge writer, on a connection of its own, exactly as
+/// `ingest_document`'s walk calls it for a caller's relationship.
+async fn ingest_writer(
+    pool: &PgPool,
+    key: Option<EdgeSigningKey<'_>>,
+    source: Uuid,
+    target: Uuid,
+) -> Result<bool, DbError> {
+    let mut conn = pool.acquire().await.expect("acquire");
+    EdgeRepository::create_if_absent_including_retracted_signed_conn(
+        &mut conn,
+        key,
+        source,
+        "claim",
+        target,
+        "claim",
+        "shifted_to",
+        None,
+        None,
+        None,
+    )
+    .await
+    .map(|(_, created)| created)
+}
+
+/// A collision on THIS index reaches the caller as the designed STATE
+/// refusal, with its own text, not as `DuplicateKey` or an opaque fault.
+fn assert_designed_refusal(res: Result<bool, DbError>, what: &str) {
+    match res {
+        Err(DbError::Refused {
+            kind: RefusalKind::State,
+            message,
+        }) => {
+            assert_eq!(message, SHIFTED_TO_PAIR_REFUSAL, "{what}");
+            assert!(message.contains("shifted_to"), "{what}: {message}");
+        }
+        other => panic!("{what}: expected the designed STATE refusal, got {other:?}"),
+    }
 }
 
 /// The error is a unique violation of THIS index, not of some other one.
@@ -208,4 +252,71 @@ async fn the_358_undo_drops_the_pair_index(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("the undo is idempotent");
+}
+
+/// Review finding: the document ingest already stores a caller's
+/// `shifted_to` verbatim, so after 358 an ingest that reverses (or, through a
+/// writer that dedups by direction only, duplicates) an in-force succession
+/// trips the index. Its writer must answer with the designed refusal, on the
+/// unsigned and on the signed (attested-at-INSERT) path alike, and an
+/// ordinary unique violation elsewhere keeps `DuplicateKey`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ingest_writer_answers_a_pair_collision_with_the_designed_refusal(pool: PgPool) {
+    let signer = AgentSigner::from_bytes(&[0x58; 32]).expect("signer");
+    let agent = seed_agent(&pool).await;
+    sqlx::query("UPDATE agents SET public_key = $2 WHERE id = $1")
+        .bind(agent)
+        .bind(signer.public_key().as_slice())
+        .execute(&pool)
+        .await
+        .expect("register the signer's key");
+    let a = seed_claim(&pool, agent, "ceiling 400/s").await;
+    let b = seed_claim(&pool, agent, "ceiling 900/s").await;
+
+    assert!(
+        ingest_writer(&pool, None, a, b).await.expect("a -> b"),
+        "the first succession is written"
+    );
+    assert!(
+        !ingest_writer(&pool, None, a, b)
+            .await
+            .expect("a -> b again"),
+        "calibration: the same direction is the writer's own dedup hit, not a refusal"
+    );
+    assert_designed_refusal(
+        ingest_writer(&pool, None, b, a).await,
+        "an unsigned reversal",
+    );
+    let key = Some(EdgeSigningKey {
+        signer: &signer,
+        signer_id: agent,
+    });
+    assert_designed_refusal(ingest_writer(&pool, key, b, a).await, "a signed reversal");
+
+    // Only THIS index is re-classified: a unique violation of another index
+    // (042's alternative_of pair key) is still `DuplicateKey`.
+    let mut conn = pool.acquire().await.expect("acquire");
+    for (s, t) in [(a, b), (b, a)] {
+        let res = EdgeRepository::create_signed_conn(
+            &mut conn,
+            None,
+            s,
+            "claim",
+            t,
+            "claim",
+            "alternative_of",
+            None,
+            None,
+            None,
+        )
+        .await;
+        if s == b {
+            assert!(
+                matches!(res, Err(DbError::DuplicateKey { .. })),
+                "another pair index keeps its classification: {res:?}"
+            );
+        } else {
+            res.expect("the first alternative_of");
+        }
+    }
 }
