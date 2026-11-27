@@ -83,6 +83,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use epigraph_auth::claim_act::ClaimActRefusal;
 use epigraph_db::repos::admin_cascade::{
     self as audit, EVENT_APPLIED, EVENT_APPLIED_IDS, EVENT_BELIEF, EVENT_BELIEF_IDS, EVENT_FAILED,
     EVENT_RETIRED,
@@ -169,6 +170,20 @@ pub struct OauthPrincipal {
     pub owner_id: Option<Uuid>,
     /// The agent the token carries, when it carries one.
     pub agent_id: Option<Uuid>,
+}
+
+/// The principal an authenticated call's token names, for the cascade's audit
+/// row: its client, owner and agent, as the token carries them. Both
+/// transports (HTTP routes and MCP tools) build it here, from the shared
+/// `epigraph_auth::AuthContext`.
+impl From<&epigraph_auth::AuthContext> for OauthPrincipal {
+    fn from(auth: &epigraph_auth::AuthContext) -> Self {
+        Self {
+            client_id: Some(auth.client_id),
+            owner_id: auth.owner_id,
+            agent_id: auth.agent_id,
+        }
+    }
 }
 
 /// Where a replayed cascade came from.
@@ -424,6 +439,40 @@ pub async fn session_or_record_deferral<'s>(
             let status = record_deferral(&mut *tx, trigger, &reason).await?;
             Ok((None, status))
         }
+    }
+}
+
+/// The database's refusal of a supersede ACT (`supersede_act_conn`),
+/// classified by [`ClaimActRefusal::of_act`]: the one decision both
+/// transports' `supersede_refusal` map onto their own error type.
+///
+/// Only a database error (`DbError::QueryFailed` carrying a driver
+/// `Database` error) has a SQLSTATE and a message to read; every other
+/// `DbError` is [`ClaimActRefusal::Other`].
+#[must_use]
+pub fn supersede_act_refusal(e: &DbError) -> ClaimActRefusal {
+    database_refusal(e, ClaimActRefusal::of_act)
+}
+
+/// [`supersede_act_refusal`] for the cascade DEFERRAL a supersede records
+/// ([`session_or_record_deferral`]'s error): [`ClaimActRefusal::of_deferral`],
+/// so CX03 or a fault.
+#[must_use]
+pub fn cascade_deferral_refusal(e: &DbError) -> ClaimActRefusal {
+    database_refusal(e, ClaimActRefusal::of_deferral)
+}
+
+/// `classify` over a database error's `(SQLSTATE, message)`, or over
+/// `(None, "")` for any other `DbError`.
+fn database_refusal(
+    e: &DbError,
+    classify: fn(Option<&str>, &str) -> ClaimActRefusal,
+) -> ClaimActRefusal {
+    match e {
+        DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } => classify(d.code().as_deref(), d.message()),
+        _ => classify(None, ""),
     }
 }
 
@@ -1914,6 +1963,42 @@ pub async fn replay_deferred(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The audit row's principal is the token's client, owner and agent, as
+    /// both transports used to build it by hand: the client always, owner and
+    /// agent only when the token carries them.
+    #[test]
+    fn an_oauth_principal_names_the_tokens_client_owner_and_agent() {
+        let token = |owner: Option<Uuid>, agent: Option<Uuid>| epigraph_auth::AuthContext {
+            client_id: Uuid::from_u128(1),
+            agent_id: agent,
+            owner_id: owner,
+            client_type: epigraph_auth::ClientType::Agent,
+            scopes: vec!["claims:write".to_string()],
+            jti: Uuid::from_u128(4),
+            family_id: Some(Uuid::from_u128(5)),
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: Some(Uuid::from_u128(6)),
+        };
+        assert_eq!(
+            OauthPrincipal::from(&token(Some(Uuid::from_u128(2)), Some(Uuid::from_u128(3)))),
+            OauthPrincipal {
+                client_id: Some(Uuid::from_u128(1)),
+                owner_id: Some(Uuid::from_u128(2)),
+                agent_id: Some(Uuid::from_u128(3)),
+            }
+        );
+        assert_eq!(
+            OauthPrincipal::from(&token(None, None)),
+            OauthPrincipal {
+                client_id: Some(Uuid::from_u128(1)),
+                owner_id: None,
+                agent_id: None,
+            }
+        );
+    }
 
     /// The act's errors split three ways (backlog dca9ed56): a designed
     /// refusal keeps its kind; a duplicate deleted after the caller read it

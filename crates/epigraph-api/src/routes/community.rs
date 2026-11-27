@@ -508,6 +508,9 @@ pub async fn remove_member(
         perspective_id,
     )
     .await?;
+    if outcome == epigraph_db::MembershipOutcome::Applied {
+        clear_stale_community_folds(&mut tx, community_id, perspective_id).await?;
+    }
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the membership change: {e}"),
     })?;
@@ -529,6 +532,71 @@ pub async fn remove_member(
             id: format!("{community_id}/{perspective_id}"),
         }),
     }
+}
+
+/// Delete the community's stored scoped beliefs (`ds_combined_beliefs`,
+/// `scope_type = 'community'`) that folded the removed perspective's BBAs, on
+/// the removal's own transaction, so they go with the membership.
+///
+/// Step 17 of `submit_evidence` reaches a community only through the
+/// SUBMITTING perspective's memberships, so nothing else would ever rewrite
+/// such a row once its member is gone: it would keep serving the removed
+/// member's BBAs. See
+/// [`epigraph_db::ScopedBeliefRepository::clear_community_folds_of_member`].
+///
+/// Best-effort under a SAVEPOINT: a failed delete is logged and rolled back,
+/// and never fails the revocation. Row security leaves a row on a claim owned
+/// by a group the caller cannot write; that count is logged, not an error.
+///
+/// # Errors
+/// Only when the savepoint cannot be opened or closed (the transaction is then
+/// unusable).
+#[cfg(feature = "db")]
+async fn clear_stale_community_folds(
+    tx: &mut epigraph_db::ScopedTx<'_>,
+    community_id: Uuid,
+    perspective_id: Uuid,
+) -> Result<(), ApiError> {
+    use sqlx::Acquire as _;
+    let mut sp = (**tx).begin().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to open a savepoint: {e}"),
+    })?;
+    let cleared = epigraph_db::ScopedBeliefRepository::clear_community_folds_of_member(
+        &mut *sp,
+        community_id,
+        perspective_id,
+    )
+    .await;
+    let closed = match cleared {
+        Ok(c) => {
+            if c.left() > 0 {
+                tracing::warn!(
+                    %community_id, %perspective_id,
+                    deleted = c.deleted,
+                    left = c.left(),
+                    "community::remove_member: stale community scoped beliefs on claims \
+                     owned by a group the caller cannot write were left in place"
+                );
+            } else if c.deleted > 0 {
+                tracing::debug!(
+                    %community_id, %perspective_id,
+                    deleted = c.deleted,
+                    "community::remove_member: cleared stale community scoped beliefs"
+                );
+            }
+            sp.commit().await
+        }
+        Err(e) => {
+            tracing::warn!(
+                %community_id, %perspective_id,
+                "community::remove_member: stale community scoped beliefs not cleared: {e}"
+            );
+            sp.rollback().await
+        }
+    };
+    closed.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to close a savepoint: {e}"),
+    })
 }
 
 /// A transaction stamped from `viewer`, for the two membership writes.

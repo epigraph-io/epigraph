@@ -90,3 +90,28 @@ def test_scripts_readme_names_the_pinned_dependency_file():
     readme = SCRIPTS_README.read_text()
     assert "tests/requirements-ci.txt" in readme
     assert (REPO / "tests" / "requirements-ci.txt").exists()
+
+
+def test_the_rebuild_is_operator_run_with_the_flag_and_the_rebuild_steps():
+    """A projection replaces every theme id, and the cascade drops the graph
+    neighbourhoods and every Atlas layout and map with the old themes (backlog
+    18ae37e7). Over existing themes the job refuses without
+    --i-understand-full-rebuild, so a timer that runs it plain fails every run,
+    and one that adds the flag wipes those views unattended with nothing to
+    rebuild them. The row must say so, and send the operator to the rebuild."""
+    flag = "--i-understand-full-rebuild"
+    # Calibration: the flag the row names is the one the script takes.
+    assert f'FULL_REBUILD_FLAG = "{flag}"' in (REPO / "scripts" / "project_to_themes.py").read_text()
+    grow = next(r for r in table_rows(step10()) if "theme_pipeline.py grow" in r)
+    cells = [c.strip() for c in grow.strip().strip("|").split("|")]
+    command, cadence, notes = cells[1], cells[2], cells[3]
+    assert flag in command, command
+    assert re.search(r"on demand", cadence, re.I) and re.search(r"not a timer", cadence, re.I), cadence
+    assert "rebuild_next" in notes, notes
+    assert "docs/ops/theme-v2-promotion-runbook.md" in notes, notes
+    assert "A projection is a full rebuild" in (
+        REPO / "docs" / "ops" / "theme-v2-promotion-runbook.md").read_text()
+    # The refusal sends callers to an operator job, not a periodic one.
+    message = retired_message()
+    assert "periodic" not in message, message
+    assert flag in message, message

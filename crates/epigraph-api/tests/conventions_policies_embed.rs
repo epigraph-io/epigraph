@@ -13,15 +13,20 @@
 //! `claim_routes_bind_the_caller.rs` do, in the deployment shape each one
 //! works in:
 //!
-//! * the two convention handlers write on the raw `db_pool`, so their state's
-//!   raw pool is the harness superuser (a deployment on a privileged DSN);
+//! * `share_skill` writes on the raw `db_pool` and embeds through
+//!   `conventions.rs::embed_created_claim` on it, so its state's raw pool is
+//!   the harness superuser (a deployment on a privileged DSN);
+//! * `learn_convention` writes on a transaction stamped with its caller and
+//!   embeds after the commit through `AppState::embed_claim_as` on the
+//!   caller's stamp (backlog 1c822492). It runs on both shapes: on the
+//!   application role the vector must land through the stamped pool alone;
 //! * `create_challenge` writes on a transaction stamped with the caller, so it
 //!   runs on the application role, as a human whose agent is the system agent.
 //!
 //! # Verified to fail
 //!
-//! With the three `embed_*` calls removed from the handlers, each test fails
-//! on its "carries a vector" assertion and nothing else.
+//! With the `embed_*` calls removed from the handlers, each test fails on its
+//! "carries a vector" assertion and nothing else.
 
 mod viewer_fixture;
 
@@ -90,9 +95,30 @@ async fn current_and_embedded(pool: &PgPool, claim: Uuid) -> (bool, bool) {
         .expect("read the claim")
 }
 
+/// Both pools on the application role, as production serves.
+async fn app_role_state(pool: &PgPool) -> AppState {
+    let raw = downgraded_pool(pool, "epigraph_app").await;
+    let mut state = AppState::with_db(raw, ApiConfig::default());
+    state.scoped = Some(app_role_scoped(pool).await);
+    state.with_embedding_service(mock_embedder())
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn learn_convention_embeds_the_convention_claim(pool: PgPool) {
     let state = privileged_raw_state(&pool).await;
+    assert_learn_convention_embeds(pool, state).await;
+}
+
+/// On the application role nothing privileged can store the vector: it lands
+/// only if the post-commit embed runs on the caller's stamp and the caller may
+/// write the claim it just created.
+#[sqlx::test(migrations = "../../migrations")]
+async fn learn_convention_on_the_app_role_embeds_the_convention_claim(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    assert_learn_convention_embeds(pool, state).await;
+}
+
+async fn assert_learn_convention_embeds(pool: PgPool, state: AppState) {
     let (admin, _) = seed_agent_with_group(&pool, "convention-admin").await;
     let request: LearnConventionRequest = serde_json::from_value(serde_json::json!({
         "content": "Prefer explicit lifetimes in public signatures",

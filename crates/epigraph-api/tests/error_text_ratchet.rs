@@ -26,6 +26,14 @@
 //!    instead: its boundary must still withhold the text, and no route or MCP
 //!    tool may call an engine function that hands back an unfiltered report.
 //!
+//! 4. **Designed 4xx refusals.** `ApiError::Refused` (and its constructors
+//!    `ApiError::refused` / `ApiError::refused_with`) renders its `message`
+//!    and `details` verbatim, so a route can answer the body it designed
+//!    (backlog 23db186a). No construction under `src/` outside `errors.rs`
+//!    and test modules may render an error value into those arguments; a
+//!    route logs the error and answers designed text, or answers through a
+//!    redacted variant.
+//!
 //! The register scan in (2) covers `epigraph-api/src` and
 //! `epigraph-engine/src`, and matches both `error: Option<String>` and
 //! `errors: Vec<String>` on a `Serialize` type.
@@ -34,9 +42,15 @@
 //! an error value by the receiver names `e`, `err`, `error`, `source` and
 //! `db_err`. A per-item `error` built in a helper the constructing function
 //! calls is out of reach, unless that helper also builds the type, as
-//! `belief.rs::pair_conflict` does. The JSON `"error"` rule covers 5xx bodies
-//! only: its one allowed file, `routes/submit.rs`, is allowed whole, so a 4xx
-//! body there is not checked.
+//! `belief.rs::pair_conflict` does. The JSON `"error"` rule has no allowed
+//! file: `routes/submit.rs`, the one that had its own 5xx choke point, answers
+//! through `ApiError` now (backlog 23db186a), so a JSON `"error"` field
+//! rendering an error's text is refused everywhere under `src/`. The refusal
+//! scan in (4) reads only the call's own arguments: text derived from an
+//! error into a local binding first (as `submit.rs` does for the labels
+//! guard's `DbError::InvalidData` reason) is out of its reach, and so is a
+//! `Refused` constructed through a bare imported name rather than
+//! `ApiError::Refused`.
 //!
 //! Comments are stripped by this file's own [`strip_comments`], not the shared
 //! `lint_text` one, which drops the byte that follows a backslash inside a
@@ -93,11 +107,12 @@ const UNFILTERED_REPORT_FNS: &[&str] = &[
 
 /// A JSON `"error": e.to_string()` is allowed only where the body is a 5xx that
 /// a choke point redacts: `(path under src/, sentinel in that file)`.
-const JSON_ERROR_FIELD_REDACTED_AT: &[(&str, &str)] = &[(
-    "routes/submit.rs",
-    // `error_response` sends a 4xx as built and redacts every 5xx.
-    "if !status.is_server_error() {\n        return (status, Json(error)).into_response();",
-)];
+///
+/// Empty: `routes/submit.rs`'s private `error_response` choke point was its
+/// one entry, and that route's 5xx now go through `ApiError`'s redaction
+/// (backlog 23db186a). A new entry needs a choke point of its own; prefer
+/// `ApiError::InternalError`, which logs the text and never sends it.
+const JSON_ERROR_FIELD_REDACTED_AT: &[(&str, &str)] = &[];
 
 const ERROR_RECEIVERS: &[&str] = &["e", "err", "error", "source", "db_err"];
 
@@ -725,5 +740,75 @@ fn a_json_error_field_carries_error_text_only_in_a_redacted_5xx() {
     assert!(
         offenders.is_empty(),
         "a JSON `\"error\"` field renders an error's text outside a redacted 5xx: {offenders:?}"
+    );
+}
+
+/// `(file, enclosing fn, the construction's argument text)` for every
+/// `ApiError::refused(..)`, `ApiError::refused_with(..)` and
+/// `ApiError::Refused { .. }` construction outside `errors.rs`.
+fn refused_sites() -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (rel, src, _) in sources() {
+        if rel == "errors.rs" {
+            continue;
+        }
+        for needle in [
+            "ApiError::refused(",
+            "ApiError::refused_with(",
+            "ApiError::Refused",
+        ] {
+            let mut from = 0;
+            while let Some(rel_at) = src[from..].find(needle) {
+                let at = from + rel_at;
+                from = at + needle.len();
+                let open = if needle.ends_with('(') {
+                    from - 1
+                } else {
+                    let rest = &src[from..];
+                    let trimmed = rest.trim_start();
+                    if !trimmed.starts_with('{') {
+                        continue;
+                    }
+                    from + (rest.len() - trimmed.len())
+                };
+                let close = closing(&src, open);
+                let inner = src[open + 1..close].trim();
+                let after = src[close + 1..].trim_start();
+                // A pattern, not a construction.
+                if inner.ends_with("..")
+                    || after.starts_with("=>")
+                    || (after.starts_with('=') && !after.starts_with("=="))
+                {
+                    continue;
+                }
+                out.push((rel.clone(), enclosing_fn(&src, at), inner.to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn no_refusal_renders_an_error_into_its_verbatim_body() {
+    let sites = refused_sites();
+    // Calibration: `routes/submit.rs` alone answers its 4xx through about
+    // thirty-five of these. A broken scanner finds none and would pass all.
+    assert!(
+        sites.len() >= 30,
+        "the scan found only {} refusal constructions; it is not seeing the tree",
+        sites.len()
+    );
+    let offenders: Vec<String> = sites
+        .iter()
+        .filter_map(|(file, func, args)| {
+            let hits = error_renderings(&without_tracing(args));
+            (!hits.is_empty()).then(|| format!("{file}::{func}: {hits:?}"))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "an ApiError::Refused body is sent verbatim, so its message and details must be \
+         designed text: log the error and answer a fixed message, or use a redacted variant:\n{}",
+        offenders.join("\n")
     );
 }

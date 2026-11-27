@@ -1,0 +1,51 @@
+# EpiGraph job-queue drain (drain_jobs, epigraph-api).
+#
+# A TEMPLATE: nothing in this repository installs it. Copy it, replace the
+# placeholders (the binary path, the service user, the environment file) and
+# install it by hand, without the `.example` suffix, as
+# /etc/systemd/system/epigraph-jobs-drain.service
+# (docs/deploy.md, step 10 and section 5).
+#
+# No request-serving process runs jobs: they are drained here. The API and MCP
+# server name this unit's timer in their start-up line.
+#
+# The environment file (0600, owned by root) holds MAINTENANCE_DATABASE_URL
+# (required; the fallback to DATABASE_URL is refused) and DATABASE_URL, which
+# must name the same database; drain_jobs reads both from the environment
+# only. The maintenance login must satisfy epigraph_bypass(). A job handler
+# that calls a provider (an embedding job, say) needs that provider's key in
+# the same file.
+
+[Unit]
+Description=EpiGraph job-queue drain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=epigraph-maintenance
+Group=epigraph-maintenance
+EnvironmentFile=/etc/epigraph/maintenance.env
+Environment=RUST_LOG=info
+# One run drains until the queue is empty or --max-runtime (default 50min)
+# has elapsed. A run that finds another holding the drain's lock prints
+# {"locked": true} and exits 0.
+ExecStart=/usr/local/bin/drain_jobs
+# 3: out of time with work pending; the next run continues. Not a failure.
+# 1 (a job failed), 4 (pending jobs no handler claims) and 5 (a privatization
+# plan stranded in applying or reverting) ARE failures: never add them here.
+SuccessExitStatus=3
+# Above --max-runtime, so the drain stops itself before systemd kills it.
+TimeoutStartSec=1h
+Nice=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077

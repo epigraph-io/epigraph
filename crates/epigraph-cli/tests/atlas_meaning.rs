@@ -198,6 +198,15 @@ impl Corpus {
             .copied()
             .collect()
     }
+
+    /// Every claim the team's map draws: the embedded members, which the
+    /// result clusters, and the current ones with no embedding, which the
+    /// apply adds in a "not yet placed" leaf (backlog 029392cb).
+    fn team_drawn(&self) -> BTreeSet<Uuid> {
+        let mut all = self.team_members();
+        all.extend(self.unembedded.iter().copied());
+        all
+    }
 }
 
 async fn team_other(pool: &PgPool) -> Uuid {
@@ -427,8 +436,8 @@ async fn every_leaf_of_a_team_map_fits_the_cap_as_w3_counts(pool: PgPool) {
     assert!(leaves >= 3, "254 nodes need at least three leaves of 100");
     assert_eq!(
         every_claim(&levels),
-        members,
-        "every member in exactly one leaf"
+        c.team_drawn(),
+        "every member in exactly one leaf, also one with no embedding"
     );
 }
 
@@ -542,7 +551,7 @@ async fn a_team_map_never_holds_another_teams_claim(pool: PgPool) {
         .iter()
         .all(|s| s.owner_group_id == c.team && s.visibility == "group"));
     let drawn = every_claim(&levels);
-    assert_eq!(drawn, c.team_members());
+    assert_eq!(drawn, c.team_drawn());
     for o in &c.others {
         assert!(!drawn.contains(o));
         assert!(levels
@@ -629,7 +638,7 @@ async fn stored_level_documents_validate_against_the_contract(pool: PgPool) {
         .expect("apply");
     let run = run_id(&r);
     let levels = stored(&pool, run).await;
-    assert_eq!(levels.len(), 6);
+    assert_eq!(levels.len(), 7, "by_blob's six and the not-yet-placed leaf");
     let by_id: BTreeMap<Uuid, &Stored> = levels.iter().map(|s| (s.group_id, s)).collect();
     for s in &levels {
         let body = serde_json::to_vec(&s.payload).unwrap();
@@ -676,7 +685,16 @@ async fn leaf_membership_reads_back_every_claim(pool: PgPool) {
             want.insert(*m, g.id);
         }
     }
+    let waiting: BTreeSet<Uuid> = c.unembedded.iter().copied().collect();
+    for m in &waiting {
+        want.insert(*m, group_id(map, M, c.theme, &waiting));
+    }
     assert_eq!(got, want);
+    assert_eq!(
+        r["params"]["unplaced_leaves"],
+        serde_json::json!([group_id(map, M, c.theme, &waiting)]),
+        "{r}"
+    );
     // Another map's run reads nothing.
     let none = AtlasMeaningRepository::leaf_membership(
         &mut conn,
@@ -725,9 +743,10 @@ async fn apply_refuses_a_result_whose_members_drifted(pool: PgPool) {
 
 /// A run is the WHOLE map (the latest finished run is what is served): a
 /// result that lacks a theme the map draws with an embedded member is refused
-/// and nothing is written. Themes the map does not draw (only another team's
-/// claims, or only unembedded members) are not required, and a result naming
-/// one is refused.
+/// and nothing is written. Themes the result cannot hold (only another
+/// team's claims, or only unembedded members) are not required, and a result
+/// naming one is refused; the apply draws a theme of only unembedded members
+/// as one "not yet placed" root leaf (backlog 029392cb).
 #[sqlx::test(migrations = "../../migrations")]
 async fn apply_refuses_a_result_that_lacks_a_theme_the_map_draws(pool: PgPool) {
     let (_scoped, viewer) = fixture::bypass(&pool).await;
@@ -740,7 +759,10 @@ async fn apply_refuses_a_result_that_lacks_a_theme_the_map_draws(pool: PgPool) {
     let theirs = theme(&pool).await;
     claims(&pool, theirs, filer, ("group", c.other), 5, Some(300)).await;
     let bare = theme(&pool).await;
-    claims(&pool, bare, filer, ("group", c.team), 2, None).await;
+    let bare_members: BTreeSet<Uuid> = claims(&pool, bare, filer, ("group", c.team), 2, None)
+        .await
+        .into_iter()
+        .collect();
     // Drawn: a second theme of the team's own claims.
     let second = theme(&pool).await;
     let members: BTreeSet<Uuid> = claims(&pool, second, filer, ("group", c.team), 6, Some(500))
@@ -783,8 +805,17 @@ async fn apply_refuses_a_result_that_lacks_a_theme_the_map_draws(pool: PgPool) {
     )
     .await
     .expect("every drawn theme");
-    assert_eq!(report["params"]["themes"], 2, "{report}");
+    assert_eq!(report["params"]["themes"], 3, "{report}");
     assert_eq!(runs(pool.clone()).await, 1);
+    let levels = stored(&pool, run_id(&report)).await;
+    let root = levels
+        .iter()
+        .find(|s| s.group_id == root_id(map, M, bare))
+        .expect("the theme of only unembedded members is drawn");
+    assert_eq!(
+        leaf_claims(root).map(|v| v.into_iter().collect::<BTreeSet<Uuid>>()),
+        Some(bare_members)
+    );
 }
 
 /// An id that is not the minted one is refused.
@@ -810,8 +841,9 @@ async fn apply_refuses_a_forged_group_id(pool: PgPool) {
     assert!(err.to_string().contains("minted"), "{err}");
 }
 
-/// Retired claims (superseded or duplicate-marked) and current claims with no
-/// embedding are not members of the tree; the report counts the second.
+/// Retired claims (superseded or duplicate-marked) are not members; current
+/// claims with no embedding are listed apart from the embedded members (they
+/// cannot be clustered; the builds put them in "not yet placed" leaves).
 #[sqlx::test(migrations = "../../migrations")]
 async fn retired_and_unembedded_claims_are_not_members(pool: PgPool) {
     let (_scoped, viewer) = fixture::bypass(&pool).await;
@@ -827,7 +859,9 @@ async fn retired_and_unembedded_claims_are_not_members(pool: PgPool) {
     tx.commit().await.unwrap();
     let ids: BTreeSet<Uuid> = members.embedded.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, c.team_members());
-    assert_eq!(members.unembedded, c.unembedded.len());
+    let mut unembedded = c.unembedded.clone();
+    unembedded.sort_unstable();
+    assert_eq!(members.unembedded, unembedded);
     assert!(c.retired.iter().all(|r| !ids.contains(r)));
     assert!(members
         .embedded

@@ -1,127 +1,15 @@
-//! Edge type for the label property graph
+//! The relationship vocabulary for rows in the `edges` table.
 //!
-//! Edges are directed relationships between nodes with a type and properties.
-
-use crate::errors::CoreError;
-use crate::ids::{EdgeId, NodeId};
-use crate::properties::PropertyMap;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-
-/// A directed edge in the label property graph
-///
-/// Edges connect two nodes with:
-/// - A relationship type (string, enabling dynamic ontology)
-/// - Arbitrary properties (key-value pairs)
-/// - Timestamps for auditing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Edge {
-    /// Unique identifier for this edge
-    pub id: EdgeId,
-
-    /// Source node of the relationship
-    pub source: NodeId,
-
-    /// Target node of the relationship
-    pub target: NodeId,
-
-    /// Relationship type (e.g., "supports", "refutes", "`authored_by`")
-    pub relationship: String,
-
-    /// Properties stored on this edge
-    pub properties: PropertyMap,
-
-    /// When this edge was created
-    pub created_at: DateTime<Utc>,
-
-    /// Start of temporal validity (None = atemporal or ongoing)
-    pub valid_from: Option<DateTime<Utc>>,
-
-    /// End of temporal validity (None = still valid / atemporal)
-    pub valid_to: Option<DateTime<Utc>>,
-}
-
-impl Edge {
-    /// Create a new edge between two nodes
-    ///
-    /// # Errors
-    /// Returns `CoreError::SelfReferentialEdge` if source and target are the same.
-    pub fn new(
-        source: NodeId,
-        target: NodeId,
-        relationship: impl Into<String>,
-    ) -> Result<Self, CoreError> {
-        if source == target {
-            return Err(CoreError::SelfReferentialEdge(source.as_uuid()));
-        }
-
-        Ok(Self {
-            id: EdgeId::new(),
-            source,
-            target,
-            relationship: relationship.into(),
-            properties: PropertyMap::new(),
-            created_at: Utc::now(),
-            valid_from: None,
-            valid_to: None,
-        })
-    }
-
-    /// Create a new edge with a specific ID
-    ///
-    /// # Errors
-    /// Returns `CoreError::SelfReferentialEdge` if source and target are the same.
-    pub fn with_id(
-        id: EdgeId,
-        source: NodeId,
-        target: NodeId,
-        relationship: impl Into<String>,
-    ) -> Result<Self, CoreError> {
-        if source == target {
-            return Err(CoreError::SelfReferentialEdge(source.as_uuid()));
-        }
-
-        Ok(Self {
-            id,
-            source,
-            target,
-            relationship: relationship.into(),
-            properties: PropertyMap::new(),
-            created_at: Utc::now(),
-            valid_from: None,
-            valid_to: None,
-        })
-    }
-
-    /// Set a property on this edge
-    pub fn set_property(
-        &mut self,
-        key: impl Into<String>,
-        value: impl Into<crate::properties::PropertyValue>,
-    ) {
-        self.properties.insert(key, value);
-    }
-
-    /// Get a property from this edge
-    #[must_use]
-    pub fn get_property(&self, key: &str) -> Option<&crate::properties::PropertyValue> {
-        self.properties.get(key)
-    }
-}
-
-impl PartialEq for Edge {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for Edge {}
-
-impl std::hash::Hash for Edge {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
+//! An edge is a row in `edges` (its endpoints, a `relationship` name and a
+//! JSONB `properties` map), written and read through `epigraph-db`; this
+//! crate does not model it as an in-memory type. What the kernel shares
+//! across crates is the [`relationships`] module: the
+//! well-known relationship names, which of them are stored in two spellings
+//! ([`relationships::CASE_FOLDED_RELATIONSHIPS`]), the spelling a writer stores
+//! ([`relationships::canonical_relationship`]), the spellings a reader matches
+//! ([`relationships::relationship_spellings`]), the symmetric claim/claim
+//! relationships, and the lineage relationship only the supersession act may
+//! write.
 
 /// Well-known relationship types for `EpiGraph`
 pub mod relationships {
@@ -304,7 +192,7 @@ pub mod relationships {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::relationships;
 
     #[test]
     fn symmetric_claim_relationships_match_either_case_and_exclude_directional_ones() {
@@ -329,56 +217,11 @@ mod tests {
     }
 
     #[test]
-    fn create_edge_between_nodes() {
-        let source = NodeId::new();
-        let target = NodeId::new();
-
-        let edge = Edge::new(source, target, relationships::SUPPORTS).unwrap();
-
-        assert_eq!(edge.source, source);
-        assert_eq!(edge.target, target);
-        assert_eq!(edge.relationship, relationships::SUPPORTS);
-    }
-
-    #[test]
-    fn self_referential_edge_rejected() {
-        let node = NodeId::new();
-        let result = Edge::new(node, node, relationships::SUPPORTS);
-
-        assert!(matches!(result, Err(CoreError::SelfReferentialEdge(_))));
-    }
-
-    #[test]
-    fn edge_has_temporal_fields() {
-        let source = NodeId::new();
-        let target = NodeId::new();
-        let edge = Edge::new(source, target, relationships::SUPPORTS).unwrap();
-        assert!(edge.valid_from.is_none());
-        assert!(edge.valid_to.is_none());
-    }
-
-    #[test]
     fn new_relationship_constants_exist() {
         assert_eq!(relationships::AFFILIATED_WITH, "AFFILIATED_WITH");
         assert_eq!(relationships::EMPLOYED_BY, "EMPLOYED_BY");
         assert_eq!(relationships::OPERATED_BY, "OPERATED_BY");
         assert_eq!(relationships::MANUFACTURED_BY, "MANUFACTURED_BY");
-    }
-
-    #[test]
-    fn edge_with_properties() {
-        let source = NodeId::new();
-        let target = NodeId::new();
-
-        let mut edge = Edge::new(source, target, relationships::SUPPORTS).unwrap();
-        edge.set_property("weight", 0.85);
-        edge.set_property("confidence", 0.9);
-
-        assert_eq!(
-            edge.get_property("weight")
-                .and_then(super::super::properties::PropertyValue::as_float),
-            Some(0.85)
-        );
     }
 
     #[test]

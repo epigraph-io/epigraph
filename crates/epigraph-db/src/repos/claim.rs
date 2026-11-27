@@ -1988,8 +1988,8 @@ struct CreatedClaimRow {
 /// * single-claim reads — `find_by_content_hash_and_agent`, `get_by_agent`
 /// * create paths that return the row they wrote — `create`, `create_with_tx`,
 ///   `create_strict`, `batch_create`
-/// * single-claim updates that return the updated row — `update_truth_value`,
-///   `update_truth_value_conn`, `update_trace_id`, `update_trace_id_conn`
+/// * single-claim updates that return the updated row — `update_truth_value`
+///   and `update_trace_id` (their `_conn` forms are wrappers over them)
 /// * the bulk list/search readers (`list`, `list_by_labels`, `search_*`, …)
 ///
 /// The create paths are the sharpest case: `create` INSERTs the caller's
@@ -5630,179 +5630,125 @@ impl ClaimRepository {
         Ok(claims)
     }
 
-    /// Update the truth value of a claim
+    /// Update the truth value of a claim and return the updated row.
+    ///
+    /// ONE statement for both connection shapes (backlog 2dbf45f2). This was
+    /// a `&PgPool` fn using `sqlx::query!` beside a `_conn` twin that repeated
+    /// the same `UPDATE` with runtime `sqlx::query` and decoded it with
+    /// `Row::get`, which panics on a missing column or a type mismatch.
+    /// `&PgPool`, `&mut PgConnection` and a `ScopedTx` deref all satisfy
+    /// [`sqlx::PgExecutor`], so one generic body serves every caller, and
+    /// [`Self::update_truth_value_conn`] is a thin wrapper kept for its callers'
+    /// `&mut tx` deref coercion.
+    ///
+    /// Runtime `query_as` into the `FromRow` `ClaimRow`, NOT `query!`: a decode
+    /// failure is an `Err`, not a panic, and the statement stays an ordinary
+    /// `sqlx::query` the write-gate marker (`splice_write`) can later reach,
+    /// which no macro site can (`tests/write_gate_lint.rs`, `MACRO_WRITE_SITES`).
     ///
     /// # Errors
-    /// Returns `DbError::NotFound` if the claim doesn't exist.
-    /// Returns `DbError::QueryFailed` for other database errors.
-    #[instrument(skip(pool))]
-    pub async fn update_truth_value(
-        pool: &PgPool,
+    /// Returns `DbError::NotFound` if the claim doesn't exist (or the session
+    /// cannot see it).
+    /// Returns `DbError::QueryFailed` for other database errors, including a
+    /// `42501` refusal by `claims_tenancy`'s `WITH CHECK`.
+    #[instrument(skip(executor))]
+    pub async fn update_truth_value<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: ClaimId,
         truth: TruthValue,
     ) -> Result<Claim, DbError> {
         let uuid: Uuid = id.into();
-        let truth_value = truth.value();
 
-        let row = sqlx::query!(
+        let row = sqlx::query_as::<_, ClaimRow>(
             r#"
             UPDATE claims
             SET truth_value = $2, updated_at = NOW()
             WHERE id = $1
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at
             "#,
-            uuid,
-            truth_value
         )
-        .fetch_optional(pool)
+        .bind(uuid)
+        .bind(truth.value())
+        .fetch_optional(executor)
         .await?;
 
-        match row {
-            Some(row) => {
-                let truth_value = TruthValue::new(row.truth_value)?;
-
-                Ok(claim_from_row(
-                    row.id,
-                    row.content,
-                    row.agent_id,
-                    row.trace_id,
-                    truth_value,
-                    row.created_at,
-                    row.updated_at,
-                ))
-            }
-            None => Err(DbError::NotFound {
-                entity: "Claim".to_string(),
-                id: uuid,
-            }),
-        }
+        Self::updated_claim_or_not_found(row, uuid)
     }
 
-    /// Update the truth value of a claim using an existing connection (e.g. inside a transaction).
+    /// [`Self::update_truth_value`] on an existing connection (e.g. inside a
+    /// transaction). A wrapper, not a second statement: its `&mut PgConnection`
+    /// parameter is what lets callers pass `&mut tx` by deref coercion, which a
+    /// generic `E` does not do.
     pub async fn update_truth_value_conn(
         conn: &mut sqlx::PgConnection,
         id: ClaimId,
         truth: TruthValue,
     ) -> Result<Claim, DbError> {
-        let uuid: Uuid = id.into();
-        let truth_value = truth.value();
-
-        use sqlx::Row;
-        let row = sqlx::query(
-            r#"UPDATE claims
-               SET truth_value = $2, updated_at = NOW()
-               WHERE id = $1
-               RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
-        )
-        .bind(uuid)
-        .bind(truth_value)
-        .fetch_optional(&mut *conn)
-        .await?;
-
-        match row {
-            Some(row) => {
-                let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                Ok(claim_from_row(
-                    row.get("id"),
-                    row.get("content"),
-                    row.get("agent_id"),
-                    row.get("trace_id"),
-                    tv,
-                    row.get("created_at"),
-                    row.get("updated_at"),
-                ))
-            }
-            None => Err(DbError::NotFound {
-                entity: "Claim".to_string(),
-                id: uuid,
-            }),
-        }
+        Self::update_truth_value(&mut *conn, id, truth).await
     }
 
-    /// Update the trace_id of a claim
+    /// Update the trace_id of a claim and return the updated row.
     ///
-    /// Use this to associate a claim with a reasoning trace after both have been created.
+    /// Use this to associate a claim with a reasoning trace after both have
+    /// been created. One statement for both connection shapes, for the reasons
+    /// [`Self::update_truth_value`] gives (backlog 2dbf45f2);
+    /// [`Self::update_trace_id_conn`] is its thin wrapper.
     ///
     /// # Errors
-    /// Returns `DbError::NotFound` if the claim doesn't exist.
-    /// Returns `DbError::QueryFailed` for other database errors.
-    #[instrument(skip(pool))]
-    pub async fn update_trace_id(
-        pool: &PgPool,
+    /// Returns `DbError::NotFound` if the claim doesn't exist (or the session
+    /// cannot see it).
+    /// Returns `DbError::QueryFailed` for other database errors, including a
+    /// `42501` refusal by `claims_tenancy`'s `WITH CHECK`.
+    #[instrument(skip(executor))]
+    pub async fn update_trace_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: ClaimId,
         trace_id: TraceId,
     ) -> Result<Claim, DbError> {
         let uuid: Uuid = id.into();
         let trace_uuid: Uuid = trace_id.into();
 
-        let row = sqlx::query!(
+        let row = sqlx::query_as::<_, ClaimRow>(
             r#"
             UPDATE claims
             SET trace_id = $2, updated_at = NOW()
             WHERE id = $1
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at
             "#,
-            uuid,
-            trace_uuid
         )
-        .fetch_optional(pool)
+        .bind(uuid)
+        .bind(trace_uuid)
+        .fetch_optional(executor)
         .await?;
 
-        match row {
-            Some(row) => {
-                let truth_value = TruthValue::new(row.truth_value)?;
-
-                Ok(claim_from_row(
-                    row.id,
-                    row.content,
-                    row.agent_id,
-                    row.trace_id,
-                    truth_value,
-                    row.created_at,
-                    row.updated_at,
-                ))
-            }
-            None => Err(DbError::NotFound {
-                entity: "Claim".to_string(),
-                id: uuid,
-            }),
-        }
+        Self::updated_claim_or_not_found(row, uuid)
     }
 
-    /// Update the trace_id of a claim using an existing connection (e.g. inside a transaction).
+    /// [`Self::update_trace_id`] on an existing connection (e.g. inside a
+    /// transaction). A wrapper, not a second statement; see
+    /// [`Self::update_truth_value_conn`] for why the concrete parameter stays.
     pub async fn update_trace_id_conn(
         conn: &mut sqlx::PgConnection,
         id: ClaimId,
         trace_id: TraceId,
     ) -> Result<Claim, DbError> {
-        let uuid: Uuid = id.into();
-        let trace_uuid: Uuid = trace_id.into();
+        Self::update_trace_id(&mut *conn, id, trace_id).await
+    }
 
-        use sqlx::Row;
-        let row = sqlx::query(
-            r#"UPDATE claims
-               SET trace_id = $2, updated_at = NOW()
-               WHERE id = $1
-               RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
-        )
-        .bind(uuid)
-        .bind(trace_uuid)
-        .fetch_optional(&mut *conn)
-        .await?;
-
+    /// The shared tail of [`Self::update_truth_value`] and
+    /// [`Self::update_trace_id`]: the `RETURNING` row as a [`Claim`], or
+    /// `NotFound` for the id when the `UPDATE` matched nothing.
+    fn updated_claim_or_not_found(row: Option<ClaimRow>, uuid: Uuid) -> Result<Claim, DbError> {
         match row {
-            Some(row) => {
-                let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                Ok(claim_from_row(
-                    row.get("id"),
-                    row.get("content"),
-                    row.get("agent_id"),
-                    row.get("trace_id"),
-                    tv,
-                    row.get("created_at"),
-                    row.get("updated_at"),
-                ))
-            }
+            Some(row) => Ok(claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                TruthValue::new(row.truth_value)?,
+                row.created_at,
+                row.updated_at,
+            )),
             None => Err(DbError::NotFound {
                 entity: "Claim".to_string(),
                 id: uuid,

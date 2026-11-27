@@ -453,7 +453,7 @@ pub async fn decide_candidate(
             let mut trigger = CascadeTrigger::new(
                 CascadeCause::MatchRetire,
                 viewer.principal(),
-                Some(crate::routes::versioning::oauth_principal(&auth)),
+                Some(epigraph_engine::admin_cascade::OauthPrincipal::from(&auth)),
                 id,
                 None,
             );

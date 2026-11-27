@@ -96,7 +96,10 @@ const REGISTER: &[(&str, usize)] = &[
     // is gone; the evidence write itself now writes that edge in its own
     // transaction (`EvidenceRepository::link_to_claims_signed_conn`), and its
     // error propagates.
-    ("conventions.rs", 3),
+    // 3 -> 0, row removed (backlog 1c822492): `learn_convention`'s AUTHORED /
+    // TRACES / HAS_TRACE edges are written on the caller's stamped
+    // transaction with the claim, and their errors propagate (rolling the
+    // whole convention back).
     // `crud.rs` is gone: 2 before `create_reasoning_trace` moved its trace
     // and HAS_TRACE edge onto the caller-stamped `write_as` transaction, and
     // 1 -> 0 when `create_evidence` did the same with its DERIVED_FROM edge

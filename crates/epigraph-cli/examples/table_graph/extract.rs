@@ -4,24 +4,20 @@
 //! sibling modules `discover` and `llm`, which aren't visible when dossier.rs
 //! is `#[path]`-included into the integration test crate.
 
+use crate::cli::{join, Roots};
 use crate::dossier::{build_dossier, content_hash};
 use crate::types::StagingFile;
 use crate::{discover, llm};
 use anyhow::Result;
 use std::io::Write;
 
-pub fn run(only: Option<&str>) -> Result<()> {
+pub fn run(roots: &Roots, only: Option<&str>) -> Result<()> {
     let staging_dir = "docs/superpowers/artifacts/2026-04-30-table-graph/staging";
     let narratives_dir = "docs/superpowers/artifacts/2026-04-30-table-graph/narratives";
     std::fs::create_dir_all(staging_dir)?;
     std::fs::create_dir_all(narratives_dir)?;
 
-    let empty: &[&str] = &[];
-    let upstream: &[&str] = &["upstream"];
-    let tables = discover::scan_migrations(&[
-        ("epigraph", "/home/jeremy/epigraph/migrations", empty),
-        ("episcience", "/home/jeremy/episcience/migrations", upstream),
-    ])?;
+    let tables = discover::scan_migrations(&roots.migration_dirs())?;
 
     for t in &tables {
         if let Some(filter) = only {
@@ -31,15 +27,11 @@ pub fn run(only: Option<&str>) -> Result<()> {
         }
         let staging_path = format!("{}/{}.{}.json", staging_dir, t.repo, t.name);
         let md_path = format!("{}/{}.{}.md", narratives_dir, t.repo, t.name);
-        let (repo_root, migration_dir) = match t.repo.as_str() {
-            "epigraph" => ("/home/jeremy/epigraph", "/home/jeremy/epigraph/migrations"),
-            "episcience" => (
-                "/home/jeremy/episcience",
-                "/home/jeremy/episcience/migrations",
-            ),
-            _ => continue,
+        let Some(repo_root) = roots.repo_root(&t.repo) else {
+            continue;
         };
-        let dossier = build_dossier(repo_root, migration_dir, t)?;
+        let migration_dir = join(repo_root, "migrations");
+        let dossier = build_dossier(repo_root, &migration_dir, t)?;
         let dossier_hash = content_hash(&dossier)?;
 
         if let Ok(existing) = std::fs::read_to_string(&staging_path) {

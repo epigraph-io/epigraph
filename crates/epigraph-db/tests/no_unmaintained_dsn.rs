@@ -68,18 +68,15 @@
 //!   file that constructs nothing, mints a bypass viewer, and runs the
 //!   statement on a `PgPool` it was handed has the same defect and is invisible
 //!   here, because there is no construction to key on. Two files in this tree
-//!   have that shape and neither is live:
-//!   `epigraph-api/src/routes/claims.rs::find_claims_needing_embeddings` HAD it
-//!   and PR-15 fixed it (the statement now runs on the leased
-//!   `MaintenanceConn`, which is why the repo method takes an executor); and
-//!   `epigraph-jobs/src/db_reputation_service.rs::get_claim_outcomes` still has
-//!   it — it mints a viewer from `self.scoped` and queries `self.pool` — but has
-//!   no production constructor. A second lint keyed on that shape, with those
-//!   two files as its calibration cases, is recorded as
-//!   `D-PR17-hybrid-shape-lint` in `docs/tenancy/progress.json`. Until it
-//!   exists, a green run here means "no scanned file builds an unmaintained
-//!   pool", not "no scanned file spends a bypass on an unprivileged
-//!   connection".
+//!   had that shape: `epigraph-api/src/routes/claims.rs::find_claims_needing_embeddings`,
+//!   which PR-15 fixed (the statement now runs on the leased `MaintenanceConn`,
+//!   which is why the repo method takes an executor), and
+//!   `epigraph-jobs/src/db_reputation_service.rs::get_claim_outcomes`, which
+//!   was deleted with the unregistered reputation job handler. The second lint
+//!   keyed on that shape (`D-PR17-hybrid-shape-lint` in
+//!   `docs/tenancy/progress.json`) is `no_hybrid_bypass_spend.rs`; a green run
+//!   HERE means "no scanned file builds an unmaintained pool", not "no scanned
+//!   file spends a bypass on an unprivileged connection".
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

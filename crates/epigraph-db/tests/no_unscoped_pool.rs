@@ -898,7 +898,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// reads on the caller's stamped connection, both now holding a `Viewer`;
 /// `routes/experiments.rs` 4 -> 0, key DELETED (`HIGH_WATER_FILES` falls by
 /// one with it).
-const HIGH_WATER: usize = 126;
+/// 126 -> 125 (backlog 1c822492; staging 2026-11-27 (2): #1136 measured
+/// 150 -> 149 against main, where the base had already lowered this to 126):
+/// `learn_convention` writes its convention
+/// claim, labels, evidence, trace and structural edges on ONE caller-stamped
+/// `AppState::write_as` transaction, authored by the caller and owned by its
+/// home group (`routes/conventions.rs` 3 -> 2). No file reached zero.
+const HIGH_WATER: usize = 125;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1080,9 +1086,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 4 before conversion shard 7, which moved `list_skills` onto
     // `AppState::read_as` through the same `WorkflowRepository::list` widening
     // that serves `routes/workflows.rs::list_workflows` — one signature change
-    // for two converted sites in two files. The three that remain
-    // (`learn_convention`, `forget_convention`, `share_skill`) all WRITE.
-    ("routes/conventions.rs", 3),
+    // for two converted sites in two files. 3 -> 2 (backlog 1c822492):
+    // `learn_convention` writes every row on the caller's `AppState::write_as`
+    // transaction and holds no `pool` alias. The two that remain
+    // (`forget_convention`, `share_skill`) both WRITE.
+    ("routes/conventions.rs", 2),
     // 7 until U012 (concurrent match-candidate decides), which removed the
     // promote arm's own `EdgeRepository::create_symmetric_if_absent(&state.db_pool, …)`:
     // the edge is now written inside `MatchCandidateRepo::promote_if_pending`,

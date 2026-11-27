@@ -28,6 +28,9 @@ Nothing in the repository installs it. Every step below is an operator step.
      edges among them cannot be split, so it keeps its heaviest 1,024 (each
      agent and evidence node keeps an edge to the claim) and the cut is
      reported under `leaf_edge_cap`;
+   - puts each theme's current members with NO embedding in its "not yet
+     placed" leaves (below), so every current themed claim the map may draw
+     is in a leaf;
    - builds real leaves (claims with their stored `truth_value` as the
      colour value, agents, evidence, W7 flow weights);
    - once every theme is final, builds the map's cross-group links: group
@@ -45,6 +48,46 @@ No UMAP or k-means runs on the box. A theme new to a map that does not fit
 one leaf is `unbuilt` until an operator builds the map (below), or, with the
 off-box hook, has its meaning tree computed off the box and is built the same
 night (the map's `offbox`).
+
+### Members with no embedding ("not yet placed" leaves)
+
+A current themed claim with no embedding cannot be clustered (neither tree
+has a vector to place it by), but it is still drawn (backlog 029392cb):
+- in a theme with embedded members, its theme's members with no embedding
+  form one subtree beside the clustered ones, the last child of the theme
+  root (a root that was one leaf becomes a group of that leaf and the
+  subtree; a root that already has the contract's 128 children is pushed one
+  level down first). The subtree is ONE leaf when they fit W3's cap, else
+  W3's fallback split by claim id (groups of at most 128 leaves);
+- a theme with NO embedded member is drawn as that subtree alone: one root
+  leaf when it fits.
+
+Both hierarchies hold the same "not yet placed" leaves, and each switches to
+the other's. They are named like any level (W8 samples their members' text).
+The operator builds (`atlas_meaning apply`, `atlas_links apply`) do the same
+after their checks; the results they apply hold the embedded members only, as
+the export writes them.
+
+If a theme's subtree cannot be added (the reachable case: a root with 128
+children pushed one level down would take a leaf past the contract's depth
+of 16), that theme keeps its clustered trees and its members with no
+embedding stay in no leaf for that build. The theme still builds, and the
+reason is reported: `themes.built[].stats.unplaced_refused` in the nightly's
+report, `unplaced_refused` (theme id and error) in an operator build's
+report. Neither is stored in the run's `params`.
+
+Every run records those leaves in its `params.unplaced_leaves` (both
+hierarchies). The next night takes their claims out of the previous trees
+before it updates them, so a claim embedded since is placed by meaning (the
+nearest centroid) like any new member, and a theme whose previous tree held
+only such claims is treated as new to the map: when its embedded members do
+not fit one leaf it is `unbuilt` (or computed through the hook), so it is
+missing from that night's run until it is built.
+
+Embedding those claims before the night is optional and is not part of this
+binary (it needs a live embedder): an embedding backfill (for example the MCP
+`backfill_embeddings` tool) run before the timer moves them into the
+clustered trees that night.
 
 ## The off-box hook (optional)
 
@@ -139,9 +182,13 @@ The binary prints one JSON summary. Per map, `status` is `written`,
 newer run was published while the night ran; nothing was written) or
 `failed`. Also per map:
 - `themes.built` (per theme: members, added, removed, leaves, resplit leaves,
-  linked, mirrors), `themes.carried`, `themes.dropped`, `themes.unbuilt`;
+  linked, mirrors, and `unplaced_refused` when its members with no embedding
+  could not be placed, above), `themes.carried`, `themes.dropped`,
+  `themes.unbuilt`;
 - `unembedded_members` (current themed claims the map may draw with no
-  embedding, in every theme, also one with no embedded member: in no leaf);
+  embedding, in every theme, also one with no embedded member: in the "not
+  yet placed" leaves of a theme that built or was carried, in no leaf of one
+  that was dropped, is unbuilt or reports `unplaced_refused`); per theme, `themes.built[].stats.unembedded`;
 - `links` (the cross-group links: `links` read, and what the contract caps
   cut: `dropped_targets`, `dropped_bundles`, `dropped_outgoing`,
   `dropped_links`; also stored in the run's `params`). A cut keeps the

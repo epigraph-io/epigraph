@@ -5,8 +5,8 @@ Sets properties.document_type and properties.document_type_confidence on
 the L0 claim row via a PATCH through the EpiGraph claims API. Descendants
 inherit at query time via decomposes_to walk; no denormalisation.
 
-LLM: spawns `claude -p` per paper. Per feedback_claude_cli_oauth.md we never
-import the Anthropic SDK directly.
+LLM: spawns `claude -p` per paper, which uses the signed-in Claude CLI's own
+credentials; the script never imports the Anthropic SDK directly.
 
 Idempotent: skips L0 papers that already have a document_type set.
 Per spec 2026-05-18-cross-source-anchor-design.md §Component 1.

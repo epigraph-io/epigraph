@@ -106,7 +106,7 @@ pub fn extract_md(text: &str) -> Result<String> {
 /// Invoke `claude -p` and read its narrative output from a result file.
 ///
 /// Nested `claude` sessions suppress text in the `--output-format json` `result`
-/// field (see `feedback_nested_cli.md`), so we instead instruct Claude to Write
+/// field, so we instead instruct Claude to Write
 /// the narrative to `result_path` and poll for that file.
 pub fn invoke_claude(prompt: &str, result_path: &std::path::Path) -> Result<String> {
     if let Some(parent) = result_path.parent() {

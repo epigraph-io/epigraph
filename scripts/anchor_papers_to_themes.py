@@ -234,9 +234,9 @@ def insert_instantiates_edge(api: EpiGraphClient, source_id: str, target_id: str
 # BACKLOG: No explicit-assign API endpoint exists. POST /api/v1/themes/reassign
 # auto-decides based on embedding distance — it can't be told to use the LLM
 # judge's choice. Until POST /api/v1/themes/:id/assign-claims is added,
-# this script uses raw SQL for primary theme assignment. Per
-# feedback_no_raw_sql.md, the missing endpoint should be filed as a feature
-# request. See spec 2026-05-18-cross-source-anchor §3.
+# this script uses raw SQL for primary theme assignment. Scripts should call
+# the API rather than write raw SQL, so the missing endpoint should be filed
+# as a feature request. See spec 2026-05-18-cross-source-anchor §3.
 def set_primary_theme(conn, claim_id: str, theme_id: str) -> None:
     cur = conn.cursor()
     cur.execute("UPDATE claims SET theme_id = %s WHERE id = %s", (theme_id, claim_id))

@@ -17,7 +17,7 @@
 //! removed anywhere in `src/routes/` and no routed handler signature changed.
 //! The header was describing a contract the code had already left behind.)
 //!
-//! # Tenancy: 1 of this file's 4 raw-pool sites is converted
+//! # Tenancy: 2 of this file's 4 raw-pool sites are converted
 //!
 //! Conversion shard 7. `list_skills` reads through a viewer-stamped connection
 //! from [`AppState::read_as`]. It shares `WorkflowRepository::list` with
@@ -25,13 +25,18 @@
 //! serves two converted sites in two files; that statement already carried
 //! `/* {VISIBILITY:c} */` over `claims`.
 //!
-//! The other 3 sites — `learn_convention`, `forget_convention`, `share_skill` —
-//! all WRITE. [`AppState::read_as`] is documented read-only and a write routed
-//! through a `ScopedRead` is rolled back on drop under
-//! `SessionGucMode::Transaction` while still type-checking. Their owner is
-//! `ScopedPool::begin_as` plus `Viewer::splice_write`, and
-//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
-//! `("conventions.rs", 2)` for two of them, unchanged by this shard.
+//! `learn_convention` (backlog 1c822492) writes every row of the request on
+//! ONE transaction from `AppState::write_as`, stamped with the caller's
+//! viewer: the convention is authored by its `claims:admin` caller and owned
+//! by the caller's home group. It holds no raw-pool alias any more.
+//!
+//! The other 2 sites — `forget_convention`, `share_skill` — WRITE on the raw
+//! pool apart from their evidence / edge statements. [`AppState::read_as`] is
+//! documented read-only and a write routed through a `ScopedRead` is rolled
+//! back on drop under `SessionGucMode::Transaction` while still
+//! type-checking. Their owner is `AppState::write_as`, and
+//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` carries this file's
+//! remaining inline scoped-table writes.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -124,14 +129,16 @@ pub struct SkillResponse {
 // EMBEDDING
 // =============================================================================
 
-/// Embed a claim one of these handlers just created, best-effort (CLAUDE.md
+/// Embed the shared copy `share_skill` just created, best-effort (CLAUDE.md
 /// "Embedding policy"): every failure is logged and swallowed, because the
 /// claim is already stored and a failed embed must not fail the request.
 ///
-/// Stored on `pool`, the handler's own `state.db_pool`: these handlers write
-/// the claim itself and everything attached to it there, so the vector lands
-/// on the authority that wrote the row. `ClaimRepository::store_embedding`
-/// carries the "not sealed" predicate every claim-vector writer needs.
+/// Stored on `pool`, the handler's own `state.db_pool`: `share_skill` writes
+/// the claim itself there, so the vector lands on the authority that wrote
+/// the row. `ClaimRepository::store_embedding` carries the "not sealed"
+/// predicate every claim-vector writer needs. (`learn_convention` writes on
+/// the caller's stamped transaction and embeds through
+/// `AppState::embed_claim_as` instead.)
 async fn embed_created_claim(
     state: &AppState,
     pool: &epigraph_db::PgPool,
@@ -170,14 +177,24 @@ async fn embed_created_claim(
 ///
 /// `POST /api/v1/conventions`
 ///
-/// The evidence row and its `evidence -> claim` `supports` edge are written on
-/// a transaction stamped with the CALLER's viewer (backlog 73d4f7ff), as
-/// `forget_convention` writes its refutation: the convention claim is public
-/// and owned by the system agent's group, so migration 114's attach rule owns
-/// the evidence by the caller's group and migration 120 owns the edge by it.
-/// On the raw pool nothing stamped the caller and the edge landed world-owned.
-/// The claim, its labels, its trace and its structural edges still autocommit
-/// on the raw pool under the system agent, so this splits no transaction.
+/// A convention is authored by its `claims:admin` CALLER and owned by the
+/// caller's home group, publicly visible (`default_decl_for_author`, backlog
+/// 1c822492). Every row of the request (the claim, its labels, the evidence
+/// and its `evidence -> claim` `supports` edge, the reasoning trace, the
+/// claim's `trace_id` and the AUTHORED / TRACES / HAS_TRACE edges) is ONE
+/// write on a transaction stamped with the caller's viewer, so the database's
+/// row security decides it and a refusal or fault leaves nothing behind.
+///
+/// Until then the claim, its labels, trace and structural edges were written
+/// on the raw, unstamped pool under a zero-key system agent: on the
+/// application role `claims_tenancy`'s `WITH CHECK` refused that INSERT (a
+/// 500), and on a privileged pool the claim landed in the system agent's
+/// group, with the caller's evidence attached to it in a second transaction.
+///
+/// The claim's embedding is stored after the commit, through the caller's
+/// stamped transaction ([`AppState::embed_claim_as`]), best-effort.
+///
+/// [`AppState::embed_claim_as`]: crate::AppState::embed_claim_as
 pub async fn learn_convention(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -196,9 +213,8 @@ pub async fn learn_convention(
             reason: "Convention content cannot be empty".to_string(),
         });
     }
-    // `request.tags` is caller-supplied and is extended onto the label array
-    // below. Refused here, with the other 400s, because the claim row is created
-    // BEFORE the label UPDATE — validating later would leave an orphan claim.
+    // `request.tags` is caller-supplied and is added to the label array below.
+    // Refused here, with the other 400s, before the transaction opens.
     epigraph_db::reject_unexpanded_labels(&request.tags).map_err(|e| {
         ApiError::ValidationError {
             field: "tags".to_string(),
@@ -208,54 +224,56 @@ pub async fn learn_convention(
             },
         }
     })?;
+    // The author is the authenticated principal, as on `POST /api/v1/claims`.
+    let Some(author) = auth.agent_id else {
+        return Err(ApiError::Unauthorized {
+            reason: "token carries no agent_id; re-authenticate to obtain a token bound to a \
+                     principal"
+                .to_string(),
+        });
+    };
 
     let confidence = request.confidence.clamp(0.0, 1.0);
-    let pool = &state.db_pool;
-
-    // Ensure system agent exists for API-created conventions
-    let pub_key = [0u8; 32];
-    let system_agent = if let Some(a) =
-        epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: e.to_string(),
-            })? {
-        a
-    } else {
-        let agent = epigraph_core::Agent::new(pub_key, Some("api-system".to_string()));
-        epigraph_db::AgentRepository::create(pool, &agent)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: e.to_string(),
-            })?
-    };
-    let agent_id = epigraph_core::AgentId::from_uuid(system_agent.id.as_uuid());
+    let agent_id = epigraph_core::AgentId::from_uuid(author);
     let truth = epigraph_core::TruthValue::clamped(confidence);
+
+    let mut tx = state.write_as(&viewer, "learn_convention").await?;
+
+    let pub_key = epigraph_db::AgentRepository::get_by_id(&mut *tx, agent_id)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: format!("token names agent {author}, which does not exist"),
+        })?
+        .public_key;
 
     let mut claim = epigraph_core::Claim::new(request.content.clone(), agent_id, pub_key, truth);
     claim.content_hash = epigraph_crypto::ContentHasher::hash(request.content.as_bytes());
 
-    // A convention is authored by the SYSTEM agent, so the declaration names
-    // the system agent's own personal group. There is no caller-supplied group
-    // on this surface -- a convention is instance-wide by construction.
-    let decl =
-        epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id.into()).await?;
-    epigraph_db::ClaimRepository::create(pool, &claim, decl).await?;
+    // ('public', the caller's home group). Resolved on the stamped transaction,
+    // so a rollback takes anything the resolution provisioned with it.
+    let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut tx, author).await?;
+    // The legacy create answers a content-hash dedup hit with the EXISTING
+    // row, which is another write's: labelling it, or attaching this
+    // request's evidence and trace to it, would write onto a claim this
+    // request did not create. Refused, with nothing written.
+    let (_, inserted) =
+        epigraph_db::ClaimRepository::create_signed_reporting_conn(&mut tx, &claim, decl, None)
+            .await?;
+    if !inserted {
+        return Err(ApiError::Conflict {
+            reason: "a claim with this content already exists".to_string(),
+        });
+    }
 
-    // Set labels: convention + any user tags
-    let mut labels = vec!["convention".to_string(), "learned".to_string()];
-    labels.extend(request.tags);
+    // Labels: convention + any user tags.
+    let mut add = vec!["convention".to_string(), "learned".to_string()];
+    add.extend(request.tags);
+    let labels =
+        epigraph_db::ClaimRepository::update_labels_conn(&mut tx, claim.id.as_uuid(), &add, &[])
+            .await?;
 
-    sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
-        .bind(&labels)
-        .bind(claim.id.as_uuid())
-        .execute(pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?;
-
-    // Create evidence
+    // The evidence, with its `evidence -> claim` `supports` edge (backlog
+    // 2d60f619).
     let evidence_hash = epigraph_crypto::ContentHasher::hash(request.evidence.as_bytes());
     let evidence = epigraph_core::Evidence::new(
         agent_id,
@@ -269,18 +287,14 @@ pub async fn learn_convention(
         Some(request.evidence),
         claim.id,
     );
-    // With its `evidence -> claim` `supports` edge (backlog 2d60f619), in ONE
-    // transaction stamped with the caller's viewer (backlog 73d4f7ff).
-    let mut tx = state.write_as(&viewer, "learn_convention").await?;
     epigraph_db::EvidenceRepository::create(
         &mut *tx,
         &evidence,
         epigraph_db::EvidenceEdge::supports(state.edge_signing_key()),
     )
     .await?;
-    tx.commit().await?;
 
-    // Create reasoning trace
+    // The reasoning trace.
     let trace = epigraph_core::ReasoningTrace::new(
         agent_id,
         pub_key,
@@ -289,69 +303,48 @@ pub async fn learn_convention(
         confidence,
         format!("Convention learned: {}", request.content),
     );
-    epigraph_db::ReasoningTraceRepository::create(pool, &trace, claim.id).await?;
-    epigraph_db::ClaimRepository::update_trace_id(pool, claim.id, trace.id).await?;
+    epigraph_db::ReasoningTraceRepository::create(&mut *tx, &trace, claim.id).await?;
+    epigraph_db::ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id).await?;
 
-    // Materialize graph edges (the evidence's own `supports` edge was written
-    // with the evidence row above).
+    // The structural edges. Inside the transaction an error is returned, not
+    // swallowed: a failed statement aborts the transaction anyway.
     let claim_uuid = claim.id.as_uuid();
     let trace_uuid = trace.id.as_uuid();
-    let agent_uuid = system_agent.id.as_uuid();
+    for (source, source_type, target, target_type, relationship) in [
+        (author, "agent", claim_uuid, "claim", "AUTHORED"),
+        (trace_uuid, "trace", claim_uuid, "claim", "TRACES"),
+        (claim_uuid, "claim", trace_uuid, "trace", "HAS_TRACE"),
+    ] {
+        epigraph_db::EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
+            source,
+            source_type,
+            target,
+            target_type,
+            relationship,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    }
+    tx.commit().await?;
 
-    let _ = epigraph_db::EdgeRepository::create_signed(
-        pool,
-        state.edge_signing_key(),
-        agent_uuid,
-        "agent",
-        claim_uuid,
-        "claim",
-        "AUTHORED",
-        None,
-        None,
-        None,
-    )
-    .await;
-    let _ = epigraph_db::EdgeRepository::create_signed(
-        pool,
-        state.edge_signing_key(),
-        trace_uuid,
-        "trace",
-        claim_uuid,
-        "claim",
-        "TRACES",
-        None,
-        None,
-        None,
-    )
-    .await;
-    let _ = epigraph_db::EdgeRepository::create_signed(
-        pool,
-        state.edge_signing_key(),
-        claim_uuid,
-        "claim",
-        trace_uuid,
-        "trace",
-        "HAS_TRACE",
-        None,
-        None,
-        None,
-    )
-    .await;
-
-    // After every write of this request, so a failed embed changes nothing.
-    embed_created_claim(
-        &state,
-        pool,
-        claim_uuid,
-        &request.content,
-        "learn_convention",
-    )
-    .await;
+    // After the commit, so a failed embed changes nothing.
+    state
+        .embed_claim_as(
+            &viewer,
+            claim_uuid,
+            &request.content,
+            "learn_convention.embed",
+        )
+        .await;
 
     Ok((
         StatusCode::CREATED,
         Json(ConventionResponse {
-            claim_id: claim.id.as_uuid(),
+            claim_id: claim_uuid,
             content: request.content,
             truth_value: confidence,
             labels,

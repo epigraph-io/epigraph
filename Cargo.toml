@@ -20,7 +20,6 @@ members = [
     "crates/epigraph-cli",
     "crates/epigraph-jobs",
     "crates/epigraph-events",
-    "crates/epigraph-tools",
     "crates/epigraph-mcp",
     "crates/epigraph-ingest",
     "crates/epigraph-ingest-executor",
@@ -76,7 +75,6 @@ hex = "0.4"
 # Floor 0.14.3 (zstd-safe 8.2): RUSTSEC-2026-0391/0398/0403 have no 0.13 fix;
 # pinned by crates/epigraph-db/tests/zstd_advisory_floor.rs.
 zstd = { version = "0.14.3", default-features = false }
-hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -108,7 +106,6 @@ epigraph-embeddings = { path = "crates/epigraph-embeddings", features = ["openai
 epigraph-jobs = { path = "crates/epigraph-jobs" }
 epigraph-events = { path = "crates/epigraph-events" }
 epigraph-ds = { path = "crates/epigraph-ds" }
-epigraph-tools = { path = "crates/epigraph-tools" }
 epigraph-mcp = { path = "crates/epigraph-mcp" }
 epigraph-ingest = { path = "crates/epigraph-ingest" }
 epigraph-ingest-executor = { path = "crates/epigraph-ingest-executor" }

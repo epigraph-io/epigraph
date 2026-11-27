@@ -31,10 +31,16 @@ use super::files::{
 use super::graph::{
     check_mirrors, counted_links, leaf_count, linked_claims, meaning_leaf_of, switch_targets,
 };
-use crate::atlas_meaning::build::{resolve_result, resolve_theme, ResolvedTheme};
+use crate::atlas_meaning::build::{
+    resolve_result, resolve_theme, unplaced_only_themes, unplaced_refusals, ResolvedTheme,
+    UNPLACED_KEY,
+};
 use crate::atlas_meaning::docs::level_documents_with_switch;
 use crate::atlas_meaning::files::{index_attachments, prepare_export_dir, ResultDoc};
-use crate::atlas_meaning::tree::{check_tree, map_key, resolve_tree, MeaningTree, ResolveStats};
+use crate::atlas_meaning::tree::{
+    check_tree, map_key, place_unplaced, place_unplaced_or_keep, resolve_tree, MeaningTree,
+    ResolveStats,
+};
 
 /// The `atlas_map_runs.algo` of a run holding both hierarchies.
 pub const HIERARCHIES_ALGO: &str = "atlas-hierarchies/1";
@@ -220,6 +226,8 @@ pub struct ResolvedLinksTheme {
     pub mirrors: usize,
     pub id_chunk_cuts: u32,
     pub embedding_splits: u32,
+    /// The tree's "not yet placed" leaves ([`place_unplaced_both`]).
+    pub unplaced_leaves: Vec<Uuid>,
 }
 
 /// Check `links` against `map`'s rows in the build's snapshot and against
@@ -298,10 +306,126 @@ pub async fn resolve_links_result(
             mirrors,
             id_chunk_cuts: t.id_chunk_cuts,
             embedding_splits: t.embedding_splits,
+            unplaced_leaves: Vec::new(),
             tree,
         });
     }
     Ok(out)
+}
+
+/// Both hierarchies of every theme with the theme's members that have no
+/// embedding added in "not yet placed" leaves ([`place_unplaced`], the same
+/// claims in both), each links level's switch recomputed on the new trees;
+/// and every theme `map` draws with no embedded member appended as one such
+/// tree in each hierarchy. `meaning` and `links` are the resolved themes in
+/// the same order ([`resolve_links_result`] keeps `meaning`'s). Call it on
+/// the build's transaction, after the W5b checks, which hold for the
+/// clustered members only.
+///
+/// A theme whose placement is refused keeps both trees as computed, its
+/// members with no embedding in no leaf, and the refusal in
+/// [`ResolvedTheme::unplaced_refused`] ([`place_unplaced_or_keep`]).
+///
+/// # Errors
+/// A refusal of [`place_unplaced`] for a theme with no embedded member, one
+/// of [`switch_targets`], two lists of different themes, or a database
+/// error.
+pub async fn place_unplaced_both(
+    tx: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    meaning: Vec<ResolvedTheme>,
+    links: Vec<ResolvedLinksTheme>,
+    cap: usize,
+) -> anyhow::Result<(Vec<ResolvedTheme>, Vec<ResolvedLinksTheme>)> {
+    ensure!(
+        meaning.len() == links.len()
+            && meaning
+                .iter()
+                .zip(&links)
+                .all(|(m, l)| m.tree.theme_id == l.tree.theme_id),
+        "the meaning and links themes differ"
+    );
+    let mut m_out = Vec::with_capacity(meaning.len());
+    let mut l_out = Vec::with_capacity(links.len());
+    for (mut m, mut l) in meaning.into_iter().zip(links) {
+        if !m.unembedded.is_empty() {
+            let theme = m.tree.theme_id;
+            let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &m.unembedded).await?;
+            let placed = place_unplaced_or_keep(
+                map,
+                theme,
+                m.tree,
+                Some(l.tree),
+                &m.unembedded,
+                &rows,
+                cap,
+                &mut m.stats,
+                &mut l.stats,
+            );
+            m.tree = placed.meaning;
+            l.tree = placed
+                .links
+                .context("place_unplaced_or_keep returned no links tree")?;
+            if placed.refused.is_none() {
+                l.switch = switch_targets(&l.tree, &m.tree)?;
+                // The record lists each leaf once; its hierarchy is the
+                // tree that holds it.
+                let in_links: BTreeSet<Uuid> = l.tree.nodes.iter().map(|n| n.id).collect();
+                (l.unplaced_leaves, m.unplaced_leaves) = placed
+                    .leaves
+                    .into_iter()
+                    .partition(|id| in_links.contains(id));
+            }
+            m.unplaced_refused = placed.refused;
+        }
+        m_out.push(m);
+        l_out.push(l);
+    }
+    for (theme, unplaced) in unplaced_only_themes(tx, viewer, map).await? {
+        let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &unplaced).await?;
+        let (mut m_stats, mut l_stats) = (ResolveStats::default(), ResolveStats::default());
+        let (mt, ml) = place_unplaced(
+            map,
+            AtlasHierarchy::Meaning,
+            theme,
+            None,
+            &unplaced,
+            &rows,
+            cap,
+            &mut m_stats,
+        )?;
+        let (lt, ll) = place_unplaced(
+            map,
+            HIERARCHY,
+            theme,
+            None,
+            &unplaced,
+            &rows,
+            cap,
+            &mut l_stats,
+        )?;
+        l_out.push(ResolvedLinksTheme {
+            stats: l_stats,
+            switch: switch_targets(&lt, &mt)?,
+            linked: 0,
+            unlinked: 0,
+            mirrors: 0,
+            id_chunk_cuts: 0,
+            embedding_splits: 0,
+            unplaced_leaves: ll,
+            tree: lt,
+        });
+        m_out.push(ResolvedTheme {
+            tree: mt,
+            stats: m_stats,
+            id_chunk_cuts: 0,
+            unembedded: unplaced,
+            unplaced_leaves: ml,
+            unplaced_refused: None,
+        });
+    }
+    Ok((m_out, l_out))
 }
 
 /// Write every links level document of `themes` into the unfinished run
@@ -438,6 +562,8 @@ async fn build_hierarchies(
     let meaning_themes = resolve_result(&mut tx, viewer, map, meaning, cap).await?;
     let links_themes =
         resolve_links_result(&mut tx, viewer, map, links, &meaning_themes, cap).await?;
+    let (meaning_themes, links_themes) =
+        place_unplaced_both(&mut tx, viewer, map, meaning_themes, links_themes, cap).await?;
 
     let m_sum = |f: fn(&ResolvedTheme) -> usize| meaning_themes.iter().map(f).sum::<usize>();
     let l_sum = |f: fn(&ResolvedLinksTheme) -> usize| links_themes.iter().map(f).sum::<usize>();
@@ -455,7 +581,7 @@ async fn build_hierarchies(
             "inner_groups": m_sum(|t| t.stats.groups),
             "resplit_leaves": m_sum(|t| t.stats.resplit_leaves),
             "id_chunk_cuts": meaning_themes.iter().map(|t| u64::from(t.id_chunk_cuts)).sum::<u64>(),
-            "unembedded_members": m_sum(|t| t.unembedded),
+            "unembedded_members": m_sum(|t| t.unembedded.len()),
         },
         "links": {
             "result_cap": links.cap,
@@ -470,6 +596,9 @@ async fn build_hierarchies(
             "embedding_splits": links_themes.iter().map(|t| u64::from(t.embedding_splits)).sum::<u64>(),
             "id_chunk_cuts": links_themes.iter().map(|t| u64::from(t.id_chunk_cuts)).sum::<u64>(),
         },
+        UNPLACED_KEY: meaning_themes.iter().flat_map(|t| t.unplaced_leaves.iter().copied())
+            .chain(links_themes.iter().flat_map(|t| t.unplaced_leaves.iter().copied()))
+            .collect::<Vec<Uuid>>(),
     });
     let mut report = json!({
         "map": map_key(map),
@@ -477,6 +606,8 @@ async fn build_hierarchies(
         "params": params,
         "max_leaf_nodes": meaning_themes.iter().map(|t| t.stats.max_leaf_nodes)
             .chain(links_themes.iter().map(|t| t.stats.max_leaf_nodes)).max().unwrap_or(0),
+        // In the report only (not the run's params): the theme ids and why.
+        "unplaced_refused": unplaced_refusals(&meaning_themes),
     });
     if !write {
         let mut docs = 0;

@@ -3,15 +3,13 @@
 This file is loaded into any Claude Code / agent session opened in this repo.
 Project-wide rules below; module-specific rules live next to their code.
 
-## Adding MCP tools — `epigraph-tools` is not the extension point
+## Adding MCP tools — the two extension points
 
-`crates/epigraph-tools` defines a `Tool` trait and a `ToolRegistry`. Despite the
-names, that is **not** how tools reach the MCP server, and no crate in this
-workspace depends on it.
-
-`epigraph-mcp` has no extension trait — zero `pub trait` declarations, and a
-compile-time `#[tool_router]` impl block. Its router and `scope_map` are a
-closed set by design.
+There is no in-process tool trait or registry to implement. `epigraph-mcp` has
+no extension trait — zero `pub trait` declarations, and a compile-time
+`#[tool_router]` impl block. Its router and `scope_map` are a closed set by
+design: a tool reaches the MCP server either as a kernel tool or as a
+downstream product's federated tool.
 
 - **Kernel tool** → add it to the `#[tool_router] impl` in
   `epigraph-mcp/src/server.rs` *and* to `SCOPE_MAP` in `scope_map.rs` (a
@@ -102,8 +100,8 @@ refuses such a label merge instead. Over HTTP the
 WHOLE label mutation needs that ownership, whatever the labels (as
 `patch_claim` and `PATCH /api/v1/claims/:id/labels` do); on stdio every other
 label stays ungated. A stdio agent that shares no operator with the claim's
-author, and is not its delegate, is now refused, including through `release/epiclaw/CLAUDE.md`'s
-`update_labels(original_id, add=["resolved"])` procedure, and so is a stdio
+author, and is not its delegate, is now refused, including through the agent fleet's
+`update_labels(original_id, add=["resolved"])` retirement procedure, and so is a stdio
 server with no declared signer (`--agent-key` or the separate signing key) on any claim it
 did not author. The deploy preconditions this sets for the fleet are in
 `scripts/e2e/README.md` ("Deploy preconditions").
@@ -137,7 +135,15 @@ Full spec: `docs/conventions/backlog-retirement.md`.
 - After adding or modifying a `sqlx::query!` / `sqlx::query_as!` macro
   call, run `DATABASE_URL=... cargo sqlx prepare --workspace -- --tests`
   and commit `.sqlx/` so `SQLX_OFFLINE=true cargo check --workspace`
-  passes in CI.
+  passes in CI. Removing a macro call leaves its `.sqlx/` entry orphaned;
+  delete it.
+- Most repo SQL is runtime, not macro-checked (under one in ten statements
+  use the macros; `crates/epigraph-db/README.md`, "Setup"). Prefer the macro
+  only for a static statement that no `Viewer::splice` / `splice_write`
+  marker will ever need to reach, since a macro cannot take a spliced
+  literal. Otherwise decode a runtime query through `query_as` into a
+  `FromRow` struct, never `Row::get`, which panics on a missing column or a
+  type mismatch.
 - `claim_from_row` has ~20 callers in `crates/epigraph-db/src/repos/claim.rs`.
   Do not widen its signature — extend the relevant `SELECT` in the caller
   and post-fix the returned `Claim` (see `list_by_labels` and `get_by_id`
@@ -280,7 +286,8 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `add_step`** and **HTTP `POST /api/v1/workflows/steps`** — embed when `AddStepResult::inserted_content` is `Some` (a new step, or a reused one revived from a workflow deprecation)
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
-- **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
+- **HTTP `POST /api/v1/conventions`** — embeds the convention claim after `tx.commit()` on the caller's stamp (`AppState::embed_claim_as`); the claim and everything attached to it are written on that caller's stamped transaction; `crates/epigraph-api/src/routes/conventions.rs::learn_convention`
+- **HTTP `POST /api/v1/skills/share`** — embeds the shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool the handler writes the claim on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
 - **HTTP `POST /api/v1/policy-challenges`** — embeds a NEW challenge after `tx.commit()` on the caller's stamp (`AppState::store_claim_embedding_as`); a repeat request creates nothing and embeds nothing; `crates/epigraph-api/src/routes/policies.rs::embed_new_challenge`
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs::submit_packet` (the `if !was_duplicate` block; stored through `AppState::store_claim_embedding_as`)
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`

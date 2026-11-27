@@ -1320,9 +1320,9 @@ async fn deliver_to_subscription(
 }
 
 /// The dispatcher's HTTP client construction lives in `epigraph_jobs::egress`,
-/// shared with `epigraph_jobs::PinnedHttpClient`, so the API and the jobs crate
-/// build every webhook client from ONE place and cannot drift apart on the
-/// no-redirect / no-proxy / pinned-resolution / fail-closed properties.
+/// beside the egress guard, so every webhook client is built in ONE place and
+/// the no-redirect / no-proxy / pinned-resolution / fail-closed properties
+/// cannot be held by one caller and forgotten by another.
 ///
 /// * [`dispatcher_client_builder`] (`egress::delivery_client_builder`): no
 ///   redirects, no proxy.
@@ -2224,114 +2224,6 @@ mod tests {
             stub.calls(host),
             2,
             "one failed lookup, one vetted lookup, and no lookup after that"
-        );
-    }
-
-    // ---- epigraph_jobs::PinnedHttpClient, driven from here because reaching a
-    // loopback listener needs `exempt_socket_for_tests`, which only a crate
-    // that enables `epigraph-jobs/test-support` as a dev-dependency has. ----
-
-    /// The jobs crate's sanctioned client reaches the VETTED address for a name
-    /// that system DNS has never heard of (RFC 2606 `.example`): it can only
-    /// have connected through the pinned override, not by resolving again.
-    #[tokio::test]
-    async fn test_jobs_pinned_http_client_dials_the_vetted_address() {
-        use epigraph_jobs::HttpClient as _;
-        let (addr, hits, task) = counting_listener("127.0.0.1:0", OK_200).await;
-        let host = "jobs-pinned.example";
-        let egress =
-            stub_egress(StubResolver::new().with(host, [addr.ip()])).exempt_socket_for_tests(addr);
-        let target = egress
-            .vet(&format!("http://{host}:{}/hook", addr.port()))
-            .await
-            .expect("exempt listener vets");
-
-        let response = epigraph_jobs::PinnedHttpClient::new(std::time::Duration::from_secs(2))
-            .post(&target, std::collections::HashMap::new(), "{}")
-            .await
-            .expect("pinned delivery succeeds");
-        task.abort();
-
-        assert_eq!(response.status_code, 200);
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    /// The jobs crate's sanctioned client keeps at most
-    /// `MAX_RESPONSE_BODY` bytes of what the receiver sends: the receiver is
-    /// untrusted and the handler copies the body into job output.
-    #[tokio::test]
-    async fn test_jobs_pinned_http_client_caps_the_response_body() {
-        use epigraph_jobs::HttpClient as _;
-        let cap = epigraph_jobs::PinnedHttpClient::MAX_RESPONSE_BODY;
-        let big = cap * 4;
-        let mut raw =
-            format!("HTTP/1.1 200 OK\r\nContent-Length: {big}\r\nConnection: close\r\n\r\n")
-                .into_bytes();
-        raw.extend(std::iter::repeat_n(b'x', big));
-        let response_bytes: &'static [u8] = Box::leak(raw.into_boxed_slice());
-        let (addr, _hits, task) = counting_listener("127.0.0.1:0", response_bytes).await;
-        let host = "jobs-bigbody.example";
-        let egress =
-            stub_egress(StubResolver::new().with(host, [addr.ip()])).exempt_socket_for_tests(addr);
-        let target = egress
-            .vet(&format!("http://{host}:{}/hook", addr.port()))
-            .await
-            .expect("exempt listener vets");
-
-        let response = epigraph_jobs::PinnedHttpClient::new(std::time::Duration::from_secs(5))
-            .post(&target, std::collections::HashMap::new(), "{}")
-            .await
-            .expect("the receiver answers");
-        task.abort();
-
-        assert_eq!(response.status_code, 200);
-        assert_eq!(
-            response.body.len(),
-            cap,
-            "the body must be truncated at the cap, not buffered whole"
-        );
-    }
-
-    /// The jobs crate's sanctioned client does not follow a redirect: the 3xx
-    /// comes back as the response and the hop target is never dialled.
-    #[tokio::test]
-    async fn test_jobs_pinned_http_client_does_not_follow_redirects() {
-        use epigraph_jobs::HttpClient as _;
-        let (hop_addr, hop_hits, hop_task) = counting_listener("127.0.0.1:0", OK_200).await;
-        let redirect: &'static [u8] = Box::leak(
-            format!(
-                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{hop_addr}/latest/meta-data/\r\n\
-                 Content-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .into_bytes()
-            .into_boxed_slice(),
-        );
-        let (entry_addr, entry_hits, entry_task) = counting_listener("127.0.0.1:0", redirect).await;
-        let host = "jobs-entry.example";
-        let egress = stub_egress(StubResolver::new().with(host, [entry_addr.ip()]))
-            .exempt_socket_for_tests(entry_addr);
-        let target = egress
-            .vet(&format!("http://{host}:{}/hook", entry_addr.port()))
-            .await
-            .expect("exempt listener vets");
-
-        let response = epigraph_jobs::PinnedHttpClient::new(std::time::Duration::from_secs(2))
-            .post(&target, std::collections::HashMap::new(), "{}")
-            .await
-            .expect("the entry answers");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        entry_task.abort();
-        hop_task.abort();
-
-        assert_eq!(
-            response.status_code, 307,
-            "the 3xx is returned, not followed"
-        );
-        assert_eq!(entry_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(
-            hop_hits.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the redirect target must never be dialled"
         );
     }
 

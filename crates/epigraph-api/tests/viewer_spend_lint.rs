@@ -518,10 +518,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
         ],
     ),
+    // ... and, when the removal applied, the delete of the community's stale
+    // stored scoped beliefs on the SAME stamped transaction
+    // (`clear_stale_community_folds`, backlog 8d720490): FORCE'd row security
+    // against that transaction's GUCs limits it to rows the caller may write.
     (
         "community.rs",
         "remove_member",
-        &["CommunityRepository::remove_member"],
+        &[
+            "CommunityRepository::remove_member",
+            "clear_stale_community_folds",
+        ],
     ),
     // narrows: an `apply` run keeps the cache-admissible rows of the BBAs it
     // read through the viewer (`get_for_claims`); a read-only run filters them
@@ -556,30 +563,26 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
-    // The convention claim, its labels, trace and structural edges are the
-    // SYSTEM agent's, written on the raw pool as before (the caller does not
-    // write that agent's group). The evidence and its signed `supports` edge
-    // (backlog 73d4f7ff) are ONE write on a transaction stamped with the
-    // caller's viewer (`state.write_as(&viewer, ..)`, passed as `&mut *tx`), as
-    // in `forget_convention`: migration 114 owns the evidence by the caller's
-    // group and migration 120 the edge. `embed_created_claim` stores the
-    // claim's vector where the claim was written.
+    // stamped + write (backlog 1c822492): every statement runs on ONE
+    // transaction from `state.write_as(&viewer, ..)`, passed as `&mut tx`, so
+    // the claims / evidence / edges triggers and `WITH CHECK` decide each row
+    // by the caller's writable set. The caller authors the convention: its
+    // agent row (`get_by_id`, agents are untenanted) supplies the key, and
+    // `default_decl_for_author` (a definer) names its home group. None of
+    // these reads anything for display. The embed after the commit goes
+    // through `AppState::embed_claim_as`, which receives the viewer.
     (
         "conventions.rs",
         "learn_convention",
         &[
-            "AgentRepository::create",
-            "AgentRepository::get_by_public_key",
-            "ClaimRepository::create",
-            "ClaimRepository::default_decl_for_author_pool",
-            "ClaimRepository::update_trace_id",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
+            "AgentRepository::get_by_id",
+            "ClaimRepository::create_signed_reporting_conn",
+            "ClaimRepository::default_decl_for_author",
+            "ClaimRepository::update_labels_conn",
+            "ClaimRepository::update_trace_id_conn",
+            "EdgeRepository::create_signed_conn",
             "EvidenceRepository::create",
             "ReasoningTraceRepository::create",
-            "embed_created_claim",
-            "sqlx::query(UPDATE).execute",
         ],
     ),
     // `embed_created_claim` (backlog 56d2430b): the best-effort embed of the

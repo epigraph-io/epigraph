@@ -409,7 +409,7 @@ pub async fn retire_match_candidate(
     let mut trigger = CascadeTrigger::new(
         CascadeCause::MatchRetire,
         Some(acting_agent),
-        crate::tools::supersede::oauth_principal(auth),
+        auth.map(epigraph_engine::admin_cascade::OauthPrincipal::from),
         candidate_id,
         None,
     );

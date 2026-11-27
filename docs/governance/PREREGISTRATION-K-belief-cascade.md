@@ -1,8 +1,8 @@
 # PRE-REGISTRATION — Cascading belief recomputation downstream of `supersede_claim` / `mark_duplicate`
 
 **Backlog claim:** `20e9ed83-c5f1-4f26-bee5-d6eb105d2635`
-**Branch:** `feat/supersede-cascade-recompute` (worktree `/home/jeremy/epigraph-wt-K`, branched from `origin/main` @ `7cd5eeef`)
-**Governance agent:** Ada discipline (`/home/jeremy/Ada/agents/governance-agent-template.agent.md`)
+**Branch:** `feat/supersede-cascade-recompute` (worktree `<worktree-K>`, branched from `origin/main` @ `7cd5eeef`)
+**Governance agent:** Ada discipline (`<ada>/agents/governance-agent-template.agent.md`)
 **Written:** 2026-08-17 — **BEFORE any implementation.** This file is the answer key.
 **Status of this document:** binding. Criteria and challenges below are fixed. An
 implementer who cannot satisfy one must record a **protocol deviation** in the commit
@@ -241,7 +241,7 @@ both responses gain an **additive** field reporting the cascade's target claim i
 outcome, so a caller can observe what was scheduled instead of being told to wait blindly.
 This is the resource-form answer to the Gate 1 tension in §1.
 
-**Pass.** `git -C /home/jeremy/epigraph-wt-K diff origin/main -- crates/epigraph-mcp/src/types.rs`
+**Pass.** `git -C <worktree-K> diff origin/main -- crates/epigraph-mcp/src/types.rs`
 shows no added non-`Option` field on either params struct; the two return types are
 byte-identical in the diff; a named test
 (`crates/epigraph-mcp/tests/supersede_cascade_reports_targets.rs`) asserts the new field
@@ -339,7 +339,7 @@ non-empty), and the implementation queries no column named `target_is_current`.
 
 **Pass.** The cascade's reported target list (the C1(b) field, or a directly-tested pure
 enumeration helper) contains `B`; and
-`grep -rn "target_is_current" /home/jeremy/epigraph-wt-K/crates /home/jeremy/epigraph-wt-K/migrations`
+`grep -rn "target_is_current" <worktree-K>/crates <worktree-K>/migrations`
 returns **zero** hits.
 
 **Refute.** Target set is empty / the cascade logs "0 downstream claims"; or
@@ -449,7 +449,7 @@ failure of an otherwise-correct implementation, and it must be scored as failed.
 **Pass.** The cyclic-fixture test completes under the default `cargo test` timeout with no
 stack overflow; a test asserts `supersede_claim` returns success when the belief subsystem
 cannot run (e.g. downstream claim carries no frames);
-`git -C /home/jeremy/epigraph-wt-K diff origin/main -- crates/epigraph-db/src/repos/claim.rs`
+`git -C <worktree-K> diff origin/main -- crates/epigraph-db/src/repos/claim.rs`
 contains no `tokio::spawn` and no change inside the `supersede` transaction; and
 `grep -rn "sqlx::query" crates/epigraph-mcp/src/tools/supersede.rs crates/epigraph-api/src/routes/versioning.rs`
 shows no new raw SQL from this diff.
@@ -471,7 +471,7 @@ cache consistent.
 **Pass.** All four exit 0, in order:
 
 ```bash
-cd /home/jeremy/epigraph-wt-K
+cd <worktree-K>
 cargo fmt --all -- --check
 SQLX_OFFLINE=true cargo check --workspace
 cargo clippy --all-targets -- -D warnings
@@ -488,7 +488,7 @@ shown to **fail at `HEAD`**.
 
 ## 3. BCH-style regression challenges
 
-Modelled on `/home/jeremy/Ada/benchmark_challenges/*.yaml`. Each is a case where a
+Modelled on `<ada>/benchmark_challenges/*.yaml`. Each is a case where a
 plausible naive implementation is **confidently wrong**. Expected score at `HEAD`: 0/100;
 required after the change: ≥90/100.
 
@@ -926,7 +926,7 @@ deleting BBAs it has already established it cannot re-derive.
 
 Recorded after adversarial review of the implementation (three reviewers, 14 findings) and the
 follow-up fix pass. Every line below is the result of running the named command in
-`/home/jeremy/epigraph-wt-K` at the branch tip, not a restatement of intent.
+`<worktree-K>` at the branch tip, not a restatement of intent.
 
 **Environment.** `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test`,
 `SQLX_OFFLINE=true`. The production `epigraph` database on `epigraph-postgres` was never
@@ -1083,7 +1083,7 @@ $ DATABASE_URL=… cargo test -p epigraph-api --features db \
 
 **Build-profile note.** The four `cargo test` runs above were invoked with
 `CARGO_PROFILE_DEV_DEBUG=0` prepended. That is a build-configuration workaround for a disk-full
-event on the shared `/home/jeremy/.cargo-target` (see D15), not part of the criterion; it changes
+event on the shared `~/.cargo-target` (see D15), not part of the criterion; it changes
 only debuginfo emission, no test semantics. An auditor re-running the bare command in the
 criterion gets the same results from a larger build.
 
@@ -1155,6 +1155,6 @@ Both halves were additionally invoked with `CARGO_PROFILE_DEV_DEBUG=0`. Mid-adju
 filled to 100% (`/dev/sda1 150G, 176K available`) and `rustc` began failing with
 `No space left on device`; `cargo clean -p epigraph-mcp -p epigraph-api -p epigraph-engine
 -p epigraph-db` reclaimed 36.8 GiB, and the reduced debuginfo keeps the rebuild from immediately
-re-filling. The root cause is outside this repo: `/home/jeremy/.cargo/config.toml` declares
+re-filling. The root cause is outside this repo: `~/.cargo/config.toml` declares
 `[env]` **twice**, so its `CARGO_PROFILE_DEV_DEBUG = "line-tables-only"` never takes effect and
 every test binary is built with `-C debuginfo=2`.

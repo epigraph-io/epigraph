@@ -27,10 +27,95 @@ pub struct ScopedBeliefRow {
     pub computed_at: DateTime<Utc>,
 }
 
+/// What [`ScopedBeliefRepository::clear_community_folds_of_member`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommunityFoldsCleared {
+    /// Stale community rows the session could see.
+    pub matched: u64,
+    /// Of those, the rows it deleted. Row security filters a row owned by a
+    /// group the session cannot write out of the DELETE without an error,
+    /// so `matched - deleted` rows were left in place.
+    pub deleted: u64,
+}
+
+impl CommunityFoldsCleared {
+    /// Stale rows the session could see but not delete.
+    #[must_use]
+    pub const fn left(&self) -> u64 {
+        self.matched.saturating_sub(self.deleted)
+    }
+}
+
 /// Repository for scoped combined belief operations
 pub struct ScopedBeliefRepository;
 
 impl ScopedBeliefRepository {
+    /// Delete the stored `community` folds of `community_id` that counted
+    /// `perspective_id` as a member, after that perspective left the
+    /// community.
+    ///
+    /// A community row is the fold of its members' BBAs on one `(claim,
+    /// frame)`, written when a member submits evidence. Nothing rewrites it
+    /// when the member list shrinks, so without this the row would keep
+    /// serving the removed member's BBAs, permanently when no other member
+    /// submits on that key again. The rows deleted are those on a `(claim,
+    /// frame)` where the perspective holds a live (unretracted) BBA, the
+    /// same set the BBA retract definer clears for a community counting the
+    /// perspective. A community's mass override (`strategy_used =
+    /// 'override'`) folds no member row and is kept.
+    ///
+    /// The rows are derived caches: deleted, not rewritten as vacuous; the
+    /// next submission by a remaining member writes the key afresh.
+    ///
+    /// Runs on the caller's stamped transaction, as the caller: row security
+    /// limits the DELETE to rows owned by a group the session may write
+    /// (migrations 077, 115, 126), so a row on another group's claim is
+    /// left, without an error, and reported in
+    /// [`CommunityFoldsCleared::left`] for the caller to log.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the statement fails.
+    #[instrument(skip(executor))]
+    pub async fn clear_community_folds_of_member<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        community_id: Uuid,
+        perspective_id: Uuid,
+    ) -> Result<CommunityFoldsCleared, DbError> {
+        let (matched, deleted): (i64, i64) = sqlx::query_as(
+            r#"
+            WITH stale AS (
+                SELECT d.id
+                  FROM ds_combined_beliefs d
+                 WHERE d.scope_type = 'community'
+                   AND d.scope_id = $1
+                   AND COALESCE(d.strategy_used, '') <> 'override'
+                   AND EXISTS (
+                       SELECT 1
+                         FROM mass_functions mf
+                        WHERE mf.claim_id = d.claim_id
+                          AND mf.frame_id = d.frame_id
+                          AND mf.perspective_id = $2
+                          AND mf.retracted_at IS NULL)
+            ),
+            gone AS (
+                DELETE FROM ds_combined_beliefs d
+                 USING stale s
+                 WHERE d.id = s.id
+                RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM stale), (SELECT count(*) FROM gone)
+            "#,
+        )
+        .bind(community_id)
+        .bind(perspective_id)
+        .fetch_one(executor)
+        .await?;
+        Ok(CommunityFoldsCleared {
+            matched: u64::try_from(matched).unwrap_or(0),
+            deleted: u64::try_from(deleted).unwrap_or(0),
+        })
+    }
+
     /// Upsert a scoped combined belief
     ///
     /// Uses ON CONFLICT on (frame_id, claim_id, scope_type, scope_id) to update.

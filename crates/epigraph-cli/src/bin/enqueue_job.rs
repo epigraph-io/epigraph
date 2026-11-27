@@ -13,9 +13,10 @@
 //!
 //! 1. The job is read from `--job` or, without it, from stdin, and validated
 //!    by `epigraph_cli::enqueue_job::parse_job`: it must deserialize into an
-//!    `EpiGraphJob` (an unknown or retired kind such as `ThemeClusterRebuild`
-//!    is refused), carry no key its kind lacks, and not be a privatization
-//!    kind (those are enqueued only by their HTTP dispatch).
+//!    `EpiGraphJob` (an unknown or removed kind such as `ThemeClusterRebuild`
+//!    is refused), carry no key its kind lacks, not be a retired kind
+//!    (`EpiGraphJob::is_retired`: no handler exists for it), and not be a
+//!    privatization kind (those are enqueued only by their HTTP dispatch).
 //! 2. `--dry-run` prints the row it would write and exits without connecting.
 //! 3. Otherwise `MAINTENANCE_DATABASE_URL` must be SET (the fallback to
 //!    `DATABASE_URL` is refused, as the drain refuses it) and its login must

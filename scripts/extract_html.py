@@ -20,9 +20,12 @@ SCOPE — structure recovery only:
 
 Usage:
     python3 scripts/extract_html.py https://arxiv.org/html/2603.04139v1 \
-        --output /home/jeremy/tmp/extractions/
+        --output extractions/
     python3 scripts/extract_html.py path/to/page.html --from-file \
-        --uri https://arxiv.org/html/2603.04139v1 --output /home/jeremy/tmp/extractions/
+        --uri https://arxiv.org/html/2603.04139v1 --output extractions/
+
+--output (the directory the JSON is written to) is required; there is no
+default location.
 
 The --from-file mode parses a local HTML file (no network) — used by tests and
 for offline/airgapped operation.
@@ -265,7 +268,10 @@ def main():
     ap.add_argument("input", help="URL, or local .html path with --from-file")
     ap.add_argument("--from-file", action="store_true", help="Treat input as a local HTML file (no network)")
     ap.add_argument("--uri", default="", help="Source URI to record when reading --from-file")
-    ap.add_argument("--output", "-o", default="/home/jeremy/tmp/extractions/")
+    ap.add_argument(
+        "--output", "-o", required=True,
+        help="Directory to write <name>_extraction.json to (required; no default)",
+    )
     args = ap.parse_args()
 
     if args.from_file:
