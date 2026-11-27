@@ -1598,10 +1598,12 @@ than reading zero.
 Defaults to `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource`,
 which is the document the API serves, so most deployments need nothing. Set
 it only when the metadata document is served from a different host. A value
-that cannot go into an HTTP header (control characters, non-ASCII, an
-embedded newline) makes the process `exit(1)` at boot, rather than silently
-dropping the challenge from every 401. `epigraph-mcp`'s
-`--resource-metadata-url` fails fast the same way.
+that is empty, contains non-ASCII bytes or a TAB, is not an absolute
+`http://` / `https://` URL, or cannot go into an HTTP header (control
+characters, an embedded newline) makes the process `exit(1)` at boot, rather
+than silently dropping the challenge from every 401 or advertising one a
+client cannot use. `epigraph-mcp`'s `--resource-metadata-url` (which also
+reads this variable) applies the same rules.
 
 ### `EPIGRAPH_REQUIRE_SIGNATURES`
 
