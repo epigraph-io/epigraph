@@ -961,6 +961,17 @@ pub async fn agent_claims(
     let total =
         EdgeRepository::count_claims_attributed_to(&mut *read, &viewer, id, min_truth).await?;
 
+    // The page's labels, in one read on the same viewer-stamped connection
+    // (backlog a8b785a7: every item used to carry `labels: []`). A failed read
+    // is an error, not an empty label list: `[]` would claim the claims are
+    // unlabelled.
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let mut labels = ClaimRepository::labels_by_ids(&mut *read, &viewer, &ids)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("agent_claims: failed to read the claims' labels: {e}"),
+        })?;
+
     let items: Vec<AttributedClaimResponse> = rows
         .into_iter()
         .map(|row| {
@@ -976,7 +987,7 @@ pub async fn agent_claims(
                 encrypted_content: None,
                 encryption_epoch: None,
                 group_id: None,
-                labels: Vec::new(),
+                labels: labels.remove(&row.id).unwrap_or_default(),
                 was_created: false,
                 authored_by: None,
                 visibility: None,
