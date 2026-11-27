@@ -39,14 +39,15 @@ use std::path::{Path, PathBuf};
 /// module of the same name. Workspace-relative, with `/` separators.
 pub const SPLIT_MODULES: &[&str] = &["crates/epigraph-db/src/repos/claim.rs"];
 
-/// The workspace root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`.
-pub fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/epigraph-db has two ancestors")
-        .to_path_buf()
-}
+/// This crate's directory, written relative to the workspace root, as the
+/// registered paths name it.
+///
+/// Every read here stays inside this crate: a registered path is resolved
+/// against `CARGO_MANIFEST_DIR` with this prefix stripped, never by climbing
+/// to the workspace root. `.github/scripts/test-shard.py` classes a test
+/// that climbs out of its crate and walks a directory as a whole-tree
+/// scanner, which must be declared in its `WALKERS`; this module is not one.
+pub const CRATE_DIR: &str = "crates/epigraph-db/";
 
 /// The key a lint registers `path` under.
 ///
@@ -142,11 +143,20 @@ pub fn module_files_in(root: &Path, registered: &str) -> Vec<(String, String)> {
     out
 }
 
-/// [`module_files_in`] at the workspace root. Panics when the module has no
+/// [`module_files_in`] for a workspace-relative `registered` path inside this
+/// crate ([`CRATE_DIR`]), with the returned paths workspace-relative too.
+/// Panics when the path is outside this crate, and when the module has no
 /// file at all, so a misspelled or deleted path fails instead of passing on
 /// an empty text.
 pub fn module_files(registered: &str) -> Vec<(String, String)> {
-    let out = module_files_in(&repo_root(), registered);
+    let in_crate = registered
+        .strip_prefix(CRATE_DIR)
+        .unwrap_or_else(|| panic!("{registered} is not under {CRATE_DIR}"));
+    let out: Vec<(String, String)> =
+        module_files_in(Path::new(env!("CARGO_MANIFEST_DIR")), in_crate)
+            .into_iter()
+            .map(|(path, text)| (format!("{CRATE_DIR}{path}"), text))
+            .collect();
     assert!(
         !out.is_empty(),
         "no source for module {registered}: neither the file nor a directory module exists"
