@@ -941,7 +941,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "method_gap_analysis",
         &["MethodRepository::get_methods_for_capability"],
     ),
-    // write: the stored analysis is computed from viewer-filtered claims.
+    // write: the stored analysis is computed from viewer-filtered claims and
+    // holds their ids and scores, never their text (backlog e21530f3).
     (
         "gaps.rs",
         "gap_analysis",

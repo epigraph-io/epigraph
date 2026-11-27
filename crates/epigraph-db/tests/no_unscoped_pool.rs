@@ -904,7 +904,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// claim, labels, evidence, trace and structural edges on ONE caller-stamped
 /// `AppState::write_as` transaction, authored by the caller and owned by its
 /// home group (`routes/conventions.rs` 3 -> 2). No file reached zero.
-const HIGH_WATER: usize = 125;
+/// 125 -> 124 (backlog e21530f3): `gap_analysis` searches claims on the
+/// caller's stamped read, and the analysis it stores holds claim ids, not
+/// claim text (`routes/gaps.rs` 5 -> 4). No file reached zero.
+const HIGH_WATER: usize = 124;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1169,14 +1172,15 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // the HTTP public-only reads of 2026-11-05): `add_method` writes on
     // `AppState::write_as` and `find_methods` reads on `AppState::read_as`,
     // both now holding a `Viewer`.
-    // UNCHANGED at 5, deliberately (HTTP public-only reads, 2026-11-05).
-    // `gap_analysis` holds a `Viewer` and its claim search is a read, but the
-    // result feeds `GapRepository::store_gap_analysis`, which persists claim
-    // text into `gap_analyses` -- a table with no tenancy that the viewer-less
-    // `surface_gaps` serves back to any caller. Stamping the read would start
-    // copying group-private content there. Its owner is a tenancy decision
-    // for `gap_analyses`, not an executor swap.
-    ("routes/gaps.rs", 5),
+    // 5 -> 4 (backlog e21530f3): `gap_analysis`'s claim search now runs on
+    // the caller's stamped read. It was held at 5 (HTTP public-only reads,
+    // 2026-11-05) because the result fed claim TEXT into `gap_analyses`, a
+    // table with no tenancy that `surface_gaps` serves to any caller; the
+    // stored `GapRecord` now carries the claim id and fixed templates only,
+    // so stamping the read copies no group-private content there. Its
+    // `store_gap_analysis` stays on the pool: an append-only, untenanted row
+    // holding ids and scores.
+    ("routes/gaps.rs", 4),
     // 4 before conversion shard 7, which moved `expand` onto
     // `AppState::read_as`. ONE register site spending its alias on FOUR
     // statements: two inline run/cluster-metadata probes, the viewer-spliced

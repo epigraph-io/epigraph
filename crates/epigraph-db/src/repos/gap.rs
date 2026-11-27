@@ -8,12 +8,25 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// A single gap identified between graph-constrained and unconstrained analyses.
+///
+/// # What a stored record may carry
+///
+/// `gap_analyses` has no tenancy columns, and `POST /api/v1/gaps/surface`
+/// serves any stored analysis to any caller who names its id. So a record that
+/// is PERSISTED names the claim it is about by [`Self::nearest_claim_id`] and
+/// holds no claim text: `unconstrained_claim` is a fixed template around ids
+/// and scores, and `nearest_graph_claim` is `None`. A reader resolves the id
+/// through its own caller's viewer, which is where a group-private claim stays
+/// private. Rows written before the id existed deserialize with it `None`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GapRecord {
     pub gap_type: String,
     pub severity: f64,
     pub unconstrained_claim: String,
     pub nearest_graph_claim: Option<String>,
+    /// The graph claim this gap is about, when there is one.
+    #[serde(default)]
+    pub nearest_claim_id: Option<Uuid>,
     pub nearest_similarity: f64,
     pub graph_inference_path: Option<String>,
     pub recommendation: String,
