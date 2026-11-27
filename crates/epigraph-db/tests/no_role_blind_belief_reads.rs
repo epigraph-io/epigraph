@@ -127,25 +127,12 @@ const ROW_TYPES: &[&str] = &[
 ];
 
 /// The plan PRs a reader may be tagged with (IMPL-PLAN rows that convert a
-/// reader), plus `unassigned` for a reader no plan row converts yet.
+/// reader). There is no `unassigned`: every reader is converted, tagged with
+/// the plan PR that converts it, or ruled [`Tag::ByDesign`] (backlog
+/// e178dfe0), so a new reader no plan row converts needs a ruling first.
 const PLAN_PRS: &[&str] = &[
-    "PR-1",
-    "PR-5b1",
-    "PR-5b2",
-    "PR-C2",
-    "PR-F2",
-    "PR-M1",
-    "PR-M2",
-    "PR-R1a",
-    "PR-R1b",
-    "PR-R2",
-    "PR-R3",
-    "PR-R5",
-    "PR-W1a",
-    "PR-W1b",
-    "PR-W1c",
-    "PR-W4",
-    "unassigned",
+    "PR-1", "PR-5b1", "PR-5b2", "PR-C2", "PR-F2", "PR-M1", "PR-M2", "PR-R1a", "PR-R1b", "PR-R2",
+    "PR-R3", "PR-R5", "PR-W1a", "PR-W1b", "PR-W1c", "PR-W4",
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -164,9 +151,9 @@ enum Tag {
 }
 
 /// Every role-blind belief reader (and writer) in the tree today, measured
-/// on this branch. A reader names the plan PR that converts it; `unassigned`
-/// marks a reader no plan row converts yet (D5 cannot pass while one is
-/// left). Sorted by path, then unit.
+/// on this branch. A reader names the plan PR that converts it, or the
+/// operator ruling that keeps it role-blind by design. Sorted by path, then
+/// unit.
 const REGISTER: &[(&str, &str, Tag)] = &[
     // --- epigraph-api -------------------------------------------------------
     ("crates/epigraph-api/src/routes/belief.rs", "claim_divergence", Tag::Todo { pr: "PR-R1b", why: "REST divergence serves a compound's BetP divergence; SPEC §7.2 reads it as derived, see leaves" }),
