@@ -69,13 +69,13 @@ pub struct CorpusCounts {
     /// `None` when `detailed` was false.
     pub embedded_claims: Option<i64>,
     /// Readable claims carrying a signature (`claims.signature IS NOT NULL`,
-    /// backlog 953d5707). Like `edges_signed`, an upper bound on verifiable
-    /// claims: presence is counted, not verified. `None` when `detailed` was
-    /// false.
+    /// backlog 953d5707), whoever signed them. Like `edges_signed`, an upper
+    /// bound on verifiable claims: presence is counted, not verified. `None`
+    /// when `detailed` was false.
     pub signed_claims: Option<i64>,
-    /// Readable claims with no signature: no server or agent attested them.
-    /// Counted in the SAME statement as `signed_claims`, so the two always
-    /// add up to one snapshot's claim count. `None` when `detailed` was false.
+    /// Readable claims with no signature. Counted in the same scan as
+    /// `claims`, so `signed_claims + unsigned_claims == claims` exactly.
+    /// `None` when `detailed` was false.
     pub unsigned_claims: Option<i64>,
 }
 
@@ -121,19 +121,27 @@ impl CorpusStatsRepository {
     ) -> Result<CorpusCounts, DbError> {
         // `WHERE true` gives every marker a preceding predicate to append
         // ` AND (...)` to; `predicate_fragment` deliberately starts with AND.
+        //
+        // The claim count and its signed share come from ONE scan of `claims`
+        // (the derived table `cs`), so the signing metric costs no extra scan
+        // and `claims = signed + unsigned` holds within one response.
         let base = r"
             SELECT
-              (SELECT COUNT(*) FROM claims c
-                 WHERE true /* {VISIBILITY:c} */)    AS claims,
+              cs.total                               AS claims,
+              cs.signed                              AS signed_claims,
               (SELECT COUNT(*) FROM evidence ev
                  WHERE true /* {VISIBILITY:ev} */)   AS evidence,
               (SELECT COUNT(*) FROM edges eg
                  WHERE true /* {EDGE_VISIBILITY:eg} */)   AS edges,
               (SELECT COUNT(*) FROM frames f
                  WHERE true /* {VISIBILITY:f} */)    AS frames
+            FROM (SELECT COUNT(*) AS total,
+                         COUNT(*) FILTER (WHERE c.signature IS NOT NULL) AS signed
+                    FROM claims c
+                   WHERE true /* {VISIBILITY:c} */) cs
         ";
         let sql = viewer.splice(base, 1);
-        let mut q = sqlx::query_as::<_, (i64, i64, i64, i64)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(&sql);
         // Guarded, not `unwrap_or(&[])`. `render_predicate` emits nothing at
         // all for a `Bypass` viewer, so an unconditional bind sends one more
         // parameter than the rendered statement references and Postgres
@@ -144,7 +152,7 @@ impl CorpusStatsRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let (claims, evidence, edges, frames) = q.fetch_one(&mut *conn).await?;
+        let (claims, signed, evidence, edges, frames) = q.fetch_one(&mut *conn).await?;
 
         let mut out = CorpusCounts {
             claims,
@@ -169,26 +177,19 @@ impl CorpusStatsRepository {
                                     WHERE chc.id = ch.claim_id /* {VISIBILITY:chc} */))
                                                                               AS challenges,
                   (SELECT COUNT(*) FROM claims c2
-                     WHERE c2.embedding IS NOT NULL /* {VISIBILITY:c2} */)    AS embedded_claims,
-                  cs.total                                                    AS claims_total,
-                  cs.signed                                                   AS signed_claims
-                FROM (SELECT COUNT(*) AS total,
-                             COUNT(*) FILTER (WHERE c3.signature IS NOT NULL) AS signed
-                        FROM claims c3
-                       WHERE true /* {VISIBILITY:c3} */) cs
+                     WHERE c2.embedding IS NOT NULL /* {VISIBILITY:c2} */)    AS embedded_claims
             ";
             let detail_sql = viewer.splice(detail_base, 1);
-            let mut dq = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(&detail_sql);
+            let mut dq = sqlx::query_as::<_, (i64, i64, i64)>(&detail_sql);
             if let Some(g) = viewer.group_bind() {
                 dq = dq.bind(g);
             }
-            let (workflow_claims, challenges, embedded_claims, claims_total, signed_claims) =
-                dq.fetch_one(&mut *conn).await?;
+            let (workflow_claims, challenges, embedded_claims) = dq.fetch_one(&mut *conn).await?;
             out.workflow_claims = Some(workflow_claims);
             out.challenges = Some(challenges);
             out.embedded_claims = Some(embedded_claims);
-            out.signed_claims = Some(signed_claims);
-            out.unsigned_claims = Some(claims_total - signed_claims);
+            out.signed_claims = Some(signed);
+            out.unsigned_claims = Some(claims - signed);
         }
 
         Ok(out)
