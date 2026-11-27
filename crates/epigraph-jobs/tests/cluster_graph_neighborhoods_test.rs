@@ -238,6 +238,36 @@ async fn theme_claim(
     id
 }
 
+/// The `workflow-ingest` system agent (migration 148), the only author whose
+/// `source_type: workflow` root stamp makes a tree procedural: the one already
+/// registered in this shared test database, else `agent`, planted directly
+/// with triggers off (the role is the registry's primary key).
+async fn workflow_ingest_agent(pool: &sqlx::PgPool, agent: Uuid) -> Uuid {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, registered_public_key, reason)
+         SELECT 'workflow-ingest', a.id, a.public_key, 'neighbourhood test plant'
+           FROM public.agents a WHERE a.id = $1
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(agent)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let registered: Uuid = sqlx::query_scalar(
+        "SELECT agent_id FROM public.system_agents WHERE role = 'workflow-ingest'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    registered
+}
+
 /// Backlog fe1cdcdf: the theme subgraph is atoms-only by the ONE role
 /// predicate (`claim_role::IS_COMPOUND_SQL`), not a hand-rolled "has any
 /// `decomposes_to` out-edge" test. A compound's cached BetP stays out of the
@@ -245,6 +275,11 @@ async fn theme_claim(
 /// RETIRED (`valid_to` in the past) is no compound and counts as the atom it
 /// now is. The old predicate read every `decomposes_to` row, in force or not,
 /// so it dropped that claim and averaged the remaining atom alone.
+///
+/// A workflow tree (`claim_role::IS_PROCEDURAL_SQL`) is out too, its LEAF
+/// included: a workflow claim's truth is a lifecycle marker, not a belief
+/// (the procedural ruling the role-blind register's ByDesign rows cite). The
+/// old predicate kept a workflow leaf, which has no out-edge.
 #[tokio::test(flavor = "multi_thread")]
 async fn neighbourhood_betp_reads_atoms_by_the_role_predicate() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
@@ -274,9 +309,23 @@ async fn neighbourhood_betp_reads_atoms_by_the_role_predicate() {
     let compound = theme_claim(&pool, agent, Some(theme_id), "compound", 0.9).await;
     let retired_parent = theme_claim(&pool, agent, Some(theme_id), "retired parent", 0.8).await;
     let child = theme_claim(&pool, agent, None, "child", 0.5).await;
-    for (parent, valid_to) in [
-        (compound, "NULL"),
-        (retired_parent, "now() - interval '1 day'"),
+    let workflow_author = workflow_ingest_agent(&pool, agent).await;
+    let workflow_root =
+        theme_claim(&pool, workflow_author, Some(theme_id), "workflow root", 0.9).await;
+    sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"source_type\": \"workflow\"}'
+          WHERE id = $1",
+    )
+    .bind(workflow_root)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let workflow_leaf =
+        theme_claim(&pool, workflow_author, Some(theme_id), "workflow leaf", 0.9).await;
+    for (parent, child, valid_to) in [
+        (compound, child, "NULL"),
+        (retired_parent, child, "now() - interval '1 day'"),
+        (workflow_root, workflow_leaf, "NULL"),
     ] {
         sqlx::query(&format!(
             "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship,
@@ -290,6 +339,20 @@ async fn neighbourhood_betp_reads_atoms_by_the_role_predicate() {
         .await
         .unwrap();
     }
+    // Calibration: the workflow leaf IS procedural, so its absence below is
+    // the role predicate's doing and not a fixture that missed the stamp.
+    let leaf_is_procedural: bool = sqlx::query_scalar(&format!(
+        "SELECT {} FROM claims c WHERE c.id = $1",
+        epigraph_db::repos::claim_role::is_procedural_sql("c"),
+    ))
+    .bind(workflow_leaf)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        leaf_is_procedural,
+        "calibration: the workflow leaf is procedural"
+    );
 
     epigraph_jobs::cluster_graph::neighborhood::run_theme_neighborhoods(
         &pool,
@@ -323,12 +386,14 @@ async fn neighbourhood_betp_reads_atoms_by_the_role_predicate() {
     assert_eq!(
         members,
         [atom, retired_parent].into_iter().collect(),
-        "the compound {compound} is no member; the retired parent is an atom"
+        "the compound {compound} is no member, nor is the workflow tree \
+         ({workflow_root}, its leaf {workflow_leaf}); the retired parent is an atom"
     );
     assert_eq!(size, 2);
     let mean = mean_betp.expect("mean_betp over two atoms");
     assert!(
         (mean - 0.5).abs() < 1e-9,
-        "mean_betp = (0.2 + 0.8) / 2, the compound's 0.9 excluded; got {mean}"
+        "mean_betp = (0.2 + 0.8) / 2, the compound's and the workflow tree's 0.9 \
+         excluded; got {mean}"
     );
 }
