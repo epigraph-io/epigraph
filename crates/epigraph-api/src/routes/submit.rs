@@ -482,9 +482,15 @@ async fn validate_packet(packet: &EpistemicPacket, state: &AppState) -> Result<(
     // write this guard protects — `submit_packet`'s raw `UPDATE claims SET
     // labels` — is itself `#[cfg(feature = "db")]`, so without `db` there is no
     // persistence path for an unexpanded label to reach.
+    //
+    // The same block bounds the label set (backlog 854165dd): at most
+    // `MAX_LABELS_PER_CLAIM` labels, none empty or longer than
+    // `MAX_LABEL_CHARS` characters.
     #[cfg(feature = "db")]
     {
-        if let Err(e) = epigraph_db::reject_unexpanded_labels(&packet.claim.labels) {
+        let checked = epigraph_db::reject_unexpanded_labels(&packet.claim.labels)
+            .and_then(|()| epigraph_db::check_label_bounds(&packet.claim.labels));
+        if let Err(e) = checked {
             let reason = match e {
                 epigraph_db::DbError::InvalidData { reason } => reason,
                 other => other.to_string(),
@@ -493,7 +499,11 @@ async fn validate_packet(packet: &EpistemicPacket, state: &AppState) -> Result<(
                 RefusalStatus::BadRequest,
                 "ValidationError",
                 reason,
-                serde_json::json!({ "field": "claim.labels" }),
+                serde_json::json!({
+                    "field": "claim.labels",
+                    "max_labels": epigraph_db::MAX_LABELS_PER_CLAIM,
+                    "max_label_chars": epigraph_db::MAX_LABEL_CHARS
+                }),
             ));
         }
     }
@@ -1331,7 +1341,8 @@ async fn persist_packet(
     // Set labels at creation (parity with `claims.rs::create_claim`), so a
     // multi-principal writer labels the claim it just created as the creator —
     // no separate ownership-gated label PATCH (which would need `claims:admin`).
-    // Guarded on creation: a duplicate submit must not relabel another run's claim.
+    // Guarded on creation: a duplicate submit must not relabel another run's claim
+    // (pinned by `submit_packet_dedup_leaves_the_first_submits_labels`).
     if was_created && !packet.claim.labels.is_empty() {
         sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
             .bind(&packet.claim.labels)
