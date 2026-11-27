@@ -890,44 +890,69 @@ async fn find_workflow_post_embed(
     success_json(&results)
 }
 
+/// The in-force workflow references touching each of `workflow_ids`
+/// (backlog 41d7b27a), as `viewer` reads them, in ONE statement on the
+/// caller's stamped read. Best-effort, like the other hierarchical
+/// enrichments: the read runs in its own savepoint, so a failure (a
+/// statement timeout on a widely referenced workflow, say) returns `None`,
+/// the caller omits `references`, and the rest of the read stays usable.
+/// Both workflow readers (`find_workflow`, `find_workflow_hierarchical`)
+/// share it, so they fail the same way.
+pub(crate) async fn workflow_references_best_effort(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    workflow_ids: &[uuid::Uuid],
+    tool: &str,
+) -> Option<std::collections::HashMap<uuid::Uuid, Vec<crate::types::WorkflowReference>>> {
+    use sqlx::Acquire;
+    if workflow_ids.is_empty() {
+        return Some(std::collections::HashMap::new());
+    }
+    let mut sp = match conn.begin().await {
+        Ok(sp) => sp,
+        Err(e) => {
+            tracing::warn!("{tool}: could not open the references read: {e}");
+            return None;
+        }
+    };
+    match WorkflowRepository::references_of_conn(&mut sp, viewer, workflow_ids).await {
+        Ok(found) => {
+            if let Err(e) = sp.commit().await {
+                tracing::warn!("{tool}: could not end the references read: {e}");
+                return None;
+            }
+            Some(
+                found
+                    .into_iter()
+                    .map(|(id, rows)| (id, rows.into_iter().map(Into::into).collect()))
+                    .collect(),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("{tool}: workflow references lookup failed: {e}");
+            let _ = sp.rollback().await;
+            None
+        }
+    }
+}
+
 /// Fill `references` on the hierarchical entries of `results` (backlog
-/// 41d7b27a): the in-force `invokes`, `depends_on`, `related_to` and
-/// `alternative_of` references touching each workflow, as `viewer` reads
-/// them, in ONE statement on the caller's stamped read. Best-effort, like the
-/// other hierarchical enrichments: the read runs in its own savepoint, so a
-/// failure leaves `references` absent and the rest of the read usable.
+/// 41d7b27a), through [`workflow_references_best_effort`]: a failed lookup
+/// leaves `references` absent.
 async fn attach_workflow_references(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     workflow_ids: &[uuid::Uuid],
     results: &mut [FindWorkflowResult],
 ) {
-    use sqlx::Acquire;
     if workflow_ids.is_empty() {
         return;
     }
-    let mut sp = match conn.begin().await {
-        Ok(sp) => sp,
-        Err(e) => {
-            tracing::warn!("find_workflow: could not open the references read: {e}");
-            return;
-        }
+    let Some(mut found) =
+        workflow_references_best_effort(conn, viewer, workflow_ids, "find_workflow").await
+    else {
+        return;
     };
-    let mut found =
-        match WorkflowRepository::references_of_conn(&mut sp, viewer, workflow_ids).await {
-            Ok(found) => {
-                if let Err(e) = sp.commit().await {
-                    tracing::warn!("find_workflow: could not end the references read: {e}");
-                    return;
-                }
-                found
-            }
-            Err(e) => {
-                tracing::warn!("find_workflow: workflow references lookup failed: {e}");
-                let _ = sp.rollback().await;
-                return;
-            }
-        };
     let wanted: std::collections::HashSet<String> =
         workflow_ids.iter().map(ToString::to_string).collect();
     for result in results.iter_mut() {
@@ -937,14 +962,7 @@ async fn attach_workflow_references(
         let Ok(id) = result.workflow_id.parse::<uuid::Uuid>() else {
             continue;
         };
-        result.references = Some(
-            found
-                .remove(&id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        );
+        result.references = Some(found.remove(&id).unwrap_or_default());
     }
 }
 
