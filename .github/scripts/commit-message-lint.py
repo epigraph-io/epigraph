@@ -2,6 +2,7 @@
 """Lint the messages of the commits a change adds (CI gate, stdlib only).
 
     .github/scripts/commit-message-lint.py <base> <head>
+    .github/scripts/commit-message-lint.py --cited-shas <base> <head>
 
 Reads the NON-MERGE commits in <base>..<head> (only <head> when <base> is empty
 or all zeros) and reports per commit. ERRORS fail the run (exit 1):
@@ -24,7 +25,19 @@ WARNINGS never change the exit status: W2 a subject outside
 sections. Offending values are NEVER printed (public CI logs): each finding is
 redacted, and a subject that itself holds an error is withheld. Run from the
 repository root.
+
+`--cited-shas` runs ONLY W4 and always exits 0 (a workflow on every push to
+main runs it, .github/workflows/cited-sha-check.yml): W4 a token in a message
+that looks like a commit sha (9-40 lowercase hex characters holding a digit and
+a letter, not part of a UUID or a longer hex run and not right after `@`; or
+7-8 hex characters right after the word `commit`) that names no commit
+REACHABLE from <head>. Reachability, not `git cat-file -e`: a full clone holds
+every branch's objects, so a sha that lives only on an unmerged or rebased-away
+branch still resolves there but is not on main. Trailer lines are not read.
+The rule it enforces: cite a commit by sha only once it is on main (or earlier
+in the same change); cite anything else by PR number and subject.
 """
+import bisect
 import os
 import ipaddress
 import re
@@ -69,6 +82,16 @@ CREATE_FN_RE = re.compile(r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b", re.I)
 DEFINER_RE = re.compile(r"SECURITY\s+DEFINER", re.I)
 # A unified-diff hunk header: old start/count, new start/count.
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# W4: a sha-like token. Not inside a word, a UUID (hyphen) or a longer hex run
+# such as a 64-hex content hash (the 40 cap plus the boundary), and not right
+# after `@` (an action pin or another repository's revision).
+CITED_SHA_RE = re.compile(r"(?<![0-9A-Za-z_@-])([0-9a-f]{9,40})(?![0-9A-Za-z_-])")
+# W4: a short sha (7-8 hex) counts only right after the word `commit(s)`, so an
+# 8-hex backlog claim-id prefix elsewhere is not read as a sha.
+CITED_SHORT_RE = re.compile(r"\bcommits?\s+`?([0-9a-f]{7,8})(?![0-9A-Za-z_-])", re.I)
+# W4: a hex run labelled as a content hash just before it ("sha256 <hex>",
+# "blake3: <hex>", "hash=<hex>") is a digest, not a commit.
+HASH_LABEL_RE = re.compile(r"(?:sha-?256|sha-?512|blake3|md5|hash)[\s:=]*`?$", re.I)
 
 
 def is_public_ipv4(text):
@@ -210,9 +233,68 @@ def lint(subject, message):
     return errors, warnings
 
 
+def cited_shas(message):
+    """The sha-like tokens a message cites (W4), in order, trailers skipped. A
+    token needs a digit and a letter: an all-digit run is a number or a date,
+    an all-letter one a word. A 32-hex run is a hyphenless UUID or an MD5, and a
+    run labelled as a hash is a digest; neither is read as a sha."""
+    found = []
+    for line in message.split("\n"):
+        if TRAILER_RE.match(line):
+            continue
+        spans = []
+        for rx in (CITED_SHA_RE, CITED_SHORT_RE):
+            for m in rx.finditer(line):
+                tok = m.group(1).lower()
+                if not (re.search(r"[0-9]", tok) and re.search(r"[a-f]", tok)):
+                    continue
+                if len(tok) == 32 or HASH_LABEL_RE.search(line[:m.start(1)]):
+                    continue
+                spans.append((m.start(1), tok))
+        found += [tok for _, tok in sorted(set(spans))]
+    return found
+
+
+def reachable_from(head):
+    """Sorted full shas of every commit reachable from <head>, for prefix lookup."""
+    out = subprocess.run(["git", "rev-list", head], check=True,
+                         capture_output=True, text=True).stdout
+    return sorted(out.split())
+
+
+def resolves(token, reachable):
+    """True when <token> is a prefix of a commit in the sorted <reachable> list."""
+    i = bisect.bisect_left(reachable, token)
+    return i < len(reachable) and reachable[i].startswith(token)
+
+
+def main_cited(base, head):
+    """`--cited-shas`: report W4 for each cited sha not reachable from <head>."""
+    reachable = reachable_from(head)
+    n = n_tok = n_warn = 0
+    for sha, subject, message in commits(base, head):
+        n += 1
+        shown = ("<subject withheld: holds an error or a cited token>"
+                 if scan_line(subject) or scan_deny(subject) or cited_shas(subject)
+                 else subject[:72])
+        for k, tok in enumerate(cited_shas(message), 1):
+            n_tok += 1
+            if not resolves(tok, reachable):
+                n_warn += 1
+                # The token itself is never printed: a hex run could be a secret.
+                print(f"warning W4 {sha[:10]} [{shown}]: cited sha-like token #{k} "
+                      f"({len(tok)} hex chars) names no commit reachable from the scanned head; "
+                      "cite work not on main by PR number and subject")
+    print(f"commit-message-lint --cited-shas: {n} commit(s), {n_tok} cited token(s), "
+          f"{n_warn} warning(s)")
+    return 0
+
+
 def main(argv):
+    if len(argv) == 4 and argv[1] == "--cited-shas":
+        return main_cited(argv[2], argv[3])
     if len(argv) != 3:
-        print("usage: commit-message-lint.py <base> <head>", file=sys.stderr)
+        print("usage: commit-message-lint.py [--cited-shas] <base> <head>", file=sys.stderr)
         return 2
     n = n_err = n_warn = 0
     print(f"commit-message-lint: private deny-list {'configured' if DENY else 'not configured'}")
