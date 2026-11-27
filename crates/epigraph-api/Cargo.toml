@@ -85,7 +85,7 @@ subtle = "2.5"  # Constant-time comparison for signature verification
 hex = "0.4"  # Hex encoding for public keys
 base64 = "0.22"  # Base64 encoding for signatures
 utoipa = { workspace = true }  # OpenAPI documentation generation
-async-trait = { workspace = true }  # Async trait definitions for harvester client
+async-trait = { workspace = true }
 dotenvy = "0.15"  # Load .env file at startup
 prometheus-client = "0.22"  # Prometheus metrics exposition (GET /metrics)
 # OpenTelemetry — optional, enabled via --features otel

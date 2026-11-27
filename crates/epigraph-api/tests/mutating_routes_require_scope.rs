@@ -170,7 +170,6 @@ fn claims_write_routes() -> Vec<(Method, String)> {
         (Method::POST, "/api/v1/submit/packet".into()),
         (Method::POST, "/api/v1/gaps/analysis".into()),
         (Method::POST, "/api/v1/gaps/surface".into()),
-        (Method::POST, "/api/v1/harvest".into()),
     ]
 }
 

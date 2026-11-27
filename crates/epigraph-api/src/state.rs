@@ -13,7 +13,6 @@ use epigraph_db::PgPool;
 
 use crate::middleware::SignatureVerificationState;
 use crate::oauth::providers::ProviderRegistry;
-use crate::routes::harvest::HarvesterClient;
 use crate::security::audit::InMemorySecurityAuditLog;
 use crate::security::AgentRateLimiter;
 use chrono::{DateTime, Utc};
@@ -229,13 +228,6 @@ pub async fn hydrate_webhook_store(
 /// When present, it provides real vector embeddings for semantic search.
 /// When absent, semantic search falls back to mock embeddings.
 pub type SharedEmbeddingService = Arc<dyn EmbeddingService>;
-
-/// Thread-safe harvester gRPC client type alias
-///
-/// The harvester client is optional. When present, the `POST /api/v1/harvest`
-/// endpoint forwards requests to the Python harvester gRPC service.
-/// When absent, the endpoint returns 503 Service Unavailable.
-pub type SharedHarvesterClient = Arc<dyn HarvesterClient>;
 
 /// Thread-safe write-authorization gate.
 ///
@@ -471,11 +463,6 @@ pub struct AppState {
     /// own guard in `bin/server.rs` (`start_webhook_dispatcher`), so a test
     /// fixture's stub here can never become the resolver deliveries dial by.
     pub webhook_egress: epigraph_jobs::egress::EgressGuard,
-    /// Optional harvester gRPC client for claim extraction
-    ///
-    /// When present, the `POST /api/v1/harvest` endpoint forwards text
-    /// to the Python harvester service. When absent, returns 503.
-    pub harvester_client: Option<SharedHarvesterClient>,
     /// JWT signing configuration for OAuth2 tokens
     ///
     /// Stored once at startup via `Arc` to avoid recreating per request.
@@ -1335,7 +1322,6 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
@@ -1396,7 +1382,6 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
@@ -1431,7 +1416,6 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
@@ -2016,7 +2000,6 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
@@ -2053,7 +2036,6 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
@@ -2103,7 +2085,6 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
