@@ -291,12 +291,16 @@ def world(tmp_path):
     _retract(cur, w.ids["retracted_slot"], agent, group)
     w.retracted.append(w.ids["retracted_slot"])
 
-    # EDGE_SLOT / ASSESSMENT_SLOT: an edge-factor and an assessment BBA on a
-    # claim with exactly one evidence row. Neither is evidence-derived.
-    c_other = claim()
-    _evidence(cur, c_other)
-    w.ids["edge_slot"] = _bba(cur, c_other, frame, agent, "edge", str(uuid.uuid4()))
-    w.ids["assessment_slot"] = _bba(cur, c_other, frame, agent, "assessment", str(uuid.uuid4()))
+    # EDGE_SLOT / ASSESSMENT_SLOT: an edge-factor and an assessment BBA, each
+    # alone on a claim with exactly one evidence row (alone, so pass 2's
+    # competing-row check cannot be what refuses them). Neither is
+    # evidence-derived.
+    c_edge = claim()
+    _evidence(cur, c_edge)
+    w.ids["edge_slot"] = _bba(cur, c_edge, frame, agent, "edge", str(uuid.uuid4()))
+    c_assess = claim()
+    _evidence(cur, c_assess)
+    w.ids["assessment_slot"] = _bba(cur, c_assess, frame, agent, "assessment", str(uuid.uuid4()))
 
     # SEED / COMBINED: unslotted rows that are not evidence-derived, each alone
     # on a claim with exactly one evidence row (alone, so the one-to-one check
