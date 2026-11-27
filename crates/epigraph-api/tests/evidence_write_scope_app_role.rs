@@ -266,8 +266,8 @@ async fn post_evidence_on_an_unreadable_claim_answers_as_a_missing_one(pool: PgP
     );
 }
 
-/// `(relationship, owner_group_id)` of every edge touching `claim` whose other
-/// end is not evidence (the convention's structural AUTHORED / TRACES /
+/// `(relationship, source_type, target_type)` of every edge touching `claim`
+/// with no evidence endpoint (the convention's structural AUTHORED / TRACES /
 /// HAS_TRACE edges), sorted.
 async fn structural_edges_of(pool: &PgPool, claim: Uuid) -> Vec<(String, String, String)> {
     let mut rows: Vec<(String, String, String)> = sqlx::query_as(
