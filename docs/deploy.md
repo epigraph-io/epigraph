@@ -621,7 +621,7 @@ For the others, anything else is off.
 | `EPIGRAPH_GUEST_READS` | `off` | `on` serves every `visibility = 'public'` claim, edge and theme count to signed-out callers under `GET /api/v1/guest/*` (`docs/tenancy.md`); off, each answers 404. Any other value stays off and is warned about. With no rate limit configured, the guest routes are limited at 600 a minute per client address (Step 8, "Rate limiting"). |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
 | `OPENAI_API_KEY`, `JINA_API_KEY`, `EMBEDDING_DIMENSION` | unset, unset, `1536` | The embedding provider. OpenAI first; then Jina, which works only in a build with the `jina` feature; otherwise a mock provider for development (`Embedding service: Mock (development only)`). |
-| `CALIBRATION_PATH` | the `calibration.toml` compiled into the binary | An override file. One that does not load is logged as an error, and the compiled-in calibration is served instead. Changes need a restart. |
+| `CALIBRATION_PATH` | the `calibration.toml` compiled into the binary | An override file. One that does not load is logged as an error, and the compiled-in calibration is served instead. Changes need a restart, and a changed calibration needs a belief recompute after the rollout ([section 11](#every-upgrade-a-calibration-change-needs-a-belief-recompute)). |
 | `EPIGRAPH_ATOM_FOLD` (`legacy`\|`aef_standalone`\|`aef`), `EPIGRAPH_COMPOUND_BELIEF` (`legacy`\|`shadow`\|`progressive`\|`strict`), `EPIGRAPH_COMPOUND_WRITE_GUARD` (`warn`\|`refuse`), `EPIGRAPH_COMPOUND_SOURCE_EDGES` (`frozen`\|`excluded`), `EPIGRAPH_ATOM_CACHE_MODE` (`display`\|`pure`), `EPIGRAPH_INFERENCE` (`off`\|`shadow`\|`on`) | the first value listed for each | The belief modes. Logged at boot (`belief modes read at startup`) and reported in `/health`. An unrecognised value runs the default and logs `belief-mode flag ignored`. `EPIGRAPH_COMPOUND_WRITE_GUARD` governs the textless BBA writers (MCP `submit_ds_evidence`, `POST /api/v1/frames/:id/evidence`, `POST /api/v1/claims/:id/assess`) on a compound target: `warn` accepts the write (never folded into the compound's cached belief), answers `deprecated_compound_target` and logs a WARN under target `epigraph::compound_write_guard` (writer, claim id, caller) once the write commits, so a request that fails later adds no line; `refuse` refuses it (422 / `invalid_params`, `compound_target`) before anything is written. Read that log before flipping to `refuse`. |
 | `RUST_LOG` | `info,epigraph_api=debug` | Log filter. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | In an `otel` build, only logged: the OTLP exporter is not initialised by this binary. |
@@ -4866,6 +4866,46 @@ Undo: re-run 011's `edge_to_factor_type` body and 090's index statement.
 Both files are unchanged and re-runnable. A factor backfill for `corroborates`
 / `refutes` edges that have no factors row is a separate decision, not part
 of 175.
+
+### Every upgrade: a calibration change needs a belief recompute
+
+The cached DS beliefs on `claims` are folded under the served belief profile,
+which is built from the calibration (`epigraph-engine`'s `belief_profile.rs`).
+Nothing recomputes them when the calibration changes, so they stay on the old
+profile until recomputed (backlog `4d14e902`, ruling `a2162099`). On every
+upgrade:
+
+1. **Diff the calibration the new release serves against the deployed one.**
+   With `CALIBRATION_PATH` set, diff the file the new units will read against
+   the one the running units read. With it unset, the binaries serve the
+   `calibration.toml` compiled into them:
+   `git diff <deployed commit> <new commit> -- calibration.toml`. No change:
+   skip this section.
+2. **Roll the release out.** A process reads the calibration once, at its
+   first use, so the API, the MCP servers and every job or timer binary that
+   writes beliefs must restart on the new one, with the same
+   `CALIBRATION_PATH`.
+3. **Then recompute the cohort on the maintenance session**, from the NEW
+   build and with the API's `CALIBRATION_PATH` and belief modes (each run
+   loads the calibration itself, and the writing runs check the modes against
+   the API's `/health`):
+   * Under `EPIGRAPH_ATOM_FOLD=legacy` (the default): `recompute_claim_belief`
+     over every current claim with a cached belief
+     (`SELECT id FROM claims WHERE is_current AND pignistic_prob IS NOT NULL`
+     on the maintenance DSN), with `--snapshot <wave file>` and the disk gate
+     ([section 5](#pool-sizing-and-the-recompute-binaries)). A bad run is
+     undone with `restore_belief_cache --from <wave file>`.
+   * Under an atom fold: `recompute_betp` waves (`--role standalone`, then
+     `--role leaf` under `aef`), dry run first, each with its own wave file.
+
+The recompute refolds the stored rows. It does not rewrite rows built from
+the profile's write-time constants (the edge-factor parameters and the DS
+write path's bounds; `belief_profile.rs`, "Where it applies"), which keep the
+profile they were written under.
+
+A frame or perspective override is not covered here: under the same ruling
+the override writer (backlog `8773a687`, not built yet) must schedule the
+affected frame's recompute in the same act, or refuse the write.
 
 ## 12. Undo scripts and rollback order
 
