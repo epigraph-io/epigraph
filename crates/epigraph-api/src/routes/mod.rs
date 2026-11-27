@@ -450,6 +450,26 @@ pub fn create_router(state: AppState) -> Router {
 /// inherit scope checks or tenancy; see [`extensions`] for that contract.
 /// Passing no extensions is exactly [`create_router`].
 ///
+/// # Startup gates are the caller's
+///
+/// This builds routes; it checks nothing about the process or the database.
+/// An embedder must run the gates `bin/server.rs::main` runs, in its order,
+/// before it serves the returned router:
+///
+/// 1. **Environment gates, before any connection:**
+///    [`crate::state::request_unit_may_start`] (no maintenance DSN in a
+///    request-serving process) and [`epigraph_auth::check_kernel_jwt_keys`]
+///    (the JWT key gate). `AppState`'s default JWT config applies the latter
+///    only when `EPIGRAPH_ENV` is set to anything but a known non-production
+///    name; the binary applies it always.
+/// 2. **The session-GUC probe**, on the `ScopedPool` the state is built from
+///    (`epigraph_db::ScopedPool::probe_session_gucs`, unless the pool runs in
+///    transaction GUC mode).
+/// 3. **[`crate::boot::check_db_posture`]**, on the request pool after
+///    migrations: the pgvector floor, the passkey software-attestation and
+///    operator-binding refusals, the tenancy-trigger assertion and the RLS
+///    posture assertion.
+///
 /// # Panics
 /// When two extensions share a name.
 #[cfg(feature = "db")]

@@ -616,15 +616,19 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "state.rs",
-        12,
+        9,
         "Boot and observability, including the session-GUC probe itself. ENUMERATED rather than \
          waved at, because this is the one file where the needle is an indirection layer: a \
          `pub async fn` on AppState that reads self.db_pool is exempt-by-file no matter who calls \
          it, and a ViewerExtractor grep cannot detect the mixed case (AppState methods take &self; \
-         the Viewer lives in the calling handler). The twelve sites are exactly \
-         load_entity_type_cache (1), assert_tenancy_triggers_armed (3), probe_rls_posture (3), \
-         rls_canary_visible (2), warn_on_privileged_connection (1), begin_claim_write (1), and \
-         admin_scope_posture (1, elevation plan EL-10): the admin-scope switch read for the \
+         the Viewer lives in the calling handler). The nine sites are exactly \
+         load_entity_type_cache (1), rls_canary_visible (2), begin_claim_write (1), \
+         admin_scope_posture (1), and the four one-line boot-posture wrappers \
+         assert_tenancy_triggers_armed, probe_rls_posture, assert_rls_posture and \
+         warn_on_privileged_connection (1 each), which hand self.db_pool to their `*_on(pool)` \
+         associated functions; boot::check_db_posture calls those on the request pool before any \
+         AppState exists (backlog 2cb020af). admin_scope_posture (elevation plan EL-10) is the \
+         admin-scope switch read for the \
          check chokepoint, `epigraph_admin_scopes_armed()` through AdminScopeArmingCache, called \
          by the bearer middlewares BEFORE any viewer exists (it decides the request's \
          AuthContext); the switch is a one-row control table with no tenancy columns and no row \
@@ -632,14 +636,14 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          begin_claim_write's site is the fallback for a TEST-BUILT AppState with no ScopedPool: \
          every server is built through with_scoped_pool and takes the stamped write_as branch, \
          and a claim written by an unstamped application session is refused by migration 122 \
-         once armed (OPL01), so the fallback cannot fail open in production. The third site in \
-         assert_tenancy_triggers_armed is the marker probe of the migration-gated tiers, \
+         once armed (OPL01), so the fallback cannot fail open in production. The third query in \
+         assert_tenancy_triggers_armed_on is the marker probe of the migration-gated tiers, \
          added with TENANCY_TRIGGERS_089 and since shared by TENANCY_TRIGGERS_173: it reads pg_proc, which carries no tenancy columns and no rows a \
          Viewer could filter. VERIFIED BY CALL GRAPH, not \
-         by grep: every caller outside state.rs is bin/server.rs at boot, tenancy_gauge.rs (itself \
+         by grep: every caller outside state.rs is bin/server.rs or boot.rs at boot, tenancy_gauge.rs (itself \
          exempt), or a #[cfg(all(test, feature = \"db\"))] module in routes/admin.rs and \
          routes/edges.rs. Scoping the probe to a Viewer would make it prove a property of that \
-         viewer instead of the pool. The count is pinned so a thirteenth site cannot inherit this \
+         viewer instead of the pool. The count is pinned so a tenth site cannot inherit this \
          reason silently — see the `state.rs` note in the module's Known limits.",
     ),
     (

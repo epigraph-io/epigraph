@@ -321,6 +321,14 @@ pub struct AppState {
     /// boot.
     #[cfg(feature = "db")]
     pub run_token_models: crate::oauth::run_token::RunTokenModels,
+    /// The legacy redirect-URI fallback of the browser OAuth flow
+    /// (`crate::oauth::device`), used when neither the caller nor the
+    /// provider's config names a redirect URI. `None` in every constructor,
+    /// which leaves the `http://127.0.0.1:1` placeholder; `bin/server.rs`
+    /// reads `EPIGRAPH_REDIRECT_URI` once at boot and sets it, so no request
+    /// reads the environment.
+    #[cfg(feature = "db")]
+    pub legacy_redirect_uri: Option<String>,
     /// The federation extensions the RFC 8693 token-exchange grant may mint
     /// for (`crate::oauth::token_exchange`). EMPTY in every constructor, which
     /// refuses every exchange; `bin/server.rs` sets it from
@@ -1359,6 +1367,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
+            #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
@@ -1474,6 +1484,15 @@ impl AppState {
         models: crate::oauth::run_token::RunTokenModels,
     ) -> Self {
         self.run_token_models = models;
+        self
+    }
+
+    /// Set the browser OAuth flow's legacy redirect-URI fallback; see
+    /// [`Self::legacy_redirect_uri`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_legacy_redirect_uri(mut self, uri: Option<String>) -> Self {
+        self.legacy_redirect_uri = uri;
         self
     }
 
@@ -1977,6 +1996,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
+            #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
@@ -2062,6 +2083,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
+            #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
@@ -2100,20 +2123,11 @@ impl AppState {
     /// ([`epigraph_auth::JwtConfig::from_kernel_env`]): EdDSA when
     /// `EPIGRAPH_JWT_SIGNING_KEY` is set (with `EPIGRAPH_JWT_SECRET`, if set,
     /// as the accept-only HS256 window), else HS256 from the secret or the
-    /// dev fallback.
+    /// dev fallback. When `EPIGRAPH_ENV` is set to anything but a known
+    /// non-production name the dev fallback is refused; see
+    /// [`jwt_config_from_env_values`].
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
-        // NOTE: the dev fallback is intentionally NOT fail-closed. This is
-        // called by test/builder constructors; the production gate lives in
-        // bin/server.rs::main (`epigraph_auth::check_kernel_jwt_keys`), which
-        // refuses a malformed signing key before any state is built, so the
-        // panic below is unreachable from the server binary. A malformed key
-        // must never fall back to shared-secret signing.
-        let signing_key = std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR).ok();
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET").ok();
-        let config =
-            crate::oauth::JwtConfig::from_kernel_env(signing_key.as_deref(), secret.as_deref())
-                .unwrap_or_else(|reason| panic!("FATAL: {reason}"));
-        Arc::new(config)
+        jwt_config_from_lookup(|name| std::env::var(name).ok())
     }
 
     /// The admin-scope switch for one request (elevation plan EL-10): read on
@@ -2243,7 +2257,9 @@ impl AppState {
     /// Returns `DbError::InvalidData` if an expected trigger is absent on a
     /// table that exists, or if any matching trigger is not `tgenabled = 'O'`.
     #[cfg(feature = "db")]
-    pub async fn assert_tenancy_triggers_armed(&self) -> Result<(), epigraph_db::DbError> {
+    pub async fn assert_tenancy_triggers_armed_on(
+        pool: &PgPool,
+    ) -> Result<(), epigraph_db::DbError> {
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT c.relname, t.tgname, t.tgenabled::text \
                FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
@@ -2255,7 +2271,7 @@ impl AppState {
                                      'edges_atlas_map_stale', 'evidence_atlas_map_stale')) \
               ORDER BY c.relname, t.tgname",
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
 
         let present: std::collections::HashSet<(&str, &str)> = rows
@@ -2283,7 +2299,7 @@ impl AppState {
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
         let existing: std::collections::HashSet<&str> =
             existing_tables.iter().map(String::as_str).collect();
@@ -2309,7 +2325,7 @@ impl AppState {
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
         let migration_210_applied = markers
             .iter()
@@ -2393,6 +2409,15 @@ impl AppState {
         Ok(())
     }
 
+    /// [`Self::assert_tenancy_triggers_armed_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::assert_tenancy_triggers_armed_on`].
+    #[cfg(feature = "db")]
+    pub async fn assert_tenancy_triggers_armed(&self) -> Result<(), epigraph_db::DbError> {
+        Self::assert_tenancy_triggers_armed_on(&self.db_pool).await
+    }
+
     /// Ask the database the questions [`rls_verdict`] decides on.
     ///
     /// One round trip for the role/catalog facts and one for the canary, which
@@ -2402,7 +2427,7 @@ impl AppState {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the catalog cannot be read at all.
     #[cfg(feature = "db")]
-    pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
+    pub async fn probe_rls_posture_on(pool: &PgPool) -> Result<RlsPosture, epigraph_db::DbError> {
         // The seed column asks what the `*_require_tenancy` triggers ask AT
         // THIS DATABASE'S MIGRATION LEVEL: since 216 an explicit grant, not
         // `pg_has_role`, which every superuser satisfies. See
@@ -2432,18 +2457,18 @@ impl AppState {
             i64,
         ) = sqlx::query_as(&sql)
             .bind(FORCE_PROTECTED_SET)
-            .fetch_one(&self.db_pool)
+            .fetch_one(pool)
             .await?;
 
         // Below 078 there is no canary. `to_regclass` returns NULL rather than
         // raising, so this is one statement either way.
         let canary_exists: bool =
             sqlx::query_scalar("SELECT to_regclass('public.rls_canary') IS NOT NULL")
-                .fetch_one(&self.db_pool)
+                .fetch_one(pool)
                 .await?;
         let canary_visible: i64 = if canary_exists {
             sqlx::query_scalar("SELECT count(*) FROM public.rls_canary")
-                .fetch_one(&self.db_pool)
+                .fetch_one(pool)
                 .await?
         } else {
             0
@@ -2461,6 +2486,15 @@ impl AppState {
         })
     }
 
+    /// [`Self::probe_rls_posture_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::probe_rls_posture_on`].
+    #[cfg(feature = "db")]
+    pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
+        Self::probe_rls_posture_on(&self.db_pool).await
+    }
+
     /// Probe, decide, and either log or refuse. The PR-17 boot assertion.
     ///
     /// See [`rls_verdict`] for the staging rule and for the one acceptance item
@@ -2468,8 +2502,8 @@ impl AppState {
     ///
     /// # A FAILURE TO *READ* THE POSTURE IS NOT A REFUSAL
     ///
-    /// The caller wraps this in `.expect()`, so anything returned here is a boot
-    /// panic. Staging the VERDICT (see [`rls_verdict`]) buys nothing if the
+    /// The caller ([`crate::boot::check_db_posture`]) turns anything returned
+    /// here into a boot refusal. Staging the VERDICT (see [`rls_verdict`]) buys nothing if the
     /// PROBE is unconditionally fatal, and the probe has a reachable failure
     /// that has nothing to do with posture: its canary read needs the GRANT that
     /// migration 078 issues inside `IF EXISTS (SELECT 1 FROM pg_roles WHERE
@@ -2490,8 +2524,8 @@ impl AppState {
     /// # Errors
     /// Propagates [`rls_verdict`] refusals ONLY.
     #[cfg(feature = "db")]
-    pub async fn assert_rls_posture(&self) -> Result<(), epigraph_db::DbError> {
-        let posture = match self.probe_rls_posture().await {
+    pub async fn assert_rls_posture_on(pool: &PgPool) -> Result<(), epigraph_db::DbError> {
+        let posture = match Self::probe_rls_posture_on(pool).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -2523,6 +2557,15 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::assert_rls_posture_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::assert_rls_posture_on`].
+    #[cfg(feature = "db")]
+    pub async fn assert_rls_posture(&self) -> Result<(), epigraph_db::DbError> {
+        Self::assert_rls_posture_on(&self.db_pool).await
     }
 
     /// The number of `rls_canary` rows visible on the API pool.
@@ -2587,7 +2630,9 @@ impl AppState {
     /// Returns the underlying `DbError` if the catalog probe itself fails. The
     /// posture findings are logged, not returned.
     #[cfg(feature = "db")]
-    pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
+    pub async fn warn_on_privileged_connection_on(
+        pool: &PgPool,
+    ) -> Result<(), epigraph_db::DbError> {
         // See `epigraph_db::repos::seed_posture`: the seed column is the
         // question the triggers ask at this migration level, and the last
         // column says which question that is (216's explicit grant, or 074's
@@ -2605,7 +2650,7 @@ impl AppState {
             bool,
             bool,
             bool,
-        ) = sqlx::query_as(&sql).fetch_one(&self.db_pool).await?;
+        ) = sqlx::query_as(&sql).fetch_one(pool).await?;
 
         if current_user != "epigraph_app" {
             tracing::warn!(
@@ -2638,6 +2683,15 @@ impl AppState {
             );
         }
         Ok(())
+    }
+
+    /// [`Self::warn_on_privileged_connection_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::warn_on_privileged_connection_on`].
+    #[cfg(feature = "db")]
+    pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
+        Self::warn_on_privileged_connection_on(&self.db_pool).await
     }
 
     /// Replace the webhook-registration egress guard. See
@@ -3225,6 +3279,103 @@ pub fn admin_cascade_enabled(source: epigraph_db::MaintenanceDsnSource, bypass: 
     source == epigraph_db::MaintenanceDsnSource::Configured && bypass
 }
 
+/// `EPIGRAPH_ALLOW_INSECURE_SECRET`'s truthy set (`1`, `true`, `yes`, any
+/// case): the opt-out from the JWT key check, for local development and CI.
+/// Shared by `bin/server.rs::main`'s boot gate and
+/// [`AppState`]'s default JWT config so both read the flag the same way.
+#[must_use]
+pub fn allow_insecure_secret(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// The refusal printed when [`epigraph_auth::check_kernel_jwt_keys`] rejects
+/// the configured keys. One text for `bin/server.rs::main` and for
+/// [`jwt_config_from_env_values`].
+#[must_use]
+pub fn jwt_key_refusal(reason: &str) -> String {
+    format!(
+        "FATAL: {reason}. Set {} (64 hex characters, an Ed25519 seed) or a real \
+         EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), or set \
+         EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI.",
+        epigraph_auth::JWT_SIGNING_KEY_VAR
+    )
+}
+
+/// Does this `EPIGRAPH_ENV` value demand the JWT key check, for the
+/// dev-secret refusal?
+///
+/// Fail closed on every value that is SET: anything but a known
+/// non-production name ([`crate::oauth::providers::env_is_production`]'s
+/// allowlist: `development`, `dev`, `test`, `testing`, `local`, `ci`) is
+/// production, so `prod`, `staging` or a typo of `production` refuses the
+/// dev fallback rather than signing with the published dev secret (standing
+/// decision Q4, the rule `env_is_production` documents).
+///
+/// The one difference from `env_is_production`: an UNSET, empty or
+/// whitespace-only value keeps the dev fallback, because every test and
+/// builder constructor runs with `EPIGRAPH_ENV` unset and relies on it. The
+/// server binary does not depend on this predicate; `bin/server.rs::main`
+/// runs [`epigraph_auth::check_kernel_jwt_keys`] in every environment before
+/// any state is built.
+fn jwt_env_is_production(env: Option<&str>) -> bool {
+    env.map(str::trim)
+        .filter(|e| !e.is_empty())
+        .is_some_and(crate::oauth::providers::env_is_production)
+}
+
+/// [`AppState`]'s JWT config from a variable lookup: the four variables
+/// `AppState::default_jwt_config` reads, by name, passed to
+/// [`jwt_config_from_env_values`]. `default_jwt_config` passes
+/// `std::env::var`; a test passes a closure, so the variable NAMES are
+/// covered without mutating the process environment.
+fn jwt_config_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Arc<crate::oauth::JwtConfig> {
+    let signing_key = lookup(epigraph_auth::JWT_SIGNING_KEY_VAR);
+    let secret = lookup("EPIGRAPH_JWT_SECRET");
+    let env = lookup("EPIGRAPH_ENV");
+    let allow_insecure = lookup("EPIGRAPH_ALLOW_INSECURE_SECRET");
+    jwt_config_from_env_values(
+        signing_key.as_deref(),
+        secret.as_deref(),
+        env.as_deref(),
+        allow_insecure_secret(allow_insecure.as_deref()),
+    )
+}
+
+/// [`AppState`]'s JWT config from the raw environment values. Pure, so every
+/// arm is testable without mutating the process environment.
+///
+/// When `EPIGRAPH_ENV` is set to anything but a known non-production name
+/// (see [`jwt_env_is_production`]) the keys must pass
+/// [`epigraph_auth::check_kernel_jwt_keys`] (the binary's boot gate), so an
+/// embedder that builds `AppState` in production with no key, or with only
+/// the dev secret, gets a panic rather than a config that signs with the
+/// published dev secret. `allow_insecure`
+/// (`EPIGRAPH_ALLOW_INSECURE_SECRET`) opts out exactly as it does for the
+/// binary. With `EPIGRAPH_ENV` unset, empty or non-production the dev
+/// fallback stands.
+///
+/// # Panics
+/// With [`jwt_key_refusal`]'s text when production refuses the keys, and with
+/// `FATAL:` in every environment when a set signing key does not parse (a
+/// malformed key must never fall back to shared-secret signing).
+pub fn jwt_config_from_env_values(
+    signing_key: Option<&str>,
+    secret: Option<&str>,
+    env: Option<&str>,
+    allow_insecure: bool,
+) -> Arc<crate::oauth::JwtConfig> {
+    if jwt_env_is_production(env) {
+        if let Err(reason) =
+            epigraph_auth::check_kernel_jwt_keys(signing_key, secret, allow_insecure)
+        {
+            panic!("{}", jwt_key_refusal(&reason));
+        }
+    }
+    let config = crate::oauth::JwtConfig::from_kernel_env(signing_key, secret)
+        .unwrap_or_else(|reason| panic!("FATAL: {reason}"));
+    Arc::new(config)
+}
+
 /// Whether the API `server` may start, given the value of
 /// `MAINTENANCE_DATABASE_URL` in its environment (operator decision D9).
 ///
@@ -3348,5 +3499,167 @@ impl std::ops::DerefMut for ClaimWriteTx<'_> {
             Self::Stamped(tx) => &mut *tx,
             Self::Unscoped(tx) => &mut *tx,
         }
+    }
+}
+
+#[cfg(test)]
+mod default_jwt_config_tests {
+    //! [`super::jwt_config_from_env_values`], the pure core of
+    //! `AppState::default_jwt_config`, and [`super::jwt_config_from_lookup`],
+    //! which reads the variables by name. No test here touches the process
+    //! environment.
+    use super::{allow_insecure_secret, jwt_config_from_env_values, jwt_config_from_lookup};
+    use jsonwebtoken::Algorithm;
+
+    /// A valid Ed25519 seed (64 hex characters).
+    const SEED: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    /// A secret `assert_production_secret` admits (>= 32 bytes, not the dev
+    /// literal).
+    const REAL_SECRET: &str = "a-real-production-secret-of-48-bytes-0123456789ab";
+
+    fn dev_secret() -> &'static str {
+        std::str::from_utf8(epigraph_auth::DEV_JWT_SECRET).expect("dev secret is utf-8")
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn production_with_no_key_panics() {
+        let _ = jwt_config_from_env_values(None, None, Some("production"), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "EPIGRAPH_ALLOW_INSECURE_SECRET=1")]
+    fn production_with_only_the_dev_secret_panics() {
+        let _ = jwt_config_from_env_values(None, Some(dev_secret()), Some("production"), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn production_is_matched_trimmed_and_case_insensitively() {
+        let _ = jwt_config_from_env_values(None, None, Some(" Production "), false);
+    }
+
+    #[test]
+    fn production_with_a_valid_signing_key_builds_eddsa() {
+        let cfg = jwt_config_from_env_values(Some(SEED), None, Some("production"), false);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::EdDSA));
+    }
+
+    #[test]
+    fn production_with_a_real_secret_builds_hs256() {
+        let cfg = jwt_config_from_env_values(None, Some(REAL_SECRET), Some("production"), false);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    #[test]
+    fn production_with_the_insecure_opt_out_keeps_the_dev_fallback() {
+        let cfg = jwt_config_from_env_values(None, None, Some("production"), true);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    /// Dev and test behaviour is unchanged: unset, empty and the known
+    /// non-production names keep the dev fallback (the whole suite runs with
+    /// `EPIGRAPH_ENV` unset, and the served tests set `test`).
+    #[test]
+    fn non_production_keeps_the_dev_fallback() {
+        for env in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("test"),
+            Some("development"),
+            Some("dev"),
+            Some("testing"),
+            Some("local"),
+            Some("CI"),
+        ] {
+            let cfg = jwt_config_from_env_values(None, None, env, false);
+            assert_eq!(
+                cfg.signing_algorithm(),
+                Some(Algorithm::HS256),
+                "env={env:?}"
+            );
+        }
+    }
+
+    /// Fail closed: a SET value that is not a known non-production name is
+    /// production, so a deployment that spells it `prod` or `staging` does
+    /// not sign with the published dev secret.
+    #[test]
+    fn an_unrecognised_env_value_is_production() {
+        for env in ["prod", "staging", "prd", "productoin"] {
+            let outcome = std::panic::catch_unwind(|| {
+                jwt_config_from_env_values(None, None, Some(env), false)
+            });
+            let Err(payload) = outcome else {
+                panic!("EPIGRAPH_ENV={env:?} with no key must refuse the dev fallback");
+            };
+            let text = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                text.starts_with("FATAL: ") && text.contains("EPIGRAPH_ALLOW_INSECURE_SECRET=1"),
+                "EPIGRAPH_ENV={env:?} refused with the wrong text: {text:?}"
+            );
+        }
+    }
+
+    /// The wiring: `EPIGRAPH_ENV` is read by that name and reaches the
+    /// production check. A lookup that answers only `EPIGRAPH_ENV` (no key, no
+    /// opt-out) must refuse; one that also answers the opt-out by its name
+    /// must not.
+    #[test]
+    fn the_lookup_reads_epigraph_env_by_name() {
+        let refused = std::panic::catch_unwind(|| {
+            jwt_config_from_lookup(|name| (name == "EPIGRAPH_ENV").then(|| "production".into()))
+        });
+        assert!(
+            refused.is_err(),
+            "EPIGRAPH_ENV=production with no key must refuse the dev fallback"
+        );
+
+        let opted_out = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_ALLOW_INSECURE_SECRET" => Some("1".into()),
+            _ => None,
+        });
+        assert_eq!(opted_out.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    /// The wiring: the signing key and the secret are read by their names.
+    #[test]
+    fn the_lookup_reads_the_keys_by_name() {
+        let eddsa = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_JWT_SIGNING_KEY" => Some(SEED.into()),
+            _ => None,
+        });
+        assert_eq!(eddsa.signing_algorithm(), Some(Algorithm::EdDSA));
+
+        let hs256 = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_JWT_SECRET" => Some(REAL_SECRET.into()),
+            _ => None,
+        });
+        assert_eq!(hs256.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    /// A malformed signing key never falls back, in any environment.
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn a_malformed_signing_key_panics_outside_production_too() {
+        let _ = jwt_config_from_env_values(Some("not-hex"), None, None, true);
+    }
+
+    #[test]
+    fn the_insecure_opt_out_parses_like_the_boot_gate() {
+        for on in ["1", "true", "TRUE", "yes", "Yes"] {
+            assert!(allow_insecure_secret(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "false", "no", "on"] {
+            assert!(!allow_insecure_secret(Some(off)), "{off:?}");
+        }
+        assert!(!allow_insecure_secret(None));
     }
 }

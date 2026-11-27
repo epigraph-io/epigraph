@@ -27,7 +27,8 @@ pub struct AuthUrlResponse {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct AuthUrlRequest {
-    /// Optional override; falls back to provider config or EPIGRAPH_REDIRECT_URI.
+    /// Optional override; falls back to provider config, then to the
+    /// `EPIGRAPH_REDIRECT_URI` value read at boot.
     pub redirect_uri: Option<String>,
 }
 
@@ -102,18 +103,27 @@ fn percent_decode(input: &str) -> String {
     result
 }
 
+/// The redirect URI used when nothing names one.
+const PLACEHOLDER_REDIRECT_URI: &str = "http://127.0.0.1:1";
+
 /// Resolve the redirect URI in priority order:
 /// 1. Caller-supplied (request body `redirect_uri`).
 /// 2. Provider-configured default (from `OidcRedirectFlow::default_redirect_uri`).
-/// 3. Legacy fallback: `EPIGRAPH_REDIRECT_URI` env var, defaulting to `http://127.0.0.1:1`.
-fn resolve_redirect_uri(caller: Option<&str>, provider_default: Option<&str>) -> String {
-    if let Some(uri) = caller {
-        return uri.to_string();
-    }
-    if let Some(uri) = provider_default {
-        return uri.to_string();
-    }
-    std::env::var("EPIGRAPH_REDIRECT_URI").unwrap_or_else(|_| "http://127.0.0.1:1".to_string())
+/// 3. Legacy fallback: `legacy_env`, the `EPIGRAPH_REDIRECT_URI` value
+///    `bin/server.rs` reads once at boot ([`AppState::legacy_redirect_uri`]).
+/// 4. `http://127.0.0.1:1`.
+///
+/// Pure: the environment is read at boot, never per request.
+fn resolve_redirect_uri(
+    caller: Option<&str>,
+    provider_default: Option<&str>,
+    legacy_env: Option<&str>,
+) -> String {
+    caller
+        .or(provider_default)
+        .or(legacy_env)
+        .unwrap_or(PLACEHOLDER_REDIRECT_URI)
+        .to_string()
 }
 
 #[cfg(feature = "db")]
@@ -136,8 +146,11 @@ pub async fn auth_url_endpoint(
         })?;
 
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    let redirect_uri =
-        resolve_redirect_uri(req.redirect_uri.as_deref(), flow.default_redirect_uri());
+    let redirect_uri = resolve_redirect_uri(
+        req.redirect_uri.as_deref(),
+        flow.default_redirect_uri(),
+        state.legacy_redirect_uri.as_deref(),
+    );
     let (verifier, challenge) = generate_pkce();
     let csrf_state = generate_state();
     let auth_url = flow.build_auth_url(&csrf_state, &challenge, &redirect_uri);
@@ -181,8 +194,11 @@ pub async fn exchange_endpoint(
         });
     }
 
-    let redirect_uri =
-        resolve_redirect_uri(req.redirect_uri.as_deref(), flow.default_redirect_uri());
+    let redirect_uri = resolve_redirect_uri(
+        req.redirect_uri.as_deref(),
+        flow.default_redirect_uri(),
+        state.legacy_redirect_uri.as_deref(),
+    );
 
     let id_token = flow
         .exchange_code(&code, &redirect_uri, &req.code_verifier)
@@ -254,4 +270,33 @@ pub async fn exchange_endpoint(
     Err(ApiError::ServiceUnavailable {
         service: "database required for OAuth2".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_redirect_uri, PLACEHOLDER_REDIRECT_URI};
+
+    const CALLER: &str = "https://caller.example/cb";
+    const PROVIDER: &str = "https://provider.example/cb";
+    const LEGACY: &str = "https://legacy.example/cb";
+
+    /// The four precedence cases, with no environment read or written: the
+    /// legacy value is an argument.
+    #[test]
+    fn caller_then_provider_default_then_legacy_then_placeholder() {
+        assert_eq!(
+            resolve_redirect_uri(Some(CALLER), Some(PROVIDER), Some(LEGACY)),
+            CALLER
+        );
+        assert_eq!(
+            resolve_redirect_uri(None, Some(PROVIDER), Some(LEGACY)),
+            PROVIDER
+        );
+        assert_eq!(resolve_redirect_uri(None, None, Some(LEGACY)), LEGACY);
+        assert_eq!(
+            resolve_redirect_uri(None, None, None),
+            PLACEHOLDER_REDIRECT_URI
+        );
+        assert_eq!(PLACEHOLDER_REDIRECT_URI, "http://127.0.0.1:1");
+    }
 }
