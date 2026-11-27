@@ -2563,7 +2563,7 @@ pub struct IngestDocumentParams {
     /// Synchronous by default (backlog 81d8afe0): `None`/`true` waits for the
     /// walk; `false` is the explicit fire-and-forget opt-in.
     #[schemars(
-        description = "Optional, default true: the call waits for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error; a failed walk writes nothing, the papers row included, so retrying is safe. false = fire-and-forget: returns {status: 'queued', paper_id, document_key} and a failed walk reaches only the server log."
+        description = "Optional, default true: the call waits for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error; a failed walk writes nothing, the papers row included, so retrying is safe; a dropped or timed-out connection is not a failed walk (it may still commit), so check query_paper before treating it as one. false = fire-and-forget: returns {status: 'queued', paper_id, document_key} and a failed walk reaches only the server log."
     )]
     #[serde(default)]
     pub wait: Option<bool>,
@@ -2596,7 +2596,7 @@ pub struct IngestDocumentInlineParams {
     /// Synchronous by default (backlog 81d8afe0): `None`/`true` waits for the
     /// walk; `false` is the explicit fire-and-forget opt-in.
     #[schemars(
-        description = "Optional, default true: the call waits for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error; a failed walk writes nothing, the papers row included, so retrying is safe. false = fire-and-forget: returns {status: 'queued', paper_id, document_key} and a failed walk reaches only the server log."
+        description = "Optional, default true: the call waits for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error; a failed walk writes nothing, the papers row included, so retrying is safe; a dropped or timed-out connection is not a failed walk (it may still commit), so check query_paper before treating it as one. false = fire-and-forget: returns {status: 'queued', paper_id, document_key} and a failed walk reaches only the server log."
     )]
     #[serde(default)]
     pub wait: Option<bool>,
