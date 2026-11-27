@@ -280,7 +280,8 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `add_step`** and **HTTP `POST /api/v1/workflows/steps`** — embed when `AddStepResult::inserted_content` is `Some` (a new step, or a reused one revived from a workflow deprecation)
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
-- **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
+- **HTTP `POST /api/v1/conventions`** — embeds the convention claim after `tx.commit()` on the caller's stamp (`AppState::embed_claim_as`); the claim and everything attached to it are written on that caller's stamped transaction; `crates/epigraph-api/src/routes/conventions.rs::learn_convention`
+- **HTTP `POST /api/v1/skills/share`** — embeds the shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool the handler writes the claim on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
 - **HTTP `POST /api/v1/policy-challenges`** — embeds a NEW challenge after `tx.commit()` on the caller's stamp (`AppState::store_claim_embedding_as`); a repeat request creates nothing and embeds nothing; `crates/epigraph-api/src/routes/policies.rs::embed_new_challenge`
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs::submit_packet` (the `if !was_duplicate` block; stored through `AppState::store_claim_embedding_as`)
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
