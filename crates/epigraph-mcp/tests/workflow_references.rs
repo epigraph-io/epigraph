@@ -725,3 +725,45 @@ async fn a_symmetric_reference_needs_authority_over_both_workflows(pool: PgPool)
     .await
     .expect("a workflow may declare another agent's public workflow a prerequisite");
 }
+
+/// A rival pair of workflows is stored public, so a `target_claim_id` it
+/// carries must be a public claim: a group-private claim id is refused with
+/// nothing written, a public one is kept.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rival_workflow_pair_names_only_a_public_target_claim(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let w1 = store(&server, &["rival goal one"]).await;
+    let w2 = store(&server, &["rival goal two"]).await;
+    let scratch = store(&server, &["scratch step"]).await;
+    let group = make_private(&pool, scratch).await;
+    let private_claim = seed_claim(&pool, "a private target", 0.5).await;
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(private_claim)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("make the claim group-private in the caller's group");
+
+    let mut params = rivals(w1, w2);
+    params.target_claim_id = Some(private_claim.to_string());
+    let err = do_link_alternative(&server, &viewer, params, None)
+        .await
+        .expect_err("a public rival pair does not carry a private claim id");
+    assert!(err.message.contains("is not public"), "{}", err.message);
+    assert_eq!(pair_edges(&pool, w1, w2, "alternative_of").await, 0);
+
+    let public_claim = seed_claim(&pool, "a public target", 0.5).await;
+    let mut params = rivals(w1, w2);
+    params.target_claim_id = Some(public_claim.to_string());
+    let written = do_link_alternative(&server, &viewer, params, None)
+        .await
+        .expect("a public target claim is kept");
+    let (target,): (Option<String>,) =
+        sqlx::query_as("SELECT properties->>'target_claim_id' FROM edges WHERE id = $1::uuid")
+            .bind(first_text(&written)["edge_id"].as_str().expect("edge_id"))
+            .fetch_one(&pool)
+            .await
+            .expect("the edge");
+    assert_eq!(target, Some(public_claim.to_string()));
+}

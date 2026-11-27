@@ -20,9 +20,11 @@
 //!   `link_hierarchical` workflow source take), recorded as that gate's writes
 //!   are: the pair is listed as `mutual` on each workflow's readers, so it is
 //!   a statement about both, and neither owner's workflow is marked a rival by
-//!   someone without a say over it. CDST BP's alternative sets read
-//!   claim-to-claim edges only (`FactorRepository::bp_alternative_sets`), so
-//!   a workflow pair moves no belief,
+//!   someone without a say over it. A `target_claim_id` on a workflow pair
+//!   must be a PUBLIC claim, since the edge carrying it is stored public.
+//!   CDST BP's alternative sets read claim-to-claim edges only
+//!   (`FactorRepository::bp_alternative_sets`), so a workflow pair moves no
+//!   belief,
 //! - the edge is **symmetric**: `{claim_a, claim_b}` is one edge regardless of
 //!   order (migration 042's `edges_alternative_of_symmetric_uniq`, which has no
 //!   endpoint-type conjunct and so covers a workflow pair too), so the call
@@ -141,6 +143,21 @@ pub async fn do_link_alternative(
             .is_none()
         {
             return Err(invalid_params(format!("target_claim_id {tid} not found")));
+        }
+        // A workflow pair's edge is stored public (no claim endpoint gives it
+        // tenancy), so the claim id it carries must be public too, or the
+        // edge would hand a private claim's id to every reader.
+        if endpoint_type == "workflow" {
+            let tenancy = ClaimRepository::tenancy_of_conn(&mut tx, viewer, &[tid])
+                .await
+                .map_err(internal_error)?;
+            if !tenancy.iter().any(|(_, v, _)| v == "public") {
+                return Err(invalid_params(format!(
+                    "refused: target_claim_id {tid} is not public. An alternative_of edge \
+                     between two workflows is stored public, so the claim it names must be \
+                     public too. Nothing was written."
+                )));
+            }
         }
         props.insert(
             "target_claim_id".to_string(),
