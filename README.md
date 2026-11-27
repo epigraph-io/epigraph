@@ -3,7 +3,8 @@
 EpiGraph is an epistemic kernel. It stores claims (nouns), edges between them
 (verbs), and the agents that assert them. EpiGraph attests what each agent
 asserts: it records the agent as the author, and the server that writes the
-record signs it with the server's own key (who signs what is set out below).
+record signs it with the server's own key where that writer signs and a key
+is configured (who signs what, and what is still unsigned, is set out below).
 It then combines those assertions into beliefs using Dempster-Shafer evidence
 combination. In place of the static paper, it runs a live loop:
 hypothesis, experiment, data, analysis, belief update. Downstream
@@ -17,10 +18,13 @@ epigraph-io stack is built on it.
 Who signs: the MCP server signs the claims its submission tools write with
 its own key, and the HTTP API signs the claims `POST /api/v1/claims` (and
 `/api/v1/claims/batch`) writes with the API's own key once
-`EPIGRAPH_API_SIGNING_KEY_FILE` is set. The signer is recorded apart from the
-author. Some other writers still store unsigned claims; `system_stats`
-(`detailed: true`) and `GET /api/v1/stats` report `claims_signed` and
-`claims_unsigned`. See
+`EPIGRAPH_API_SIGNING_KEY_FILE` is set (with no key they are unsigned). The
+signer is recorded apart from the author. A `fully_private` claim is never
+attested, because its row holds only a placeholder for the sealed content.
+Some other writers (signed-packet submit, hypotheses, conventions) still
+store unsigned claims. `system_stats` (`detailed: true`) and
+`GET /api/v1/stats` report `claims_signed` and `claims_unsigned`: whether a
+row carries a signature, not whether it verifies. See
 [agents and signing](docs/intro/02-concepts.md#2--agents-and-signing).
 
 ## Who this is for
