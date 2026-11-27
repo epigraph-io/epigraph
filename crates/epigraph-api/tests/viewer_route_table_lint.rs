@@ -641,7 +641,9 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // on the caller's stamped transaction. `share_skill`'s remains.
     ("conventions.rs", 1),
     ("hypothesis.rs", 2),
-    ("policies.rs", 4),
+    // 4 -> 0, key removed (backlog ec968070): the admin `record_outcome`,
+    // `resolve_challenge` (two) and `decay_sweep` `UPDATE claims` were deleted
+    // with their handlers.
     // 2 -> 0, key removed (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding`
     // and `PUT /api/v1/evidence/:id/embedding` (`generate_claim_embedding`,
     // `generate_evidence_embedding`) were deleted.

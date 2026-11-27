@@ -907,7 +907,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 125 -> 121 (backlog bd13e0e0): the political-monitoring module was deleted
 /// from the kernel; `routes/political.rs` 4 -> 0, key DELETED
 /// (`HIGH_WATER_FILES` falls by one with it).
-const HIGH_WATER: usize = 121;
+/// 121 -> 117 (backlog ec968070): the admin policy writes `record_outcome`,
+/// `resolve_challenge` and `decay_sweep` were deleted (`routes/policies.rs`
+/// 8 -> 4). No file reached zero.
+const HIGH_WATER: usize = 117;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1262,8 +1265,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `context.rs`'s residue.
     ("routes/perspective.rs", 1),
     // 9 before the operator-binding delta review, which moved
-    // `create_challenge`'s transaction onto `AppState::begin_claim_write`.
-    ("routes/policies.rs", 8),
+    // `create_challenge`'s transaction onto `AppState::begin_claim_write`, and
+    // 8 before backlog ec968070 deleted the admin `record_outcome` (1),
+    // `resolve_challenge` (2) and `decay_sweep` (1) writes.
+    ("routes/policies.rs", 4),
     // `routes/political.rs` was 4 and is GONE, not zeroed: backlog bd13e0e0
     // deleted the political-monitoring module from the kernel (its last four
     // sites were `list_techniques`, `list_coalitions` and the two `create_*`

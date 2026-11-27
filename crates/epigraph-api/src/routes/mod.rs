@@ -892,19 +892,11 @@ pub fn create_router_with_extensions(
             "/api/v1/graph/neighborhoods/:id/expand",
             get(graph_neighborhood::expand),
         )
-        // Policies write endpoints — require auth + scope
-        .route(
-            "/api/v1/policies/:claim_id/outcome",
-            post(policies::record_outcome),
-        )
-        .route("/api/v1/policies/decay-sweep", post(policies::decay_sweep))
+        // Policy challenges — create requires auth + `claims:write`. The admin
+        // outcome, decay-sweep and resolve writes were deleted (backlog ec968070).
         .route(
             "/api/v1/policy-challenges",
             post(policies::create_challenge),
-        )
-        .route(
-            "/api/v1/policy-challenges/:id/resolve",
-            post(policies::resolve_challenge),
         )
         // Cross-source match candidates — write/list endpoints, require auth + scope
         .route(
