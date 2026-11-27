@@ -1559,6 +1559,7 @@ dependencies = [
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",

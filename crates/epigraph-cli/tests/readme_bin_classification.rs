@@ -15,30 +15,61 @@ const README: &str = include_str!("../README.md");
 /// The classes `README.md`'s "Classes" table defines.
 const CLASSES: [&str; 5] = ["standing", "admin", "one-shot", "ingest", "experiment"];
 
-/// The `name` of every `[[bin]]` table, wherever it sits in the manifest
+/// The `name` of every `[[bin]]` target, read with a TOML parser so that any
+/// valid spelling of the table header (`[[ bin ]]`, a trailing comment, the
+/// inline `bin = [...]` array form) is found, wherever it sits in the manifest
 /// (one is declared after `[lints]`).
 fn manifest_bins(manifest: &str) -> Vec<String> {
-    let mut bins = Vec::new();
-    let mut in_bin = false;
-    for line in manifest.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_bin = line == "[[bin]]";
-            continue;
-        }
-        if !in_bin {
-            continue;
-        }
-        if let Some(value) = line
-            .strip_prefix("name")
-            .map(str::trim_start)
-            .and_then(|rest| rest.strip_prefix('='))
-        {
-            let name = value.trim().trim_matches('"').to_string();
-            bins.push(name);
-            in_bin = false;
-        }
-    }
-    bins
+    let manifest: toml::Table = toml::from_str(manifest).expect("Cargo.toml parses as TOML");
+    let Some(bins) = manifest.get("bin") else {
+        return Vec::new();
+    };
+    bins.as_array()
+        .expect("`bin` is an array of tables")
+        .iter()
+        .map(|bin| {
+            bin.get("name")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("a [[bin]] has no string `name`: {bin:?}"))
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn manifest_bins_finds_every_valid_spelling_of_a_bin_table() {
+    let manifest = r#"
+[package]
+name = "x"
+
+[[bin]]  # an operator tool
+name = "commented_header"
+path = "src/bin/a.rs"
+
+[[ bin ]]
+name = "spaced_header"
+path = "src/bin/b.rs"
+
+[[bin]]
+path = "src/bin/c.rs"
+name = "name_after_path"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "after_lints"
+path = "src/bin/d.rs"
+"#;
+    assert_eq!(
+        manifest_bins(manifest),
+        [
+            "commented_header",
+            "spaced_header",
+            "name_after_path",
+            "after_lints"
+        ]
+    );
 }
 
 /// `(binary, class)` for every row of the table under `## <heading>`.

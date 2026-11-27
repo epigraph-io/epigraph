@@ -665,6 +665,9 @@ url = "2"
 # the library and its bins do not link either crate.
 regex = { workspace = true }
 walkdir = { workspace = true }
+# `tests/readme_bin_classification.rs` reads every `[[bin]]` name with a real
+# TOML parser (already in the lockfile, via epigraph-auth and epigraph-engine).
+toml = { workspace = true }
 
 # A cargo example, not a `[[bin]]`: a research/documentation pipeline that
 # narrates each migration table, built only by `cargo build --example
