@@ -839,6 +839,11 @@ fn own_groups(viewer: &epigraph_db::visibility::Viewer) -> HashSet<Uuid> {
         .collect()
 }
 
+/// A selection's boundary reason for a superseded claim (root or reached).
+const NOT_CURRENT: &str = "not_current";
+const NOT_CURRENT_DETAIL: &str =
+    "the claim is superseded; a selection does not move it or walk from it";
+
 /// Whether the act would MOVE a claim it classified so (not merely accept
 /// it, as `already_public`).
 fn moves(outcome: &str) -> bool {
@@ -1022,7 +1027,21 @@ pub async fn plan(
     }
     let mut seen: HashSet<Uuid> = HashSet::from([selection.root]);
     let mut frontier: Vec<Uuid> = Vec::new();
-    if accepted(&root.outcome) {
+    // A superseded root is a boundary as a superseded child is: the walk
+    // neither takes it nor starts from it. (Readable: the preview found it.)
+    let root_current =
+        ClaimRepository::are_all_current(&mut *conn, viewer, std::slice::from_ref(&selection.root))
+            .await?;
+    if !root_current {
+        out.boundaries.push(PlanBoundary {
+            claim_id: selection.root,
+            depth: 0,
+            reason: NOT_CURRENT.to_string(),
+            detail: Some(NOT_CURRENT_DETAIL),
+            reached_from: None,
+            relationship: None,
+        });
+    } else if accepted(&root.outcome) {
         out.claims.push(PlannedClaim {
             claim_id: root.claim_id,
             depth: 0,
@@ -1072,8 +1091,8 @@ pub async fn plan(
             out.boundaries.push(PlanBoundary {
                 claim_id: to,
                 depth,
-                reason: "not_current".to_string(),
-                detail: Some("the claim is superseded; a selection does not walk into it"),
+                reason: NOT_CURRENT.to_string(),
+                detail: Some(NOT_CURRENT_DETAIL),
                 reached_from: Some(from),
                 relationship: Some(relationship),
             });
@@ -1192,8 +1211,24 @@ pub async fn act(
         .into());
     }
     if planned.claims.is_empty() {
-        // Only the root can leave the plan empty: it is a boundary. Refuse as
-        // the act refuses it.
+        // Only the root can leave the plan empty: it is a boundary. A
+        // superseded root is refused as such; any other, as the act refuses
+        // it.
+        if planned
+            .boundaries
+            .iter()
+            .any(|b| b.depth == 0 && b.reason == NOT_CURRENT)
+        {
+            return Err(DbError::Refused {
+                kind: RefusalKind::State,
+                message: format!(
+                    "{}: refused, and nothing was changed: the selection's root is superseded; \
+                     select from its current version",
+                    act.name()
+                ),
+            }
+            .into());
+        }
         let root: Vec<VisibilityActOutcome> = planned
             .boundaries
             .iter()

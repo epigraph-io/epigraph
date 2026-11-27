@@ -29,7 +29,8 @@
 //!   someone else's public claim it passes, and withholds every foreign
 //!   group id on the edges of the claims it moves;
 //! * a root the caller cannot read answers exactly as a missing one, dry run
-//!   or not; a root the act refuses is refused with the act's own reason;
+//!   or not; a root the act refuses is refused with the act's own reason; a
+//!   superseded root is a `not_current` boundary and refused;
 //! * a selection over the 500-claim cap is refused whole;
 //! * a malformed selection is refused before anything runs.
 
@@ -792,6 +793,51 @@ async fn a_dry_run_names_no_group_the_caller_is_not_in(pool: PgPool) {
     let rows = audits(&pool, "claim.publicized").await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(audited_ids(&rows[0].1), set(&[m]), "{rows:?}");
+}
+
+/// A superseded root is a `not_current` boundary, as a superseded child is:
+/// the dry run plans nothing and runs no trial, and the act is refused as a
+/// state refusal with nothing moved (review of 02d9e9a1: the root's
+/// `is_current` was never checked, so a superseded root was planned and
+/// moved, and its closure with it).
+///
+/// Verified to fail with the root check removed (the root is planned).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_superseded_root_is_a_boundary_and_the_act_is_refused(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "sel-alice").await;
+    add_member(&pool, t, alice, "writer").await;
+    let old = claim(&pool, alice, home, "group", "a superseded root").await;
+    let a = claim(&pool, alice, home, "group", "its child").await;
+    edge(&pool, old, a, "decomposes_to").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(old)
+        .execute(&pool)
+        .await
+        .expect("supersede the root");
+
+    let body = share(&pool, &s, alice, selection(old), t, true)
+        .await
+        .expect("dry run");
+    assert_eq!(body["plan"]["claims"], serde_json::json!([]), "{body}");
+    assert_eq!(ids(&body["plan"]["boundaries"]), set(&[old]), "{body}");
+    assert_eq!(
+        boundary_of(&body["plan"], old)["reason"],
+        "not_current",
+        "{body}"
+    );
+    assert!(body["plan"]["effects"].is_null(), "no trial: {body}");
+
+    let err = share(&pool, &s, alice, selection(old), t, false)
+        .await
+        .expect_err("a superseded root is refused");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+    assert!(err.message.contains("superseded"), "{err:?}");
+    for c in [old, a] {
+        assert_eq!(tenancy(&pool, c).await, ("group".to_string(), home), "{c}");
+    }
+    assert!(audits(&pool, "claim.shared_with_team").await.is_empty());
 }
 
 /// A root the caller cannot read answers exactly as a missing one, dry run or

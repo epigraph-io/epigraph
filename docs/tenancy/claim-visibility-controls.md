@@ -402,7 +402,8 @@ The walk (`epigraph_engine::visibility_act::plan`) adds no authority:
   an `already_public` claim too). Any other claim is a **boundary**: it is reported with the
   definer's reason (`refused_not_private`, `refused_not_author`, `refused_not_admin`,
   `refused_sealed`, `refused_not_team_writer`, `refused_not_human`), or as `not_current` for a
-  superseded claim. A boundary is left untouched and the walk does not pass through it.
+  superseded claim, the root included (a superseded root refuses the act as a state refusal:
+  409 over REST, `INVALID_REQUEST` over MCP). A boundary is left untouched and the walk does not pass through it.
 * The act then runs on the planned ids exactly as on an explicit list: the same definer, the same
   cascade and refold for each claim, all or nothing, and one audit row naming every moved id.
 * A root the caller cannot read answers exactly as a missing claim (`not found` / 404), dry run or
