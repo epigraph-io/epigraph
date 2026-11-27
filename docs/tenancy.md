@@ -918,9 +918,10 @@ reads nothing extra. A delegated token is refused unless:
 
 * it carries no scope outside the delegated ceiling,
   `epigraph_auth::DELEGATED_SCOPE_CEILING` (`claims:read claims:write
-  claims:challenge evidence:read evidence:submit edges:read edges:write
-  agents:read`): no group or agent management, no webhooks, no client or
-  admin-only scope. `AuthContext::has_scope` also never answers `true` outside
+  evidence:submit edges:read edges:write agents:read`): no group or agent
+  management, no webhooks, no client or admin-only scope. A retired scope
+  (`epigraph_auth::RETIRED_SCOPES`) a token still carries is ignored, not
+  refused. `AuthContext::has_scope` also never answers `true` outside
   the ceiling for a delegated context, so no `claims:admin` arm runs for one;
 * the process read `EPIGRAPH_RUN_TOKENS=on` at boot (both `epigraph-api` and
   the MCP HTTP listener; unset or any other value, every `dlg` token is
