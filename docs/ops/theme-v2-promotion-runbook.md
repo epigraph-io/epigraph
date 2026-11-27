@@ -118,8 +118,8 @@ every user through `ps`.
 
 ## Restore after a `claim_themes` wipe (no re-clustering)
 
-A wipe of `claim_themes` (a nightly or probe `theme_cluster` call with
-`wipe_first=true`) clears only Model A. The run's `claim_clusters` memberships and
+A wipe of `claim_themes` (historically, a nightly or probe `theme_cluster` call
+with `wipe_first=true`; that tool is removed) clears only Model A. The run's `claim_clusters` memberships and
 its `cluster_labels` names survive, so the themes come back without UMAP:
 
 1. **Check the run is intact:** `SELECT count(DISTINCT cluster_id), count(*) FROM
@@ -265,12 +265,15 @@ are usable.
 > task instead of re-enabling it. It does not recompute theme centroids or
 > reassign misplaced claims, which `maintain_themes.py` did.
 
-> **Update (backlog a0ed0180):** the k-means `theme_cluster` path is retired.
-> The MCP tool name stays registered only to refuse (JSON-RPC -32600,
-> `data.status = "retired"`) with a pointer to `scripts/maintain_themes.py`, so a
-> re-enabled `theme-maintenance` task can no longer wipe themes through the
-> fallback below; it fails loudly instead. The two edits below are still needed
-> for the nightly to do useful work.
+> **Update (backlogs a0ed0180, 90993e95):** the k-means `theme_cluster` path is
+> retired, and the MCP tool itself is now removed. It was first kept registered
+> only to refuse with a pointer to `scripts/maintain_themes.py`; since backlog
+> 90993e95 the name is not served at all, so a call gets the kernel's routing
+> refusal (JSON-RPC -32600, "Unknown or unavailable tool 'theme_cluster'", no
+> `data`). A re-enabled `theme-maintenance` task can no longer wipe themes
+> through the fallback below; it fails loudly instead. Remove the fallback from
+> the task's prompt. The two edits below are still needed for the nightly to do
+> useful work.
 
 **This step is outstanding.** On 2026-08-18 11:20 UTC the nightly fired against the
 completed 76-theme run and replaced it with 16 `auto-NN` rows over 500 claims. The task

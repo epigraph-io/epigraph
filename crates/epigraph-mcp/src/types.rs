@@ -4056,12 +4056,6 @@ impl From<BatchClaimEntry> for SubmitClaimParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct StageClaimsParams {
-    #[schemars(description = "Array of claim content strings to validate without persisting")]
-    pub claims: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SystemStatsParams {
     #[schemars(description = "Include detailed breakdowns by type (default false)")]
     pub detailed: Option<bool>,

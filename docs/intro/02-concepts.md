@@ -334,8 +334,8 @@ unthemed claims, reassign by boundary ratio, split high-variance themes,
 recompute centroids, all through `/api/v1/themes/*`). Agents read them with
 the `list_themes` / `get_theme` MCP tools. The earlier k-means prototype
 (`theme_cluster`, `POST /api/v1/themes/build-from-corpus`, the
-`theme_cluster_rebuild` job) is retired; the `theme_cluster` name only
-answers "retired". Because `claim_themes` has no `UNIQUE(label)`
+`theme_cluster_rebuild` job) is retired, and the `theme_cluster` MCP tool
+is removed. Because `claim_themes` has no `UNIQUE(label)`
 constraint, the `auto-00, auto-01, …` rows that prototype left may repeat a
 label.
 

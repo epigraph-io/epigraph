@@ -121,50 +121,6 @@ impl SuppliedByEntry {
     }
 }
 
-/// Stage claims for validation without persisting.
-pub async fn stage_claims(
-    _server: &EpiGraphMcpFull,
-    params: StageClaimsParams,
-) -> Result<CallToolResult, McpError> {
-    if params.claims.is_empty() {
-        return Err(invalid_params("claims array cannot be empty"));
-    }
-
-    let mut results = Vec::new();
-
-    for (i, content) in params.claims.iter().enumerate() {
-        let trimmed = content.trim();
-        let valid = !trimmed.is_empty() && trimmed.len() >= 10;
-        let warnings: Vec<String> = if trimmed.len() < 20 {
-            vec!["Claim is very short — consider adding more detail".into()]
-        } else {
-            vec![]
-        };
-
-        results.push(serde_json::json!({
-            "index": i,
-            "valid": valid,
-            "content_length": trimmed.len(),
-            "warnings": warnings,
-        }));
-    }
-
-    let valid_count = results
-        .iter()
-        .filter(|r| r["valid"].as_bool().unwrap_or(false))
-        .count();
-
-    Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::json!({
-            "total": params.claims.len(),
-            "valid": valid_count,
-            "invalid": params.claims.len() - valid_count,
-            "results": results,
-        })
-        .to_string(),
-    )]))
-}
-
 /// Get system statistics.
 ///
 /// # Tenancy (PR-09)

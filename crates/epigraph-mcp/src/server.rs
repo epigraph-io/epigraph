@@ -2789,7 +2789,7 @@ impl EpiGraphMcpFull {
         tools::events::publish_event(self, viewer, params, auth).await
     }
 
-    // ── Batch / Staging / Stats (3 tools) ──
+    // ── Batch / Stats (2 tools) ──
 
     #[tool(
         description = "Submit multiple claims in a single batch (max 100). Each entry accepts every submit_claim field: content, evidence_data and evidence_type are required; methodology, confidence, source_url, reasoning, labels and novelty_threshold are optional. An entry with no methodology is submitted as inductive_generalization and one with no confidence at 0.5, as before these fields existed. Entries are submitted one at a time, exactly as submit_claim, each on its own transaction. The response keeps submitted (a count), errors (a count) and error_details, and adds results: one object per entry in input order, either {index, status: 'ok', ...} carrying that entry's full submit_claim response (claim_id, truth_value, content_hash, embedded, and belief, plausibility, pignistic_prob, frame_id when a belief was wired, and the deduplicated block when the entry matched an existing claim, as submit_claim documents), or {index, status: 'error', error}. An entry that repeats an earlier entry of the same batch, or an existing claim, is reported with deduplicated rather than as a new insert; its inputs_applied / inputs_discarded name only fields the entry supplied, so an omitted (defaulted) methodology or confidence appears in neither. A refused entry (an unknown methodology or evidence_type, a bad label, a refused write) writes nothing, and the other entries still land. If an operator has revoked the personal-group membership of the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), or (HTTP) the caller's agent has no live writable membership at all, every entry is refused that way. The membership is never restored or created; that is an operator action."
@@ -2803,16 +2803,6 @@ impl EpiGraphMcpFull {
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
         tools::batch::batch_submit_claims(self, viewer, params, auth).await
-    }
-
-    #[tool(
-        description = "Validate claims without persisting them. Returns validity checks and warnings for each claim."
-    )]
-    async fn stage_claims(
-        &self,
-        Parameters(params): Parameters<StageClaimsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        tools::batch::stage_claims(self, params).await
     }
 
     #[tool(
@@ -3086,7 +3076,7 @@ impl EpiGraphMcpFull {
         crate::tools::embeddings::backfill_embeddings(self, &mut session, params).await
     }
 
-    // ── Themes (2 read tools, and the retired `theme_cluster` refusal) ──
+    // ── Themes (2 read tools) ──
 
     #[tool(
         description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of the is_current claims assigned to it that YOU can read), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Only themes with at least one current member you can read are listed. Optional label_prefix filter (e.g. \"auto\" for the legacy auto-NN family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME predicate (prefix and visibility), so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this to answer \"what topics does this graph cover\"."
@@ -3112,16 +3102,6 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::themes::get_theme(self, viewer, params).await
-    }
-
-    #[tool(
-        description = "RETIRED. Was server-side k-means theme clustering; that prototype is removed. Every call is refused with nothing written. Themes are maintained by the UMAP theme pipeline (scripts/maintain_themes.py, theme_pipeline.py grow); read them with list_themes / get_theme."
-    )]
-    async fn theme_cluster(
-        &self,
-        Parameters(_params): Parameters<crate::tools::themes::RetiredThemeClusterParams>,
-    ) -> Result<CallToolResult, McpError> {
-        Err(crate::tools::themes::theme_cluster_retired())
     }
 
     // ── RDF Triple Layer (3 tools) ──
