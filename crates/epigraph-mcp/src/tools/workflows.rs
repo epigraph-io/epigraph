@@ -2128,10 +2128,13 @@ async fn deprecate_hierarchical_workflow(
         // would deprecate the part it sees and report success. Refused
         // instead, nothing written, when any generation of a target's name is
         // hidden from the caller (migration 202's check, as every workflow
-        // write asks it). A wholly hidden fork under another name (a private
-        // variant of a visible parent, named differently) is not seen by this
-        // check and is not part of the cascade: it belongs to a group the
-        // caller cannot read, whose members deprecate it. Asked after the
+        // write asks it). BY DESIGN (ruling e5f6a9d7, backlog aa2fb722): a
+        // wholly hidden fork under another name (a private variant of a
+        // visible parent, named differently) is not seen by this check and is
+        // not part of the cascade. It belongs to a group the caller cannot
+        // read, whose members deprecate it; the cascade neither deprecates it
+        // nor signals it (no count, no event), and the tool description says
+        // so. This is not an open gap. Asked after the
         // authority check, so a caller with no authority over the part it
         // sees is refused by the gate and learns nothing about hidden rows.
         let names = WorkflowRepository::canonical_names_of(&mut *tx, &targets)

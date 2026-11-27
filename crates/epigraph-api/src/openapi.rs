@@ -621,7 +621,7 @@ async fn report_hierarchical_outcome_doc() {}
     params(
         ("id" = uuid::Uuid, Path, description = "UUID of the workflow to deprecate"),
         ("reason" = String, Query, description = "Reason for deprecation"),
-        ("cascade" = Option<bool>, Query, description = "Whether to cascade deprecation to descendants"),
+        ("cascade" = Option<bool>, Query, description = "Whether to cascade deprecation to descendants. A fork under another canonical_name that the caller cannot read belongs to its own group: the cascade neither deprecates it nor reports it."),
     ),
     responses(
         (status = 200, body = serde_json::Value),
