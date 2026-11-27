@@ -575,7 +575,7 @@ async fn a_refresh_request_narrows_the_access_token_but_not_the_chain(pool: PgPo
     let both = [s("claims:read"), s("claims:write")];
     let (client_id, client, code) = seed_code_with(
         &pool,
-        &[s("claims:read"), s("claims:write"), s("evidence:read")],
+        &[s("claims:read"), s("claims:write"), s("edges:read")],
         &both,
     )
     .await;
@@ -589,14 +589,14 @@ async fn a_refresh_request_narrows_the_access_token_but_not_the_chain(pool: PgPo
         serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": r0,
-            "scope": "claims:read  evidence:read",
+            "scope": "claims:read  edges:read",
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "narrowing refresh: {body}");
     assert_eq!(
         body["scope"], "claims:read",
-        "narrowed to the request, and evidence:read (granted to the client but never \
+        "narrowed to the request, and edges:read (granted to the client but never \
          consented) is not added"
     );
     let claims = jwt

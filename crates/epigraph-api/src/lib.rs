@@ -1,4 +1,6 @@
 #[cfg(feature = "db")]
+pub mod boot;
+#[cfg(feature = "db")]
 pub mod edge_signer;
 pub mod embedding_restore;
 pub mod errors;

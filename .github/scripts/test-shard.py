@@ -200,6 +200,9 @@ WALKERS = {
         "crates/epigraph-mcp/src/*",
     ),
     "crates/epigraph-api/tests/no_redaction_sentinel.rs": ("crates/*/src/*",),
+    # No retired OAuth scope literal in any crate's src outside the two
+    # RETIRED_SCOPES lists (backlog 7b2e8e26).
+    "crates/epigraph-api/tests/retired_scopes.rs": ("crates/*/src/*",),
     # Every `<name>.timer` named under crates/*/src must have its unit file in
     # deploy/systemd/, which it also walks (backlog 21be383b).
     "crates/epigraph-cli/tests/maintenance_units.rs": ("crates/*/src/*", "deploy/systemd/*"),

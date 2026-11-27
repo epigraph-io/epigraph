@@ -109,7 +109,20 @@ pub async fn provision_external_user_client(
                     reason: "user not provisioned and auto_provision disabled".into(),
                 });
             }
-            let scopes = provider.default_scopes().to_vec();
+            // A retired scope (`epigraph_auth::RETIRED_SCOPES`) a deployment's
+            // `default_scopes` still lists is not granted: no gate checks it.
+            let configured = provider.default_scopes().to_vec();
+            let scopes = epigraph_auth::without_retired_scopes(configured.clone());
+            if scopes.len() != configured.len() {
+                tracing::warn!(
+                    provider = provider.name(),
+                    retired = ?configured
+                        .iter()
+                        .filter(|s| epigraph_auth::is_retired_scope(s))
+                        .collect::<Vec<_>>(),
+                    "providers.toml default_scopes lists retired scopes; not granted (remove them)"
+                );
+            }
             let id = OAuthClientRepository::create(
                 &state.db_pool,
                 &oauth_client_id,

@@ -13,7 +13,6 @@ use epigraph_db::PgPool;
 
 use crate::middleware::SignatureVerificationState;
 use crate::oauth::providers::ProviderRegistry;
-use crate::routes::harvest::HarvesterClient;
 use crate::security::audit::InMemorySecurityAuditLog;
 use crate::security::AgentRateLimiter;
 use chrono::{DateTime, Utc};
@@ -230,13 +229,6 @@ pub async fn hydrate_webhook_store(
 /// When absent, semantic search falls back to mock embeddings.
 pub type SharedEmbeddingService = Arc<dyn EmbeddingService>;
 
-/// Thread-safe harvester gRPC client type alias
-///
-/// The harvester client is optional. When present, the `POST /api/v1/harvest`
-/// endpoint forwards requests to the Python harvester gRPC service.
-/// When absent, the endpoint returns 503 Service Unavailable.
-pub type SharedHarvesterClient = Arc<dyn HarvesterClient>;
-
 /// Thread-safe write-authorization gate.
 ///
 /// Defaults to [`epigraph_authz::GroupPolicyGate`] — **fail-closed**. Before
@@ -329,6 +321,14 @@ pub struct AppState {
     /// boot.
     #[cfg(feature = "db")]
     pub run_token_models: crate::oauth::run_token::RunTokenModels,
+    /// The legacy redirect-URI fallback of the browser OAuth flow
+    /// (`crate::oauth::device`), used when neither the caller nor the
+    /// provider's config names a redirect URI. `None` in every constructor,
+    /// which leaves the `http://127.0.0.1:1` placeholder; `bin/server.rs`
+    /// reads `EPIGRAPH_REDIRECT_URI` once at boot and sets it, so no request
+    /// reads the environment.
+    #[cfg(feature = "db")]
+    pub legacy_redirect_uri: Option<String>,
     /// The federation extensions the RFC 8693 token-exchange grant may mint
     /// for (`crate::oauth::token_exchange`). EMPTY in every constructor, which
     /// refuses every exchange; `bin/server.rs` sets it from
@@ -471,11 +471,6 @@ pub struct AppState {
     /// own guard in `bin/server.rs` (`start_webhook_dispatcher`), so a test
     /// fixture's stub here can never become the resolver deliveries dial by.
     pub webhook_egress: epigraph_jobs::egress::EgressGuard,
-    /// Optional harvester gRPC client for claim extraction
-    ///
-    /// When present, the `POST /api/v1/harvest` endpoint forwards text
-    /// to the Python harvester service. When absent, returns 503.
-    pub harvester_client: Option<SharedHarvesterClient>,
     /// JWT signing configuration for OAuth2 tokens
     ///
     /// Stored once at startup via `Arc` to avoid recreating per request.
@@ -504,6 +499,12 @@ pub struct AppState {
     /// `/oauth/register` accepts beside the built-in hosted and loopback
     /// classes. EMPTY in every constructor; `bin/server.rs` sets it at boot.
     pub oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins,
+
+    /// Whether the token endpoint still accepts a VERSION-1 agent assertion
+    /// (bound to no issuer; `crate::oauth::assertion`). `Accept` (the default)
+    /// in every constructor; `bin/server.rs` sets it from
+    /// `EPIGRAPH_ASSERTION_V1` at boot.
+    pub assertion_v1: crate::oauth::assertion::AssertionV1Policy,
 
     /// entity_types registry cache: `type_name` -> resolved [`EntityTypeEntry`].
     ///
@@ -760,7 +761,8 @@ impl ApiConfig {
 /// checked that they are all FORCEd would pass whatever the migration did.
 ///
 /// `rls_canary` is deliberately absent — migration 078 FORCEs it at creation and
-/// 079's array omits it for the same reason.
+/// 079's array omits it for the same reason. So are the five harvester tables
+/// (two of 062's tier A, 173's two and 347's one): migration 354 dropped them.
 ///
 /// # `079_rls_force.sql` IS NOT THE ONLY SOURCE, AND IT MUST NOT BE EDITED
 ///
@@ -799,7 +801,6 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
     "claim_frames",
-    "harvester_claim_provenance",
     "challenges",
     "reasoning_traces",
     "experiment_triples",
@@ -808,7 +809,6 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     "claim_cluster_membership",
     "claim_neighborhood_membership",
     "claim_signature_revocations",
-    "harvester_fragments",
     "frames",
     "contexts",
     "perspectives",
@@ -867,11 +867,6 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // Role-attached agents (166), FORCEd by the migration that creates it, on
     // the same precedent.
     "role_agents",
-    // The two harvester neighbours of `harvester_fragments` (173, ruling
-    // R-66), brought under tenancy and FORCEd by that migration, on the same
-    // precedent. Apply 173 before or with a binary carrying these two names.
-    "harvester_sources",
-    "harvester_audit_reports",
     // Workflow rows (183, ruling R-74): given tenancy columns and FORCEd by
     // that migration, on the same precedent.
     "workflows",
@@ -896,10 +891,6 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // that migration, on the same precedent. Apply 246 before or with a binary
     // carrying this name.
     "papers",
-    // Enriched harvester concepts (347, backlog f214b84e): given tenancy
-    // columns and FORCEd by that migration, on the same precedent. Apply 347
-    // before or with a binary carrying this name.
-    "harvester_enriched_concepts",
     // Declared agent scopes (356, backlog d7ee64a6), FORCEd by the migration
     // that creates them, on the same precedent; privileged policies only. Inert
     // on a database below 356 (the count is over relations that exist).
@@ -1154,7 +1145,7 @@ pub fn rls_verdict(p: &RlsPosture) -> Result<RlsVerdict, epigraph_db::DbError> {
 /// The tenancy triggers **migration 070** installs, as `(relation, trigger)`.
 ///
 /// Transcribed from `migrations/070_tenancy_write_path.sql`: arm (c)'s
-/// 17-element `inheritors` array, plus `claims_require_tenancy` (arm a),
+/// 17-element `inheritors` array less the provenance table 354 dropped, plus `claims_require_tenancy` (arm a),
 /// `edges_tenancy` (arm b) and `claims_propagate_tenancy` (arm d).
 ///
 /// Required unconditionally by [`AppState::assert_tenancy_triggers_armed`],
@@ -1163,13 +1154,14 @@ pub fn rls_verdict(p: &RlsPosture) -> Result<RlsVerdict, epigraph_db::DbError> {
 ///
 /// # ⚠ This list is 070's, not "every stamping trigger"
 ///
-/// Migration 089's `harvester_claim_provenance_fragment_inherit_tenancy` is
-/// deliberately absent from THIS tier and from [`TENANCY_TRIGGERS_074`], and
-/// that is not an omission: an entry in either one would refuse a database that
-/// is legitimately behind. Here it would refuse every pre-089 database — the
-/// plan §9.2 step (i) failure this whole staged split exists to prevent — and in
-/// 074's tier it would refuse every database between 074 and 089. It lives in
-/// [`TENANCY_TRIGGERS_089`] instead, gated on its own migration's marker.
+/// A later migration's trigger never goes in this tier or in
+/// [`TENANCY_TRIGGERS_074`]: an entry in either one would refuse a database
+/// that is legitimately behind (plan §9.2 step (i)). It gets its own tier,
+/// gated on its own migration's marker, as [`TENANCY_TRIGGERS_210`] is.
+///
+/// The harvester tables' triggers (one of 070's, two of 074's, and the 089
+/// and 173 tiers this list used to sit beside) are not listed: migration 354
+/// dropped those tables. On a database below 354 they are no longer required.
 #[cfg(feature = "db")]
 const TENANCY_TRIGGERS_070: &[(&str, &str)] = &[
     ("claims", "claims_require_tenancy"),
@@ -1186,10 +1178,6 @@ const TENANCY_TRIGGERS_070: &[(&str, &str)] = &[
         "ds_bayesian_divergence_inherit_tenancy",
     ),
     ("claim_frames", "claim_frames_inherit_tenancy"),
-    (
-        "harvester_claim_provenance",
-        "harvester_claim_provenance_inherit_tenancy",
-    ),
     ("challenges", "challenges_inherit_tenancy"),
     ("reasoning_traces", "reasoning_traces_inherit_tenancy"),
     ("experiment_triples", "experiment_triples_inherit_tenancy"),
@@ -1217,7 +1205,8 @@ const TENANCY_TRIGGERS_070: &[(&str, &str)] = &[
 /// Transcribed from `migrations/074_tenancy_required.sql`: section 2's
 /// 17 derived-table `*_require_tenancy` triggers (the same 17 relations as
 /// 070's `inheritors`, on the BEFORE INSERT side), section 3's 6 roots, and
-/// section 4's `claims_block_widening`.
+/// section 4's `claims_block_widening`, less the two on the harvester tables
+/// 354 dropped (one derived, one root).
 ///
 /// Required by [`AppState::assert_tenancy_triggers_armed`] **only when
 /// `claims_block_widening` is present**, which is the marker that 074 ran.
@@ -1237,10 +1226,6 @@ const TENANCY_TRIGGERS_074: &[(&str, &str)] = &[
         "ds_bayesian_divergence_require_tenancy",
     ),
     ("claim_frames", "claim_frames_require_tenancy"),
-    (
-        "harvester_claim_provenance",
-        "harvester_claim_provenance_require_tenancy",
-    ),
     ("challenges", "challenges_require_tenancy"),
     ("reasoning_traces", "reasoning_traces_require_tenancy"),
     ("experiment_triples", "experiment_triples_require_tenancy"),
@@ -1265,91 +1250,7 @@ const TENANCY_TRIGGERS_074: &[(&str, &str)] = &[
     ("contexts", "contexts_require_tenancy"),
     ("perspectives", "perspectives_require_tenancy"),
     ("communities", "communities_require_tenancy"),
-    ("harvester_fragments", "harvester_fragments_require_tenancy"),
     ("recall_events", "recall_events_require_tenancy"),
-];
-
-/// The tenancy trigger **migration 089** adds, as `(relation, trigger)`.
-///
-/// Transcribed from `migrations/089_harvester_fragment_provenance_stamp.sql`:
-/// the statement-level `AFTER INSERT` trigger that stamps a harvester fragment
-/// from the claim its provenance link names.
-///
-/// Required by [`AppState::assert_tenancy_triggers_armed`] **only when 089's
-/// own function `public.epigraph_inherit_fragment_tenancy_stmt` exists**, which
-/// is [`MIGRATION_089_MARKER`].
-///
-/// # Why a third tier rather than an entry in one of the other two
-///
-/// Both existing tiers would refuse a database that is legitimately behind:
-/// unconditionally, every pre-089 database (plan §9.2 step (i)); under 074's
-/// marker, every database between 074 and 089. The staging is the control, so
-/// each migration's triggers have to be gated on that migration's own marker.
-///
-/// # Why the FUNCTION is the marker and the trigger is not
-///
-/// A gate keyed on the trigger would be vacuous by construction: the state it
-/// exists to catch is the trigger's absence, and the marker would vanish with
-/// it. 089 installs a `CREATE OR REPLACE FUNCTION` as well as a
-/// `CREATE TRIGGER`, and dropping the trigger leaves the function behind — so
-/// "function present, trigger absent" is exactly the state that now refuses.
-/// Dropping both (a database that never ran 089, or one deliberately reverted
-/// by 089's own documented reversal) requires nothing and boots, which is what
-/// keeps the staging property intact.
-///
-/// # What this closes
-///
-/// Before this tier, a *disabled* 089 trigger was refused — the `disabled` half
-/// of the check is built from the `%\_inherit\_tenancy` LIKE-matched rows rather
-/// than from `required` — while a *dropped* one was not. That asymmetry was
-/// finding `F-089-G` in `docs/tenancy/progress.json`.
-#[cfg(feature = "db")]
-const TENANCY_TRIGGERS_089: &[(&str, &str)] = &[(
-    "harvester_claim_provenance",
-    "harvester_claim_provenance_fragment_inherit_tenancy",
-)];
-
-/// The marker that migration 089 has run: the function it installs alongside
-/// its trigger. See [`TENANCY_TRIGGERS_089`] for why it is the function and not
-/// the trigger.
-#[cfg(feature = "db")]
-const MIGRATION_089_MARKER: &str = "epigraph_inherit_fragment_tenancy_stmt";
-
-/// The tenancy triggers **migration 173** adds, as `(relation, trigger)`.
-///
-/// Transcribed from `migrations/173_harvester_tables_tenancy_posture.sql`'s
-/// section 4: the root trigger that makes a `harvester_sources` writer declare
-/// its tenancy, the stamp that gives an audit report its fragment's pair at
-/// INSERT, and the trigger on `harvester_fragments` that re-stamps a
-/// fragment's audit reports when the fragment's pair changes. A dropped follow
-/// trigger is the silent case: the audit of a narrowed or re-owned fragment
-/// stays readable to its old readers, and nothing errors.
-///
-/// Required by [`AppState::assert_tenancy_triggers_armed`] **only when one of
-/// [`MIGRATION_173_MARKERS`] exists**, for the reasons
-/// [`TENANCY_TRIGGERS_089`] gives: an unconditional entry would refuse every
-/// database that has not reached 173.
-#[cfg(feature = "db")]
-const TENANCY_TRIGGERS_173: &[(&str, &str)] = &[
-    ("harvester_sources", "harvester_sources_require_tenancy"),
-    (
-        "harvester_audit_reports",
-        "harvester_audit_reports_inherit_tenancy",
-    ),
-    (
-        "harvester_fragments",
-        "harvester_fragments_audit_reports_inherit_tenancy",
-    ),
-];
-
-/// The markers that migration 173 has run: the two functions it installs
-/// beside its triggers. EITHER one present means 173 ran, so dropping one
-/// trigger together with its own function still leaves the tier required by
-/// the other. 173's documented undo drops both, and then nothing is required.
-#[cfg(feature = "db")]
-const MIGRATION_173_MARKERS: &[&str] = &[
-    "epigraph_audit_report_inherit_tenancy",
-    "epigraph_fragment_audit_reports_follow",
 ];
 
 /// The triggers **migration 210** (per-team Atlas maps) adds, as
@@ -1360,8 +1261,10 @@ const MIGRATION_173_MARKERS: &[&str] = &[
 /// set, no epoch moves, and a stored map that still holds it keeps reporting
 /// itself current and departure-free.
 ///
-/// Required **only when one of [`MIGRATION_210_MARKERS`] exists**, for the
-/// reasons [`TENANCY_TRIGGERS_089`] gives.
+/// Required **only when one of [`MIGRATION_210_MARKERS`] exists**: an
+/// unconditional entry would refuse every database that has not reached 210.
+/// The marker is a FUNCTION, not a trigger: a gate keyed on the trigger would
+/// vanish with the very trigger whose absence it exists to catch.
 #[cfg(feature = "db")]
 const TENANCY_TRIGGERS_210: &[(&str, &str)] = &[
     ("atlas_map_epochs", "atlas_map_epochs_require_tenancy"),
@@ -1390,7 +1293,7 @@ const MIGRATION_210_MARKERS: &[&str] = &[
 /// stay readable to its old readers, and nothing errors.
 ///
 /// Required **only when one of [`MIGRATION_240_MARKERS`] exists**, for the
-/// reasons [`TENANCY_TRIGGERS_089`] gives.
+/// reasons [`TENANCY_TRIGGERS_210`] gives.
 #[cfg(feature = "db")]
 const TENANCY_TRIGGERS_240: &[(&str, &str)] = &[
     (
@@ -1437,11 +1340,11 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
         }
     }
 
@@ -1475,6 +1378,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
+            #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
@@ -1498,11 +1403,11 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -1533,11 +1438,11 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
         }
     }
 
@@ -1592,6 +1497,15 @@ impl AppState {
         models: crate::oauth::run_token::RunTokenModels,
     ) -> Self {
         self.run_token_models = models;
+        self
+    }
+
+    /// Set the browser OAuth flow's legacy redirect-URI fallback; see
+    /// [`Self::legacy_redirect_uri`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_legacy_redirect_uri(mut self, uri: Option<String>) -> Self {
+        self.legacy_redirect_uri = uri;
         self
     }
 
@@ -2095,6 +2009,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
+            #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
@@ -2118,11 +2034,11 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -2155,11 +2071,11 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
         }
     }
 
@@ -2181,6 +2097,8 @@ impl AppState {
             run_tokens: epigraph_db::RunTokens::Off,
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
+            #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
             #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
@@ -2205,11 +2123,11 @@ impl AppState {
             started_at: Instant::now(),
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
+            assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -2221,20 +2139,11 @@ impl AppState {
     /// ([`epigraph_auth::JwtConfig::from_kernel_env`]): EdDSA when
     /// `EPIGRAPH_JWT_SIGNING_KEY` is set (with `EPIGRAPH_JWT_SECRET`, if set,
     /// as the accept-only HS256 window), else HS256 from the secret or the
-    /// dev fallback.
+    /// dev fallback. When `EPIGRAPH_ENV` is set to anything but a known
+    /// non-production name the dev fallback is refused; see
+    /// [`jwt_config_from_env_values`].
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
-        // NOTE: the dev fallback is intentionally NOT fail-closed. This is
-        // called by test/builder constructors; the production gate lives in
-        // bin/server.rs::main (`epigraph_auth::check_kernel_jwt_keys`), which
-        // refuses a malformed signing key before any state is built, so the
-        // panic below is unreachable from the server binary. A malformed key
-        // must never fall back to shared-secret signing.
-        let signing_key = std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR).ok();
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET").ok();
-        let config =
-            crate::oauth::JwtConfig::from_kernel_env(signing_key.as_deref(), secret.as_deref())
-                .unwrap_or_else(|reason| panic!("FATAL: {reason}"));
-        Arc::new(config)
+        jwt_config_from_lookup(|name| std::env::var(name).ok())
     }
 
     /// The admin-scope switch for one request (elevation plan EL-10): read on
@@ -2347,15 +2256,10 @@ impl AppState {
     ///     (some roots armed, `claims_block_widening` created) is therefore
     ///     still caught, because that trigger is created in section 4, before
     ///     section 5 drops the defaults.
-    ///   * [`TENANCY_TRIGGERS_089`] is required only once
-    ///     [`MIGRATION_089_MARKER`] — 089's own function — is present. The
-    ///     marker is deliberately NOT the trigger: a gate keyed on the thing it
-    ///     checks for is vacuous.
-    ///   * [`TENANCY_TRIGGERS_173`] is required only once either of
-    ///     [`MIGRATION_173_MARKERS`] — 173's own functions — is present, on the
-    ///     same reasoning.
     ///   * [`TENANCY_TRIGGERS_210`] is required only once any of
     ///     [`MIGRATION_210_MARKERS`] — 210's staleness functions — is present.
+    ///     The marker is deliberately NOT the trigger: a gate keyed on the
+    ///     thing it checks for is vacuous.
     ///   * [`TENANCY_TRIGGERS_240`] is required only once any of
     ///     [`MIGRATION_240_MARKERS`] — 240's stamp and follow functions — is
     ///     present.
@@ -2369,7 +2273,9 @@ impl AppState {
     /// Returns `DbError::InvalidData` if an expected trigger is absent on a
     /// table that exists, or if any matching trigger is not `tgenabled = 'O'`.
     #[cfg(feature = "db")]
-    pub async fn assert_tenancy_triggers_armed(&self) -> Result<(), epigraph_db::DbError> {
+    pub async fn assert_tenancy_triggers_armed_on(
+        pool: &PgPool,
+    ) -> Result<(), epigraph_db::DbError> {
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT c.relname, t.tgname, t.tgenabled::text \
                FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
@@ -2381,7 +2287,7 @@ impl AppState {
                                      'edges_atlas_map_stale', 'evidence_atlas_map_stale')) \
               ORDER BY c.relname, t.tgname",
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
 
         let present: std::collections::HashSet<(&str, &str)> = rows
@@ -2397,35 +2303,30 @@ impl AppState {
               WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = ANY($1)",
         )
         .bind(
-            // EVERY tier's relations, including 089's. A relation missing from
-            // this bind list falls to `table_absent` and WARNS instead of
-            // refusing — so forgetting one here makes the tier that names it
-            // fail open, which is the defect this whole function exists to
-            // remove. (089's relation happens also to be in 070's list, so the
-            // chain below is currently redundant for it. It is spelled anyway:
-            // the next tier's relation will not be.)
+            // EVERY tier's relations. A relation missing from this bind list
+            // falls to `table_absent` and WARNS instead of refusing — so
+            // forgetting one here makes the tier that names it fail open,
+            // which is the defect this whole function exists to remove.
             TENANCY_TRIGGERS_070
                 .iter()
                 .chain(TENANCY_TRIGGERS_074.iter())
-                .chain(TENANCY_TRIGGERS_089.iter())
-                .chain(TENANCY_TRIGGERS_173.iter())
                 .chain(TENANCY_TRIGGERS_210.iter())
                 .chain(TENANCY_TRIGGERS_240.iter())
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
         let existing: std::collections::HashSet<&str> =
             existing_tables.iter().map(String::as_str).collect();
 
-        // 089 ran iff its function is installed. Keyed on the FUNCTION rather
+        // 210 ran iff one of its functions is installed. Keyed on the FUNCTION rather
         // than on the trigger, because the state this tier exists to catch is
         // the trigger's absence and a marker that disappears with its subject
         // can never fire. `pg_proc`, not `_sqlx_migrations`: the catalog is what
         // the trigger actually lives in, and a hand-edited migrations table
         // would otherwise decide a safety check.
-        // One read for every marker-gated tier (089's, 173's, 210's and 240's), so the boot
+        // One read for every marker-gated tier (210's and 240's), so the boot
         // check keeps a single catalog probe.
         let markers: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT p.proname::text FROM pg_proc p \
@@ -2433,19 +2334,15 @@ impl AppState {
               WHERE n.nspname = 'public' AND p.proname = ANY($1)",
         )
         .bind(
-            std::iter::once(MIGRATION_089_MARKER)
-                .chain(MIGRATION_173_MARKERS.iter().copied())
-                .chain(MIGRATION_210_MARKERS.iter().copied())
+            MIGRATION_210_MARKERS
+                .iter()
+                .copied()
                 .chain(MIGRATION_240_MARKERS.iter().copied())
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
-        let migration_089_applied = markers.iter().any(|m| m == MIGRATION_089_MARKER);
-        let migration_173_applied = markers
-            .iter()
-            .any(|m| MIGRATION_173_MARKERS.contains(&m.as_str()));
         let migration_210_applied = markers
             .iter()
             .any(|m| MIGRATION_210_MARKERS.contains(&m.as_str()));
@@ -2461,12 +2358,6 @@ impl AppState {
         let mut required: Vec<(&str, &str)> = TENANCY_TRIGGERS_070.to_vec();
         if migration_074_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_074);
-        }
-        if migration_089_applied {
-            required.extend_from_slice(TENANCY_TRIGGERS_089);
-        }
-        if migration_173_applied {
-            required.extend_from_slice(TENANCY_TRIGGERS_173);
         }
         if migration_210_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_210);
@@ -2527,13 +2418,20 @@ impl AppState {
         tracing::info!(
             triggers = rows.len(),
             migration_074_applied,
-            migration_089_applied,
-            migration_173_applied,
             migration_210_applied,
             migration_240_applied,
             "tenancy triggers armed"
         );
         Ok(())
+    }
+
+    /// [`Self::assert_tenancy_triggers_armed_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::assert_tenancy_triggers_armed_on`].
+    #[cfg(feature = "db")]
+    pub async fn assert_tenancy_triggers_armed(&self) -> Result<(), epigraph_db::DbError> {
+        Self::assert_tenancy_triggers_armed_on(&self.db_pool).await
     }
 
     /// Ask the database the questions [`rls_verdict`] decides on.
@@ -2545,7 +2443,7 @@ impl AppState {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the catalog cannot be read at all.
     #[cfg(feature = "db")]
-    pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
+    pub async fn probe_rls_posture_on(pool: &PgPool) -> Result<RlsPosture, epigraph_db::DbError> {
         // The seed column asks what the `*_require_tenancy` triggers ask AT
         // THIS DATABASE'S MIGRATION LEVEL: since 216 an explicit grant, not
         // `pg_has_role`, which every superuser satisfies. See
@@ -2575,18 +2473,18 @@ impl AppState {
             i64,
         ) = sqlx::query_as(&sql)
             .bind(FORCE_PROTECTED_SET)
-            .fetch_one(&self.db_pool)
+            .fetch_one(pool)
             .await?;
 
         // Below 078 there is no canary. `to_regclass` returns NULL rather than
         // raising, so this is one statement either way.
         let canary_exists: bool =
             sqlx::query_scalar("SELECT to_regclass('public.rls_canary') IS NOT NULL")
-                .fetch_one(&self.db_pool)
+                .fetch_one(pool)
                 .await?;
         let canary_visible: i64 = if canary_exists {
             sqlx::query_scalar("SELECT count(*) FROM public.rls_canary")
-                .fetch_one(&self.db_pool)
+                .fetch_one(pool)
                 .await?
         } else {
             0
@@ -2604,6 +2502,15 @@ impl AppState {
         })
     }
 
+    /// [`Self::probe_rls_posture_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::probe_rls_posture_on`].
+    #[cfg(feature = "db")]
+    pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
+        Self::probe_rls_posture_on(&self.db_pool).await
+    }
+
     /// Probe, decide, and either log or refuse. The PR-17 boot assertion.
     ///
     /// See [`rls_verdict`] for the staging rule and for the one acceptance item
@@ -2611,8 +2518,8 @@ impl AppState {
     ///
     /// # A FAILURE TO *READ* THE POSTURE IS NOT A REFUSAL
     ///
-    /// The caller wraps this in `.expect()`, so anything returned here is a boot
-    /// panic. Staging the VERDICT (see [`rls_verdict`]) buys nothing if the
+    /// The caller ([`crate::boot::check_db_posture`]) turns anything returned
+    /// here into a boot refusal. Staging the VERDICT (see [`rls_verdict`]) buys nothing if the
     /// PROBE is unconditionally fatal, and the probe has a reachable failure
     /// that has nothing to do with posture: its canary read needs the GRANT that
     /// migration 078 issues inside `IF EXISTS (SELECT 1 FROM pg_roles WHERE
@@ -2633,8 +2540,8 @@ impl AppState {
     /// # Errors
     /// Propagates [`rls_verdict`] refusals ONLY.
     #[cfg(feature = "db")]
-    pub async fn assert_rls_posture(&self) -> Result<(), epigraph_db::DbError> {
-        let posture = match self.probe_rls_posture().await {
+    pub async fn assert_rls_posture_on(pool: &PgPool) -> Result<(), epigraph_db::DbError> {
+        let posture = match Self::probe_rls_posture_on(pool).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -2666,6 +2573,15 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::assert_rls_posture_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::assert_rls_posture_on`].
+    #[cfg(feature = "db")]
+    pub async fn assert_rls_posture(&self) -> Result<(), epigraph_db::DbError> {
+        Self::assert_rls_posture_on(&self.db_pool).await
     }
 
     /// The number of `rls_canary` rows visible on the API pool.
@@ -2730,7 +2646,9 @@ impl AppState {
     /// Returns the underlying `DbError` if the catalog probe itself fails. The
     /// posture findings are logged, not returned.
     #[cfg(feature = "db")]
-    pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
+    pub async fn warn_on_privileged_connection_on(
+        pool: &PgPool,
+    ) -> Result<(), epigraph_db::DbError> {
         // See `epigraph_db::repos::seed_posture`: the seed column is the
         // question the triggers ask at this migration level, and the last
         // column says which question that is (216's explicit grant, or 074's
@@ -2748,7 +2666,7 @@ impl AppState {
             bool,
             bool,
             bool,
-        ) = sqlx::query_as(&sql).fetch_one(&self.db_pool).await?;
+        ) = sqlx::query_as(&sql).fetch_one(pool).await?;
 
         if current_user != "epigraph_app" {
             tracing::warn!(
@@ -2781,6 +2699,15 @@ impl AppState {
             );
         }
         Ok(())
+    }
+
+    /// [`Self::warn_on_privileged_connection_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::warn_on_privileged_connection_on`].
+    #[cfg(feature = "db")]
+    pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
+        Self::warn_on_privileged_connection_on(&self.db_pool).await
     }
 
     /// Replace the webhook-registration egress guard. See
@@ -2933,6 +2860,14 @@ impl AppState {
         origins: crate::oauth::redirect::RedirectOrigins,
     ) -> Self {
         self.oauth_redirect_origins = origins;
+        self
+    }
+
+    /// Set whether a version-1 agent assertion is still accepted; see
+    /// [`Self::assertion_v1`].
+    #[must_use]
+    pub fn with_assertion_v1(mut self, policy: crate::oauth::assertion::AssertionV1Policy) -> Self {
+        self.assertion_v1 = policy;
         self
     }
 
@@ -3368,6 +3303,103 @@ pub fn admin_cascade_enabled(source: epigraph_db::MaintenanceDsnSource, bypass: 
     source == epigraph_db::MaintenanceDsnSource::Configured && bypass
 }
 
+/// `EPIGRAPH_ALLOW_INSECURE_SECRET`'s truthy set (`1`, `true`, `yes`, any
+/// case): the opt-out from the JWT key check, for local development and CI.
+/// Shared by `bin/server.rs::main`'s boot gate and
+/// [`AppState`]'s default JWT config so both read the flag the same way.
+#[must_use]
+pub fn allow_insecure_secret(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// The refusal printed when [`epigraph_auth::check_kernel_jwt_keys`] rejects
+/// the configured keys. One text for `bin/server.rs::main` and for
+/// [`jwt_config_from_env_values`].
+#[must_use]
+pub fn jwt_key_refusal(reason: &str) -> String {
+    format!(
+        "FATAL: {reason}. Set {} (64 hex characters, an Ed25519 seed) or a real \
+         EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), or set \
+         EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI.",
+        epigraph_auth::JWT_SIGNING_KEY_VAR
+    )
+}
+
+/// Does this `EPIGRAPH_ENV` value demand the JWT key check, for the
+/// dev-secret refusal?
+///
+/// Fail closed on every value that is SET: anything but a known
+/// non-production name ([`crate::oauth::providers::env_is_production`]'s
+/// allowlist: `development`, `dev`, `test`, `testing`, `local`, `ci`) is
+/// production, so `prod`, `staging` or a typo of `production` refuses the
+/// dev fallback rather than signing with the published dev secret (standing
+/// decision Q4, the rule `env_is_production` documents).
+///
+/// The one difference from `env_is_production`: an UNSET, empty or
+/// whitespace-only value keeps the dev fallback, because every test and
+/// builder constructor runs with `EPIGRAPH_ENV` unset and relies on it. The
+/// server binary does not depend on this predicate; `bin/server.rs::main`
+/// runs [`epigraph_auth::check_kernel_jwt_keys`] in every environment before
+/// any state is built.
+fn jwt_env_is_production(env: Option<&str>) -> bool {
+    env.map(str::trim)
+        .filter(|e| !e.is_empty())
+        .is_some_and(crate::oauth::providers::env_is_production)
+}
+
+/// [`AppState`]'s JWT config from a variable lookup: the four variables
+/// `AppState::default_jwt_config` reads, by name, passed to
+/// [`jwt_config_from_env_values`]. `default_jwt_config` passes
+/// `std::env::var`; a test passes a closure, so the variable NAMES are
+/// covered without mutating the process environment.
+fn jwt_config_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Arc<crate::oauth::JwtConfig> {
+    let signing_key = lookup(epigraph_auth::JWT_SIGNING_KEY_VAR);
+    let secret = lookup("EPIGRAPH_JWT_SECRET");
+    let env = lookup("EPIGRAPH_ENV");
+    let allow_insecure = lookup("EPIGRAPH_ALLOW_INSECURE_SECRET");
+    jwt_config_from_env_values(
+        signing_key.as_deref(),
+        secret.as_deref(),
+        env.as_deref(),
+        allow_insecure_secret(allow_insecure.as_deref()),
+    )
+}
+
+/// [`AppState`]'s JWT config from the raw environment values. Pure, so every
+/// arm is testable without mutating the process environment.
+///
+/// When `EPIGRAPH_ENV` is set to anything but a known non-production name
+/// (see [`jwt_env_is_production`]) the keys must pass
+/// [`epigraph_auth::check_kernel_jwt_keys`] (the binary's boot gate), so an
+/// embedder that builds `AppState` in production with no key, or with only
+/// the dev secret, gets a panic rather than a config that signs with the
+/// published dev secret. `allow_insecure`
+/// (`EPIGRAPH_ALLOW_INSECURE_SECRET`) opts out exactly as it does for the
+/// binary. With `EPIGRAPH_ENV` unset, empty or non-production the dev
+/// fallback stands.
+///
+/// # Panics
+/// With [`jwt_key_refusal`]'s text when production refuses the keys, and with
+/// `FATAL:` in every environment when a set signing key does not parse (a
+/// malformed key must never fall back to shared-secret signing).
+pub fn jwt_config_from_env_values(
+    signing_key: Option<&str>,
+    secret: Option<&str>,
+    env: Option<&str>,
+    allow_insecure: bool,
+) -> Arc<crate::oauth::JwtConfig> {
+    if jwt_env_is_production(env) {
+        if let Err(reason) =
+            epigraph_auth::check_kernel_jwt_keys(signing_key, secret, allow_insecure)
+        {
+            panic!("{}", jwt_key_refusal(&reason));
+        }
+    }
+    let config = crate::oauth::JwtConfig::from_kernel_env(signing_key, secret)
+        .unwrap_or_else(|reason| panic!("FATAL: {reason}"));
+    Arc::new(config)
+}
+
 /// Whether the API `server` may start, given the value of
 /// `MAINTENANCE_DATABASE_URL` in its environment (operator decision D9).
 ///
@@ -3491,5 +3523,167 @@ impl std::ops::DerefMut for ClaimWriteTx<'_> {
             Self::Stamped(tx) => &mut *tx,
             Self::Unscoped(tx) => &mut *tx,
         }
+    }
+}
+
+#[cfg(test)]
+mod default_jwt_config_tests {
+    //! [`super::jwt_config_from_env_values`], the pure core of
+    //! `AppState::default_jwt_config`, and [`super::jwt_config_from_lookup`],
+    //! which reads the variables by name. No test here touches the process
+    //! environment.
+    use super::{allow_insecure_secret, jwt_config_from_env_values, jwt_config_from_lookup};
+    use jsonwebtoken::Algorithm;
+
+    /// A valid Ed25519 seed (64 hex characters).
+    const SEED: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    /// A secret `assert_production_secret` admits (>= 32 bytes, not the dev
+    /// literal).
+    const REAL_SECRET: &str = "a-real-production-secret-of-48-bytes-0123456789ab";
+
+    fn dev_secret() -> &'static str {
+        std::str::from_utf8(epigraph_auth::DEV_JWT_SECRET).expect("dev secret is utf-8")
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn production_with_no_key_panics() {
+        let _ = jwt_config_from_env_values(None, None, Some("production"), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "EPIGRAPH_ALLOW_INSECURE_SECRET=1")]
+    fn production_with_only_the_dev_secret_panics() {
+        let _ = jwt_config_from_env_values(None, Some(dev_secret()), Some("production"), false);
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn production_is_matched_trimmed_and_case_insensitively() {
+        let _ = jwt_config_from_env_values(None, None, Some(" Production "), false);
+    }
+
+    #[test]
+    fn production_with_a_valid_signing_key_builds_eddsa() {
+        let cfg = jwt_config_from_env_values(Some(SEED), None, Some("production"), false);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::EdDSA));
+    }
+
+    #[test]
+    fn production_with_a_real_secret_builds_hs256() {
+        let cfg = jwt_config_from_env_values(None, Some(REAL_SECRET), Some("production"), false);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    #[test]
+    fn production_with_the_insecure_opt_out_keeps_the_dev_fallback() {
+        let cfg = jwt_config_from_env_values(None, None, Some("production"), true);
+        assert_eq!(cfg.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    /// Dev and test behaviour is unchanged: unset, empty and the known
+    /// non-production names keep the dev fallback (the whole suite runs with
+    /// `EPIGRAPH_ENV` unset, and the served tests set `test`).
+    #[test]
+    fn non_production_keeps_the_dev_fallback() {
+        for env in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("test"),
+            Some("development"),
+            Some("dev"),
+            Some("testing"),
+            Some("local"),
+            Some("CI"),
+        ] {
+            let cfg = jwt_config_from_env_values(None, None, env, false);
+            assert_eq!(
+                cfg.signing_algorithm(),
+                Some(Algorithm::HS256),
+                "env={env:?}"
+            );
+        }
+    }
+
+    /// Fail closed: a SET value that is not a known non-production name is
+    /// production, so a deployment that spells it `prod` or `staging` does
+    /// not sign with the published dev secret.
+    #[test]
+    fn an_unrecognised_env_value_is_production() {
+        for env in ["prod", "staging", "prd", "productoin"] {
+            let outcome = std::panic::catch_unwind(|| {
+                jwt_config_from_env_values(None, None, Some(env), false)
+            });
+            let Err(payload) = outcome else {
+                panic!("EPIGRAPH_ENV={env:?} with no key must refuse the dev fallback");
+            };
+            let text = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                text.starts_with("FATAL: ") && text.contains("EPIGRAPH_ALLOW_INSECURE_SECRET=1"),
+                "EPIGRAPH_ENV={env:?} refused with the wrong text: {text:?}"
+            );
+        }
+    }
+
+    /// The wiring: `EPIGRAPH_ENV` is read by that name and reaches the
+    /// production check. A lookup that answers only `EPIGRAPH_ENV` (no key, no
+    /// opt-out) must refuse; one that also answers the opt-out by its name
+    /// must not.
+    #[test]
+    fn the_lookup_reads_epigraph_env_by_name() {
+        let refused = std::panic::catch_unwind(|| {
+            jwt_config_from_lookup(|name| (name == "EPIGRAPH_ENV").then(|| "production".into()))
+        });
+        assert!(
+            refused.is_err(),
+            "EPIGRAPH_ENV=production with no key must refuse the dev fallback"
+        );
+
+        let opted_out = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_ALLOW_INSECURE_SECRET" => Some("1".into()),
+            _ => None,
+        });
+        assert_eq!(opted_out.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    /// The wiring: the signing key and the secret are read by their names.
+    #[test]
+    fn the_lookup_reads_the_keys_by_name() {
+        let eddsa = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_JWT_SIGNING_KEY" => Some(SEED.into()),
+            _ => None,
+        });
+        assert_eq!(eddsa.signing_algorithm(), Some(Algorithm::EdDSA));
+
+        let hs256 = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_JWT_SECRET" => Some(REAL_SECRET.into()),
+            _ => None,
+        });
+        assert_eq!(hs256.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    /// A malformed signing key never falls back, in any environment.
+    #[test]
+    #[should_panic(expected = "FATAL")]
+    fn a_malformed_signing_key_panics_outside_production_too() {
+        let _ = jwt_config_from_env_values(Some("not-hex"), None, None, true);
+    }
+
+    #[test]
+    fn the_insecure_opt_out_parses_like_the_boot_gate() {
+        for on in ["1", "true", "TRUE", "yes", "Yes"] {
+            assert!(allow_insecure_secret(Some(on)), "{on:?}");
+        }
+        for off in ["", "0", "false", "no", "on"] {
+            assert!(!allow_insecure_secret(Some(off)), "{off:?}");
+        }
+        assert!(!allow_insecure_secret(None));
     }
 }

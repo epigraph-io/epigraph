@@ -5,6 +5,11 @@ Status: design only, nothing is built. Operator request 2026-11-12: "We're going
 `main` at `55b524f37`. Code is cited as `path::function` plus a fragment you can grep for, never by
 line number.
 
+> **Since migration 354 (2026-11-27, backlog c7752f07, a6e3dba2) the five harvester tables are
+> dropped**, and share and publicize no longer carry fragments or sources (242's fragment hold and
+> 215's source rule are gone, with their audit counts). Every harvester row, rule and question
+> below describes the design as measured before 354.
+
 Related documents: [claim-visibility-controls.md](claim-visibility-controls.md) (migration 206,
 PR #784, decisions D-V1..D-V5), [papers-tenancy-followup.md](papers-tenancy-followup.md), and
 `docs/deploy.md` (operator CLI runbook).

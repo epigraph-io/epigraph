@@ -45,8 +45,6 @@ const ARMED_READ_WRITE: &[(&str, &str)] = &[
     ("frames", "T-OWN"),
     ("group_memberships", "T-GROUP"),
     ("groups", "T-GROUP"),
-    ("harvester_claim_provenance", "T-DER"),
-    ("harvester_fragments", "T-OWN"),
     ("mass_functions", "T-DER"),
     ("perspectives", "T-OWN"),
     ("reasoning_traces", "T-DER"),
@@ -190,21 +188,6 @@ const EXCLUDED: &[(&str, &str)] = &[
     (
         "rls_canary",
         "bypass-only boot canary: the application reads and writes no row",
-    ),
-    (
-        "harvester_sources",
-        "harvester pipeline (173): the application writes no row (118 section 6), and no \
-         elevated read arm is added, so an elevated session reads only what its tenancy admits",
-    ),
-    (
-        "harvester_audit_reports",
-        "harvester pipeline (173): the application writes no row (118 section 6), and no \
-         elevated read arm is added, so an elevated session reads only what its tenancy admits",
-    ),
-    (
-        "harvester_enriched_concepts",
-        "harvester pipeline (347): the application writes no row (118 section 6), and no \
-         elevated read arm is added, so an elevated session reads only what its tenancy admits",
     ),
     (
         "atlas_map_epochs",
@@ -712,6 +695,20 @@ async fn disarm(conn: &mut sqlx::PgConnection) {
     .expect("disarm");
 }
 
+/// 126 names two harvester tables that migration 354 dropped, so its file
+/// re-runs only where they exist: `docs/runbooks/354-undo.sql` recreates them
+/// (in their pre-354 shape, 126's elevated policies included) before a rerun.
+async fn restore_126_tables(pool: &PgPool) {
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/354-undo.sql"),
+    )
+    .expect("354-undo.sql");
+    sqlx::raw_sql(&undo)
+        .execute(pool)
+        .await
+        .expect("the 354 undo applies at head");
+}
+
 /// Running 126 again changes nothing: the same policies, the same bodies, and
 /// the migrator connection's `lock_timeout` is what it was before (each
 /// block's timeout is transaction-local).
@@ -721,6 +718,7 @@ async fn disarm(conn: &mut sqlx::PgConnection) {
 /// removed (the rerun fails: the policy already exists).
 #[sqlx::test(migrations = "../../migrations")]
 async fn rerunning_126_changes_nothing(pool: PgPool) {
+    restore_126_tables(&pool).await;
     let before = observed(&pool).await;
     let mut conn = pool.acquire().await.expect("a connection");
     let timeout_before = lock_timeout(&mut conn).await;
@@ -734,6 +732,11 @@ async fn rerunning_126_changes_nothing(pool: PgPool) {
         "the per-table lock timeout must not outlive the file on the migrator's connection"
     );
     assert_eq!(observed(&mut *conn).await, before, "a rerun is a no-op");
+    // The census is head's, which has no harvester table.
+    let before: BTreeMap<String, BTreeSet<Pol>> = before
+        .into_iter()
+        .filter(|(t, _)| !t.starts_with("harvester_"))
+        .collect();
     assert_eq!(
         before,
         expected()
@@ -757,6 +760,7 @@ async fn rerunning_126_changes_nothing(pool: PgPool) {
 /// timeout removed (the file waits for the lock: the 20 s bound fires).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_held_lock_fails_one_table_and_a_rerun_resumes(pool: PgPool) {
+    restore_126_tables(&pool).await;
     let full = observed(&pool).await;
     let url = {
         let db: String = sqlx::query_scalar("SELECT current_database()")

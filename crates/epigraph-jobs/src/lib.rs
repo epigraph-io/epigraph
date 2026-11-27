@@ -1025,6 +1025,17 @@ pub enum EmbeddingJobError {
         /// The claim ID that was not found
         claim_id: Uuid,
     },
+
+    /// The claim gained a vector while the job was calling the provider, so
+    /// the store wrote nothing rather than overwrite it (backlog 1b83b2a1).
+    ///
+    /// Not a failure: [`ConfigurableEmbeddingHandler`] completes the job as a
+    /// skip when `generate_and_store` returns it.
+    #[error("Claim {claim_id} already has an embedding")]
+    AlreadyEmbedded {
+        /// The claim that already carries a vector
+        claim_id: Uuid,
+    },
 }
 
 /// Service trait for embedding generation in job handlers.
@@ -1047,7 +1058,21 @@ pub trait EmbeddingJobService: Send + Sync {
     /// Returns `None` if the claim does not exist.
     async fn get_claim_text(&self, claim_id: Uuid) -> Option<String>;
 
-    /// Generate an embedding for the text and store it for the claim.
+    /// Whether the claim already carries a stored vector.
+    ///
+    /// The handler asks this first and, on `Ok(true)`, completes the job as a
+    /// skip without reading the text or calling the provider (backlog
+    /// 1b83b2a1): the job exists to fill a missing vector, and an inline write
+    /// may have filled it since the job was enqueued. Required rather than
+    /// defaulted to `Ok(false)`, so an implementor cannot opt out silently.
+    ///
+    /// # Errors
+    /// An `EmbeddingJobError` when the check itself could not run; the handler
+    /// classifies it like a store error.
+    async fn already_embedded(&self, claim_id: Uuid) -> Result<bool, EmbeddingJobError>;
+
+    /// Generate an embedding for the text and store it for the claim, without
+    /// overwriting a vector the claim gained in the meantime.
     ///
     /// # Arguments
     /// * `claim_id` - The claim ID to associate with the embedding
@@ -1055,6 +1080,8 @@ pub trait EmbeddingJobService: Send + Sync {
     ///
     /// # Returns
     /// * `Ok(Vec<f32>)` - The generated embedding vector
+    /// * `Err(EmbeddingJobError::AlreadyEmbedded)` - The claim gained a vector
+    ///   during the provider call; nothing was stored (the handler skips)
     /// * `Err(EmbeddingJobError)` - If generation or storage fails
     async fn generate_and_store(
         &self,
@@ -1108,7 +1135,21 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
             });
         };
 
-        // Step 2: Get the claim text from the service. `None` stays TRANSIENT:
+        let start = std::time::Instant::now();
+
+        // Step 2: A claim that already has a vector is done: no text read, no
+        // provider call, nothing stored (backlog 1b83b2a1). The job fills a
+        // missing vector; an inline write may have filled it since enqueue.
+        if self
+            .embedding_service
+            .already_embedded(claim_id)
+            .await
+            .map_err(embedding_job_error)?
+        {
+            return Ok(already_embedded_result(claim_id, start.elapsed()));
+        }
+
+        // Step 3: Get the claim text from the service. `None` stays TRANSIENT:
         // the service also answers `None` when it could not get a connection
         // or the read failed, which a later run may not hit.
         let claim_text = self
@@ -1119,21 +1160,27 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
                 message: format!("Claim not found: {claim_id}"),
             })?;
 
-        // Step 3: Generate and store the embedding
-        let start = std::time::Instant::now();
-
-        let embedding = self
+        // Step 4: Generate and store the embedding. A vector that landed
+        // during the provider call is kept, and the job completes as a skip
+        // rather than failing a claim that has what the job was for.
+        let embedding = match self
             .embedding_service
             .generate_and_store(claim_id, &claim_text)
             .await
-            .map_err(embedding_job_error)?;
+        {
+            Ok(embedding) => embedding,
+            Err(EmbeddingJobError::AlreadyEmbedded { .. }) => {
+                return Ok(already_embedded_result(claim_id, start.elapsed()));
+            }
+            Err(e) => return Err(embedding_job_error(e)),
+        };
 
         let execution_duration = start.elapsed();
 
-        // Step 4: Get token usage for metadata
+        // Step 5: Get token usage for metadata
         let token_usage = self.embedding_service.token_usage();
 
-        // Step 5: Build result metadata
+        // Step 6: Build result metadata
         let mut extra = std::collections::HashMap::new();
         extra.insert(
             "embedding_dimension".to_string(),
@@ -1174,6 +1221,25 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
     }
 }
 
+/// The result of an `embedding_generation` job whose claim already carries a
+/// vector: completed, nothing generated or stored (backlog 1b83b2a1).
+fn already_embedded_result(claim_id: Uuid, execution_duration: Duration) -> JobResult {
+    let mut extra = std::collections::HashMap::new();
+    extra.insert("skipped".to_string(), serde_json::json!("already_embedded"));
+    JobResult {
+        output: serde_json::json!({
+            "claim_id": claim_id,
+            "skipped": "already_embedded",
+        }),
+        execution_duration,
+        metadata: JobResultMetadata {
+            worker_id: Some("embedding-worker".to_string()),
+            items_processed: Some(0),
+            extra,
+        },
+    }
+}
+
 /// Classify an [`EmbeddingJobError`] for the runner's retry decision
 /// ([`JobError::should_retry`]).
 ///
@@ -1188,7 +1254,10 @@ fn embedding_job_error(e: EmbeddingJobError) -> JobError {
         EmbeddingJobError::NotFound { .. }
         | EmbeddingJobError::ClaimNotFound { .. }
         | EmbeddingJobError::EmptyText
-        | EmbeddingJobError::DimensionMismatch { .. } => JobError::PermanentFailure { message },
+        | EmbeddingJobError::DimensionMismatch { .. }
+        // The handler turns a store's `AlreadyEmbedded` into a skip before it
+        // gets here; from anywhere else, a re-run would find the same vector.
+        | EmbeddingJobError::AlreadyEmbedded { .. } => JobError::PermanentFailure { message },
         EmbeddingJobError::RateLimitExceeded { .. } | EmbeddingJobError::ApiError { .. } => {
             JobError::ProcessingFailed { message }
         }
