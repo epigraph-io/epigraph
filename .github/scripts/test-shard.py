@@ -148,6 +148,9 @@ WALKERS = {
         "crates/epigraph-mcp/src/*",
     ),
     "crates/epigraph-api/tests/no_redaction_sentinel.rs": ("crates/*/src/*",),
+    # Every `<name>.timer` named under crates/*/src must have its unit file in
+    # deploy/systemd/, which it also walks (backlog 21be383b).
+    "crates/epigraph-cli/tests/maintenance_units.rs": ("crates/*/src/*", "deploy/systemd/*"),
     # README.md, docs/README.md, docs/intro/*.md and the names under docs/,
     # docs/architecture and docs/audits (the index must link every entry under
     # docs/; a dated audit lives in docs/audits). A link TARGET elsewhere can

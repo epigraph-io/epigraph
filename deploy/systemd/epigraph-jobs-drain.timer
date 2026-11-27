@@ -1,0 +1,19 @@
+# Runs epigraph-jobs-drain.service five minutes after the last run ended.
+# A TEMPLATE: see the service file and docs/deploy.md step 10. The cadence is
+# your choice; one run drains until the queue is empty or out of time.
+#
+# OnUnitInactiveSec counts from the end of the last run, so a long drain is
+# followed by a pause, never by an overlapping start. OnBootSec gives the
+# first trigger.
+
+[Unit]
+Description=Run the EpiGraph job-queue drain
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=epigraph-jobs-drain.service
+
+[Install]
+WantedBy=timers.target

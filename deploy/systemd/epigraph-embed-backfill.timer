@@ -1,0 +1,18 @@
+# Runs epigraph-embed-backfill.service once a day. A TEMPLATE: see the
+# service file and docs/deploy.md step 10.
+#
+# 03:00 local is a default, not a requirement: the job is "as needed", so pick
+# a cadence that matches how often embeddings go missing on your instance, and
+# a slot clear of the host's backup window.
+
+[Unit]
+Description=Run the EpiGraph embedding backfill
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+AccuracySec=1min
+Unit=epigraph-embed-backfill.service
+
+[Install]
+WantedBy=timers.target

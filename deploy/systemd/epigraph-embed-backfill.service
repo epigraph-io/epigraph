@@ -1,0 +1,39 @@
+# EpiGraph embedding backfill (embed_backfill, epigraph-cli).
+#
+# A TEMPLATE: nothing in this repository installs it. Copy it, replace the
+# placeholders (the binary path, the service user, the environment file) and
+# install it by hand: docs/deploy.md, step 10.
+#
+# Fills NULL claim embeddings (claims.embedding) and NULL workflow goal
+# embeddings, up to --limit rows of each per run. The environment file (0600,
+# owned by root) holds MAINTENANCE_DATABASE_URL, DATABASE_URL (the same
+# database) and OPENAI_API_KEY. Never add --allow-mock: a mock vector in a real
+# database is served by recall as a real one and is never refilled.
+
+[Unit]
+Description=EpiGraph embedding backfill
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=epigraph-maintenance
+Group=epigraph-maintenance
+EnvironmentFile=/etc/epigraph/maintenance.env
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/embed_backfill --limit 500
+# Exit 2: a leg had a failure (an embedder error, say). A failure, so it shows.
+# The binary takes no lock: do not start a second copy beside the timer's.
+TimeoutStartSec=1h
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077

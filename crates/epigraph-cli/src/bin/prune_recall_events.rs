@@ -11,7 +11,8 @@
 //!   grows unbounded: 73,236 rows accumulated since 2026-03-06 with nothing
 //!   pruning them.
 //!
-//! Runs from `prune-recall-events.timer` at 04:10 — after the 03:30
+//! Runs from `epigraph-prune-recall-events.timer` (a template ships in
+//! `deploy/systemd/`) at 04:10 — after the 03:30
 //! cross-source sweep and clear of the 01:00/02:00 pgBackRest windows, so a
 //! large DELETE never overlaps a backup.
 
