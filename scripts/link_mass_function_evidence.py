@@ -21,20 +21,38 @@ is gone, or sits on another claim, is reported as `unmatched` and left NULL.
 
 Pass 2 -- the single candidate
 ==============================
-For an unslotted BBA (`slot_kind IS NULL`), look at the evidence rows on its
-claim. If there is exactly ONE, link to it. Claims with several evidence rows
-are `ambiguous` and claims with none are `no_candidate`; both stay NULL.
-Slotted rows are excluded here and reported as `other_slot` when pass 1 does
-not apply to them:
+Pass 2 links only a row shaped like the evidence BBA the forward writers
+link: `combination_method = 'auto_wire'`, a source agent, no perspective and
+no slot (`auto_wire_ds_for_claim` and the batch writer `wire_single_batch_entry`
+in `ds_auto.rs`; the batch writer predates the FK and wrote NULL). Every other
+unslotted row is reported as `not_evidence_derived`, with a breakdown by
+`combination_method`, and left NULL: a truth_value seed, an `edge_factor` row
+written before 267, a propagated or attributed row, a manual DS submission
+(`ds.rs`, `belief.rs`: no evidence row in scope), a perspective's row, and a
+combined row (`source_agent_id IS NULL`, a fold of several inputs). For all of
+those `evidence_id` is NULL by contract (`mass_function.rs`, `store`).
+
+An evidence-shaped row is then linked to its claim's evidence row E only when
+the link is one-to-one:
+  * the claim has exactly ONE evidence row E (several: `ambiguous`; none:
+    `no_candidate`);
+  * the row is the claim's only unlinked evidence-shaped row, and no other
+    BBA on the claim already names E (`evidence_id = E`, or an evidence slot
+    on E, which pass 1 links to E). Otherwise `shared_candidate`.
+The engine keys a BBA's source item on `evidence_id` (`atom_items.rs`,
+`source_dependence.rs::item_key`: rows citing one evidence row are one
+source), so a second row linked to E would merge two sources into one. The
+case this rules out: a claim created without an evidence row that later got
+its one evidence row E through the slotted update path. Its creation row is
+not from E; the slot row is.
+
+Slotted rows are excluded from pass 2 and reported as `other_slot` when pass 1
+does not apply to them:
   * an evidence-slot row already names its evidence row, so one that pass 1
     could not match must not be linked to a different row merely because its
     claim has one;
   * an edge-slot row (an edge factor) or an assessment-slot row is not
-    evidence-derived, and `evidence_id` is NULL for non-evidence BBAs by
-    contract. The engine keys a BBA's source item on `evidence_id`
-    (`atom_items.rs`: rows citing one evidence row are one source), so
-    linking such a row to its claim's evidence would merge two independent
-    sources into one.
+    evidence-derived.
 
 Why not value-match on `source_strength` x `evidence_type_weight`? That has a
 composition trap: `edge_factor.rs::wire_evidential_edge_factor` stores
@@ -48,8 +66,15 @@ Both passes skip retracted BBAs: migration 184's rewrite guard (re-created by
 in an UPDATE would abort the whole run. They are reported as `retracted`.
 
 The two passes match disjoint rows (pass 1 only evidence-slot rows, pass 2
-only unslotted rows), so the dry-run counts are exactly what `--execute` links,
-barring concurrent writes. The reported buckets partition the unlinked rows.
+only unslotted rows), and pass 2's one-to-one check already counts an evidence
+slot pass 1 will link, so the dry-run counts are exactly what `--execute`
+links, barring concurrent writes. The reported buckets partition the unlinked
+rows.
+
+Beliefs are not recomputed here. A linked row's visibility rule changes with
+`evidence_id` (a cached combination checks the evidence row's visibility
+through it), so recompute the beliefs of the claims behind the undo file after
+`--execute`, and again after `--undo --execute`.
 
 Undo
 ====
@@ -116,11 +141,31 @@ UPDATE mass_functions mf
 RETURNING mf.id::text, mf.evidence_id::text
 """
 
-# Pass 2: an unslotted row, on a claim with exactly one evidence row. Edge and
-# assessment slots are not evidence-derived, and an evidence slot names its own
-# row (pass 1). Postgres lacks `MIN(uuid)`; with HAVING COUNT(*) = 1,
-# `(array_agg(id))[1]` is that sole row.
+# Pass 2. EVIDENCE_SHAPED is the forward evidence writers' row (auto_wire, a
+# source agent, no perspective, no slot); every other unslotted row is not
+# evidence-derived. `{a}` is the table alias. Null-safe throughout (IS NOT
+# DISTINCT FROM), so `NOT (...)` is never NULL and the buckets partition.
+EVIDENCE_SHAPED = (
+    "{a}.slot_kind IS NULL AND {a}.perspective_id IS NULL "
+    "AND {a}.source_agent_id IS NOT NULL "
+    "AND {a}.combination_method IS NOT DISTINCT FROM 'auto_wire'"
+)
 UNSLOTTED = "mf.slot_kind IS NULL"
+SHAPED = EVIDENCE_SHAPED.format(a="mf")
+# One-to-one: no OTHER row on the claim names E (linked to it, or an evidence
+# slot on it, which pass 1 links), and no other unlinked live evidence-shaped
+# row competes for it. `{e}` is the expression for E.
+ONE_TO_ONE = (
+    "NOT EXISTS (SELECT 1 FROM mass_functions o "
+    "WHERE o.claim_id = mf.claim_id AND o.id <> mf.id AND ("
+    "o.evidence_id = {e} "
+    "OR (o.slot_kind = 'evidence' AND o.slot_id = {e}) "
+    "OR (o.evidence_id IS NULL AND o.retracted_at IS NULL AND "
+    + EVIDENCE_SHAPED.format(a="o")
+    + ")))"
+)
+# Postgres lacks `MIN(uuid)`; with HAVING COUNT(*) = 1, `(array_agg(id))[1]`
+# is that sole row.
 LINK_SINGLE_SQL = f"""
 WITH single_evidence_claims AS (
     SELECT claim_id, (array_agg(id))[1] AS evidence_id
@@ -133,7 +178,8 @@ UPDATE mass_functions mf
   FROM single_evidence_claims sec
  WHERE mf.claim_id = sec.claim_id
    AND {ELIGIBLE}
-   AND {UNSLOTTED}
+   AND {SHAPED}
+   AND {ONE_TO_ONE.format(e="sec.evidence_id")}
 RETURNING mf.id::text, mf.evidence_id::text
 """
 
@@ -141,7 +187,8 @@ RETURNING mf.id::text, mf.evidence_id::text
 # the two UPDATEs so a dry run counts what --execute would link.
 BUCKETS_SQL = f"""
 WITH ec AS (
-    SELECT claim_id, COUNT(*) AS n FROM evidence GROUP BY claim_id
+    SELECT claim_id, COUNT(*) AS n, (array_agg(id))[1] AS sole_id
+      FROM evidence GROUP BY claim_id
 )
 SELECT
   COUNT(*) FILTER (WHERE mf.retracted_at IS NOT NULL)                            AS retracted,
@@ -149,13 +196,27 @@ SELECT
   COUNT(*) FILTER (WHERE {ELIGIBLE} AND mf.slot_kind = 'evidence'
                      AND NOT ({SLOT_MATCH}))                                     AS slot_unmatched,
   COUNT(*) FILTER (WHERE {ELIGIBLE} AND mf.slot_kind <> 'evidence')             AS other_slot,
-  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {UNSLOTTED} AND COALESCE(ec.n, 0) = 1)   AS single_linkable,
-  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {UNSLOTTED} AND COALESCE(ec.n, 0) > 1)   AS ambiguous,
-  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {UNSLOTTED} AND COALESCE(ec.n, 0) = 0)   AS no_candidate,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {UNSLOTTED} AND NOT ({SHAPED}))          AS not_evidence_derived,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {SHAPED} AND COALESCE(ec.n, 0) = 1
+                     AND {ONE_TO_ONE.format(e="ec.sole_id")})                    AS single_linkable,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {SHAPED} AND COALESCE(ec.n, 0) = 1
+                     AND NOT ({ONE_TO_ONE.format(e="ec.sole_id")}))              AS shared_candidate,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {SHAPED} AND COALESCE(ec.n, 0) > 1)      AS ambiguous,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {SHAPED} AND COALESCE(ec.n, 0) = 0)      AS no_candidate,
   COUNT(*)                                                                        AS unlinked
   FROM mass_functions mf
   LEFT JOIN ec ON ec.claim_id = mf.claim_id
  WHERE mf.evidence_id IS NULL
+"""
+
+# The `not_evidence_derived` bucket by label: what the single-candidate rule
+# would have linked before it was restricted to evidence-shaped rows.
+NOT_DERIVED_BY_METHOD_SQL = f"""
+SELECT COALESCE(mf.combination_method, '(null)') AS method, COUNT(*)
+  FROM mass_functions mf
+ WHERE {ELIGIBLE} AND {UNSLOTTED} AND NOT ({SHAPED})
+ GROUP BY 1
+ ORDER BY 2 DESC, 1
 """
 
 LINKED_TOTAL_SQL = "SELECT COUNT(*) FROM mass_functions WHERE evidence_id IS NOT NULL"
@@ -175,7 +236,8 @@ UNDO_COUNT_SQL = (
 UNDO_SQL = "UPDATE mass_functions mf SET evidence_id = NULL" + UNDO_FROM + "RETURNING mf.id"
 
 BUCKET_KEYS = ("retracted", "slot_linkable", "slot_unmatched", "other_slot",
-               "single_linkable", "ambiguous", "no_candidate")
+               "not_evidence_derived", "single_linkable", "shared_candidate",
+               "ambiguous", "no_candidate")
 
 
 def missing_columns(conn) -> list[str]:
@@ -190,6 +252,12 @@ def buckets(conn) -> dict[str, int]:
         cur.execute(BUCKETS_SQL)
         names = [d[0] for d in cur.description]
         return {n: int(v) for n, v in zip(names, cur.fetchone())}
+
+
+def not_derived_by_method(conn) -> dict[str, int]:
+    with conn.cursor() as cur:
+        cur.execute(NOT_DERIVED_BY_METHOD_SQL)
+        return {m: int(n) for m, n in cur.fetchall()}
 
 
 def linked_total(conn) -> int:
@@ -234,29 +302,39 @@ def summary(**fields) -> None:
     print("summary: " + json.dumps(fields, sort_keys=True))
 
 
-def print_buckets(b: dict[str, int], slot: int, single: int, verb: str) -> None:
+def print_buckets(b: dict[str, int], slot: int, single: int, verb: str,
+                  by_method: dict[str, int]) -> None:
     print("  pass 1 (evidence slot, exact):")
     print(f"    {verb:<12} = {slot:>10}")
     print(f"    unmatched    = {b['slot_unmatched']:>10} (slot's evidence row missing "
           f"or on another claim; left NULL)")
     print(f"  other_slot     = {b['other_slot']:>10} (edge or assessment slot; not "
           f"evidence-derived, never linked)")
-    print("  pass 2 (single candidate, unslotted rows):")
+    print(f"  not_evidence_derived = {b['not_evidence_derived']:>10} (unslotted, not an "
+          f"auto_wire row of one agent; never linked)")
+    for method, n in by_method.items():
+        print(f"    {method:<26} {n:>10}")
+    print("  pass 2 (single candidate, unslotted evidence-shaped rows):")
     print(f"    {verb:<12} = {single:>10}")
+    print(f"    shared       = {b['shared_candidate']:>10} (the one evidence row is already "
+          f"named by another BBA, or several rows compete for it; left NULL)")
     print(f"    ambiguous    = {b['ambiguous']:>10} (claim has >= 2 evidence rows; left NULL)")
     print(f"    no_candidate = {b['no_candidate']:>10} (claim has no evidence row; left NULL)")
     print(f"  retracted      = {b['retracted']:>10} (evidence_id frozen; never linked)")
     print(f"  unlinked total = {b['unlinked']:>10}")
 
 
-def pass_counts(b: dict[str, int], slot: int, single: int) -> dict:
+def pass_counts(b: dict[str, int], slot: int, single: int, by_method: dict[str, int]) -> dict:
     return {
         "pass1_slot": {"linked": slot, "unmatched": b["slot_unmatched"]},
         "pass2_single": {
             "linked": single,
+            "shared_candidate": b["shared_candidate"],
             "ambiguous": b["ambiguous"],
             "no_candidate": b["no_candidate"],
         },
+        "not_evidence_derived": b["not_evidence_derived"],
+        "not_evidence_derived_by_method": by_method,
         "other_slot": b["other_slot"],
         "retracted": b["retracted"],
     }
@@ -272,12 +350,14 @@ def do_link(conn, execute: bool, undo_file: str | None) -> int:
     if not execute:
         print("DRY-RUN -- no writes.")
         print(f"  linked now     = {linked_total(conn):>10}")
-        print_buckets(before, before["slot_linkable"], before["single_linkable"], "would link")
+        by_method = not_derived_by_method(conn)
+        print_buckets(before, before["slot_linkable"], before["single_linkable"], "would link",
+                      by_method)
         print()
         print("Pass --execute --undo-file <new file> to commit.")
         conn.rollback()
         summary(mode="dry-run", **pass_counts(
-            before, before["slot_linkable"], before["single_linkable"]))
+            before, before["slot_linkable"], before["single_linkable"], by_method))
         return 0
 
     print("Executing both passes in one transaction...")
@@ -297,12 +377,15 @@ def do_link(conn, execute: bool, undo_file: str | None) -> int:
     conn.commit()
 
     after = buckets(conn)
+    by_method = not_derived_by_method(conn)
+    conn.rollback()
     print(f"  undo file: {undo_file} ({len(records)} rows)")
-    print_buckets(after, len(slot_rows), len(single_rows), "linked")
+    print_buckets(after, len(slot_rows), len(single_rows), "linked", by_method)
     print()
     print("A re-run links nothing new (every UPDATE has `evidence_id IS NULL`). "
           f"Revert with --undo {undo_file}.")
-    summary(mode="execute", **pass_counts(after, len(slot_rows), len(single_rows)))
+    print("Recompute the beliefs of the linked rows' claims (see the header).")
+    summary(mode="execute", **pass_counts(after, len(slot_rows), len(single_rows), by_method))
     return 0
 
 

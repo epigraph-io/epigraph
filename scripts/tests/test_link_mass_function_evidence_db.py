@@ -12,6 +12,14 @@ Backlog d2c71a07:
     linked by neither pass, even when its claim has exactly one evidence row;
   * an edge-slot or assessment-slot row (not evidence-derived) is never
     linked, even on a claim with exactly one evidence row;
+  * pass 2 links only an evidence-shaped row (`auto_wire`, a source agent, no
+    perspective, no slot): an unslotted truth_value seed or a combined row
+    (no source agent) on a one-evidence claim stays NULL;
+  * pass 2 links one-to-one only: a creation row on a claim whose one
+    evidence row already has its evidence-slot BBA, a row on a claim whose
+    evidence row another BBA is already linked to, and two competing rows on
+    one claim all stay NULL (a second row naming one evidence row would be
+    merged with it into one source);
   * a dry run writes nothing (no row, no undo file) and counts exactly what
     `--execute` then links; a re-run links nothing; `--undo` restores NULLs,
     skipping a row whose link changed since;
@@ -73,14 +81,15 @@ if not (TEST_DSN.rstrip("/").endswith("_test") or "/_sqlx_test" in TEST_DSN):
 MASSES = {"0": 0.6, "0,1": 0.4}
 
 
-def _bba(cur, claim, frame, agent, slot_kind=None, slot_id=None):
+def _bba(cur, claim, frame, agent, slot_kind=None, slot_id=None, method="auto_wire",
+         evidence_id=None):
     cur.execute(
         "INSERT INTO mass_functions "
         "(claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, masses, "
-        " conflict_k, combination_method, source_strength, evidence_type) "
-        "VALUES (%s, %s, %s, NULL, %s, %s, %s::jsonb, 0.0, 'auto_wire', 1.0, 'document') "
+        " conflict_k, combination_method, source_strength, evidence_type, evidence_id) "
+        "VALUES (%s, %s, %s, NULL, %s, %s, %s::jsonb, 0.0, %s, 1.0, 'document', %s) "
         "RETURNING id::text AS id",
-        (claim, frame, agent, slot_kind, slot_id, json.dumps(MASSES)),
+        (claim, frame, agent, slot_kind, slot_id, json.dumps(MASSES), method, evidence_id),
     )
     return cur.fetchone()["id"]
 
@@ -160,7 +169,11 @@ class World:
 
 
 BBAS = ("single", "retracted", "slot", "cross_slot", "retracted_slot", "edge_slot",
-        "assessment_slot")
+        "assessment_slot", "seed", "combined", "creation_beside_slot", "beside_slot",
+        "beside_linked", "competing_a", "competing_b")
+# Rows pass 2 must leave NULL although their claim has exactly one evidence row.
+PASS2_REFUSED = ("seed", "combined", "creation_beside_slot", "beside_linked", "competing_a",
+                 "competing_b")
 
 
 def summary(proc):
@@ -222,6 +235,12 @@ def world(tmp_path):
         (f"link-db-{uuid.uuid4()}",),
     )
     frame = cur.fetchone()["id"]
+    cur.execute(
+        "INSERT INTO frames (name, hypotheses) VALUES (%s, ARRAY['h0','h1']::text[]) "
+        "RETURNING id::text AS id",
+        (f"link-db-{uuid.uuid4()}",),
+    )
+    frame2 = cur.fetchone()["id"]
 
     w = World(cur, tmp_path)
 
@@ -279,7 +298,44 @@ def world(tmp_path):
     w.ids["edge_slot"] = _bba(cur, c_other, frame, agent, "edge", str(uuid.uuid4()))
     w.ids["assessment_slot"] = _bba(cur, c_other, frame, agent, "assessment", str(uuid.uuid4()))
 
+    # SEED / COMBINED: unslotted rows that are not evidence-derived, each alone
+    # on a claim with exactly one evidence row (alone, so the one-to-one check
+    # cannot be what refuses them): a truth_value seed, and an auto_wire-labelled
+    # combined row (no source agent: a fold of several inputs).
+    c_seed = claim()
+    _evidence(cur, c_seed)
+    w.ids["seed"] = _bba(cur, c_seed, frame, agent, method="truth_value_seed")
+    c_combined = claim()
+    _evidence(cur, c_combined)
+    w.ids["combined"] = _bba(cur, c_combined, frame, None)
+
+    # CREATION_BESIDE_SLOT: a claim created with no evidence row (its unslotted
+    # creation row), whose one evidence row E came later through the slotted
+    # update path (BESIDE_SLOT). Pass 1 links the slot row to E; the creation
+    # row is not from E and must stay NULL.
+    c_beside = claim()
+    w.ids["beside_evidence"] = _evidence(cur, c_beside)
+    w.ids["creation_beside_slot"] = _bba(cur, c_beside, frame, agent)
+    w.ids["beside_slot"] = _bba(cur, c_beside, frame, agent, "evidence",
+                                w.ids["beside_evidence"])
+
+    # BESIDE_LINKED: as above, but the other row already carries
+    # evidence_id = E (linked by its writer, unslotted, on a second frame).
+    c_linked = claim()
+    linked_evidence = _evidence(cur, c_linked)
+    w.ids["already_linked"] = _bba(cur, c_linked, frame2, agent, evidence_id=linked_evidence)
+    w.ids["beside_linked"] = _bba(cur, c_linked, frame, agent)
+
+    # COMPETING_A / _B: two unslotted evidence-shaped rows (two frames) on a
+    # claim with one evidence row: at most one could be from it, and nothing
+    # says which.
+    c_two = claim()
+    _evidence(cur, c_two)
+    w.ids["competing_a"] = _bba(cur, c_two, frame, agent)
+    w.ids["competing_b"] = _bba(cur, c_two, frame2, agent)
+
     assert w.fixture_state() == dict.fromkeys(BBAS), "fixture: every BBA starts unlinked"
+    assert w.evidence_id("already_linked") == linked_evidence
 
     w.frame = frame
     w.agent = agent
@@ -298,7 +354,7 @@ def world(tmp_path):
         (w.retracted,),
     )
     cur.execute("DELETE FROM claims WHERE id = ANY(%s::uuid[])", (w.claims,))
-    cur.execute("DELETE FROM frames WHERE id = %s", (frame,))
+    cur.execute("DELETE FROM frames WHERE id = ANY(%s::uuid[])", ([frame, frame2],))
     conn.close()
 
 
@@ -325,11 +381,15 @@ def test_a_slot_row_is_linked_exactly_and_a_cross_claim_slot_is_not(world):
     assert state["retracted"] is None and state["retracted_slot"] is None
     assert state["edge_slot"] is None, "an edge-factor BBA is not evidence-derived"
     assert state["assessment_slot"] is None, "an assessment BBA is not evidence-derived"
+    assert "NOTE: the buckets sum" not in proc.stderr, proc.stderr
 
     s = summary(proc)
     assert s["pass1_slot"]["linked"] >= 1 and s["pass1_slot"]["unmatched"] >= 1, s
     assert s["pass2_single"]["linked"] >= 1 and s["retracted"] >= 2, s
     assert s["other_slot"] >= 2, s
+    assert s["not_evidence_derived"] >= 2, s
+    assert s["not_evidence_derived_by_method"].get("truth_value_seed", 0) >= 1, s
+    assert s["pass2_single"]["shared_candidate"] >= 4, s
     records = {r["mass_function_id"]: r for r in undo_records(undo)}
     assert records[world.ids["slot"]] == {
         "mass_function_id": world.ids["slot"],
@@ -337,9 +397,28 @@ def test_a_slot_row_is_linked_exactly_and_a_cross_claim_slot_is_not(world):
         "pass": "slot",
     }
     assert records[world.ids["single"]]["pass"] == "single"
-    for name in ("cross_slot", "retracted", "retracted_slot", "edge_slot", "assessment_slot"):
+    for name in ("cross_slot", "retracted", "retracted_slot", "edge_slot", "assessment_slot",
+                 *PASS2_REFUSED):
         assert world.ids[name] not in records, name
     assert len(records) == s["pass1_slot"]["linked"] + s["pass2_single"]["linked"]
+
+
+def test_pass_two_links_only_evidence_shaped_rows_one_to_one(world):
+    proc, _ = world.execute()
+    state = world.fixture_state()
+    assert state["seed"] is None, "a truth_value seed is not from the claim's evidence row"
+    assert state["combined"] is None, "a combined row (no source agent) is not one evidence's BBA"
+    assert state["beside_slot"] == world.ids["beside_evidence"], (
+        "the slot row is linked to its evidence row:\n" + proc.stdout
+    )
+    assert state["creation_beside_slot"] is None, (
+        "the creation row must not share the slot row's evidence row (one source, merged)"
+    )
+    assert state["beside_linked"] is None, "the evidence row is already another row's"
+    assert state["competing_a"] is None and state["competing_b"] is None, (
+        "two rows compete for one evidence row; neither is linked"
+    )
+    assert state["single"] == world.ids["single_evidence"], "the one-to-one case still links"
 
 
 def test_a_dry_run_writes_nothing_and_counts_what_execute_links(world):
@@ -351,11 +430,13 @@ def test_a_dry_run_writes_nothing_and_counts_what_execute_links(world):
     assert not named.exists(), "a dry run writes no undo file"
     d = summary(dry)
     assert d["mode"] == "dry-run", d
+    assert "NOTE: the buckets sum" not in dry.stderr, dry.stderr
 
     proc, _ = world.execute()
     e = summary(proc)
     assert d["pass1_slot"]["linked"] == e["pass1_slot"]["linked"] >= 1, (d, e)
     assert d["pass2_single"]["linked"] == e["pass2_single"]["linked"] >= 1, (d, e)
+    assert d["pass2_single"]["shared_candidate"] == e["pass2_single"]["shared_candidate"], (d, e)
     assert world.linked_total() == before_total + e["pass1_slot"]["linked"] + e[
         "pass2_single"]["linked"]
 
