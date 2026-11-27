@@ -287,7 +287,7 @@ pub use recall_event::{
     NewRecallEvent, RecallEventRepository, RecallEventRow, DEFAULT_RETENTION_DAYS,
     PRUNABLE_EVENT_TYPES,
 };
-pub use scoped_belief::ScopedBeliefRepository;
+pub use scoped_belief::{CommunityFoldsCleared, ScopedBeliefRepository};
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use sources::{

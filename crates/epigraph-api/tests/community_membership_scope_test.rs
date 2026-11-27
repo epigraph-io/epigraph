@@ -546,3 +546,336 @@ async fn remove_member_no_token_returns_401() {
         .unwrap();
     assert_eq!(resp.status(), 401, "got {}", resp.status());
 }
+
+// ===========================================================================
+// DELETE /api/v1/communities/:id/members/:perspective_id -- the community's
+// stored scoped beliefs (backlog 8d720490, part 3)
+// ===========================================================================
+
+/// The community's stored scoped beliefs on one `(claim, frame)`.
+async fn community_rows(
+    pool: &sqlx::PgPool,
+    claim: uuid::Uuid,
+    frame: uuid::Uuid,
+    community: uuid::Uuid,
+) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM ds_combined_beliefs \
+          WHERE claim_id = $1 AND frame_id = $2 \
+            AND scope_type = 'community' AND scope_id = $3",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(community)
+    .fetch_one(pool)
+    .await
+    .expect("count community rows")
+}
+
+/// A `visibility = 'public'` claim owned by `group`: readable by every
+/// caller, writable only by `group`'s writers.
+async fn public_claim_of(pool: &sqlx::PgPool, agent: uuid::Uuid, group: uuid::Uuid) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                             is_current, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.8, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(format!("fold public claim {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed a public claim of another group");
+    id
+}
+
+/// A live BBA of `perspective` on `(claim, frame)`, as the evidence route
+/// stores one.
+async fn store_bba(
+    pool: &sqlx::PgPool,
+    claim: uuid::Uuid,
+    frame: uuid::Uuid,
+    agent: uuid::Uuid,
+    perspective: uuid::Uuid,
+) {
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        Some(agent),
+        Some(perspective),
+        &serde_json::json!({"0": 0.7, "0,1": 0.3}),
+        None,
+        None,
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store a BBA");
+}
+
+/// A stored scoped belief, as step 20 of the evidence route writes one.
+async fn store_scoped(
+    pool: &sqlx::PgPool,
+    claim: uuid::Uuid,
+    frame: uuid::Uuid,
+    scope_type: &str,
+    scope: uuid::Uuid,
+    strategy: Option<&str>,
+) {
+    epigraph_db::ScopedBeliefRepository::upsert(
+        pool,
+        frame,
+        claim,
+        scope_type,
+        Some(scope),
+        0.7,
+        1.0,
+        0.0,
+        0.0,
+        None,
+        strategy,
+        Some(0.85),
+    )
+    .await
+    .expect("store a scoped belief");
+}
+
+/// Backlog 8d720490 part (3), on the APPLICATION ROLE. A community's stored
+/// scoped belief is the fold of its members' BBAs, and step 17 of the
+/// evidence route reaches a community only through the SUBMITTING
+/// perspective's memberships. So once a member is removed nothing ever
+/// rewrote a row that folded its BBAs: the scoped read kept serving the
+/// removed member's evidence as the community's belief.
+///
+/// The removal now deletes, on its own stamped transaction, the community's
+/// rows on every `(claim, frame)` where the removed perspective holds a live
+/// BBA, and nothing else:
+///
+/// * the owner case: the caller may write the claim's group, so the row goes;
+/// * the non-owner case: the row is on a public claim of a group the caller
+///   cannot write, so row security filters it out of the DELETE; the removal
+///   still succeeds (the count is logged) and the row stays;
+/// * a row on a key where only another member holds a BBA, the community's
+///   mass override, and the removed perspective's OWN perspective row are
+///   not the removed membership's folds and stay.
+#[sqlx::test(migrations = "../../migrations")]
+async fn removing_a_member_clears_the_community_folds_it_contributed_to(pool: sqlx::PgPool) {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use epigraph_api::middleware::bearer::{RequireScopeGroupsAdmin, ViewerExtractor};
+    use epigraph_api::routes::community::remove_member;
+
+    let (leaver, leaver_group) = viewer_fixture::seed_agent_with_group(&pool, "fold-leaver").await;
+    let (other, other_group) = viewer_fixture::seed_agent_with_group(&pool, "fold-other").await;
+    let community = common::seed_community_with_member(&pool, leaver).await;
+    let leaving: uuid::Uuid =
+        sqlx::query_scalar("SELECT perspective_id FROM community_members WHERE community_id = $1")
+            .bind(community)
+            .fetch_one(&pool)
+            .await
+            .expect("the fixture's own membership");
+    let staying: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(format!("fold-staying-{}", uuid::Uuid::new_v4()))
+    .bind(other)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the remaining member's perspective");
+    sqlx::query("INSERT INTO community_members (community_id, perspective_id) VALUES ($1, $2)")
+        .bind(community)
+        .bind(staying)
+        .execute(&pool)
+        .await
+        .expect("seed the remaining membership");
+    let frame = epigraph_db::FrameRepository::create(
+        &pool,
+        &format!("fold-frame-{}", uuid::Uuid::new_v4()),
+        None,
+        &["h0".to_string(), "h1".to_string()],
+    )
+    .await
+    .expect("frame")
+    .id;
+
+    // Owner case: a claim of the leaver's own group.
+    let owned =
+        viewer_fixture::seed_group_claim(&pool, leaver, leaver_group, "fold owned claim").await;
+    // Non-owner case: a public claim of a group the leaver cannot write.
+    let foreign = public_claim_of(&pool, other, other_group).await;
+    // Only the remaining member holds a BBA here.
+    let others_only =
+        viewer_fixture::seed_group_claim(&pool, leaver, leaver_group, "fold others-only claim")
+            .await;
+    // The community's mass override, on a key the leaver holds a BBA on.
+    let overridden =
+        viewer_fixture::seed_group_claim(&pool, leaver, leaver_group, "fold overridden claim")
+            .await;
+
+    for claim in [owned, foreign, overridden] {
+        store_bba(&pool, claim, frame, leaver, leaving).await;
+    }
+    for claim in [owned, others_only] {
+        store_bba(&pool, claim, frame, other, staying).await;
+    }
+    for claim in [owned, foreign, others_only] {
+        store_scoped(
+            &pool,
+            claim,
+            frame,
+            "community",
+            community,
+            Some("Dempster"),
+        )
+        .await;
+    }
+    store_scoped(
+        &pool,
+        overridden,
+        frame,
+        "community",
+        community,
+        Some("override"),
+    )
+    .await;
+    store_scoped(&pool, owned, frame, "perspective", leaving, None).await;
+
+    let state = app_role_state(&pool).await;
+    let viewer = epigraph_db::Viewer::resolve(&pool, leaver)
+        .await
+        .expect("viewer");
+    let status = remove_member(
+        RequireScopeGroupsAdmin(groups_admin(leaver)),
+        ViewerExtractor(viewer),
+        State(state),
+        Path((community, leaving)),
+    )
+    .await
+    .into_response()
+    .status();
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NO_CONTENT,
+        "the perspective's owner may leave, and a row it cannot clear must not fail the \
+         removal"
+    );
+    let membership: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM community_members WHERE community_id = $1 AND perspective_id = $2",
+    )
+    .bind(community)
+    .bind(leaving)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(membership, 0, "the membership is gone");
+
+    assert_eq!(
+        community_rows(&pool, owned, frame, community).await,
+        0,
+        "the community row that folded the removed member's BBA must go with the membership: \
+         nothing else would ever rewrite it"
+    );
+    assert_eq!(
+        community_rows(&pool, foreign, frame, community).await,
+        1,
+        "a row on a claim of a group the caller cannot write is filtered out of the DELETE by \
+         row security (left, logged, no error)"
+    );
+    assert_eq!(
+        community_rows(&pool, others_only, frame, community).await,
+        1,
+        "a row on a key where the removed perspective holds no BBA did not fold it"
+    );
+    assert_eq!(
+        community_rows(&pool, overridden, frame, community).await,
+        1,
+        "a community's mass override folds no member row"
+    );
+    let own_row: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ds_combined_beliefs \
+          WHERE claim_id = $1 AND frame_id = $2 \
+            AND scope_type = 'perspective' AND scope_id = $3",
+    )
+    .bind(owned)
+    .bind(frame)
+    .bind(leaving)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        own_row, 1,
+        "the perspective's own fold does not depend on its community memberships"
+    );
+}
+
+/// The repo method's counts, on the application role: the caller sees both
+/// stale rows, deletes the one it may write, and is told about the other.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_community_fold_cleanup_reports_the_rows_it_could_not_delete(pool: sqlx::PgPool) {
+    let (leaver, leaver_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "fold-count-leaver").await;
+    let (other, other_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "fold-count-other").await;
+    let community = common::seed_community_with_member(&pool, leaver).await;
+    let leaving: uuid::Uuid =
+        sqlx::query_scalar("SELECT perspective_id FROM community_members WHERE community_id = $1")
+            .bind(community)
+            .fetch_one(&pool)
+            .await
+            .expect("the fixture's own membership");
+    let frame = epigraph_db::FrameRepository::create(
+        &pool,
+        &format!("fold-count-frame-{}", uuid::Uuid::new_v4()),
+        None,
+        &["h0".to_string(), "h1".to_string()],
+    )
+    .await
+    .expect("frame")
+    .id;
+    let owned =
+        viewer_fixture::seed_group_claim(&pool, leaver, leaver_group, "fold-count owned").await;
+    let foreign = public_claim_of(&pool, other, other_group).await;
+    for claim in [owned, foreign] {
+        store_bba(&pool, claim, frame, leaver, leaving).await;
+        store_scoped(
+            &pool,
+            claim,
+            frame,
+            "community",
+            community,
+            Some("Dempster"),
+        )
+        .await;
+    }
+
+    let state = app_role_state(&pool).await;
+    let viewer = epigraph_db::Viewer::resolve(&pool, leaver)
+        .await
+        .expect("viewer");
+    let scoped = state.scoped.as_ref().expect("scoped pool");
+    let mut tx = scoped.begin_as(&viewer).await.expect("stamped transaction");
+    let cleared = epigraph_db::ScopedBeliefRepository::clear_community_folds_of_member(
+        &mut *tx, community, leaving,
+    )
+    .await
+    .expect("a filtered row is not an error");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(
+        cleared.matched, 2,
+        "both stale rows are visible to the caller"
+    );
+    assert_eq!(
+        cleared.deleted, 1,
+        "only the row of a group it writes is deleted"
+    );
+    assert_eq!(cleared.left(), 1, "and the other is reported as left");
+    assert_eq!(community_rows(&pool, owned, frame, community).await, 0);
+    assert_eq!(community_rows(&pool, foreign, frame, community).await, 1);
+}

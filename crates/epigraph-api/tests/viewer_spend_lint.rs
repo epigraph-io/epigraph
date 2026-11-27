@@ -518,10 +518,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
         ],
     ),
+    // ... and, when the removal applied, the delete of the community's stale
+    // stored scoped beliefs on the SAME stamped transaction
+    // (`clear_stale_community_folds`, backlog 8d720490): FORCE'd row security
+    // against that transaction's GUCs limits it to rows the caller may write.
     (
         "community.rs",
         "remove_member",
-        &["CommunityRepository::remove_member"],
+        &[
+            "CommunityRepository::remove_member",
+            "clear_stale_community_folds",
+        ],
     ),
     // narrows: an `apply` run keeps the cache-admissible rows of the BBAs it
     // read through the viewer (`get_for_claims`); a read-only run filters them

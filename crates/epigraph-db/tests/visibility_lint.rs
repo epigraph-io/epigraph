@@ -4253,6 +4253,17 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "scoped_belief.rs",
+        "clear_community_folds_of_member",
+        "DELETE of one community's stored `ds_combined_beliefs` folds on the keys where a \
+         removed member perspective holds a live BBA, with a count of the matching rows the \
+         session can see. A cache cleanup the membership removal runs on the caller's stamped \
+         transaction; its control is the table's FORCE'd RLS (077 tenancy, 115 owner-scoped \
+         DELETE, 126 elevated refusal) against that transaction's GUCs, so it deletes only rows \
+         the caller may write and reports the rest as left. Pinned on the application role by \
+         `epigraph-api/tests/community_membership_scope_test.rs`.",
+    ),
+    (
+        "scoped_belief.rs",
         "upsert",
         "INSERT INTO `ds_combined_beliefs` (ON CONFLICT on `(frame_id, claim_id, scope_type, \
          scope_id)` DO UPDATE); a WRITE with no FROM for a viewer splice. Its control is the \
