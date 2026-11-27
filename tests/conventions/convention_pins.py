@@ -197,6 +197,31 @@ PINS: tuple[Pin, ...] = (
         needle="`docs/conventions/no-longer-in-force.md`",
         incident="64eeca4e",
     ),
+    # --- The match-candidate provenance note, linked from the code it covers -
+    Pin(
+        id="decide-match-candidate-doc-links-provenance-note",
+        file="crates/epigraph-mcp/src/tools/matching.rs",
+        section_start="/// Promote or reject a `pending` match candidate",
+        section_end="pub async fn decide_match_candidate(",
+        needle="`docs/architecture/match-candidate-edge-provenance.md`",
+        incident="c8f16097",
+    ),
+    Pin(
+        id="retire-match-candidate-doc-links-provenance-note",
+        file="crates/epigraph-mcp/src/tools/matching.rs",
+        section_start="/// Retire a promoted match candidate:",
+        section_end="pub async fn retire_match_candidate(",
+        needle="`docs/architecture/match-candidate-edge-provenance.md`",
+        incident="c8f16097",
+    ),
+    Pin(
+        id="match-candidate-repo-retire-doc-links-provenance-note",
+        file="crates/epigraph-db/src/repos/match_candidate.rs",
+        section_start="/// Retract a candidate's promotion:",
+        section_end="pub async fn retire(&self",
+        needle="`docs/architecture/match-candidate-edge-provenance.md`",
+        incident="c8f16097",
+    ),
     # --- CLAUDE.md, "Test database" ----------------------------------------
     Pin(
         id="test-db-fresh-and-migrated-from-empty",

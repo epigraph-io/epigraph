@@ -9,3 +9,4 @@ tests/conventions itself.
 
 from tests.conventions.test_convention_pins import *  # noqa: F401,F403
 from tests.conventions.test_no_longer_in_force import *  # noqa: F401,F403
+from tests.conventions.test_match_candidate_note import *  # noqa: F401,F403

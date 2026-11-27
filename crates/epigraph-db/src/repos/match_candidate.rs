@@ -407,9 +407,11 @@ impl MatchCandidateRepo {
         Ok(DecideOutcome::Decided)
     }
 
-    /// Retract a candidate's promotion: delete every matcher-created edge
-    /// between its claim pair together with the derived records that hang off
-    /// those edges, then flip the row to `stale`. One transaction.
+    /// Retract a candidate's promotion: retract (close `valid_to` on) every
+    /// matcher-created edge between its claim pair, delete the derived records
+    /// that hang off those edges, then flip the row to `stale`. One transaction.
+    /// The design note on how matcher edges link back to their candidate is
+    /// `docs/architecture/match-candidate-edge-provenance.md`.
     ///
     /// # Why this is not `set_status(id, "stale", by)`
     ///
