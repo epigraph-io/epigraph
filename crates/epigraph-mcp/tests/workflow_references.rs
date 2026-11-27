@@ -726,6 +726,76 @@ async fn a_symmetric_reference_needs_authority_over_both_workflows(pool: PgPool)
     .expect("a workflow may declare another agent's public workflow a prerequisite");
 }
 
+/// A reference stored public whose OTHER end later went group-private: the
+/// reference edge stays public, so only the reader's check on the other
+/// workflow keeps that workflow's name and goal from an outsider. A member
+/// still sees it. Also: `at_step` is an `invokes`-only field, so a
+/// `depends_on` carrying an `at_step` property reads back without one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reference_to_a_workflow_gone_private_is_named_to_members_only(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let outsider = outsider_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let outsider_viewer = own_viewer(&outsider).await;
+    let asker = store(&server, &["asker step"]).await;
+    let gone = store(&server, &["gone private step"]).await;
+    let stays = store(&server, &["stays public step"]).await;
+    for params in [
+        link(asker, "workflow", gone, "workflow", "depends_on"),
+        LinkHierarchicalParams {
+            properties: Some(serde_json::json!({ "at_step": 3 })),
+            ..link(asker, "workflow", stays, "workflow", "depends_on")
+        },
+    ] {
+        do_link_hierarchical(&server, &viewer, params, None)
+            .await
+            .expect("the prerequisite is written");
+    }
+    make_private(&pool, gone).await;
+    let (vis,): (String,) = sqlx::query_as(
+        "SELECT visibility::text FROM edges WHERE source_id = $1 AND target_id = $2 \
+           AND relationship = 'depends_on'",
+    )
+    .bind(asker)
+    .bind(gone)
+    .fetch_one(&pool)
+    .await
+    .expect("the edge");
+    assert_eq!(vis, "public", "the reference edge itself stays public");
+
+    let goal = goal_of(&pool, asker).await;
+    let s = |u: Uuid| u.to_string();
+    let public_view: Vec<RefShape> =
+        vec![("depends_on".into(), "outgoing".into(), s(stays), None, None)];
+    let member_view = {
+        let mut v = public_view.clone();
+        v.push(("depends_on".into(), "outgoing".into(), s(gone), None, None));
+        v.sort();
+        v
+    };
+    for answer in [
+        find_hierarchical(&server, &viewer, &goal).await,
+        find_flat_and_hierarchical(&server, &viewer, &goal).await,
+    ] {
+        assert_eq!(
+            shape(&references_of(&answer, asker)),
+            member_view,
+            "a member sees both prerequisites: {answer}"
+        );
+    }
+    for answer in [
+        find_hierarchical(&outsider, &outsider_viewer, &goal).await,
+        find_flat_and_hierarchical(&outsider, &outsider_viewer, &goal).await,
+    ] {
+        assert_eq!(
+            shape(&references_of(&answer, asker)),
+            public_view,
+            "an outsider sees only the public prerequisite: {answer}"
+        );
+        assert!(!answer.to_string().contains(&s(gone)), "{answer}");
+    }
+}
+
 /// A rival pair of workflows is stored public, so a `target_claim_id` it
 /// carries must be a public claim: a group-private claim id is refused with
 /// nothing written, a public one is kept.

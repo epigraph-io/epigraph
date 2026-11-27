@@ -2881,7 +2881,8 @@ impl WorkflowRepository {
                     o.canonical_name AS other_canonical_name, \
                     o.generation AS other_generation, o.goal AS other_goal, \
                     r.via_step_claim_id, \
-                    CASE WHEN r.properties->>'at_step' ~ '^[0-9]{1,9}$' \
+                    CASE WHEN r.relationship = 'invokes' \
+                          AND r.properties->>'at_step' ~ '^[0-9]{1,9}$' \
                          THEN (r.properties->>'at_step')::bigint END AS at_step \
                FROM refs r \
                JOIN workflows o ON o.id = r.other_id \
