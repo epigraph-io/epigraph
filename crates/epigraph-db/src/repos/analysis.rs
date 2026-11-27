@@ -4,6 +4,7 @@
 //! linked to claims via `concludes` edges and to evidence via `interpreted_by` edges.
 
 use crate::errors::DbError;
+use crate::repos::claim_role::is_compound_sql;
 use crate::repos::edge::EdgeRepository;
 use crate::repos::edge_signature::EdgeSigningKey;
 use chrono::{DateTime, Utc};
@@ -144,16 +145,24 @@ impl AnalysisRepository {
         viewer: &crate::visibility::Viewer,
         analysis_id: Uuid,
     ) -> Result<Vec<ClaimSummary>, sqlx::Error> {
+        // Role-aware (backlog fe1cdcdf): a compound's cached `truth_value` is
+        // a fold of its own BBAs, not a belief, so the order ranks
+        // non-compounds by it and lists every compound after them, by `id`.
+        let compound = is_compound_sql("c");
         let sql = viewer.splice(
-            "SELECT c.id, c.content, c.truth_value, c.created_at \
-             FROM claims c \
-             JOIN edges e ON e.target_id = c.id \
-             WHERE e.source_id = $1 \
-               AND e.relationship = 'concludes' \
-               AND e.source_type = 'analysis' \
-               AND e.target_type = 'claim' \
-               /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */ \
-             ORDER BY c.truth_value DESC",
+            &format!(
+                "SELECT c.id, c.content, c.truth_value, c.created_at \
+                 FROM claims c \
+                 JOIN edges e ON e.target_id = c.id \
+                 WHERE e.source_id = $1 \
+                   AND e.relationship = 'concludes' \
+                   AND e.source_type = 'analysis' \
+                   AND e.target_type = 'claim' \
+                   /* {{VISIBILITY:c}} */ /* {{EDGE_VISIBILITY:e}} */ \
+                 ORDER BY {compound}, \
+                          CASE WHEN {compound} THEN NULL ELSE c.truth_value END DESC, \
+                          c.id"
+            ),
             2,
         );
         let mut q = sqlx::query_as::<_, ClaimSummaryRow>(&sql).bind(analysis_id);

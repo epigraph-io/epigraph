@@ -198,7 +198,6 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", Tag::Todo { pr: "PR-W4", why: "CLI hypothesis prior from neighbours' cached Bel/Pl; SPEC §4.1 W13" }),
     // --- epigraph-db --------------------------------------------------------
     ("crates/epigraph-db/src/repos/alternative_set.rs", "scan_candidates", Tag::Todo { pr: "PR-R5", why: "suggest_alternative_sets scores pairs by LEAST(COALESCE(pignistic_prob, 0)); SPEC §7.2 excludes compounds, no NULL as 0" }),
-    ("crates/epigraph-db/src/repos/analysis.rs", "get_claims_for_analysis", Tag::Todo { pr: "unassigned", why: "analysis selection ordered on truth_value; no plan row converts it" }),
     ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_hierarchical", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow selection gated on it")),
     ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_lineage", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow selection gated on it")),
     ("crates/epigraph-db/src/repos/claim.rs", "const EFFECTIVE_BELIEF_SCORE_SQL", Tag::Todo { pr: "PR-R1a", why: "the effective-belief choke point (recall, traverse, query_claims); SPEC §7.2 dispatches on role" }),
@@ -227,7 +226,6 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/mass_function.rs", "clear_claim_belief", Tag::Writer("NULLs the cache columns; reads none (SPEC §4.2 stops calling it on atoms)")),
     ("crates/epigraph-db/src/repos/mass_function.rs", "update_claim_belief", Tag::Writer("writes the cache columns; reads none")),
     ("crates/epigraph-db/src/repos/method.rs", "get_evidence_strength", Tag::Todo { pr: "PR-M2", why: "aggregates BetP / truth_value over claims, compounds included; SPEC §7.2 excludes compounds" }),
-    ("crates/epigraph-db/src/repos/policy.rs", "list_active_network", Tag::Todo { pr: "unassigned", why: "policy claims gated and ordered on truth_value; no plan row converts it (moved from routes/policies.rs::list_network_policies)" }),
     ("crates/epigraph-db/src/repos/scoped_belief.rs", "get", Tag::Todo { pr: "PR-R1b", why: "scoped belief row read; SPEC §7.2 filters the constant derived scope rows" }),
     ("crates/epigraph-db/src/repos/scoped_belief.rs", "list_for_claim", Tag::Todo { pr: "PR-R1b", why: "returns every scoped row; SPEC §7.2 filters the constant derived scope rows" }),
     ("crates/epigraph-db/src/repos/scoped_belief.rs", "list_for_scope", Tag::Todo { pr: "PR-R1b", why: "scoped rows per scope; SPEC §7.2" }),

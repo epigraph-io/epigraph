@@ -1,5 +1,5 @@
 //! The live belief readers that list or count claims by `truth_value` know
-//! the claim's role (backlog ef58c6ad; the register
+//! the claim's role (backlog ef58c6ad, fe1cdcdf; the register
 //! `no_role_blind_belief_reads.rs`).
 //!
 //! A compound's cached `truth_value` is a fold of its own BBAs, not a value
@@ -7,7 +7,8 @@
 //! it were a belief:
 //!
 //! * the **listing** readers (`list_by_labels`, `list_filtered` /
-//!   `count_filtered`, `rag_hybrid_context`) apply the truth gate and the truth order to
+//!   `count_filtered`, `rag_hybrid_context`, `list_active_network`,
+//!   `get_claims_for_analysis`) apply the truth gate and the truth order to
 //!   non-compounds only. A compound passes the gate ungated, so no compound
 //!   disappears from a listing, and it is ranked after the atoms with no
 //!   belief term of its own;
@@ -26,7 +27,8 @@ mod fixture;
 use std::collections::BTreeSet;
 
 use epigraph_db::{
-    ClaimListFilter, ClaimRepository, ClaimSortField, ClaimSortOrder, EdgeRepository, LabelQuery,
+    AnalysisRecord, AnalysisRepository, ClaimListFilter, ClaimRepository, ClaimSortField,
+    ClaimSortOrder, EdgeRepository, LabelQuery, PolicyRepository,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -314,4 +316,77 @@ async fn attribution_truth_gate_excludes_compounds(pool: PgPool) {
         "with no gate every attributed claim is listed"
     );
     assert_eq!(all_total, 3);
+}
+
+// ── list_active_network ────────────────────────────────────────────────────
+
+/// Policy claims: the truth gate and the order apply to atoms; compounds pass
+/// ungated and come after the atoms.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_active_network_gates_and_orders_atoms_only(pool: PgPool) {
+    let a = agent(&pool).await;
+    let labels = ["policy:active", "policy:network"];
+    let atom_high = claim(&pool, a, "policy atom high", 0.9, &labels).await;
+    let atom_mid = claim(&pool, a, "policy atom mid", 0.7, &labels).await;
+    let atom_low = claim(&pool, a, "policy atom low", 0.2, &labels).await;
+    let compound_low = compound(&pool, a, "policy compound low", 0.1, &labels).await;
+    let compound_high = compound(&pool, a, "policy compound high", 0.95, &labels).await;
+
+    let rows = PolicyRepository::list_active_network(&pool, 0.5)
+        .await
+        .expect("list_active_network");
+    let got = ids(&rows, |(id, _, _)| *id);
+    assert_eq!(
+        got.len(),
+        4,
+        "{got:?} (the low atom {atom_low} is gated out)"
+    );
+    assert_eq!(
+        got[..2],
+        [atom_high, atom_mid],
+        "atoms first, by truth DESC"
+    );
+    assert_eq!(set(&got[2..]), set(&[compound_low, compound_high]));
+}
+
+// ── get_claims_for_analysis ────────────────────────────────────────────────
+
+/// An analysis's concluded claims: atoms by truth DESC, then every compound.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_claims_for_analysis_orders_atoms_by_truth_then_compounds(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let a = agent(&pool).await;
+    let atom_low = claim(&pool, a, "concluded atom low", 0.3, &[]).await;
+    let compound_high = compound(&pool, a, "concluded compound", 0.95, &[]).await;
+    let atom_high = claim(&pool, a, "concluded atom high", 0.7, &[]).await;
+    let record = AnalysisRecord {
+        id: Uuid::new_v4(),
+        analysis_type: "role-aware test".to_string(),
+        method_description: "fixture".to_string(),
+        inference_path: "fixture".to_string(),
+        constraints: None,
+        coverage_context: serde_json::json!({}),
+        input_evidence_ids: Vec::new(),
+        agent_id: a,
+        properties: serde_json::json!({}),
+        created_at: chrono::Utc::now(),
+    };
+    let analysis = AnalysisRepository::persist_bundle(
+        &pool,
+        None,
+        &record,
+        &[atom_low, compound_high, atom_high],
+        &[],
+    )
+    .await
+    .expect("persist_bundle");
+
+    let rows = AnalysisRepository::get_claims_for_analysis(&pool, &viewer, analysis)
+        .await
+        .expect("get_claims_for_analysis");
+    assert_eq!(
+        ids(&rows, |r| r.id),
+        vec![atom_high, atom_low, compound_high],
+        "the compound's cached 0.95 does not rank it first"
+    );
 }
