@@ -6,7 +6,7 @@
 |---|---|
 | Proposal | EpiGraph backlog claim `03bb1479-ec73-43fb-b5f3-2b991d3efa91` |
 | Brief | "temporal recall: `created_at` in RecallRow + optional `since:` param" |
-| Branch | `feat/recall-temporal-since` (worktree `/home/jeremy/epigraph-wt-J`) |
+| Branch | `feat/recall-temporal-since` (worktree `<worktree-J>`) |
 | Base | `origin/main` @ `7cd5eeef` |
 | Author role | Governance agent (Ada three-gate discipline) |
 | Date | 2026-08-17 |
@@ -168,7 +168,7 @@ No new MCP tool. See **G8**.
 
 ## 2. Criterion gates
 
-Fixed now. Each is decided by the named command. `WT=/home/jeremy/epigraph-wt-J`.
+Fixed now. Each is decided by the named command. `WT=<worktree-J>`.
 
 > **Database rule for every command below.** The production `epigraph` database on
 > container `epigraph-postgres` is off limits — no connections, no migrations, ever.
@@ -450,7 +450,7 @@ plus a test extending `recall_audit_wiring.rs` asserting
 ## 3. BCH regression challenges
 
 Adversarial cases where a plausible naive implementation is **confidently wrong**.
-Format follows `/home/jeremy/Ada/benchmark_challenges/`.
+Format follows `<ada>/benchmark_challenges/`.
 
 ```yaml
 id: BCH-J01
@@ -1036,8 +1036,8 @@ crates/epigraph-db/src/repos/claim.rs::max_agent_claims_constant_is_positive  (p
 Reproduced on base, so it is not caused by this change:
 
 ```
-$ git worktree add --detach /home/jeremy/pre-j-base origin/main
-$ cd /home/jeremy/pre-j-base && SQLX_OFFLINE=true cargo clippy -p epigraph-tools --all-targets -- -D warnings
+$ git worktree add --detach <pre-j-base> origin/main
+$ cd <pre-j-base> && SQLX_OFFLINE=true cargo clippy -p epigraph-tools --all-targets -- -D warnings
 error: function `scan_crates` is never used
 … EXIT=101
 ```

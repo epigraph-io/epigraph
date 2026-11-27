@@ -255,8 +255,8 @@ delivered — so the residual has no compensating control), `D-PR16-mcp-http-par
 `D-PR27-proven-equivalent-sibling-pairs`, `D-PR27-A`, `D-PR27-B`,
 `D-PR27-shared-db-test-isolation` (partly discharged by `tenancy/fix-test-integrity`).
 
-**4.6 The 20 `CONVERSION-TAIL` findings.** Filed as EpiGraph backlog claims and recorded in
-`~/ops-private/2026-09-13-tenancy-backlog-epigraph-mapping.md`. Several ride along with
+**4.6 The 20 `CONVERSION-TAIL` findings.** Filed as EpiGraph backlog claims (the mapping from finding to claim is kept in private
+operator notes). Several ride along with
 §2.1 shards; the rest are independent.
 
 ---

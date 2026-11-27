@@ -1,8 +1,8 @@
 # scripts/
 
 Operational scripts for the live EpiGraph deployment. Not part of the
-build; invoked manually or by maintenance tasks (see `epiclaw-host`'s
-`schedules.toml`).
+build; invoked manually or by the deployment's scheduled maintenance tasks
+(a host scheduler of your choice; `docs/deploy.md` step 10 lists the jobs).
 
 ## Dependencies and database
 
@@ -104,7 +104,7 @@ Different problems, different keys; both are needed eventually.
 
 ```bash
 # Inspect what would change against a freshly synced snapshot:
-python3 scripts/fuzzy_dedup_claims.py --input /home/jeremy/epigraph-gui/public/semantic-dedup.json --verbose
+python3 scripts/fuzzy_dedup_claims.py --input <path-to>/semantic-dedup.json --verbose
 
 # Mark a small batch first:
 EPIGRAPH_TOKEN=... python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute --limit 50
@@ -214,7 +214,7 @@ EPIGRAPH_GIT_INGEST_GITHUB_PAT=ghp_readonly... \
 overlapping runs):
 
 ```
-*/15 * * * *  EPIGRAPH_GIT_INGEST_GITHUB_PAT=... /usr/bin/python3 /home/jeremy/epigraph/scripts/git_ingest_reconciler.py --config /var/lib/epiclaw/git-ingest/config.toml >> /var/log/git-ingest.log 2>&1
+*/15 * * * *  EPIGRAPH_GIT_INGEST_GITHUB_PAT=... /usr/bin/python3 <checkout>/scripts/git_ingest_reconciler.py --config /var/lib/epiclaw/git-ingest/config.toml >> /var/log/git-ingest.log 2>&1
 ```
 
 **Hard rule — do NOT enable the cron until Plan 2.5 is in prod**

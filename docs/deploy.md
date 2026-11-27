@@ -20,11 +20,15 @@ Background for the features named here is in [`docs/tenancy.md`](tenancy.md)
 migration's own header is the authoritative record of what it does. This
 runbook gives the order in which to do things.
 
-Throughout, `<placeholders>` stand for values from your own deployment. No
-unit files, container images or host paths ship in this repository. Where a
-refusal message names a unit (`epigraph-cascade-replay.timer`,
-`epigraph-jobs-drain.timer`), those are the names the code suggests, and you
-may use others.
+Throughout, `<placeholders>` stand for values from your own deployment. This
+runbook does not prescribe your hosts' layout, and no container image for the
+kernel ships here. Template systemd units do ship, in
+[`deploy/systemd/`](../deploy/systemd/), for four of the maintenance jobs of
+step 10 (as `<unit>.example`) and for the Atlas nightly. Their binary path,
+service user and environment file are placeholders to replace, and nothing
+installs them. Where a refusal message names a unit
+(`epigraph-cascade-replay.timer`, `epigraph-jobs-drain.timer`), that is the
+installed name of the template; you may install it under another.
 
 ## Contents
 
@@ -502,6 +506,18 @@ neither.
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 | Theme maintenance | `assign_unthemed_themes --apply` (`epigraph-cli`), then `python3 scripts/maintain_themes.py` | nightly | Keeps the themes `recall(diverse=true)` samples from current between rebuilds: assigns unthemed claims, reassigns misplaced ones, splits at most three high-variance themes, recomputes the affected centroids. `maintain_themes.py` works over the HTTP API, not a DSN: it needs `EPIGRAPH_API_URL` and `EPIGRAPH_TOKEN`, a token with `claims:write` and `claims:admin` minted through the token endpoint (the script's docstring shows how), and refuses to start without the token. On a row-secured deployment its first phase can only assign claims the token may write, so run `assign_unthemed_themes --apply` first (maintenance DSN; a dry run without `--apply`). Small in memory: a split clusters at most 5,000 2-D projections. `--dry-run` reports without writing. |
 | Theme rebuild | `python3 scripts/theme_pipeline.py grow --i-understand-full-rebuild` | on demand, run by an operator (for example monthly, or after a large ingest); not a timer job | The full UMAP rebuild `theme_cluster` used to point at: base clustering, split loop, projection onto `claim_themes`, then labelling. It replaces every theme, so do not put it on a timer. Once `claim_themes` has rows, a run without `--i-understand-full-rebuild` refuses before it clusters anything and exits 1 with nothing written, printing the theme count and the rows it would drop (a first run on an empty `claim_themes` needs no flag). A confirmed run mints new theme ids, and the `ON DELETE CASCADE` foreign keys on `claim_themes` delete every graph neighbourhood, every Atlas layout position and every level of every Atlas map (the public map and each team map) with the old themes; nothing rebuilds them by itself. Run the rebuild steps it prints (stdout `rebuild_next`) straight after, in order: `docs/ops/theme-v2-promotion-runbook.md`, "A projection is a full rebuild". Never store a theme id across a rebuild. Connects on `MAINTENANCE_DATABASE_URL` (an application login under row security clusters only the rows it can see and still exits 0); every statement is bounded at 15 minutes. The label step runs `scripts/label_themes_llm.py --relabel-all`, which calls the `claude` CLI, so the unit's user needs that CLI installed and signed in; when labelling fails the run prints `"status": "label_failed"` and exits 1 with the clustering already committed, and `theme_pipeline.py label` retries just that step. The base assignment alone has taken about 40 minutes; `--from-run-id <run>` resumes the split, projection and label phases on an existing run. Memory: budget about 3 GB. `cluster_claims.py` documents a 620 MB UMAP reducer and a 2.6 GB peak at a 100K batch (this job's default `--batch-size` is 20000), and `refine_clusters.py` fits UMAP on a capped sample; measure the peak on your corpus before you tighten a cgroup limit. Writes the fitted reducer to `data/umap_reducer.pkl` in the checkout. `--dry-run` writes nothing: with `--from-run-id <run>` it lists the clusters the split loop would act on in that run; without it, it only says a fresh run would start with base clustering (base clustering commits a run, so it is not run as a preview). `theme_pipeline.py discover` previews the latest run. |
+
+Template units for the first, second, fourth and fifth rows ship in
+[`deploy/systemd/`](../deploy/systemd/): `epigraph-cascade-replay.timer.example`,
+`epigraph-jobs-drain.timer.example`, `epigraph-embed-backfill.timer.example`
+and `epigraph-prune-recall-events.timer.example`, each with its
+`.service.example`. Each service is a oneshot that runs the binary with the
+command and exit-code handling of this table, reads one environment file
+(`/etc/epigraph/maintenance.env`, a placeholder) and runs as a placeholder
+service user. Install each without the `.example` suffix (for example as
+`/etc/systemd/system/epigraph-cascade-replay.timer`), replace the placeholders,
+and enable the timers; the comments in each file say what to change. The other
+rows have no template; schedule them the same way.
 
 `replay_deferred_cascades` and `drain_jobs` each take their own session
 advisory lock, so an overlapping or hand-started run prints

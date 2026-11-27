@@ -73,8 +73,8 @@ pub const DEFAULT_NOVELTY_THRESHOLD: f64 = 0.05;
 /// * `telemetry`: the marker this repo's embedding policy already keys on;
 ///   scheduled agents also put it on per-run observations (url-discovery
 ///   results, filter-drop lists, fetch outages).
-/// * The per-run summary labels the scheduled writers in epiclaw-host's
-///   `deploy/` prompts write today: the norcal-rfp generators, reviewers,
+/// * The per-run summary labels the host's scheduled agent prompts write
+///   today: the norcal-rfp generators, reviewers,
 ///   revisers and cross-generator dedup (`norcal-rfp-*-status`), and the
 ///   grant-monitor generators, dedup and run summary (`grant-*-status`). Those
 ///   writers rebuild their roster of completed cycles from these labels, so a

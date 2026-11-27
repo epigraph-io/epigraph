@@ -2801,8 +2801,8 @@ pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 ///
 /// The populations this newly refuses: a stdio agent retiring a claim by an
 /// agent it shares no operator with (unlinked fleet agents included) — the
-/// `release/epiclaw/CLAUDE.md` procedure that relabels cross-agent items with
-/// `update_labels` now works only between agents linked to one operator — and
+/// agent fleet's retirement procedure, which relabels cross-agent items with
+/// `update_labels`, now works only between agents linked to one operator — and
 /// an undeclared-signer stdio server retiring anything it did not author.
 ///
 /// Removing `backlog` also takes an item out of the open-backlog query and is
