@@ -121,6 +121,8 @@ pub mod mcp_twins;
 pub mod methods;
 #[cfg(test)]
 mod negative_tests;
+/// The list-endpoint pagination convention (`docs/conventions/api-pagination.md`).
+pub mod pagination;
 pub mod papers;
 pub mod perspective;
 #[cfg(feature = "db")]
