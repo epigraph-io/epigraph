@@ -401,6 +401,77 @@ fn only_begin_claim_act_borrows_the_server_stamp() {
     );
 }
 
+/// Receivers whose `.agent_id()` is not a context's, each with its type. A
+/// row is a reviewed exemption from
+/// [`no_other_crate_borrows_the_stamp_or_resolves_the_server_agent`]; never
+/// add one for a server or a context.
+const NON_SERVER_AGENT_ID_RECEIVERS: &[(&str, &str)] = &[
+    (
+        "event",
+        "epigraph-api's security audit event (`SecurityEvent::agent_id`), the event's actor",
+    ),
+    (
+        "events[0]",
+        "the same audit event type, read from a list in that module's tests",
+    ),
+];
+
+/// Whether `line` (comments already stripped) carries one of `needles`. A
+/// `.agent_id()` counts unless the receiver right before it (an identifier,
+/// with any `[index]`) is a listed non-server receiver, so
+/// `(*server).agent_id()` and `ServiceHost::ctx(&server).agent_id()` count as
+/// well.
+fn offending_line(line: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| {
+        if *n != ".agent_id()" {
+            return line.contains(n);
+        }
+        line.match_indices(n).any(|(at, _)| {
+            let receiver: String = line[..at]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '[' | ']'))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            !NON_SERVER_AGENT_ID_RECEIVERS
+                .iter()
+                .any(|(r, _)| *r == receiver)
+        })
+    })
+}
+
+/// The line matcher behind the workspace scan catches every spelling that
+/// reaches `Ctx::agent_id` through the server's `Deref`, and passes the
+/// listed non-server receiver.
+#[test]
+fn the_workspace_scan_matches_every_spelling_of_the_server_agent() {
+    let needles = &[".agent_id()", ".write_identity("];
+    for line in [
+        "let me = server.agent_id().await?;",
+        "let me = (*server).agent_id().await?;",
+        "let me = ServiceHost::ctx(&server).agent_id().await?;",
+        "let me = self.ctx.agent_id().await?;",
+        "let id = server.write_identity(None, &viewer).await?;",
+        "if event.agent_id() == server.agent_id().await? {",
+    ] {
+        assert!(offending_line(line, needles), "missed: {line}");
+    }
+    assert!(!offending_line(
+        "if event.agent_id() != Some(agent_id) {",
+        needles
+    ));
+    assert!(!offending_line(
+        "assert_eq!(events[0].agent_id(), Some(agent1));",
+        needles
+    ));
+    assert!(offending_line(
+        "let me = servers[0].agent_id().await?;",
+        needles
+    ));
+}
+
 /// Scans 1 and 7 across the WORKSPACE (backlog 30133ca8). Moving the
 /// resolvers to `epigraph_service::Ctx` made them `pub` there, and
 /// `EpiGraphMcpFull` derefs to its `Ctx`, so a crate that is neither this one
@@ -412,16 +483,35 @@ fn only_begin_claim_act_borrows_the_server_stamp() {
 /// that needs either is a new borrower or a new author resolution, and needs
 /// its own review and its own row in scans 1 / 7.
 ///
+/// Rust skips a private inherent method and keeps looking through `Deref`, so
+/// `server.agent_id()` on an `EpiGraphMcpFull` resolves to `Ctx::agent_id`
+/// from any crate, although the server's own `agent_id` is `pub(crate)`. The
+/// scan therefore matches the method call `.agent_id()` on ANY receiver, not
+/// just the spellings that name the context, and exempts only the receivers in
+/// [`NON_SERVER_AGENT_ID_RECEIVERS`], each a type that is not a context. It
+/// also refuses, outside the two crates: minting a write identity
+/// (`.write_identity(`), building a context (`Ctx::new(`), whose identity key
+/// decides the agent `write_identity(None, ..)` answers, and calling the
+/// service crate's author-authority helpers directly.
+///
+/// `read_as` is not matched: it stamps a connection with a viewer the caller
+/// already holds, which `epigraph_db::ScopedPool::read_as` (public) does too,
+/// and the API's own `AppState::read_as` would make the needle all noise.
+///
 /// Verified load-bearing by planting: a call to
-/// `admin_borrowed_server_identity(` in an `epigraph-cli` source file fails it.
+/// `admin_borrowed_server_identity(` in an `epigraph-cli` source file fails
+/// it, and so does `server.agent_id()` there.
 #[test]
 fn no_other_crate_borrows_the_stamp_or_resolves_the_server_agent() {
     const NEEDLES: &[&str] = &[
         "admin_borrowed_server_identity(",
-        "Ctx::agent_id(",
-        "ctx().agent_id()",
-        "ctx.agent_id()",
+        ".agent_id()",
         ".server_agent_id()",
+        ".write_identity(",
+        "Ctx::new(",
+        "author_write_authority",
+        "begin_author_stamped_tx",
+        "store_embedding_author_stamped",
     ];
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut roots = Vec::new();
@@ -460,7 +550,7 @@ fn no_other_crate_borrows_the_stamp_or_resolves_the_server_agent() {
             scanned += 1;
             let text = strip_line_comments(&std::fs::read_to_string(&path).expect("read"));
             for (i, line) in text.lines().enumerate() {
-                if NEEDLES.iter().any(|n| line.contains(n)) {
+                if offending_line(line, NEEDLES) {
                     offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
                 }
             }

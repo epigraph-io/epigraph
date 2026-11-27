@@ -8,9 +8,19 @@
 //! [`WriteIdentity::from_resolved`] is `pub(crate)` HERE, and its only callers
 //! are [`Ctx::write_identity`](crate::ctx::Ctx::write_identity) and
 //! [`Ctx::admin_borrowed_server_identity`](crate::ctx::Ctx::admin_borrowed_server_identity).
-//! A front end cannot mint one from an agent it chose itself; the compiler
+//! A front end cannot build one from an agent id it names; the compiler
 //! refuses it, where a `pub(crate)` constructor inside the front end's own
 //! crate only a source scan could police.
+//!
+//! The type does not decide WHICH agent the resolvers answer, though. Over
+//! HTTP it is the token's principal. With no `auth` (stdio and the operator
+//! CLIs) it is the context's own agent, found by the identity key the context
+//! was built with ([`Ctx::with_identity_public_key`](crate::ctx::Ctx::with_identity_public_key),
+//! else the signer's key), and whoever builds a context chooses that key. So
+//! the trust boundary for the no-`auth` arm is building the context, which only
+//! the process's own start-up does: the MCP crate's
+//! `tests/write_identity_ratchet.rs` refuses `Ctx::new(` and
+//! `.write_identity(` in every crate other than the MCP and service crates.
 //!
 //! The refusals below are the resolver's, as [`ServiceError`]s; a front end
 //! maps them onto its own error type.

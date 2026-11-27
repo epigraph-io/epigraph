@@ -102,8 +102,10 @@ pub struct Ctx {
     /// `MaintenanceSession::assert_privileged` on every call.
     pub scoped: Option<epigraph_db::ScopedPool>,
     /// `Some(reason)` when the caller DECLARED that `pool` is a privileged
-    /// (BYPASSRLS) maintenance pool, set only through
-    /// [`Self::on_a_privileged_pool`]. The operator `ingest-document` CLI runs
+    /// (BYPASSRLS) maintenance pool, set through
+    /// [`Self::on_a_privileged_pool`]. The field is `pub` so a front end can
+    /// read it; a crate can write it only on a `Ctx` it owns, since the MCP
+    /// server lends its context through `Deref` alone (no `DerefMut`). The operator `ingest-document` CLI runs
     /// its whole ingest on `MaintenancePool`, where there is no tenancy context
     /// to stamp and a plain transaction is the correct shape. Declared rather
     /// than defaulted, mirroring the MCP embedder's `on_a_privileged_pool`: a
@@ -595,6 +597,18 @@ impl Ctx {
 /// here is what lets all three write paths share ONE refusal triple instead of a
 /// second copy that resolved a viewer and skipped the empty-writable check.
 ///
+/// # Why it is `pub` and takes a bare `Uuid`
+///
+/// The MCP crate's embedding store is a caller, and it learns the author by
+/// reading the claim row, so it holds an id, not a
+/// [`crate::write_identity::WriteIdentity`]. The function confers nothing a
+/// crate lacks without it: [`Viewer::resolve`] and
+/// [`epigraph_db::ScopedPool::begin_as`] are public, and this adds only the
+/// three refusals. Its callers are pinned instead: the MCP crate's
+/// `tests/write_identity_ratchet.rs` refuses the name in every crate other
+/// than the MCP and service crates. It moves behind a `WriteIdentity`-taking
+/// entry point with the embedding store (backlog 30133ca8's remaining part).
+///
 /// # Errors
 /// * `ServiceError::Internal` if this process was not built from a
 ///   [`epigraph_db::ScopedPool`] — never a fallback to the unstamped pool.
@@ -735,7 +749,7 @@ pub async fn author_write_authority<'p>(
 /// `epigraph-db/tests/author_stamped_write_loop.rs` pins both measurements.
 ///
 /// The group is therefore ensured exactly where it already was:
-/// `server.rs::agent_id`'s PR-09 block, once per process, before either caller
+/// [`Ctx::agent_id`]'s PR-09 block, once per process, before either caller
 /// reaches this function.
 ///
 /// The refusal is the one part of this conversion that changes behaviour for a
