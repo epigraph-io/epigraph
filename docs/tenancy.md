@@ -88,10 +88,18 @@ back. Migration 062 forbids that pairing outright with
 | Pre-existing rows (the one-shot backfill) | the **author's personal group**, `visibility = 'public'` — plan D2. Those rows were already world-readable, so declaring `public` is a no-op, not a new disclosure. |
 | A new claim from an authenticated principal | the principal's declared write target |
 | A claim-derived row (`evidence`, `triples`, …) | inherited from the parent claim by 070 arm (c), at insert |
-| A visibility change on a claim | propagated to 17 derived tables, `harvester_fragments` and `edges` by 070 arm (d), in the same transaction |
+| A visibility change on a claim | propagated to the derived tables (16 since 354) and `edges` by 070 arm (d), in the same transaction |
 | A `harvester_fragments` row whose provenance row arrives later | stamped from the cited claim by **089**, when the `harvester_claim_provenance` row linking them is inserted — but only if the fragment is still unstamped. With several citing claims the most restrictive wins (**218**). See the note below the table. |
 | An edge | the **meet** of its two endpoints, 070 arm (b); since **120** (operator decision D8) an edge between two public claims (or evidence, or from a `synthesis` source) is owned by its **writer's group** and stays public, and every other public-meet edge (an agent, paper, workflow, trace ... endpoint) stays `('public', world)`. See "Edges between public claims are their writer's (120)" below. |
 | A row with no derivable owner (`frames`, `contexts`, `perspectives`, `communities`, `recall_events`) | **must be declared by the writer.** Before 074 these landed on `('public', world)`; after 074 there is no default to land on. See the next section. `harvester_fragments` is in this set too, with one qualification — see below. |
+
+**Migration 354 dropped the five harvester tables** (`harvester_sources`,
+`harvester_fragments`, `harvester_audit_reports`, `harvester_claim_provenance`,
+`harvester_enriched_concepts`), which had no writer left, together with every
+stamp, arm and policy that named them; it refuses to drop a non-empty one. The
+harvester notes in this document (the fragment row above, the trust model and
+`F-218-A` below, the seal's fragment blanking) describe the schema from 070 to
+353.
 
 **`harvester_fragments` is the one table in two rows of that table, and the
 order of the two writes decides which.** It has no `claim_id`, so it is a
@@ -334,7 +342,7 @@ have moved and REPORTS the platform corpus.
 It is resumable across a `kill -9`: the `tenancy_backfill_progress` cursor is
 committed in the same transaction as its batch.
 
-**Bounded runs.** `--entity claims|communities|perspectives|recall-events|harvester-fragments`
+**Bounded runs.** `--entity claims|communities|perspectives|recall-events|registry-edges`
 runs one arm alone (no settle, no final verify). `--max-runtime 2h` (or `90m`,
 `3600s`) stops cleanly between batches and exits **3**: partial, re-run the same
 command to resume. A walk that begins from a cursor an earlier run left (an
@@ -383,7 +391,8 @@ locked are stepped over. Run one.
 2. **Phase 0** — mints a personal group, plus a live membership in it, for every
    claim author that lacks one (migration 057 documents ~1,198 orphan agents
    that have never authenticated).
-3. The entity arms: `claims`, `recall_events`, `harvester_fragments`.
+3. The entity arms: `claims`, `recall_events` (and, until 354 dropped the
+   table, `harvester_fragments`).
    (`--entity perspectives` and `--entity communities` are accepted and do
    nothing; see below.)
 4. `settle_remaining`, then `verify`.
@@ -2329,7 +2338,7 @@ a future change to any of these tables can be checked against it.
 | `evidence.embedding`, `evidence.embedding_3072` | → `NULL` | **not restored** — see the gap below |
 | `evidence.properties` | → `'{}'`; ciphertext to `evidence_encryption.encrypted_properties` | yes |
 | `triples`, `entity_mentions`, `experiment_entity_mentions`, `reasoning_traces`, `challenges`, `experiment_triples` | rows **DELETED** | **no** — re-extraction is a separate, explicit operation |
-| `harvester_fragments.content_text`, `.context_window` | blanked, including a fragment cited by claims outside the plan | **no, and not recoverable** — the fragment text *is* the source |
+| `harvester_fragments.content_text`, `.context_window` (until migration 354 dropped the table) | blanked, including a fragment cited by claims outside the plan | **no, and not recoverable** — the fragment text *is* the source |
 
 Deleting the derived extractions rather than encrypting them is deliberate: they
 are re-derivable from the plaintext, and encrypting each one would multiply the

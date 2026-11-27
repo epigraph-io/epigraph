@@ -2496,16 +2496,6 @@
       "disposition_date": "2026-11-14"
     },
     {
-      "id": "F-218-A",
-      "where": "public.harvester_claim_provenance grants (epigraph_app keeps INSERT; migrations 077, 115, 218) together with public.epigraph_propagate_tenancy (arm (d), last defined in migrations/218_fragment_tenancy_most_restrictive.sql)",
-      "what": "The accepted harvester trust model (F-089-F) is enforced at the INSERT-time stamp but not on every path: an application-role session may still INSERT a provenance link, and arm (d) re-stamps a fragment from a linked claim's later tenancy change without regard to who wrote the link.",
-      "status": "OPEN and PRE-EXISTING: migration 168's arm (d) behaves the same. Measured 2026-11-14 on fresh databases while reviewing migration 218, which was revised so that it does not widen this (its stamp ranks only its own statement's rows, and its arm (d) never moves a fragment to a claim the statement did not change). Analysis held outside this repository.",
-      "owner": "unassigned - needs an operator decision. The candidate repair is to revoke INSERT on public.harvester_claim_provenance from epigraph_app, which matches the documented trust model and has no in-tree writer, but would break the external harvester if it connects on an application DSN; which role it connects as can only be confirmed on the deployment.",
-      "disposition": "OPERATOR-DECISION",
-      "disposition_note": "Recorded at the level this repository's disclosure rule allows for an unfixed gap: an id, a location and an owner. Not fixed in migration 218 because the repair depends on a deployment fact this tree cannot measure.",
-      "disposition_date": "2026-11-14"
-    },
-    {
       "id": "F-SEC14-A",
       "where": "crates/epigraph-api/src/routes/edges.rs::claim_provenance",
       "what": "An observable-difference gap: the handler can render two distinguishable response shapes that the viewer-filtered reads alone do not collapse.",
@@ -3208,6 +3198,16 @@
       "closing_measurement": "CLOSED BY THE CHEAPER OF THE TWO REPAIRS THIS ENTRY NAMED: migration 218 revokes UPDATE on public.harvester_claim_provenance from epigraph_app (a table-level REVOKE, which also removes any column-level grant), so the AFTER INSERT stamp is again the only way a link appears. No writer used the privilege: the only Rust references to the table are reads, the external harvester INSERTs, and arm (d) re-stamps the rows' own tenancy as a maintenance-owned definer under epigraph_maintenance's own UPDATE (070). No second trigger, so none of the four pinned trigger counts moves. Measured on fresh databases: below 218 has_table_privilege('epigraph_app', ..., 'UPDATE') is true; at 218 it and has_any_column_privilege are false, an epigraph_app UPDATE of a provenance row's fragment_id is refused with 42501, and INSERT, SELECT and DELETE are kept. Pinned by crates/epigraph-db/tests/fragment_tenancy_most_restrictive.rs::the_app_role_cannot_update_provenance, which fails with 218 removed.",
       "closed_date": "2026-11-14",
       "closed_by": "migration 218 (backlog 77fbf3f9)"
+    },
+    {
+      "id": "F-218-A",
+      "where": "public.harvester_claim_provenance grants (epigraph_app keeps INSERT; migrations 077, 115, 218) together with public.epigraph_propagate_tenancy (arm (d), last defined in migrations/218_fragment_tenancy_most_restrictive.sql)",
+      "what": "The accepted harvester trust model (F-089-F) is enforced at the INSERT-time stamp but not on every path: an application-role session may still INSERT a provenance link, and arm (d) re-stamps a fragment from a linked claim's later tenancy change without regard to who wrote the link.",
+      "status": "CLOSED 2026-11-27 by migration 354 (backlog a6e3dba2): the five harvester tables are dropped, harvester_claim_provenance with them, and epigraph_propagate_tenancy no longer has a fragment arm, so neither the application-role provenance INSERT nor the arm (d) re-stamp this finding names exists. Pre-fix status: OPEN and PRE-EXISTING: migration 168's arm (d) behaves the same. Measured 2026-11-14 on fresh databases while reviewing migration 218, which was revised so that it does not widen this (its stamp ranks only its own statement's rows, and its arm (d) never moves a fragment to a claim the statement did not change). Analysis held outside this repository.",
+      "owner": "migration 354, which closed it. Pre-fix owner clause: unassigned - needs an operator decision. The candidate repair is to revoke INSERT on public.harvester_claim_provenance from epigraph_app, which matches the documented trust model and has no in-tree writer, but would break the external harvester if it connects on an application DSN; which role it connects as can only be confirmed on the deployment.",
+      "disposition": "CLOSED",
+      "disposition_note": "RE-DISPOSED from OPERATOR-DECISION: the operator chose to drop the harvester tables (no writer remained, and the deployed tables were measured empty), which moots the candidate repair (revoking INSERT on the provenance table) rather than taking it. Recorded at the level this repository's disclosure rule allows for an unfixed gap: an id, a location and an owner. Not fixed in migration 218 because the repair depends on a deployment fact this tree cannot measure.",
+      "disposition_date": "2026-11-27"
     }
   ],
   "halted": null,
@@ -3252,7 +3252,7 @@
       "F-089-D -- MIS-FILED, ANNOTATED IN PLACE 2026-09-22, same precedent and same reason as F-089-B: disposition is CONVERSION-TAIL, not OPERATOR-DECISION. SUBSTANCE, for scheduling: the operator-run repair and the verify gate's residual census both bind the WORLD sentinel alone while migration 089's trigger matches BOTH sentinels, so a seed-owned harvester_fragments row already on disk is repaired by neither (the trigger fires only on a new provenance insert) and counted by neither, and verify's tier-A residual line reads zero over it.",
       "F-089-E -- MIS-FILED, ANNOTATED IN PLACE 2026-09-22, same precedent and same reason as F-089-B: disposition is CONVERSION-TAIL, not OPERATOR-DECISION. SUBSTANCE, for scheduling: the trigger is AFTER INSERT only, so an UPDATE of an existing harvester_claim_provenance row's fragment_id or claim_id runs no stamping trigger at all, and epigraph_app holds UPDATE on that table, so nothing enforces the assumption that no writer does it. CLOSED 2026-11-14 by migration 218 (UPDATE revoked from epigraph_app); the entry is now in closed_findings.",
       "F-089-F -- DECIDED 2026-09-22 (accept: the ingest path is trusted), ANNOTATED IN PLACE 2026-11-14 and not removed: documented in docs/tenancy.md and migration 218; the finding is now ACCEPTED.",
-      "F-218-A",
+      "F-218-A -- MOOT, ANNOTATED IN PLACE 2026-11-27 and not removed, on this list's own precedent: the operator chose to drop the harvester tables, and migration 354 did; the finding is now in closed_findings.",
       "webhook-secret-key-custody (D-PR19-webhook-secret-at-rest)",
       "delegated-authorship-policy (D-PR16-claim-authorship-is-not-a-credential)",
       "recall-events-historical-row-reconciliation (D-PR16-recall-events-are-instance-wide residual 2) -- a one-off pass over rows written before tenancy/fix-security-track deploys; same shape as D-PR18-stale-cross-group-edges' remediation, and bounded meanwhile by the 90-day retention prune",
