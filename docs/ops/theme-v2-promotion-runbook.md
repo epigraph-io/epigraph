@@ -169,9 +169,9 @@ The views built per run on theme ids reference `claim_themes` with
 
 So the projection refuses, before it changes anything, when `claim_themes` is not
 empty, unless it is given `--i-understand-full-rebuild`. The refusal and the
-confirmed run both print the theme count, the row count of each cascading table
-(read from the foreign keys in the catalog, so a later one is listed too), and the
-maps that lose their levels. A confirmed run then prints the steps below, and the
+confirmed run both print the theme count, the row count of each cascading table,
+including the tables that cascade from those (read from the foreign keys in the
+catalog, so a later one is listed too), and the maps that lose their levels. A confirmed run then prints the steps below, and the
 JSON result carries them as `rebuild_next`.
 
 **Required after every projection**, in order, as the maintenance role (the same
@@ -305,8 +305,12 @@ Correct split:
   recomputes only affected centroids, and reports new theme candidates. Cumulative
   growth, no wipe. Needs `EPIGRAPH_TOKEN` with `claims:write` (`claims:admin` for
   cross-owner reassign).
-- **Periodic full rebuild = `theme_pipeline.py grow`**, on the host, under the memory
-  cap, monthly or on demand. Never on the nightly cron.
+- **Full rebuild = `theme_pipeline.py grow --i-understand-full-rebuild`**, run by an
+  operator on the host, under the memory cap, on demand (for example monthly). Never
+  on the nightly cron, and never on any timer: it replaces every theme id, and the
+  cascade takes the graph neighbourhoods and every Atlas layout and map with the old
+  themes. Without the flag it refuses over existing themes; with it, run the steps in
+  "A projection is a full rebuild" straight after.
 
 Both edits are needed, or the old chain stays reachable:
 
