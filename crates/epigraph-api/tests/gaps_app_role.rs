@@ -21,7 +21,7 @@ use axum::extract::State;
 use axum::Json;
 use epigraph_api::middleware::bearer::{AuthContext, RequireScopeWrite, ViewerExtractor};
 use epigraph_api::middleware::ClientType;
-use epigraph_api::routes::gaps::{gap_analysis, GapAnalysisRequest};
+use epigraph_api::routes::gaps::{gap_analysis, surface_gaps, GapAnalysisRequest};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
@@ -176,4 +176,164 @@ async fn gap_analysis_sees_the_members_private_claim_and_stores_its_id_not_its_t
         "gap_analyses has no tenancy, so it must hold no claim text; found \
          statement fragments {leaked:?} in {stored}"
     );
+}
+
+// ── surface_gaps ──
+
+/// A stored analysis in the pre-fix shape: claim text in both text fields, and
+/// the claim id. `surface_gaps` must use the id and ignore the text. A second
+/// gap has text and NO id (every row written before ids were stored): it has
+/// no claim to target, so it is skipped rather than served.
+async fn legacy_analysis(
+    pool: &PgPool,
+    claim: Uuid,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let gaps = serde_json::json!([
+        {
+            "gap_type": "blind_spot",
+            "severity": 0.9,
+            "unconstrained_claim": format!("Low truth (0.10) on relevant claim: {STATEMENT}"),
+            "nearest_graph_claim": STATEMENT,
+            "nearest_claim_id": claim,
+            "nearest_similarity": 1.0,
+            "graph_inference_path": null,
+            "recommendation": "Investigate low-truth claim for missing evidence",
+        },
+        {
+            "gap_type": "confidence_divergence",
+            "severity": 0.9,
+            "unconstrained_claim": format!("High ignorance (0.60) on: {STATEMENT}"),
+            "nearest_graph_claim": STATEMENT,
+            "nearest_similarity": 1.0,
+            "graph_inference_path": null,
+            "recommendation": "Gather more evidence to reduce ignorance",
+        },
+    ]);
+    sqlx::query(
+        "INSERT INTO gap_analyses (id, question, graph_claims_count, \
+         unconstrained_claims_count, matched_count, gap_count, proprietary_count, gaps, \
+         created_at) VALUES ($1, $2, 1, 0, 0, 2, 0, $3, $4)",
+    )
+    .bind(id)
+    .bind(QUESTION)
+    .bind(&gaps)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("plant a stored analysis");
+    id
+}
+
+/// A newer, unrelated analysis, so the one under test is NOT the newest row.
+async fn newer_analysis(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO gap_analyses (id, question, graph_claims_count, \
+         unconstrained_claims_count, matched_count, gap_count, proprietary_count, gaps, \
+         created_at) VALUES ($1, 'a later question', 0, 0, 0, 0, 0, '[]'::jsonb, now())",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("plant a newer analysis");
+    id
+}
+
+async fn surface(
+    pool: &PgPool,
+    state: AppState,
+    caller: Uuid,
+    analysis: Uuid,
+) -> Result<serde_json::Value, epigraph_api::errors::ApiError> {
+    let request: epigraph_api::routes::gaps::SurfaceGapsRequest =
+        serde_json::from_value(serde_json::json!({ "gap_analysis_id": analysis }))
+            .expect("request");
+    surface_gaps(
+        write_scope(caller),
+        viewer(pool, caller).await,
+        State(state),
+        Json(request),
+    )
+    .await
+    .map(|Json(v)| v)
+}
+
+/// `(challenger, explanation)` of every challenge filed against `claim`.
+async fn challenges_on(pool: &PgPool, claim: Uuid) -> Vec<(Option<Uuid>, String)> {
+    sqlx::query_as("SELECT challenger_id, explanation FROM challenges WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_all(pool)
+        .await
+        .expect("challenges on the claim")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn surface_gaps_files_an_id_only_challenge_for_the_member(pool: PgPool) {
+    let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
+    let (member, _stranger, claim) = private_claim(&pool, &embedder).await;
+    let analysis = legacy_analysis(&pool, claim, chrono::Utc::now()).await;
+    let state = production_state(&pool).await;
+
+    let body = surface(&pool, state, member, analysis)
+        .await
+        .expect("surface_gaps for the member");
+    assert_eq!(
+        body["challenges_created"], 1,
+        "exactly the gap that names a claim the member can read is surfaced; the \
+         text-only legacy gap has no target: {body}"
+    );
+
+    let filed = challenges_on(&pool, claim).await;
+    assert_eq!(filed.len(), 1, "one challenge on the claim: {filed:?}");
+    let (challenger, explanation) = &filed[0];
+    assert_eq!(*challenger, Some(member), "the caller is the challenger");
+    assert_eq!(
+        explanation,
+        &format!("gap_blind_spot: claim {claim}"),
+        "the challenge names the gap type and the claim id only"
+    );
+    let leaked = statement_windows_in(&format!("{explanation} {body}"));
+    assert!(
+        leaked.is_empty(),
+        "no stored statement text may be copied into a challenge: {leaked:?}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn surface_gaps_skips_a_claim_the_caller_cannot_read(pool: PgPool) {
+    let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
+    let (_member, stranger, claim) = private_claim(&pool, &embedder).await;
+    let analysis = legacy_analysis(&pool, claim, chrono::Utc::now()).await;
+    let state = production_state(&pool).await;
+
+    let body = surface(&pool, state, stranger, analysis)
+        .await
+        .expect("surface_gaps for the stranger answers, it does not error");
+    assert_eq!(
+        body["challenges_created"], 0,
+        "the stranger cannot read the member's private claim: {body}"
+    );
+    assert!(
+        challenges_on(&pool, claim).await.is_empty(),
+        "nothing may be filed against a claim the caller cannot read"
+    );
+    let leaked = statement_windows_in(&body.to_string());
+    assert!(leaked.is_empty(), "the response leaks {leaked:?}: {body}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn surface_gaps_finds_an_analysis_that_is_not_the_newest(pool: PgPool) {
+    let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
+    let (member, _stranger, claim) = private_claim(&pool, &embedder).await;
+    let older = legacy_analysis(&pool, claim, chrono::Utc::now() - chrono::Duration::days(1)).await;
+    let newest = newer_analysis(&pool).await;
+    assert_ne!(older, newest);
+    let state = production_state(&pool).await;
+
+    let body = surface(&pool, state, member, older)
+        .await
+        .expect("an older analysis id must be found, not answered 404");
+    assert_eq!(body["challenges_created"], 1, "{body}");
 }

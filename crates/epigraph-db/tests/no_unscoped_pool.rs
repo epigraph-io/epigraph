@@ -907,7 +907,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 125 -> 124 (backlog e21530f3): `gap_analysis` searches claims on the
 /// caller's stamped read, and the analysis it stores holds claim ids, not
 /// claim text (`routes/gaps.rs` 5 -> 4). No file reached zero.
-const HIGH_WATER: usize = 124;
+/// 124 -> 121 (backlog 07ef644c): `surface_gaps` runs its analysis lookup,
+/// challenges and events on ONE caller-stamped `AppState::write_as`
+/// transaction (`routes/gaps.rs` 4 -> 1). No file reached zero.
+const HIGH_WATER: usize = 121;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1180,7 +1183,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // so stamping the read copies no group-private content there. Its
     // `store_gap_analysis` stays on the pool: an append-only, untenanted row
     // holding ids and scores.
-    ("routes/gaps.rs", 4),
+    // 4 -> 1 (backlog 07ef644c): `surface_gaps` loads the analysis by id,
+    // resolves each stored claim id through the caller's viewer, and files the
+    // challenges and their events, all on ONE `AppState::write_as`
+    // transaction. The 1 left is `gap_analysis`'s `store_gap_analysis`.
+    ("routes/gaps.rs", 1),
     // 4 before conversion shard 7, which moved `expand` onto
     // `AppState::read_as`. ONE register site spending its alias on FOUR
     // statements: two inline run/cluster-metadata probes, the viewer-spliced

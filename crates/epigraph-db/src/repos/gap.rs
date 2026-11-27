@@ -65,6 +65,25 @@ struct GapAnalysisRow {
     created_at: DateTime<Utc>,
 }
 
+impl From<GapAnalysisRow> for GapAnalysisResult {
+    fn from(r: GapAnalysisRow) -> Self {
+        Self {
+            id: r.id,
+            question: r.question,
+            analysis_a_id: r.analysis_a_id,
+            analysis_b_id: r.analysis_b_id,
+            graph_claims_count: r.graph_claims_count,
+            unconstrained_claims_count: r.unconstrained_claims_count,
+            matched_count: r.matched_count,
+            gap_count: r.gap_count,
+            proprietary_count: r.proprietary_count,
+            confidence_boundary: r.confidence_boundary,
+            gaps: r.gaps,
+            created_at: r.created_at,
+        }
+    }
+}
+
 pub struct GapRepository;
 
 impl GapRepository {
@@ -141,22 +160,29 @@ impl GapRepository {
             .await?
         };
 
-        Ok(rows
-            .into_iter()
-            .map(|r| GapAnalysisResult {
-                id: r.id,
-                question: r.question,
-                analysis_a_id: r.analysis_a_id,
-                analysis_b_id: r.analysis_b_id,
-                graph_claims_count: r.graph_claims_count,
-                unconstrained_claims_count: r.unconstrained_claims_count,
-                matched_count: r.matched_count,
-                gap_count: r.gap_count,
-                proprietary_count: r.proprietary_count,
-                confidence_boundary: r.confidence_boundary,
-                gaps: r.gaps,
-                created_at: r.created_at,
-            })
-            .collect())
+        Ok(rows.into_iter().map(GapAnalysisResult::from).collect())
+    }
+
+    /// One stored gap analysis by id, or `None` when there is no such row.
+    ///
+    /// `gap_analyses` has no tenancy, so this answers any session; what a
+    /// caller may do with the claims a stored analysis names is decided by
+    /// resolving each `GapRecord::nearest_claim_id` through that caller's own
+    /// viewer. Generic over the executor so a handler can run it on the
+    /// transaction it writes on.
+    pub async fn get_gap_analysis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<GapAnalysisResult>, sqlx::Error> {
+        let row: Option<GapAnalysisRow> = sqlx::query_as(
+            "SELECT id, question, analysis_a_id, analysis_b_id, graph_claims_count, \
+             unconstrained_claims_count, matched_count, gap_count, proprietary_count, \
+             confidence_boundary, gaps, created_at \
+             FROM gap_analyses WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row.map(GapAnalysisResult::from))
     }
 }
