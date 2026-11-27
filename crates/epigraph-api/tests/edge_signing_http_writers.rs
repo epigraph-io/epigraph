@@ -263,6 +263,157 @@ async fn create_claim_attests_its_authored_edge() {
     );
 }
 
+/// The `(signature, signer_id)` a claim row stores.
+async fn stored_claim_signature(pool: &PgPool, claim: Uuid) -> (Option<Vec<u8>>, Option<Uuid>) {
+    sqlx::query_as("SELECT signature, signer_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("claim row")
+}
+
+/// `GET /api/v1/claims/:id/verify` as `token`.
+async fn verify_claim(addr: SocketAddr, token: &str, claim: Uuid) -> serde_json::Value {
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/claims/{claim}/verify"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "verify {claim}: {status}: {text}");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("verify {claim}: {e}: {text}"))
+}
+
+/// Backlog 953d5707: the server attests every claim `POST /api/v1/claims`
+/// (and `POST /api/v1/claims/batch`, one call per item) INSERTS with the API's
+/// own key, as MCP's `submit_claim` attests with its server key. The row
+/// stores a v1 claim signature with `signer_id` = the API's signer agent (not
+/// the author), and the HTTP verifier reports it signed and valid. Both
+/// insert arms (the default strict one and `if_not_exists`) attest.
+///
+/// Verified to fail on the pre-953d5707 handler, which stored
+/// `(signature, signer_id) = (NULL, NULL)` for every HTTP claim.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_claim_attests_the_claim_row_with_the_api_key() {
+    let (url, pool) = pool().await;
+    let (signer, signer_id) = api_signer(&pool).await;
+    let (addr, _shutdown) = spawn_signed(&url, signer).await;
+    let (token, client) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:read"]).await;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+        .bind(client)
+        .fetch_one(&pool)
+        .await
+        .expect("the client's agent");
+    let tag = Uuid::new_v4();
+
+    let strict = post(
+        addr,
+        &token,
+        "/api/v1/claims",
+        serde_json::json!({
+            "content": format!("953d5707: an HTTP claim is server-attested {tag}"),
+            "agent_id": author,
+            "visibility": "public",
+        }),
+    )
+    .await;
+    let if_absent = post(
+        addr,
+        &token,
+        "/api/v1/claims",
+        serde_json::json!({
+            "content": format!("953d5707: an if_not_exists HTTP claim is attested {tag}"),
+            "agent_id": author,
+            "if_not_exists": true,
+            "visibility": "public",
+        }),
+    )
+    .await;
+    assert_eq!(
+        if_absent["was_created"],
+        serde_json::json!(true),
+        "{if_absent}"
+    );
+    let batch = post(
+        addr,
+        &token,
+        "/api/v1/claims/batch",
+        serde_json::json!({"claims": [{
+            "content": format!("953d5707: a batch HTTP claim is attested {tag}"),
+            "visibility": "public",
+        }]}),
+    )
+    .await;
+    let batch_claim: Uuid = batch["results"][0]["claim_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("batch item id: {batch}"))
+        .parse()
+        .expect("uuid");
+
+    for (what, claim) in [
+        ("strict", id_of(&strict, "id")),
+        ("if_not_exists", id_of(&if_absent, "id")),
+        ("batch", batch_claim),
+    ] {
+        let (sig, signer) = stored_claim_signature(&pool, claim).await;
+        assert_eq!(
+            sig.as_ref().map(Vec::len),
+            Some(64),
+            "{what}: the row stores a signature"
+        );
+        assert_eq!(signer, Some(signer_id), "{what}: the API's agent signs");
+        assert_ne!(signer, Some(author), "{what}: the signer is not the author");
+        let v = verify_claim(addr, &token, claim).await;
+        assert_eq!(v["signed"], serde_json::json!(true), "{what}: {v}");
+        assert_eq!(v["signature_valid"], serde_json::json!(true), "{what}: {v}");
+        assert_eq!(
+            v["signature_scheme"],
+            serde_json::json!("v1"),
+            "{what}: {v}"
+        );
+    }
+}
+
+/// Backlog 953d5707: an `if_not_exists` dedup hit returns the matched row as
+/// it is. A claim first written unsigned (by a server with no key) stays
+/// unsigned when a keyed server matches it: the API attests only a row it
+/// INSERTED, never another write's assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_dedup_hit_is_not_attested_after_the_fact() {
+    let (url, pool) = pool().await;
+    let (unsigned_addr, _a) = common::spawn_app(&url).await;
+    let (signer, _) = api_signer(&pool).await;
+    let (signed_addr, _b) = spawn_signed(&url, signer).await;
+    let (token, client) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+        .bind(client)
+        .fetch_one(&pool)
+        .await
+        .expect("the client's agent");
+    let body = serde_json::json!({
+        "content": format!("953d5707: a matched row keeps its signature state {}", Uuid::new_v4()),
+        "agent_id": author,
+        "if_not_exists": true,
+        "visibility": "public",
+    });
+    let first = post(unsigned_addr, &token, "/api/v1/claims", body.clone()).await;
+    let claim = id_of(&first, "id");
+    assert_eq!(
+        stored_claim_signature(&pool, claim).await,
+        (None, None),
+        "CALIBRATION: written by a server with no key"
+    );
+    let again = post(signed_addr, &token, "/api/v1/claims", body).await;
+    // `was_created` is omitted when false.
+    assert_ne!(again["was_created"], serde_json::json!(true), "{again}");
+    assert_eq!(id_of(&again, "id"), claim);
+    assert_eq!(stored_claim_signature(&pool, claim).await, (None, None));
+}
+
 /// The `AUTHORED` edges from `author` to `claim`.
 async fn authored_edges(pool: &PgPool, author: Uuid, claim: Uuid) -> Vec<Uuid> {
     sqlx::query_scalar(
@@ -424,6 +575,25 @@ async fn without_a_key_the_http_writers_insert_unsigned() {
     .await;
     assert_eq!(
         stored_attestation(&pool, id_of(&out, "edge_id")).await,
+        (None, None)
+    );
+
+    // Backlog 953d5707: the claim writer, too.
+    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let author = common::seed_system_agent(&pool).await;
+    let out = post(
+        addr,
+        &token,
+        "/api/v1/claims",
+        serde_json::json!({
+            "content": format!("953d5707: unsigned with no key {tag}"),
+            "agent_id": author,
+            "visibility": "public",
+        }),
+    )
+    .await;
+    assert_eq!(
+        stored_claim_signature(&pool, id_of(&out, "id")).await,
         (None, None)
     );
 }

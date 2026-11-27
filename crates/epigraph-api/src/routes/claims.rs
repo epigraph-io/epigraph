@@ -973,11 +973,34 @@ pub(crate) async fn create_claim_core(
     // nothing downstream may treat it as one. What PR-03 does guarantee is that
     // the *key* is now always a real agent's key, resolved from an
     // authenticated principal.
-    let claim = if let Some(trace_uuid) = request.trace_id {
+    //
+    // ── Server attestation (backlog 953d5707) ──
+    //
+    // With the API's signing key configured (`EPIGRAPH_API_SIGNING_KEY_FILE`,
+    // the key its edge writers attest with), the server attests the row it
+    // writes: a v1 claim signature over the digest the INSERT stores
+    // (`blake3(content_for_db)`), recorded with the API's signer agent as
+    // `claims.signer_id`, exactly as MCP `submit_claim` attests with its
+    // server key. The signer is not the author: `claims.agent_id` stays the
+    // body's author, and `verify_claim` checks the signature against
+    // `signer_id`'s key. The claim carries the SIGNER's public key so the
+    // repository's store gate (`v1_claim_signature_to_store`) verifies the
+    // signature under it; `claims` has no public-key column, so the author's
+    // key resolved above is not lost (it still proves the principal exists).
+    //
+    // What the signature attests is "this server recorded this row", not "the
+    // author signed this content". A `fully_private` row stores the
+    // `[private]` placeholder, so its signature covers that placeholder and
+    // nothing of the sealed content. With no key the row stays unsigned, as
+    // before (no fail-closed boot), and `system_stats` counts it in
+    // `claims_unsigned`.
+    let attest = state.edge_signing_key();
+    let row_key = attest.map_or(public_key, |k| k.signer.public_key());
+    let mut claim = if let Some(trace_uuid) = request.trace_id {
         Claim::new_with_trace(
             content_for_db,
             AgentId::from_uuid(request.agent_id),
-            public_key,
+            row_key,
             TraceId::from_uuid(trace_uuid),
             truth_value,
         )
@@ -985,10 +1008,19 @@ pub(crate) async fn create_claim_core(
         Claim::new(
             content_for_db,
             AgentId::from_uuid(request.agent_id),
-            public_key,
+            row_key,
             truth_value,
         )
     };
+    let attest_signer_id = attest.map(|k| {
+        let digest = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
+        claim.content_hash = digest;
+        claim.signature = Some(
+            k.signer
+                .sign_entity(epigraph_crypto::SignedEntity::Claim, &digest),
+        );
+        k.signer_id
+    });
 
     // Use a transaction for claim + encryption metadata atomicity, STAMPED
     // with the authenticated viewer: migration 122's claims trigger binds the
@@ -1137,7 +1169,10 @@ pub(crate) async fn create_claim_core(
 
     // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
     let (created_claim, was_created) = if request.if_not_exists {
-        ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl).await?
+        // A matched row is returned as it is: its signature (or its absence)
+        // is another write's and is never rewritten.
+        ClaimRepository::create_or_get_signed(&mut tx, viewer, &claim, decl, attest_signer_id)
+            .await?
     } else {
         // create_strict's 409-on-duplicate contract relied on the
         // (content_hash, agent_id) UNIQUE constraint migration 013 added. It is
@@ -1183,7 +1218,7 @@ pub(crate) async fn create_claim_core(
                 return Err(dup_conflict());
             }
         }
-        match ClaimRepository::create_strict(&mut tx, &claim, decl).await {
+        match ClaimRepository::create_strict_signed(&mut tx, &claim, decl, attest_signer_id).await {
             Ok(c) => (c, true),
             // Belt-and-suspenders: if a unique constraint on the pair is ever
             // restored and a writer that bypassed the lock wins between the
@@ -1543,7 +1578,11 @@ pub(crate) async fn create_claim_core(
     if was_created {
         // Content hash for provenance: BLAKE3 of claim content
         let content_hash = blake3::hash(request.content.as_bytes());
-        // Provenance signature placeholder (agent did not sign this request body via Ed25519)
+        // `provenance_log.provenance_sig` is the AGENT's signature over its
+        // request body. An HTTP caller authenticates with a bearer token and
+        // signs no body, so it is empty. The row-level attestation is a
+        // different thing: the server's signature on the claim row itself
+        // (`claims.signature` / `signer_id`, above, when the API has a key).
         let provenance_sig: &[u8] = &[];
 
         if let Err(e) = crate::middleware::provenance::record_provenance(

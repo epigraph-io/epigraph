@@ -1566,7 +1566,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "AgentRepository::get_by_id",
             "ClaimEncryptionRepository::insert_conn",
-            "ClaimRepository::create_strict",
+            "ClaimRepository::create_strict_signed",
             "ClaimRepository::lock_content_hash_agent",
             "ClaimRepository::resolve_write_decl",
             "ClaimRepository::write_tenancy_report",
