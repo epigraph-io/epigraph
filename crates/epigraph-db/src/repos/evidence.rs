@@ -273,6 +273,20 @@ fn evidence_from_row(
     )
 }
 
+/// One evidence row's claim and stored tenancy, as
+/// [`EvidenceRepository::tenancy_for_claims`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct EvidenceTenancy {
+    /// The evidence row.
+    pub id: Uuid,
+    /// Its claim.
+    pub claim_id: Uuid,
+    /// `visibility`.
+    pub visibility: Option<String>,
+    /// `owner_group_id`.
+    pub owner_group_id: Option<Uuid>,
+}
+
 impl EvidenceRepository {
     /// Create new evidence in the database.
     ///
@@ -1227,6 +1241,39 @@ impl EvidenceRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_all(executor).await?.into_iter().collect())
+    }
+
+    /// The stored tenancy ([`EvidenceTenancy`]) of every evidence row
+    /// `viewer` can read for a claim of `claim_ids`, ordered by
+    /// id, at most `limit` rows. A widening act's dry run reads it before and
+    /// after a trial of the act it rolls back (`epigraph_engine::visibility_act`,
+    /// backlog 02d9e9a1), to report which evidence stays behind (pinned).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn tenancy_for_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<EvidenceTenancy>, DbError> {
+        let sql = viewer.splice(
+            "SELECT ev.id, ev.claim_id, ev.visibility::text AS visibility, ev.owner_group_id \
+               FROM evidence ev \
+              WHERE ev.claim_id = ANY($1::uuid[]) \
+                /* {VISIBILITY:ev} */ \
+              ORDER BY ev.id \
+              LIMIT $2",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EvidenceTenancy>(&sql)
+            .bind(claim_ids)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Evidence linked to `claim_id` by an edge with any of `relationships`.

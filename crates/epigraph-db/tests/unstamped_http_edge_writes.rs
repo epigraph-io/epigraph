@@ -47,15 +47,11 @@
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
 //! | spans.rs | close_span | span -> claim generated | no |
 //! | spans.rs | close_span | span -> claim uses_evidence | no |
-//! | experiment_loop.rs | create_experiment | experiment -> claim tests_hypothesis | no |
-//! | experiment_loop.rs | submit_results | experiment_result -> experiment result_of | no |
-//! | experiment_loop.rs | analyze_result | analysis -> experiment_result analyzes | no |
-//! | experiment_loop.rs | analyze_result | analysis -> claim provides_evidence | no |
 //!
-//! The four `experiment_loop.rs` rows are not new writes: they were that file's
-//! raw `INSERT INTO edges` statements (the second register), moved onto
-//! `EdgeRepository::create_signed` so the API key attests them (ruling R-50),
-//! on the same raw pool as before. Stamping them is still to do.
+//! `experiment_loop.rs` once had four rows here (its raw `INSERT INTO edges`
+//! statements, moved onto `EdgeRepository::create_signed` under ruling R-50 on
+//! the same raw pool). The D1127c-03 conversion put those writes on the
+//! caller's viewer-stamped transaction, so the file no longer appears.
 //!
 //!
 //! # The second register: raw `INSERT INTO edges` in a route file
@@ -158,7 +154,9 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // "What this file does NOT see").
     // R-50: moved here from RAW_INSERTS (its four raw INSERTs became
     // `EdgeRepository::create_signed` on the same raw pool); not new writes.
-    ("experiment_loop.rs", 4),
+    // `experiment_loop.rs` (4) left with the D1127c-03 conversion: `create_experiment`,
+    // `submit_results` and `analyze_result` write their edges on the caller's
+    // viewer-stamped transaction, so the file has no raw-pool edge write to count.
     ("perspective.rs", 1),
     // 3 -> 2 (backlog 1dea9589): `create_span`'s attributed_to edge is written
     // on the caller's stamped transaction. `close_span`'s two remain.

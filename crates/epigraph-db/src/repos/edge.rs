@@ -90,6 +90,30 @@ pub const EDGE_IN_FORCE: &str = "(e.valid_to IS NULL OR e.valid_to > now())";
 /// `EDGE_IN_FORCE`.
 pub const EDGE_IN_FORCE_UNALIASED: &str = "(valid_to IS NULL OR valid_to > now())";
 
+/// One edge's endpoints and stored tenancy, as
+/// [`EdgeRepository::tenancy_incident_to_claims`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct IncidentEdgeTenancy {
+    /// The edge.
+    pub id: Uuid,
+    /// Its source.
+    pub source_id: Uuid,
+    /// Its source's type.
+    pub source_type: String,
+    /// Its target.
+    pub target_id: Uuid,
+    /// Its target's type.
+    pub target_type: String,
+    /// Its relationship, as stored.
+    pub relationship: String,
+    /// `visibility`.
+    pub visibility: Option<String>,
+    /// `owner_group_id`.
+    pub owner_group_id: Option<Uuid>,
+    /// `co_owner_group_id`.
+    pub co_owner_group_id: Option<Uuid>,
+}
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {
@@ -1304,6 +1328,7 @@ impl EdgeRepository {
             None,
             a,
             b,
+            "claim",
             relationship,
             properties,
         )
@@ -1314,6 +1339,11 @@ impl EdgeRepository {
     /// INSERTS attested at INSERT by `key` (ruling R-50; see
     /// [`Self::create_signed_conn`]). A dedup hit writes nothing.
     ///
+    /// Both endpoints are of `endpoint_type`: `"claim"` for the claim links,
+    /// `"workflow"` for the symmetric workflow references (`related_to` and a
+    /// workflow `alternative_of`, backlog 41d7b27a). The dedup matches the
+    /// unordered pair by id alone, as before (ids are unique across tables).
+    ///
     /// # Errors
     /// As [`Self::create_symmetric_if_absent_returning`], and
     /// `DbError::InvalidData` if the stored row cannot be attested.
@@ -1323,11 +1353,20 @@ impl EdgeRepository {
         key: Option<EdgeSigningKey<'_>>,
         a: Uuid,
         b: Uuid,
+        endpoint_type: &str,
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<(Uuid, bool), DbError> {
         if let Some(key) = key {
-            let att = new_attestation(a, "claim", b, "claim", relationship, properties, None);
+            let att = new_attestation(
+                a,
+                endpoint_type,
+                b,
+                endpoint_type,
+                relationship,
+                properties,
+                None,
+            );
             if let Some(row) =
                 insert_attested_conn(conn, key, att, None, SymmetricGuard::InForce, true).await?
             {
@@ -1342,7 +1381,7 @@ impl EdgeRepository {
         let insert = format!(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
-             SELECT $1, 'claim', $2, 'claim', $3, $4
+             SELECT $1, $6, $2, $6, $3, $4
              WHERE NOT EXISTS (
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
@@ -1359,6 +1398,7 @@ impl EdgeRepository {
             .bind(canonical_relationship(relationship))
             .bind(Json(properties))
             .bind(relationship_spellings(relationship))
+            .bind(endpoint_type)
             .fetch_optional(&mut *conn)
             .await?;
 
@@ -1887,6 +1927,114 @@ impl EdgeRepository {
         let rows: Vec<(Uuid, Uuid, String)> = q.fetch_all(executor).await?;
 
         Ok(rows)
+    }
+
+    /// One step of a selection walk (backlog 02d9e9a1,
+    /// `epigraph_engine::visibility_act::plan_selection`): every in-force
+    /// claim-to-claim edge `viewer` can read with a relationship in
+    /// `relationships` (each matched in every stored spelling,
+    /// [`relationship_spellings`]) that leaves (`outgoing`) or enters
+    /// (`incoming`) a claim of `frontier`, as `(from, to, relationship,
+    /// to_is_current)`: `from` the frontier claim, `to` the claim across the
+    /// edge. Only a `to` claim the viewer can read is returned, so a claim the
+    /// caller cannot read is never named, and an edge that is retracted
+    /// (`valid_to` passed) is not followed. Ordered by `(from, to,
+    /// relationship)`, at most `limit` rows.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, frontier))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_neighbors_for_selection<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        frontier: &[Uuid],
+        relationships: &[&str],
+        outgoing: bool,
+        incoming: bool,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, Uuid, String, bool)>, DbError> {
+        let spellings: Vec<String> = relationships
+            .iter()
+            .flat_map(|r| relationship_spellings(r))
+            .collect();
+        let sql = viewer.splice(
+            &format!(
+                r#"
+            SELECT s.from_id, s.to_id, s.relationship, c.is_current
+              FROM (
+                SELECT f.id AS from_id, e.target_id AS to_id, e.relationship, e.id AS edge_id
+                  FROM unnest($1::uuid[]) AS f(id)
+                  JOIN edges e ON e.source_id = f.id
+                 WHERE $3::bool
+                   AND e.source_type = 'claim' AND e.target_type = 'claim'
+                   AND e.relationship = ANY($2::text[])
+                   AND {EDGE_IN_FORCE}
+                   /* {{EDGE_VISIBILITY:e}} */
+                UNION ALL
+                SELECT f.id AS from_id, e.source_id AS to_id, e.relationship, e.id AS edge_id
+                  FROM unnest($1::uuid[]) AS f(id)
+                  JOIN edges e ON e.target_id = f.id
+                 WHERE $4::bool
+                   AND e.source_type = 'claim' AND e.target_type = 'claim'
+                   AND e.relationship = ANY($2::text[])
+                   AND {EDGE_IN_FORCE}
+                   /* {{EDGE_VISIBILITY:e}} */
+              ) AS s
+              JOIN claims c ON c.id = s.to_id
+             WHERE true /* {{VISIBILITY:c}} */
+             ORDER BY s.from_id, s.to_id, s.relationship, s.edge_id
+             LIMIT $5
+            "#
+            ),
+            6,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String, bool)>(&sql)
+            .bind(frontier)
+            .bind(&spellings)
+            .bind(outgoing)
+            .bind(incoming)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Every edge `viewer` can read with a claim of `claim_ids` as an
+    /// endpoint, with its stored tenancy, ordered by id, at most `limit`
+    /// rows. A widening act's dry run reads it before and after a trial of the
+    /// act it rolls back (`epigraph_engine::visibility_act`, backlog
+    /// 02d9e9a1), to report which edges the act widens and which it leaves.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn tenancy_incident_to_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<IncidentEdgeTenancy>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
+                    e.relationship, e.visibility::text AS visibility, e.owner_group_id, \
+                    e.co_owner_group_id \
+               FROM edges e \
+              WHERE ((e.source_type = 'claim' AND e.source_id = ANY($1::uuid[])) \
+                  OR (e.target_type = 'claim' AND e.target_id = ANY($1::uuid[]))) \
+                /* {EDGE_VISIBILITY:e} */ \
+              ORDER BY e.id \
+              LIMIT $2",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, IncidentEdgeTenancy>(&sql)
+            .bind(claim_ids)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Can `viewer` READ the edge `id`? The edge-visibility predicate (the

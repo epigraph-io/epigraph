@@ -1,0 +1,16 @@
+-- ===================================================================
+-- 353-undo.sql: take migration 353 (`edges_related_to_symmetric_uniq`;
+-- backlog 41d7b27a) back out, on the migration (superuser) DSN.
+--
+-- ORDER: no binary needs the index to run. A binary with backlog 41d7b27a's
+-- `related_to` keeps working without it; only the concurrent-write backstop
+-- for the symmetric dedup is gone (the writer's in-force guard remains).
+--
+-- WHAT IT DOES: drops the index, CONCURRENTLY (run it outside a transaction
+-- block, as its own statement), so edge writes are not blocked.
+--
+-- WHAT IT LEAVES: every `edges` row, `related_to` references included;
+-- 353's `_sqlx_migrations` row. Re-introducing the index is a NEW
+-- migration, never a re-run of 353.
+-- ===================================================================
+DROP INDEX CONCURRENTLY IF EXISTS public.edges_related_to_symmetric_uniq;

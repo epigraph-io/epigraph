@@ -1,0 +1,62 @@
+name: Cited sha check
+
+# After a merge to main, checks that every commit sha cited in the merged
+# commits' messages names a commit on main (`commit-message-lint.py
+# --cited-shas`, rule W4). A sha cited from a branch that was later rebased, or
+# from a pull request that has not merged, does not resolve on main, and the
+# message's provenance link is then dead for every later reader.
+#
+# The rule is: cite a commit by sha only once it is on main (or earlier in the
+# same change); cite anything else by PR number and subject. It is documented
+# beside the lint in CLAUDE.md ("Commit-message lint").
+#
+# It runs on push to main only, not on pull requests: on a PR head a sha that
+# reaches main later is not yet reachable, and history on main cannot be
+# rewritten, so the check reports rather than blocks. W4 is a warning: the job
+# stays green and lists each finding as an annotation and in the job summary.
+# It is a separate workflow so it does not touch ci.yml.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  cited-sha-check:
+    name: Cited sha check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Pinned to the same full commit sha as ci.yml (a floating tag can be
+      # moved upstream). Full history: reachability from main needs every
+      # commit, and a shallow clone would report every cited sha.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - name: Check the shas cited in the pushed commits
+        env:
+          # SHAs reach the script through env, never interpolated into the
+          # shell body. `before` is all zeros when the push created the
+          # branch; the script then reads the head commit alone.
+          SCAN_BASE: ${{ github.event.before }}
+          SCAN_HEAD: ${{ github.sha }}
+        run: |
+          # After a forced update of main the old tip may be absent from the
+          # clone; read the head commit alone rather than fail the job.
+          if [[ -n "$SCAN_BASE" && ! "$SCAN_BASE" =~ ^0+$ ]] && ! git cat-file -e "${SCAN_BASE}^{commit}" 2>/dev/null; then
+            echo "before-sha not in the clone; reading the head commit alone"
+            SCAN_BASE=""
+          fi
+          out=$(python3 .github/scripts/commit-message-lint.py --cited-shas "$SCAN_BASE" "$SCAN_HEAD")
+          printf '%s\n' "$out"
+          # One annotation per finding, naming only the citing commit (the
+          # finding text is already redacted: the token is never printed).
+          grep '^warning W4 ' <<<"$out" | awk '{print "::warning title=Cited sha not on main (W4)::commit " $3 " cites a sha that is not on main"}' || true
+          {
+            echo "### Cited sha check"
+            echo
+            echo '```'
+            printf '%s\n' "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

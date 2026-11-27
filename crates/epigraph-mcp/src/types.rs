@@ -2662,18 +2662,18 @@ pub struct LinkHierarchicalParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Structural relationship type. Claim to claim: decomposes_to, section_follows, continues_argument. Workflow references: executes (workflow -> claim: the workflow runs that step claim; use it to repair a dropped executes edge), invokes (workflow -> workflow, or step claim -> workflow: a sub-workflow reference; optional at_step; cycles refused), depends_on (workflow -> workflow: a prerequisite; cycles refused). Agent attribution: asserts (agent -> claim: the agent asserts the claim; written only by that agent or the human operating it through a live binding). None of them moves belief."
+        description = "Structural relationship type. Claim to claim: decomposes_to, section_follows, continues_argument. Workflow references: executes (workflow -> claim: the workflow runs that step claim; use it to repair a dropped executes edge), invokes (workflow -> workflow, or step claim -> workflow: a sub-workflow reference; optional at_step; cycles refused), depends_on (workflow -> workflow: a prerequisite; cycles refused), related_to (workflow <-> workflow: a loose, symmetric see-also; one edge per unordered pair, so the reverse call returns the existing edge with created=false). Rival workflows for one goal are linked with link_alternative. Agent attribution: asserts (agent -> claim: the agent asserts the claim; written only by that agent or the human operating it through a live binding). None of them moves belief."
     )]
     pub relationship: String,
 
     #[schemars(
-        description = "Entity type of the source, validated against the entity_types registry. Default \"claim\". executes, invokes and depends_on take \"workflow\" here (invokes also \"claim\", for a step claim); asserts takes \"agent\". A workflow source requires authority over that workflow, as add_step does (its submitter, the submitter's operator or delegate, or a writer of its owner group), and a step-claim source of invokes requires it over every workflow executing that step; a refusal writes nothing."
+        description = "Entity type of the source, validated against the entity_types registry. Default \"claim\". executes, invokes, depends_on and related_to take \"workflow\" here (invokes also \"claim\", for a step claim); asserts takes \"agent\". A workflow source requires authority over that workflow, as add_step does (its submitter, the submitter's operator or delegate, or a writer of its owner group), and a step-claim source of invokes requires it over every workflow executing that step; a refusal writes nothing."
     )]
     #[serde(default)]
     pub source_type: Option<String>,
 
     #[schemars(
-        description = "Entity type of the target, validated against the entity_types registry. Default \"claim\". invokes and depends_on take \"workflow\" here; executes and asserts take \"claim\"."
+        description = "Entity type of the target, validated against the entity_types registry. Default \"claim\". invokes, depends_on and related_to take \"workflow\" here; executes and asserts take \"claim\"."
     )]
     #[serde(default)]
     pub target_type: Option<String>,
@@ -2800,17 +2800,29 @@ pub struct DeleteEdgeResponse {
 /// max-plausibility combine over the `alternative_set` view, not a Dempster
 /// re-wire here. Idempotent on the unordered pair: a re-hit returns the existing
 /// `edge_id` with `created=false`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct LinkAlternativeParams {
     #[schemars(
-        description = "UUID of the first competing claim. Written with YOUR agent's authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
+        description = "UUID of the first competing claim (or workflow, with source_type \"workflow\"). Written with YOUR agent's authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused, with nothing written."
     )]
     pub claim_a: String,
 
     #[schemars(
-        description = "UUID of the second competing claim. Same authority rule as claim_a."
+        description = "UUID of the second competing claim (or workflow, with target_type \"workflow\"). Same authority rule as claim_a."
     )]
     pub claim_b: String,
+
+    #[schemars(
+        description = "Entity type of claim_a: \"claim\" (default) or \"workflow\". It must equal target_type: two rival claims, or two rival workflows reaching the same goal (backlog 41d7b27a). A workflow pair needs both workflows readable and PUBLIC (the edge takes no tenancy from a workflow end, so it would be stored public), and authority over claim_a's workflow, as add_step needs (its submitter, the submitter's operator or delegate, or a writer of its owner group); a refusal writes nothing."
+    )]
+    #[serde(default)]
+    pub source_type: Option<String>,
+
+    #[schemars(
+        description = "Entity type of claim_b: \"claim\" (default) or \"workflow\"; must equal source_type."
+    )]
+    #[serde(default)]
+    pub target_type: Option<String>,
 
     #[schemars(
         description = "Optional UUID of the shared target the two claims are rival supporters of. Validated and stored on the edge for provenance. A claim you cannot read reports not found and nothing is written."
@@ -3174,6 +3186,51 @@ pub struct FindWorkflowResult {
     /// generation of the same lineage exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_generation: Option<i64>,
+    /// Hierarchical results only (absent for flat workflow claims, and when
+    /// the lookup failed): the in-force workflow references touching this
+    /// workflow that the caller can read (backlog 41d7b27a), `[]` when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub references: Option<Vec<WorkflowReference>>,
+}
+
+/// One workflow reference of a hierarchical workflow, as `find_workflow` and
+/// `find_workflow_hierarchical` surface it (backlog 41d7b27a).
+#[derive(Debug, Serialize)]
+pub struct WorkflowReference {
+    /// `invokes`, `depends_on`, `related_to` or `alternative_of`.
+    pub relationship: String,
+    /// `outgoing` (this workflow, or one of its steps, references the other),
+    /// `incoming` (the other workflow, or one of its steps, references this
+    /// one), or `mutual` for the symmetric `related_to` and `alternative_of`.
+    pub direction: String,
+    /// The workflow at the other end.
+    pub workflow_id: String,
+    pub canonical_name: String,
+    pub generation: i64,
+    pub goal: String,
+    /// A step claim's `invokes`: the step claim it is written from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_step_claim_id: Option<String>,
+    /// `invokes` only: the step index it was written with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_step: Option<i64>,
+    pub edge_id: String,
+}
+
+impl From<epigraph_db::WorkflowReferenceRow> for WorkflowReference {
+    fn from(r: epigraph_db::WorkflowReferenceRow) -> Self {
+        Self {
+            relationship: r.relationship,
+            direction: r.direction,
+            workflow_id: r.other_workflow_id.to_string(),
+            canonical_name: r.other_canonical_name,
+            generation: i64::from(r.other_generation),
+            goal: r.other_goal,
+            via_step_claim_id: r.via_step_claim_id.map(|id| id.to_string()),
+            at_step: r.at_step,
+            edge_id: r.edge_id.to_string(),
+        }
+    }
 }
 
 /// One frozen step of a hierarchical [`FindWorkflowResult`] whose lineage head
@@ -3720,12 +3777,25 @@ pub struct PublishEventParams {
 
 // ── Claim visibility (docs/tenancy/claim-visibility-controls.md) ──
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct PublicizeClaimsParams {
     #[schemars(
-        description = "UUIDs of team or private claims to make PUBLIC (1 to 500). All or nothing: if any claim is not found, not readable, sealed, or owned by a group you are not a live ADMIN of, nothing changes and the error lists each refused claim. Already-public claims are reported as already_public. The owner group is unchanged. Unpinned evidence and traces follow the claim, and edges between claims that are now public become public."
+        description = "UUIDs of team or private claims to make PUBLIC (1 to 500). All or nothing: if any claim is not found, not readable, sealed, or owned by a group you are not a live ADMIN of, nothing changes and the error lists each refused claim. Already-public claims are reported as already_public. The owner group is unchanged. Unpinned evidence and traces follow the claim, and edges between claims that are now public become public. Give claim_ids or selection, not both."
     )]
+    #[serde(default)]
     pub claim_ids: Vec<String>,
+
+    #[schemars(
+        description = "Instead of claim_ids: a root claim and the closure to walk from it (by default what it decomposes_to and supports, outgoing, 3 edges deep). Every claim reached that you may publish is published with the root; a claim you may not (another group's, sealed, not yours to publish, superseded) is a boundary: listed with its reason, left untouched, and not walked through. A claim you cannot read is never followed or named. All or nothing, at most 500 claims."
+    )]
+    #[serde(default)]
+    pub selection: Option<SelectionParams>,
+
+    #[schemars(
+        description = "true: change nothing and return the plan ({claims, boundaries, capped}) the call would carry out and, when it would run, its effects (edges_widened, edges_kept, evidence_moved, evidence_kept), measured by running it and rolling it back. Run it first on a selection."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 
     #[schemars(
         description = "Why these claims are being published. Required, and recorded in the claim.publicized audit event."
@@ -3733,12 +3803,25 @@ pub struct PublicizeClaimsParams {
     pub reason: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ShareClaimsWithTeamParams {
     #[schemars(
-        description = "UUIDs of PRIVATE claims (owned by your home group) to move into a team (1 to 500). You must have written each claim, or be an admin of your home group. All or nothing. Visibility stays group-only: the team's members can read them afterwards. Public and team claims are refused; publicize_claims publishes."
+        description = "UUIDs of PRIVATE claims (owned by your home group) to move into a team (1 to 500). You must have written each claim, or be an admin of your home group. All or nothing. Visibility stays group-only: the team's members can read them afterwards. Public and team claims are refused; publicize_claims publishes. Give claim_ids or selection, not both."
     )]
+    #[serde(default)]
     pub claim_ids: Vec<String>,
+
+    #[schemars(
+        description = "Instead of claim_ids: a root claim and the closure to walk from it (by default what it decomposes_to and supports, outgoing, 3 edges deep). Every claim reached that you may share moves with the root; a claim you may not (public, already a team's, written by someone else, sealed, superseded) is a boundary: listed with its reason, left untouched, and not walked through. A claim you cannot read is never followed or named. All or nothing, at most 500 claims."
+    )]
+    #[serde(default)]
+    pub selection: Option<SelectionParams>,
+
+    #[schemars(
+        description = "true: change nothing and return the plan ({claims, boundaries, capped}) the call would carry out and, when it would run, its effects (edges_widened, edges_kept, evidence_moved, evidence_kept), measured by running it and rolling it back. Run it first on a selection."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 
     #[schemars(
         description = "UUID of the team to move the claims into. You need your own live writer or admin membership of it."
@@ -3749,6 +3832,32 @@ pub struct ShareClaimsWithTeamParams {
         description = "Why. Required, and recorded in the claim.shared_with_team audit event."
     )]
     pub reason: String,
+}
+
+/// A subgraph for `publicize_claims` / `share_claims_with_team` (backlog
+/// 02d9e9a1).
+#[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
+pub struct SelectionParams {
+    #[schemars(description = "UUID of the claim to start from.")]
+    pub root: String,
+
+    #[schemars(
+        description = "Edge types to follow (default [\"decomposes_to\", \"supports\"]). Any of decomposes_to, supports, corroborates, elaborates, specializes, generalizes, refines, section_follows, continues_argument."
+    )]
+    #[serde(default)]
+    pub edge_types: Option<Vec<String>>,
+
+    #[schemars(
+        description = "'outgoing' (default: from the root to what it decomposes_to or supports), 'incoming' (to what decomposes into or supports it), or 'both'."
+    )]
+    #[serde(default)]
+    pub direction: Option<String>,
+
+    #[schemars(
+        description = "Edges to walk from the root, 0 to 10 (default 3; 0: the root alone)."
+    )]
+    #[serde(default)]
+    pub max_depth: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3780,7 +3889,15 @@ pub struct SetProfileVisibilityParams {
 
 #[derive(Debug, Serialize)]
 pub struct VisibilityActResponse {
-    /// Per-claim outcome: `publicized` / `already_public`, or `shared`.
+    /// Present for a selection or a dry run: whether this was a dry run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    /// Present for a selection or a dry run: the plan
+    /// (`epigraph_engine::visibility_act::VisibilityPlan`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<serde_json::Value>,
+    /// Per-claim outcome: `publicized` / `already_public`, or `shared`. Empty
+    /// on a dry run.
     pub results: Vec<VisibilityActItem>,
 }
 

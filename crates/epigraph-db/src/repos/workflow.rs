@@ -165,6 +165,37 @@ pub struct ScoredHierarchicalWorkflowRow {
     pub similarity: f64,
 }
 
+/// One workflow reference touching a workflow, as
+/// [`WorkflowRepository::references_of_conn`] reads it: the structural,
+/// belief-neutral `invokes`, `depends_on`, `related_to` (MCP
+/// `link_hierarchical`) and `alternative_of` (MCP `link_alternative`),
+/// backlog 41d7b27a.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct WorkflowReferenceRow {
+    /// The workflow asked about.
+    pub workflow_id: Uuid,
+    /// The reference edge.
+    pub edge_id: Uuid,
+    /// `invokes`, `depends_on`, `related_to` or `alternative_of`.
+    pub relationship: String,
+    /// `outgoing` (the asked workflow, or one of its steps, is the source),
+    /// `incoming` (it is the target), or `mutual` for the symmetric
+    /// `related_to` and `alternative_of`.
+    pub direction: String,
+    /// The workflow at the other end: the target of an outgoing reference,
+    /// the source of an incoming one, or (for a step-claim `invokes` into the
+    /// asked workflow) a workflow executing that step.
+    pub other_workflow_id: Uuid,
+    pub other_canonical_name: String,
+    pub other_generation: i32,
+    pub other_goal: String,
+    /// Set when the reference is a step claim's `invokes`: that step claim.
+    pub via_step_claim_id: Option<Uuid>,
+    /// `invokes` only: the edge's `properties.at_step`, when it is a
+    /// non-negative integer.
+    pub at_step: Option<i64>,
+}
+
 /// What [`WorkflowRepository::ingest_anchors`] found; see its doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IngestAnchors {
@@ -2756,6 +2787,120 @@ impl WorkflowRepository {
                 (workflow_id, steps.into_iter().map(|(_, c)| c).collect())
             })
             .collect())
+    }
+
+    /// The in-force workflow references touching each of `workflow_ids`, as
+    /// `viewer` reads them, keyed by the asked workflow (backlog 41d7b27a:
+    /// the workflow readers surface them). Absent keys have none.
+    ///
+    /// Read, per asked workflow `W`:
+    /// - every in-force `invokes` / `depends_on` / `related_to` /
+    ///   `alternative_of` edge between two workflows with `W` at either end
+    ///   (`outgoing`, `incoming`, or `mutual` for the symmetric two);
+    /// - every in-force step-claim `invokes` from a claim of a step lineage
+    ///   `W` executes (`outgoing`, `via_step_claim_id` = that claim), the
+    ///   lineage rule `WorkflowRepository::workflows_executing_step_lineage`
+    ///   applies (a step evolved after the plan was frozen still belongs to
+    ///   it);
+    /// - every in-force step-claim `invokes` INTO `W`, reported against each
+    ///   workflow executing that step's lineage (`incoming`).
+    ///
+    /// Every edge leg (the reference and any `executes` it is reached
+    /// through) carries the edge predicate, every claim leg the claim
+    /// predicate, and the workflow at the other end the `workflows`
+    /// predicate, on top of the row security of the STAMPED connection this
+    /// runs on (`EpiGraphMcpFull::read_as`). So a reference, a step or a
+    /// workflow the caller cannot read is not named: a group-private step's
+    /// `invokes` into a public workflow is invisible to a non-member.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn references_of_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<WorkflowReferenceRow>>, sqlx::Error> {
+        if workflow_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // `$1` is the id array, so the viewer bind is `$2`.
+        let sql = viewer.splice(
+            "WITH refs AS ( \
+                 SELECT s.id AS workflow_id, e.id AS edge_id, \
+                        e.relationship::text AS relationship, \
+                        CASE WHEN e.relationship IN ('related_to', 'alternative_of') \
+                             THEN 'mutual' \
+                             WHEN e.source_id = s.id THEN 'outgoing' \
+                             ELSE 'incoming' END AS direction, \
+                        CASE WHEN e.source_id = s.id THEN e.target_id \
+                             ELSE e.source_id END AS other_id, \
+                        NULL::uuid AS via_step_claim_id, e.properties \
+                   FROM unnest($1::uuid[]) AS s(id) \
+                   JOIN edges e ON (e.source_id = s.id OR e.target_id = s.id) \
+                  WHERE e.relationship IN ('invokes', 'depends_on', 'related_to', \
+                                           'alternative_of') \
+                    AND e.source_type = 'workflow' AND e.target_type = 'workflow' \
+                    AND e.source_id <> e.target_id \
+                    AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                    /* {EDGE_VISIBILITY:e} */ \
+                 UNION ALL \
+                 SELECT x.source_id, e.id, 'invokes', 'outgoing', e.target_id, \
+                        e.source_id, e.properties \
+                   FROM edges x \
+                   JOIN claims xs ON xs.id = x.target_id \
+                   JOIN claims sc ON (sc.id = xs.id OR sc.step_lineage_id = xs.step_lineage_id) \
+                   JOIN edges e ON e.source_id = sc.id \
+                  WHERE x.source_id = ANY($1) \
+                    AND x.relationship = 'executes' \
+                    AND x.source_type = 'workflow' AND x.target_type = 'claim' \
+                    AND (x.valid_to IS NULL OR x.valid_to > now()) \
+                    AND e.relationship = 'invokes' \
+                    AND e.source_type = 'claim' AND e.target_type = 'workflow' \
+                    AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                    /* {EDGE_VISIBILITY:x} */ /* {EDGE_VISIBILITY:e} */ \
+                    /* {VISIBILITY:xs} */ /* {VISIBILITY:sc} */ \
+                 UNION ALL \
+                 SELECT e.target_id, e.id, 'invokes', 'incoming', x.source_id, \
+                        e.source_id, e.properties \
+                   FROM edges e \
+                   JOIN claims sc ON sc.id = e.source_id \
+                   JOIN claims xs ON (xs.id = sc.id OR xs.step_lineage_id = sc.step_lineage_id) \
+                   JOIN edges x ON x.target_id = xs.id \
+                  WHERE e.target_id = ANY($1) \
+                    AND e.relationship = 'invokes' \
+                    AND e.source_type = 'claim' AND e.target_type = 'workflow' \
+                    AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                    AND x.relationship = 'executes' \
+                    AND x.source_type = 'workflow' AND x.target_type = 'claim' \
+                    AND (x.valid_to IS NULL OR x.valid_to > now()) \
+                    /* {EDGE_VISIBILITY:x} */ /* {EDGE_VISIBILITY:e} */ \
+                    /* {VISIBILITY:xs} */ /* {VISIBILITY:sc} */ \
+             ) \
+             SELECT DISTINCT r.workflow_id, r.edge_id, r.relationship, r.direction, \
+                    r.other_id AS other_workflow_id, \
+                    o.canonical_name AS other_canonical_name, \
+                    o.generation AS other_generation, o.goal AS other_goal, \
+                    r.via_step_claim_id, \
+                    CASE WHEN r.relationship = 'invokes' \
+                          AND r.properties->>'at_step' ~ '^[0-9]{1,9}$' \
+                         THEN (r.properties->>'at_step')::bigint END AS at_step \
+               FROM refs r \
+               JOIN workflows o ON o.id = r.other_id \
+              WHERE r.other_id <> r.workflow_id /* {VISIBILITY:o} */ \
+              ORDER BY r.workflow_id, r.relationship, r.direction, \
+                       o.canonical_name, o.generation, r.edge_id",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, WorkflowReferenceRow>(&sql).bind(workflow_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(&mut *conn).await?;
+        let mut by_workflow: HashMap<Uuid, Vec<WorkflowReferenceRow>> = HashMap::new();
+        for row in rows {
+            by_workflow.entry(row.workflow_id).or_default().push(row);
+        }
+        Ok(by_workflow)
     }
 
     /// Write the embedding vector for a hierarchical workflow's goal text.

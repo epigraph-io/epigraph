@@ -696,10 +696,12 @@ const REGISTER: &[Site] = &[
         2,
         Signed,
     ),
+    // The directional references, and the symmetric `related_to` (backlog
+    // 41d7b27a) through the symmetric writer; both signed at INSERT.
     site(
         "crates/epigraph-mcp/src/tools/link_hierarchical.rs",
         "do_link_hierarchical",
-        1,
+        2,
         Signed,
     ),
     site(

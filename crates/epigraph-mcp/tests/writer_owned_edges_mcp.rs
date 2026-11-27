@@ -256,6 +256,7 @@ async fn alternative(s: &Side, a: Uuid, b: Uuid) -> Alternative {
             claim_b: b.to_string(),
             target_claim_id: None,
             rationale: None,
+            ..Default::default()
         },
         None,
     )

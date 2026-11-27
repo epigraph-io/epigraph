@@ -18,7 +18,8 @@
 //!   the submitter still evolves it;
 //! * a step two workflows execute needs authority over both;
 //! * a retracted `executes` edge still counts;
-//! * a server built without a `ScopedPool` gates too;
+//! * (a server built without a `ScopedPool` no longer reaches the gate: it is
+//!   refused before any write, pinned in `no_scoped_pool_fallbacks_refuse.rs`);
 //! * the audited admin arm is admitted and recorded; a grantless admin is
 //!   refused ADM02;
 //! * stdio is checked too (backlog 222289f3): a stdio caller that did not
@@ -35,7 +36,7 @@ mod fixture;
 
 mod common;
 
-use common::{build_scoped_test_server, build_test_server, seed_caller};
+use common::{build_scoped_test_server, seed_caller};
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::AgentRepository;
 use epigraph_ingest::common::schema::ThesisDerivation;
@@ -624,35 +625,6 @@ async fn bound_agents_are_refused_and_the_submitters_operator_is_admitted(pool: 
     assert_eq!(d["arm"], "operator", "{d}");
     assert_eq!(d["operator"], h.to_string(), "{d}");
     assert_eq!(d["submitter"], s.to_string(), "{d}");
-}
-
-/// A server with no `ScopedPool` (the raw-pool branch of the tool) gates the
-/// authenticated transport the same way.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_server_without_a_scoped_pool_still_gates(pool: PgPool) {
-    let scoped = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let (_o, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
-    let (wf, step) = ingest_as(
-        &scoped,
-        &pool,
-        "acme-mcp-evolve-raw",
-        &owner_viewer,
-        &owner_token,
-    )
-    .await;
-    let raw = build_test_server(pool.clone());
-    let (_s, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
-    assert_refused(
-        &raw,
-        &pool,
-        &stranger_viewer,
-        &stranger_token,
-        by_id(step, "a stranger's revision on the raw pool", "supersedes"),
-        step,
-        wf,
-        "was submitted by agent",
-    )
-    .await;
 }
 
 /// The audited admin arm: a live `claims:admin` grant is admitted and the

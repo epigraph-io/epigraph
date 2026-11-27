@@ -6,7 +6,9 @@ A claim carries two independent belief stores:
 
 - **`claims.truth_value`**: an authored scalar in `[0, 1]`, `NOT NULL`. `submit_claim` and
   `update_with_evidence` seed it from BetP, but `patch_claim`, `POST /api/v1/claims` and other
-  writers set it directly. No Dempster-Shafer (DS) write path refreshes it.
+  writers set it directly (`POST /api/v1/claims` stores `initial_truth`, default 0.5, with no
+  calibrated evidence-type weight; `docs/deploy.md`, "`POST /api/v1/claims`: the raw claim
+  write"). No Dempster-Shafer (DS) write path refreshes it.
 - **The DS cache**: `claims.{belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing}`.
   These columns are `NULL` until a DS write (an evidence BBA, an epistemic edge, `recompute_beliefs`)
   combines a BBA onto the claim. The recompute writes them and leaves `truth_value` alone.

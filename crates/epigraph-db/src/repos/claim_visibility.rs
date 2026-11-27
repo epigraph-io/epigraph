@@ -167,6 +167,43 @@ pub struct VisibilityActOutcome {
     pub outcome: String,
 }
 
+impl VisibilityActOutcome {
+    /// The user-facing reason for a refused outcome (`refused_*`), as the
+    /// act's refusal message words it; `None` for an outcome the act accepts
+    /// (`publicize`, `already_public`, `share`, and their done forms) and for
+    /// `not_found`.
+    #[must_use]
+    pub fn refusal_text(&self) -> Option<&'static str> {
+        self.outcome
+            .starts_with("refused")
+            .then(|| refusal_text(&self.outcome))
+    }
+}
+
+/// The refusal the act named `act` (`publicize_claims` /
+/// `share_claims_with_team`) answers for this classification, worded and
+/// kinded exactly as the act's own (`not_found` first, as a missing claim);
+/// `None` when every outcome is one the act accepts. For a caller that
+/// classified with [`ClaimRepository::preview_publicize_conn`] or
+/// [`ClaimRepository::preview_share_with_team_conn`] and refuses on the
+/// definer's word without calling the act.
+#[must_use]
+pub fn preview_refusal(act: &str, outcomes: &[VisibilityActOutcome]) -> Option<DbError> {
+    outcomes_or_refusal(
+        act,
+        outcomes
+            .iter()
+            .map(|o| (o.claim_id, o.outcome.clone()))
+            .collect(),
+        &["publicize", "already_public", "share"],
+    )
+    .err()
+}
+
+/// The most claim ids one preview call hands a definer: the definers' own
+/// cap (500) less the one sentinel id the preview adds.
+const PREVIEW_CHUNK: usize = 499;
+
 /// What [`ClaimRepository::set_agent_default_conn`] sets an agent's default to
 /// (migration 209).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +317,68 @@ fn outcomes_or_refusal(
         .into_iter()
         .map(|(claim_id, outcome)| VisibilityActOutcome { claim_id, outcome })
         .collect())
+}
+
+/// [`ClaimRepository::preview_publicize_conn`] (`share_into` `None`) or
+/// [`ClaimRepository::preview_share_with_team_conn`].
+async fn preview_conn(
+    conn: &mut PgConnection,
+    claim_ids: &[Uuid],
+    share_into: Option<Uuid>,
+) -> Result<Vec<VisibilityActOutcome>, DbError> {
+    let mut ids: Vec<Uuid> = claim_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(PREVIEW_CHUNK) {
+        let sentinel = loop {
+            let s = Uuid::new_v4();
+            if !chunk.contains(&s) {
+                break s;
+            }
+        };
+        let mut call: Vec<Uuid> = chunk.to_vec();
+        call.push(sentinel);
+        sqlx::query("SAVEPOINT epigraph_visibility_preview")
+            .execute(&mut *conn)
+            .await?;
+        let rows = match share_into {
+            None => {
+                sqlx::query_as::<_, (Uuid, String)>(
+                    "SELECT claim_id, outcome \
+                       FROM public.epigraph_publicize_claims($1, 'preview')",
+                )
+                .bind(&call)
+                .fetch_all(&mut *conn)
+                .await
+            }
+            Some(group) => {
+                sqlx::query_as::<_, (Uuid, String)>(
+                    "SELECT claim_id, outcome \
+                       FROM public.epigraph_share_claims_with_team($1, $2, 'preview')",
+                )
+                .bind(&call)
+                .bind(group)
+                .fetch_all(&mut *conn)
+                .await
+            }
+        };
+        // Always back to before the call, whatever it answered or did.
+        sqlx::query("ROLLBACK TO SAVEPOINT epigraph_visibility_preview")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("RELEASE SAVEPOINT epigraph_visibility_preview")
+            .execute(&mut *conn)
+            .await?;
+        let rows = rows.map_err(map_vis_error)?;
+        out.extend(
+            rows.into_iter()
+                .filter(|(id, _)| *id != sentinel)
+                .map(|(claim_id, outcome)| VisibilityActOutcome { claim_id, outcome }),
+        );
+    }
+    out.sort_by_key(|o| o.claim_id);
+    Ok(out)
 }
 
 fn refusal_text(outcome: &str) -> &'static str {
@@ -772,6 +871,47 @@ impl ClaimRepository {
         .await
         .map_err(map_vis_error)?;
         outcomes_or_refusal("share_claims_with_team", rows, &["shared"])
+    }
+
+    /// How `epigraph_publicize_claims` would classify each of `claim_ids` for
+    /// the session principal on `conn`, without acting: `publicize`,
+    /// `already_public`, `not_found`, or a `refused_*` outcome. Ordered by id,
+    /// one row per distinct id.
+    ///
+    /// The definer itself classifies, so the preview cannot disagree with the
+    /// act about who may move what (backlog 02d9e9a1: a selection reuses the
+    /// migration-206 definers unchanged and adds no authority). Each call
+    /// hands it one extra id that names no claim (a fresh v4), which the
+    /// definer classifies `not_found`; a call with any outcome other than an
+    /// accepted one returns its classification before it changes anything
+    /// (the early return after classifying, re-stated by 242 and 284). The
+    /// call also runs inside a savepoint that is always rolled back, so even
+    /// a definer that one day acted on such a call leaves nothing behind:
+    /// no move, no audit row, no row lock.
+    ///
+    /// # Errors
+    /// `DbError::Refused` for the definer's own refusals of the whole call
+    /// (`VIS01` no principal, `VIS03`); `DbError::QueryFailed` for faults.
+    pub async fn preview_publicize_conn(
+        conn: &mut PgConnection,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<VisibilityActOutcome>, DbError> {
+        preview_conn(conn, claim_ids, None).await
+    }
+
+    /// How `epigraph_share_claims_with_team` would classify each of
+    /// `claim_ids` for a share into `group_id` by the session principal on
+    /// `conn`, without acting: `share`, `not_found`, or a `refused_*`
+    /// outcome. As [`Self::preview_publicize_conn`].
+    ///
+    /// # Errors
+    /// As [`Self::preview_publicize_conn`].
+    pub async fn preview_share_with_team_conn(
+        conn: &mut PgConnection,
+        claim_ids: &[Uuid],
+        group_id: Uuid,
+    ) -> Result<Vec<VisibilityActOutcome>, DbError> {
+        preview_conn(conn, claim_ids, Some(group_id)).await
     }
 
     /// Of `claim_ids`, those this SESSION cannot write: the claim is not

@@ -379,6 +379,69 @@ job (another session), not this one.
 Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
 `set_agent_default_conn` (209; it replaced 206's `set_default_group_conn`).
 
+### 4.5 Sharing or publishing a subgraph, with a dry run (backlog 02d9e9a1)
+
+Both acts also take a `selection` instead of `claim_ids` (MCP and REST alike):
+`{root, edge_types?, direction?, max_depth?}`, defaulting to `decomposes_to` and `supports`,
+`outgoing`, depth 3 (at most 10). `edge_types` is limited to claim-to-claim structural and
+epistemic links (`decomposes_to`, `supports`, `corroborates`, `elaborates`, `specializes`,
+`generalizes`, `refines`, `section_follows`, `continues_argument`); every stored spelling of each
+is followed. With `dry_run: true` either form returns the plan and changes nothing (the
+transaction is dropped).
+
+The walk (`epigraph_engine::visibility_act::plan`) adds no authority:
+
+* It runs on the caller's own stamped transaction and reads edges and claims through the
+  caller's viewer (`EdgeRepository::claim_neighbors_for_selection`, in-force edges only), so a
+  claim or edge the caller cannot read is never followed or named.
+* Every claim it reaches is classified by the act's own definer
+  (`ClaimRepository::preview_publicize_conn` / `preview_share_with_team_conn`). The preview adds
+  one id that names no claim, so the definer returns its classification before writing, and it
+  runs inside a savepoint that is always rolled back.
+* A claim the definer would move joins the plan, and the walk continues from it (for publicize,
+  an `already_public` claim too). Any other claim is a **boundary**: it is reported with the
+  definer's reason (`refused_not_private`, `refused_not_author`, `refused_not_admin`,
+  `refused_sealed`, `refused_not_team_writer`, `refused_not_human`), or as `not_current` for a
+  superseded claim, the root included (a superseded root refuses the act as a state refusal:
+  409 over REST, `INVALID_REQUEST` over MCP). A boundary is left untouched and the walk does not pass through it.
+* The act then runs on the planned ids exactly as on an explicit list: the same definer, the same
+  cascade and refold for each claim, all or nothing, and one audit row naming every moved id.
+* A root the caller cannot read answers exactly as a missing claim (`not found` / 404), dry run or
+  not. A root the definer refuses is refused with its reason.
+* A plan of more than 500 claims, or a walk reaching more than 2,000 claims in all, is refused
+  whole (input, 400); its dry run reports `capped: true`.
+
+When the act would run (claims to move, not capped, and for an id list no refused id), the dry run
+also runs the act once inside a savepoint it rolls back, and reports what it did to the planned
+claims' edges and evidence, as far as the caller can read them (`plan.effects`):
+`edges_widened` (public after and not before, or no longer requiring a group it required),
+`edges_kept` (still requiring every group it required: an edge to a claim that stays behind, a
+declared edge), each with its `before` and `after` tenancy (`after` is `null` for an edge the
+caller can no longer read after the act, reported kept); `evidence_moved` (a count) and
+`evidence_kept` (rows that stay behind, such as evidence pinned private by migration 110). The
+act's own cascade decides all of it, so the report cannot drift from the act. Lists stop at
+5,000 rows each (`truncated`).
+
+The effects name no group the caller is not in. They cover only the claims the act would **move**
+(`publicize` / `share`): an `already_public` claim the plan passes through (as like as not someone
+else's) is handed to the act, which leaves it, and is not reported on; with nothing to move there
+is no trial and `effects` is empty. Every stored `owner_group_id` / `co_owner_group_id` outside
+the caller's own groups (its memberships and writable groups; for an elevated session only its
+writable groups) is withheld: `null`, with `owner_group_withheld` / `co_owner_group_withheld`
+set. Edges are classified on the stored values first, so a withheld group still counts. No claim
+read surface returns another group's id, and a dry run must not become one.
+
+The response is the usual `{results}` plus, for a selection or a dry run,
+`{dry_run, plan: {selection, claims: [{claim_id, depth, outcome, reached_from?, relationship?}],
+boundaries: [{claim_id, depth, reason, detail?, reached_from?, relationship?}], capped,
+effects?}}`.
+
+Moving workflow lineages stays out of scope; it remains an operator act. Tests:
+`epigraph-mcp/tests/visibility_selection_app_role.rs`,
+`epigraph-db/tests/selection_walk_visibility.rs` (the walk's own claim and edge predicates, with
+row security off) and
+`epigraph-api/tests/claim_visibility_http.rs::share_a_selection_over_http_with_a_dry_run`.
+
 ## 5. Tests (app role, `ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
 
 `crates/epigraph-mcp/tests/claim_visibility_controls_app_role.rs` (12 tests):

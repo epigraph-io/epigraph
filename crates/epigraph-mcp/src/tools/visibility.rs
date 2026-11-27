@@ -9,7 +9,8 @@
 //! cached belief for their new audience before the commit). The definer reads the caller from that stamp
 //! (`epigraph_principal_id()`), makes the authority decision, and writes the
 //! audit row in the same transaction. The tool decides nothing about authority
-//! itself, so the HTTP twins (`epigraph-api` `routes/claim_visibility.rs`)
+//! itself (a `selection` is walked and classified by the same definer,
+//! `visibility_act::plan`; a `dry_run` drops the transaction), so the HTTP twins (`epigraph-api` `routes/claim_visibility.rs`)
 //! cannot drift from it.
 
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -19,9 +20,10 @@ use crate::claim_helper::visibility_caller_error;
 use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::{
-    PublicizeClaimsParams, SetDefaultGroupParams, SetProfileVisibilityParams,
+    PublicizeClaimsParams, SelectionParams, SetDefaultGroupParams, SetProfileVisibilityParams,
     ShareClaimsWithTeamParams, VisibilityActItem, VisibilityActResponse,
 };
+use epigraph_engine::visibility_act::{self, ActReport, ActTarget, Selection, WideningAct};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -41,9 +43,43 @@ fn parse_ids(raw: &[String]) -> Result<Vec<Uuid>, McpError> {
         .collect()
 }
 
-fn respond(outcomes: Vec<epigraph_db::VisibilityActOutcome>) -> Result<CallToolResult, McpError> {
+/// What the call names: `claim_ids` (#784) or a `selection` (backlog
+/// 02d9e9a1), exactly one.
+fn target_of(
+    claim_ids: &[String],
+    selection: Option<&SelectionParams>,
+) -> Result<ActTarget, McpError> {
+    match selection {
+        None => Ok(ActTarget::Ids(parse_ids(claim_ids)?)),
+        Some(_) if !claim_ids.is_empty() => {
+            Err(invalid_params("give claim_ids or selection, not both"))
+        }
+        Some(sel) => {
+            let root = Uuid::parse_str(sel.root.trim()).map_err(|_| {
+                invalid_params(format!("selection.root {:?} is not a uuid", sel.root))
+            })?;
+            Selection::new(
+                root,
+                sel.edge_types.as_deref(),
+                sel.direction.as_deref(),
+                sel.max_depth,
+            )
+            .map(ActTarget::Selection)
+            .map_err(invalid_params)
+        }
+    }
+}
+
+fn respond(report: ActReport, dry_run: bool) -> Result<CallToolResult, McpError> {
+    let plan = report
+        .plan
+        .map(|p| serde_json::to_value(p).map_err(internal_error))
+        .transpose()?;
     success_json(&VisibilityActResponse {
-        results: outcomes
+        dry_run: plan.as_ref().map(|_| dry_run),
+        plan,
+        results: report
+            .results
             .into_iter()
             .map(|o| VisibilityActItem {
                 claim_id: o.claim_id.to_string(),
@@ -66,6 +102,8 @@ fn act_error(e: epigraph_engine::visibility_act::VisibilityActError) -> McpError
 }
 
 /// `publicize_claims`: group → public, team admins only (D-V2), all or nothing.
+/// By explicit ids, or by a selection walked from a root (backlog 02d9e9a1);
+/// `dry_run` returns the plan and changes nothing.
 ///
 /// # Errors
 /// `INVALID_PARAMS` for a bad request or a claim the caller cannot read (as if
@@ -77,19 +115,32 @@ pub async fn publicize_claims(
     params: PublicizeClaimsParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let ids = parse_ids(&params.claim_ids)?;
+    let target = target_of(&params.claim_ids, params.selection.as_ref())?;
+    let dry_run = params.dry_run.unwrap_or(false);
     let caller = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "publicize_claims").await?;
-    let outcomes =
-        epigraph_engine::visibility_act::publicize_claims(&mut tx, viewer, &ids, &params.reason)
-            .await
-            .map_err(act_error)?;
-    tx.commit().await.map_err(internal_error)?;
-    respond(outcomes)
+    let report = visibility_act::act(
+        &mut tx,
+        viewer,
+        WideningAct::Publicize,
+        &target,
+        &params.reason,
+        dry_run,
+    )
+    .await
+    .map_err(act_error)?;
+    // A dry run changes nothing: its transaction is dropped, not committed.
+    if dry_run {
+        tx.rollback().await.map_err(internal_error)?;
+    } else {
+        tx.commit().await.map_err(internal_error)?;
+    }
+    respond(report, dry_run)
 }
 
-/// `share_claims_with_team`: private → a team the caller writes.
+/// `share_claims_with_team`: private → a team the caller writes. By explicit
+/// ids or by a selection; `dry_run` as [`publicize_claims`].
 ///
 /// # Errors
 /// As [`publicize_claims`].
@@ -99,24 +150,31 @@ pub async fn share_claims_with_team(
     params: ShareClaimsWithTeamParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let ids = parse_ids(&params.claim_ids)?;
+    let target = target_of(&params.claim_ids, params.selection.as_ref())?;
+    let dry_run = params.dry_run.unwrap_or(false);
     let group = Uuid::parse_str(params.group_id.trim())
         .map_err(|_| invalid_params(format!("group_id {:?} is not a uuid", params.group_id)))?;
     let caller = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "share_claims_with_team")
             .await?;
-    let outcomes = epigraph_engine::visibility_act::share_claims_with_team(
+    let report = visibility_act::act(
         &mut tx,
         viewer,
-        &ids,
-        group,
+        WideningAct::ShareWithTeam { group_id: group },
+        &target,
         &params.reason,
+        dry_run,
     )
     .await
     .map_err(act_error)?;
-    tx.commit().await.map_err(internal_error)?;
-    respond(outcomes)
+    // A dry run changes nothing: its transaction is dropped, not committed.
+    if dry_run {
+        tx.rollback().await.map_err(internal_error)?;
+    } else {
+        tx.commit().await.map_err(internal_error)?;
+    }
+    respond(report, dry_run)
 }
 
 /// `set_default_group`: the default of the caller, or (`agent_id`, migration
