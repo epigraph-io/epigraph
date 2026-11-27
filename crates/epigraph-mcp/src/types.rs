@@ -1728,6 +1728,25 @@ pub struct SubmitClaimResponse {
     /// claim was handled exactly as without it. See [`AtomicityWarning`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub atomicity: Option<AtomicityWarning>,
+    /// Present ONLY when the novelty gate should have run and could not: the
+    /// claim was inserted WITHOUT a near-duplicate check. See [`GateSkipped`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_skipped: Option<GateSkipped>,
+}
+
+/// The novelty gate's visible fail-open (backlog 8482b8fc), on `submit_claim`,
+/// each `batch_submit_claims` entry and `memorize`.
+///
+/// The gate embeds the content and reads its nearest neighbours before an
+/// insert. When either step fails the write goes ahead exactly as if the gate
+/// did not exist (an outage never blocks a write), and this block tells the
+/// caller that the claim was NOT checked for near-duplicates, and why. Absent
+/// when the gate ran, and when it was skipped by design (an exact resubmit,
+/// which the content-hash probe answers first).
+#[derive(Debug, Clone, Serialize)]
+pub struct GateSkipped {
+    /// `embedder_unavailable`, `read_unavailable` or `nearest_query_failed`.
+    pub reason: crate::tools::novelty_gate::GateSkip,
 }
 
 /// The warn-only atomicity gate on `submit_claim`, `batch_submit_claims` and
@@ -2061,6 +2080,9 @@ pub struct MemorizeResponse {
     /// See [`SubmitClaimResponse::atomicity`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub atomicity: Option<AtomicityWarning>,
+    /// See [`SubmitClaimResponse::gate_skipped`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_skipped: Option<GateSkipped>,
 }
 
 #[derive(Debug, Serialize)]

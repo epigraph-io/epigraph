@@ -390,6 +390,9 @@ struct Submission {
     pending_embedding: Option<String>,
     /// The resolved `visibility` / `group_id` (docs/tenancy/claim-visibility-controls.md).
     tenancy: epigraph_db::ResolvedWriteDecl,
+    /// Why the novelty gate could not run, when it should have (backlog
+    /// 8482b8fc). Reported on the response.
+    gate_skipped: Option<crate::tools::novelty_gate::GateSkip>,
 }
 
 /// What [`write_submission`] wrote.
@@ -496,11 +499,12 @@ async fn prepare_submission(
         crate::tools::novelty_gate::exact_resubmit_probe(server, viewer, &content_hash, agent_id)
             .await?;
     let mut pending_embedding: Option<String> = None;
+    let mut gate_skipped: Option<crate::tools::novelty_gate::GateSkip> = None;
     if !is_exact_resubmit {
         let novelty_threshold = params
             .novelty_threshold
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
-        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+        match crate::tools::novelty_gate::decide(
             server,
             viewer,
             server.embedder.as_ref(),
@@ -510,76 +514,90 @@ async fn prepare_submission(
         )
         .await
         {
-            if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
-            {
-                // Semantic duplicate: suppress the insert entirely and
-                // report the existing claim, mirroring the shape of a
-                // content-hash dedup hit (no new Evidence/Trace/edges/DS).
-                //
-                // Two deliberate differences from the content-hash dedup
-                // this composes with, both intended per the backlog spec
-                // (nearest_by_embedding scans ALL is_current claims, not
-                // scoped to this agent):
-                //   1. `existing_id` can belong to ANOTHER agent's claim —
-                //      unlike find_by_content_hash_and_agent's same-agent
-                //      dedup, semantic novelty is corpus-wide. CONCRETE
-                //      CONSEQUENCE: if agent B asserts a near-paraphrase of
-                //      a fact agent A already asserted, B's submission is
-                //      suppressed at the default threshold and B receives
-                //      A's claim id — with NO independent AUTHORED edge,
-                //      Evidence, or ReasoningTrace recorded for B. In a
-                //      Dempster-Shafer system where independent
-                //      corroboration from a second source is itself
-                //      evidentiary signal (BBA combination), that is a real
-                //      loss of corroboration data, not just a dedup nicety.
-                //      This is what the backlog spec asks for (no agent
-                //      filter on the ANN query) — flagging it here for a
-                //      future owner to reconsider, not changing it
-                //      unilaterally.
-                //   2. `params.labels` (the CALLER's requested labels on
-                //      THIS submission) are silently dropped here, since
-                //      nothing is inserted. `resolve_backlog_item` is
-                //      unaffected (it hardcodes novelty_threshold=0.0 so
-                //      this branch never fires for it).
-                let existing =
-                    crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id)
-                        .await?;
-                return Ok(PreparedSubmission::Existing(Box::new(
-                    SubmitClaimResponse {
-                        claim_id: existing_id.to_string(),
-                        truth_value: existing.truth_value.value(),
-                        content_hash: ContentHasher::to_hex(&existing.content_hash),
-                        embedded: false,
-                        belief: None,
-                        plausibility: None,
-                        pignistic_prob: None,
-                        frame_id: None,
-                        // The caller is TOLD this is not an insert, and that
-                        // every input it sent was dropped (backlog a3e63a12).
-                        deduplicated: Some(dedup_block(DedupBy::NoveltyGate, existing_id, &params)),
-                        visibility: None,
-                        owner_group_id: None,
-                        visibility_note: None,
-                        // About the SUBMITTED text, on every path.
-                        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
-                    },
-                )));
-            }
-            // Insert / InsertFlagged: stash the already-generated,
-            // pgvector-formatted embedding so the was_created branch below
-            // can store it directly instead of paying for a second
-            // embedding call via embed_and_store.
-            pending_embedding = Some(pgvec);
-            if matches!(
+            // The gate could not run: fall through exactly as before this
+            // feature existed (insert, then embed best-effort post-insert),
+            // and say so on the response (backlog 8482b8fc).
+            Err(skip) => gate_skipped = Some(skip),
+            Ok(crate::tools::novelty_gate::GateVerdict {
                 decision,
-                crate::tools::novelty_gate::GateDecision::InsertFlagged
-            ) && !params.labels.iter().any(|l| l == "near-duplicate")
-            {
-                params.labels.push("near-duplicate".to_string());
+                embedding: pgvec,
+                ..
+            }) => {
+                if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) =
+                    decision
+                {
+                    // Semantic duplicate: suppress the insert entirely and
+                    // report the existing claim, mirroring the shape of a
+                    // content-hash dedup hit (no new Evidence/Trace/edges/DS).
+                    //
+                    // Two deliberate differences from the content-hash dedup
+                    // this composes with, both intended per the backlog spec
+                    // (nearest_by_embedding scans ALL is_current claims, not
+                    // scoped to this agent):
+                    //   1. `existing_id` can belong to ANOTHER agent's claim —
+                    //      unlike find_by_content_hash_and_agent's same-agent
+                    //      dedup, semantic novelty is corpus-wide. CONCRETE
+                    //      CONSEQUENCE: if agent B asserts a near-paraphrase of
+                    //      a fact agent A already asserted, B's submission is
+                    //      suppressed at the default threshold and B receives
+                    //      A's claim id — with NO independent AUTHORED edge,
+                    //      Evidence, or ReasoningTrace recorded for B. In a
+                    //      Dempster-Shafer system where independent
+                    //      corroboration from a second source is itself
+                    //      evidentiary signal (BBA combination), that is a real
+                    //      loss of corroboration data, not just a dedup nicety.
+                    //      This is what the backlog spec asks for (no agent
+                    //      filter on the ANN query) — flagging it here for a
+                    //      future owner to reconsider, not changing it
+                    //      unilaterally.
+                    //   2. `params.labels` (the CALLER's requested labels on
+                    //      THIS submission) are silently dropped here, since
+                    //      nothing is inserted. `resolve_backlog_item` is
+                    //      unaffected (it hardcodes novelty_threshold=0.0 so
+                    //      this branch never fires for it).
+                    let existing =
+                        crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id)
+                            .await?;
+                    return Ok(PreparedSubmission::Existing(Box::new(
+                        SubmitClaimResponse {
+                            claim_id: existing_id.to_string(),
+                            truth_value: existing.truth_value.value(),
+                            content_hash: ContentHasher::to_hex(&existing.content_hash),
+                            embedded: false,
+                            belief: None,
+                            plausibility: None,
+                            pignistic_prob: None,
+                            frame_id: None,
+                            // The caller is TOLD this is not an insert, and that
+                            // every input it sent was dropped (backlog a3e63a12).
+                            deduplicated: Some(dedup_block(
+                                DedupBy::NoveltyGate,
+                                existing_id,
+                                &params,
+                            )),
+                            visibility: None,
+                            owner_group_id: None,
+                            visibility_note: None,
+                            // About the SUBMITTED text, on every path.
+                            atomicity: crate::types::AtomicityWarning::for_content(&params.content),
+                            gate_skipped: None,
+                        },
+                    )));
+                }
+                // Insert / InsertFlagged: stash the already-generated,
+                // pgvector-formatted embedding so the was_created branch below
+                // can store it directly instead of paying for a second
+                // embedding call via embed_and_store.
+                pending_embedding = Some(pgvec);
+                if matches!(
+                    decision,
+                    crate::tools::novelty_gate::GateDecision::InsertFlagged
+                ) && !params.labels.iter().any(|l| l == "near-duplicate")
+                {
+                    params.labels.push("near-duplicate".to_string());
+                }
             }
         }
-        // embedder failure (None): fall through exactly as before this
-        // feature existed — insert, then embed best-effort post-insert.
     }
 
     Ok(PreparedSubmission::Fresh(Box::new(Submission {
@@ -598,6 +616,7 @@ async fn prepare_submission(
         evidence_type,
         pending_embedding,
         tenancy,
+        gate_skipped,
     })))
 }
 
@@ -902,6 +921,7 @@ async fn finish_submission(
         raw_truth,
         content_hash,
         mut pending_embedding,
+        gate_skipped,
         ..
     } = sub;
     let WrittenSubmission {
@@ -1007,6 +1027,7 @@ async fn finish_submission(
         visibility_note: tenancy.note,
         // Warn-only (backlog 72850d43): the claim above is already committed.
         atomicity: crate::types::AtomicityWarning::for_content(&params.content),
+        gate_skipped: gate_skipped.map(|reason| crate::types::GateSkipped { reason }),
     })
 }
 

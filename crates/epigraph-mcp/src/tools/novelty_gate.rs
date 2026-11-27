@@ -160,14 +160,47 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
     }
 }
 
-/// I/O wrapper: embed `content`, look up its nearest `is_current` claims,
-/// and classify. Returns `None` (never gates) if embedding generation
-/// fails — the gate is best-effort and must never block a write the way
-/// post-insert embedding is best-effort today (see CLAUDE.md embedding
-/// policy). Callers that get `None` should fall back to the pre-gate
-/// embed-after-insert behavior (there is no vector to reuse).
+/// Why [`decide`] could not run the gate (backlog 8482b8fc).
 ///
-/// On `Some`, the returned `String` is the ALREADY-GENERATED embedding,
+/// The gate fails OPEN: the caller inserts exactly as if the gate did not
+/// exist, so an embedder or database outage never blocks a write. It used to
+/// fail open SILENTLY, so a caller could not tell a novel claim from one that
+/// was never checked. Every caller now reports this cause on its response as
+/// `gate_skipped: {reason}` ([`crate::types::GateSkipped`]), and [`decide`]
+/// logs it with the stable `novelty gate skipped` prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateSkip {
+    /// The embedder could not produce a vector for the content (no provider
+    /// configured, or the provider failed).
+    EmbedderUnavailable,
+    /// The caller's stamped read for the neighbour lookup could not be opened.
+    ReadUnavailable,
+    /// The nearest-neighbour query failed.
+    NearestQueryFailed,
+}
+
+/// What [`decide`] answers when the gate ran.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateVerdict {
+    /// The decision.
+    pub decision: GateDecision,
+    /// The ALREADY-GENERATED embedding, pgvector-formatted (see [`decide`]).
+    pub embedding: String,
+    /// The cosine distance to the nearest readable neighbour, `None` when there
+    /// is none.
+    pub nearest_distance: Option<f64>,
+}
+
+/// I/O wrapper: embed `content`, look up its nearest `is_current` claims,
+/// and classify. Returns `Err(GateSkip)` (never gates) if embedding
+/// generation or the neighbour read fails — the gate is best-effort and must
+/// never block a write the way post-insert embedding is best-effort today
+/// (see CLAUDE.md embedding policy). Callers that get `Err` fall back to the
+/// pre-gate embed-after-insert behavior (there is no vector to reuse) and
+/// report the [`GateSkip`] on their response.
+///
+/// On `Ok`, [`GateVerdict::embedding`] is the ALREADY-GENERATED embedding,
 /// pgvector-formatted, so the caller can hand it straight to
 /// `claim_helper::embed_claim_author_stamped`'s `pending_embedding` parameter
 /// instead of paying for a second embedding call. (Storing it "directly" through
@@ -203,9 +236,12 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// the caller's groups; the session's policy dropped them.
 ///
 /// A server with no `ScopedPool` has its read refused, and the gate then
-/// answers `None` (no gate), as on any other read failure. A deployed server
-/// always has one, and `exact_resubmit_probe`, which runs first, refuses loudly
-/// on a server without it.
+/// answers [`GateSkip::ReadUnavailable`] (no gate), as on any other read
+/// failure. A deployed server always has one, and `exact_resubmit_probe`,
+/// which runs first, refuses loudly on a server without it.
+///
+/// # Errors
+/// The [`GateSkip`] naming why the gate did not run.
 pub async fn decide(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -213,29 +249,49 @@ pub async fn decide(
     content: &str,
     novelty_threshold: f64,
     labels: &[String],
-) -> Option<(GateDecision, String)> {
-    let vector = embedder.generate(content).await.ok()?;
+) -> Result<GateVerdict, GateSkip> {
+    let vector = match embedder.generate(content).await {
+        Ok(vector) => vector,
+        Err(e) => {
+            tracing::warn!(
+                reason = "embedder_unavailable",
+                "novelty gate skipped: the embedder produced no vector; inserting unchecked: {e}"
+            );
+            return Err(GateSkip::EmbedderUnavailable);
+        }
+    };
     let pgvec = epigraph_db::pgvector_literal(&vector);
     let mut read = match server.read_as(viewer, "novelty_gate").await {
         Ok(read) => read,
         Err(e) => {
-            tracing::warn!("novelty gate: could not open the caller's read: {e:?}");
-            return None;
+            tracing::warn!(
+                reason = "read_unavailable",
+                "novelty gate skipped: could not open the caller's read; inserting unchecked: \
+                 {e:?}"
+            );
+            return Err(GateSkip::ReadUnavailable);
         }
     };
     let nearest =
         match ClaimRepository::nearest_by_embedding(&mut read, viewer, &pgvec, NEAREST_K).await {
             Ok(hits) => hits,
             Err(e) => {
-                tracing::warn!("novelty gate: nearest_by_embedding failed: {e}");
-                return None;
+                tracing::warn!(
+                    reason = "nearest_query_failed",
+                    "novelty gate skipped: nearest_by_embedding failed; inserting unchecked: {e}"
+                );
+                return Err(GateSkip::NearestQueryFailed);
             }
         };
     if let Err(e) = read.commit().await {
         tracing::warn!("novelty gate: closing the caller's read failed: {e}");
     }
     let threshold = effective_threshold(novelty_threshold, labels);
-    Some((classify(&nearest, threshold), pgvec))
+    Ok(GateVerdict {
+        decision: classify(&nearest, threshold),
+        embedding: pgvec,
+        nearest_distance: nearest.first().map(|hit| hit.distance),
+    })
 }
 
 /// `true` when `agent_id` already authored a claim with `content_hash` that
@@ -474,7 +530,7 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(
+        let decision = decide(
             &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
@@ -485,7 +541,8 @@ mod tests {
             &[],
         )
         .await
-        .expect("decide must succeed with a working mock embedder");
+        .expect("decide must succeed with a working mock embedder")
+        .decision;
 
         assert_eq!(
             decision,
@@ -525,7 +582,7 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(
+        let decision = decide(
             &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
@@ -536,7 +593,8 @@ mod tests {
             &[],
         )
         .await
-        .expect("decide must succeed with a working mock embedder");
+        .expect("decide must succeed with a working mock embedder")
+        .decision;
 
         assert_eq!(
             decision,
@@ -553,7 +611,7 @@ mod tests {
     async fn decide_inserts_unflagged_when_no_neighbors_exist(pool: sqlx::PgPool) {
         let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
 
-        let (decision, _pgvec) = decide(
+        let decision = decide(
             &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
@@ -564,9 +622,28 @@ mod tests {
             &[],
         )
         .await
-        .expect("decide must succeed with a working mock embedder");
+        .expect("decide must succeed with a working mock embedder")
+        .decision;
 
         assert_eq!(decision, GateDecision::Insert);
+    }
+
+    /// Each [`GateSkip`] serializes to the stable snake_case `reason` the
+    /// responses carry (backlog 8482b8fc): callers match on these strings.
+    #[test]
+    fn every_gate_skip_serializes_to_its_stable_reason() {
+        for (skip, reason) in [
+            (GateSkip::EmbedderUnavailable, "embedder_unavailable"),
+            (GateSkip::ReadUnavailable, "read_unavailable"),
+            (GateSkip::NearestQueryFailed, "nearest_query_failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(crate::types::GateSkipped { reason: skip })
+                    .expect("serializes"),
+                serde_json::json!({ "reason": reason }),
+                "{skip:?}"
+            );
+        }
     }
 
     // ── status-claim bypass (ruling R-35) ────────────────────────────────

@@ -94,11 +94,12 @@ pub async fn memorize(
         crate::tools::novelty_gate::exact_resubmit_probe(server, viewer, &content_hash, agent_id)
             .await?;
     let mut pending_embedding: Option<String> = None;
+    let mut gate_skipped: Option<crate::tools::novelty_gate::GateSkip> = None;
     if !is_exact_resubmit {
         let novelty_threshold = params
             .novelty_threshold
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
-        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+        match crate::tools::novelty_gate::decide(
             server,
             viewer,
             server.embedder.as_ref(),
@@ -110,49 +111,59 @@ pub async fn memorize(
         )
         .await
         {
-            if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
-            {
-                // See submit_claim's identical branch (claims.rs) for the
-                // full rationale on both deliberate differences from
-                // content-hash dedup: corpus-wide (cross-agent) suppression
-                // — with the same epistemic-corroboration-loss consequence
-                // for memorize's caller — and this submission's `tags`
-                // being dropped since nothing is inserted.
-                let existing =
-                    crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id)
-                        .await?;
-                let deduplicated = memorize_dedup_block(
-                    DedupBy::NoveltyGate,
-                    existing_id,
-                    &MemorizeInputs {
-                        confidence_supplied: params.confidence.is_some(),
-                        tags_supplied: !tags.is_empty(),
-                        novelty_threshold_supplied: params.novelty_threshold.is_some(),
-                        provenance_written: false,
-                    },
-                );
-                return success_json(&MemorizeResponse {
-                    claim_id: existing_id.to_string(),
-                    truth_value: existing.truth_value.value(),
-                    embedded: false,
-                    tags,
-                    belief: None,
-                    plausibility: None,
-                    pignistic_prob: None,
-                    deduplicated: Some(deduplicated),
-                    visibility: None,
-                    owner_group_id: None,
-                    visibility_note: None,
-                    atomicity: crate::types::AtomicityWarning::for_content(&params.content),
-                });
-            }
-            pending_embedding = Some(pgvec);
-            if matches!(
+            // As in `submit_claim`: insert unchecked, and say so (8482b8fc).
+            Err(skip) => gate_skipped = Some(skip),
+            Ok(crate::tools::novelty_gate::GateVerdict {
                 decision,
-                crate::tools::novelty_gate::GateDecision::InsertFlagged
-            ) && !tags.iter().any(|t| t == "near-duplicate")
-            {
-                tags.push("near-duplicate".to_string());
+                embedding: pgvec,
+                ..
+            }) => {
+                if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) =
+                    decision
+                {
+                    // See submit_claim's identical branch (claims.rs) for the
+                    // full rationale on both deliberate differences from
+                    // content-hash dedup: corpus-wide (cross-agent) suppression
+                    // — with the same epistemic-corroboration-loss consequence
+                    // for memorize's caller — and this submission's `tags`
+                    // being dropped since nothing is inserted.
+                    let existing =
+                        crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id)
+                            .await?;
+                    let deduplicated = memorize_dedup_block(
+                        DedupBy::NoveltyGate,
+                        existing_id,
+                        &MemorizeInputs {
+                            confidence_supplied: params.confidence.is_some(),
+                            tags_supplied: !tags.is_empty(),
+                            novelty_threshold_supplied: params.novelty_threshold.is_some(),
+                            provenance_written: false,
+                        },
+                    );
+                    return success_json(&MemorizeResponse {
+                        claim_id: existing_id.to_string(),
+                        truth_value: existing.truth_value.value(),
+                        embedded: false,
+                        tags,
+                        belief: None,
+                        plausibility: None,
+                        pignistic_prob: None,
+                        deduplicated: Some(deduplicated),
+                        visibility: None,
+                        owner_group_id: None,
+                        visibility_note: None,
+                        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
+                        gate_skipped: None,
+                    });
+                }
+                pending_embedding = Some(pgvec);
+                if matches!(
+                    decision,
+                    crate::tools::novelty_gate::GateDecision::InsertFlagged
+                ) && !tags.iter().any(|t| t == "near-duplicate")
+                {
+                    tags.push("near-duplicate".to_string());
+                }
             }
         }
     }
@@ -404,6 +415,7 @@ pub async fn memorize(
         visibility_note: tenancy_report.note,
         // Warn-only (backlog 72850d43): the claim above is already committed.
         atomicity: crate::types::AtomicityWarning::for_content(&params.content),
+        gate_skipped: gate_skipped.map(|reason| crate::types::GateSkipped { reason }),
     })
 }
 
