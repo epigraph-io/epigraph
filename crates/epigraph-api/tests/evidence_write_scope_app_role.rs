@@ -31,8 +31,9 @@
 //! convention is now authored by its `claims:admin` caller and owned by the
 //! caller's home group, and every row of the request (claim, labels, evidence,
 //! trace, edges) is one write on the caller's stamped transaction. Its arms run
-//! on both shapes, and a caller without `claims:admin` is refused with nothing
-//! written.
+//! on both shapes, a caller without `claims:admin` is refused with nothing
+//! written, and content an existing convention already holds is a 409 that
+//! leaves the existing convention untouched.
 #![cfg(feature = "db")]
 
 mod viewer_fixture;
@@ -266,12 +267,21 @@ async fn post_evidence_on_an_unreadable_claim_answers_as_a_missing_one(pool: PgP
     );
 }
 
-/// `(relationship, source_type, target_type)` of every edge touching `claim`
-/// with no evidence endpoint (the convention's structural AUTHORED / TRACES /
-/// HAS_TRACE edges), sorted.
-async fn structural_edges_of(pool: &PgPool, claim: Uuid) -> Vec<(String, String, String)> {
-    let mut rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT relationship, source_type, target_type FROM edges \
+/// `(relationship, source_type, target_type, owner_group_id, writer_group_id)`
+/// of every edge touching `claim` with no evidence endpoint (the convention's
+/// structural AUTHORED / TRACES / HAS_TRACE edges), sorted.
+///
+/// A structural edge between public endpoints stays `('public', world)` by
+/// migration 120's design, so its OWNER cannot tell who wrote it; its
+/// `writer_group_id` can: the trigger records the writing session's group on
+/// every INSERT, and NULL when no session principal was stamped.
+async fn structural_edges_of(
+    pool: &PgPool,
+    claim: Uuid,
+) -> Vec<(String, String, String, Uuid, Option<Uuid>)> {
+    let mut rows: Vec<(String, String, String, Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT relationship, source_type, target_type, owner_group_id, writer_group_id \
+           FROM edges \
           WHERE (source_id = $1 OR target_id = $1) \
             AND source_type <> 'evidence' AND target_type <> 'evidence'",
     )
@@ -284,11 +294,19 @@ async fn structural_edges_of(pool: &PgPool, claim: Uuid) -> Vec<(String, String,
 }
 
 fn convention_request(content: &str) -> Json<LearnConventionRequest> {
+    convention_request_with(content, "seen in three reviews", "rust-style")
+}
+
+fn convention_request_with(
+    content: &str,
+    evidence: &str,
+    tag: &str,
+) -> Json<LearnConventionRequest> {
     Json(
         serde_json::from_value(serde_json::json!({
             "content": content,
-            "evidence": "seen in three reviews",
-            "tags": ["rust-style"],
+            "evidence": evidence,
+            "tags": [tag],
         }))
         .expect("request"),
     )
@@ -350,26 +368,25 @@ async fn assert_learn_convention_is_the_callers(pool: PgPool, state: AppState, l
         "{label}: the supports edge is the caller's, not world-owned ({})",
         world_group(&pool).await
     );
+    let world = world_group(&pool).await;
+    let structural = |relationship: &str, source: &str, target: &str| {
+        (
+            relationship.to_string(),
+            source.to_string(),
+            target.to_string(),
+            world,
+            Some(admin_group),
+        )
+    };
     assert_eq!(
         structural_edges_of(&pool, created.claim_id).await,
         vec![
-            (
-                "AUTHORED".to_string(),
-                "agent".to_string(),
-                "claim".to_string()
-            ),
-            (
-                "HAS_TRACE".to_string(),
-                "claim".to_string(),
-                "trace".to_string()
-            ),
-            (
-                "TRACES".to_string(),
-                "trace".to_string(),
-                "claim".to_string()
-            ),
+            structural("AUTHORED", "agent", "claim"),
+            structural("HAS_TRACE", "claim", "trace"),
+            structural("TRACES", "trace", "claim"),
         ],
-        "{label}: the structural edges are written with the claim"
+        "{label}: the structural edges are written with the claim, on the caller's stamp \
+         (world-owned, as every public structural edge is, with the caller's writer group)"
     );
     let authored_by: Uuid = sqlx::query_scalar(
         "SELECT source_id FROM edges WHERE target_id = $1 AND relationship = 'AUTHORED'",
@@ -448,5 +465,95 @@ async fn learn_convention_without_claims_admin_is_refused_and_writes_nothing(poo
         (claims, evidence, agents_after),
         (0, 0, agents_before),
         "nothing written"
+    );
+}
+
+/// Every row hanging off `claim` that a convention request writes: its labels,
+/// its trace id, and the counts of its evidence, reasoning traces and edges,
+/// read on the superuser harness connection so nothing is filtered.
+async fn convention_footprint(
+    pool: &PgPool,
+    claim: Uuid,
+) -> (Vec<String>, Option<Uuid>, i64, i64, i64) {
+    let (labels, trace): (Vec<String>, Option<Uuid>) =
+        sqlx::query_as("SELECT labels, trace_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("the convention claim");
+    let count = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(sql)
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect(sql)
+    };
+    (
+        labels,
+        trace,
+        count("SELECT count(*) FROM evidence WHERE claim_id = $1").await,
+        count("SELECT count(*) FROM reasoning_traces WHERE claim_id = $1").await,
+        count("SELECT count(*) FROM edges WHERE source_id = $1 OR target_id = $1").await,
+    )
+}
+
+/// A second `claims:admin` caller posting content an existing convention
+/// already holds is refused (409), and writes nothing: the content-hash dedup
+/// answers with the OTHER writer's claim, and labelling it or attaching this
+/// request's evidence, trace and edges to it would write onto a claim this
+/// request did not create.
+#[sqlx::test(migrations = "../../migrations")]
+async fn learn_convention_on_existing_content_is_a_conflict_and_writes_nothing(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (first, _) = seed_agent_with_group(&pool, "convention-first").await;
+    let (second, second_group) = seed_agent_with_group(&pool, "convention-second").await;
+    let content = format!("1c822492 duplicate convention {}", Uuid::new_v4());
+
+    let (status, Json(created)) = learn_convention(
+        viewer(&pool, first).await,
+        State(state.clone()),
+        auth(first, "claims:admin"),
+        convention_request(&content),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the first convention is learned: {e:?}"));
+    assert_eq!(status.as_u16(), 201);
+    let before = convention_footprint(&pool, created.claim_id).await;
+    let claims_before: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(&pool)
+        .await
+        .expect("claims");
+
+    let res = learn_convention(
+        viewer(&pool, second).await,
+        State(state),
+        auth(second, "claims:admin"),
+        convention_request_with(&content, "a second writer's evidence", "second-writer-tag"),
+    )
+    .await;
+    let (status, body) = rendered(res, created.claim_id).await;
+    assert_eq!(status, 409, "existing content is a conflict: {body}");
+
+    assert_eq!(
+        convention_footprint(&pool, created.claim_id).await,
+        before,
+        "the existing convention is untouched: no label, evidence, trace or edge added"
+    );
+    let claims_after: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(&pool)
+        .await
+        .expect("claims");
+    let second_rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM evidence WHERE raw_content = 'a second writer''s evidence') \
+              + (SELECT count(*) FROM edges WHERE owner_group_id = $1)",
+    )
+    .bind(second_group)
+    .fetch_one(&pool)
+    .await
+    .expect("the second writer's rows");
+    assert_eq!(
+        (claims_after, second_rows),
+        (claims_before, 0),
+        "the refused request wrote no claim, evidence or edge"
     );
 }
