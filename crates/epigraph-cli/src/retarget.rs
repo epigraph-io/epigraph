@@ -341,7 +341,7 @@ pub struct RetargetPlanEntry {
     pub model: String,
     /// The parent's challenges that were open when the entry was planned
     /// (backlog 122ac356). A retarget moves conflict EDGES only; challenges
-    /// stay on the parent by design (R-CH1/R-3), and this reports them.
+    /// stay on the parent by design, and this reports them.
     /// Absent (empty) when there are none, so older manifests still read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parent_open_challenges: Vec<crate::decompose::OpenChallenge>,

@@ -341,7 +341,7 @@ pub struct PlannedDecomposition {
 /// One open challenge on a parent a `--redecompose` or `--retarget` run
 /// touches, as its manifest entry records it (backlog 122ac356).
 ///
-/// Challenges stay on the parent by design (R-CH1/R-3): a re-decomposition
+/// Challenges stay on the parent by design: a re-decomposition
 /// or a retarget never moves or edits one. The run reports them so the
 /// operator sees which disputes now sit on a decomposed parent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

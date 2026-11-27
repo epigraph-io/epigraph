@@ -61,7 +61,7 @@
 //! or the `compound-atom` label (`atomicity_sweep`). Afterwards the
 //! re-decomposed claim is a decomposed parent, so `--retarget` moves its
 //! contradicts/refutes edges onto the new atoms; challenges stay on the
-//! parent by design (R-CH1/R-3): they are reported in the manifest and listed
+//! parent by design: they are reported in the manifest and listed
 //! on atoms with list_challenges include_parents. Every `--redecompose` mode
 //! that calls the LLM or writes, and every `--retarget` mode, prints one
 //! `OPEN-CHALLENGE` line per open challenge (state not accepted, rejected or
@@ -1587,7 +1587,7 @@ async fn report_decomposed_conflict_parents(
 
 /// Name every open challenge on a parent this run touched, one line each,
 /// then their count over the `touched` parents (backlog 122ac356). Nothing
-/// here changes a challenge: they stay on the parent by design (R-CH1/R-3).
+/// here changes a challenge: they stay on the parent by design.
 fn report_open_challenges(
     open: &std::collections::BTreeMap<uuid::Uuid, Vec<epigraph_cli::decompose::OpenChallenge>>,
     touched: usize,

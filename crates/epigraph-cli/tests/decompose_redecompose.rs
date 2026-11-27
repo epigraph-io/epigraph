@@ -446,7 +446,7 @@ async fn challenge_row(pool: &PgPool, id: Uuid) -> serde_json::Value {
 /// line (the `--redecompose --plan` manifest entry, through the JSONL file)
 /// and on a `--retarget` manifest entry for its conflict edge, and applying
 /// the plan leaves every challenge row exactly as it was: challenges stay on
-/// the parent by design (R-CH1/R-3).
+/// the parent by design.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_redecomposition_reports_the_parents_open_challenges_and_changes_none(pool: PgPool) {
     let w = seed(&pool).await;
