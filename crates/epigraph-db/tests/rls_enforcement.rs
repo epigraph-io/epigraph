@@ -402,7 +402,6 @@ const PROTECTED: &[&str] = &[
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
     "claim_frames",
-    "harvester_claim_provenance",
     "challenges",
     "reasoning_traces",
     "experiment_triples",
@@ -411,7 +410,6 @@ const PROTECTED: &[&str] = &[
     "claim_cluster_membership",
     "claim_neighborhood_membership",
     "claim_signature_revocations",
-    "harvester_fragments",
     "frames",
     "contexts",
     "perspectives",
@@ -446,8 +444,6 @@ const PROTECTED: &[&str] = &[
     "agent_succession",
     "group_role_bindings",
     "role_agents",
-    "harvester_sources",
-    "harvester_audit_reports",
     "workflows",
     "atlas_map_epochs",
     "atlas_map_runs",
@@ -455,8 +451,8 @@ const PROTECTED: &[&str] = &[
     "workflow_outcome_reports",
     "behavioral_executions",
     "group_invitations",
-    // Migration 347 (backlog f214b84e): 173's posture, FOR ALL policy.
-    "harvester_enriched_concepts",
+    // The five harvester tables (062's two, 173's two, 347's one) left this
+    // list when migration 354 dropped them.
 ];
 
 // ===========================================================================
