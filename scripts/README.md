@@ -33,7 +33,9 @@ scripts differ:
   read-only login; nothing enforces that.
 - `screen_public_claims.py` is read-only (its session is set read-only) and
   takes `--database-url` only (required; not read from the environment). Give
-  it a read-only login.
+  it a read-only login, and leave the password out of the DSN: a command line
+  is visible to other users of the host and lands in shell history, while
+  libpq still reads `~/.pgpass` (or the file `PGPASSFILE` names).
 - `lib/tiered_enrichment.py --claim-id` takes `--database-url` only (not from
   the environment), so a privileged `DATABASE_URL` exported for another job is
   never used for it.

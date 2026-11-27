@@ -52,7 +52,10 @@ the DSN).
 
 DSN: `--database-url` only, and required. It is never read from the
 environment: an exported application or maintenance DSN belongs to another
-job and is usually privileged. Give it a read-only login.
+job and is usually privileged. Give it a read-only login, and keep its
+password out of the DSN (a command line is visible to other users of the host
+and lands in shell history): libpq still reads `~/.pgpass` or `PGPASSFILE`
+for a DSN that names no password.
 
 Usage:
     python3 scripts/screen_public_claims.py --database-url <read-only DSN> \\
@@ -227,7 +230,8 @@ def main():
     parser.add_argument(
         "--database-url",
         required=True,
-        help="DSN of a read-only login. Required; never read from the environment.",
+        help="DSN of a read-only login. Required; never read from the environment. "
+             "Leave the password out and let libpq read ~/.pgpass or PGPASSFILE.",
     )
     parser.add_argument(
         "--private-groups",
