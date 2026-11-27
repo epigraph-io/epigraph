@@ -513,6 +513,89 @@ class EventPolicy(unittest.TestCase):
         self.assertEqual(ts.decide(root, pkgs, shards, env)["mode"], "full")
 
 
+class LightPlan(unittest.TestCase):
+    """The burndown's fix/triage-* pull requests (operator ruling 2026-11-27)."""
+
+    LIGHT_HEAD = "fix/triage-d1127c-05-abc"
+
+    def test_a_light_head_runs_only_the_light_targets(self):
+        d = pr_plan(["crates/epigraph-db/src/repos/claim.rs"], GITHUB_HEAD_REF=self.LIGHT_HEAD)
+        self.assertEqual(d["mode"], "light")
+        self.assertEqual(d["ids"], [ts.SCANS])
+        [entry] = d["matrix"]["include"]
+        self.assertEqual(entry["shard"], ts.SCANS)
+        self.assertFalse(entry["save"])
+        self.assertEqual(json.loads(entry["targets"]), {p: sorted(t) for p, t in ts.LIGHT_TARGETS.items()})
+        self.assertEqual(d["run"], {"test-shard": True, "test-extra": False, "lint-features": False})
+
+    def test_a_light_head_is_light_whatever_it_changes(self):
+        # Every FULL_PATHS kind and an api change that would select 4+ shards.
+        for changed in (
+            ["migrations/300_x.sql"],
+            [".github/workflows/ci.yml"],
+            ["Cargo.lock"],
+            ["rust-toolchain.toml"],
+            ["crates/epigraph-api/src/lib.rs"],
+            ["docs/x.md"],
+        ):
+            d = pr_plan(changed, GITHUB_HEAD_REF=self.LIGHT_HEAD)
+            self.assertEqual(d["mode"], "light", changed)
+            self.assertEqual(d["ids"], [ts.SCANS], changed)
+
+    def test_a_light_head_does_not_need_a_diff(self):
+        root, pkgs, shards = workspace()
+        env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_HEAD_REF": self.LIGHT_HEAD}
+        self.assertEqual(ts.decide(root, pkgs, shards, env)["mode"], "light")
+
+    def test_the_ci_full_label_beats_the_light_plan(self):
+        d = pr_plan(["docs/x.md"], GITHUB_HEAD_REF=self.LIGHT_HEAD, PR_LABELS=json.dumps(["ci:full"]))
+        self.assertEqual(d["mode"], "full")
+        self.assertTrue(all(d["run"].values()))
+
+    def test_only_fix_triage_heads_are_light(self):
+        for head in ("fix/other", "fix/triage", "chore/light-ci-fix-prs", "triage/fix-x", "feature/fix/triage-x"):
+            d = pr_plan(["docs/x.md"], GITHUB_HEAD_REF=head)
+            self.assertEqual(d["mode"], "affected", head)
+        # A staging PR is full even when a light head's name were a prefix.
+        self.assertEqual(pr_plan(["docs/x.md"], GITHUB_HEAD_REF="integration/20261127")["mode"], "full")
+
+    def test_only_pull_requests_are_light(self):
+        for event in ("push", "workflow_dispatch", "schedule"):
+            d = pr_plan(["docs/x.md"], GITHUB_EVENT_NAME=event, GITHUB_HEAD_REF=self.LIGHT_HEAD)
+            self.assertEqual(d["mode"], "full", event)
+
+    def test_the_gate_passes_a_light_run_and_fails_a_red_ratchet(self):
+        run = json.dumps({"test-shard": True, "test-extra": False, "lint-features": False})
+
+        def needs(shard):
+            return {
+                "plan": {"result": "success", "outputs": {"run": run}},
+                "test-shard": {"result": shard},
+                "test-extra": {"result": "skipped"},
+                "lint-features": {"result": "skipped"},
+            }
+
+        self.assertEqual(ts.gate(needs("success")), [])
+        self.assertTrue(ts.gate(needs("failure")))
+
+    def test_every_light_target_exists(self):
+        _root, pkgs, _shards = workspace()
+        out = io.StringIO()
+        self.assertTrue(ts.check_light_targets(pkgs, out), out.getvalue())
+
+    def test_a_missing_light_target_fails_check(self):
+        _root, pkgs, _shards = workspace()
+        saved = ts.LIGHT_TARGETS
+        for bad in ({"epigraph-db": ("no_such_ratchet",)}, {"no-such-crate": ("x",)}):
+            ts.LIGHT_TARGETS = bad
+            try:
+                out = io.StringIO()
+                self.assertFalse(ts.check_light_targets(pkgs, out), bad)
+                self.assertIn("FAIL LIGHT_TARGETS", out.getvalue())
+            finally:
+                ts.LIGHT_TARGETS = saved
+
+
 class RunnerSwitch(unittest.TestCase):
     REPO = "epigraph-io/epigraph"
     SELF = '["self-hosted", "linux", "epigraph-shard"]'

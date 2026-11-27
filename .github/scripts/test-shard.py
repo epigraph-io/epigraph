@@ -70,6 +70,18 @@ script change everything), on any event but `pull_request`, on a pull request
 from a branch in FULL_BRANCHES (the staging and integration PRs, where the
 whole suite belongs), with the FULL_LABEL label, or when the diff cannot be
 computed. Whatever is selected, `check` always runs over the full plan.
+
+LIGHT PLAN (operator ruling 2026-11-27, "light CI on fix PRs"). A pull
+request from a branch in LIGHT_BRANCHES (the backlog burndown's
+`fix/triage-*` PRs) runs neither every shard nor the affected ones: its plan
+holds only the `source-scans` shard over LIGHT_TARGETS, the cross-crate
+ratchets and registers that parallel burndown PRs break, and turns off every
+other gated job (`test-extra`, `lint-features`, and the ci.yml jobs that
+read the plan's `mode` output). The diff is not consulted, so a migration or a
+`.github/` change on such a head is still light. These PRs reach `main` only
+through a staging PR (FULL_BRANCHES), whose full run is the authoritative
+one. The FULL_LABEL label still runs every shard on a light head. `check`
+fails if a LIGHT_TARGETS entry is not a test target of its package.
 """
 
 import fnmatch
@@ -117,6 +129,46 @@ FULL_LABEL = "ci:full"
 # The events that run every shard. Anything else that is not `pull_request`
 # also runs every shard: an unknown event is never narrowed.
 FULL_EVENTS = ("push", "merge_group", "workflow_dispatch", "schedule")
+# Pull requests from these head branches get the LIGHT plan (see LIGHT PLAN in
+# the module docstring): the backlog burndown's fix PRs, which reach main only
+# through a staging PR. fnmatch, as FULL_BRANCHES.
+LIGHT_BRANCHES = ("fix/triage-*",)
+# What the light plan runs, in the `source-scans` shard: the ratchets and
+# registers that a parallel burndown PR most often breaks (the ones the staging
+# runs of 2026-11-23..27 had to re-derive or fix), all source scans or catalog
+# checks that run in seconds once built. Their cost is compiling five
+# packages' test targets, not running them. A name here that is not a test
+# target of its package fails `check`, so a renamed ratchet fails `plan`
+# instead of the shard.
+LIGHT_TARGETS = {
+    "epigraph-api": (
+        "no_inline_sql_in_routes",
+        "router_extension_seam_lint",
+        "viewer_route_table_lint",
+        "viewer_spend_lint",
+    ),
+    "epigraph-db": (
+        "bba_retract_read_lint",
+        "definer_search_path_ratchet",
+        "edge_writer_signing_ratchet",
+        "maintenance_surface_register",
+        "no_unscoped_pool",
+        "personal_group_mint_ratchet",
+        "tenancy_coverage",
+        "viewer_ratchet",
+        "visibility_act_callers_ratchet",
+        "visibility_lint",
+        "write_gate_lint",
+    ),
+    "epigraph-engine": ("belief_fold_literal_ratchet", "viewer_calls_register"),
+    "epigraph-ingest-executor": ("viewer_calls_register",),
+    "epigraph-mcp": (
+        "no_inline_sql_in_tools",
+        "raw_pool_register",
+        "tool_viewer_coverage",
+        "write_identity_ratchet",
+    ),
+}
 # A change under these directories of a package is visible to that package's
 # own tests only: no dependent compiles them.
 LOCAL_ONLY = ("tests/", "benches/", "examples/")
@@ -818,6 +870,41 @@ def event_full_reason(event, head_ref, labels):
     return None
 
 
+def event_light_reason(event, head_ref):
+    """Why this event gets the light plan, or None. Asked only after
+    `event_full_reason` returned None, so the FULL_LABEL label wins."""
+    if event != "pull_request":
+        return None
+    for pattern in LIGHT_BRANCHES:
+        if fnmatch.fnmatchcase(head_ref or "", pattern):
+            return f"head branch {head_ref} matches {pattern}"
+    return None
+
+
+def light_targets():
+    """LIGHT_TARGETS in `affected`'s `partial` shape: {package: {target: why}}."""
+    return {p: {t: "light plan" for t in ts} for p, ts in LIGHT_TARGETS.items()}
+
+
+def check_light_targets(pkgs, out=None):
+    """Fail on a LIGHT_TARGETS package or test target that does not exist."""
+    out = sys.stdout if out is None else out
+    ok = True
+    for package, names in sorted(LIGHT_TARGETS.items()):
+        if package not in pkgs:
+            ok = False
+            print(f"FAIL LIGHT_TARGETS: {package} is not a workspace member", file=out)
+            continue
+        known = {t["name"] for t in pkgs[package]["targets"] if "test" in t["kind"]}
+        for name in sorted(set(names) - known):
+            ok = False
+            print(f"FAIL LIGHT_TARGETS: {package} has no test target {name}", file=out)
+    if ok:
+        n = sum(len(ts) for ts in LIGHT_TARGETS.values())
+        print(f"ok   light plan: {n} test targets in {len(LIGHT_TARGETS)} packages, all present", file=out)
+    return ok
+
+
 def shard_runner(event, head_repo, repository, raw):
     """(the shards' `runs-on`, a warning or None).
 
@@ -890,17 +977,25 @@ def decide(root, pkgs, shards, env, changed=None, reads=None):
 
     `changed` (the diff) is computed from DIFF_BASE when not given, and
     `reads` (`scan_reads`'s first result) from the tree. Returns a
-    dict: mode ("full" or "affected"), reason, ids (the matrix's shard ids,
-    source-scans included), whole and partial (see `affected`), matrix, run,
-    runs_on, max_parallel, warnings."""
+    dict: mode ("full", "affected" or "light"), reason, ids (the matrix's
+    shard ids, source-scans included), whole and partial (see `affected`;
+    in a light plan `partial` is LIGHT_TARGETS), matrix, run, runs_on,
+    max_parallel, warnings."""
     event = env.get("GITHUB_EVENT_NAME", "")
     try:
         labels = json.loads(env.get("PR_LABELS") or "[]")
     except ValueError:
         labels = []
     warnings = []
-    reason = event_full_reason(event, env.get("GITHUB_HEAD_REF", ""), labels)
-    if reason is None and changed is None:
+    head_ref = env.get("GITHUB_HEAD_REF", "")
+    reason = event_full_reason(event, head_ref, labels)
+    light = event_light_reason(event, head_ref) if reason is None else None
+    if light is not None:
+        # The diff is not consulted: a light head is light whatever it
+        # touches (migrations and .github/ included). Its staging PR is full.
+        mode, reason = "light", light
+        whole, partial, ids = {}, light_targets(), []
+    elif reason is None and changed is None:
         base = env.get("DIFF_BASE", "")
         if not base:
             reason = "no DIFF_BASE to diff against"
@@ -913,9 +1008,11 @@ def decide(root, pkgs, shards, env, changed=None, reads=None):
                 changed = changed_paths(root, base, worktree=bool(env.get("DIFF_WORKTREE")))
             except subprocess.CalledProcessError as e:
                 reason = f"cannot diff against {base}: {(e.stderr or '').strip()}"
-    if reason is None:
+    if light is None and reason is None:
         reason = full_reason_for_paths(changed)
-    if reason is None:
+    if light is not None:
+        pass
+    elif reason is None:
         dirs = package_dirs(root, pkgs)
         if reads is None:
             reads, _walkers = scan_reads(root, pkgs, dirs, git_files(root), gone=changed)
@@ -961,6 +1058,10 @@ def explain(d, out):
     print(f"shards: {len(d['ids'])} (the full plan has {d['total']})", file=out)
     for sid in d["ids"]:
         print(f"  {sid}", file=out)
+    if d["mode"] == "light":
+        print(f"light plan: only these test targets ({SCANS}); the staging PR runs the rest", file=out)
+        for name, ts in sorted(d["partial"].items()):
+            print(f"  {name}: {' '.join(sorted(ts))}", file=out)
     if d["mode"] == "affected":
         print(f"wholly affected packages: {len(d['whole'])}", file=out)
         for name, why in sorted(d["whole"].items()):
@@ -1047,6 +1148,7 @@ def main(argv):
         ok = check(pkgs, shards)
         _reads, walkers = scan_reads(root, pkgs, package_dirs(root, pkgs), git_files(root))
         ok = check_walkers(walkers) and ok
+        ok = check_light_targets(pkgs) and ok
         unknown = sorted({p for ps in EXTRA_JOBS.values() for p in ps} - set(pkgs))
         if unknown:
             ok = False
