@@ -83,6 +83,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use epigraph_auth::claim_act::ClaimActRefusal;
 use epigraph_db::repos::admin_cascade::{
     self as audit, EVENT_APPLIED, EVENT_APPLIED_IDS, EVENT_BELIEF, EVENT_BELIEF_IDS, EVENT_FAILED,
     EVENT_RETIRED,
@@ -424,6 +425,40 @@ pub async fn session_or_record_deferral<'s>(
             let status = record_deferral(&mut *tx, trigger, &reason).await?;
             Ok((None, status))
         }
+    }
+}
+
+/// The database's refusal of a supersede ACT (`supersede_act_conn`),
+/// classified by [`ClaimActRefusal::of_act`]: the one decision both
+/// transports' `supersede_refusal` map onto their own error type.
+///
+/// Only a database error (`DbError::QueryFailed` carrying a driver
+/// `Database` error) has a SQLSTATE and a message to read; every other
+/// `DbError` is [`ClaimActRefusal::Other`].
+#[must_use]
+pub fn supersede_act_refusal(e: &DbError) -> ClaimActRefusal {
+    database_refusal(e, ClaimActRefusal::of_act)
+}
+
+/// [`supersede_act_refusal`] for the cascade DEFERRAL a supersede records
+/// ([`session_or_record_deferral`]'s error): [`ClaimActRefusal::of_deferral`],
+/// so CX03 or a fault.
+#[must_use]
+pub fn cascade_deferral_refusal(e: &DbError) -> ClaimActRefusal {
+    database_refusal(e, ClaimActRefusal::of_deferral)
+}
+
+/// `classify` over a database error's `(SQLSTATE, message)`, or over
+/// `(None, "")` for any other `DbError`.
+fn database_refusal(
+    e: &DbError,
+    classify: fn(Option<&str>, &str) -> ClaimActRefusal,
+) -> ClaimActRefusal {
+    match e {
+        DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } => classify(d.code().as_deref(), d.message()),
+        _ => classify(None, ""),
     }
 }
 

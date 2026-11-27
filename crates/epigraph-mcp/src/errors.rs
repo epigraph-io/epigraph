@@ -220,15 +220,12 @@ fn log_designed_refusal(e: &dyn std::any::Any, text: &str) {
 }
 
 /// Whether a database message opens with a schema refusal code: two to five
-/// ASCII capitals, two digits, a colon (`FA07: ...`), at the very start.
+/// ASCII capitals, two digits, a colon (`FA07: ...`), at the very start. The
+/// grammar is [`epigraph_auth::claim_act::is_coded_refusal`], the one the
+/// claim-act refusal kinds are classified by, so a code reads as a code on
+/// every path.
 pub(crate) fn coded(message: &str) -> bool {
-    let b = message.as_bytes();
-    let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
-    (2..=5).contains(&caps)
-        && b.len() > caps + 2
-        && b[caps].is_ascii_digit()
-        && b[caps + 1].is_ascii_digit()
-        && b[caps + 2] == b':'
+    epigraph_auth::claim_act::is_coded_refusal(message)
 }
 
 /// A server fault whose message is DESIGNED, caller-facing text, sent
