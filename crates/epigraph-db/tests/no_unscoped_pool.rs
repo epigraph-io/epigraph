@@ -887,7 +887,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// gone (`routes/tasks.rs` 15 -> 14). Removed, not converted. No file reached
 /// zero. (Staging 2026-11-26-2: the PR did not lower this register; its own
 /// CI failed on it.)
-const HIGH_WATER: usize = 150;
+/// 150 -> 130 (backlog 30c84267): every experiment-loop write
+/// (`create_experiment`, `start_experiment`, `submit_results`,
+/// `add_measurements`, `analyze_result`) runs on ONE `AppState::write_as`
+/// transaction and `list_experiments` reads on the caller's stamped
+/// connection; `routes/experiment_loop.rs` 20 -> 0, key DELETED
+/// (`HIGH_WATER_FILES` falls by one with it).
+const HIGH_WATER: usize = 130;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -963,7 +969,8 @@ const HIGH_WATER: usize = 150;
 /// 34 -> 33 when `routes/assess.rs` reached zero (backlog 74feb76b).
 /// 33 -> 32 when `routes/computation.rs` reached zero (backlog 52b96600).
 /// 32 -> 31 when `routes/clusters.rs` reached zero (backlog 67c905a3).
-const HIGH_WATER_FILES: usize = 31;
+/// 31 -> 30 when `routes/experiment_loop.rs` reached zero (backlog 30c84267).
+const HIGH_WATER_FILES: usize = 30;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1141,7 +1148,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // store, so its `retain_visible_events` call on `state.db_pool` is gone with
     // it. Removed, not converted; the DO-NOT-CONVERT hold above stands.
     ("routes/events.rs", 5),
-    ("routes/experiment_loop.rs", 20),
+    // `routes/experiment_loop.rs` was 20 and is GONE (backlog 30c84267): its
+    // five write handlers each run on ONE `AppState::write_as` transaction and
+    // `list_experiments` reads on the caller's stamped connection.
     // 8 -> 4 (HTTP public-only reads, 2026-11-05): `hypothesize` (2) and
     // `design_experiment` (2) moved onto `AppState::read_as`. The 4 that remain
     // hold no `Viewer`: `add_method` (writes) and `find_methods` (reads

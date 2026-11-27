@@ -831,7 +831,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (operator ruling R-51: `require_experiment_hypothesis` reads the
     // experiment's hypothesis through the viewer, requires it writable and the
-    // result to belong to `:eid`) then the untenanted result row it named.
+    // result to belong to `:eid`) then the untenanted result row it named, on
+    // the caller's stamped transaction (backlog 30c84267).
     (
         "experiment_loop.rs",
         "add_measurements",
@@ -846,14 +847,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // hypothesis is the same `result` 404 as a missing result, before
     // anything is written; until
     // backlog 4815dcf7 and ruling R-51 neither held) then untenanted reads
-    // (experiments, experiment_results, frames by name) and writes against it.
+    // (experiment_results, frames by name) and writes against it, all on ONE
+    // stamped transaction (backlog 30c84267), so the edges and the BBA, which
+    // take the hypothesis's tenancy, are checked against the caller's
+    // writable set. The hypothesis id is the gate's answer, not a second
+    // `experiments` read.
     (
         "experiment_loop.rs",
         "analyze_result",
         &[
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
-            "ExperimentRepository::get",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
             "ExperimentRepository::update_status",
             "ExperimentRepository::update_status",
             "ExperimentResultRepository::get",
@@ -865,12 +869,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (R-51: `require_hypothesis` reads the body's hypothesis through
     // the viewer and requires it writable) then write: the untenanted
-    // experiment row and its `tests_hypothesis` edge onto that hypothesis.
+    // experiment row and its `tests_hypothesis` edge onto that hypothesis, on
+    // ONE stamped transaction (backlog 30c84267).
     (
         "experiment_loop.rs",
         "create_experiment",
         &[
-            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed_conn",
             "ExperimentRepository::create",
         ],
     ),
@@ -891,12 +896,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (R-51: `require_experiment_hypothesis`, write access) then writes
     // on untenanted rows: the result, its `result_of` edge to the experiment,
-    // and the experiment's status.
+    // and the experiment's status, on ONE stamped transaction (backlog
+    // 30c84267).
     (
         "experiment_loop.rs",
         "submit_results",
         &[
-            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed_conn",
             "ExperimentRepository::update_status",
             "ExperimentResultRepository::create",
         ],

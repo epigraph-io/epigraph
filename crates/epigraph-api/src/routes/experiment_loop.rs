@@ -246,7 +246,38 @@ async fn require_experiment_hypothesis(
     Ok(hypothesis_id)
 }
 
+/// Map a failed write on the caller's stamped transaction: the database's
+/// `42501` refusal is `403` naming the hypothesis (nothing commits), anything
+/// else is the `500` naming `what` that the handler answered before.
+#[cfg(feature = "db")]
+fn stamped_write_failed(what: &str, e: epigraph_db::DbError) -> ApiError {
+    if crate::errors::db_is_insufficient_privilege(&e) {
+        return crate::errors::write_refused("hypothesis");
+    }
+    ApiError::InternalError {
+        message: format!("{what}: {e}"),
+    }
+}
+
+/// The error a failed COMMIT of `handler`'s stamped transaction answers.
+#[cfg(feature = "db")]
+fn commit_failed(handler: &'static str, e: epigraph_db::DbError) -> ApiError {
+    tracing::error!(
+        target: "tenancy.scoped_write",
+        error = %e,
+        handler,
+        "could not commit a viewer-stamped transaction"
+    );
+    stamped_write_failed("Failed to commit", e)
+}
+
 /// POST /api/v1/experiments
+///
+/// The experiment row and its `tests_hypothesis` edge are ONE transaction
+/// stamped with the caller's viewer (backlog 30c84267). The edge takes the
+/// hypothesis's tenancy, so on the unstamped application pool row security
+/// refused it, and the old `.ok()` answered 200 with an experiment that no
+/// edge tied to its hypothesis.
 #[cfg(feature = "db")]
 pub async fn create_experiment(
     ViewerExtractor(viewer): ViewerExtractor,
@@ -265,8 +296,9 @@ pub async fn create_experiment(
     )
     .await?;
 
+    let mut tx = state.write_as(&viewer, "create_experiment").await?;
     let id = epigraph_db::ExperimentRepository::create(
-        &state.db_pool,
+        &mut *tx,
         req.hypothesis_id,
         author,
         req.method_ids.as_deref(),
@@ -274,13 +306,11 @@ pub async fn create_experiment(
         None,
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("{e}"),
-    })?;
+    .map_err(|e| stamped_write_failed("Failed to create experiment", e))?;
 
     // Create tests_hypothesis edge
-    epigraph_db::EdgeRepository::create_signed(
-        &state.db_pool,
+    epigraph_db::EdgeRepository::create_signed_conn(
+        &mut tx,
         state.edge_signing_key(),
         id,
         "experiment",
@@ -292,7 +322,10 @@ pub async fn create_experiment(
         None,
     )
     .await
-    .ok();
+    .map_err(|e| stamped_write_failed("Failed to create tests_hypothesis edge", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| commit_failed("create_experiment", e))?;
 
     Ok(Json(
         serde_json::json!({ "experiment_id": id, "status": "designed" }),
@@ -317,17 +350,22 @@ pub async fn start_experiment(
         "start this experiment",
     )
     .await?;
-    epigraph_db::ExperimentRepository::update_status(&state.db_pool, id, "running")
+    let mut tx = state.write_as(&viewer, "start_experiment").await?;
+    epigraph_db::ExperimentRepository::update_status(&mut *tx, id, "running")
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("{e}"),
-        })?;
+        .map_err(|e| stamped_write_failed("Failed to start experiment", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| commit_failed("start_experiment", e))?;
     Ok(Json(
         serde_json::json!({ "experiment_id": id, "status": "running" }),
     ))
 }
 
 /// POST /api/v1/experiments/:id/results
+///
+/// The result row, its `result_of` edge and the experiment's `collecting`
+/// status are ONE stamped transaction: all three land or none does.
 #[cfg(feature = "db")]
 pub async fn submit_results(
     ViewerExtractor(viewer): ViewerExtractor,
@@ -354,21 +392,20 @@ pub async fn submit_results(
 
     let count = req.measurements.len() as i32;
 
+    let mut tx = state.write_as(&viewer, "submit_results").await?;
     let result_id = epigraph_db::ExperimentResultRepository::create(
-        &state.db_pool,
+        &mut *tx,
         experiment_id,
         &req.data_source,
         &measurements_json,
         count,
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("{e}"),
-    })?;
+    .map_err(|e| stamped_write_failed("Failed to create result", e))?;
 
     // Create result_of edge
-    epigraph_db::EdgeRepository::create_signed(
-        &state.db_pool,
+    epigraph_db::EdgeRepository::create_signed_conn(
+        &mut tx,
         state.edge_signing_key(),
         result_id,
         "experiment_result",
@@ -380,12 +417,15 @@ pub async fn submit_results(
         None,
     )
     .await
-    .ok();
+    .map_err(|e| stamped_write_failed("Failed to create result_of edge", e))?;
 
     // Update experiment status to collecting
-    epigraph_db::ExperimentRepository::update_status(&state.db_pool, experiment_id, "collecting")
+    epigraph_db::ExperimentRepository::update_status(&mut *tx, experiment_id, "collecting")
         .await
-        .ok();
+        .map_err(|e| stamped_write_failed("Failed to update experiment status", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| commit_failed("submit_results", e))?;
 
     Ok(Json(serde_json::json!({
         "result_id": result_id,
@@ -426,20 +466,19 @@ pub async fn add_measurements(
     // For v1, store raw measurements and let analysis compute effective error
     let effective_err = serde_json::json!(null);
 
+    let mut tx = state.write_as(&viewer, "add_measurements").await?;
     epigraph_db::ExperimentResultRepository::add_measurements(
-        &state.db_pool,
+        &mut *tx,
         result_id,
         &new_json,
         new_count,
         &effective_err,
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("{e}"),
-    })?;
+    .map_err(|e| stamped_write_failed("Failed to add measurements", e))?;
 
     // Get updated count
-    let result = epigraph_db::ExperimentResultRepository::get(&state.db_pool, result_id)
+    let result = epigraph_db::ExperimentResultRepository::get(&mut *tx, result_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("{e}"),
@@ -448,6 +487,9 @@ pub async fn add_measurements(
             entity: "result".into(),
             id: result_id.to_string(),
         })?;
+    tx.commit()
+        .await
+        .map_err(|e| commit_failed("add_measurements", e))?;
 
     Ok(Json(serde_json::json!({
         "result_id": result_id,
@@ -460,6 +502,14 @@ pub async fn add_measurements(
 /// Creates an analysis node, computes error-derived mass function,
 /// submits to hypothesis_assessment frame, creates provides_evidence edge
 /// (which triggers shared_evidence factor if multi-hypothesis).
+///
+/// Everything after the gate runs on ONE transaction stamped with the caller's
+/// viewer (backlog 30c84267): the analysis, both edges, the BBA and the two
+/// status marks commit together or not at all. On the unstamped application
+/// pool row security refused the `provides_evidence` edge and the BBA (both
+/// take the hypothesis's tenancy), so a group writer's analysis answered 500
+/// after its analysis row, its `analyzes` edge and the `analyzing` status had
+/// already committed.
 #[cfg(feature = "db")]
 pub async fn analyze_result(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -482,47 +532,14 @@ pub async fn analyze_result(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
     let author = caller_author(&viewer, req.agent_id, "an experiment write")?;
 
-    // Load result
-    let result = epigraph_db::ExperimentResultRepository::get(&state.db_pool, result_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("{e}"),
-        })?
-        .ok_or(ApiError::NotFound {
-            entity: "result".into(),
-            id: result_id.to_string(),
-        })?;
-    // The two path segments name ONE resource: a result of another experiment
-    // is the same 404 as a missing result. Without this the hypothesis gate
-    // below covers the named experiment only, and another experiment's result
-    // would be analyzed, linked and marked complete under it.
-    if result.experiment_id != experiment_id {
-        return Err(ApiError::NotFound {
-            entity: "result".into(),
-            id: result_id.to_string(),
-        });
-    }
-
-    // Load experiment to get hypothesis_id
-    let experiment = epigraph_db::ExperimentRepository::get(&state.db_pool, experiment_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("{e}"),
-        })?
-        .ok_or(ApiError::NotFound {
-            entity: "experiment".into(),
-            id: experiment_id.to_string(),
-        })?;
-
-    // The hypothesis this analysis files evidence on, read as the caller. Every
-    // write below (the analysis, its `provides_evidence` edge, the BBA) lands on
-    // it, so one the caller cannot read is 404 (backlog 4815dcf7: the viewer was
-    // spent only on the grounding check and the frame choice), and one it can
-    // read but not write is 403 (R-51). Nothing is written in either case.
-    // The unreadable case is the SAME `result` 404 as a missing or mismatched
-    // result: a `hypothesis` 404 would confirm the pair exists and name the
-    // private hypothesis.
-    require_experiment_hypothesis(
+    // The hypothesis this analysis files evidence on, read as the caller, with
+    // the result: the two path segments name ONE resource, so a missing result,
+    // a result of another experiment and an experiment on a hypothesis the
+    // caller cannot read are one `result` 404 (a `hypothesis` 404 would
+    // confirm the pair exists and name the private hypothesis; backlog
+    // 4815dcf7). One it can read but not write is 403 (R-51). Nothing is read
+    // past this or written in either case.
+    let hypothesis_id = require_experiment_hypothesis(
         &state,
         &viewer,
         experiment_id,
@@ -531,6 +548,19 @@ pub async fn analyze_result(
         "analyze a result onto this hypothesis",
     )
     .await?;
+
+    let mut tx = state.write_as(&viewer, "analyze_result").await?;
+
+    // Load result
+    let result = epigraph_db::ExperimentResultRepository::get(&mut *tx, result_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{e}"),
+        })?
+        .ok_or(ApiError::NotFound {
+            entity: "result".into(),
+            id: result_id.to_string(),
+        })?;
 
     // ── Circularity guard ──
     // Reject if the hypothesis claim itself lacks grounded evidence AND
@@ -547,15 +577,18 @@ pub async fn analyze_result(
             // Check if any measurement source references a claim by UUID
             if let Ok(source_claim_id) = source.parse::<Uuid>() {
                 // Reject self-reference
-                if source_claim_id == experiment.hypothesis_id {
+                if source_claim_id == hypothesis_id {
                     return Err(ApiError::BadRequest {
                         message: "Circularity rejected: measurement source references the hypothesis itself. \
                                   A hypothesis cannot provide evidence for itself.".into(),
                     });
                 }
-                // Check if source claim is grounded
+                // Check if source claim is grounded. A failed read counts as
+                // ungrounded, and every ungrounded source ends in the 400
+                // below before anything is written, so the transaction it
+                // aborts is never asked to write.
                 let grounded = epigraph_db::ClaimRepository::has_grounded_evidence(
-                    &state.db_pool,
+                    &mut *tx,
                     &viewer,
                     source_claim_id,
                 )
@@ -585,9 +618,9 @@ pub async fn analyze_result(
     let (random_err, systematic_err, effect_size) = aggregate_errors(raw_measurements, expected);
 
     // Update experiment status to 'analyzing'
-    epigraph_db::ExperimentRepository::update_status(&state.db_pool, experiment_id, "analyzing")
+    epigraph_db::ExperimentRepository::update_status(&mut *tx, experiment_id, "analyzing")
         .await
-        .ok();
+        .map_err(|e| stamped_write_failed("Failed to update experiment status", e))?;
 
     // Build scope limitations
     let scope_lims: Vec<ScopeLimitation> = req
@@ -648,13 +681,13 @@ pub async fn analyze_result(
         },
         "supports_hypothesis": req.direction == "supports",
     }))
-    .fetch_one(&state.db_pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError { message: format!("Failed to create analysis: {e}") })?;
 
     // Create analyzes edge (analysis → result)
-    epigraph_db::EdgeRepository::create_signed(
-        &state.db_pool,
+    epigraph_db::EdgeRepository::create_signed_conn(
+        &mut tx,
         state.edge_signing_key(),
         analysis_id.0,
         "analysis",
@@ -666,18 +699,16 @@ pub async fn analyze_result(
         None,
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to create analyzes edge: {e}"),
-    })?;
+    .map_err(|e| stamped_write_failed("Failed to create analyzes edge", e))?;
 
     // Create provides_evidence edge (analysis → hypothesis)
     // CRITICAL: This triggers the shared_evidence factor creation if multi-hypothesis.
-    epigraph_db::EdgeRepository::create_signed(
-        &state.db_pool,
+    epigraph_db::EdgeRepository::create_signed_conn(
+        &mut tx,
         state.edge_signing_key(),
         analysis_id.0,
         "analysis",
-        experiment.hypothesis_id,
+        hypothesis_id,
         "claim",
         "provides_evidence",
         Some(serde_json::json!({
@@ -689,26 +720,18 @@ pub async fn analyze_result(
         None,
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to create provides_evidence edge: {e}"),
-    })?;
+    .map_err(|e| stamped_write_failed("Failed to create provides_evidence edge", e))?;
 
     // Submit the mass function to the frame the hypothesis's readers read:
     // hypothesis_assessment, or research_validity once it is promoted (writers
     // follow the readers, operator ruling R-8). The status is read as the
-    // caller, on a stamped connection.
-    let evidence_frame = {
-        let mut read = state.read_as(&viewer).await?;
-        epigraph_engine::promotion::hypothesis_evidence_frame(
-            &mut read,
-            &viewer,
-            experiment.hypothesis_id,
-        )
-        .await?
-    };
+    // caller, on the same stamped transaction.
+    let evidence_frame =
+        epigraph_engine::promotion::hypothesis_evidence_frame(&mut tx, &viewer, hypothesis_id)
+            .await?;
     let frame_id: (Uuid,) = sqlx::query_as("SELECT id FROM frames WHERE name = $1")
         .bind(evidence_frame)
-        .fetch_one(&state.db_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("{evidence_frame} frame not found: {e}"),
@@ -716,8 +739,8 @@ pub async fn analyze_result(
 
     let masses_json = mass_result.mass_function.masses_to_json();
     epigraph_db::MassFunctionRepository::store(
-        &state.db_pool,
-        experiment.hypothesis_id,
+        &mut *tx,
+        hypothesis_id,
         frame_id.0,
         Some(author),
         &masses_json,
@@ -731,21 +754,22 @@ pub async fn analyze_result(
         None,      // error-derived BBA has no evidence row (issue #197 Phase 3)
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("{e}"),
-    })?;
+    .map_err(|e| stamped_write_failed("Failed to store the mass function", e))?;
 
     // Update statuses
-    epigraph_db::ExperimentResultRepository::update_status(&state.db_pool, result_id, "complete")
+    epigraph_db::ExperimentResultRepository::update_status(&mut *tx, result_id, "complete")
         .await
-        .ok();
-    epigraph_db::ExperimentRepository::update_status(&state.db_pool, experiment_id, "complete")
+        .map_err(|e| stamped_write_failed("Failed to update result status", e))?;
+    epigraph_db::ExperimentRepository::update_status(&mut *tx, experiment_id, "complete")
         .await
-        .ok();
+        .map_err(|e| stamped_write_failed("Failed to update experiment status", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| commit_failed("analyze_result", e))?;
 
     Ok(Json(serde_json::json!({
         "analysis_id": analysis_id.0,
-        "hypothesis_id": experiment.hypothesis_id,
+        "hypothesis_id": hypothesis_id,
         "mass_function": {
             "precision_ratio": mass_result.precision_ratio,
             "evidence_strength": mass_result.evidence_strength,
@@ -772,12 +796,14 @@ pub async fn list_experiments(
     )
     .await?;
 
+    let mut read = crate::routes::open_scoped_read(&state, &viewer, "list_experiments").await?;
     let experiments =
-        epigraph_db::ExperimentRepository::get_for_hypothesis(&state.db_pool, params.hypothesis_id)
+        epigraph_db::ExperimentRepository::get_for_hypothesis(&mut *read, params.hypothesis_id)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("{e}"),
             })?;
+    crate::routes::finish_scoped_read(read, "list_experiments").await?;
 
     let results: Vec<serde_json::Value> = experiments
         .iter()
