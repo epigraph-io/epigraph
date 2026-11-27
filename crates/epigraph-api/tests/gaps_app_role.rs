@@ -337,3 +337,64 @@ async fn surface_gaps_finds_an_analysis_that_is_not_the_newest(pool: PgPool) {
         .expect("an older analysis id must be found, not answered 404");
     assert_eq!(body["challenges_created"], 1, "{body}");
 }
+
+/// The round trip: an analysis `gap_analysis` itself stored is surfaced
+/// through the claim ids it holds. With one hit, the claim is named twice
+/// (its `blind_spot`, and the `structural_absence` whose nearest claim it
+/// is), so the member files one id-only challenge per gap; the stranger,
+/// surfacing the same analysis id, files none and gets no error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_analysis_written_by_gap_analysis_surfaces_by_claim_id(pool: PgPool) {
+    let embedder: std::sync::Arc<dyn EmbeddingService> =
+        std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    let (member, stranger, claim) = private_claim(&pool, embedder.as_ref()).await;
+    let state = production_state(&pool)
+        .await
+        .with_embedding_service(embedder);
+
+    let Json(analysed) = gap_analysis(
+        write_scope(member),
+        viewer(&pool, member).await,
+        State(state.clone()),
+        Json(GapAnalysisRequest {
+            question: QUESTION.to_string(),
+            min_gap_severity: None,
+        }),
+    )
+    .await
+    .expect("gap_analysis");
+    let analysis: Uuid = analysed["gap_analysis_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("gap_analysis_id");
+
+    let body = surface(&pool, state.clone(), stranger, analysis)
+        .await
+        .expect("the stranger's surface answers, it does not error");
+    assert_eq!(body["challenges_created"], 0, "stranger: {body}");
+    assert!(challenges_on(&pool, claim).await.is_empty());
+
+    let body = surface(&pool, state, member, analysis)
+        .await
+        .expect("the member's surface");
+    assert_eq!(
+        body["challenges_created"], 2,
+        "blind_spot and structural_absence both name the member's claim: {body}"
+    );
+    let mut texts: Vec<String> = challenges_on(&pool, claim)
+        .await
+        .into_iter()
+        .map(|(challenger, text)| {
+            assert_eq!(challenger, Some(member));
+            text
+        })
+        .collect();
+    texts.sort();
+    assert_eq!(
+        texts,
+        vec![
+            format!("gap_blind_spot: claim {claim}"),
+            format!("gap_structural_absence: claim {claim}"),
+        ]
+    );
+}
