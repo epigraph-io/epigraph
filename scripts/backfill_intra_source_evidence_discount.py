@@ -4,8 +4,17 @@
 Companion to `backfill_source_strength.py` (commit 5202ded, 2026-05-03), which
 populated `source_strength` from per-BBA `evidence_type` weights. This script
 multiplies that per-BBA reliability by the calibrated
-`intra_evidence_locality_factor` (from `calibration.toml`, default 0.3) for
+`intra_evidence_locality_factor` (from the calibration file; 0.3 in the repo's) for
 BBAs whose claim has at least one intra-source evidence row.
+
+Mirrors: the engine's locality-factor resolution, `edge_intra_locality_factor`
+in crates/epigraph-engine/src/edge_factor.rs (the frame's
+`intra_evidence_locality_factor` property, else the calibration's global
+`evidence_locality.intra_evidence_locality_factor`).
+
+Calibration file: `--calibration` if given, else `$CALIBRATION_PATH` when set
+(the file the engine serves; an unreadable one is refused), else the repo-root
+calibration.toml (the copy the engine embeds). The run prints which one it used.
 
 Composition (does NOT replace):
     source_strength_new = source_strength_old * intra_evidence_locality_factor
@@ -17,9 +26,8 @@ ordering. Cross-source BBAs are left untouched.
 
 Per-frame override: `frames.properties->>'intra_evidence_locality_factor'`,
 if set, takes precedence over the calibration.toml global default for BBAs
-on that frame (migration 044). Mirrors the resolution order in
-`edge_factor.rs`, so the backfill applies the same locality model new edge
-writes use. Operators set per-frame overrides via
+on that frame (migration 044), so the backfill applies the same locality
+model new edge writes use. Operators set per-frame overrides via
 FrameRepository::set_property or directly:
     UPDATE frames SET properties = properties ||
       jsonb_build_object('intra_evidence_locality_factor', 0.5)
@@ -98,6 +106,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for older interpreter
 
 import psycopg2
 
+from calibration_source import resolve_calibration
 from maintenance_dsn import maintenance_dsn
 
 
@@ -395,7 +404,11 @@ def main() -> int:
     parser.add_argument(
         "--calibration",
         type=Path,
-        default=DEFAULT_CALIBRATION,
+        default=None,
+        help=(
+            "Path to calibration.toml (default: $CALIBRATION_PATH when set, "
+            f"else {DEFAULT_CALIBRATION})"
+        ),
     )
     parser.add_argument(
         "--scope",
@@ -424,7 +437,9 @@ def main() -> int:
     # environment, maintenance_dsn() refuses instead of reaching a live database.
     args.database_url = args.database_url or maintenance_dsn()
 
-    intra_factor = load_intra_factor(args.calibration)
+    calibration, source = resolve_calibration(args.calibration, DEFAULT_CALIBRATION)
+    print(f"calibration: {source}")
+    intra_factor = load_intra_factor(calibration)
     scope_tiers = SCOPE_TIERS[args.scope]
     assert scope_tiers is not None
     print(f"intra_evidence_locality_factor = {intra_factor}")

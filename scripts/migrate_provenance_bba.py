@@ -5,6 +5,11 @@ Plan: docs/superpowers/plans/2026-09-16-provenance-bba-migration.md
 Spec context: backlogs 14b98adc (recall ranks on a column no DS path refreshes),
 0183a294 (BetP bounds), 696d3a1c (one frame owns the cached scalars).
 
+Mirrors: `MassFunction::from_pignistic_prior` in crates/epigraph-ds/src/mass.rs,
+the seed `ds_auto::auto_wire_ds_update` (crates/epigraph-mcp/src/tools/ds_auto.rs)
+gives a BBA-less claim on its first evidence update. This script re-implements
+that shape in Python; a change to either Rust function must be made here too.
+
 WHY
 ---
 `epigraph_engine::bayesian::calculate_initial_truth` gives ingested claims a

@@ -14,8 +14,15 @@ Policy:
   - For each NULL row with no attached evidence on the claim:
     use the conversational / agent-only tier (0.3).
 
-The mapping is loaded from `calibration.toml` at the repo root (single
-source of truth shared with the Rust engine).
+Mirrors: the engine's evidence-type weight lookup,
+`CalibrationConfig::get_evidence_type_weight` in
+crates/epigraph-engine/src/calibration.rs (a canonical
+`[evidence_type_weights]` key, else an `[evidence_type_aliases]` alias of one).
+The DB-vocab fallback table below is this script's own addition.
+
+Calibration file: `--calibration` if given, else `$CALIBRATION_PATH` when set
+(the file the engine serves; an unreadable one is refused), else the repo-root
+calibration.toml (the copy the engine embeds). The run prints which one it used.
 
 Usage:
     python3 scripts/backfill_source_strength.py            # dry run
@@ -35,6 +42,7 @@ from pathlib import Path
 
 import psycopg2
 
+from calibration_source import resolve_calibration
 from maintenance_dsn import maintenance_dsn
 
 DEFAULT_CALIBRATION = Path(__file__).resolve().parent.parent / "calibration.toml"
@@ -174,8 +182,11 @@ def main() -> int:
     parser.add_argument(
         "--calibration",
         type=Path,
-        default=DEFAULT_CALIBRATION,
-        help=f"Path to calibration.toml (default: {DEFAULT_CALIBRATION})",
+        default=None,
+        help=(
+            "Path to calibration.toml (default: $CALIBRATION_PATH when set, "
+            f"else {DEFAULT_CALIBRATION})"
+        ),
     )
     parser.add_argument(
         "--execute",
@@ -187,11 +198,11 @@ def main() -> int:
     # environment, maintenance_dsn() refuses instead of reaching a live database.
     args.database_url = args.database_url or maintenance_dsn()
 
-    weight_map = load_weight_map(args.calibration)
+    calibration, source = resolve_calibration(args.calibration, DEFAULT_CALIBRATION)
+    print(f"calibration: {source}")
+    weight_map = load_weight_map(calibration)
     agent_only_weight = weight_map.get(AGENT_ONLY_TIER_KEY, 0.3)
-    print(
-        f"loaded {len(weight_map)} evidence-type weights from {args.calibration}"
-    )
+    print(f"loaded {len(weight_map)} evidence-type weights from {calibration}")
     print(f"agent-only tier ({AGENT_ONLY_TIER_KEY}) = {agent_only_weight}")
     print()
 
