@@ -193,7 +193,7 @@ check_cited "W4 7 hex after 'commit', unresolved"  "fix(x): t$good_body"$'\n\nre
 # told apart by the word that labels them, also through a list of ids.
 check_cited "W4 bare 8-hex short sha, unresolved"  "fix(x): t$good_body"$'\n\n- Scoped gate on 5e1f0c0f: failed' 1 "5e1f0c0f"
 check_cited "W4 ok bare 8-hex prefix of an ancestor" "fix(x): t$good_body"$'\n\n- Review of '"${anc:0:8}"': fine' 0 -
-check_cited "W4 labelled id lists are not shas"    "fix(x): t$good_body"$'\n\nBacklog 114b17a4, 2a2d527f and 9f86d081; claims 5e1f0c0f / 0a97ba24;\nruling R-9 (decision 2bb5a33f); key type ed25519' 0 -
+check_cited "W4 labelled id lists are not shas"    "fix(x): t$good_body"$'\n\nBacklog 114b17a4, 2a2d527f and 9f86d081; claims 5e1f0c0f / 1b2c3d4e;\nper (decision 7c0ffee1); key type ed25519' 0 -
 check_cited "W4 counts each unresolved token"      "fix(x): t $missing$good_body"$'\n\nsee '"${side:0:12}"' and '"$anc" 2 "$missing"
 check_cited "W4 not-sha shapes are not cited"      "fix(x): t$good_body"$'\n\nclaim 2a2d527f-387f-4ef4-89e0-1a645dfeaf49, backlog 114b17a4,\nhash 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08,\nnumber 17000000001234, word deadbeefcafe, pin actions/checkout@'"$missing"$',\nuuid 2a2d527f387f4ef489e01a645dfeaf49, digest (sha256 '"$missing"') blake3: '"$missing" 0 -
 check_cited "W4 trailer lines are not read"        "fix(x): t$good_body"$'\n\nCo-Authored-By: A <a@example.com> '"$missing" 0 -
