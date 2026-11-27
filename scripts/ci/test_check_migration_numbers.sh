@@ -21,6 +21,9 @@ set -euo pipefail
 check=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check_migration_numbers.sh
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# Run from the temp directory so no shell glob can match the caller's own
+# checkout (CI runs this from the repository root, which has migrations/).
+cd "$work"
 failures=0
 n=0
 
@@ -109,7 +112,7 @@ fixture "$plain_readme"; mkdir -p "$r/migrations/sub"; add sub/003_nested.sql
 expect "a file in a subdirectory is not a migration" 0 "0 added file(s)" "$base"
 
 # A base with no versioned migration has no head to check against: refuse.
-fixture "$plain_readme"; g rm -q migrations/0*.sql; g commit -q -m empty; base=$(g rev-parse HEAD); add 001_x.sql
+fixture "$plain_readme"; g rm -q 'migrations/0*.sql'; g commit -q -m empty; base=$(g rev-parse HEAD); add 001_x.sql
 expect "a base with no migrations is refused" 2 "no versioned migrations" "$base"
 
 # Default base: the merge-base with origin/main, here the base commit, even
