@@ -2387,7 +2387,9 @@ impl AppState {
     /// Returns `DbError::InvalidData` if an expected trigger is absent on a
     /// table that exists, or if any matching trigger is not `tgenabled = 'O'`.
     #[cfg(feature = "db")]
-    pub async fn assert_tenancy_triggers_armed(&self) -> Result<(), epigraph_db::DbError> {
+    pub async fn assert_tenancy_triggers_armed_on(
+        pool: &PgPool,
+    ) -> Result<(), epigraph_db::DbError> {
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT c.relname, t.tgname, t.tgenabled::text \
                FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
@@ -2399,7 +2401,7 @@ impl AppState {
                                      'edges_atlas_map_stale', 'evidence_atlas_map_stale')) \
               ORDER BY c.relname, t.tgname",
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
 
         let present: std::collections::HashSet<(&str, &str)> = rows
@@ -2432,7 +2434,7 @@ impl AppState {
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
         let existing: std::collections::HashSet<&str> =
             existing_tables.iter().map(String::as_str).collect();
@@ -2458,7 +2460,7 @@ impl AppState {
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(pool)
         .await?;
         let migration_089_applied = markers.iter().any(|m| m == MIGRATION_089_MARKER);
         let migration_173_applied = markers
@@ -2554,6 +2556,15 @@ impl AppState {
         Ok(())
     }
 
+    /// [`Self::assert_tenancy_triggers_armed_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::assert_tenancy_triggers_armed_on`].
+    #[cfg(feature = "db")]
+    pub async fn assert_tenancy_triggers_armed(&self) -> Result<(), epigraph_db::DbError> {
+        Self::assert_tenancy_triggers_armed_on(&self.db_pool).await
+    }
+
     /// Ask the database the questions [`rls_verdict`] decides on.
     ///
     /// One round trip for the role/catalog facts and one for the canary, which
@@ -2563,7 +2574,7 @@ impl AppState {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the catalog cannot be read at all.
     #[cfg(feature = "db")]
-    pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
+    pub async fn probe_rls_posture_on(pool: &PgPool) -> Result<RlsPosture, epigraph_db::DbError> {
         // The seed column asks what the `*_require_tenancy` triggers ask AT
         // THIS DATABASE'S MIGRATION LEVEL: since 216 an explicit grant, not
         // `pg_has_role`, which every superuser satisfies. See
@@ -2593,18 +2604,18 @@ impl AppState {
             i64,
         ) = sqlx::query_as(&sql)
             .bind(FORCE_PROTECTED_SET)
-            .fetch_one(&self.db_pool)
+            .fetch_one(pool)
             .await?;
 
         // Below 078 there is no canary. `to_regclass` returns NULL rather than
         // raising, so this is one statement either way.
         let canary_exists: bool =
             sqlx::query_scalar("SELECT to_regclass('public.rls_canary') IS NOT NULL")
-                .fetch_one(&self.db_pool)
+                .fetch_one(pool)
                 .await?;
         let canary_visible: i64 = if canary_exists {
             sqlx::query_scalar("SELECT count(*) FROM public.rls_canary")
-                .fetch_one(&self.db_pool)
+                .fetch_one(pool)
                 .await?
         } else {
             0
@@ -2622,6 +2633,15 @@ impl AppState {
         })
     }
 
+    /// [`Self::probe_rls_posture_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::probe_rls_posture_on`].
+    #[cfg(feature = "db")]
+    pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
+        Self::probe_rls_posture_on(&self.db_pool).await
+    }
+
     /// Probe, decide, and either log or refuse. The PR-17 boot assertion.
     ///
     /// See [`rls_verdict`] for the staging rule and for the one acceptance item
@@ -2629,8 +2649,8 @@ impl AppState {
     ///
     /// # A FAILURE TO *READ* THE POSTURE IS NOT A REFUSAL
     ///
-    /// The caller wraps this in `.expect()`, so anything returned here is a boot
-    /// panic. Staging the VERDICT (see [`rls_verdict`]) buys nothing if the
+    /// The caller ([`crate::boot::check_db_posture`]) turns anything returned
+    /// here into a boot refusal. Staging the VERDICT (see [`rls_verdict`]) buys nothing if the
     /// PROBE is unconditionally fatal, and the probe has a reachable failure
     /// that has nothing to do with posture: its canary read needs the GRANT that
     /// migration 078 issues inside `IF EXISTS (SELECT 1 FROM pg_roles WHERE
@@ -2651,8 +2671,8 @@ impl AppState {
     /// # Errors
     /// Propagates [`rls_verdict`] refusals ONLY.
     #[cfg(feature = "db")]
-    pub async fn assert_rls_posture(&self) -> Result<(), epigraph_db::DbError> {
-        let posture = match self.probe_rls_posture().await {
+    pub async fn assert_rls_posture_on(pool: &PgPool) -> Result<(), epigraph_db::DbError> {
+        let posture = match Self::probe_rls_posture_on(pool).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -2684,6 +2704,15 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::assert_rls_posture_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::assert_rls_posture_on`].
+    #[cfg(feature = "db")]
+    pub async fn assert_rls_posture(&self) -> Result<(), epigraph_db::DbError> {
+        Self::assert_rls_posture_on(&self.db_pool).await
     }
 
     /// The number of `rls_canary` rows visible on the API pool.
@@ -2748,7 +2777,9 @@ impl AppState {
     /// Returns the underlying `DbError` if the catalog probe itself fails. The
     /// posture findings are logged, not returned.
     #[cfg(feature = "db")]
-    pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
+    pub async fn warn_on_privileged_connection_on(
+        pool: &PgPool,
+    ) -> Result<(), epigraph_db::DbError> {
         // See `epigraph_db::repos::seed_posture`: the seed column is the
         // question the triggers ask at this migration level, and the last
         // column says which question that is (216's explicit grant, or 074's
@@ -2766,7 +2797,7 @@ impl AppState {
             bool,
             bool,
             bool,
-        ) = sqlx::query_as(&sql).fetch_one(&self.db_pool).await?;
+        ) = sqlx::query_as(&sql).fetch_one(pool).await?;
 
         if current_user != "epigraph_app" {
             tracing::warn!(
@@ -2799,6 +2830,15 @@ impl AppState {
             );
         }
         Ok(())
+    }
+
+    /// [`Self::warn_on_privileged_connection_on`] on this state's pool.
+    ///
+    /// # Errors
+    /// See [`Self::warn_on_privileged_connection_on`].
+    #[cfg(feature = "db")]
+    pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
+        Self::warn_on_privileged_connection_on(&self.db_pool).await
     }
 
     /// Replace the webhook-registration egress guard. See
