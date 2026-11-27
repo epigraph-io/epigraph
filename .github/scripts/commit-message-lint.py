@@ -28,10 +28,11 @@ repository root.
 
 `--cited-shas` runs ONLY W4 and always exits 0 (a workflow on every push to
 main runs it, .github/workflows/cited-sha-check.yml): W4 a token in a message
-that looks like a commit sha (9-40 lowercase hex characters holding a digit and
-a letter, not part of a UUID or a longer hex run and not right after `@`; or
-7-8 hex characters right after the word `commit`) that names no commit
-REACHABLE from <head>. Reachability, not `git cat-file -e`: a full clone holds
+that looks like a commit sha (7-40 lowercase hex characters holding a digit and
+a letter, not part of a UUID or a longer hex run, not right after `@`, not 32
+long, not labelled as a digest, and not an id in a list labelled `backlog`,
+`claim`, `item`, `id` or `decision`) that names no commit REACHABLE from
+<head>. Reachability, not `git cat-file -e`: a full clone holds
 every branch's objects, so a sha that lives only on an unmerged or rebased-away
 branch still resolves there but is not on main. Trailer lines are not read.
 The rule it enforces: cite a commit by sha only once it is on main (or earlier
@@ -85,10 +86,16 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # W4: a sha-like token. Not inside a word, a UUID (hyphen) or a longer hex run
 # such as a 64-hex content hash (the 40 cap plus the boundary), and not right
 # after `@` (an action pin or another repository's revision).
-CITED_SHA_RE = re.compile(r"(?<![0-9A-Za-z_@-])([0-9a-f]{9,40})(?![0-9A-Za-z_-])")
-# W4: a short sha (7-8 hex) counts only right after the word `commit(s)`, so an
-# 8-hex backlog claim-id prefix elsewhere is not read as a sha.
-CITED_SHORT_RE = re.compile(r"\bcommits?\s+`?([0-9a-f]{7,8})(?![0-9A-Za-z_-])", re.I)
+# A bare 7-8 hex short sha counts too: it is the commonest citation shape here
+# ("Scoped gate on <sha>", "Review of <sha>").
+CITED_SHA_RE = re.compile(r"(?<![0-9A-Za-z_@-])([0-9a-f]{7,40})(?![0-9A-Za-z_-])")
+# W4: an 8-hex backlog or claim id is told apart from a short sha by the word
+# that labels it, also through a list ("backlog 114b17a4, 2a2d527f and ...").
+ID_LIST_RE = re.compile(
+    r"\b(?:backlogs?|claims?|items?|ids?|uuids?|decisions?)\b[\s:`(]*"
+    r"(?:[0-9a-f]{7,8}`?(?:\s*(?:[,;/&]|\band\b|\bor\b)\s*|\s+)`?)*$", re.I)
+# W4: hex-looking words that are never commits.
+NOT_SHA_WORDS = {"ed25519"}
 # W4: a hex run labelled as a content hash just before it ("sha256 <hex>",
 # "blake3: <hex>", "hash=<hex>") is a digest, not a commit.
 HASH_LABEL_RE = re.compile(r"(?:sha-?256|sha-?512|blake3|md5|hash)[\s:=]*`?$", re.I)
@@ -236,22 +243,23 @@ def lint(subject, message):
 def cited_shas(message):
     """The sha-like tokens a message cites (W4), in order, trailers skipped. A
     token needs a digit and a letter: an all-digit run is a number or a date,
-    an all-letter one a word. A 32-hex run is a hyphenless UUID or an MD5, and a
-    run labelled as a hash is a digest; neither is read as a sha."""
+    an all-letter one a word. A 32-hex run is a hyphenless UUID or an MD5, a
+    run labelled as a hash is a digest, and a 7-8 hex run in a labelled id
+    list is a backlog/claim id; none is read as a sha."""
     found = []
     for line in message.split("\n"):
         if TRAILER_RE.match(line):
             continue
-        spans = []
-        for rx in (CITED_SHA_RE, CITED_SHORT_RE):
-            for m in rx.finditer(line):
-                tok = m.group(1).lower()
-                if not (re.search(r"[0-9]", tok) and re.search(r"[a-f]", tok)):
-                    continue
-                if len(tok) == 32 or HASH_LABEL_RE.search(line[:m.start(1)]):
-                    continue
-                spans.append((m.start(1), tok))
-        found += [tok for _, tok in sorted(set(spans))]
+        for m in CITED_SHA_RE.finditer(line):
+            tok = m.group(1)
+            if not (re.search(r"[0-9]", tok) and re.search(r"[a-f]", tok)):
+                continue
+            before = line[:m.start(1)]
+            if len(tok) == 32 or tok in NOT_SHA_WORDS or HASH_LABEL_RE.search(before):
+                continue
+            if len(tok) <= 8 and ID_LIST_RE.search(before):
+                continue
+            found.append(tok)
     return found
 
 
