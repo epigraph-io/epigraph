@@ -37,7 +37,7 @@ use epigraph_events::EpiGraphEvent;
 // Database-related imports (only when db feature is enabled)
 use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
-use epigraph_core::{EvidenceId, EvidenceType, Methodology, TraceInput};
+use epigraph_core::{EvidenceId, EvidenceType, TraceInput};
 #[cfg(feature = "db")]
 use epigraph_db::AgentRepository;
 
@@ -229,22 +229,32 @@ pub enum MethodologySubmission {
 }
 
 impl MethodologySubmission {
+    /// The domain methodology this wire value names: the one mapping, used
+    /// for the stored trace and for [`Self::weight_modifier`].
+    #[must_use]
+    pub const fn as_domain(self) -> epigraph_core::Methodology {
+        use epigraph_core::Methodology as M;
+        match self {
+            Self::Deductive => M::Deductive,
+            Self::Inductive => M::Inductive,
+            Self::Abductive => M::Abductive,
+            Self::Instrumental => M::Instrumental,
+            Self::Extraction => M::Extraction,
+            Self::BayesianInference => M::BayesianInference,
+            Self::VisualInspection => M::VisualInspection,
+            Self::FormalProof => M::FormalProof,
+            Self::Heuristic => M::Heuristic,
+        }
+    }
+
     /// Returns a weight modifier for truth calculation
     ///
-    /// Formal proofs get bonuses (> 1.0), heuristics get penalties (< 1.0)
+    /// Formal proofs get bonuses (> 1.0), heuristics get penalties (< 1.0).
+    /// Read from `epigraph_core::Methodology::weight_modifier`, the one
+    /// methodology weight table (backlog 19e46f05); this route keeps no copy.
     #[must_use]
     pub const fn weight_modifier(self) -> f64 {
-        match self {
-            Self::FormalProof => 1.2,
-            Self::Deductive => 1.1,
-            Self::BayesianInference => 1.0,
-            Self::Inductive => 0.9,
-            Self::Instrumental => 0.85,
-            Self::VisualInspection => 0.8,
-            Self::Extraction => 0.75,
-            Self::Abductive => 0.7,
-            Self::Heuristic => 0.5,
-        }
+        self.as_domain().weight_modifier()
     }
 }
 
@@ -896,22 +906,6 @@ fn calculate_truth_from_evidence(
 // TYPE CONVERSIONS (Database Feature)
 // =============================================================================
 
-/// Convert submission methodology to domain methodology
-#[cfg(feature = "db")]
-fn convert_methodology(submission: MethodologySubmission) -> Methodology {
-    match submission {
-        MethodologySubmission::Deductive => Methodology::Deductive,
-        MethodologySubmission::Inductive => Methodology::Inductive,
-        MethodologySubmission::Abductive => Methodology::Abductive,
-        MethodologySubmission::Instrumental => Methodology::Instrumental,
-        MethodologySubmission::Extraction => Methodology::Extraction,
-        MethodologySubmission::BayesianInference => Methodology::BayesianInference,
-        MethodologySubmission::VisualInspection => Methodology::VisualInspection,
-        MethodologySubmission::FormalProof => Methodology::FormalProof,
-        MethodologySubmission::Heuristic => Methodology::Heuristic,
-    }
-}
-
 /// Convert evidence type submission to domain evidence type
 #[cfg(feature = "db")]
 fn convert_evidence_type(submission: &EvidenceTypeSubmission) -> EvidenceType {
@@ -1360,7 +1354,7 @@ async fn persist_packet(
     if was_created {
         // 4. Insert reasoning trace (with claim_id)
         let trace_uuid: Uuid = trace_id.into();
-        let methodology = convert_methodology(packet.reasoning_trace.methodology);
+        let methodology = packet.reasoning_trace.methodology.as_domain();
         // The one enum -> reasoning_type mapping, shared with the repo layer
         // rather than copied here. The packet's `MethodologySubmission` has no
         // observation variant, so this transport cannot say "observational".
