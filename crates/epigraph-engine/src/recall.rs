@@ -28,7 +28,8 @@
 //!
 //! - **Similarity** is the System-1 leg alone: ANN over `claims.embedding`.
 //! - **Hierarchical** is the System-2 leg alone: the query's nearest themes
-//!   by centroid ([`ClaimThemeRepository::find_similar_themes_at_dim`]), then
+//!   by centroid that the viewer can see
+//!   ([`ClaimThemeRepository::find_similar_visible_themes_at_dim`]), then
 //!   those themes' current members ranked by similarity
 //!   ([`ClaimThemeRepository::claims_in_themes_at_dim_since`], viewer-scoped).
 //! - **Auto** runs the ANN leg and adds the theme leg only when the ANN page
@@ -40,8 +41,10 @@
 //! A theme leg hit is a claim the ANN page did not rank this high: its theme
 //! sits near the query even though the claim itself does not. Both legs read
 //! on the same connection under the caller's `viewer`, so the merge cannot
-//! widen what the viewer may see; theme rows carry no tenancy, and only their
-//! ids are used.
+//! widen what the viewer may see. The theme shortlist is viewer-scoped too: a
+//! theme counts only when the viewer can read at least one of its current
+//! members (backlog 06f5c5b2's rule), so a theme made only of another team's
+//! private claims is neither named nor given a shortlist slot.
 //! A failed theme leg degrades to the ANN page on Auto, and to the text
 //! fallback on Hierarchical, the same way a failed ANN leg does. A query
 //! vector at a dimension other than 1536 fails the 1536-d ANN read first, so
@@ -252,8 +255,10 @@ pub fn rrf_merge(
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ThemeLeg {
     /// The query's nearest themes by centroid, nearest first, as
-    /// `(theme_id, label)`. At most [`THEME_LEG_THEMES`]. Theme rows carry no
-    /// tenancy, so this shortlist is not viewer-scoped; its members are.
+    /// `(theme_id, label)`. At most [`THEME_LEG_THEMES`]. Viewer-scoped: only
+    /// themes with at least one current member the viewer can read
+    /// ([`ClaimThemeRepository::find_similar_visible_themes_at_dim`]), so a
+    /// caller may name them.
     pub themes: Vec<(uuid::Uuid, String)>,
     /// Those themes' current members visible to the viewer, as
     /// `(claim_id, cosine similarity to the query)`, best first: the ranked
@@ -266,7 +271,9 @@ pub struct ThemeLeg {
 ///
 /// The ONE implementation of the leg (backlog a47df8ed): [`recall_routed`] and
 /// the MCP `recall` tool's `route` parameter both run it, so the shortlist
-/// size, the viewer-scoped member query
+/// size, the viewer-scoped shortlist
+/// ([`ClaimThemeRepository::find_similar_visible_themes_at_dim`]), the
+/// viewer-scoped member query
 /// ([`ClaimThemeRepository::claims_in_themes_at_dim_since`]) and the savepoint
 /// below are the same on both surfaces.
 ///
@@ -317,9 +324,14 @@ async fn theme_leg_reads(
     since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<ThemeLeg, epigraph_db::DbError> {
     let dim = u32::try_from(dim).unwrap_or(0);
-    let themes =
-        ClaimThemeRepository::find_similar_themes_at_dim(&mut *conn, pgvec, THEME_LEG_THEMES, dim)
-            .await?;
+    let themes = ClaimThemeRepository::find_similar_visible_themes_at_dim(
+        &mut *conn,
+        viewer,
+        pgvec,
+        THEME_LEG_THEMES,
+        dim,
+    )
+    .await?;
     if themes.is_empty() {
         return Ok(ThemeLeg::default());
     }

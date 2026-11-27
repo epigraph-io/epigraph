@@ -332,12 +332,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // session: a bypass viewer's connection must be the bypass session.
     ("recall.rs", "recall", &["assert_conn_spends_bypass"]),
-    // untenanted: `claim_themes`.
-    (
-        "recall.rs",
-        "theme_leg_reads",
-        &["ClaimThemeRepository::find_similar_themes_at_dim"],
-    ),
     // audit: the principal's own personal group on its own stamp, then its
     // event.
     (

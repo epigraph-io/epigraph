@@ -989,7 +989,8 @@ pub struct RecallParams {
                        label}], added: the returned claims that only the theme leg supplied}. \
                        auto and hierarchical are REJECTED with tags, agent_id, offset, \
                        theme_id or theme_label, which the theme leg cannot honour; since is \
-                       honoured. Unknown values are rejected. Omitted: byte-identical to recall \
+                       honoured. Themes are only those with at least one current member you may \
+                       read. Unknown values are rejected. Omitted: byte-identical to recall \
                        before this parameter existed."
     )]
     #[serde(default)]

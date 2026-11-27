@@ -479,6 +479,118 @@ async fn a_private_theme_member_is_invisible_to_an_outsider(pool: PgPool) {
     }
 }
 
+/// A theme made only of another team's private claims is never NAMED to an
+/// outsider, and never takes a shortlist slot from a theme the outsider can
+/// read (backlog 06f5c5b2's rule: a theme exists for a caller only when the
+/// caller can read at least one of its current members). Run as the
+/// application role in both GUC modes.
+///
+/// Three hidden themes sit NEARER the query than the visible theme, so a
+/// shortlist ranked over every theme row (3 slots) would name all three and
+/// crowd the visible theme, and with it the public member, out. The other
+/// team's own author is the control: the hidden themes are named to them, so
+/// the narrowing is by viewer, not a blanket removal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_theme_of_only_private_members_is_not_named_to_an_outsider(pool: PgPool) {
+    let c = seed(&pool).await;
+    // The visible theme moves off the query (cos ~0.894), so every hidden
+    // theme below is nearer than it.
+    sqlx::query("UPDATE claim_themes SET centroid = $2::vector WHERE id = $1")
+        .bind(c.theme)
+        .bind(mixed(7, 2.0))
+        .execute(&pool)
+        .await
+        .expect("move visible centroid");
+
+    let (other_author, other_group) =
+        fixture::seed_agent_with_group(&pool, "a47df8ed-mcp-other-team").await;
+    let mut hidden: Vec<(Uuid, String)> = Vec::new();
+    for (i, centroid) in [query_bucket(), mixed(8, 4.0), mixed(9, 3.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let label = format!("a47df8ed-hidden-label-{i}");
+        let theme = seed_theme(&pool, &label, &centroid).await;
+        let claim = fixture::seed_group_claim(
+            &pool,
+            other_author,
+            other_group,
+            &format!("other team private member {i}"),
+        )
+        .await;
+        embed_and_theme(&pool, claim, &mixed(10 + i, 0.25), Some(theme)).await;
+        hidden.push((theme, label));
+    }
+
+    let url = fixture::database_url_for(&pool).await;
+    for mode in [
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::SessionGucMode::Transaction,
+    ] {
+        let scoped =
+            epigraph_db::ScopedPool::connect_downgraded_for_tests(&url, mode, "epigraph_app")
+                .await
+                .expect("app-role ScopedPool");
+        let app = scoped.inner().clone();
+        let outsider = epigraph_db::Viewer::resolve(&app, c.outsider)
+            .await
+            .expect("outsider viewer");
+        let insider = epigraph_db::Viewer::resolve(&app, other_author)
+            .await
+            .expect("other-team viewer");
+        let server = build_server(app, scoped);
+
+        for route in ["auto", "hierarchical"] {
+            let text = recall_text(
+                &server,
+                &outsider,
+                params(json!({ "limit": 10, "route": route })),
+            )
+            .await;
+            for (id, label) in &hidden {
+                assert!(
+                    !text.contains(&id.to_string()) && !text.contains(label.as_str()),
+                    "{mode:?}/{route} named a theme of only private members to an outsider: \
+                     {text}"
+                );
+            }
+            let body: Value = serde_json::from_str(&text).expect("recall envelope");
+            assert_eq!(body["route_used"], route, "{mode:?}: {body}");
+            assert_eq!(
+                body["theme_leg"]["themes"],
+                json!([{ "theme_id": c.theme.to_string(), "label": "a47df8ed-mcp-theme" }]),
+                "{mode:?}/{route}: the visible theme keeps its shortlist slot: {body}"
+            );
+            assert!(
+                ids(&body).contains(&c.member.to_string()),
+                "{mode:?}/{route}: the visible theme's public member is served: {body}"
+            );
+        }
+
+        let theirs = recall_body(
+            &server,
+            &insider,
+            params(json!({ "limit": 10, "route": "hierarchical" })),
+        )
+        .await;
+        let named: Vec<String> = theirs["theme_leg"]["themes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("themes array: {theirs}"))
+            .iter()
+            .map(|t| t["theme_id"].as_str().expect("theme_id").to_string())
+            .collect();
+        assert_eq!(
+            named,
+            hidden
+                .iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>(),
+            "{mode:?}: the team that can read the members sees its themes, nearest first: \
+             {theirs}"
+        );
+    }
+}
+
 /// The route is part of what was asked, so the audit row records it, and
 /// whether the theme leg ran.
 #[sqlx::test(migrations = "../../migrations")]
