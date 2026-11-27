@@ -654,3 +654,59 @@ async fn a_private_paraphrase_never_moves_the_public_claims_cached_belief(pool: 
     );
     assert_eq!(bbas_by(&pool, own_id, b).await.len(), 1);
 }
+
+/// B, a writer of team T, holds a TEAM claim and then submits a PUBLIC
+/// paraphrase of it. The paraphrase is not attached to the team claim (it
+/// would vanish from every public reader), so B's public claim is inserted,
+/// and it carries NO `near-duplicate` label: that label is on a public row,
+/// and would tell every public reader that some claim they cannot read lies
+/// within the novelty threshold of this one. The refusal is still named to B.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_paraphrase_of_a_team_claim_is_not_labelled_near_duplicate(pool: PgPool) {
+    binary_truth(&pool).await;
+    let t = team(&pool, "corro-narrow-team").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "corro-narrow-b").await;
+    add_member(&pool, t, b, "writer").await;
+    let server = app_server(&pool).await;
+
+    let original = "The team's prototype seal held at nine bar for an hour";
+    let team_claim = parse_uuid_field(
+        &submit_as(
+            &pool,
+            &server,
+            b,
+            submit(original, "bench log 7", "team", Some(t), &[]),
+        )
+        .await,
+        "claim_id",
+    );
+    let before = claim_state(&pool, team_claim).await;
+
+    let paraphrase = "For an hour the team's prototype seal held at nine bar";
+    let body = submit_as(
+        &pool,
+        &server,
+        b,
+        submit(paraphrase, "public bench summary", "public", None, &[]),
+    )
+    .await;
+
+    assert_ne!(body["claim_id"], team_claim.to_string(), "{body}");
+    assert_eq!(
+        body["corroboration"]["refused"], "claim visibility differs from this write's",
+        "{body}"
+    );
+    let own = claims_with_content(&pool, paraphrase).await;
+    assert_eq!(own.len(), 1, "B's own public claim: {own:?}");
+    let (_, _, own_visibility, own_labels) = own[0].clone();
+    assert_eq!(own_visibility, "public");
+    assert!(
+        !own_labels.iter().any(|l| l == "near-duplicate"),
+        "a public claim must not disclose a team claim's proximity: {own_labels:?}"
+    );
+    assert_eq!(
+        claim_state(&pool, team_claim).await,
+        before,
+        "nothing written on the team claim"
+    );
+}

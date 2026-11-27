@@ -15,8 +15,8 @@
 //!   ([`corroborate`], backlog 4f4c6175) and its id is returned. When the
 //!   caller may not attach to that claim, or it sits in a different audience
 //!   than the caller asked to write to, the caller's own claim is inserted
-//!   instead, flagged `near-duplicate` like the next band (backlogs 5578f693,
-//!   fef24216).
+//!   instead (backlogs 5578f693, fef24216), flagged `near-duplicate` like the
+//!   next band when its readers may read the match ([`neighbour_covers_write`]).
 //! - `dist < 0.15` — near-duplicate. Insert normally, but flag it with a
 //!   `near-duplicate` label so it is discoverable/reviewable. The 0.15 band
 //!   is fixed, NOT the tunable `novelty_threshold`.
@@ -402,10 +402,14 @@ pub enum CorroborationOutcome {
     /// AUTHORED edge written. `None`: the caller's group had already attached
     /// the same evidence body to this claim, and nothing was written.
     Attached { evidence_id: Option<Uuid> },
-    /// Nothing was written; the caller inserts its own claim, flagged
-    /// `near-duplicate`. The reason is [`REFUSED_NOT_WRITABLE`] or
-    /// [`REFUSED_OTHER_SCOPE`].
-    Refused(&'static str),
+    /// Nothing was written; the caller inserts its own claim. `reason` is
+    /// [`REFUSED_NOT_WRITABLE`] or [`REFUSED_OTHER_SCOPE`].
+    /// `flag_near_duplicate` is whether that claim
+    /// may carry the `near-duplicate` label ([`neighbour_covers_write`]).
+    Refused {
+        reason: &'static str,
+        flag_near_duplicate: bool,
+    },
 }
 
 impl CorroborationOutcome {
@@ -418,11 +422,55 @@ impl CorroborationOutcome {
                 evidence_id: evidence_id.map(|e| e.to_string()),
                 note: evidence_id.is_none().then_some(ALREADY_ATTACHED_NOTE),
             },
-            Self::Refused(refused) => crate::types::Corroboration::Refused {
-                refused,
+            Self::Refused { reason, .. } => crate::types::Corroboration::Refused {
+                refused: reason,
                 nearest_claim_id: existing_id.to_string(),
             },
         }
+    }
+
+    /// Whether the caller's own claim, inserted after a refusal, is labelled
+    /// `near-duplicate`. Always false for an attachment (nothing is inserted).
+    #[must_use]
+    pub fn flags_near_duplicate(self) -> bool {
+        matches!(
+            self,
+            Self::Refused {
+                flag_near_duplicate: true,
+                ..
+            }
+        )
+    }
+}
+
+/// Whether every reader of the claim this write inserts can also read the
+/// matched claim, so that a `near-duplicate` label on the inserted claim tells
+/// its readers nothing they could not see for themselves.
+///
+/// The label is persisted on the caller's claim, so it is read by that claim's
+/// whole audience. When the write is wider than the claim the gate matched (a
+/// PUBLIC write next to a team or private claim, or a team write next to
+/// another group's claim), the label would tell that audience that some claim
+/// they may not read lies within the novelty threshold of this one, which the
+/// gate used to keep to itself (it suppressed the write). A PRIVATE write is
+/// read only within the author's home group and stays labelled, as backlog
+/// 5578f693 requires of a reader's own claim. `claim` is the matched claim's
+/// `(visibility, owner_group_id)` as the caller reads it, `None` when it could
+/// not be read.
+#[must_use]
+pub fn neighbour_covers_write(
+    tenancy: &epigraph_db::ResolvedWriteDecl,
+    claim: Option<(&str, Uuid)>,
+) -> bool {
+    if tenancy.resolved == "private" {
+        return true;
+    }
+    match claim {
+        Some(("public", _)) => true,
+        Some((_, owner)) => {
+            tenancy.resolved != "public" && tenancy.decl.owner_group_bind() == Some(owner)
+        }
+        None => false,
     }
 }
 
@@ -453,7 +501,7 @@ impl CorroborationOutcome {
 ///   one the caller writes, and it is not public (backlog 5578f693). Decided
 ///   before any write; a row-security refusal of the evidence INSERT (a public
 ///   claim, but no writable home group to own the attachment) is caught as
-///   the same refusal. The caller then inserts its own claim, flagged.
+///   the same refusal. The caller then inserts its own claim.
 /// * The claim's audience differs from the one the caller asked to write to
 ///   (backlog fef24216). An attachment takes the CLAIM's audience: a non-owner's
 ///   evidence on a public claim is public (migration 114), and a BBA on a public
@@ -467,6 +515,10 @@ impl CorroborationOutcome {
 ///   is inserted where it asked. This is a rule about where a write lands, not
 ///   a second belief filter: what the cache folds stays the derivation-scope
 ///   filter's decision.
+///
+/// The caller's own claim is labelled `near-duplicate` only when its readers
+/// can read the matched claim too ([`neighbour_covers_write`]); otherwise the
+/// label would disclose a claim they may not see.
 ///
 /// # Errors
 /// An internal error for a failed read or write other than those refusals, or
@@ -500,8 +552,15 @@ pub async fn corroborate(
     else {
         // Vanished (or narrowed) since the gate read it: there is nothing the
         // caller may attach to.
-        return Ok(CorroborationOutcome::Refused(REFUSED_NOT_WRITABLE));
+        return Ok(CorroborationOutcome::Refused {
+            reason: REFUSED_NOT_WRITABLE,
+            flag_near_duplicate: neighbour_covers_write(ev.tenancy, None),
+        });
     };
+    // Should the caller's own claim, if it is inserted instead, carry the
+    // `near-duplicate` label? Only when its readers can read this claim too.
+    let flag_near_duplicate =
+        neighbour_covers_write(ev.tenancy, Some((claim_visibility.as_str(), claim_owner)));
 
     // May the caller attach at all? A writer of the claim's group, or a
     // non-owner of a PUBLIC claim (migration 114). Asked of the session itself.
@@ -515,7 +574,10 @@ pub async fn corroborate(
             .await
             .map_err(internal_error)?;
     if !writes_claim_group && !foreign_public {
-        return Ok(CorroborationOutcome::Refused(REFUSED_NOT_WRITABLE));
+        return Ok(CorroborationOutcome::Refused {
+            reason: REFUSED_NOT_WRITABLE,
+            flag_near_duplicate,
+        });
     }
 
     // Into the audience the caller asked for, and no other.
@@ -527,7 +589,10 @@ pub async fn corroborate(
         None => false,
     };
     if !same_scope {
-        return Ok(CorroborationOutcome::Refused(REFUSED_OTHER_SCOPE));
+        return Ok(CorroborationOutcome::Refused {
+            reason: REFUSED_OTHER_SCOPE,
+            flag_near_duplicate,
+        });
     }
 
     let edge_key = server.edge_signing_key().await?;
@@ -549,7 +614,10 @@ pub async fn corroborate(
                 "novelty gate corroboration refused by row security; inserting the caller's \
                  own claim instead: {e}"
             );
-            return Ok(CorroborationOutcome::Refused(REFUSED_NOT_WRITABLE));
+            return Ok(CorroborationOutcome::Refused {
+                reason: REFUSED_NOT_WRITABLE,
+                flag_near_duplicate,
+            });
         }
         // The caller's group already attached this body to this claim (the
         // per-owner evidence de-duplication, migration 171). Nothing is new:

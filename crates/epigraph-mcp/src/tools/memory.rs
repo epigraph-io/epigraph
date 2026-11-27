@@ -142,7 +142,8 @@ pub async fn memorize(
     // 4f4c6175): this memory is attached to it as testimony evidence, with its
     // BBA and an AUTHORED edge, and no claim row is written. When the caller may
     // not attach there (backlogs 5578f693, fef24216) the memory is inserted
-    // below as the caller's own claim, tagged `near-duplicate`. See
+    // below as the caller's own claim, tagged `near-duplicate` when its readers
+    // may read the match. See
     // `novelty_gate::corroborate`.
     let mut corroboration: Option<crate::types::Corroboration> = None;
     if let Some((existing_id, distance)) = near_duplicate {
@@ -219,7 +220,9 @@ pub async fn memorize(
                 corroboration: Some(outcome.report(existing_id)),
             });
         }
-        if !tags.iter().any(|t| t == "near-duplicate") {
+        // Tagged only when the memory's readers may read the match too
+        // (`novelty_gate::neighbour_covers_write`).
+        if outcome.flags_near_duplicate() && !tags.iter().any(|t| t == "near-duplicate") {
             tags.push("near-duplicate".to_string());
         }
         corroboration = Some(outcome.report(existing_id));

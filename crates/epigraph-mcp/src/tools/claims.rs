@@ -270,8 +270,9 @@ pub(crate) async fn submit_claim_response(
         } => {
             match corroborate_submission(server, viewer, existing_id, distance, &mut sub).await? {
                 Some(response) => return Ok(response),
-                // Refused: `sub` now carries the `near-duplicate` label and
-                // the refusal, and is inserted as the caller's own claim.
+                // Refused: `sub` now carries the refusal (and, when its
+                // readers may read the match, the `near-duplicate` label), and
+                // is inserted as the caller's own claim.
                 None => *sub,
             }
         }
@@ -300,8 +301,9 @@ pub(crate) async fn submit_claim_response(
 /// The novelty gate matched `existing_id`: attach this submission's evidence
 /// to it as corroboration (`novelty_gate::corroborate`, backlog 4f4c6175) and
 /// answer with the existing claim, or, when the caller may not attach there
-/// (backlogs 5578f693, fef24216), flag `sub` `near-duplicate`, record the
-/// refusal on it, and answer `None` so the caller inserts it as its own claim.
+/// (backlogs 5578f693, fef24216), record the refusal on `sub` (and flag it
+/// `near-duplicate` when its readers may read the match), and answer `None` so
+/// the caller inserts it as its own claim.
 /// `sub.pending_embedding` already holds the gate's vector, so that insert
 /// pays for no second embedding.
 async fn corroborate_submission(
@@ -333,7 +335,11 @@ async fn corroborate_submission(
     )
     .await?;
     let crate::tools::novelty_gate::CorroborationOutcome::Attached { evidence_id } = outcome else {
-        if !sub.params.labels.iter().any(|l| l == "near-duplicate") {
+        // Labelled only when the claim's readers may read the match too
+        // (`novelty_gate::neighbour_covers_write`).
+        if outcome.flags_near_duplicate()
+            && !sub.params.labels.iter().any(|l| l == "near-duplicate")
+        {
             sub.params.labels.push("near-duplicate".to_string());
         }
         sub.corroboration = Some(outcome.report(existing_id));

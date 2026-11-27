@@ -139,7 +139,7 @@ pub struct SubmitClaimParams {
     pub labels: Vec<String>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting a new claim, and this call's evidence corroborates it (an evidence row, its BBA combined into the claim's belief, an AUTHORED edge from you; the claim's truth_value, labels and content stay its owner's): the response carries deduplicated.by='novelty_gate' and corroboration.evidence_id. If you cannot write that claim, or it has a different visibility than this write, your own claim is inserted labeled 'near-duplicate' and corroboration.refused says why. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never deduplicated by this gate (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting a new claim, and this call's evidence corroborates it (an evidence row, its BBA combined into the claim's belief, an AUTHORED edge from you; the claim's truth_value, labels and content stay its owner's): the response carries deduplicated.by='novelty_gate' and corroboration.evidence_id. If you cannot write that claim, or it has a different visibility than this write, your own claim is inserted instead, labeled 'near-duplicate' when everyone who can read it can also read the match, and corroboration.refused says why. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never deduplicated by this gate (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -806,7 +806,7 @@ pub struct MemorizeParams {
     pub tags: Option<Vec<String>>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting a new claim, and this memory corroborates it as testimony evidence (an evidence row, its BBA combined into the claim's belief, an AUTHORED edge from you; the claim's truth_value, labels and content stay its owner's): the response carries deduplicated.by='novelty_gate' and corroboration.evidence_id. If you cannot write that claim, or it has a different visibility than this write, your own claim is inserted tagged 'near-duplicate' and corroboration.refused says why. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never deduplicated by this gate (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting a new claim, and this memory corroborates it as testimony evidence (an evidence row, its BBA combined into the claim's belief, an AUTHORED edge from you; the claim's truth_value, labels and content stay its owner's): the response carries deduplicated.by='novelty_gate' and corroboration.evidence_id. If you cannot write that claim, or it has a different visibility than this write, your own claim is inserted instead, tagged 'near-duplicate' when everyone who can read it can also read the match, and corroboration.refused says why. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never deduplicated by this gate (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -1753,8 +1753,10 @@ pub struct SubmitClaimResponse {
 ///
 /// When the caller may not attach to that claim, or attaching would move its
 /// evidence into a different audience than the one it asked for, its OWN
-/// claim is inserted instead, labelled `near-duplicate`, and this block says
-/// why (`refused`) and which claim was nearest.
+/// claim is inserted instead, and this block says why (`refused`) and which
+/// claim was nearest. That claim is labelled `near-duplicate` only when all
+/// of its readers can read the nearest claim too
+/// (`novelty_gate::neighbour_covers_write`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Corroboration {
@@ -1768,7 +1770,7 @@ pub enum Corroboration {
         note: Option<&'static str>,
     },
     /// Not attached: `refused` is the reason, `nearest_claim_id` the claim the
-    /// gate matched. The caller's own claim was inserted, flagged.
+    /// gate matched. The caller's own claim was inserted.
     Refused {
         refused: &'static str,
         nearest_claim_id: String,
