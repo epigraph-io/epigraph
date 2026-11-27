@@ -55,6 +55,15 @@
 //!   [`migration_224_refuses_to_apply_over_another_body`] and
 //!   [`the_224_undo_restores_the_oauth_family_on_190s_path`]: what 224
 //!   changed, its md5 precondition, and its undo runbook.
+//! * [`the_system_agent_family_resolves_in_pg_catalog_only`]: 148's seven
+//!   system-agent registry definers (176's body for the `agents` guard) are
+//!   on 172's form since 352, keep their owner and grants, and run on it;
+//!   [`the_system_agent_audit_ignores_a_public_overload_of_jsonb_build_object`]
+//!   is the resolution 352 closes, observed through the registration's audit
+//!   row. [`migration_352_changes_only_the_family_paths_and_qualifiers`],
+//!   [`migration_352_refuses_to_apply_over_another_body`] and
+//!   [`the_352_undo_restores_the_family_on_its_public_path`]: what 352
+//!   changed, its md5 precondition, and its undo runbook.
 //!
 //! Each catalog check is CALIBRATED in-test: probe definers of each wrong shape
 //! are created on the test database and must be reported.
@@ -78,7 +87,7 @@
 //! `CAST(x AS some_type)` (it reads a type only after `::` or before `%`); the
 //! second and later relations of a comma-joined `FROM a, b`, and the relation
 //! after `DELETE .. USING`; quoted identifiers. No pg_catalog-only body at
-//! 190 or 224 uses any of these forms.
+//! 190, 224 or 352 uses any of these forms.
 //!
 //! Uses the non-macro `sqlx::query` forms so the offline `.sqlx/` cache is not
 //! extended for one test.
@@ -103,7 +112,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_admin_scopes_armed()",
     "public.epigraph_agent_is_retired(uuid)",
     "public.epigraph_agent_prompt_history(uuid)",
-    "public.epigraph_agents_refuse_registered_system_key()",
     "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
     "public.epigraph_allowlisted_operator(uuid)",
     "public.epigraph_arm_operator_binding()",
@@ -185,7 +193,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_human_operators_guard_insert()",
     "public.epigraph_human_operators_guard_update()",
     "public.epigraph_human_operators_mirror_instance_admins()",
-    "public.epigraph_human_operators_refuse_system_agent()",
     "public.epigraph_inherit_fragment_tenancy_stmt()",
     "public.epigraph_inherit_tenancy_stmt()",
     "public.epigraph_instance_admins_frozen()",
@@ -209,7 +216,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_operator_links_audit()",
     "public.epigraph_operator_links_operator_is_human()",
     "public.epigraph_operator_links_refuse_allowlisted_agent()",
-    "public.epigraph_operator_links_refuse_retired_system_agent()",
     "public.epigraph_operator_links_refuse_role_holder()",
     "public.epigraph_operator_of_author(uuid)",
     "public.epigraph_operator_scope_exempt()",
@@ -240,7 +246,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_refuse_role_node_subject()",
     "public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)",
     "public.epigraph_register_human_operator(uuid, text, uuid)",
-    "public.epigraph_register_system_agent(text, uuid, text)",
     "public.epigraph_reown_legacy_edges_to_signer(integer, uuid[])",
     "public.epigraph_reown_legacy_writer_bbas(integer)",
     "public.epigraph_require_attributable(uuid, uuid, boolean)",
@@ -272,9 +277,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_set_admin_scope_enforcement(boolean, text)",
     "public.epigraph_set_elevation_ticket_challenge(uuid, jsonb)",
     "public.epigraph_set_passkey_enrollment_challenge(uuid, jsonb)",
-    "public.epigraph_system_agents_audit()",
-    "public.epigraph_system_agents_guard_insert()",
-    "public.epigraph_system_agents_immutable()",
     "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
     "public.epigraph_team_group_remove_member(uuid, uuid, text)",
     "public.epigraph_team_group_roster_verbs_only()",
@@ -298,7 +300,9 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 // 189 -> 188: 311 re-states `epigraph_provision_oauth_agent` on 172's form.
 // 188 -> 187: 346's successor on this tree re-states `epigraph_is_group_admin(uuid)` on
 // 172's form (staging 2026-11-26: each branch lowered it by one on its own).
-const HIGH_WATER: usize = 187;
+// 187 -> 180: 352 re-states 148's seven system-agent registry definers on
+// 172's form.
+const HIGH_WATER: usize = 180;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.
@@ -351,6 +355,38 @@ const OAUTH_FAMILY_224: &[(&str, bool, usize)] = &[
         false,
         3,
     ),
+];
+
+/// 148's system-agent registry definers (176's body for the `agents` guard)
+/// 352 re-states on 172's form. `(signature, the number of `pg_catalog.`
+/// qualifiers 352 inserts into its body)`. Neither PUBLIC nor the
+/// application role executes any of them (148's grant set; the owner,
+/// `epigraph_maintenance`, holds EXECUTE as owner).
+const SYSTEM_AGENT_FAMILY_352: &[(&str, usize)] = &[
+    ("public.epigraph_system_agents_guard_insert()", 7),
+    ("public.epigraph_system_agents_immutable()", 0),
+    ("public.epigraph_system_agents_audit()", 1),
+    ("public.epigraph_agents_refuse_registered_system_key()", 1),
+    ("public.epigraph_human_operators_refuse_system_agent()", 2),
+    (
+        "public.epigraph_operator_links_refuse_retired_system_agent()",
+        2,
+    ),
+    ("public.epigraph_register_system_agent(text, uuid, text)", 3),
+];
+
+/// The built-ins the family's 148 / 176 bodies call; 352 writes each
+/// `pg_catalog.`-qualified.
+const SYSTEM_AGENT_FAMILY_BUILTINS: &[&str] = &[
+    "current_setting(",
+    "pg_advisory_xact_lock(",
+    "hashtext(",
+    "length(",
+    "now(",
+    "lower(",
+    "encode(",
+    "jsonb_build_object(",
+    "format(",
 ];
 
 /// One `definers` row: signature, `search_path`, `proconfig`, owner, ACL,
@@ -1802,6 +1838,409 @@ async fn the_224_undo_restores_the_oauth_family_on_190s_path(pool: PgPool) {
     drop(conn);
     assert_eq!(
         session_take_src(&pool).await,
+        foreign,
+        "the undo left the foreign body"
+    );
+}
+
+/// An agent row with a key of its own, inserted on the test's superuser pool.
+async fn seed_plain_agent(pool: &PgPool) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let key: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query("INSERT INTO public.agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(id)
+        .bind(&key)
+        .execute(pool)
+        .await
+        .expect("seed an agent");
+    id
+}
+
+/// Register `agent` as the workflow-ingest system agent through 148's
+/// definer, on the test's superuser pool (the definer's superuser arm).
+async fn register_system_agent(pool: &PgPool, agent: uuid::Uuid, reason: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT registered_now FROM \
+           public.epigraph_register_system_agent('workflow-ingest', $1, $2)",
+    )
+    .bind(agent)
+    .bind(reason)
+    .fetch_one(pool)
+    .await
+    .expect("the registration definer runs on its pinned path")
+}
+
+fn db_message<T>(r: &Result<T, sqlx::Error>) -> String {
+    r.as_ref()
+        .err()
+        .and_then(|e| e.as_database_error())
+        .map(|d| d.message().to_string())
+        .unwrap_or_default()
+}
+
+/// Migration 352: 148's seven system-agent registry definers (176's body for
+/// the `agents` guard) are on 172's form, call every built-in
+/// `pg_catalog.`-qualified, keep their owner and grants, and run on that path
+/// over real rows. Run here: the registration definer, the registry's guard
+/// (a refusal and the accepting path), its audit trigger, its immutability
+/// trigger on both the row and the TRUNCATE path, and the `agents` key guard.
+/// The `human_operators` and `operator_links` reverse guards run in
+/// `system_agent_registry.rs` (their tables' other guards need a full human
+/// operator fixture).
+///
+/// Fails before 352: each pins `public, pg_temp` and calls its built-ins
+/// unqualified.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_system_agent_family_resolves_in_pg_catalog_only(pool: PgPool) {
+    let defs = definers(&pool).await;
+    for (sig, _) in SYSTEM_AGENT_FAMILY_352 {
+        let d = defs
+            .get(*sig)
+            .unwrap_or_else(|| panic!("{sig} is not a SECURITY DEFINER function"));
+        assert_eq!(
+            d.config,
+            vec!["search_path=pg_catalog, pg_temp".to_string()],
+            "{sig}: 172's path"
+        );
+        assert_eq!(d.owner, "epigraph_maintenance", "{sig}: owner");
+        let code = code_only(&d.src);
+        for builtin in SYSTEM_AGENT_FAMILY_BUILTINS {
+            let all = code.matches(builtin).count();
+            let qualified = code.matches(&format!("pg_catalog.{builtin}")).count();
+            assert_eq!(
+                all, qualified,
+                "{sig}: an unqualified {builtin}..) remains; 172's written form qualifies \
+                 every built-in (a body copied from 148?)"
+            );
+        }
+        let can: (bool, bool) = sqlx::query_as(
+            "SELECT has_function_privilege('public', $1::regprocedure, 'EXECUTE'), \
+                    has_function_privilege('epigraph_app', $1::regprocedure, 'EXECUTE')",
+        )
+        .bind(*sig)
+        .fetch_one(&pool)
+        .await
+        .expect("privileges");
+        assert_eq!(can, (false, false), "{sig}: (PUBLIC, epigraph_app) EXECUTE");
+    }
+
+    let a = seed_plain_agent(&pool).await;
+    let b = seed_plain_agent(&pool).await;
+
+    // The guard's refusal path: `current_setting`, the advisory lock and
+    // `length(trim(..))` resolve before it refuses a blank reason.
+    let r = sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, reason) \
+         VALUES ('workflow-ingest', $1, '   ')",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await;
+    assert_eq!(
+        (sqlstate(&r).as_deref(), db_message(&r).as_str()),
+        (Some("22004"), "system_agents: a reason is required"),
+        "the guard refuses a blank reason (its plpgsql body resolved): {r:?}"
+    );
+
+    // The definer, the guard's accepting path and the audit trigger.
+    assert!(
+        register_system_agent(&pool, a, "b15 registration").await,
+        "the first registration is recorded"
+    );
+    assert!(
+        !register_system_agent(&pool, a, "again").await,
+        "a second registration of the same agent is idempotent"
+    );
+    let recorded: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT details->>'role', details->>'reason' FROM public.security_events \
+          WHERE event_type = 'operator.system_agent_registered' AND agent_id = $1",
+    )
+    .bind(a)
+    .fetch_all(&pool)
+    .await
+    .expect("the audit rows");
+    assert_eq!(
+        recorded,
+        vec![(
+            Some("workflow-ingest".to_string()),
+            Some("b15 registration".to_string())
+        )],
+        "one audit row, written by the audit trigger on its pinned path"
+    );
+
+    // The immutability trigger, on its row path and its TRUNCATE path.
+    let r = sqlx::query("UPDATE public.system_agents SET reason = 'changed'")
+        .execute(&pool)
+        .await;
+    assert_eq!(sqlstate(&r).as_deref(), Some("55000"), "{r:?}");
+    assert!(
+        db_message(&r).contains("is immutable"),
+        "the row path refuses: {r:?}"
+    );
+    let r = sqlx::query("TRUNCATE public.system_agents")
+        .execute(&pool)
+        .await;
+    assert_eq!(sqlstate(&r).as_deref(), Some("55000"), "{r:?}");
+    assert!(
+        db_message(&r).contains("cannot be truncated"),
+        "the statement path refuses: {r:?}"
+    );
+
+    // The `agents` key guard (176's body, with `pg_catalog.format`).
+    let r = sqlx::query(
+        "UPDATE public.agents SET public_key = \
+           (SELECT s.registered_public_key FROM public.system_agents s WHERE s.agent_id = $1) \
+         WHERE id = $2",
+    )
+    .bind(a)
+    .bind(b)
+    .execute(&pool)
+    .await;
+    assert_eq!(sqlstate(&r).as_deref(), Some("55000"), "{r:?}");
+    assert!(
+        db_message(&r).starts_with("AGK01: "),
+        "another agent cannot take the registered key: {r:?}"
+    );
+}
+
+/// The resolution 352 closes. On `public, pg_temp` a
+/// `public.jsonb_build_object(text, text, text, text, text, name)` matches the
+/// audit trigger's `jsonb_build_object('role', NEW.role, 'reason', NEW.reason,
+/// 'recorded_by', session_user)` on three argument types exactly and beats
+/// pg_catalog's `jsonb_build_object(VARIADIC "any")`, so it decides what the
+/// `operator.system_agent_registered` audit row records, and runs as the
+/// definer's owner. On `pg_catalog, pg_temp` with
+/// `pg_catalog.jsonb_build_object` it is never reached.
+///
+/// Fails before 352: the audit row records the overload's forged role and no
+/// reason.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_system_agent_audit_ignores_a_public_overload_of_jsonb_build_object(pool: PgPool) {
+    let agent = seed_plain_agent(&pool).await;
+    sqlx::raw_sql(
+        "CREATE FUNCTION public.jsonb_build_object(text, text, text, text, text, name) \
+         RETURNS jsonb LANGUAGE sql AS $$ SELECT '{\"role\": \"forged\"}'::jsonb $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the public overload");
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET search_path = public, pg_temp")
+        .execute(&mut *conn)
+        .await
+        .expect("the pre-352 path");
+    let calibration: Option<String> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('role', $1::text, 'reason', $2::text, \
+                                   'recorded_by', session_user)->>'role'",
+    )
+    .bind("workflow-ingest")
+    .bind("why")
+    .fetch_one(&mut *conn)
+    .await
+    .expect("calibration");
+    assert_eq!(
+        calibration.as_deref(),
+        Some("forged"),
+        "CALIBRATION: on a path listing public the overload wins the unqualified call"
+    );
+    sqlx::query("RESET search_path")
+        .execute(&mut *conn)
+        .await
+        .expect("reset");
+    drop(conn);
+
+    assert!(register_system_agent(&pool, agent, "the ingest identity").await);
+    let recorded: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT details->>'role', details->>'reason' FROM public.security_events \
+          WHERE event_type = 'operator.system_agent_registered' AND agent_id = $1",
+    )
+    .bind(agent)
+    .fetch_all(&pool)
+    .await
+    .expect("the audit row");
+    assert_eq!(
+        recorded,
+        vec![(
+            Some("workflow-ingest".to_string()),
+            Some("the ingest identity".to_string())
+        )],
+        "the registration's audit row records the role and reason, not a public overload's"
+    );
+}
+
+/// 352 changes, on the seven system-agent registry definers, only the path
+/// (`public, pg_temp` to `pg_catalog, pg_temp`) and the body by the
+/// `pg_catalog.` qualifiers it inserts (counted per function), and no other
+/// definer at all. No definer appears or disappears, and no owner, ACL or
+/// volatility moves.
+#[sqlx::test(migrations = false)]
+async fn migration_352_changes_only_the_family_paths_and_qualifiers(pool: PgPool) {
+    migrate(&pool, &below(352))
+        .await
+        .expect("migrate below 352");
+    let before = definers(&pool).await;
+    migrate(&pool, &below(353)).await.expect("migrate to 352");
+    let after = definers(&pool).await;
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "352 adds or drops no definer"
+    );
+    for (sig, _) in SYSTEM_AGENT_FAMILY_352 {
+        assert!(
+            before.contains_key(*sig),
+            "CALIBRATION: {sig} exists before 352"
+        );
+    }
+    for (sig, b) in &before {
+        let a = &after[sig];
+        assert_eq!(
+            (&a.owner, &a.acl, &a.volatile),
+            (&b.owner, &b.acl, &b.volatile),
+            "{sig}: owner, ACL and volatility unchanged"
+        );
+        let Some((_, qualifiers)) = SYSTEM_AGENT_FAMILY_352.iter().find(|(s, _)| s == sig) else {
+            assert_eq!(a, b, "{sig}: not in 352's family, unchanged");
+            continue;
+        };
+        assert_eq!(
+            b.config,
+            vec!["search_path=public, pg_temp".to_string()],
+            "{sig}: 148's path before 352"
+        );
+        assert_eq!(
+            a.config,
+            vec!["search_path=pg_catalog, pg_temp".to_string()],
+            "{sig}: 172's path after 352"
+        );
+        assert_eq!(
+            a.src.matches("pg_catalog.").count() - b.src.matches("pg_catalog.").count(),
+            *qualifiers,
+            "{sig}: the qualifiers 352 inserts"
+        );
+        assert_eq!(
+            a.src.replace("pg_catalog.", ""),
+            b.src.replace("pg_catalog.", ""),
+            "{sig}: qualification only"
+        );
+    }
+}
+
+/// A body for `epigraph_system_agents_immutable` on its pre-352 path.
+fn immutable_with(src: &str) -> String {
+    format!(
+        "CREATE OR REPLACE FUNCTION public.epigraph_system_agents_immutable() \
+         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
+         SET search_path = public, pg_temp AS $body${src}$body$"
+    )
+}
+
+async fn immutable_src(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT prosrc FROM pg_catalog.pg_proc \
+          WHERE oid = 'public.epigraph_system_agents_immutable()'::regprocedure",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the immutability trigger's body")
+}
+
+/// 352 re-states each body whole, so it refuses to apply over any other body
+/// and changes nothing. POSITIVE CONTROL: restored to 148's body, 352
+/// applies.
+#[sqlx::test(migrations = false)]
+async fn migration_352_refuses_to_apply_over_another_body(pool: PgPool) {
+    migrate(&pool, &below(352))
+        .await
+        .expect("migrate below 352");
+    let original = immutable_src(&pool).await;
+    sqlx::raw_sql(&immutable_with(&format!(
+        "{original}-- a later migration's delta\n"
+    )))
+    .execute(&pool)
+    .await
+    .expect("re-body");
+    let before = definers(&pool).await;
+    let err = migrate(&pool, &below(353))
+        .await
+        .expect_err("352 over another body");
+    assert!(
+        err.contains("is not the body 352 re-states"),
+        "the refusal names the reason: {err}"
+    );
+    let applied: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 352)")
+            .fetch_one(&pool)
+            .await
+            .expect("probe");
+    assert!(!applied, "a refused 352 is not recorded");
+    assert_eq!(
+        definers(&pool).await,
+        before,
+        "a refused 352 changes no definer"
+    );
+
+    sqlx::raw_sql(&immutable_with(&original))
+        .execute(&pool)
+        .await
+        .expect("restore 148's body");
+    migrate(&pool, &below(353))
+        .await
+        .expect("POSITIVE CONTROL: over 148's body, 352 applies");
+}
+
+/// `docs/runbooks/352-undo.sql` returns every definer to its state below 352
+/// (148's and 176's bodies on `public, pg_temp`, owner and ACL as they were),
+/// twice over, and refuses (55000, nothing changed) over a body that is
+/// neither 352's nor the one below it.
+#[sqlx::test(migrations = false)]
+async fn the_352_undo_restores_the_family_on_its_public_path(pool: PgPool) {
+    let undo = repo_text("docs/runbooks/352-undo.sql");
+    migrate(&pool, &below(352))
+        .await
+        .expect("migrate below 352");
+    let before = definers(&pool).await;
+    migrate(&pool, &below(353)).await.expect("migrate to 352");
+    assert_ne!(
+        definers(&pool).await,
+        before,
+        "CALIBRATION: 352 changed the definers"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("the undo applies");
+    assert_eq!(
+        definers(&pool).await,
+        before,
+        "the definers are as below 352"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("a second run applies");
+    assert_eq!(definers(&pool).await, before, "idempotent");
+
+    let foreign = "\nBEGIN\n    RETURN NULL;\nEND ";
+    sqlx::raw_sql(&immutable_with(foreign))
+        .execute(&pool)
+        .await
+        .expect("a foreign body");
+    // The undo opens its own transaction: end it on the same connection.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+    assert_eq!(
+        sqlstate(&r).as_deref(),
+        Some("55000"),
+        "the undo over a foreign body: {r:?}"
+    );
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the undo's transaction");
+    drop(conn);
+    assert_eq!(
+        immutable_src(&pool).await,
         foreign,
         "the undo left the foreign body"
     );

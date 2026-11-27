@@ -5212,6 +5212,31 @@ restart.
   key; one near the btree tuple limit would fail the build, or later an INSERT with 54000). Undo:
   `docs/runbooks/351-undo.sql` (roll the binary back first). **Deploy order:** migrate BEFORE the
   binary of this change (its lookup names the function); an older binary runs on 351 unchanged.
+- **352**: `system_agent_definers_pg_catalog_path` (backlog 368ce622, the family after 190's
+  and 224's). Re-states 148's seven system-agent registry definers
+  (`epigraph_register_system_agent`, the registry triggers `epigraph_system_agents_guard_insert`,
+  `_immutable` and `_audit`, and the reverse guards `epigraph_agents_refuse_registered_system_key`
+  (176's body), `epigraph_human_operators_refuse_system_agent` and
+  `epigraph_operator_links_refuse_retired_system_agent`) on 172's form: `SET search_path =
+  pg_catalog, pg_temp` (from 148's `public, pg_temp`), with `current_setting(`,
+  `pg_advisory_xact_lock(`, `hashtext(`, `length(`, `now()`, `lower(`, `encode(`,
+  `jsonb_build_object(` and `format(` qualified `pg_catalog.` and no other byte of the 148 / 176
+  bodies changed (`_immutable` calls no function: only its path moves). On the old path a
+  `public.jsonb_build_object(text, text, text, text, text, name)` decided what a registration's
+  `operator.system_agent_registered` audit row records, running as the definer's owner.
+  Signatures, owner (`epigraph_maintenance`), ACL and triggers unchanged; they stay registered at
+  148 in `tenancy_backfill.rs`. A precondition checks the md5 of each body in place (55000,
+  nothing changed, over any other body). `PUBLIC_PATH_REGISTER` loses the seven (`HIGH_WATER`
+  187 -> 180). Pinned by `epigraph-db/tests/definer_search_path_ratchet.rs`
+  (`the_system_agent_family_resolves_in_pg_catalog_only`,
+  `the_system_agent_audit_ignores_a_public_overload_of_jsonb_build_object`,
+  `migration_352_changes_only_the_family_paths_and_qualifiers`,
+  `migration_352_refuses_to_apply_over_another_body`,
+  `the_352_undo_restores_the_family_on_its_public_path`) and, behaviourally,
+  `system_agent_registry.rs`. Undo: `docs/runbooks/352-undo.sql` (148's and 176's bodies on
+  `public, pg_temp`, byte for byte; md5-guarded, idempotent). No binary depends on it; no deploy
+  order. Measure first (the precondition): `SELECT p.oid::regprocedure, md5(p.prosrc) FROM pg_proc
+  p WHERE p.proname LIKE 'epigraph\_%system\_agent%'` matches the md5s in the file.
 
 ## `-- no-transaction` migrations
 
