@@ -16,7 +16,7 @@ row names no `[[bin]]`, or when a row's class is not one of the five below.
 |---|---|
 | `standing` | Standing maintenance: runs on a timer or at a regular cadence against a live deployment. |
 | `admin` | Operator admin or ceremony: a deliberate, reusable operator act run by hand when needed (provisioning, authority and ownership, group keys and sealing, reviewed belief-cache waves and their undo, repairs of named rows). |
-| `one-shot` | A backfill, sweep, repair or measurement tied to one change, migration or incident. Once that change has been applied everywhere it is a retirement candidate (backlog `02de2b85`). |
+| `one-shot` | A backfill, sweep, repair or measurement tied to one change, migration or incident. Once that change has been applied everywhere it is a retirement candidate (backlog `02de2b85`), unless its row says it is an *undo path*: keep that one while its change can still be undone. |
 | `ingest` | Ingest client: writes source content into the graph, through the HTTP API or the ingestion pipeline. |
 | `experiment` | Research experiment or analysis: graph analyses, enrichment and bridging pipelines, hypothesis and experiment tooling, calibration harnesses. Not needed to operate a deployment. |
 
@@ -54,10 +54,10 @@ row names no `[[bin]]`, or when a row's class is not one of the five below.
 | `belief_shadow_report` | one-shot | Read-only report of served beliefs beside the atom-fold derivation, for the atom-level belief cutover review. |
 | `supersede_belief_delta` | one-shot | Read-only dry-run belief delta of the supersede belief fixes. |
 | `r131_factor_mint` | one-shot | Mints the missing BP factors of factorless claim-to-claim `corroborates`/`refutes` edges (backlog `5094766c`). |
-| `decomposes_to_factor_sweep` | one-shot | Exports and deletes the BP factors of `decomposes_to` edges minted before migration 262 (backlog `444b1f4a`). |
+| `decomposes_to_factor_sweep` | one-shot | Exports and deletes the BP factors of `decomposes_to` edges minted before migration 262 (backlog `444b1f4a`). *Undo path:* its `--restore` mode is the factor-restore step of the migration 262 undo runbook (`docs/runbooks/262-undo.sql`). |
 | `sweep_retired_source_bbas` | one-shot | Retroactively removes the BBAs retired claims froze onto current claims, with dry run and undo. |
 | `backfill_factors` | one-shot | Tier A factor backfill (evidence phase, edge rewire phases). |
-| `restore_edge_factors` | one-shot | Undoes a targeted edge-factor rewire's row writes by compare-and-swap. |
+| `restore_edge_factors` | one-shot | Undoes a targeted edge-factor rewire's row writes by compare-and-swap. *Undo path* of `backfill_factors`'s rewire phases. |
 | `refresh_truth_mirrors` | one-shot | Compare-and-set refresh of `claims.truth_value` copies of an old belief cache, from recompute wave files, and its undo. |
 | `retire_match_candidates` | one-shot | Retires listed match candidates and retracts the evidential edges they promoted (a same-source provenance leak). |
 | `backfill_evidence_type` | one-shot | Types legacy mass-function rows whose provenance determines their evidence type (backlog `bc06ec6f`). |
