@@ -3,10 +3,17 @@
 -- back out, in ONE transaction, on the migration (superuser or maintenance)
 -- DSN.
 --
--- NO BINARY NEEDS ROLLING BACK: a binary with 354's change never touches
--- the harvester tables, so it runs on this restored schema too. Roll it back
--- only if you need the harvester code paths an older binary carried (the
--- operator CLI's fragment arm, the seal's fragment blanking).
+-- BINARIES: the API, the MCP server and the seal run on this restored
+-- schema unchanged (a binary with 354's change never touches the harvester
+-- tables). The operator CLI with 354's change does NOT: below 354
+-- `epigraph_propagate_tenancy` cascades to `harvester_claim_provenance`
+-- again, a table its model no longer has, so its `restrict-claims`,
+-- `regroup-claims`, `reown-*` and `reown-workflows` refuse ("no writer
+-- rule"; they fail closed and change nothing). Roll the operator CLI back to
+-- a build without 354's change before using those acts on an undone
+-- database. A binary with the change also no longer blanks a sealed claim's
+-- fragments; the tables come back empty, so there is none to blank until a
+-- writer appears.
 --
 -- WHAT IT DOES:
 --   * REFUSES (42501, nothing changed) unless the session is a superuser, a

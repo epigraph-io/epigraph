@@ -5289,12 +5289,21 @@ restart.
   'harvester_audit_reports', count(*) FROM harvester_audit_reports UNION ALL SELECT
   'harvester_claim_provenance', count(*) FROM harvester_claim_provenance UNION ALL SELECT
   'harvester_enriched_concepts', count(*) FROM harvester_enriched_concepts;` on the migration
-  DSN. **Deploy order:** the binaries carrying this change FIRST (they run on either side of
-  354), then 354; an older binary on a 354 database boots, but its operator CLI acts refuse and a
-  seal fails (relation does not exist). Undo: `docs/runbooks/354-undo.sql` (the five tables
-  EMPTY at their 353 shape, the three functions, the four bodies byte for byte; md5-guarded,
-  idempotent). After 354 the earlier undo runbooks that name a harvester table (001's restore,
-  070, 074, 079, 126, 215, 218, 219, 242, 246, 258, 284, 347) fail until 354 is undone first.
+  DSN. **Deploy order:** the binaries carrying this change FIRST, then 354 soon after, in a
+  quiet window. An older binary on a 354 database boots, but its operator CLI acts refuse and a
+  seal fails (relation does not exist). The new API and MCP binaries run on either side of 354;
+  the new operator CLI's `restrict-claims`, `regroup-claims`, `reown-*` and `reown-workflows`
+  refuse below 354 ("no writer rule", fail closed) because `epigraph_propagate_tenancy` still
+  cascades to `harvester_claim_provenance` there. Until 354 a seal also no longer blanks a cited
+  fragment, and the boot check no longer refuses a disabled 089/173 stamping trigger (both
+  moot over empty tables). **Locks:** the DROP takes ACCESS EXCLUSIVE on `claims` and `groups`
+  (it removes the foreign keys' RI triggers there) to commit; a waiting 354 queues their readers
+  for at most its 3 s lock timeout, and a concurrent `claims` UPDATE on the old propagate body can
+  deadlock with it (one side aborts; retry). Undo: `docs/runbooks/354-undo.sql` (the five tables
+  EMPTY at their 353 shape with 001's comments, the three functions, the four bodies byte for
+  byte; md5-guarded, idempotent); roll the operator CLI back with it, for the same reason. The
+  earlier undo runbooks that touch a harvester table (001's restore, 070, 074, 126, 218, 219,
+  242, 246, 258, 284, 347) were written for a schema that has them: undo 354 first.
 
 ## `-- no-transaction` migrations
 

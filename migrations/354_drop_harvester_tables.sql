@@ -66,23 +66,43 @@
 -- PINNED BY `crates/epigraph-db/tests/no_harvester_references.rs`: at head no
 -- function body, policy, trigger or relation names a harvester table, and no
 -- `crates/*/src` file names one; 354 refuses (55000, nothing changed) over a
--- non-empty table and over another body; the undo restores the catalog below
--- 354 exactly and 354 then applies again.
+-- non-empty table and over another body, and (42501) a session that could
+-- not read every row; the undo restores what the test reads of the catalog
+-- below 354 and 354 then applies again.
 --
--- DEPLOY ORDER: the binaries carrying this change FIRST, then this migration.
--- A binary without the change runs the operator CLI's table model and the
--- seal's fragment blanking against these tables, so on a 354 database its
--- `restrict-claims` / `regroup-claims` / `reown-*` refuse and a seal fails
--- (relation does not exist); the API still boots (an absent tenancy-trigger
--- table is a warning). The binary with the change runs on either side of
--- 354.
+-- DEPLOY ORDER: the binaries carrying this change FIRST, then this migration,
+-- soon after. A binary without the change runs the operator CLI's table model
+-- and the seal's fragment blanking against these tables, so on a 354
+-- database its `restrict-claims` / `regroup-claims` / `reown-*` refuse and a
+-- seal fails (relation does not exist); the API still boots (an absent
+-- tenancy-trigger table is a warning). The API and MCP binaries with the
+-- change run on either side of 354; the operator CLI with the change does
+-- NOT: below 354 `epigraph_propagate_tenancy` still cascades to
+-- `harvester_claim_provenance`, which its table model no longer has, so its
+-- `restrict-claims` / `regroup-claims` / `reown-*` / `reown-workflows`
+-- refuse ("no writer rule"; fail closed, nothing changed) until 354 is
+-- applied. In the same window a seal no longer blanks a cited fragment and
+-- the API's boot check no longer refuses a disabled 089/173 stamping
+-- trigger; both matter only while the tables hold rows, and they were
+-- measured empty with no writer.
+--
+-- LOCKS: besides the five tables, the DROP removes the foreign keys' RI
+-- triggers on `claims` and `groups`, which takes ACCESS EXCLUSIVE on both to
+-- the end of this transaction. Readers of those tables queue behind a 354
+-- that is waiting for its lock (at most the 3 s lock timeout, then 55P03 and
+-- nothing changed), and a concurrent `claims` UPDATE still running the old
+-- propagate body (it writes `harvester_fragments`) can deadlock with it;
+-- Postgres aborts one side, and either is safe to retry. Apply it in a quiet
+-- window.
 --
 -- UNDO: `docs/runbooks/354-undo.sql` (recreates the five tables EMPTY at
--- their 353 shape with their triggers, policies, grants and the three
--- functions, and restores the four bodies; guarded by md5, idempotent).
--- After 354 the earlier undo runbooks that name a harvester table (070, 074,
--- 079, 126, 215, 218, 219, 242, 246, 258, 284, 347 and 001's restore) fail
--- until 354 is undone first.
+-- their 353 shape with their triggers, policies, grants, comments and the
+-- three functions, and restores the four bodies; guarded by md5,
+-- idempotent). On an undone database the operator CLI with this change
+-- refuses its re-own, restrict and regroup acts (see DEPLOY ORDER): roll
+-- the operator CLI back with it. The earlier undo runbooks that touch a
+-- harvester table (001's restore, 070, 074, 126, 218, 219, 242, 246, 258,
+-- 284, 347) were written for a schema that has them: undo 354 first.
 SET LOCAL lock_timeout = '3s';
 
 -- -------------------------------------------------------------------
