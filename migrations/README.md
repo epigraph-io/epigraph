@@ -5283,7 +5283,10 @@ restart.
   body refuses a non-maintenance session 42501 `AGS02`); the AFTER trigger
   `epigraph_agent_scopes_audit` writes exactly one `security_events` row per grant
   (`platform.agent_scope_granted`) and per revoke (`platform.agent_scope_revoked`), whatever path
-  wrote the row; a repeated revoke returns false and writes nothing. Adds `agent_scope_arming`
+  wrote the row; a repeated revoke returns false and writes nothing. The events carry the scoped
+  agent as `agent_id`, so through 169's own-row arm the agent reads its own grant and revoke events
+  (scope, group, class, window, the granting or revoking login and the reason text), as with 166's
+  `platform.role_agent_*` events; write a reason as the agent may read it. Adds `agent_scope_arming`
   (one row, installed `armed = false`; the application and maintenance roles hold SELECT only, so
   only a superuser moves it until the first enforcing door brings its audited verb). No write door
   reads either table, so applying 356 changes no write and no read. Registered in

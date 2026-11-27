@@ -70,8 +70,20 @@
 -- exactly `epigraph_bypass()` or `epigraph_definer_bypass()` for SELECT,
 -- INSERT and UPDATE, and has no DELETE policy. The application role holds NO
 -- privilege on the table at all (not even SELECT): a later enforcing door
--- reads it through a definer, and an agent's declared scope set is not the
--- request path's to enumerate.
+-- reads it through a definer, and the request path cannot enumerate the
+-- table.
+--
+-- WHAT THE SCOPED AGENT CAN STILL SEE: its own audit rows. Each event above
+-- is written with `agent_id` = the scoped agent, and 169's
+-- `security_events_read` own-row arm admits an agent's own rows (it excludes
+-- only `cascade.*`), so the agent reads every `platform.agent_scope_*` event
+-- about itself (the security audit and timeline routes). Each names the
+-- scope, the group (the grant does not require membership, so this may be a
+-- group the agent is not in), the class, the window, the granting or
+-- revoking login and the operator's reason text. Write a reason as the agent
+-- may read it. This is the shape of 166's `platform.role_agent_*` events;
+-- narrowing the own-row arm for both families belongs with the first
+-- enforcing door, not with this record.
 --
 -- ===================================================================
 -- 3. THE VERBS (maintenance only)
