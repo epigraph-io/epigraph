@@ -415,7 +415,8 @@ also runs the act once inside a savepoint it rolls back, and reports what it did
 claims' edges and evidence, as far as the caller can read them (`plan.effects`):
 `edges_widened` (public after and not before, or no longer requiring a group it required),
 `edges_kept` (still requiring every group it required: an edge to a claim that stays behind, a
-declared edge), each with its `before` and `after` tenancy; `evidence_moved` (a count) and
+declared edge), each with its `before` and `after` tenancy (`after` is `null` for an edge the
+caller can no longer read after the act, reported kept); `evidence_moved` (a count) and
 `evidence_kept` (rows that stay behind, such as evidence pinned private by migration 110). The
 act's own cascade decides all of it, so the report cannot drift from the act. Lists stop at
 5,000 rows each (`truncated`).

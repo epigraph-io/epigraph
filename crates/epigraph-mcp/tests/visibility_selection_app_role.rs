@@ -285,6 +285,8 @@ fn predicted(effects: &serde_json::Value) -> Vec<(Uuid, String, PredictedGroup, 
     ["edges_widened", "edges_kept"]
         .iter()
         .flat_map(|k| effects[*k].as_array().cloned().unwrap_or_default())
+        // An edge the caller no longer reads after the act predicts nothing.
+        .filter(|e| !e["after"].is_null())
         .map(|e| {
             (
                 e["edge_id"].as_str().unwrap().parse().unwrap(),

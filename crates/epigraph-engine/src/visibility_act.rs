@@ -862,8 +862,10 @@ pub struct PlannedEdge {
     pub relationship: String,
     /// Its tenancy now.
     pub before: StoredTenancy,
-    /// Its tenancy after the act.
-    pub after: StoredTenancy,
+    /// Its tenancy after the act; `None` when the caller can no longer read
+    /// the edge after it (then it is reported kept: nothing the caller reads
+    /// says it widened).
+    pub after: Option<StoredTenancy>,
 }
 
 /// An evidence row of a planned claim, as the act would leave it.
@@ -1265,10 +1267,8 @@ async fn trial(
     };
     for e in edges_before.iter().take(MAX_EFFECT_ROWS) {
         let before = tenancy_of(e);
-        let after = after
-            .get(&e.id)
-            .map_or_else(|| before.clone(), |a| tenancy_of(a));
-        let widened = widens(&before, &after);
+        let after = after.get(&e.id).map(|a| tenancy_of(a));
+        let widened = after.as_ref().is_some_and(|a| widens(&before, a));
         let planned = PlannedEdge {
             edge_id: e.id,
             source_id: e.source_id,
@@ -1277,7 +1277,7 @@ async fn trial(
             target_type: e.target_type.clone(),
             relationship: e.relationship.clone(),
             before: before.withhold_foreign(&own),
-            after: after.withhold_foreign(&own),
+            after: after.map(|a| a.withhold_foreign(&own)),
         };
         if widened {
             out.edges_widened.push(planned);
