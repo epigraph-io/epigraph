@@ -371,6 +371,13 @@ pub const REFUSED_NOT_WRITABLE: &str = "claim not writable by caller";
 /// audience is not the one this write asked for (backlog fef24216).
 pub const REFUSED_OTHER_SCOPE: &str = "claim visibility differs from this write's";
 
+/// [`crate::types::Corroboration::Refused`]'s reason when the matched claim is
+/// a promoted hypothesis whose evidence frame (`research_validity`) is missing
+/// or not binary, so no evidence can be filed on it
+/// (`epigraph_engine::promotion::promoted_hypothesis_filing_frame`).
+pub const REFUSED_NO_FILING_FRAME: &str =
+    "claim cannot take this evidence: its evidence frame is missing or not binary";
+
 /// The note on a corroboration whose evidence body this caller's group had
 /// already attached to the claim.
 pub const ALREADY_ATTACHED_NOTE: &str =
@@ -403,7 +410,8 @@ pub enum CorroborationOutcome {
     /// the same evidence body to this claim, and nothing was written.
     Attached { evidence_id: Option<Uuid> },
     /// Nothing was written; the caller inserts its own claim. `reason` is
-    /// [`REFUSED_NOT_WRITABLE`] or [`REFUSED_OTHER_SCOPE`].
+    /// [`REFUSED_NOT_WRITABLE`], [`REFUSED_OTHER_SCOPE`] or
+    /// [`REFUSED_NO_FILING_FRAME`].
     /// `flag_near_duplicate` is whether that claim
     /// may carry the `near-duplicate` label ([`neighbour_covers_write`]).
     Refused {
@@ -515,6 +523,8 @@ pub fn neighbour_covers_write(
 ///   is inserted where it asked. This is a rule about where a write lands, not
 ///   a second belief filter: what the cache folds stays the derivation-scope
 ///   filter's decision.
+/// * The claim is a promoted hypothesis whose evidence frame is missing or not
+///   binary, so it can take no evidence from anyone. Checked before any write.
 ///
 /// The caller's own claim is labelled `near-duplicate` only when its readers
 /// can read the matched claim too ([`neighbour_covers_write`]); otherwise the
@@ -593,6 +603,36 @@ pub async fn corroborate(
             reason: REFUSED_OTHER_SCOPE,
             flag_near_duplicate,
         });
+    }
+
+    // Can the matched claim take evidence at all? A promoted hypothesis files
+    // it on `research_validity`, and a missing or non-binary frame refuses
+    // every attachment (`tools::claims::wire_attached_evidence_in_tx`). That
+    // refusal is a fact about the MATCHED claim, which the caller never named:
+    // failing the caller's submission on it would lose a write that was a
+    // successful dedup before corroboration existed. So it is decided here,
+    // before any write, and the caller's own claim is inserted instead. Any
+    // other failure (a read or write error) still propagates: a retry may
+    // corroborate, and a transient error must not leave a duplicate behind.
+    match epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut tx, viewer, existing_id)
+        .await
+    {
+        Ok(_) => {}
+        Err(
+            e @ (epigraph_db::DbError::NotFound { .. } | epigraph_db::DbError::InvalidData { .. }),
+        ) => {
+            tracing::warn!(
+                claim_id = %existing_id,
+                tool = ev.tool,
+                "novelty gate corroboration refused: the matched claim cannot take this \
+                 evidence; inserting the caller's own claim instead: {e}"
+            );
+            return Ok(CorroborationOutcome::Refused {
+                reason: REFUSED_NO_FILING_FRAME,
+                flag_near_duplicate,
+            });
+        }
+        Err(e) => return Err(internal_error(e)),
     }
 
     let edge_key = server.edge_signing_key().await?;

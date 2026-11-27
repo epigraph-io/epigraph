@@ -710,3 +710,78 @@ async fn a_public_paraphrase_of_a_team_claim_is_not_labelled_near_duplicate(pool
         "nothing written on the team claim"
     );
 }
+
+/// A's public claim is a PROMOTED hypothesis, and the `research_validity`
+/// frame its evidence is filed on does not exist, so no evidence can be
+/// attached to it by anyone. B's public paraphrase is not failed on that fact
+/// about a claim B never named: B's own claim is inserted, labelled
+/// `near-duplicate` (the match is public), the response names the refusal, and
+/// nothing of B lands on A's claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paraphrase_of_a_claim_that_cannot_take_evidence_is_inserted_not_failed(pool: PgPool) {
+    binary_truth(&pool).await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "corro-promoted-a").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "corro-promoted-b").await;
+    let server = app_server(&pool).await;
+
+    let original = "Raising the anneal temperature halves the defect density";
+    let a_claim = parse_uuid_field(
+        &submit_as(
+            &pool,
+            &server,
+            a,
+            submit(original, "wafer batch 3", "public", None, &[]),
+        )
+        .await,
+        "claim_id",
+    );
+    sqlx::query(
+        "UPDATE claims SET properties = coalesce(properties, '{}'::jsonb) \
+                || '{\"hypothesis_status\": \"promoted\"}'::jsonb \
+          WHERE id = $1",
+    )
+    .bind(a_claim)
+    .execute(&pool)
+    .await
+    .expect("promote A's claim");
+    let research_validity: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM frames WHERE name = 'research_validity'")
+            .fetch_one(&pool)
+            .await
+            .expect("frames");
+    assert_eq!(
+        research_validity, 0,
+        "PREMISE: no research_validity frame, so A's claim can take no evidence"
+    );
+    let before = claim_state(&pool, a_claim).await;
+
+    let paraphrase = "The defect density halves raising the anneal temperature";
+    let b_evidence = "independent wafer batch 9";
+    let body = submit_as(
+        &pool,
+        &server,
+        b,
+        submit(paraphrase, b_evidence, "public", None, &[]),
+    )
+    .await;
+
+    assert_ne!(body["claim_id"], a_claim.to_string(), "{body}");
+    assert_eq!(
+        body["corroboration"]["refused"],
+        "claim cannot take this evidence: its evidence frame is missing or not binary",
+        "{body}"
+    );
+    assert_eq!(
+        body["corroboration"]["nearest_claim_id"],
+        a_claim.to_string(),
+        "{body}"
+    );
+    let own = claims_with_content(&pool, paraphrase).await;
+    assert_eq!(own.len(), 1, "B's own claim: {own:?}");
+    assert!(own[0].3.iter().any(|l| l == "near-duplicate"), "{own:?}");
+    assert_eq!(claim_state(&pool, a_claim).await, before);
+    assert!(evidence_with_body(&pool, a_claim, b_evidence)
+        .await
+        .is_empty());
+    assert!(authored_edges(&pool, b, a_claim).await.is_empty());
+}
