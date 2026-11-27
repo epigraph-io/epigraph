@@ -963,7 +963,14 @@ and revoking the token's jti. Disarming the switch needs a restart.
 | MCP viewer (`tools/viewer.rs::request_viewer`) | the agent's own viewer |
 | Claim ownership (`require_owner_or_admin`) | the actor arm, as on stdio; never the `claims:admin` arm |
 | Federated tools (`enforce_federated_scope`) | refused (the bearer is never forwarded) |
-| Webhooks | registration refused (outside the ceiling); delivery keys on the principal, which is operated |
+| Webhooks | refused on every route: registration (outside the ceiling), and list, get and delete (a delegated request); delivery keys on the principal, which is operated |
+
+Webhooks are principal-only; a delegate acting under a delegated run token
+gets no webhook authority (backlog 9cd4592b). The list, get and delete routes
+resolve no viewer, so they refuse a delegated request themselves
+(`routes/webhooks.rs::refuse_delegated`), before they read the subscription
+store: a delegated token neither lists nor reads nor deletes any
+subscription, the operated agent's own included.
 
 An old binary decodes a `dlg` token as an ordinary token for an operated agent
 and refuses it, so any deploy order fails closed.

@@ -442,13 +442,19 @@ pub async fn register_webhook(
 /// `epigraph-core::canonical_scopes` and the role vocabulary — outside this
 /// PR's ledgered scope. The ownership filter, not a scope, is the control.
 ///
+/// Webhooks are principal-only; a delegate acting under a delegated run token
+/// gets no webhook authority (backlog 9cd4592b): a delegated request is
+/// refused before the store is read ([`refuse_delegated`]).
+///
 /// # Errors
 ///
 /// - 401 Unauthorized: no `AuthContext`, or a token that names no `agents.id`
+/// - 403 Forbidden: a delegated run token
 pub async fn list_webhooks(
     State(state): State<AppState>,
     caller: crate::middleware::bearer::RequirePrincipal,
-) -> Json<Vec<WebhookSubscription>> {
+) -> Result<Json<Vec<WebhookSubscription>>, ApiError> {
+    refuse_delegated(&caller.auth)?;
     let store = state.webhook_store.read().await;
     let subscriptions: Vec<WebhookSubscription> = store
         .values()
@@ -458,7 +464,32 @@ pub async fn list_webhooks(
         .filter(|sub| sub.agent_id == Some(caller.principal))
         .cloned()
         .collect();
-    Json(subscriptions)
+    Ok(Json(subscriptions))
+}
+
+/// The refusal [`refuse_delegated`] answers.
+const WEBHOOKS_PRINCIPAL_ONLY: &str =
+    "webhooks are principal-only: a delegate acting under a delegated run token has no \
+     webhook authority";
+
+/// Webhooks are principal-only (backlog 9cd4592b): refuse a request that
+/// carries a delegated run token (`dlg`), whatever it asks for and whoever
+/// owns the subscription, the token's own operated principal included.
+///
+/// No database read: a `dlg` context reaches a handler only after the bearer
+/// middleware found its delegation live for this request (`admit_delegated`;
+/// the non-`db` build refuses every one there), so its presence alone decides.
+/// The delegated scope ceiling already keeps `webhooks:write` off such a
+/// token; this refusal is what keeps list and get, which take no scope, and
+/// delete, whose scope refusal would name the scope rather than the rule,
+/// closed to a delegate.
+fn refuse_delegated(auth: &crate::middleware::bearer::AuthContext) -> Result<(), ApiError> {
+    if auth.delegated_by.is_some() {
+        return Err(ApiError::Forbidden {
+            reason: WEBHOOKS_PRINCIPAL_ONLY.into(),
+        });
+    }
+    Ok(())
 }
 
 /// Get one of the caller's webhook subscriptions by ID
@@ -477,16 +508,23 @@ pub async fn list_webhooks(
 /// away is bounded: the id is an unguessable v4 uuid and the caller is already
 /// authenticated.
 ///
+/// Webhooks are principal-only; a delegate acting under a delegated run token
+/// gets no webhook authority (backlog 9cd4592b): a delegated request is
+/// refused before the store is read, for every subscription, its own
+/// principal's included ([`refuse_delegated`]).
+///
 /// # Errors
 ///
 /// - 401 Unauthorized: no `AuthContext`, or a token that names no `agents.id`
-/// - 403 Forbidden: the subscription belongs to another principal
+/// - 403 Forbidden: the subscription belongs to another principal, or the
+///   request carries a delegated run token
 /// - 404 Not Found: No subscription with the given ID
 pub async fn get_webhook(
     State(state): State<AppState>,
     caller: crate::middleware::bearer::RequirePrincipal,
     Path(id): Path<Uuid>,
 ) -> Result<Json<WebhookSubscription>, ApiError> {
+    refuse_delegated(&caller.auth)?;
     let store = state.webhook_store.read().await;
     let sub = store.get(&id).cloned().ok_or(ApiError::NotFound {
         entity: "Webhook".to_string(),
@@ -537,11 +575,18 @@ pub async fn get_webhook(
 /// tokens minted by `test_bearer_token_with_scopes`, which uses one uuid for
 /// all three fields — a coincidence, not an invariant.
 ///
+/// Webhooks are principal-only; a delegate acting under a delegated run token
+/// gets no webhook authority (backlog 9cd4592b). Such a token cannot carry
+/// `webhooks:write` (it lies outside the delegated scope ceiling), and it is
+/// refused here as well, BEFORE the scope check, so the refusal names the rule
+/// rather than a missing scope ([`refuse_delegated`]).
+///
 /// # Errors
 ///
 /// - 401 Unauthorized: Missing or invalid Bearer token, or a token naming no
 ///   `agents.id`
-/// - 403 Forbidden: Missing scope or caller is not the webhook owner
+/// - 403 Forbidden: Missing scope, caller is not the webhook owner, or the
+///   request carries a delegated run token
 /// - 404 Not Found: No subscription with the given ID
 /// - 500 Internal: the row could not be removed from the table
 pub async fn delete_webhook(
@@ -554,6 +599,11 @@ pub async fn delete_webhook(
     let axum::Extension(auth) = auth_ctx.ok_or(ApiError::Unauthorized {
         reason: "authentication required".into(),
     })?;
+
+    // Principal-only (backlog 9cd4592b), before the scope check: a delegated
+    // run token never holds `webhooks:write`, so after it the refusal would
+    // name the scope and hide the rule.
+    refuse_delegated(&auth)?;
 
     // Unconditional, not conditional on the context being present.
     crate::middleware::scopes::check_scopes(&auth, &["webhooks:write"])?;
