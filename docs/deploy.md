@@ -2700,17 +2700,17 @@ agent process a different, active `signing` key of that agent:
 stdio only. `epigraph-mcp-full` refuses to serve unless the signing key is an
 ACTIVE `signing` key of the agent the identity key names.
 
-**What an agent's signature certifies** (backlog `a8c6a943`, ruling
-`d29f2f75`): a declared configuration, not a computation. A claim's signature
-binds the claim to the agent's key, and `authored_by.prompt_snapshot` names
-the model and prompt hash the agent was running at the claim's `created_at`
-(the snapshot the host attestor recorded, joined at read time; not a signed
-field of the claim). Neither commits to which recalled claims fed the output.
-`recall_events` records retrieval separately; it is not signed, not linked to
-the claims the agent then filed, and pruned after
-`RECALL_EVENTS_RETENTION_DAYS`. A signed context manifest, a separate row
-linked to the claim, is the planned extension once `recall_events` tenancy is
-decided.
+**What an agent's signature certifies** (backlog `a8c6a943`, provisional
+ruling `d29f2f75`): a declared configuration, not a computation. Where the
+agent signed a claim, the signature binds the claim to the agent's key, and
+`authored_by.prompt_snapshot` names the model and prompt hash the agent was
+running at the claim's `created_at` (the snapshot the host attestor recorded,
+joined at read time; not a signed field of the claim). Neither commits to
+which recalled claims fed the output. `recall_events` records retrieval
+separately; it is not signed, not linked to the claims the agent then filed,
+and pruned after `RECALL_EVENTS_RETENTION_DAYS`. A signed context manifest, a
+separate row linked to the claim, is the planned extension once
+`recall_events` tenancy is decided.
 
 **Role-attached agents (migration 166).** An agent attached to a role runs
 only while a human holds the role. An application write whose acting agent

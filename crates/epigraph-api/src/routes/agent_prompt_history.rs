@@ -87,17 +87,18 @@
 //!
 //! # What an agent's signature certifies
 //!
-//! A declared configuration, not a computation (backlog a8c6a943, ruling
-//! d29f2f75). A claim's signature binds the claim to the agent's key, and
-//! `authored_by.prompt_snapshot` names the model and prompt hash that agent
-//! was running at the claim's `created_at`: the snapshot the host attestor
-//! recorded (migration 161), the one this route lists, joined to the claim at
-//! read time and not a signed field of it. Neither commits to which recalled
-//! claims fed the output. `recall_events` records retrieval separately (the
-//! query and the claim ids it returned, per agent); it is not signed, not
-//! linked to the claims the agent then filed, and pruned after its retention.
-//! A signed context manifest, a separate row linked to the claim, is the
-//! planned extension once `recall_events` tenancy is decided.
+//! A declared configuration, not a computation (backlog a8c6a943, provisional
+//! ruling d29f2f75). Where the agent signed a claim, the signature binds the
+//! claim to the agent's key, and `authored_by.prompt_snapshot` names the model
+//! and prompt hash that agent was running at the claim's `created_at`: the
+//! snapshot the host attestor recorded (migration 161), the one this route
+//! lists, joined to the claim at read time and not a signed field of it.
+//! Neither commits to which recalled claims fed the output. `recall_events`
+//! records retrieval separately (the query and the claim ids it returned, per
+//! agent); it is not signed, not linked to the claims the agent then filed,
+//! and pruned after its retention. A signed context manifest, a separate row
+//! linked to the claim, is the planned extension once `recall_events` tenancy
+//! is decided.
 //!
 //! # No registration route
 //!
