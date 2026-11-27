@@ -3,15 +3,13 @@
 This file is loaded into any Claude Code / agent session opened in this repo.
 Project-wide rules below; module-specific rules live next to their code.
 
-## Adding MCP tools — `epigraph-tools` is not the extension point
+## Adding MCP tools — the two extension points
 
-`crates/epigraph-tools` defines a `Tool` trait and a `ToolRegistry`. Despite the
-names, that is **not** how tools reach the MCP server, and no crate in this
-workspace depends on it.
-
-`epigraph-mcp` has no extension trait — zero `pub trait` declarations, and a
-compile-time `#[tool_router]` impl block. Its router and `scope_map` are a
-closed set by design.
+There is no in-process tool trait or registry to implement. `epigraph-mcp` has
+no extension trait — zero `pub trait` declarations, and a compile-time
+`#[tool_router]` impl block. Its router and `scope_map` are a closed set by
+design: a tool reaches the MCP server either as a kernel tool or as a
+downstream product's federated tool.
 
 - **Kernel tool** → add it to the `#[tool_router] impl` in
   `epigraph-mcp/src/server.rs` *and* to `SCOPE_MAP` in `scope_map.rs` (a
