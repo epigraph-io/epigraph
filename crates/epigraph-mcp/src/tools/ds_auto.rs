@@ -59,6 +59,43 @@ pub struct DsAutoResult {
     /// (index 0 is TRUE). Its masses drive the claim's Beta-Bernoulli track
     /// (`epigraph_engine::ds_divergence::beta_increments`).
     pub evidence_bba: MassFunction,
+    /// What the cache write did that the values above do not show (backlog
+    /// 8ff648c9). All empty for [`auto_wire_ds_for_claim`].
+    pub cache_notes: CacheWriteNotes,
+}
+
+/// Where [`auto_wire_ds_update_filed_on`]'s cache write diverged from a plain
+/// "this call's fold, on the frame that owns the cache" (backlog 8ff648c9).
+/// Each field is `None` when its divergence did not happen, so a default
+/// value means the write was exactly that.
+///
+/// The update folds every two-hypothesis frame's BBAs, clamps a supporting
+/// result up to the claim's prior, and writes the cache on `binary_truth`;
+/// the owner recompute (`cache_owner_frame_for_claim`, then that frame's fold)
+/// folds ONE frame and does not clamp. Where the two differ, a caller that
+/// reads only `pignistic_prob` and `cache_written` was told nothing: a clamp
+/// to the prior made a supporting update a silent no-op, and a cache carried
+/// on another frame was silently re-pointed.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CacheWriteNotes {
+    /// This call's fold BetP BEFORE the supports=true monotonicity clamp,
+    /// when the clamp RAISED it (the fold was below the claim's prior). The
+    /// written and returned `pignistic_prob` is the clamped value, not a fold
+    /// of the stored BBAs, and the next owner recompute will not reproduce it.
+    pub clamped_from: Option<Prob>,
+    /// The prior the clamp bounded BetP by (the cached `pignistic_prob`, or
+    /// the claim's `truth_value` when it had no cache), when it fired.
+    pub clamp_prior: Option<Prob>,
+    /// The frame the claim's cache recorded (`claims.belief_frame_id`) before
+    /// this call, when the cache was written and that frame is not the one
+    /// this call wrote: the cache was RE-POINTED from it to `binary_truth`.
+    pub repointed_from: Option<Uuid>,
+    /// The frame the cache-owner rule elects after this call, when the cache
+    /// was written and the rule does NOT elect the frame this call wrote:
+    /// `Some(None)` when the claim has no owner (a compound, or template-only
+    /// input). The next owner recompute refolds the cache there (or, with no
+    /// owner, never from these BBAs), so the written value will not stand.
+    pub owner_elsewhere: Option<Option<Uuid>>,
 }
 
 /// Entry for batch DS wiring (used by `do_ingest_document`).
@@ -585,6 +622,7 @@ pub async fn auto_wire_ds_for_claim(
         frame_id,
         cache_written,
         evidence_bba: bba,
+        cache_notes: CacheWriteNotes::default(),
     })
 }
 
@@ -706,9 +744,11 @@ pub async fn auto_wire_ds_update_filed_on(
     // (the seed's source). PR-09: a per-id read over a caller-supplied uuid, so
     // it is filtered rather than exempted; an invisible claim reads as "no
     // prior", the same answer a nonexistent one gives.
-    let claim_prior: Option<(Option<f64>, f64, Uuid)> = {
+    // The recorded cache frame (`belief_frame_id`) is read here too, so the
+    // response can say when this write re-points the cache (backlog 8ff648c9).
+    let claim_prior: Option<(Option<f64>, f64, Uuid, Option<Uuid>)> = {
         let sql = viewer.splice(
-            "SELECT c.pignistic_prob, c.truth_value, c.agent_id FROM claims c \
+            "SELECT c.pignistic_prob, c.truth_value, c.agent_id, c.belief_frame_id FROM claims c \
                  WHERE c.id = $1 /* {VISIBILITY:c} */",
             // belief-profile: allow-literal (the SQL bind slot the visibility splice uses)
             2,
@@ -717,7 +757,8 @@ pub async fn auto_wire_ds_update_filed_on(
         let group: Option<Vec<Uuid>> = viewer.group_bind().map(<[Uuid]>::to_vec);
         optional_read_under_savepoint(&mut *conn, "claim prior", move |c| {
             Box::pin(async move {
-                let mut q = sqlx::query_as::<_, (Option<f64>, f64, Uuid)>(&sql).bind(claim_id);
+                let mut q = sqlx::query_as::<_, (Option<f64>, f64, Uuid, Option<Uuid>)>(&sql)
+                    .bind(claim_id);
                 if let Some(g) = group {
                     q = q.bind(g);
                 }
@@ -733,7 +774,7 @@ pub async fn auto_wire_ds_update_filed_on(
     // recompute) and no binary BBA, and a claim whose BBAs sit on a legacy
     // binary frame already has its prior in the combine below.
     if seed_truth_prior {
-        if let Some((_, truth, author)) = claim_prior {
+        if let Some((_, truth, author, _)) = claim_prior {
             let existing =
                 MassFunctionRepository::get_for_claim_binary_frames(&mut *conn, viewer, claim_id)
                     .await
@@ -873,7 +914,7 @@ pub async fn auto_wire_ds_update_filed_on(
     // value: the cached `pignistic_prob`, or the authored `truth_value` when the
     // claim has no cache (backlog fc55465b: with no fallback the clamp never
     // fired on exactly the claims whose prior was otherwise discarded).
-    let prior_betp: Option<f64> = claim_prior.map(|(cached, truth, _)| cached.unwrap_or(truth));
+    let prior_betp: Option<f64> = claim_prior.map(|(cached, truth, _, _)| cached.unwrap_or(truth));
 
     // The second value is the conflict the fold SAW. Since U025 every
     // `combine_multiple` step is Dempster, which normalises conflict out of
@@ -931,10 +972,16 @@ pub async fn auto_wire_ds_update_filed_on(
     // plausibility is not a weaker guarantee, it is an impossible one. Clamping
     // to `prior.min(pl)` keeps 30bfbb19's intent wherever the prior is
     // representable, and yields to `pl` only when it is not.
+    let mut notes = CacheWriteNotes::default();
     if supports {
         if let Some(prior) = prior_betp {
             let bounded_prior = prior.min(pl);
             if betp < bounded_prior {
+                // Backlog 8ff648c9: the clamp is reported, not silent. When it
+                // pins BetP to the prior, this supporting update moved
+                // nothing, and the value written is no fold of the BBAs.
+                notes.clamped_from = Some(betp);
+                notes.clamp_prior = Some(prior);
                 betp = bounded_prior;
             }
         }
@@ -955,6 +1002,21 @@ pub async fn auto_wire_ds_update_filed_on(
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
 
+    // Backlog 8ff648c9: when this write took the cache, say where it departs
+    // from the owner recompute's frame. Read AFTER the write, so the owner is
+    // the one every later recompute elects (this call's BBA included).
+    if cache_written {
+        let recorded_before = claim_prior.and_then(|(_, _, _, recorded)| recorded);
+        notes.repointed_from = recorded_before.filter(|recorded| *recorded != frame_id);
+        let owner =
+            MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, claim_id)
+                .await
+                .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?;
+        if owner != Some(frame_id) {
+            notes.owner_elsewhere = Some(owner);
+        }
+    }
+
     Ok(DsAutoResult {
         belief: bel,
         plausibility: pl,
@@ -964,6 +1026,7 @@ pub async fn auto_wire_ds_update_filed_on(
         frame_id,
         cache_written,
         evidence_bba: bba,
+        cache_notes: notes,
     })
 }
 

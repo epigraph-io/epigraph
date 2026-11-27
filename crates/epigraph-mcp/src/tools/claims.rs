@@ -1475,6 +1475,7 @@ const DS_UPDATE_STEPS: &[&str] = &[
     "assign_claim",
     "binary frame",
     "build BBA",
+    "cache_owner_frame_for_claim",
     "combine_multiple",
     "discount",
     "evidence source_url read",
@@ -1961,6 +1962,40 @@ pub async fn update_with_evidence(
              not the claim's cached values."
         ));
     }
+    // Backlog 8ff648c9: the three ways the cache write departs from "this
+    // call's fold, on the frame that owns the cache", each named, never silent.
+    let notes = ds.cache_notes;
+    if let (Some(fold), Some(prior)) = (notes.clamped_from, notes.clamp_prior) {
+        warnings.push(format!(
+            "The monotonicity clamp fired: this call's fold of the claim's two-hypothesis BBAs \
+             gives pignistic_prob {fold}, below the claim's prior {prior} (its cached \
+             pignistic_prob, or its truth_value when it had none), so the supporting update \
+             was held at {} instead. That value is not a fold of the stored BBAs, and a \
+             recompute from them will not reproduce it.",
+            ds.pignistic_prob
+        ));
+    }
+    if let Some(from) = notes.repointed_from {
+        warnings.push(format!(
+            "claim {claim_id}'s cached belief was carried on frame {from}; this call replaced \
+             it with its fold and re-pointed the cache to {} (belief_frame_id).",
+            ds.frame_id
+        ));
+    }
+    if let Some(owner) = notes.owner_elsewhere {
+        warnings.push(match owner {
+            Some(owner) => format!(
+                "The cache-owner rule elects frame {owner} for claim {claim_id}, not {} where \
+                 this call wrote its cache: the next recompute refolds the cache on {owner}.",
+                ds.frame_id
+            ),
+            None => format!(
+                "claim {claim_id} has no cache-owner frame (a compound, whose belief is a query \
+                 over its leaves, or a claim whose only inputs are ingest templates): the cache \
+                 this call wrote is not one any recompute keeps."
+            ),
+        });
+    }
     let warning = (!warnings.is_empty()).then(|| warnings.join(" "));
 
     // `belief_wired` / `bba_stored` / `ds_wire_error` are #497's response fields,
@@ -1988,6 +2023,11 @@ pub async fn update_with_evidence(
         belief: Some(ds.belief),
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),
+        fold_pignistic_prob: notes.clamped_from,
+        cache_repointed_from: notes.repointed_from.map(|f| f.to_string()),
+        cache_owner_frame_id: notes
+            .owner_elsewhere
+            .map(|owner| owner.map_or_else(|| "none".to_string(), |f| f.to_string())),
         warning,
     })
 }

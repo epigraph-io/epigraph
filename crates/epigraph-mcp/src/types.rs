@@ -2032,12 +2032,35 @@ pub struct UpdateResponse {
     pub plausibility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
+    /// Present only when the supports=true monotonicity clamp RAISED this
+    /// call's result (backlog 8ff648c9): the BetP its fold of the claim's
+    /// two-hypothesis BBAs gave before the clamp. `pignistic_prob` (and
+    /// `truth_after`) is then the clamped value, bounded below by the claim's
+    /// prior, not a fold of the stored BBAs; equal to the prior means the
+    /// supporting update moved nothing. `warning` says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fold_pignistic_prob: Option<f64>,
+    /// Present only when this call wrote the claim's cache and the cache had
+    /// been carried on ANOTHER frame (`belief_frame_id`): that frame's id. The
+    /// cache now records `binary_truth` and holds this call's fold (backlog
+    /// 8ff648c9). `warning` says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_repointed_from: Option<String>,
+    /// Present only when this call wrote the claim's cache and the cache-owner
+    /// rule elects ANOTHER frame for it (the frame's id, or `"none"` for a
+    /// claim with no owner: a compound, or template-only input). The next
+    /// recompute refolds the cache there, so the values above will not stand
+    /// (backlog 8ff648c9). `warning` says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_owner_frame_id: Option<String>,
     /// Populated when supporting evidence *lowered* the pignistic probability
     /// (the claim's prior sits above the plausibility its stored BBAs allow, so
     /// the monotonicity clamp yields to that bound; this is mathematically
     /// correct Dempster-Shafer combination, and the warning exists so callers
-    /// don't mistake it for a bug), and when
-    /// [`Self::cache_written`] is `false`. Several notes are joined by a space.
+    /// don't mistake it for a bug), when [`Self::cache_written`] is `false`,
+    /// and for each of [`Self::fold_pignistic_prob`],
+    /// [`Self::cache_repointed_from`] and [`Self::cache_owner_frame_id`] that
+    /// is present. Several notes are joined by a space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
