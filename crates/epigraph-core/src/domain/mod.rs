@@ -1,7 +1,6 @@
 //! Domain models for `EpiGraph`'s epistemic knowledge graph
 //!
-//! This module provides high-level domain types that build on the Label Property Graph
-//! primitives. These types represent the core entities in `EpiGraph`:
+//! This module provides the domain types for the core entities in `EpiGraph`:
 //!
 //! - [`Agent`]: An entity that can make claims and provide evidence
 //! - [`Claim`]: An epistemic assertion with a truth value
@@ -19,12 +18,9 @@
 //!
 //! # Design Philosophy
 //!
-//! Unlike the `IMPLEMENTATION_PLAN.md` which suggested storing properties directly,
-//! this implementation follows the established LPG pattern:
-//! - Domain types are strongly typed Rust structs
-//! - They can be converted to/from Node representations
-//! - Properties are stored in `PropertyMap` for graph storage
-//! - Type-safe IDs prevent accidental confusion
+//! - Domain types are strongly typed Rust structs; `epigraph-db` maps them to
+//!   and from their table rows.
+//! - Type-safe IDs ([`ids`]) prevent accidental confusion between entities.
 
 pub mod activity;
 pub mod agent;
