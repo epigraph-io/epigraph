@@ -6,8 +6,8 @@
 //! Their handlers ran four inline `UPDATE claims` statements on the unstamped
 //! pool (a truth-value nudge, a bulk decay sweep, and a challenge resolve that
 //! also strengthened every default-deny policy), with no audit row and no
-//! viewer. The ruling was to delete them rather than build an audited admin
-//! write path nobody calls; the challenge create/get routes stay.
+//! viewer. They were deleted rather than given an audited admin write path
+//! nobody calls; the challenge create/get routes stay.
 //!
 //! The arm sends each request with a `claims:admin` token, the scope the old
 //! handlers required, and asserts both that it is not routed (404) and that

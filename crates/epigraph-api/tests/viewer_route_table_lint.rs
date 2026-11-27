@@ -319,10 +319,10 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // had proving tests for.
     // `political.rs` was 1 and is now 0, so it is gone from the register
     // (backlog 67c905a3). The site was `inflation_leaderboard`'s
-    // `claims ⨝ agents` aggregate; it is now
-    // `PoliticalRepository::get_inflation_leaderboard(.., &viewer)`, marking
-    // `c` in the `WHERE` so the mean and the `HAVING` threshold both see only
-    // visible claims, on the caller's `read_as` connection.
+    // `claims ⨝ agents` aggregate; it moved into
+    // `PoliticalRepository::get_inflation_leaderboard(.., &viewer)`, and the
+    // whole political module was later deleted from the kernel (backlog
+    // bd13e0e0).
     // `search.rs` was 1 and is now 0, so it is gone from the register (backlog
     // 67c905a3). The site was the `format!`-built `full_sql` in
     // `semantic_search`'s diverse arm. That statement was safe only by a
