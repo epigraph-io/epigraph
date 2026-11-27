@@ -86,7 +86,7 @@
 mod belief_lint;
 
 use belief_lint::{
-    balanced_end, find_words, has_word, is_sql, is_write_sql, python_unit_at, python_view,
+    balanced_end, find_words, has_word, is_sql, is_write_sql, python_unit_span, python_view,
     rust_fns, rust_sources, rust_view, script_sources, sql_without_comments, with_scratch,
     RustUnits, Source, View,
 };
@@ -256,7 +256,6 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-mcp/src/tools/link_epistemic.rs", "do_link_epistemic", Tag::Todo { pr: "PR-W1b", why: "reads the source's cache to wire an edge and reports the target's; SPEC §4.1 W7" }),
     ("crates/epigraph-mcp/src/tools/recall.rs", "fetch_batched_context", Tag::Todo { pr: "PR-R2", why: "recall_with_context context rows gated on truth_value; SPEC §7.2" }),
     // --- scripts ------------------------------------------------------------
-    ("scripts/label_themes_llm.py", "load_neighborhoods_with_samples", Tag::Todo { pr: "unassigned", why: "orders a neighbourhood's public sample claims by cached BetP for the labelling prompt, compounds included; no plan row converts it" }),
     ("scripts/migrate_provenance_bba.py", "census", Tag::Todo { pr: "PR-W4", why: "seed-migration census on truth_value; SPEC §4.1 W13 script, frozen" }),
 ];
 
@@ -759,10 +758,15 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
             if kinds.is_empty() {
                 continue;
             }
-            let unit = python_unit_at(&view.code, lit.start);
+            let (unit, span) = python_unit_span(&view.code, lit.start);
             let u = out.entry((s.path.clone(), unit)).or_default();
             u.kinds.extend(kinds);
             u.reads |= !is_write_sql(&sql);
+            // The `def`'s CODE (strings and comments blanked) names a marker:
+            // a module constant spelling migration 193's definer call or the
+            // compound predicate, used inside the function.
+            u.marked |= span
+                .is_some_and(|(a, e)| ROLE_MARKERS.iter().any(|m| has_word(&view.code[a..e], m)));
         }
     }
     out
@@ -1323,6 +1327,99 @@ def report(cur):
     assert!(
         f.iter().any(|l| l.contains(&format!("{path}::report"))),
         "an executed triple-quoted statement is a reader; got {f:#?}"
+    );
+}
+
+/// A Python `def` is classified the way a Rust fn is: by a role marker its
+/// CODE names (a module constant spelling migration 193's definer call or
+/// the compound predicate, used inside the function). A marker only in a
+/// string or a comment, or only at module level, classifies nothing.
+#[test]
+fn a_python_def_is_classified_only_by_a_marker_in_its_code() {
+    let path = "scripts/scratch_role_reader.py";
+    let unit = format!("{path}::samples");
+    let run = |src: &str| {
+        findings(&measure(
+            &rust_sources(),
+            &with_scratch(&script_sources(), path, src),
+        ))
+    };
+
+    let raw = r#"
+IS_COMPOUND_DEFINER_CALL = "public.epigraph_claim_is_compound($1)"
+
+def samples(cur):
+    cur.execute("SELECT id FROM claims c ORDER BY c.pignistic_prob DESC")
+    return cur.fetchall()
+"#;
+    let f = run(raw);
+    assert!(
+        f.iter().any(|l| l.contains(&unit)),
+        "a marker defined at module level but unused in the def classifies nothing; got {f:#?}"
+    );
+
+    let in_string_and_comment = r#"
+def samples(cur):
+    # ordered by IS_COMPOUND_DEFINER_CALL first
+    note = "IS_COMPOUND_SQL"
+    cur.execute("SELECT id FROM claims c ORDER BY c.pignistic_prob DESC")
+    return cur.fetchall()
+"#;
+    let f = run(in_string_and_comment);
+    assert!(
+        f.iter().any(|l| l.contains(&unit)),
+        "a marker in a comment or a string classifies nothing; got {f:#?}"
+    );
+
+    let spliced = r#"
+IS_COMPOUND_DEFINER_CALL = "public.epigraph_claim_is_compound($1)"
+
+def samples(cur):
+    is_compound = IS_COMPOUND_DEFINER_CALL.replace("$1", "c.id")
+    cur.execute(
+        f"""SELECT id FROM claims c
+            ORDER BY {is_compound}, c.pignistic_prob DESC"""
+    )
+    return cur.fetchall()
+
+
+def other(cur):
+    cur.execute("SELECT id FROM claims c ORDER BY c.pignistic_prob DESC")
+"#;
+    let f = run(spliced);
+    assert!(
+        !f.iter().any(|l| l.contains(&unit)),
+        "a def whose code names a role marker is classified; got {f:#?}"
+    );
+    assert!(
+        f.iter().any(|l| l.contains(&format!("{path}::other"))),
+        "the marker classifies its own def only, not the next one; got {f:#?}"
+    );
+}
+
+/// `scripts/label_themes_llm.py` spells migration 193's definer call in a
+/// module constant (Python cannot import the Rust one); it must stay the
+/// Rust constant's text, or the script tests something else.
+#[test]
+fn the_python_definer_call_is_the_rust_constant() {
+    let path = "scripts/label_themes_llm.py";
+    let src = script_sources()
+        .into_iter()
+        .find(|s| s.path == path)
+        .unwrap_or_else(|| panic!("{path} is scanned"));
+    let prefix = "IS_COMPOUND_DEFINER_CALL = \"";
+    let line = src
+        .text
+        .lines()
+        .find(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("{path} defines IS_COMPOUND_DEFINER_CALL at module level"));
+    let value = line[prefix.len()..]
+        .strip_suffix('"')
+        .unwrap_or_else(|| panic!("one plain string literal: {line}"));
+    assert_eq!(
+        value,
+        epigraph_db::repos::mass_function::IS_COMPOUND_DEFINER_CALL,
+        "{path}'s definer call drifted from the Rust constant"
     );
 }
 

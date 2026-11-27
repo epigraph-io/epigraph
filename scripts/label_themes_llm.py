@@ -75,6 +75,13 @@ from maintenance_dsn import maintenance_dsn
 psycopg2.extras.register_uuid()
 
 RESULT_DIR = "/tmp/theme_labels"
+
+# Migration 193's definer-rights role test, TRUE exactly when the claim bound
+# as $1 is a compound (claim_role::IS_COMPOUND_SQL decided on the whole
+# graph). The same text as the Rust constant
+# epigraph_db::repos::mass_function::IS_COMPOUND_DEFINER_CALL, which
+# crates/epigraph-db/tests/no_role_blind_belief_reads.rs pins this line to.
+IS_COMPOUND_DEFINER_CALL = "public.epigraph_claim_is_compound($1)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CLI_CWD = os.path.dirname(SCRIPT_DIR)  # repo root
 # How long call_claude_cli keeps looking for a result file the model wrote with
@@ -417,7 +424,12 @@ def load_neighborhoods_with_samples(conn, run_id, limit=None):
     each one's current PUBLIC members (theme_lib.public_label_source), highest
     pignistic probability first. `claim_count` is the number of such members,
     so nothing about private members reaches the prompt. A neighbourhood with
-    no public member comes back with no samples."""
+    no public member comes back with no samples.
+
+    The order is role-aware (backlog fe1cdcdf): a compound's cached BetP is a
+    fold of its own BBAs, not a belief, so it ranks no sample. Non-compounds
+    come first by BetP; compounds follow, by id."""
+    is_compound = IS_COMPOUND_DEFINER_CALL.replace("$1", "c.id")
     out = []
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         sql = """
@@ -440,7 +452,10 @@ def load_neighborhoods_with_samples(conn, run_id, limit=None):
                 WHERE m.run_id = %s AND m.neighborhood_id = %s
                   AND c.is_current
                   AND {theme_lib.public_label_source("c")}
-                ORDER BY c.pignistic_prob DESC NULLS LAST, c.id
+                ORDER BY {is_compound},
+                         CASE WHEN {is_compound} THEN NULL ELSE c.pignistic_prob END
+                             DESC NULLS LAST,
+                         c.id
                 LIMIT 10
                 """,
                 (run_id, nbr["id"]),

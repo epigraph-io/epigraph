@@ -198,3 +198,49 @@ def test_a_newer_bridge_run_is_not_the_run_labelled(db):
                 "DELETE FROM graph_cluster_runs WHERE run_id::text = ANY(%s)", ([louvain, bridge],)
             )
         db.commit()
+
+
+def test_a_compounds_cached_betp_ranks_no_sample(db, script_db, seed_agent):
+    """Backlog fe1cdcdf: the sample order is role-aware. A compound's cached
+    BetP is a fold of its own BBAs, not a belief, so a compound member with a
+    high cache does not head the prompt's samples: non-compounds come first by
+    BetP, compounds after them. The compound is decided by migration 193's
+    definer (IS_COMPOUND_DEFINER_CALL), which the script runs as its own
+    (maintenance) login, so this also pins that login's EXECUTE grant."""
+    with db.cursor() as cur:
+        theme = _theme(cur)
+        atom_low = _claim(cur, seed_agent, "role-order atom low")
+        atom_high = _claim(cur, seed_agent, "role-order atom high")
+        compound = _claim(cur, seed_agent, "role-order compound")
+        child = _claim(cur, seed_agent, "role-order compound child")
+        ids = [atom_low, atom_high, compound, child]
+        for cid, betp in ((atom_low, 0.2), (atom_high, 0.6), (compound, 0.95)):
+            cur.execute("UPDATE claims SET pignistic_prob = %s WHERE id = %s", (betp, cid))
+        cur.execute(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) "
+            "VALUES (%s, 'claim', %s, 'claim', 'decomposes_to')",
+            (compound, child),
+        )
+        run = _run(cur, 0)
+        _nbr(cur, run, theme, "neighborhood-1", [atom_low, compound, atom_high])
+    db.commit()
+    try:
+        nbrs = L.load_neighborhoods_with_samples(script_db, run)
+        script_db.rollback()
+        assert len(nbrs) == 1, nbrs
+        order = [s["content"] for s in nbrs[0]["samples"]]
+        assert order == [
+            "role-order atom high",
+            "role-order atom low",
+            "role-order compound",
+        ], order
+        assert nbrs[0]["claim_count"] == 3
+    finally:
+        db.rollback()
+        with db.cursor() as cur:
+            cur.execute(
+                "DELETE FROM edges WHERE source_id::text = %s AND target_id::text = %s",
+                (compound, child),
+            )
+        db.commit()
+        _cleanup(db, [run], ids, None, theme)
