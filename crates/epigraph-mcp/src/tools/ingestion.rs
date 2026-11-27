@@ -18,8 +18,10 @@ use epigraph_crypto::ContentHasher;
 use epigraph_db::{
     ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository,
 };
-use epigraph_ingest::common::plan::PlannedClaim;
-use epigraph_ingest::document::builder::build_ingest_plan;
+use epigraph_ingest::common::plan::{IngestPlan, PlannedClaim};
+use epigraph_ingest::document::builder::{
+    adopt_recorded_ids, build_ingest_plan, build_ingest_plan_scoped,
+};
 use epigraph_ingest::document::schema::ByteSpan;
 use epigraph_ingest::document::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 use epigraph_ingest::document::structure::{
@@ -1542,7 +1544,6 @@ async fn ingest_document_walk_reporting(
     refuse_lineage_relationships(extraction)?;
     refuse_bad_author_ids(extraction)?;
 
-    let plan = build_ingest_plan(extraction);
     // Author = the request's principal (batch H-b, D1); signer = this server's
     // key, recorded on evidence as its `signer_id` (see `Evidence::agent_id`).
     let author = server.write_identity(auth, viewer).await?;
@@ -1639,6 +1640,9 @@ async fn ingest_document_walk_reporting(
     let licence = PaperRepository::licence(&mut *tx, paper_id)
         .await
         .map_err(internal_error)?;
+    // The plan, with ids derived for the scope `decl` owns (backlog 8f56a641):
+    // built only now, once the scope and this scope's paper row are known.
+    let (plan, adopted) = ingest_plan_for_scope(&mut tx, extraction, decl, paper_id).await?;
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
     // An author with an `agent_id` IS that existing agent (backlog 94cc12db).
@@ -1789,7 +1793,7 @@ async fn ingest_document_walk_reporting(
     let atom_pairs: Vec<(Vec<u8>, Uuid)> = plan
         .claims
         .iter()
-        .filter(|planned| !planned.id_is_document_scoped())
+        .filter(|planned| !writes_by_id(planned, &adopted))
         .map(|planned| {
             (
                 ContentHasher::hash(planned.content.as_bytes()).to_vec(),
@@ -1831,6 +1835,7 @@ async fn ingest_document_walk_reporting(
             signer_typed.as_uuid(),
             TruthValue::clamped(raw_truth),
             decl,
+            &adopted,
         )
         .await?;
         // Idempotent add: also runs on the dedup branch below, so an atom
@@ -2429,6 +2434,70 @@ fn find_arxiv_id(s: &str) -> Option<String> {
     None
 }
 
+/// Whether `planned` is written by id (`create_with_id_if_absent`) rather than
+/// resolved by its text: every structural node, every atom of a non-public
+/// ingest ([`PlannedClaim::id_is_document_scoped`]), and every id re-used
+/// from this scope's earlier ingest of the document (`adopted`).
+fn writes_by_id(planned: &PlannedClaim, adopted: &HashSet<Uuid>) -> bool {
+    planned.id_is_document_scoped() || adopted.contains(&planned.id)
+}
+
+/// The plan a document ingest writes into the scope `decl` declares, on the
+/// walk's own transaction `conn`, for the in-scope paper row `paper_id`.
+///
+/// A PUBLIC ingest gets the global plan, byte for byte what it always got.
+/// A `private` or `team` ingest gets ids derived from its owning group
+/// (`build_ingest_plan_scoped`, backlog 8f56a641), so the same document in
+/// two groups is two sets of claims and neither group's ingest can converge
+/// onto, or report, the other's rows. Re-ingesting a document this scope
+/// already ingested under GLOBAL ids (before ids were scope-derived) keeps
+/// those ids, claim by claim: [`adopt_recorded_ids`] over what the in-scope
+/// paper already asserts ([`PaperRepository::asserted_claims_conn`], read on
+/// `conn`, so row security decides what is seen). Returns the plan and the
+/// adopted ids, which the walk writes by id ([`writes_by_id`]).
+///
+/// Not a short-circuit on the paper's `processed_by` stamp: chunked ingests
+/// and an abstract-then-full-text re-ingest of one document key rely on
+/// node-level dedup to add what is new.
+async fn ingest_plan_for_scope(
+    conn: &mut sqlx::PgConnection,
+    extraction: &DocumentExtraction,
+    decl: epigraph_core::TenancyDecl,
+    paper_id: Uuid,
+) -> Result<(IngestPlan, HashSet<Uuid>), McpError> {
+    let scope = match decl {
+        epigraph_core::TenancyDecl::Declared {
+            visibility: epigraph_core::Visibility::Public,
+            ..
+        } => None,
+        epigraph_core::TenancyDecl::Declared { owner_group_id, .. } => Some(owner_group_id),
+        epigraph_core::TenancyDecl::Inherited => {
+            return Err(crate::errors::internal_error_text(
+                "document ingest: the ingest's tenancy did not resolve to an owner group",
+            ));
+        }
+    };
+    let Some(group) = scope else {
+        return Ok((build_ingest_plan(extraction), HashSet::new()));
+    };
+    let scoped = build_ingest_plan_scoped(extraction, Some(group));
+    let recorded: Vec<(Uuid, Option<[u8; 32]>)> =
+        PaperRepository::asserted_claims_conn(&mut *conn, paper_id)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|(id, hash)| (id, hash.and_then(|h| <[u8; 32]>::try_from(h).ok())))
+            .collect();
+    if recorded.is_empty() {
+        return Ok((scoped, HashSet::new()));
+    }
+    Ok(adopt_recorded_ids(
+        scoped,
+        &build_ingest_plan(extraction),
+        &recorded,
+    ))
+}
+
 /// Persist one planned claim, routing on the identity class the PLANNER chose.
 ///
 /// Returns `(persisted_id, resolved_to_existing, known_author)`.
@@ -2459,6 +2528,14 @@ fn find_arxiv_id(s: &str) -> Option<String> {
 ///   hash(text))`. Convergence across papers IS the feature (it is how
 ///   cross-source corroboration finds agreement), so these stay on the
 ///   content-hash path unchanged.
+///
+/// A non-public ingest's atoms are NOT in the second class (backlog
+/// 8f56a641): their ids fold in the owning group
+/// (`epigraph_ingest::common::ids`, "Scope-derived ids"), so they take the
+/// first branch, by id. The content-hash branch looks the text up across
+/// every scope and would converge onto (and report) another tenant's row.
+/// So does an id [`adopt_recorded_ids`] re-used from this scope's earlier
+/// ingest of the document: only that recorded row may be resolved to.
 #[allow(clippy::too_many_arguments)]
 async fn persist_planned_claim(
     conn: &mut sqlx::PgConnection,
@@ -2480,8 +2557,11 @@ async fn persist_planned_claim(
     // the identical lookup, with a comment saying exactly that; the two
     // siblings now agree.
     decl: epigraph_core::TenancyDecl,
+    // The ids [`adopt_recorded_ids`] took over from this scope's earlier
+    // ingest of the document: written by id too (see [`writes_by_id`]).
+    adopted: &HashSet<Uuid>,
 ) -> Result<(Uuid, bool, Option<Uuid>), McpError> {
-    if planned.id_is_document_scoped() {
+    if writes_by_id(planned, adopted) {
         let was_new = ClaimRepository::create_with_id_if_absent_signed_conn(
             &mut *conn,
             planned.id,
@@ -2589,7 +2669,6 @@ pub async fn do_ingest_document_spine(
     refuse_lineage_relationships(extraction)?;
     refuse_bad_author_ids(extraction)?;
 
-    let plan = build_ingest_plan(extraction);
     // Author = the request's principal (batch H-b, D1); signer = this server's
     // key, recorded on evidence as its `signer_id` (see `Evidence::agent_id`).
     let author = server.write_identity(auth, viewer).await?;
@@ -2611,29 +2690,6 @@ pub async fn do_ingest_document_spine(
     // the same reason — before the first write. This is the spine handler's
     // only label check: it calls this core synchronously.
     let claim_labels = ingest_claim_labels(extraction, &doi)?;
-
-    // Atom planned IDs — skip these claims and any edges referencing them.
-    let atom_planned_ids: HashSet<Uuid> = plan
-        .claims
-        .iter()
-        .filter(|c| c.level == 3)
-        .map(|c| c.id)
-        .collect();
-
-    // Map para planned ID → document path e.g. "sections[0].paragraphs[1]".
-    // Builder iterates sections/paragraphs in extraction order so zipping is safe.
-    let para_id_to_path: HashMap<Uuid, String> = {
-        let mut map = HashMap::new();
-        let mut level2_iter = plan.claims.iter().filter(|c| c.level == 2);
-        for (si, section) in extraction.sections.iter().enumerate() {
-            for (pi, _para) in section.paragraphs.iter().enumerate() {
-                if let Some(pc) = level2_iter.next() {
-                    map.insert(pc.id, format!("sections[{si}].paragraphs[{pi}]"));
-                }
-            }
-        }
-        map
-    };
 
     // ONE transaction for the spine walk, stamped from the ingesting agent —
     // the same conversion, for the same reasons, as `do_ingest_document`'s
@@ -2671,6 +2727,32 @@ pub async fn do_ingest_document_spine(
     let licence = PaperRepository::licence(&mut *tx, paper_id)
         .await
         .map_err(internal_error)?;
+    // The same scope-derived plan as `do_ingest_document`'s (backlog
+    // 8f56a641), so a spine followed by the full ingest converges node for node.
+    let (plan, adopted) = ingest_plan_for_scope(&mut tx, extraction, decl, paper_id).await?;
+
+    // Atom planned IDs — skip these claims and any edges referencing them.
+    let atom_planned_ids: HashSet<Uuid> = plan
+        .claims
+        .iter()
+        .filter(|c| c.level == 3)
+        .map(|c| c.id)
+        .collect();
+
+    // Map para planned ID → document path e.g. "sections[0].paragraphs[1]".
+    // Builder iterates sections/paragraphs in extraction order so zipping is safe.
+    let para_id_to_path: HashMap<Uuid, String> = {
+        let mut map = HashMap::new();
+        let mut level2_iter = plan.claims.iter().filter(|c| c.level == 2);
+        for (si, section) in extraction.sections.iter().enumerate() {
+            for (pi, _para) in section.paragraphs.iter().enumerate() {
+                if let Some(pc) = level2_iter.next() {
+                    map.insert(pc.id, format!("sections[{si}].paragraphs[{pi}]"));
+                }
+            }
+        }
+        map
+    };
 
     // ── 2. Ensure author agents + authored edges ──
     let mut author_responses = Vec::new();
@@ -2823,6 +2905,7 @@ pub async fn do_ingest_document_spine(
             signer_typed.as_uuid(),
             TruthValue::clamped(raw_truth),
             decl,
+            &adopted,
         )
         .await?;
         // Same rule as `do_ingest_document`: a node this walk resolved to may

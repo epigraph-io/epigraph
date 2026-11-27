@@ -907,6 +907,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          nothing else.",
     ),
     (
+        "paper.rs",
+        "asserted_claims_conn",
+        "READ of the ids (and, where the session reads the claim row, the stored \
+         content_hash) of the claims one `papers` row asserts through ingest-written \
+         `asserts` edges, on the document ingest's own author-stamped transaction, for the \
+         paper row that transaction just got or created in its declared scope (backlog \
+         8f56a641). Row security on that transaction filters both `edges` and `claims`; every \
+         id it can return is one an earlier ingest of that scope's own paper reported to that \
+         scope, and it is used only to re-use those ids, never returned to a caller.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \

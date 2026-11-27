@@ -21,6 +21,11 @@ pub struct PaperRow {
     pub journal: Option<String>,
 }
 
+/// One claim a paper asserts, as [`PaperRepository::asserted_claims_conn`]
+/// reads it: the claim id and, when the session reads the claim row, its
+/// stored `content_hash`.
+pub type AssertedClaim = (Uuid, Option<Vec<u8>>);
+
 /// A `papers` row as `POST /api/v1/papers` answers it
 /// ([`PaperRepository::registered_row`]).
 #[derive(Debug, Clone)]
@@ -533,6 +538,51 @@ impl PaperRepository {
                 .fetch_optional(executor)
                 .await?;
         Ok(licence.flatten())
+    }
+
+    /// Every claim the paper `paper_id` asserts through an in-force,
+    /// ingest-written `paper -asserts-> claim` edge, with the claim's stored
+    /// `content_hash` when the caller's connection can read the claim row
+    /// (`None` otherwise).
+    ///
+    /// For the document ingest walk, which asks it on its own author-stamped
+    /// transaction about the paper row it just got or created in the ingest's
+    /// scope, to find the ids an ingest of the same document in the same scope
+    /// recorded before ids became scope-derived
+    /// (`epigraph_ingest::document::adopt_recorded_ids`). Only ingest-written
+    /// edges count: `paper -asserts->` is refused on every application edge
+    /// write, and the marker ([`crate::repos::ingest_written`]) is what says
+    /// the walk wrote it. Row security on the caller's connection decides
+    /// which edges and claim rows are seen; the paper is the caller's own
+    /// in-scope row, and every id returned is one an earlier ingest of it
+    /// already reported to that scope.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn asserted_claims_conn(
+        conn: &mut sqlx::PgConnection,
+        paper_id: Uuid,
+    ) -> Result<Vec<AssertedClaim>, DbError> {
+        // Runtime-checked, not `query!`: see `get_or_create`.
+        let sql = format!(
+            "SELECT DISTINCT e.target_id, c.content_hash \
+               FROM edges e \
+               LEFT JOIN claims c ON c.id = e.target_id \
+              WHERE e.source_id = $1 \
+                AND e.source_type = 'paper' \
+                AND e.target_type = 'claim' \
+                AND e.relationship = 'asserts' \
+                AND {in_force} \
+                AND {marked}",
+            in_force = crate::repos::edge::EDGE_IN_FORCE,
+            marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+        );
+        let rows: Vec<AssertedClaim> = sqlx::query_as(&sql)
+            .bind(paper_id)
+            .fetch_all(&mut *conn)
+            .await?;
+        Ok(rows)
     }
 
     /// Returns true if the paper has any outgoing `processed_by` edge whose
