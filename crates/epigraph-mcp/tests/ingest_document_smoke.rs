@@ -376,6 +376,138 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
     );
 }
 
+/// A paper that GROWS across ingests (backlog 94b9e690): the second ingest of
+/// one DOI is a strict superset of the first (the first section unchanged, plus
+/// a new section with its own paragraph and atom). The identical re-ingest
+/// (`re_ingest_same_paper_dedup_detected`) and the disjoint chapters
+/// (`per_chapter_version_gate_isolates_chunks`) leave this shape unpinned: the
+/// unchanged half must dedup onto the first ingest's claims while the new half
+/// lands, on the same paper row, and each ingest records its own stamp.
+#[sqlx::test(migrations = "../../migrations")]
+async fn superset_re_ingest_adds_only_the_new_section(pool: PgPool) {
+    const DOI: &str = "10.1234/superset-reingest";
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+
+    let first_section = r#"{
+        "title": "Superset original section",
+        "paragraphs": [{
+          "text": "Superset original paragraph compound claim",
+          "atoms": ["Superset original atom"],
+          "generality": [3],
+          "confidence": 0.8
+        }]
+      }"#;
+    let new_section = r#"{
+        "title": "Superset added section",
+        "paragraphs": [{
+          "text": "Superset added paragraph compound claim",
+          "atoms": ["Superset added atom"],
+          "generality": [3],
+          "confidence": 0.8
+        }]
+      }"#;
+    let extraction = |chapter: u64, sections: &[&str]| -> DocumentExtraction {
+        let json = format!(
+            r#"{{
+              "source": {{
+                "title": "Superset Re-ingest Paper",
+                "doi": "{DOI}",
+                "source_type": "Paper",
+                "authors": [{{"name": "Alice Author", "affiliations": [], "roles": ["author"]}}],
+                "metadata": {{"chapter_index": {chapter}}}
+              }},
+              "thesis": "Superset re-ingest thesis",
+              "thesis_derivation": "TopDown",
+              "sections": [{}],
+              "relationships": []
+            }}"#,
+            sections.join(",")
+        );
+        serde_json::from_str(&json).expect("fixture parses")
+    };
+    let doi_label = format!("doi:{DOI}");
+
+    let first = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction(1, &[first_section]),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("first ingest");
+    let first: serde_json::Value = serde_json::from_str(&result_text(&first)).unwrap();
+    assert_eq!(first["already_ingested"], serde_json::json!(false));
+    // CALIBRATION: thesis, section, paragraph and atom.
+    assert_eq!(first["claims_ingested"], serde_json::json!(4), "{first}");
+    let labelled_after_first = claims_labelled(&pool, &doi_label).await;
+    assert_eq!(labelled_after_first, 4);
+
+    let second = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction(2, &[first_section, new_section]),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("the superset re-ingest succeeds");
+    let second: serde_json::Value = serde_json::from_str(&result_text(&second)).unwrap();
+    assert_eq!(
+        second["already_ingested"],
+        serde_json::json!(false),
+        "new content was ingested: {second}"
+    );
+    // Exactly the new section, paragraph and atom: the thesis and the whole
+    // first section dedup onto the first ingest's claims.
+    assert_eq!(
+        second["claims_ingested"],
+        serde_json::json!(3),
+        "only the new section's claims are new: {second}"
+    );
+    assert_eq!(
+        claims_labelled(&pool, &doi_label).await,
+        labelled_after_first + 3,
+        "the database grew by exactly the new claims"
+    );
+    assert_eq!(second["paper_id"], first["paper_id"], "same paper row");
+
+    for content in [
+        "Superset added section",
+        "Superset added paragraph compound claim",
+        "Superset added atom",
+    ] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM claims WHERE $1 = ANY(labels) AND strpos(content, $2) > 0",
+        )
+        .bind(&doi_label)
+        .bind(content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(n >= 1, "the new content {content:?} must be stored");
+    }
+
+    // Each ingest's own processed_by stamp (`:ch1`, then `:ch2`).
+    assert_eq!(processed_by_edges(&pool, DOI).await, 2);
+    let pipelines: Vec<String> = sqlx::query_scalar(
+        "SELECT e.properties->>'pipeline' FROM edges e JOIN papers p ON p.id = e.source_id
+         WHERE p.doi = $1 AND e.relationship = 'processed_by' ORDER BY 1",
+    )
+    .bind(DOI)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pipelines,
+        vec![
+            "hierarchical_extraction_v2:ch1".to_string(),
+            "hierarchical_extraction_v2:ch2".to_string()
+        ]
+    );
+}
+
 /// A second fixture sharing one atom and the same author with the primary
 /// fixture. Validates cross-paper atom convergence and author dedup.
 const FIXTURE_OVERLAP: &str = r#"{
