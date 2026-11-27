@@ -67,5 +67,37 @@ class MatchCandidateEdgeProvenanceNote(unittest.TestCase):
         )
 
 
+def doc_block(path, item):
+    """The `///` doc comment directly above the line starting with `item`."""
+    lines = (REPO / path).read_text(encoding="utf-8").splitlines()
+    end = next(i for i, line in enumerate(lines) if line.strip().startswith(item))
+    start = end
+    while start > 0 and lines[start - 1].strip().startswith(("///", "#[")):
+        start -= 1
+    return normalize(" ".join(line.strip().lstrip("/") for line in lines[start:end]))
+
+
+class DocsLinkingTheNoteAgreeWithIt(unittest.TestCase):
+    """A doc that links the note (or that the retirement page cites) must not
+    describe the matcher's edge writers or its retirement differently."""
+
+    def test_retire_doc_names_the_current_edge_writers(self):
+        doc = doc_block("crates/epigraph-db/src/repos/match_candidate.rs", "pub async fn retire(&self")
+        self.assertIn("match-candidate-edge-provenance.md", doc)
+        for writer in (
+            "promote_if_pending",
+            "create_symmetric_if_absent_signed_conn",
+            "policy.rs::write_edge",
+        ):
+            with self.subTest(writer=writer):
+                self.assertIn(writer, doc)
+        self.assertNotIn("dropping the edge alone", doc)
+
+    def test_edge_in_force_doc_says_retire_retracts(self):
+        doc = doc_block("crates/epigraph-db/src/repos/edge.rs", "pub const EDGE_IN_FORCE:")
+        self.assertNotIn("hard-DELETEs edges", doc)
+        self.assertIn("retracts the edge", doc)
+
+
 if __name__ == "__main__":
     unittest.main()

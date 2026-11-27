@@ -74,10 +74,12 @@ pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
 /// it had no caller, and it was also the last byte-exact relationship filter
 /// that took a `relationship` parameter, backlog 5ff9c9d9), and 6 of 987,857 production rows carried a value. Every belief-bearing read saw retracted edges as live.
 ///
-/// That absence is why `MatchCandidateRepo::retire` hard-DELETEs edges rather
-/// than retracting them — a soft retraction that nothing honours retracts
-/// nothing. Enforcing the predicate on the derivation path is the precondition
-/// for making retirement non-destructive.
+/// That absence is why `MatchCandidateRepo::retire` used to hard-DELETE edges
+/// rather than retract them — a soft retraction that nothing honours retracts
+/// nothing. With the predicate enforced on the derivation path, retirement is
+/// non-destructive: `retire` now retracts the edge (closes `valid_to`) and
+/// deletes only the derived `bp_messages`, `factors` and edge-slot
+/// `mass_functions`.
 ///
 /// `valid_to IS NULL` means "ongoing or atemporal" and is the overwhelmingly
 /// common case, so the predicate is written NULL-first to short-circuit.
