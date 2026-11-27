@@ -1889,6 +1889,78 @@ impl EdgeRepository {
         Ok(rows)
     }
 
+    /// One step of a selection walk (backlog 02d9e9a1,
+    /// `epigraph_engine::visibility_act::plan_selection`): every in-force
+    /// claim-to-claim edge `viewer` can read with a relationship in
+    /// `relationships` (each matched in every stored spelling,
+    /// [`relationship_spellings`]) that leaves (`outgoing`) or enters
+    /// (`incoming`) a claim of `frontier`, as `(from, to, relationship,
+    /// to_is_current)`: `from` the frontier claim, `to` the claim across the
+    /// edge. Only a `to` claim the viewer can read is returned, so a claim the
+    /// caller cannot read is never named, and an edge that is retracted
+    /// (`valid_to` passed) is not followed. Ordered by `(from, to,
+    /// relationship)`, at most `limit` rows.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, frontier))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_neighbors_for_selection<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        frontier: &[Uuid],
+        relationships: &[&str],
+        outgoing: bool,
+        incoming: bool,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, Uuid, String, bool)>, DbError> {
+        let spellings: Vec<String> = relationships
+            .iter()
+            .flat_map(|r| relationship_spellings(r))
+            .collect();
+        let sql = viewer.splice(
+            &format!(
+                r#"
+            SELECT s.from_id, s.to_id, s.relationship, c.is_current
+              FROM (
+                SELECT f.id AS from_id, e.target_id AS to_id, e.relationship, e.id AS edge_id
+                  FROM unnest($1::uuid[]) AS f(id)
+                  JOIN edges e ON e.source_id = f.id
+                 WHERE $3::bool
+                   AND e.source_type = 'claim' AND e.target_type = 'claim'
+                   AND e.relationship = ANY($2::text[])
+                   AND {EDGE_IN_FORCE}
+                   /* {{EDGE_VISIBILITY:e}} */
+                UNION ALL
+                SELECT f.id AS from_id, e.source_id AS to_id, e.relationship, e.id AS edge_id
+                  FROM unnest($1::uuid[]) AS f(id)
+                  JOIN edges e ON e.target_id = f.id
+                 WHERE $4::bool
+                   AND e.source_type = 'claim' AND e.target_type = 'claim'
+                   AND e.relationship = ANY($2::text[])
+                   AND {EDGE_IN_FORCE}
+                   /* {{EDGE_VISIBILITY:e}} */
+              ) AS s
+              JOIN claims c ON c.id = s.to_id
+             WHERE true /* {{VISIBILITY:c}} */
+             ORDER BY s.from_id, s.to_id, s.relationship, s.edge_id
+             LIMIT $5
+            "#
+            ),
+            6,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String, bool)>(&sql)
+            .bind(frontier)
+            .bind(&spellings)
+            .bind(outgoing)
+            .bind(incoming)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Can `viewer` READ the edge `id`? The edge-visibility predicate (the
     /// owner / co-owner intersection, `Viewer::edge_predicate_fragment`), spliced.
     ///

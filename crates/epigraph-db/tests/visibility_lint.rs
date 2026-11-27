@@ -2203,6 +2203,30 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim_visibility.rs",
+        "preview_publicize_conn",
+        "CLASSIFY through 206's definer `epigraph_publicize_claims` on a STAMPED transaction, \
+         never acting (backlog 02d9e9a1): `preview_conn` adds one id that names no claim, so \
+         the definer returns its classification before it writes, inside a savepoint that is \
+         always rolled back. The classification is the definer's own, against the session's \
+         readable groups (an unreadable id is `not_found`); it returns only ids the caller \
+         passed, with an outcome word. The viewer is spent on the stamp.",
+    ),
+    (
+        "claim_visibility.rs",
+        "preview_share_with_team_conn",
+        "CLASSIFY through 206's definer `epigraph_share_claims_with_team`, as \
+         `preview_publicize_conn`: never acting, always rolled back, the definer's own \
+         classification of the ids the caller passed.",
+    ),
+    (
+        "claim_visibility.rs",
+        "preview_conn",
+        "The private body of `preview_publicize_conn` and `preview_share_with_team_conn` \
+         (above): the same definer call on the same STAMPED transaction, in chunks of 499 ids \
+         plus the sentinel, each under its own always-rolled-back savepoint.",
+    ),
+    (
+        "claim_visibility.rs",
         "claims_not_writable_on_session",
         "READ, on the widening act's own caller-STAMPED transaction, of which of the ids the act \
          just moved the SESSION cannot write: row security on the stamped connection is the \

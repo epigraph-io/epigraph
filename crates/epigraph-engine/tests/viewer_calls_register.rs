@@ -476,6 +476,18 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "publicize_claims",
         &["ClaimRepository::publicize_conn"],
     ),
+    // untenanted: the act's own definer classifies the claims the walk read
+    // through the viewer (`EdgeRepository::claim_neighbors_for_selection`),
+    // against the STAMPED session's readable groups, never acting: one extra
+    // id that names no claim makes it return before it writes, inside a
+    // savepoint always rolled back (`ClaimRepository::preview_*_conn`). It
+    // returns only the ids it was handed, with an outcome word; an unreadable
+    // root is `not_found` and answered as missing (backlog 02d9e9a1).
+    (
+        "visibility_act.rs",
+        "plan",
+        &["preview", "preview", "preview"],
+    ),
     // privileged: refuses a non-bypass viewer before any statement.
     (
         "visibility_act.rs",

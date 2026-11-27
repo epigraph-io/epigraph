@@ -1,10 +1,12 @@
 //! HTTP twins of the MCP visibility tools (docs/tenancy/claim-visibility-controls.md,
 //! migration 206):
 //!
-//! * `POST /api/v1/claims/publicize` `{claim_ids, reason}`: group → public,
+//! * `POST /api/v1/claims/publicize` `{claim_ids | selection, dry_run?, reason}`:
+//!   group → public,
 //!   team admins only (owner decision D-V2), never an operated agent
 //!   (migration 242);
-//! * `POST /api/v1/claims/share-with-team` `{claim_ids, group_id, reason}`:
+//! * `POST /api/v1/claims/share-with-team`
+//!   `{claim_ids | selection, dry_run?, group_id, reason}`:
 //!   private → a team the caller writes by its own membership, never by an
 //!   operated agent (migration 242);
 //! * `PUT /api/v1/agents/me/default-group` `{group_id}` | `{private: true}` |
@@ -30,12 +32,21 @@ use uuid::Uuid;
 use crate::errors::ApiError;
 use crate::state::AppState;
 use epigraph_db::{ClaimRepository, DefaultGroupSetting};
+use epigraph_engine::visibility_act::{self, ActReport, ActTarget, Selection, WideningAct};
 
 /// `POST /api/v1/claims/publicize`.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct PublicizeClaimsRequest {
-    /// 1 to 500 claim ids. All or nothing.
+    /// 1 to 500 claim ids. All or nothing. Omit when giving `selection`.
+    #[serde(default)]
     pub claim_ids: Vec<Uuid>,
+    /// Instead of `claim_ids`: a root and the closure walked from it (backlog
+    /// 02d9e9a1).
+    #[serde(default)]
+    pub selection: Option<SelectionRequest>,
+    /// `true`: change nothing, return the plan.
+    #[serde(default)]
+    pub dry_run: bool,
     /// Required; recorded in the `claim.publicized` audit event.
     pub reason: String,
 }
@@ -43,12 +54,40 @@ pub struct PublicizeClaimsRequest {
 /// `POST /api/v1/claims/share-with-team`.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ShareClaimsWithTeamRequest {
-    /// 1 to 500 private claim ids. All or nothing.
+    /// 1 to 500 private claim ids. All or nothing. Omit when giving
+    /// `selection`.
+    #[serde(default)]
     pub claim_ids: Vec<Uuid>,
+    /// Instead of `claim_ids`: a root and the closure walked from it (backlog
+    /// 02d9e9a1).
+    #[serde(default)]
+    pub selection: Option<SelectionRequest>,
+    /// `true`: change nothing, return the plan.
+    #[serde(default)]
+    pub dry_run: bool,
     /// The team to move them into.
     pub group_id: Uuid,
     /// Required; recorded in the `claim.shared_with_team` audit event.
     pub reason: String,
+}
+
+/// A root claim and the closure to walk from it
+/// (`epigraph_engine::visibility_act::Selection`). Every claim reached that
+/// the act may move goes with the root; every other is a boundary, reported
+/// with its reason, left untouched and not walked through.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SelectionRequest {
+    /// The claim to start from.
+    pub root: Uuid,
+    /// Edge types to follow (default `decomposes_to`, `supports`).
+    #[serde(default)]
+    pub edge_types: Option<Vec<String>>,
+    /// `outgoing` (default), `incoming` or `both`.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Edges walked from the root, 0 to 10 (default 3).
+    #[serde(default)]
+    pub max_depth: Option<u32>,
 }
 
 /// `PUT /api/v1/agents/me/default-group` and `PUT /api/v1/agents/:id/default-group`.
@@ -93,6 +132,15 @@ pub struct VisibilityActItem {
 /// The response of both claim acts.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct VisibilityActResponse {
+    /// Present for a selection or a dry run: whether this was a dry run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    /// Present for a selection or a dry run: `{selection, claims,
+    /// boundaries, capped}` (`epigraph_engine::visibility_act::VisibilityPlan`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub plan: Option<serde_json::Value>,
+    /// Empty on a dry run.
     pub results: Vec<VisibilityActItem>,
 }
 
@@ -133,16 +181,54 @@ fn bounded(ids: &[Uuid]) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn respond(outcomes: Vec<epigraph_db::VisibilityActOutcome>) -> Json<VisibilityActResponse> {
-    Json(VisibilityActResponse {
-        results: outcomes
+/// What the request names: `claim_ids` or a `selection`, exactly one.
+fn target_of(
+    claim_ids: &[Uuid],
+    selection: Option<&SelectionRequest>,
+) -> Result<ActTarget, ApiError> {
+    match selection {
+        None => {
+            bounded(claim_ids)?;
+            Ok(ActTarget::Ids(claim_ids.to_vec()))
+        }
+        Some(_) if !claim_ids.is_empty() => Err(ApiError::ValidationError {
+            field: "selection".to_string(),
+            reason: "give claim_ids or selection, not both".to_string(),
+        }),
+        Some(sel) => Selection::new(
+            sel.root,
+            sel.edge_types.as_deref(),
+            sel.direction.as_deref(),
+            sel.max_depth,
+        )
+        .map(ActTarget::Selection)
+        .map_err(|reason| ApiError::ValidationError {
+            field: "selection".to_string(),
+            reason,
+        }),
+    }
+}
+
+fn respond(report: ActReport, dry_run: bool) -> Result<Json<VisibilityActResponse>, ApiError> {
+    let plan = report
+        .plan
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| ApiError::InternalError {
+            message: format!("plan: {e}"),
+        })?;
+    Ok(Json(VisibilityActResponse {
+        dry_run: plan.as_ref().map(|_| dry_run),
+        plan,
+        results: report
+            .results
             .into_iter()
             .map(|o| VisibilityActItem {
                 claim_id: o.claim_id,
                 outcome: o.outcome,
             })
             .collect(),
-    })
+    }))
 }
 
 /// A widening act's failure: a refusal or database error as every
@@ -157,12 +243,14 @@ fn act_error(e: epigraph_engine::visibility_act::VisibilityActError) -> ApiError
     }
 }
 
-/// `POST /api/v1/claims/publicize`
+/// `POST /api/v1/claims/publicize`: by `claim_ids`, or by a `selection`
+/// walked from a root (backlog 02d9e9a1); `dry_run` returns the plan and
+/// changes nothing.
 ///
 /// # Errors
-/// 400 bad request, 404 a claim the caller cannot read, 403 not a team admin
-/// or an operated agent (migration 242), 409 a sealed claim; nothing changes
-/// on any of them.
+/// 400 bad request (or a selection over 500 claims), 404 a claim (or root)
+/// the caller cannot read, 403 not a team admin or an operated agent
+/// (migration 242), 409 a sealed claim; nothing changes on any of them.
 pub async fn publicize_claims(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -170,22 +258,30 @@ pub async fn publicize_claims(
     Json(body): Json<PublicizeClaimsRequest>,
 ) -> Result<Json<VisibilityActResponse>, ApiError> {
     require_write(auth_ctx, "POST /api/v1/claims/publicize")?;
-    bounded(&body.claim_ids)?;
+    let target = target_of(&body.claim_ids, body.selection.as_ref())?;
     let mut tx = state.write_as(&viewer, "publicize_claims").await?;
     // The act and the moved claims' cached-belief refold, in this transaction
     // (`epigraph_engine::visibility_act`; backlog 31285392).
-    let outcomes = epigraph_engine::visibility_act::publicize_claims(
+    let report = visibility_act::act(
         &mut tx,
         &viewer,
-        &body.claim_ids,
+        WideningAct::Publicize,
+        &target,
         &body.reason,
+        body.dry_run,
     )
     .await
     .map_err(act_error)?;
-    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+    // A dry run changes nothing: its transaction is dropped, not committed.
+    let done = if body.dry_run {
+        tx.rollback().await
+    } else {
+        tx.commit().await
+    };
+    done.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit: {e}"),
     })?;
-    Ok(respond(outcomes))
+    respond(report, body.dry_run)
 }
 
 /// `POST /api/v1/claims/share-with-team`
@@ -199,21 +295,30 @@ pub async fn share_claims_with_team(
     Json(body): Json<ShareClaimsWithTeamRequest>,
 ) -> Result<Json<VisibilityActResponse>, ApiError> {
     require_write(auth_ctx, "POST /api/v1/claims/share-with-team")?;
-    bounded(&body.claim_ids)?;
+    let target = target_of(&body.claim_ids, body.selection.as_ref())?;
     let mut tx = state.write_as(&viewer, "share_claims_with_team").await?;
-    let outcomes = epigraph_engine::visibility_act::share_claims_with_team(
+    let report = visibility_act::act(
         &mut tx,
         &viewer,
-        &body.claim_ids,
-        body.group_id,
+        WideningAct::ShareWithTeam {
+            group_id: body.group_id,
+        },
+        &target,
         &body.reason,
+        body.dry_run,
     )
     .await
     .map_err(act_error)?;
-    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+    // A dry run changes nothing: its transaction is dropped, not committed.
+    let done = if body.dry_run {
+        tx.rollback().await
+    } else {
+        tx.commit().await
+    };
+    done.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit: {e}"),
     })?;
-    Ok(respond(outcomes))
+    respond(report, body.dry_run)
 }
 
 /// Set `agent`'s default on one transaction stamped as the caller; the

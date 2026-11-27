@@ -212,6 +212,7 @@ async fn publicize(
         PublicizeClaimsParams {
             claim_ids: ids.iter().map(Uuid::to_string).collect(),
             reason: "ready for the open-science core".to_string(),
+            ..Default::default()
         },
         Some(&token(agent)),
     )
@@ -233,6 +234,7 @@ async fn share(
             claim_ids: ids.iter().map(Uuid::to_string).collect(),
             group_id: group.to_string(),
             reason: "share the draft".to_string(),
+            ..Default::default()
         },
         Some(&token(agent)),
     )

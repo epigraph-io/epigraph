@@ -529,6 +529,7 @@ async fn publicize(
         PublicizeClaimsParams {
             claim_ids: ids.iter().map(Uuid::to_string).collect(),
             reason: "ready for the open-science core".to_string(),
+            ..Default::default()
         },
         Some(&token(agent)),
     )
@@ -856,6 +857,7 @@ async fn a_private_claim_is_shared_with_a_team_the_author_writes(pool: PgPool) {
         claim_ids: ids.iter().map(Uuid::to_string).collect(),
         group_id: g.to_string(),
         reason: "share the draft".to_string(),
+        ..Default::default()
     };
 
     let err = share_claims_with_team(&s.server, &av, share(vec![c], other), Some(&token(alice)))
@@ -1153,6 +1155,7 @@ async fn share_decides_on_the_owner_a_concurrent_change_commits(pool: PgPool) {
         claim_ids: vec![c.to_string()],
         group_id: t.to_string(),
         reason: "share the draft".to_string(),
+        ..Default::default()
     };
     let bearer = token(alice);
     let (answer, ()) = tokio::join!(

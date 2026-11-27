@@ -174,6 +174,10 @@ pub use repos::{
     INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
 };
 pub use repos::{
+    preview_refusal, ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant,
+    VisibilityActOutcome, WriteTenancyReport,
+};
+pub use repos::{
     record_standing_refusal, AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony,
     EndReason, LiveElevation, Redemption, StandingCeremony, TicketMode, TicketPasskey,
 };
@@ -185,10 +189,6 @@ pub use repos::{
 pub use repos::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
 pub use repos::{AuthorNaming, AuthorNamingFacts};
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
-pub use repos::{
-    ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome,
-    WriteTenancyReport,
-};
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{CountersignDecision, CountersignRepository, CountersignedRow};
 pub use repos::{

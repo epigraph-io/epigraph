@@ -212,8 +212,8 @@ pub use claim_theme::{
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use claim_visibility::{
-    ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome,
-    WriteTenancyReport,
+    preview_refusal, ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant,
+    VisibilityActOutcome, WriteTenancyReport,
 };
 pub use cluster_run::{
     BridgeEdgeRow, ClaimPlacement, ClusterRunRepository, ClusterRunRow, ALGO_LOUVAIN_BRIDGE,
