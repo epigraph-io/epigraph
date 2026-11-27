@@ -15,10 +15,13 @@ use epigraph_jobs::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// A service that has text for every claim (unless `text` is `None`) and whose
-/// store fails with `error` (or succeeds when it is `None`).
+/// A service that has text for every claim (unless `text` is `None`), whose
+/// `already_embedded` pre-check fails with `check` (or answers `false` when it
+/// is `None`), and whose store fails with `error` (or succeeds when it is
+/// `None`).
 struct Service {
     text: Option<String>,
+    check: Option<EmbeddingJobError>,
     error: Option<EmbeddingJobError>,
 }
 
@@ -29,7 +32,10 @@ impl EmbeddingJobService for Service {
     }
 
     async fn already_embedded(&self, _claim_id: Uuid) -> Result<bool, EmbeddingJobError> {
-        Ok(false)
+        match &self.check {
+            Some(e) => Err(e.clone()),
+            None => Ok(false),
+        }
     }
 
     async fn generate_and_store(
@@ -63,6 +69,7 @@ fn embedding_job(claim_id: Uuid) -> Job {
 async fn retryable(text: Option<&str>, error: Option<EmbeddingJobError>) -> bool {
     let handler = ConfigurableEmbeddingHandler::new(Arc::new(Service {
         text: text.map(str::to_string),
+        check: None,
         error,
     }));
     handler
@@ -132,6 +139,7 @@ async fn a_provider_or_database_error_stays_transient() {
 async fn a_payload_of_another_job_variant_is_permanent() {
     let handler = ConfigurableEmbeddingHandler::new(Arc::new(Service {
         text: Some("text".to_string()),
+        check: None,
         error: None,
     }));
     let job = Job::new(
@@ -145,5 +153,44 @@ async fn a_payload_of_another_job_variant_is_permanent() {
     assert!(
         !err.should_retry(),
         "a payload that will never be an embedding job was retryable: {err}"
+    );
+}
+
+/// `AlreadyEmbedded` from the store means a vector landed during the provider
+/// call: the job has what it was for, so it completes as a skip.
+#[tokio::test]
+async fn a_store_that_finds_a_vector_completes_as_a_skip() {
+    let claim_id = Uuid::new_v4();
+    let handler = ConfigurableEmbeddingHandler::new(Arc::new(Service {
+        text: Some("text".to_string()),
+        check: None,
+        error: Some(EmbeddingJobError::AlreadyEmbedded { claim_id }),
+    }));
+    let result = handler
+        .handle(&embedding_job(claim_id))
+        .await
+        .expect("a vector that landed during the provider call fails the job");
+    assert_eq!(result.output["skipped"], "already_embedded");
+    assert_eq!(result.output["claim_id"], claim_id.to_string());
+}
+
+/// `AlreadyEmbedded` from anywhere but the store (here the pre-check) is not
+/// turned into a skip; it reaches the classifier, and a re-run would find the
+/// same vector, so it is PERMANENT rather than spending the retry budget.
+#[tokio::test]
+async fn already_embedded_outside_the_store_is_permanent() {
+    let claim_id = Uuid::new_v4();
+    let handler = ConfigurableEmbeddingHandler::new(Arc::new(Service {
+        text: Some("text".to_string()),
+        check: Some(EmbeddingJobError::AlreadyEmbedded { claim_id }),
+        error: None,
+    }));
+    let err = handler
+        .handle(&embedding_job(claim_id))
+        .await
+        .expect_err("the pre-check failed, so the job must fail");
+    assert!(
+        !err.should_retry(),
+        "AlreadyEmbedded was retryable: the job spends its whole budget on a vector that stays"
     );
 }
