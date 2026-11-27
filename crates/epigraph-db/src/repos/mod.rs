@@ -13,6 +13,7 @@ pub mod agent_disclosure;
 pub mod agent_identity;
 pub mod agent_key;
 pub mod agent_lookup;
+pub mod agent_profile;
 pub mod alternative_set;
 pub mod analysis;
 pub mod assertion_nonce;
@@ -142,6 +143,7 @@ pub use agent_lookup::{
     AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef, AgentSearchHit,
     AuthorNode, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
 };
+pub use agent_profile::{AgentClaimProfileRow, AgentProfileRepository, EvidenceTypeCount};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use atlas_flow::{AtlasFlowRepository, EvidenceMassRow, FlowInputs};
@@ -276,8 +278,8 @@ pub use paper::{
 pub use perspective::PerspectiveRepository;
 pub use policy::PolicyRepository;
 pub use political::{
-    AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,
-    PropagandaTechniqueRow, PropagationStepRow, TimelineClaimRow,
+    CoalitionRow, PoliticalRepository, PropagandaTechniqueRow, PropagationStepRow,
+    TimelineClaimRow,
 };
 pub use provenance_chain::{
     ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceNode, MAX_CHAIN_NODES,

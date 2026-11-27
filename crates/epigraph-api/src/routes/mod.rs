@@ -1221,9 +1221,11 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/methods/:id", get(methods::get_method))
         // Political network monitoring (Items 3–12) — read endpoints
+        // The agent epistemic profile (the Explorer's agent page) lives in
+        // `agents.rs`; the political handlers around it are a separate product.
         .route(
             "/api/v1/agents/:id/epistemic-profile",
-            get(political::epistemic_profile),
+            get(agents::epistemic_profile),
         )
         .route("/api/v1/agents/compare", get(political::compare_agents))
         .route(
@@ -1844,11 +1846,9 @@ pub fn create_router_with_extensions(
             "/api/v1/structural-features/:owner_id",
             get(structural::get_structural_features),
         )
-        // Political network monitoring (Items 3–12) — read endpoints (non-db stubs)
-        .route(
-            "/api/v1/agents/:id/epistemic-profile",
-            get(political::epistemic_profile),
-        )
+        // Political network monitoring (Items 3–12) — read endpoints (non-db stubs).
+        // The agent epistemic profile moved to `agents.rs`, which is db-only
+        // like every other agent route, so this router does not mount it.
         .route("/api/v1/agents/compare", get(political::compare_agents))
         .route(
             "/api/v1/agents/:id/position-timeline",

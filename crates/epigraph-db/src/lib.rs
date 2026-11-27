@@ -276,9 +276,12 @@ pub use repos::scoped_belief::{CommunityFoldsCleared, ScopedBeliefRow};
 
 // Re-export Political network monitoring types
 pub use repos::political::{
-    AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,
-    PropagandaTechniqueRow, PropagationStepRow, TimelineClaimRow,
+    CoalitionRow, PoliticalRepository, PropagandaTechniqueRow, PropagationStepRow,
+    TimelineClaimRow,
 };
+
+// Re-export the agent epistemic-profile reads
+pub use repos::agent_profile::{AgentClaimProfileRow, AgentProfileRepository, EvidenceTypeCount};
 
 // Re-export Lineage types for users of LineageRepository
 pub use repos::lineage::{

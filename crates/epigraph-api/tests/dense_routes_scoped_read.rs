@@ -84,10 +84,10 @@
 //!
 //! | route | sites driven | arm |
 //! |---|---|---|
-//! | `political.rs::epistemic_profile` | `AgentRepository::get_by_id`, `PoliticalRepository::{get_agent_profile_claims, get_agent_evidence_distribution}` | [`epistemic_profile_counts_the_viewers_own_group_private_claim`] |
+//! | `agents.rs::epistemic_profile` (moved from `political.rs`, backlog a1dd9225) | `AgentRepository::get_by_id`, `AgentProfileRepository::{get_agent_profile_claims, get_agent_evidence_distribution}` | [`epistemic_profile_counts_the_viewers_own_group_private_claim`] |
 //! | `political.rs::claim_genealogy` | `PoliticalRepository::get_claim_genealogy` | [`claim_genealogy_serves_the_viewers_own_group_private_edge`] |
 //! | `political.rs::claim_genealogy` (existence probe) | `ClaimRepository::visible_claim_ids` | [`claim_genealogy_private_claim_is_404_like_a_missing_one`] |
-//! | `political.rs::compare_agents` | `AgentRepository::get_by_id`, `PoliticalRepository::get_agent_profile_claims`, over N agents | [`compare_agents_measures_every_agent_against_the_same_corpus`] |
+//! | `political.rs::compare_agents` | `AgentRepository::get_by_id`, `AgentProfileRepository::get_agent_profile_claims`, over N agents | [`compare_agents_measures_every_agent_against_the_same_corpus`] |
 //! | `structural.rs::get_structural_features` | nine `StructuralRepository` reads on one connection | [`structural_features_counts_the_viewers_own_group_private_claim`] |
 //!
 //! # What IS and is NOT proven here
@@ -116,9 +116,8 @@ mod viewer_fixture;
 
 use axum::extract::{Path, Query, State};
 use epigraph_api::middleware::bearer::ViewerExtractor;
-use epigraph_api::routes::political::{
-    claim_genealogy, compare_agents, epistemic_profile, CompareAgentsParams, EpistemicProfileParams,
-};
+use epigraph_api::routes::agents::{epistemic_profile, EpistemicProfileParams};
+use epigraph_api::routes::political::{claim_genealogy, compare_agents, CompareAgentsParams};
 use epigraph_api::routes::structural::{get_structural_features, StructuralFeaturesQuery};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_auth::{AuthContext, ClientType};
@@ -308,11 +307,11 @@ async fn seed_propagation_edge(
     id
 }
 
-// ── political.rs ──
+// ── agents.rs::epistemic_profile (moved out of political.rs, backlog a1dd9225) ──
 
 /// `GET /api/v1/agents/:id/epistemic-profile` — the arm that drives the
 /// executor widening on `AgentRepository::get_by_id` alongside the two
-/// viewer-spliced `PoliticalRepository` reads that share its connection.
+/// viewer-spliced `AgentProfileRepository` reads that share its connection.
 ///
 /// The over-suppression direction is the one that catches a reversion to the raw
 /// pool: with the handler reading `&state.db_pool`, the filtered unstamped
@@ -326,7 +325,7 @@ async fn seed_propagation_edge(
 /// migration 077 gives `agents` the policy `agents_identity FOR SELECT USING
 /// (true)`, so stamping that statement's connection narrows nothing and the
 /// agent would be found either way. `claim_count` — a
-/// `PoliticalRepository::get_agent_profile_claims` read over `claims` and
+/// `AgentProfileRepository::get_agent_profile_claims` read over `claims` and
 /// `edges`, both FORCEd — is the provable half, and is what is asserted.
 #[sqlx::test(migrations = "../../migrations")]
 async fn epistemic_profile_counts_the_viewers_own_group_private_claim(pool: PgPool) {
@@ -352,6 +351,8 @@ async fn epistemic_profile_counts_the_viewers_own_group_private_claim(pool: PgPo
     )
     .0;
 
+    // `routes::agents::epistemic_profile` is the handler `routes/mod.rs` mounts
+    // at this path; importing it from `agents` is what pins the move.
     assert_eq!(
         out.claim_count, 2,
         "CALIBRATION: an agent's own profile must count BOTH its public claim ({public}) \
@@ -367,6 +368,8 @@ async fn epistemic_profile_counts_the_viewers_own_group_private_claim(pool: PgPo
          negative assertion, so the positive direction is asserted explicitly"
     );
 }
+
+// ── political.rs ──
 
 /// `GET /api/v1/claims/:id/genealogy` — the arm over `edges`, which carries the
 /// co-ownership spelling (`EDGE_VISIBILITY`) rather than the claim one.

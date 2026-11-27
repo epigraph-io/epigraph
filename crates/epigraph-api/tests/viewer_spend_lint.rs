@@ -192,6 +192,19 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: the agent row; its claims are read through the viewer.
     ("agents.rs", "agent_claims", &["AgentRepository::get_by_id"]),
+    // untenanted: the agent row; the two profile reads
+    // (`AgentProfileRepository`) are viewer-spliced. stamped: the agent's name
+    // through migration 309's disclosure on the handler's `read_as(viewer)`
+    // connection; `redact_agent` is pure.
+    (
+        "agents.rs",
+        "epistemic_profile",
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+            "epigraph_db::redact_agent",
+        ],
+    ),
     // stamped: `AgentDisclosureRepository::disclosure` runs on the handler's
     // `read_as(viewer)` connection and migration 309's
     // `epigraph_agent_disclosure` decides on that stamp (a definer that
@@ -1137,17 +1150,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "political.rs",
         "compare_agents",
-        // stamped: the agent's name through migration 309's disclosure on the
-        // handler's `read_as(viewer)` connection; `redact_agent` is pure.
-        &[
-            "AgentDisclosureRepository::disclosure",
-            "AgentRepository::get_by_id",
-            "epigraph_db::redact_agent",
-        ],
-    ),
-    (
-        "political.rs",
-        "epistemic_profile",
         // stamped: the agent's name through migration 309's disclosure on the
         // handler's `read_as(viewer)` connection; `redact_agent` is pure.
         &[

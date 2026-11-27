@@ -46,12 +46,13 @@ use axum::{
 use epigraph_core::{Agent, AgentId};
 #[cfg(feature = "db")]
 use epigraph_db::{
-    AgentDisclosureRepository, AgentRepository, ClaimRepository, EdgeRepository,
-    OAuthClientRepository,
+    AgentDisclosureRepository, AgentProfileRepository, AgentRepository, ClaimRepository,
+    EdgeRepository, OAuthClientRepository,
 };
 #[cfg(feature = "db")]
 use epigraph_engine::reputation::{ClaimOutcome, ReputationCalculator};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::middleware::bearer::ViewerExtractor;
@@ -1019,6 +1020,166 @@ pub async fn agent_claims(
 }
 
 // =============================================================================
+// EPISTEMIC PROFILE
+// =============================================================================
+//
+// `GET /api/v1/agents/:id/epistemic-profile` (the Explorer's agent page reads
+// it). The handler serves every statement on ONE viewer-stamped connection from
+// [`AppState::read_as`]: the agent row, its name through migration 309's
+// disclosure, and the two viewer-spliced `AgentProfileRepository` reads.
+
+/// An agent's epistemic profile: what its attributed claims look like in aggregate.
+#[derive(Debug, Serialize)]
+pub struct EpistemicProfileResponse {
+    pub agent_id: Uuid,
+    pub display_name: Option<String>,
+    pub claim_count: usize,
+    pub evidence_distribution: HashMap<String, f64>,
+    pub epistemic_status_distribution: HashMap<String, f64>,
+    pub mean_truth_value: f64,
+    pub refutation_rate: f64,
+    pub topics: Vec<String>,
+    pub time_range: Option<TimeRange>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TimeRange {
+    pub first: chrono::DateTime<chrono::Utc>,
+    pub last: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EpistemicProfileParams {
+    // Future: topic filter, date range
+}
+
+/// GET /api/v1/agents/:id/epistemic-profile
+///
+/// Aggregates an agent's claim history into an epistemic profile showing
+/// evidence type distribution, truth value statistics, and refutation rate.
+#[cfg(feature = "db")]
+pub async fn epistemic_profile(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(_params): Query<EpistemicProfileParams>,
+) -> Result<Json<EpistemicProfileResponse>, ApiError> {
+    let agent_id = AgentId::from_uuid(id);
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "epistemic_profile",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    // Verify agent exists
+    let mut agent = AgentRepository::get_by_id(&mut *read, agent_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound {
+            entity: "Agent".to_string(),
+            id: id.to_string(),
+        })?;
+    // The name as the caller may see it (migration 309, on this stamped
+    // connection; spec 7 row F1).
+    let d = epigraph_db::AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
+    epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());
+
+    // Fetch claims
+    let claims = AgentProfileRepository::get_agent_profile_claims(&mut *read, &viewer, id).await?;
+    let claim_count = claims.len();
+
+    if claim_count == 0 {
+        return Ok(Json(EpistemicProfileResponse {
+            agent_id: id,
+            display_name: agent.display_name,
+            claim_count: 0,
+            evidence_distribution: HashMap::new(),
+            epistemic_status_distribution: HashMap::new(),
+            mean_truth_value: 0.0,
+            refutation_rate: 0.0,
+            topics: vec![],
+            time_range: None,
+        }));
+    }
+
+    // Compute truth value stats
+    let sum_truth: f64 = claims.iter().map(|c| c.truth_value).sum();
+    let mean_truth = sum_truth / claim_count as f64;
+
+    // Refutation rate (truth < 0.2)
+    let refuted = claims.iter().filter(|c| c.truth_value < 0.2).count();
+    let refutation_rate = refuted as f64 / claim_count as f64;
+
+    // Epistemic status distribution
+    let mut status_dist: HashMap<String, usize> = HashMap::new();
+    for claim in &claims {
+        let status = if claim.truth_value < 0.2 {
+            "refuted"
+        } else if claim.truth_value < 0.4 {
+            "contested"
+        } else if claim.truth_value >= 0.8 {
+            "verified"
+        } else {
+            "active"
+        };
+        *status_dist.entry(status.to_string()).or_insert(0) += 1;
+    }
+    let status_distribution: HashMap<String, f64> = status_dist
+        .into_iter()
+        .map(|(k, v)| (k, v as f64 / claim_count as f64))
+        .collect();
+
+    // Evidence distribution
+    let ev_rows =
+        AgentProfileRepository::get_agent_evidence_distribution(&mut *read, &viewer, id).await?;
+    let ev_total: i64 = ev_rows.iter().map(|r| r.count).sum();
+    let evidence_distribution: HashMap<String, f64> = if ev_total > 0 {
+        ev_rows
+            .into_iter()
+            .filter_map(|r| {
+                r.evidence_type
+                    .map(|t| (t, r.count as f64 / ev_total as f64))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    // Extract topics from claim labels
+    let mut topics: Vec<String> = claims
+        .iter()
+        .flat_map(|c| c.labels.iter().cloned())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    topics.sort();
+
+    // Time range
+    let first = claims.iter().map(|c| c.created_at).min();
+    let last = claims.iter().map(|c| c.created_at).max();
+    let time_range = first
+        .zip(last)
+        .map(|(f, l)| TimeRange { first: f, last: l });
+
+    Ok(Json(EpistemicProfileResponse {
+        agent_id: id,
+        display_name: agent.display_name,
+        claim_count,
+        evidence_distribution,
+        epistemic_status_distribution: status_distribution,
+        mean_truth_value: mean_truth,
+        refutation_rate,
+        topics,
+        time_range,
+    }))
+}
+
+// =============================================================================
 // UPDATE AGENT
 // =============================================================================
 
@@ -1353,5 +1514,26 @@ mod tests {
         assert_eq!(json["attribution"]["prov"], "wasAttributedTo");
         assert_eq!(json["attribution"]["role"], "author");
         assert_eq!(json["attribution"]["position"], 0);
+    }
+
+    #[test]
+    fn epistemic_profile_response_serializes() {
+        let mut evidence_dist = HashMap::new();
+        evidence_dist.insert("testimonial".to_string(), 1.0);
+
+        let resp = EpistemicProfileResponse {
+            agent_id: Uuid::nil(),
+            display_name: Some("Test Agent".to_string()),
+            claim_count: 6,
+            evidence_distribution: evidence_dist,
+            epistemic_status_distribution: HashMap::new(),
+            mean_truth_value: 0.226,
+            refutation_rate: 0.833,
+            topics: vec!["Iran".to_string()],
+            time_range: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["claim_count"], 6);
+        assert_eq!(json["evidence_distribution"]["testimonial"], 1.0);
     }
 }
