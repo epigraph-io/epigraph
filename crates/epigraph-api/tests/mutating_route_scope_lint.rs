@@ -223,7 +223,6 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("groups::create_group", Scope("groups:write")),
     ("groups::remove_member", Scope("groups:admin")),
     ("groups::rotate_key", Scope("groups:admin")),
-    ("harvest::submit_harvest", Scope("claims:write")),
     ("hypothesis::create_hypothesis", Scope("claims:write")),
     ("hypothesis::promote_hypothesis", Scope("claims:write")),
     ("ingest::ingest_paper", Scope("claims:admin")),

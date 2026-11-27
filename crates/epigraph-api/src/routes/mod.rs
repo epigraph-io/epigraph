@@ -104,7 +104,6 @@ pub mod groups;
 /// The guest read surface: anonymous, public-only reads (backlog `1deb9dbf`).
 #[cfg(feature = "db")]
 pub mod guest;
-pub mod harvest;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hypothesis;
@@ -546,7 +545,6 @@ pub fn create_router_with_extensions(
             "/api/v1/webhooks/:id",
             get(webhooks::get_webhook).delete(webhooks::delete_webhook),
         )
-        .route("/api/v1/harvest", post(harvest::submit_harvest))
         .route("/api/v1/ingest/paper", post(ingest::ingest_paper))
         .route("/api/v1/ingest/paper-url", post(ingest::ingest_paper))
         .route("/api/v1/papers", post(papers::create_paper))
@@ -1652,7 +1650,6 @@ pub fn create_router_with_extensions(
             "/api/v1/webhooks/:id",
             get(webhooks::get_webhook).delete(webhooks::delete_webhook),
         )
-        .route("/api/v1/harvest", post(harvest::submit_harvest))
         .route("/api/v1/ingest/paper", post(ingest::ingest_paper))
         .route("/api/v1/ingest/paper-url", post(ingest::ingest_paper))
         .route("/api/v1/papers", post(papers::create_paper))

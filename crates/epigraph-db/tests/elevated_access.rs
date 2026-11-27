@@ -911,7 +911,6 @@ async fn every_readable_owner_group_table_is_attributed(pool: PgPool) {
         "claim_cluster_membership",
         "claim_frames",
         "claim_neighborhood_membership",
-        "harvester_claim_provenance",
     ];
     let body: String = sqlx::query_scalar(
         "SELECT pg_get_functiondef('public.epigraph_record_elevated_access(text, jsonb, \
