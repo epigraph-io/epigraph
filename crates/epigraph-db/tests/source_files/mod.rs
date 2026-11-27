@@ -236,20 +236,31 @@ pub fn repo_sources() -> Vec<(String, String)> {
     repo_sources_in(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/repos"))
 }
 
-/// For a lint's split self-test: `files` with the file at `path` (in the
-/// lint's own path form) replaced by a directory module, `<stem>/mod.rs`
-/// holding its text up to the top-level `impl` line nearest its middle and
-/// `<stem>/moved.rs` holding the rest. A top-level item boundary, so every
-/// function lands whole in one file or the other.
+/// For a lint's split self-test: `files` with the module registered as
+/// `registered` (in the lint's own path form) split further. Its largest file
+/// (ties by path) keeps its text up to the top-level `impl` line nearest its
+/// middle, and the rest moves to `<stem>/split_probe.rs`, a new file inside
+/// the module's directory. A top-level item boundary, so every function lands
+/// whole in one file or the other.
 ///
-/// Panics when `path` is not in `files` or its text has no top-level `impl`
-/// line to split at.
-pub fn split_module(files: &[(String, String)], path: &str) -> Vec<(String, String)> {
-    let text = &files
+/// Resolved by module, not by file, so it works on both layouts: before the
+/// split (`claim.rs` is the largest file) and after it (`claim/mod.rs` or a
+/// child is).
+///
+/// Panics when no file of `files` belongs to the module, when the probe path
+/// is already taken, or when the chosen text has no top-level `impl` line.
+pub fn split_module(files: &[(String, String)], registered: &str) -> Vec<(String, String)> {
+    let (path, text) = files
         .iter()
-        .find(|(p, _)| p == path)
-        .unwrap_or_else(|| panic!("{path} is not among the scanned files"))
-        .1;
+        .filter(|(p, _)| belongs_to(registered, p))
+        .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| b.0.cmp(&a.0)))
+        .unwrap_or_else(|| panic!("no file of module {registered} is among the scanned files"));
+    let stem = registered.strip_suffix(".rs").expect("a .rs path");
+    let probe = format!("{stem}/split_probe.rs");
+    assert!(
+        files.iter().all(|(p, _)| *p != probe),
+        "{probe} already exists"
+    );
     let middle = text.len() / 2;
     let mut at = None::<usize>;
     let mut offset = 0usize;
@@ -262,10 +273,9 @@ pub fn split_module(files: &[(String, String)], path: &str) -> Vec<(String, Stri
         offset += line.len();
     }
     let at = at.unwrap_or_else(|| panic!("{path} has no top-level `impl` line to split at"));
-    let stem = path.strip_suffix(".rs").expect("a .rs path");
     let mut out: Vec<(String, String)> = files.iter().filter(|(p, _)| p != path).cloned().collect();
-    out.push((format!("{stem}/mod.rs"), text[..at].to_string()));
-    out.push((format!("{stem}/moved.rs"), text[at..].to_string()));
+    out.push((path.clone(), text[..at].to_string()));
+    out.push((probe, text[at..].to_string()));
     out.sort();
     out
 }

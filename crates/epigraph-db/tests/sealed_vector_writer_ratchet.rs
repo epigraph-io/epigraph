@@ -565,12 +565,15 @@ async fn not_writers(pool: &PgPool) {
 /// file path.
 #[test]
 fn a_writer_moved_into_the_claim_module_keeps_its_site() {
-    let path = "epigraph-db/src/repos/claim.rs";
-    let text =
-        std::fs::read_to_string(workspace_root().join("crates").join(path)).expect("read claim.rs");
-    let files = vec![(path.to_string(), text)];
-    let split = source_files::split_module(&files, path);
-    assert_eq!(split.len(), 2);
+    // The module's files (claim.rs today, its directory once split),
+    // labelled relative to crates/ as `scan_tree` labels them.
+    let files: Vec<(String, String)> =
+        source_files::module_files("crates/epigraph-db/src/repos/claim.rs")
+            .into_iter()
+            .map(|(p, t)| (p.trim_start_matches("crates/").to_string(), t))
+            .collect();
+    let split = source_files::split_module(&files, "epigraph-db/src/repos/claim.rs");
+    assert_eq!(split.len(), files.len() + 1);
     let sites: Vec<String> = scan_files(&split).into_iter().map(|w| w.site).collect();
     assert_eq!(
         sites,

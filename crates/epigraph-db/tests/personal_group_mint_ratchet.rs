@@ -1020,6 +1020,6 @@ fn splitting_the_claim_module_measures_the_same() {
     let split = source_files::split_module(&files, "epigraph-db/src/repos/claim.rs");
     assert!(split
         .iter()
-        .any(|(p, _)| p == "epigraph-db/src/repos/claim/moved.rs"));
+        .any(|(p, _)| p == "epigraph-db/src/repos/claim/split_probe.rs"));
     assert_eq!(measured_calls_in(&split), measured_calls_in(&files));
 }

@@ -226,20 +226,71 @@ fn the_repos_walk_recurses_and_keys_a_split_module_by_its_file_name() {
 }
 
 #[test]
-fn split_module_moves_whole_items_into_a_directory_module() {
+fn split_module_moves_whole_items_into_the_module_directory() {
     let text = "use x;\n\nimpl A {\n    fn a() {}\n}\n\nimpl B {\n    fn b() {}\n}\n";
-    let tree = files(&[("p/claim.rs", text), ("p/other.rs", "fn o() {}\n")]);
-    let split = split_module(&tree, "p/claim.rs");
+    let sibling =
+        "impl S {\n    fn s() {}\n}\nimpl T {\n    fn t() {}\n}\n// larger than claim.rs\n";
+    let tree = files(&[
+        (CLAIM, text),
+        ("crates/epigraph-db/src/repos/claim_history.rs", sibling),
+    ]);
+    let split = split_module(&tree, CLAIM);
     let paths: Vec<&str> = split.iter().map(|(p, _)| p.as_str()).collect();
     assert_eq!(
         paths,
-        vec!["p/claim/mod.rs", "p/claim/moved.rs", "p/other.rs"]
+        vec![
+            CLAIM,
+            "crates/epigraph-db/src/repos/claim/split_probe.rs",
+            "crates/epigraph-db/src/repos/claim_history.rs",
+        ],
+        "the module's file is split, never a larger sibling"
     );
-    let joined: String = split[0].1.clone() + &split[1].1;
-    assert_eq!(joined, text, "the split loses and adds nothing");
+    assert_eq!(
+        split[0].1.clone() + &split[1].1,
+        text,
+        "nothing lost or added"
+    );
     assert!(
         split[1].1.starts_with("impl "),
-        "it splits at a top-level impl line"
+        "split at a top-level impl line"
+    );
+    assert_eq!(split[2].1, sibling);
+}
+
+/// After the split (`claim/mod.rs` and children, no `claim.rs`) the probe
+/// still resolves the module: its largest file is split.
+#[test]
+fn split_module_works_on_the_mod_rs_layout() {
+    let small = "mod dedup;\n";
+    let big = "impl A {\n    fn a() {}\n}\n\nimpl B {\n    fn b() {}\n}\n";
+    let tree = files(&[
+        ("crates/epigraph-db/src/repos/claim/mod.rs", small),
+        ("crates/epigraph-db/src/repos/claim/dedup.rs", big),
+    ]);
+    let split = split_module(&tree, CLAIM);
+    assert_eq!(
+        split.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+        vec![
+            "crates/epigraph-db/src/repos/claim/dedup.rs",
+            "crates/epigraph-db/src/repos/claim/mod.rs",
+            "crates/epigraph-db/src/repos/claim/split_probe.rs",
+        ]
+    );
+    assert_eq!(split[0].1.clone() + &split[2].1, big);
+    assert_eq!(split[1].1, small);
+
+    let taken = files(&[
+        (CLAIM, big),
+        ("crates/epigraph-db/src/repos/claim/split_probe.rs", small),
+    ]);
+    assert!(
+        std::panic::catch_unwind(|| split_module(&taken, CLAIM)).is_err(),
+        "an existing probe path is refused, not overwritten"
+    );
+    let absent = files(&[("crates/epigraph-db/src/repos/claim_history.rs", big)]);
+    assert!(
+        std::panic::catch_unwind(|| split_module(&absent, CLAIM)).is_err(),
+        "a tree without the module is refused"
     );
 }
 

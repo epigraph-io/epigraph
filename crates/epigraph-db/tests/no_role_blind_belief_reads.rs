@@ -1641,7 +1641,7 @@ fn splitting_the_claim_module_measures_the_same() {
     let split = belief_lint::with_claim_split(&rust);
     assert!(split
         .iter()
-        .any(|s| s.path.ends_with("/repos/claim/moved.rs")));
+        .any(|s| s.path.ends_with("/repos/claim/split_probe.rs")));
     let measured = measure(&split, &scripts);
     assert_eq!(
         format!("{measured:#?}"),
