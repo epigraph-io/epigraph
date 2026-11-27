@@ -194,9 +194,9 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(
     name = "epigraph-operator",
-    about = "Operator ownership backfill (retired links, claim re-own, and its reversal), \
-             operator binding (live links, the legacy-author tie, arming), and audited \
-             admin-only scope grants on human OAuth clients"
+    about = "Audited operator verbs: roles and elevation, passkeys, groups, identity \
+             links and operator binding, OAuth clients and their admin-only scopes, and \
+             custody, re-own, restriction and their reversals"
 )]
 struct Cli {
     #[command(subcommand)]

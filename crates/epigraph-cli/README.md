@@ -38,7 +38,7 @@ row names no `[[bin]]`, or when a row's class is not one of the five below.
 | `epigraph-instance-admin` | admin | Checks and lists the privatization authority (writes nothing since migration 123). |
 | `epigraph-group` | admin | Client-side group key ceremony: mint, wrap, unwrap, rotate and re-wrap group keys; talks to no server or database. |
 | `epigraph-privatize` | admin | Client half of the seal ceremony: seals, unseals and reseals a plan's members over HTTP with locally derived keys. |
-| `epigraph-tenancy-backfill` | admin | The batched tenancy backfill of pre-existing rows, and the `verify` subcommand used as a deploy pre-flight. |
+| `epigraph-tenancy-backfill` | admin | The batched tenancy backfill of pre-existing rows (`run`, one-shot), and the `verify` subcommand used as a standing deploy pre-flight. |
 | `bootstrap_clients` | admin | Idempotently provisions the three service OAuth clients of a new deployment. |
 | `unmark_duplicate` | admin | Un-marks a duplicate (or every mark of one label-dedup apply) on the maintenance connection. |
 | `export_provenance` | admin | Exports a claim's provenance graph as PROV-O JSON-LD; read-only. |
