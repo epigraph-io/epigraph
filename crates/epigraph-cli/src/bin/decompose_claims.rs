@@ -114,11 +114,14 @@
 //! * `--retarget` stays on the maintenance path, and `--priority conflict`'s
 //!   report of decomposed conflict parents is printed only there.
 //!
-//! Pass the agent the API token acts as (the service client's agent). The
-//! binary does not check that the two match: atoms are created as the
-//! token's agent and edges as `--as-agent`, so a mismatch splits their
-//! attribution. That is an operator check at deploy time, not a privilege
-//! question (the application login can already stamp any agent).
+//! Pass the agent the API token acts as (the service client's agent). Atoms
+//! are created as the token's agent and edges as `--as-agent`, so a writing
+//! run first asks the API which agent its token is (`GET /api/v1/agents/me`,
+//! backlog 076e94cc) and refuses, before any LLM call or write, unless it is
+//! the `--as-agent` agent. A minted token asks for `claims:read` as well,
+//! which that route needs; an API without the route (older than this binary)
+//! is refused too, so deploy the API first. A read-only mode resolves no token
+//! and makes no check.
 //!
 //! Coverage against the maintenance view (measured on a fixture in
 //! `tests/decompose_claims_as_agent.rs`):
@@ -796,6 +799,84 @@ fn provider_writes_to_api(provider: &str) -> bool {
     provider != "mock"
 }
 
+/// The scope `GET /api/v1/agents/me` needs; a minted `--as-agent` token asks
+/// for it besides the mode's write scope.
+const WHOAMI_SCOPE: &str = "claims:read";
+
+/// The scope a minted token asks for: the mode's write scope, plus
+/// [`WHOAMI_SCOPE`] for an `--as-agent` run, whose identity check reads
+/// `GET /api/v1/agents/me`.
+fn token_scope(mode: &Mode, as_agent: bool) -> String {
+    if as_agent {
+        format!("{} {WHOAMI_SCOPE}", mode.mint_scope())
+    } else {
+        mode.mint_scope().to_string()
+    }
+}
+
+/// Refuse unless the API token acts as `agent` (backlog 076e94cc).
+///
+/// A writing `--as-agent` run creates atoms through the API as the TOKEN's
+/// agent and writes `decomposes_to` edges stamped for `agent`. Two different
+/// agents would split one decomposition's attribution, so the run asks
+/// `GET /api/v1/agents/me` which agent the token is and refuses on any
+/// answer other than `agent`, or on no usable answer at all.
+async fn check_token_acts_as(
+    http: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    agent: uuid::Uuid,
+) -> Result<(), String> {
+    let url = format!("{}/api/v1/agents/me", api_base.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| {
+            format!("--as-agent {agent}: cannot ask the API which agent the token acts as: {e}")
+        })?;
+    let status = resp.status();
+    if matches!(status.as_u16(), 400 | 404 | 405) {
+        return Err(format!(
+            "--as-agent {agent}: the API answered {status} to GET /api/v1/agents/me, so it \
+             cannot say which agent the token acts as (an API older than this binary reads \
+             `me` as an agent id); deploy the API first"
+        ));
+    }
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(format!(
+            "--as-agent {agent}: the API refused the token on GET /api/v1/agents/me \
+             ({status}); the token needs {WHOAMI_SCOPE}"
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "--as-agent {agent}: GET /api/v1/agents/me answered {status}"
+        ));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        format!("--as-agent {agent}: GET /api/v1/agents/me answered no JSON: {e}")
+    })?;
+    let token_agent = body
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<uuid::Uuid>().ok())
+        .ok_or_else(|| {
+            format!("--as-agent {agent}: GET /api/v1/agents/me carried no agent_id: {body}")
+        })?;
+    if token_agent != agent {
+        return Err(format!(
+            "--as-agent {agent}: the API token acts as agent {token_agent}, so atoms would be \
+             created as {token_agent} and decomposes_to edges as {agent}; pass \
+             --as-agent {token_agent}, or a token for {agent}"
+        ));
+    }
+    eprintln!("identity: the API token acts as {agent}, as --as-agent says");
+    Ok(())
+}
+
 /// Resolve the bearer token for API writes, or fail fast (gh-375). Called
 /// BEFORE any LLM work in every writing mode.
 async fn resolve_token(
@@ -1003,11 +1084,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Mode::writes` / `provider_writes_to_api`.
     let token = if mode.writes(&cli.provider) {
         eprintln!("api_base={api_base}");
-        resolve_token(&api_base, mode.mint_scope(), &http).await?
+        let scope = token_scope(&mode, cli.as_agent.is_some());
+        resolve_token(&api_base, &scope, &http).await?
     } else {
         eprintln!("token: not resolved — this mode performs no API write");
         String::new()
     };
+
+    // --as-agent: atoms are created as the TOKEN's agent and `decomposes_to`
+    // edges as `--as-agent`. A writing run refuses, before any LLM call or
+    // write, unless they are the same agent (backlog 076e94cc).
+    if let (Some(agent), true) = (cli.as_agent, mode.writes(&cli.provider)) {
+        check_token_acts_as(&http, &api_base, &token, agent).await?;
+    }
 
     match mode {
         Mode::RetargetDryRun(manifest) | Mode::RetargetApply(manifest) => {
@@ -1550,9 +1639,9 @@ fn print_applied(applied: &[epigraph_cli::retarget::AppliedEntry]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        mint_service_token, provider_writes_to_api, resolve_api_base, resolve_auth_plan,
-        resolve_llm_client, resolve_service_credentials, resolve_token_url, AuthError, AuthPlan,
-        MintError,
+        check_token_acts_as, mint_service_token, provider_writes_to_api, resolve_api_base,
+        resolve_auth_plan, resolve_llm_client, resolve_service_credentials, resolve_token_url,
+        token_scope, AuthError, AuthPlan, MintError,
     };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2231,6 +2320,75 @@ mod tests {
         assert_eq!(
             resolve_service_credentials(Some("id".to_string()), Some("secret".to_string())),
             Some(("id".to_string(), "secret".to_string()))
+        );
+    }
+
+    /// `--as-agent`'s identity check (backlog 076e94cc): only an answer
+    /// naming exactly the acting agent passes. A different agent, an API
+    /// without the route (an older API answers `me` as an `:id`, 400), a
+    /// token without `claims:read` (403) and an answer with no `agent_id` are
+    /// each refused, with a message saying which.
+    #[tokio::test]
+    async fn the_identity_check_passes_only_the_acting_agent() {
+        let agent = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let http = reqwest::Client::new();
+        let answer = |status: u16, body: serde_json::Value| async move {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/agents/me"))
+                .and(wiremock::matchers::header("authorization", "Bearer tok"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            server
+        };
+
+        let s = answer(200, serde_json::json!({"agent_id": agent, "display_name": "a"})).await;
+        check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .expect("the token's own agent passes");
+
+        let s = answer(200, serde_json::json!({"agent_id": other, "display_name": "b"})).await;
+        let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains(&format!("--as-agent {agent}"))
+                && err.contains(&format!("acts as agent {other}")),
+            "{err}"
+        );
+
+        let s = answer(400, serde_json::json!({"error": "bad uuid"})).await;
+        let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .unwrap_err();
+        assert!(err.contains("deploy the API first"), "{err}");
+
+        let s = answer(403, serde_json::json!({"error": "scope"})).await;
+        let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .unwrap_err();
+        assert!(err.contains("claims:read"), "{err}");
+
+        let s = answer(200, serde_json::json!({"display_name": "a"})).await;
+        let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no agent_id"), "{err}");
+    }
+
+    /// A minted `--as-agent` token asks for `claims:read` too, which the
+    /// identity check's route requires; without `--as-agent` the mint is
+    /// unchanged.
+    #[test]
+    fn an_as_agent_mint_also_asks_for_claims_read() {
+        assert_eq!(token_scope(&Mode::Run, false), "claims:write");
+        assert_eq!(token_scope(&Mode::Run, true), "claims:write claims:read");
+        assert_eq!(
+            token_scope(&Mode::ApplyPlan(PathBuf::from("p.jsonl")), true),
+            "claims:write claims:read"
         );
     }
 }

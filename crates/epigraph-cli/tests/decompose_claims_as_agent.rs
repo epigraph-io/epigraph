@@ -56,6 +56,20 @@ async fn create_login(pool: &PgPool, parent: &str) -> (String, String) {
     (role, url)
 }
 
+/// Answer `GET /api/v1/agents/me` as the API does for a token whose agent is
+/// `agent`: the identity a writing `--as-agent` run checks before it writes
+/// (backlog 076e94cc).
+async fn mount_whoami(api: &MockServer, agent: Uuid) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/agents/me"))
+        .and(header("authorization", "Bearer decomp-test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"agent_id": agent, "display_name": "decomp test agent"}),
+        ))
+        .mount(api)
+        .await;
+}
+
 async fn drop_login(pool: &PgPool, role: &str) {
     let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
         .execute(pool)
@@ -710,6 +724,7 @@ async fn a_fleet_run_writes_decomposes_to_edges_as_the_acting_agent(pool: PgPool
     let a2 = viewer_fixture::seed_public_claim(&pool, author, atom2_text).await;
 
     let api = MockServer::start().await;
+    mount_whoami(&api, acting).await;
     for (text, id) in [(atom1_text, a1), (atom2_text, a2)] {
         Mock::given(method("POST"))
             .and(path("/api/v1/claims"))
@@ -810,6 +825,94 @@ async fn a_fleet_run_writes_decomposes_to_edges_as_the_acting_agent(pool: PgPool
     drop_login(&pool, &app_role).await;
 }
 
+/// A writing `--as-agent` run whose API token acts as ANOTHER agent is
+/// refused before anything is written (backlog 076e94cc): atoms would be
+/// created as the token's agent and edges as `--as-agent`, splitting their
+/// attribution. The run asks `GET /api/v1/agents/me` which agent the token
+/// is; the API mock answers a different agent and would accept every atom
+/// POST (`expect(0)`: none may arrive). The fleet-run tests above, whose mock
+/// answers the acting agent, are the positive control.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_write_run_refuses_an_as_agent_its_token_does_not_act_as(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (acting, _) = viewer_fixture::seed_agent_with_group(&pool, "decomp-mismatch").await;
+    let (author, _) = viewer_fixture::seed_agent_with_group(&pool, "decomp-mismatch-a").await;
+    let token_agent = seed_bare_agent(&pool).await;
+
+    let parent_text =
+        "Mismatch parent M turns freely. Mismatch parent M has a friction coefficient of 4e-22.";
+    let atom1_text = "Mismatch parent M turns freely.";
+    let atom2_text = "Mismatch parent M has a friction coefficient of 4e-22.";
+    let m = viewer_fixture::seed_public_claim(&pool, author, parent_text).await;
+    let a1 = viewer_fixture::seed_public_claim(&pool, author, atom1_text).await;
+    let a2 = viewer_fixture::seed_public_claim(&pool, author, atom2_text).await;
+
+    let api = MockServer::start().await;
+    mount_whoami(&api, token_agent).await;
+    for (text, id) in [(atom1_text, a1), (atom2_text, a2)] {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/claims"))
+            .and(body_string_contains(text))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"id": id})))
+            .expect(0)
+            .mount(&api)
+            .await;
+    }
+    let fixture = temp_path("fixture", "json");
+    std::fs::write(
+        &fixture,
+        serde_json::json!({ parent_text: {"atoms": [atom1_text, atom2_text], "generality": [0, 1]} })
+            .to_string(),
+    )
+    .unwrap();
+    let ids = temp_path("ids", "txt");
+    std::fs::write(&ids, format!("{m}\n")).unwrap();
+
+    let acting_s = acting.to_string();
+    let api_uri = api.uri();
+    let r = run(
+        &app_url,
+        &[
+            "--as-agent",
+            acting_s.as_str(),
+            "--provider",
+            "fixture",
+            "--ids-file",
+            s(&ids),
+        ],
+        &[
+            ("EPIGRAPH_API", api_uri.as_str()),
+            ("EPIGRAPH_TOKEN", "decomp-test-token"),
+            ("DECOMPOSE_FIXTURE_PATH", s(&fixture)),
+        ],
+    );
+    assert_ne!(r.code, Some(0), "a mismatched --as-agent ran:\n{}", r.stderr);
+    assert!(
+        r.stderr.contains(&format!("--as-agent {acting}"))
+            && r.stderr.contains(&format!("acts as agent {token_agent}")),
+        "the refusal must name both agents:\n{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("decompose complete"),
+        "the run went on past the refusal:\n{}",
+        r.stderr
+    );
+    let edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
+    )
+    .bind(m)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(edges, 0, "a refused run wrote edges");
+
+    for p in [&fixture, &ids] {
+        std::fs::remove_file(p).ok();
+    }
+    drop_login(&pool, &app_role).await;
+}
+
 /// The command the decomposition-cycle schedule runs (operator ORDER 3),
 /// end to end on the fleet login: a WRITING population scan with
 /// `--priority recent --limit --singleton-ledger --count-eligible
@@ -850,6 +953,7 @@ async fn the_scheduled_command_runs_on_the_fleet_login(pool: PgPool) {
     let recorded = std::fs::read(&ledger).unwrap();
 
     let api = MockServer::start().await;
+    mount_whoami(&api, acting).await;
     for (text, id) in [(atom1_text, a1), (atom2_text, a2)] {
         Mock::given(method("POST"))
             .and(path("/api/v1/claims"))
