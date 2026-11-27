@@ -206,3 +206,129 @@ async fn louvain_neighborhood_labels_are_placeholders_not_the_dominant_frame_id(
         assert!(n.parse::<u32>().is_ok(), "{label:?}");
     }
 }
+
+/// Insert one claim into `theme_id` with a cached `pignistic_prob`.
+async fn theme_claim(
+    pool: &sqlx::PgPool,
+    agent: Uuid,
+    theme_id: Option<Uuid>,
+    what: &str,
+    betp: f64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id
+        .as_bytes()
+        .iter()
+        .chain(id.as_bytes().iter())
+        .copied()
+        .collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, agent_id, pignistic_prob, theme_id)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(format!("{what} {id}"))
+    .bind(hash)
+    .bind(agent)
+    .bind(betp)
+    .bind(theme_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Backlog fe1cdcdf: the theme subgraph is atoms-only by the ONE role
+/// predicate (`claim_role::IS_COMPOUND_SQL`), not a hand-rolled "has any
+/// `decomposes_to` out-edge" test. A compound's cached BetP stays out of the
+/// neighbourhood's `mean_betp`, and a claim whose only decomposition is
+/// RETIRED (`valid_to` in the past) is no compound and counts as the atom it
+/// now is. The old predicate read every `decomposes_to` row, in force or not,
+/// so it dropped that claim and averaged the remaining atom alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn neighbourhood_betp_reads_atoms_by_the_role_predicate() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    common::reset_neighborhood_tables(&pool).await;
+    let (run_id, _theme, atoms, _standalone) = common::seed_two_clique_theme(&pool).await;
+    let agent: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(atoms[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let theme_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claim_themes (id, label, description, claim_count)
+         VALUES ($1, 'RoleTheme', '', 2)",
+    )
+    .bind(theme_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let atom = theme_claim(&pool, agent, Some(theme_id), "atom", 0.2).await;
+    let compound = theme_claim(&pool, agent, Some(theme_id), "compound", 0.9).await;
+    let retired_parent = theme_claim(&pool, agent, Some(theme_id), "retired parent", 0.8).await;
+    let child = theme_claim(&pool, agent, None, "child", 0.5).await;
+    for (parent, valid_to) in [
+        (compound, "NULL"),
+        (retired_parent, "now() - interval '1 day'"),
+    ] {
+        sqlx::query(&format!(
+            "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship,
+                                valid_from, valid_to)
+             VALUES ($1, $2, 'claim', 'claim', 'decomposes_to',
+                     now() - interval '2 days', {valid_to})"
+        ))
+        .bind(parent)
+        .bind(child)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    epigraph_jobs::cluster_graph::neighborhood::run_theme_neighborhoods(
+        &pool,
+        run_id,
+        &epigraph_jobs::cluster_graph::neighborhood::Config::default(),
+        Some(&[theme_id]),
+    )
+    .await
+    .unwrap();
+
+    let (size, mean_betp): (i32, Option<f64>) = sqlx::query_as(
+        "SELECT size, mean_betp FROM graph_neighborhoods WHERE run_id = $1 AND theme_id = $2",
+    )
+    .bind(run_id)
+    .bind(theme_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let members: std::collections::BTreeSet<Uuid> = sqlx::query_scalar(
+        "SELECT claim_id FROM claim_neighborhood_membership m
+           JOIN graph_neighborhoods n ON n.id = m.neighborhood_id
+          WHERE m.run_id = $1 AND n.theme_id = $2",
+    )
+    .bind(run_id)
+    .bind(theme_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    assert_eq!(
+        members,
+        [atom, retired_parent].into_iter().collect(),
+        "the compound {compound} is no member; the retired parent is an atom"
+    );
+    assert_eq!(size, 2);
+    let mean = mean_betp.expect("mean_betp over two atoms");
+    assert!(
+        (mean - 0.5).abs() < 1e-9,
+        "mean_betp = (0.2 + 0.8) / 2, the compound's 0.9 excluded; got {mean}"
+    );
+}
