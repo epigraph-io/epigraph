@@ -209,7 +209,7 @@ if [ -n "${C1:-}" ] && [ -n "${C2:-}" ]; then
 fi
 
 echo
-echo "=== E1: ingest_document_inline (detached; polled) ==="
+echo "=== E1: ingest_document_inline (synchronous default; polled) ==="
 DOI="10.9999/unit-e-$LABEL"
 DOC='{"source":{"title":"Unit E probe paper","doi":"'"$DOI"'","source_type":"Paper","authors":[{"name":"Probe Author","affiliations":[],"roles":["author"]}]},"thesis":"Unit E probe thesis about clean schemas","thesis_derivation":"TopDown","sections":[{"title":"Probe section","paragraphs":[{"text":"The probe paragraph states two atoms","atoms":["The first unit E probe atom","The second unit E probe atom"],"generality":[3,3],"confidence":0.8}]}],"relationships":[{"source_path":"sections/0/paragraphs/0/atoms/0","target_path":"sections/0/paragraphs/0/atoms/1","relationship":"supports"}]}'
 R=$(tool ingest_document_inline "{\"extraction\":$DOC}")
@@ -228,7 +228,7 @@ q "SELECT '   papers='||(SELECT count(*) FROM papers WHERE doi='$DOI')
         ||' processed_by='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$DOI' AND e.relationship='processed_by')"
 
 pb() { q "SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$1' AND e.relationship='processed_by'"; }
-settle() {  # $1 = doi: wait for the detached task to write processed_by, or give up
+settle() {  # $1 = doi: wait for the ingest to write processed_by, or give up
   for _ in $(seq 1 20); do [ "$(pb "$1")" -ge 1 ] && break; sleep 1; done; sleep 1
 }
 
@@ -294,7 +294,8 @@ q "SELECT '   stamps='||COALESCE(string_agg(e.properties->>'pipeline', ',' ORDER
 
 echo
 echo "=== E1 PREFLIGHT: a detached ingest the author cannot write must be refused SYNCHRONOUSLY ==="
-# ingest_document runs detached, so a refusal inside the task reaches no caller.
+# With wait:false ingest_document runs detached, so a refusal inside the task
+# reaches no caller.
 # With the server agent's memberships revoked, the synchronous preflight must
 # return an error and write NOTHING — not even the papers row — instead of
 # answering "queued" over a task that cannot write.
@@ -303,7 +304,7 @@ if [ -n "$MA" ]; then
   DOI5="10.9999/unit-e-preflight-$LABEL"
   DOC5='{"source":{"title":"Unit E preflight paper","doi":"'"$DOI5"'","source_type":"Paper","authors":[]},"thesis":"Unit E preflight thesis","thesis_derivation":"TopDown","sections":[{"title":"Preflight section","paragraphs":[{"text":"The preflight paragraph","atoms":["The unit E preflight atom"],"generality":[3],"confidence":0.8}]}],"relationships":[]}'
   q "UPDATE group_memberships SET revoked_at = now() WHERE agent_id = '$MA' AND revoked_at IS NULL" >/dev/null
-  R=$(tool ingest_document_inline "{\"extraction\":$DOC5}")
+  R=$(tool ingest_document_inline "{\"extraction\":$DOC5,\"wait\":false}")
   echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,200}' | head -1 | sed 's/^/   /'
   sleep 3
   q "SELECT '   papers='||(SELECT count(*) FROM papers WHERE doi='$DOI5')
