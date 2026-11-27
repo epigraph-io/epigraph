@@ -36,6 +36,10 @@ added here with a line saying what it is for.
   retirement, duplicates versus index hygiene, label-family dedup.
 - [`governance/`](governance/): policy notes and preregistrations (the
   release gate; the experiment preregistrations).
+- [`decisions/`](decisions/README.md): decision records. Retrospective
+  records give the reasoning, from the surviving pull request bodies and
+  specs, for invariant-setting changes made before the commit protocol
+  (2026-05-31), each tied to the `CLAUDE.md` rule it grounds.
 - [`tenancy/`](tenancy/): the multi-user tenancy plan, its completion plan
   and handoff record, and follow-up notes. Historical working documents;
   [`tenancy.md`](tenancy.md) is the current reference.
