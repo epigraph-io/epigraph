@@ -462,7 +462,8 @@ pub fn create_router(state: AppState) -> Router {
 ///    [`crate::state::request_unit_may_start`] (no maintenance DSN in a
 ///    request-serving process) and [`epigraph_auth::check_kernel_jwt_keys`]
 ///    (the JWT key gate). `AppState`'s default JWT config applies the latter
-///    only under `EPIGRAPH_ENV=production`; the binary applies it always.
+///    only when `EPIGRAPH_ENV` is set to anything but a known non-production
+///    name; the binary applies it always.
 /// 2. **The session-GUC probe**, on the `ScopedPool` the state is built from
 ///    (`epigraph_db::ScopedPool::probe_session_gucs`, unless the pool runs in
 ///    transaction GUC mode).

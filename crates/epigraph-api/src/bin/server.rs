@@ -146,9 +146,11 @@ async fn main() {
     // the only key; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. A
     // malformed signing key refuses boot even under the opt-out. This gate runs
     // in EVERY environment. AppState::default_jwt_config applies the same
-    // predicate, flag parse and message only under EPIGRAPH_ENV=production
+    // predicate, flag parse and message whenever EPIGRAPH_ENV is set to
+    // anything but a known non-production name
     // (state::jwt_config_from_env_values), so a library embedder in production
-    // cannot reach the dev fallback, while the test suite keeps it.
+    // cannot reach the dev fallback, while the test suite (EPIGRAPH_ENV unset
+    // or `test`) keeps it.
     let allow_insecure = epigraph_api::state::allow_insecure_secret(
         std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
             .ok()

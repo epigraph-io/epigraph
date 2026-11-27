@@ -2240,8 +2240,9 @@ impl AppState {
     /// ([`epigraph_auth::JwtConfig::from_kernel_env`]): EdDSA when
     /// `EPIGRAPH_JWT_SIGNING_KEY` is set (with `EPIGRAPH_JWT_SECRET`, if set,
     /// as the accept-only HS256 window), else HS256 from the secret or the
-    /// dev fallback. Under `EPIGRAPH_ENV=production` the dev fallback is
-    /// refused; see [`jwt_config_from_env_values`].
+    /// dev fallback. When `EPIGRAPH_ENV` is set to anything but a known
+    /// non-production name the dev fallback is refused; see
+    /// [`jwt_config_from_env_values`].
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
         let signing_key = std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR).ok();
         let secret = std::env::var("EPIGRAPH_JWT_SECRET").ok();
@@ -3448,29 +3449,40 @@ pub fn jwt_key_refusal(reason: &str) -> String {
     )
 }
 
-/// Does this `EPIGRAPH_ENV` value declare production, for the JWT dev-secret
-/// refusal? Exactly `production` (trimmed, any case).
+/// Does this `EPIGRAPH_ENV` value demand the JWT key check, for the
+/// dev-secret refusal?
 ///
-/// Deliberately NOT [`crate::oauth::providers::env_is_production`], which
-/// counts an unset value as production: every test and builder constructor
-/// runs with `EPIGRAPH_ENV` unset and relies on the dev fallback. The server
-/// binary does not depend on this predicate; `bin/server.rs::main` runs
-/// [`epigraph_auth::check_kernel_jwt_keys`] in every environment before any
-/// state is built.
+/// Fail closed on every value that is SET: anything but a known
+/// non-production name ([`crate::oauth::providers::env_is_production`]'s
+/// allowlist: `development`, `dev`, `test`, `testing`, `local`, `ci`) is
+/// production, so `prod`, `staging` or a typo of `production` refuses the
+/// dev fallback rather than signing with the published dev secret (standing
+/// decision Q4, the rule `env_is_production` documents).
+///
+/// The one difference from `env_is_production`: an UNSET, empty or
+/// whitespace-only value keeps the dev fallback, because every test and
+/// builder constructor runs with `EPIGRAPH_ENV` unset and relies on it. The
+/// server binary does not depend on this predicate; `bin/server.rs::main`
+/// runs [`epigraph_auth::check_kernel_jwt_keys`] in every environment before
+/// any state is built.
 fn jwt_env_is_production(env: Option<&str>) -> bool {
-    env.is_some_and(|e| e.trim().eq_ignore_ascii_case("production"))
+    env.map(str::trim)
+        .filter(|e| !e.is_empty())
+        .is_some_and(crate::oauth::providers::env_is_production)
 }
 
 /// [`AppState`]'s JWT config from the raw environment values. Pure, so every
 /// arm is testable without mutating the process environment.
 ///
-/// Under `EPIGRAPH_ENV=production` the keys must pass
+/// When `EPIGRAPH_ENV` is set to anything but a known non-production name
+/// (see [`jwt_env_is_production`]) the keys must pass
 /// [`epigraph_auth::check_kernel_jwt_keys`] (the binary's boot gate), so an
 /// embedder that builds `AppState` in production with no key, or with only
 /// the dev secret, gets a panic rather than a config that signs with the
 /// published dev secret. `allow_insecure`
 /// (`EPIGRAPH_ALLOW_INSECURE_SECRET`) opts out exactly as it does for the
-/// binary. Outside production the dev fallback stands.
+/// binary. With `EPIGRAPH_ENV` unset, empty or non-production the dev
+/// fallback stands.
 ///
 /// # Panics
 /// With [`jwt_key_refusal`]'s text when production refuses the keys, and with
@@ -3674,22 +3686,50 @@ mod default_jwt_config_tests {
         assert_eq!(cfg.signing_algorithm(), Some(Algorithm::HS256));
     }
 
-    /// Dev and test behaviour is unchanged: unset, empty and every other value
-    /// keep the dev fallback (the whole suite runs with `EPIGRAPH_ENV` unset).
+    /// Dev and test behaviour is unchanged: unset, empty and the known
+    /// non-production names keep the dev fallback (the whole suite runs with
+    /// `EPIGRAPH_ENV` unset, and the served tests set `test`).
     #[test]
     fn non_production_keeps_the_dev_fallback() {
         for env in [
             None,
             Some(""),
+            Some("  "),
             Some("test"),
             Some("development"),
-            Some("prod"),
+            Some("dev"),
+            Some("testing"),
+            Some("local"),
+            Some("CI"),
         ] {
             let cfg = jwt_config_from_env_values(None, None, env, false);
             assert_eq!(
                 cfg.signing_algorithm(),
                 Some(Algorithm::HS256),
                 "env={env:?}"
+            );
+        }
+    }
+
+    /// Fail closed: a SET value that is not a known non-production name is
+    /// production, so a deployment that spells it `prod` or `staging` does
+    /// not sign with the published dev secret.
+    #[test]
+    fn an_unrecognised_env_value_is_production() {
+        for env in ["prod", "staging", "prd", "productoin"] {
+            let outcome = std::panic::catch_unwind(|| {
+                jwt_config_from_env_values(None, None, Some(env), false)
+            });
+            let Err(payload) = outcome else {
+                panic!("EPIGRAPH_ENV={env:?} with no key must refuse the dev fallback");
+            };
+            let text = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                text.starts_with("FATAL: ") && text.contains("EPIGRAPH_ALLOW_INSECURE_SECRET=1"),
+                "EPIGRAPH_ENV={env:?} refused with the wrong text: {text:?}"
             );
         }
     }
