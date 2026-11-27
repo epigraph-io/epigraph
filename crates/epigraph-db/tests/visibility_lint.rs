@@ -4747,9 +4747,12 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "get",
         "READ of one `experiments` or `experiment_results` row by id; the FROM is that table \
          alone and it joins nothing, and neither carries tenancy columns or row security. \
-         `routes/experiment_loop.rs` reads it after `require_experiment_hypothesis` has read the \
-         hypothesis through the viewer and tied the result to the experiment. SCOPE: executor \
-         only; the SQL is unchanged.",
+         `routes/experiment_loop.rs` reads the RESULT row (`ExperimentResultRepository::get`) on \
+         the caller's stamped transaction after `require_experiment_hypothesis` has read the \
+         hypothesis through the viewer and tied the result to the experiment. No API route reads \
+         the experiment row through `ExperimentRepository::get` any more (the gate reads it); \
+         that function shares this row because the lint keys on file and name, and its only \
+         caller is the CLI on `&PgPool`. SCOPE: executor only; the SQL is unchanged.",
     ),
     (
         "experiment.rs",
