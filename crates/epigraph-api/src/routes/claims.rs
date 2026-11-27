@@ -1014,12 +1014,21 @@ pub(crate) async fn create_claim_core(
     // key resolved above is not lost (it still proves the principal exists).
     //
     // What the signature attests is "this server recorded this row", not "the
-    // author signed this content". A `fully_private` row stores the
-    // `[private]` placeholder, so its signature covers that placeholder and
-    // nothing of the sealed content. With no key the row stays unsigned, as
+    // author signed this content". With no key the row stays unsigned, as
     // before (no fail-closed boot), and `system_stats` counts it in
     // `claims_unsigned`.
-    let attest = state.edge_signing_key();
+    //
+    // A `fully_private` row is NOT attested. It stores the constant
+    // `[private]` placeholder, so a signature over it would cover nothing of
+    // the sealed content, and (Ed25519 being deterministic) every sealed
+    // claim would carry the same bytes while `verify_claim` and
+    // `claims_signed` reported it as attested. It stays unsigned and is
+    // counted as such.
+    let attest = if privacy_tier == "fully_private" {
+        None
+    } else {
+        state.edge_signing_key()
+    };
     let row_key = attest.map_or(public_key, |k| k.signer.public_key());
     let mut claim = if let Some(trace_uuid) = request.trace_id {
         Claim::new_with_trace(

@@ -414,6 +414,84 @@ async fn a_claim_dedup_hit_is_not_attested_after_the_fact() {
     assert_eq!(stored_claim_signature(&pool, claim).await, (None, None));
 }
 
+/// Backlog 953d5707 (review): a `fully_private` claim is NOT attested. Its
+/// row stores the constant `[private]` placeholder, so a server signature
+/// over it would cover nothing of the sealed content and be byte-identical on
+/// every sealed claim, yet `verify_claim` and `claims_signed` would report it
+/// attested. A public claim on the SAME keyed server is signed, so the
+/// unsigned private rows are the tier's doing, not a missing key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fully_private_claim_is_not_attested() {
+    let (url, pool) = pool().await;
+    let (signer, signer_id) = api_signer(&pool).await;
+    let (addr, _shutdown) = spawn_signed(&url, signer).await;
+    let author = common::seed_system_agent(&pool).await;
+    epigraph_db::ClaimRepository::personal_group_of_pool(&pool, author)
+        .await
+        .expect("provision the author's personal group");
+    let (token, _) = common::test_bearer_token_with_seeded_client_for_agent(
+        &pool,
+        &["claims:write", "groups:write"],
+        author,
+    )
+    .await;
+    let tag = Uuid::new_v4();
+    let group = post(
+        addr,
+        &token,
+        "/api/v1/groups",
+        serde_json::json!({
+            "name": format!("953d5707 sealed {tag}"),
+            "group_public_key": hex::encode(blake3::hash(tag.as_bytes()).as_bytes()),
+        }),
+    )
+    .await;
+    let group_id = id_of(&group, "group_id");
+
+    let public = post(
+        addr,
+        &token,
+        "/api/v1/claims",
+        serde_json::json!({
+            "content": format!("953d5707: a public claim on the keyed server {tag}"),
+            "agent_id": author,
+            "visibility": "public",
+        }),
+    )
+    .await;
+    let (sig, signer) = stored_claim_signature(&pool, id_of(&public, "id")).await;
+    assert!(
+        sig.is_some() && signer == Some(signer_id),
+        "CALIBRATION: the keyed server attests a public claim"
+    );
+
+    let mut sealed = Vec::new();
+    for ciphertext in ["Zmlyc3Q=", "c2Vjb25k"] {
+        let out = post(
+            addr,
+            &token,
+            "/api/v1/claims",
+            serde_json::json!({
+                "content": format!("953d5707: sealed {tag}"),
+                "agent_id": author,
+                "privacy_tier": "fully_private",
+                "group_id": group_id,
+                "encrypted_content": ciphertext,
+                "encryption_epoch": 0,
+            }),
+        )
+        .await;
+        sealed.push(id_of(&out, "id"));
+    }
+    for claim in sealed {
+        assert_eq!(
+            stored_claim_signature(&pool, claim).await,
+            (None, None),
+            "a sealed claim {claim} stores no attestation over its placeholder"
+        );
+    }
+}
+
 /// The `AUTHORED` edges from `author` to `claim`.
 async fn authored_edges(pool: &PgPool, author: Uuid, claim: Uuid) -> Vec<Uuid> {
     sqlx::query_scalar(
