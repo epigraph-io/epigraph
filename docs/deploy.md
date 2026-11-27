@@ -3161,8 +3161,11 @@ both must be active `team` or `community` groups (see **Who** above).
    operator's own audited membership verb on the maintenance session, so it
    writes the `reader` row even where the group's members otherwise join as
    writers; do not grant writer to fit that. An operated agent is still a
-   member only where its operator writes (`GRP03`). Check the non-member principal is not in the
-   target (`epigraph-operator group-roster --group <target>`). If the client
+   member only where its operator writes (`GRP03`). The verb serves a keyless
+   `team` target only, as here, and refuses every other kind (`GRP05`); for a
+   `community` target, stop and get the operator's ruling on how the reader
+   joins. Check the non-member principal is not in the target
+   (`epigraph-operator group-roster --group <target>`). If the client
    publishes new generations, its publishing agent needs a writer membership
    of the target too.
 2. Dry run the move (`--from-group <source> --target-group <target>
