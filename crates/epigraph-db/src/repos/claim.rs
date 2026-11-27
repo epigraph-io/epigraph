@@ -1,6 +1,7 @@
 //! Claim repository for database operations
 
 use crate::errors::DbError;
+use crate::repos::claim_role::is_compound_sql;
 use crate::repos::edge_signature::EdgeSigningKey;
 use crate::repos::vector_scan::{
     begin_exact_vector_scan, begin_iterative_hnsw, exact_retry_or_first_pass,
@@ -4156,6 +4157,12 @@ impl ClaimRepository {
     /// gate that distinguishes this from plain semantic search; `domain`, when
     /// `Some`, restricts to claims carrying that label.
     ///
+    /// Both the gate and the truth term read a NON-compound's `truth_value`
+    /// only (backlog ef58c6ad). A compound (`claim_role::IS_COMPOUND_SQL`)
+    /// passes `min_truth` ungated and scores `similarity * 0.6 +
+    /// min(edge_count / 10, 1) * 0.2`, ranking after a non-compound of equal
+    /// score; its row still reports its stored `truth_value`.
+    ///
     /// # Why this is here and not in `routes/rag.rs`
     ///
     /// Until PR-07 this statement was inline in the handler with no visibility
@@ -4185,8 +4192,14 @@ impl ClaimRepository {
         domain: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RagContextHit>, DbError> {
+        // Role-aware (backlog ef58c6ad): a compound's cached `truth_value` is
+        // a fold of its own BBAs, not a belief, so `min_truth` gates
+        // non-compounds only and a compound's `hybrid_score` carries no truth
+        // term (similarity and connectivity alone); on an equal score the
+        // non-compound ranks first.
         let sql = viewer.splice(
-            r#"
+            &format!(
+                r#"
             WITH query_vec AS (
                 SELECT $1::vector AS vec
             ),
@@ -4204,24 +4217,29 @@ impl ClaimRepository {
                         SELECT COUNT(*)
                         FROM edges e
                         WHERE (e.source_id = c.id OR e.target_id = c.id)
-                          /* {EDGE_VISIBILITY:e} */
-                    ), 0) as edge_count
+                          /* {{EDGE_VISIBILITY:e}} */
+                    ), 0) as edge_count,
+                    {compound} AS is_compound
                 FROM claims c, query_vec q
                 WHERE c.embedding IS NOT NULL
-                  AND c.truth_value >= $2
                   AND 1 - (c.embedding <=> q.vec) >= 0.0
                   AND ($3::text IS NULL OR $3 = ANY(c.labels))
-                  /* {VISIBILITY:c} */
+                  /* {{VISIBILITY:c}} */
+            ),
+            gated AS (
+                SELECT * FROM base WHERE is_compound OR truth_value >= $2
             )
             SELECT *,
                 similarity * 0.6
-                    + truth_value * 0.2
+                    + CASE WHEN is_compound THEN 0.0 ELSE truth_value * 0.2 END
                     + LEAST(edge_count::float / 10.0, 1.0) * 0.2
                 as hybrid_score
-            FROM base
-            ORDER BY hybrid_score DESC
+            FROM gated
+            ORDER BY hybrid_score DESC, is_compound
             LIMIT $4
             "#,
+                compound = is_compound_sql("c"),
+            ),
             5,
         );
         let mut q = sqlx::query_as::<_, RagContextHit>(&sql)
@@ -5975,10 +5993,20 @@ impl ClaimRepository {
     /// The bind indices differ (`$10` for the count, `$14` after
     /// `LIMIT`/`OFFSET` and the cursor), so the viewer half of these two
     /// statements could never have been literally shared anyway.
+    ///
+    /// # The truth gate is NOT in here either: it is role-aware
+    ///
+    /// `$2` / `$3` (`truth_min` / `truth_max`) gate a claim's cached
+    /// `truth_value`, which for a compound is a fold of its own BBAs rather
+    /// than a belief (backlog ef58c6ad). The gate therefore applies to
+    /// non-compounds only and a compound passes it ungated, so no compound
+    /// disappears from a filtered listing. Deciding that needs
+    /// `claim_role::IS_COMPOUND_SQL` rendered over the row, which a `const`
+    /// cannot hold, so [`Self::filter_where`] appends the gate to this
+    /// clause; both methods take the clause from it, and the one clause and
+    /// one bind order still hold.
     const FILTER_WHERE: &'static str = r#"
             WHERE ($1::text IS NULL OR content ILIKE $1)
-              AND ($2::float8 IS NULL OR truth_value >= $2)
-              AND ($3::float8 IS NULL OR truth_value <= $3)
               AND ($4::uuid IS NULL OR agent_id = $4)
               AND ($5::uuid IS NULL OR agent_id <> $5)
               AND ($6::bool IS NULL OR COALESCE(is_current, true) = $6)
@@ -5987,7 +6015,21 @@ impl ClaimRepository {
               AND ($9::uuid[] IS NULL OR id = ANY($9))
     "#;
 
-    /// Bind `$1..$9` of [`Self::FILTER_WHERE`], in order.
+    /// [`Self::FILTER_WHERE`] with the role-aware truth gate on `$2` / `$3`:
+    /// a non-compound is gated on its `truth_value`, a compound
+    /// (`claim_role::IS_COMPOUND_SQL` over the unaliased `claims` row) passes
+    /// ungated. The ONE `WHERE` clause [`Self::list_filtered`] and
+    /// [`Self::count_filtered`] share.
+    fn filter_where() -> String {
+        let compound = is_compound_sql("claims");
+        format!(
+            "{base}  AND ($2::float8 IS NULL OR claims.truth_value >= $2 OR {compound}) \
+               AND ($3::float8 IS NULL OR claims.truth_value <= $3 OR {compound})\n",
+            base = Self::FILTER_WHERE,
+        )
+    }
+
+    /// Bind `$1..$9` of [`Self::filter_where`], in order.
     ///
     /// Generic over the query type so `query_as` (rows) and `query_scalar`
     /// (count) share one implementation — the binds cannot diverge between
@@ -6064,7 +6106,7 @@ impl ClaimRepository {
         let sql = viewer.splice(
             &format!(
                 "SELECT COUNT(*) FROM claims{where_clause}\n              /* {{VISIBILITY:claims}} */",
-                where_clause = Self::FILTER_WHERE,
+                where_clause = Self::filter_where(),
             ),
             10,
         );
@@ -6130,13 +6172,20 @@ impl ClaimRepository {
             supersedes: Option<Uuid>,
         }
 
-        let sort_column = match filter.sort_by {
-            ClaimSortField::CreatedAt => "created_at",
-            ClaimSortField::TruthValue => "truth_value",
-        };
         let (direction, past) = match filter.sort_order {
             ClaimSortOrder::Desc => ("DESC", "<"),
             ClaimSortOrder::Asc => ("ASC", ">"),
+        };
+        // A `truth_value` sort ranks non-compounds only (backlog ef58c6ad): a
+        // compound's cached value is no belief, so every compound comes after
+        // the non-compounds in either direction, ordered among themselves by
+        // `id` alone.
+        let sort_column = match filter.sort_by {
+            ClaimSortField::CreatedAt => "created_at".to_string(),
+            ClaimSortField::TruthValue => {
+                let compound = is_compound_sql("claims");
+                format!("{compound}, CASE WHEN {compound} THEN NULL ELSE claims.truth_value END")
+            }
         };
         if filter.after.is_some() && filter.sort_by != ClaimSortField::CreatedAt {
             return Err(DbError::InvalidData {
@@ -6162,7 +6211,7 @@ impl ClaimRepository {
             ORDER BY {sort_column} {direction}, id {direction}
             LIMIT $10 OFFSET $11
             "#,
-                where_clause = Self::FILTER_WHERE,
+                where_clause = Self::filter_where(),
             ),
             14,
         );
@@ -6730,7 +6779,9 @@ impl ClaimRepository {
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
     /// Results are ordered by `(created_at DESC, id DESC)`, a total order, and
-    /// filtered by optional truth threshold.
+    /// filtered by optional truth threshold, which gates non-compounds only:
+    /// a compound (`claim_role::IS_COMPOUND_SQL`) is listed whatever its
+    /// cached `truth_value`.
     ///
     /// # Paging
     /// - `after` (keyset, preferred): rows strictly after a [`LabelCursor`]
@@ -6792,21 +6843,28 @@ impl ClaimRepository {
 
         let limit = limit.clamp(1, 1000);
         let offset = offset.max(0);
+        // `min_truth` gates non-compounds only (backlog ef58c6ad): a
+        // compound's cached `truth_value` is a fold of its own BBAs, not a
+        // belief, so a compound passes ungated and no compound disappears
+        // from a label listing.
         let sql = viewer.splice(
-            r#"
+            &format!(
+                r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
                    c.created_at, c.updated_at, c.labels, c.is_current, c.supersedes
             FROM claims c
             WHERE c.labels @> $1
-              AND c.truth_value >= $2
-              AND ($3::text[] = '{}'::text[] OR NOT (c.labels && $3))
+              AND (c.truth_value >= $2 OR {compound})
+              AND ($3::text[] = '{{}}'::text[] OR NOT (c.labels && $3))
               AND ($4 = false OR COALESCE(c.is_current, true) = true)
               AND ($7::timestamptz IS NULL OR (c.created_at, c.id) < ($7::timestamptz, $8::uuid))
-              /* {VISIBILITY:c} */
+              /* {{VISIBILITY:c}} */
             ORDER BY c.created_at DESC, c.id DESC
             LIMIT $5
             OFFSET $6
             "#,
+                compound = is_compound_sql("c"),
+            ),
             9,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
