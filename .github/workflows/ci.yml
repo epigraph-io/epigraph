@@ -9,6 +9,9 @@ on:
 # rather than let both hold runners. Pushes to main are never cancelled, so
 # every merge commit keeps its own complete run.
 #
+# This already covers the burndown's fix/triage-* pull requests (operator
+# ruling 2026-11-27): a superseded run of theirs is cancelled like any PR's.
+#
 # The group is per pull request, but per COMMIT for a push. A group allows one
 # running and one pending run, and a newly queued run replaces the pending one
 # even when `cancel-in-progress` is false; with one group for all of `main`
@@ -68,6 +71,27 @@ jobs:
   # to migrations/, Cargo.lock, the root Cargo.toml, .github/, rust-toolchain*,
   # .sqlx/ or .cargo/. The coverage check below always runs on the full plan.
   #
+  # LIGHT PLAN: THE BURNDOWN'S fix/triage-* PULL REQUESTS (operator ruling
+  # 2026-11-27, "light CI on fix PRs"). Their CI took a median 102 minutes,
+  # was red 23% of the time, and competed with the staging PR's CI for the 20
+  # concurrent jobs (staging jobs queued up to 149 minutes), while no step of
+  # the burndown waits on it: every such PR reaches main only through a
+  # staging PR, whose full run is the authoritative one. So a pull request
+  # from a fix/triage-* head gets plan mode `light` (test-shard.py
+  # LIGHT_BRANCHES), whatever it changes, migrations and .github/ included:
+  #   * runs: plan (the planner's unit tests and the coverage check), lint
+  #     (clippy over every target, which is the workspace type-check, fmt,
+  #     no-db check, SQLite graph), ONE source-scans shard over
+  #     test-shard.py LIGHT_TARGETS (the cross-crate ratchets and registers
+  #     parallel PRs break, on a database migrated from empty, so a broken
+  #     migration still fails), the `test` gate, secrets and
+  #     commit-message-lint;
+  #   * skipped: every other shard, test-extra, lint-features, kanban,
+  #     python, audit and layout-digest-arm64 (and the MSRV workflow).
+  # The `ci:full` label still runs everything on such a head. A skipped job
+  # reports `skipped`, which no branch rule requires and the staging
+  # selector reads as passing.
+  #
   # SELF-HOSTED SHARD RUNNERS (off unless the operator turns them on). Self-
   # hosted runners do not count against the 20-job cap. Set the repository
   # variable SHARD_RUNS_ON to a JSON `runs-on` value, e.g.
@@ -115,6 +139,9 @@ jobs:
       run: ${{ steps.plan.outputs.run }}
       runs_on: ${{ steps.plan.outputs.runs_on }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
+      # "full", "affected" or "light". The jobs outside the shard plan that a
+      # light plan turns off read it (see LIGHT PLAN above).
+      mode: ${{ steps.plan.outputs.mode }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -812,6 +839,10 @@ jobs:
   # hence no extra (unpinned-by-SHA) setup action either.
   kanban:
     name: Kanban board tests
+    needs: plan
+    # Off in a light plan (fix/triage-* heads, see LIGHT PLAN above). Not
+    # `success()`: if `plan` fails, `mode` is empty and the job still runs.
+    if: ${{ !cancelled() && needs.plan.outputs.mode != 'light' }}
     runs-on: ubuntu-latest
     # The suite takes well under a minute; 15 cuts off a hung stub or agent.
     timeout-minutes: 15
@@ -865,6 +896,10 @@ jobs:
   # a hard gate once it has been stable on main.
   python:
     name: Python tests (advisory)
+    needs: plan
+    # Off in a light plan (fix/triage-* heads, see LIGHT PLAN above). Not
+    # `success()`: if `plan` fails, `mode` is empty and the job still runs.
+    if: ${{ !cancelled() && needs.plan.outputs.mode != 'light' }}
     # Pinned, not ubuntu-latest: tests/requirements-ci.txt pins wheels built
     # for the image's system python3 (3.12; numpy 1.26.4 has none past cp312),
     # so a newer default image would turn the install into a source build.
@@ -1006,6 +1041,10 @@ jobs:
   # other's; the step that failed names the ecosystem.
   audit:
     name: Security audit (advisory)
+    needs: plan
+    # Off in a light plan (fix/triage-* heads, see LIGHT PLAN above). Not
+    # `success()`: if `plan` fails, `mode` is empty and the job still runs.
+    if: ${{ !cancelled() && needs.plan.outputs.mode != 'light' }}
     # Pinned for the same reason as the `python` job: tests/requirements-audit.txt
     # is compiled for the image's python3 (3.12) and installed binary-only.
     runs-on: ubuntu-24.04
@@ -1058,6 +1097,10 @@ jobs:
   # the diff check.
   layout-digest-arm64:
     name: Atlas layout digests on arm64 (advisory)
+    needs: plan
+    # Off in a light plan (fix/triage-* heads, see LIGHT PLAN above). Not
+    # `success()`: if `plan` fails, `mode` is empty and the job still runs.
+    if: ${{ !cancelled() && needs.plan.outputs.mode != 'light' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     continue-on-error: true
