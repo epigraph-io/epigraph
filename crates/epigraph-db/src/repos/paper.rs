@@ -635,6 +635,76 @@ impl PaperRepository {
         Ok(rows)
     }
 
+    /// What the PUBLIC `papers` row of the same document key as `paper_id`
+    /// asserts, through in-force ingest-written `asserts` edges, kept to the
+    /// rows the group `owner_group_id` may converge onto: its own and public
+    /// ones, each with its stored `content_hash`, oldest first. Empty unless
+    /// that public row asserts at least one NON-PUBLIC row `owner_group_id`
+    /// owns.
+    ///
+    /// For the document ingest walk, after [`Self::asserted_claims_conn`] and
+    /// [`Self::own_group_legacy_claims_conn`], on its own author-stamped
+    /// transaction, with `paper_id` its in-scope (group) row (backlog
+    /// 8f56a641). Before migration 246 a document had ONE `papers` row, which
+    /// 246 made public: a group's pre-246 non-public ingest recorded its
+    /// claims there, including atoms it converged onto an existing PUBLIC row
+    /// with the same text. Those are the document's recorded ids; reading
+    /// them is a lookup by the document's record, not by text.
+    ///
+    /// The gate (the public row asserts one of the group's own non-public
+    /// rows) is what says the group's earlier ingest wrote through that row; a
+    /// document only ever ingested publicly gives nothing, so a group's first
+    /// non-public ingest of it still writes its own claims. Another group's
+    /// non-public row is never returned. Both are in the SQL, not only row
+    /// security (the operator CLI's maintenance pool bypasses it).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn public_twin_recorded_claims_conn(
+        conn: &mut sqlx::PgConnection,
+        paper_id: Uuid,
+        owner_group_id: Uuid,
+    ) -> Result<Vec<AssertedClaim>, DbError> {
+        // Runtime-checked, not `query!`: see `get_or_create`.
+        let sql = format!(
+            "WITH twin AS ( \
+                 SELECT p.id FROM papers p \
+                   JOIN papers mine ON mine.id = $1 \
+                  WHERE p.doi = mine.doi \
+                    AND p.visibility = 'public' \
+                    AND p.id <> mine.id \
+             ), recorded AS ( \
+                 SELECT c.id, c.content_hash, c.created_at, c.visibility::text AS vis, \
+                        c.owner_group_id \
+                   FROM edges e \
+                   JOIN twin ON twin.id = e.source_id \
+                   JOIN claims c ON c.id = e.target_id \
+                  WHERE e.source_type = 'paper' \
+                    AND e.target_type = 'claim' \
+                    AND e.relationship = 'asserts' \
+                    AND {in_force} \
+                    AND {marked} \
+             ) \
+             SELECT DISTINCT r.id, r.content_hash, r.created_at \
+               FROM recorded r \
+              WHERE (r.vis = 'public' OR r.owner_group_id = $2) \
+                AND EXISTS (SELECT 1 FROM recorded g \
+                             WHERE g.owner_group_id = $2 AND g.vis <> 'public') \
+              ORDER BY r.created_at, r.id",
+            in_force = crate::repos::edge::EDGE_IN_FORCE,
+            marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+        );
+        // The third column is the ORDER BY key `SELECT DISTINCT` must project.
+        type Row = (Uuid, Option<Vec<u8>>, Option<chrono::DateTime<chrono::Utc>>);
+        let rows: Vec<Row> = sqlx::query_as(&sql)
+            .bind(paper_id)
+            .bind(owner_group_id)
+            .fetch_all(&mut *conn)
+            .await?;
+        Ok(rows.into_iter().map(|(id, hash, _)| (id, hash)).collect())
+    }
+
     /// Returns true if the paper has any outgoing `processed_by` edge whose
     /// `properties.pipeline` matches `pipeline_version`. Used as the
     /// re-ingestion version gate by hierarchical ingestion.

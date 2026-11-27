@@ -1223,7 +1223,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // on the same stamped transaction, for the paper row the walk got or created in its own
     // declared scope: the ids that scope's earlier ingest of the document recorded; then
     // `PaperRepository::own_group_legacy_claims_conn`, the owning group's own non-public rows
-    // under the global plan's ids or hashes (scoped in its SQL), for a pre-246 ingest.
+    // under the global plan's ids or hashes (scoped in its SQL), for a pre-246 ingest; then
+    // `PaperRepository::public_twin_recorded_claims_conn`, what the document key's public row
+    // recorded, gated and filtered to the group's own and public rows in its SQL.
     (
         "ingestion.rs",
         "ingest_document_walk_reporting",

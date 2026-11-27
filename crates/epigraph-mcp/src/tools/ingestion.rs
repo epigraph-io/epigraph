@@ -2456,11 +2456,15 @@ fn writes_by_id(planned: &PlannedClaim, adopted: &HashSet<Uuid>) -> bool {
 /// then over the owning group's own non-public rows holding one of the global
 /// plan's ids or stored hashes
 /// ([`PaperRepository::own_group_legacy_claims_conn`], the pre-246 case whose
-/// paper row was backfilled public). Both are read on `conn`; the second is
-/// scoped to the group in its SQL, so nothing outside the ingest's own scope
-/// is looked up by its text. A row the earlier ingest resolved to OUTSIDE the
-/// group (a public row, another group's) and that this scope's paper did not
-/// record is not adopted: that node gets the group's own scoped claim.
+/// paper row was backfilled public), and last over what that public row of
+/// the same document key recorded, when it asserts one of the group's own
+/// non-public rows ([`PaperRepository::public_twin_recorded_claims_conn`]:
+/// the group's rows and public ones only, which brings back the atoms the
+/// pre-246 ingest converged onto a public row). All three are read on
+/// `conn`, and each is scoped in its SQL, so nothing outside the ingest's own
+/// scope is looked up by its text and no other group's non-public row is
+/// adopted: a node the earlier ingest resolved to another group's row gets
+/// the group's own scoped claim.
 /// Returns the plan and the adopted ids, which the walk writes by id
 /// ([`writes_by_id`]).
 ///
@@ -2514,6 +2518,14 @@ async fn ingest_plan_for_scope(
         )
         .await
         .map_err(internal_error)?,
+    );
+    // Last, what the document key's PUBLIC row recorded, when the group's
+    // pre-246 ingest wrote through it: the atoms that ingest converged onto
+    // an existing public row are recorded only there.
+    recorded_raw.extend(
+        PaperRepository::public_twin_recorded_claims_conn(&mut *conn, paper_id, group)
+            .await
+            .map_err(internal_error)?,
     );
     let recorded: Vec<(Uuid, Option<[u8; 32]>)> = recorded_raw
         .into_iter()

@@ -19,9 +19,12 @@
 //!   paper recorded, and, for an ingest from before migration 246 whose paper
 //!   row that migration made public, the group's own non-public rows under
 //!   the document's global ids (full walk and spine walk).
-//! * That second read never reaches outside the ingest's own non-public
-//!   scope: not a team the author belongs to, not the author's own public
-//!   rows.
+//!   A pre-246 atom that converged onto an existing public row is re-used
+//!   from what the document's public paper row recorded.
+//! * Those reads never reach outside the ingest's own non-public scope: not
+//!   a team the author belongs to, not the author's own public rows, and not
+//!   a public ingest's rows unless the group's own earlier ingest recorded
+//!   them.
 //!
 //! Both server pools are `epigraph_app` (row security enforced); the harness
 //! superuser seeds agents, seeds the pre-change state, and reads rows back.
@@ -445,6 +448,143 @@ async fn a_reingest_of_a_pre_246_ingest_whose_paper_is_public_writes_no_new_clai
     assert_eq!(r["claims_ingested"], 0, "{r}");
     assert_eq!(r["claims_skipped_dedup"], 5, "{r}");
     assert_eq!(r["already_ingested"], true, "{r}");
+}
+
+async fn claim_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+/// A pre-246 ingest whose atom converged onto an existing PUBLIC row (another
+/// author's, same text): that atom is recorded only on the paper row 246 made
+/// public. The re-ingest re-uses it from there, as the global-id walk did, and
+/// writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pre_246_ingest_keeps_the_public_atom_it_converged_onto(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (a, group_a) = fixture::seed_agent_with_group(&pool, "scoped-pre246-pub").await;
+    let (p, group_p) = fixture::seed_agent_with_group(&pool, "scoped-pre246-pub-other").await;
+    let doi = "10.9999/scoped-ids-pre246-public-atom";
+    let plan = epigraph_ingest::document::build_ingest_plan(&extraction(doi));
+    let atom = plan.claims.iter().find(|c| c.level == 3).expect("atom");
+    {
+        let mut conn = pool.acquire().await.expect("conn");
+        let created = epigraph_db::ClaimRepository::create_with_id_if_absent_conn(
+            &mut conn,
+            atom.id,
+            &atom.content,
+            &atom.content_hash,
+            p,
+            TruthValue::clamped(0.5),
+            &[],
+            TenancyDecl::public(group_p),
+        )
+        .await
+        .expect("public atom");
+        assert!(created, "fixture: the public atom");
+    }
+    seed_pre_246_ingest(&pool, a, group_a, doi).await;
+    assert_eq!(
+        claim_ids_of(&pool, a).await.len(),
+        4,
+        "fixture: four own rows"
+    );
+    let before = claim_count(&pool).await;
+
+    let r = ingest(&pool, &server, a, doi, VisibilityChoice::Private).await;
+
+    assert_eq!(
+        claim_count(&pool).await,
+        before,
+        "the re-ingest wrote a claim beside the rows its document recorded: {r}"
+    );
+    assert_eq!(r["claims_ingested"], 0, "{r}");
+    assert_eq!(r["claims_skipped_dedup"], 5, "{r}");
+}
+
+/// The public row's records are read only when the group's own earlier ingest
+/// wrote through it: a group's first private ingest of a document that was
+/// only ever ingested publicly writes the group's own claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_first_private_ingest_of_a_public_document_writes_its_own_claims(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (a, group_a) = fixture::seed_agent_with_group(&pool, "scoped-after-public").await;
+    let (p, _) = fixture::seed_agent_with_group(&pool, "scoped-after-public-pub").await;
+    let doi = "10.9999/scoped-ids-after-public";
+    let rp = ingest(&pool, &server, p, doi, VisibilityChoice::Public).await;
+    assert_eq!(rp["claims_ingested"], 5, "{rp}");
+
+    let r = ingest(&pool, &server, a, doi, VisibilityChoice::Private).await;
+
+    assert_eq!(
+        r["claims_ingested"], 5,
+        "the private ingest folded into the public ingest's rows: {r}"
+    );
+    assert_eq!(scoped_count(&pool, a).await, 5, "{r}");
+    let owners: Vec<Uuid> =
+        sqlx::query_scalar("SELECT DISTINCT owner_group_id FROM claims WHERE agent_id = $1")
+            .bind(a)
+            .fetch_all(&pool)
+            .await
+            .expect("owners");
+    assert_eq!(owners, vec![group_a]);
+}
+
+/// The public row's records are filtered in the SQL, not by row security:
+/// on a connection that bypasses it (the harness superuser, as the operator
+/// CLI's maintenance pool does), another group's non-public row the public
+/// paper asserts is still never returned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_public_twin_read_never_returns_another_groups_non_public_row(pool: PgPool) {
+    let (a, group_a) = fixture::seed_agent_with_group(&pool, "scoped-twin-a").await;
+    let (h, group_h) = fixture::seed_agent_with_group(&pool, "scoped-twin-h").await;
+    let doi = "10.9999/scoped-ids-twin-filter";
+    let plan = epigraph_ingest::document::build_ingest_plan(&extraction(doi));
+    let atom = plan.claims.iter().find(|c| c.level == 3).expect("atom");
+    let mut conn = pool.acquire().await.expect("conn");
+    // H's non-public row holds the atom; the rest are A's.
+    assert!(epigraph_db::ClaimRepository::create_with_id_if_absent_conn(
+        &mut conn,
+        atom.id,
+        &atom.content,
+        &atom.content_hash,
+        h,
+        TruthValue::clamped(0.5),
+        &[],
+        TenancyDecl::group(group_h),
+    )
+    .await
+    .expect("h's atom"));
+    drop(conn);
+    seed_pre_246_ingest(&pool, a, group_a, doi).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let a_paper = epigraph_db::PaperRepository::get_or_create_stored(
+        &mut conn,
+        doi,
+        Some("Shared Title Paper"),
+        None,
+        TenancyDecl::group(group_a),
+        None,
+    )
+    .await
+    .expect("a's paper")
+    .id;
+
+    let got: Vec<Uuid> =
+        epigraph_db::PaperRepository::public_twin_recorded_claims_conn(&mut conn, a_paper, group_a)
+            .await
+            .expect("read")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+    assert_eq!(got.len(), 4, "A's own four rows: {got:?}");
+    assert!(
+        !got.contains(&atom.id),
+        "the read returned another group's non-public row"
+    );
 }
 
 /// The spine walk re-uses the same pre-246 rows: no structural node is

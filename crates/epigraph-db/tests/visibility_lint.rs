@@ -929,6 +929,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          to re-use the group's own ids, never returned to a caller.",
     ),
     (
+        "paper.rs",
+        "public_twin_recorded_claims_conn",
+        "READ of what the PUBLIC `papers` row of the same document key as the ingest's own \
+         in-scope row asserts through in-force ingest-written `asserts` edges, on the document \
+         ingest's own author-stamped transaction (backlog 8f56a641: a pre-246 non-public \
+         ingest recorded its claims on the one row 246 made public). In the SQL: only when \
+         that row asserts one of the ingest group's own non-public rows, and only that group's \
+         rows and public rows are returned, never another group's non-public row, so the \
+         operator CLI's RLS-bypassing pool reads no other group's row either; used only to \
+         re-use those ids, never returned to a caller.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \
