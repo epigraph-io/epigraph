@@ -420,13 +420,24 @@ declared edge), each with its `before` and `after` tenancy; `evidence_moved` (a 
 act's own cascade decides all of it, so the report cannot drift from the act. Lists stop at
 5,000 rows each (`truncated`).
 
+The effects name no group the caller is not in. They cover only the claims the act would **move**
+(`publicize` / `share`): an `already_public` claim the plan passes through (as like as not someone
+else's) is handed to the act, which leaves it, and is not reported on; with nothing to move there
+is no trial and `effects` is empty. Every stored `owner_group_id` / `co_owner_group_id` outside
+the caller's own groups (its memberships and writable groups; for an elevated session only its
+writable groups) is withheld: `null`, with `owner_group_withheld` / `co_owner_group_withheld`
+set. Edges are classified on the stored values first, so a withheld group still counts. No claim
+read surface returns another group's id, and a dry run must not become one.
+
 The response is the usual `{results}` plus, for a selection or a dry run,
 `{dry_run, plan: {selection, claims: [{claim_id, depth, outcome, reached_from?, relationship?}],
 boundaries: [{claim_id, depth, reason, detail?, reached_from?, relationship?}], capped,
 effects?}}`.
 
 Moving workflow lineages stays out of scope; it remains an operator act. Tests:
-`epigraph-mcp/tests/visibility_selection_app_role.rs` and
+`epigraph-mcp/tests/visibility_selection_app_role.rs`,
+`epigraph-db/tests/selection_walk_visibility.rs` (the walk's own claim and edge predicates, with
+row security off) and
 `epigraph-api/tests/claim_visibility_http.rs::share_a_selection_over_http_with_a_dry_run`.
 
 ## 5. Tests (app role, `ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)

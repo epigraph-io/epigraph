@@ -176,6 +176,16 @@
 //! as far as the caller can read them ([`PlanEffects`]: edges widened or
 //! kept as narrow, evidence moved or kept behind).
 //!
+//! The effects name no group the caller is not in. They cover only the
+//! claims the act would MOVE (`publicize` / `share`), never an
+//! `already_public` claim the walk passed through (someone else's public
+//! claim is no business of this act's report), and every stored
+//! `owner_group_id` / `co_owner_group_id` outside the caller's own groups is
+//! withheld (`null`, with `*_withheld: true`): no claim read surface returns
+//! another group's id, and a dry run must not be one. For an elevated
+//! session "the caller's own groups" are its writable groups only. With no
+//! claim to move, the dry run runs no trial and its effects are empty.
+//!
 //! Workflow lineages are not walked (their moves stay an operator act).
 
 use std::collections::{HashMap, HashSet};
@@ -762,15 +772,77 @@ pub struct VisibilityPlan {
 }
 
 /// One stored tenancy: `visibility`, `owner_group_id`, `co_owner_group_id`.
+///
+/// A group the caller is not in is never named: its id is `None` and the
+/// matching `*_withheld` flag is set ([`Self::withhold_foreign`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StoredTenancy {
     /// `group` or `public`.
     pub visibility: Option<String>,
-    /// The owner group.
+    /// The owner group, when it is one of the caller's.
     pub owner_group_id: Option<Uuid>,
-    /// An edge's co-owner group (the other endpoint's), when it has one.
+    /// An edge's co-owner group (the other endpoint's), when it has one and
+    /// it is one of the caller's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub co_owner_group_id: Option<Uuid>,
+    /// The owner group is set but is not one of the caller's, so it is not
+    /// named.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub owner_group_withheld: bool,
+    /// The co-owner group is set but is not one of the caller's, so it is
+    /// not named.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub co_owner_group_withheld: bool,
+}
+
+impl StoredTenancy {
+    const fn stored(
+        visibility: Option<String>,
+        owner_group_id: Option<Uuid>,
+        co_owner_group_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            visibility,
+            owner_group_id,
+            co_owner_group_id,
+            owner_group_withheld: false,
+            co_owner_group_withheld: false,
+        }
+    }
+
+    /// Withhold every group id not in `own` (the caller's groups).
+    fn withhold_foreign(mut self, own: &HashSet<Uuid>) -> Self {
+        if self.owner_group_id.is_some_and(|g| !own.contains(&g)) {
+            self.owner_group_id = None;
+            self.owner_group_withheld = true;
+        }
+        if self.co_owner_group_id.is_some_and(|g| !own.contains(&g)) {
+            self.co_owner_group_id = None;
+            self.co_owner_group_withheld = true;
+        }
+        self
+    }
+}
+
+/// The groups a dry run's report may name for `viewer`: the groups it reads
+/// as a member and the groups it writes (an elevated viewer binds no read
+/// set, so only its writable groups), and the nil owner of a public row no
+/// writer owns (it names no group).
+fn own_groups(viewer: &epigraph_db::visibility::Viewer) -> HashSet<Uuid> {
+    viewer
+        .group_bind()
+        .unwrap_or_default()
+        .iter()
+        .chain(viewer.writable_groups())
+        .copied()
+        .chain([Uuid::nil()])
+        .collect()
+}
+
+/// Whether the act would MOVE a claim it classified so (not merely accept
+/// it, as `already_public`).
+fn moves(outcome: &str) -> bool {
+    matches!(outcome, "publicize" | "share")
 }
 
 /// An edge with a planned claim as an endpoint, before and after the act.
@@ -806,7 +878,9 @@ pub struct PlannedEvidence {
 }
 
 /// What a dry run's trial of the act did to the edges and evidence of the
-/// planned claims, as far as the caller can read them (backlog 02d9e9a1, the
+/// planned claims it MOVES (not an `already_public` one), as far as the
+/// caller can read them, naming no group the caller is not in (backlog
+/// 02d9e9a1, the
 /// plan's "edges that widen or stay narrowed, evidence that stays pinned").
 /// The act's own cascade decided it (migration 206's re-meet, 110's pins,
 /// 284's declared edges); the trial is rolled back.
@@ -1074,8 +1148,29 @@ pub async fn act(
             && !planned.claims.is_empty()
             && (matches!(target, ActTarget::Selection(_)) || planned.boundaries.is_empty());
         if would_act {
-            planned.effects =
-                Some(trial(&mut *conn, viewer, act, &planned.claim_ids(), reason).await?);
+            // Report only on the claims the act would move: an
+            // `already_public` claim (someone else's, as like as not) is
+            // passed to the act, which leaves it, and is no part of the
+            // report. With nothing to move there is nothing to try.
+            let movers: Vec<Uuid> = planned
+                .claims
+                .iter()
+                .filter(|c| moves(&c.outcome))
+                .map(|c| c.claim_id)
+                .collect();
+            planned.effects = Some(if movers.is_empty() {
+                PlanEffects::default()
+            } else {
+                trial(
+                    &mut *conn,
+                    viewer,
+                    act,
+                    &planned.claim_ids(),
+                    &movers,
+                    reason,
+                )
+                .await?
+            });
         }
         return Ok(ActReport {
             plan: Some(planned),
@@ -1120,28 +1215,31 @@ pub async fn act(
     })
 }
 
-/// Run the act on `ids` inside a savepoint, read the incident edges and the
-/// evidence of `ids` through the caller's viewer before and after, and roll
-/// the savepoint back whatever happened: the dry run's report of what the act
-/// would do to them ([`PlanEffects`]). An act that would fail fails the dry
-/// run with the same error, with nothing changed.
+/// Run the act on `ids` (the whole plan, exactly what the act would be
+/// handed) inside a savepoint, read the incident edges and the evidence of
+/// `movers` (the planned claims it would move) through the caller's viewer
+/// before and after, and roll the savepoint back whatever happened: the dry
+/// run's report of what the act would do to them ([`PlanEffects`]), naming
+/// no group the caller is not in. An act that would fail fails the dry run
+/// with the same error, with nothing changed.
 async fn trial(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     act: WideningAct,
     ids: &[Uuid],
+    movers: &[Uuid],
     reason: &str,
 ) -> Result<PlanEffects, VisibilityActError> {
     let limit = i64::try_from(MAX_EFFECT_ROWS + 1).unwrap_or(i64::MAX);
     let edges_before =
-        EdgeRepository::tenancy_incident_to_claims(&mut *conn, viewer, ids, limit).await?;
+        EdgeRepository::tenancy_incident_to_claims(&mut *conn, viewer, movers, limit).await?;
     let evidence_before =
-        EvidenceRepository::tenancy_for_claims(&mut *conn, viewer, ids, limit).await?;
+        EvidenceRepository::tenancy_for_claims(&mut *conn, viewer, movers, limit).await?;
     sqlx::query("SAVEPOINT epigraph_visibility_trial")
         .execute(&mut *conn)
         .await
         .map_err(DbError::from)?;
-    let ran = trial_body(&mut *conn, viewer, act, ids, reason, limit).await;
+    let ran = trial_body(&mut *conn, viewer, act, ids, movers, reason, limit).await;
     // Always back to before the act, whatever it did.
     sqlx::query("ROLLBACK TO SAVEPOINT epigraph_visibility_trial")
         .execute(&mut *conn)
@@ -1157,18 +1255,20 @@ async fn trial(
         truncated: edges_before.len() > MAX_EFFECT_ROWS || evidence_before.len() > MAX_EFFECT_ROWS,
         ..PlanEffects::default()
     };
+    // Classified on the stored values, THEN stripped of every group id the
+    // caller is not in.
+    let own = own_groups(viewer);
     let after: HashMap<Uuid, &epigraph_db::IncidentEdgeTenancy> =
         edges_after.iter().map(|e| (e.id, e)).collect();
-    let tenancy_of = |e: &epigraph_db::IncidentEdgeTenancy| StoredTenancy {
-        visibility: e.visibility.clone(),
-        owner_group_id: e.owner_group_id,
-        co_owner_group_id: e.co_owner_group_id,
+    let tenancy_of = |e: &epigraph_db::IncidentEdgeTenancy| {
+        StoredTenancy::stored(e.visibility.clone(), e.owner_group_id, e.co_owner_group_id)
     };
     for e in edges_before.iter().take(MAX_EFFECT_ROWS) {
         let before = tenancy_of(e);
         let after = after
             .get(&e.id)
             .map_or_else(|| before.clone(), |a| tenancy_of(a));
+        let widened = widens(&before, &after);
         let planned = PlannedEdge {
             edge_id: e.id,
             source_id: e.source_id,
@@ -1176,10 +1276,10 @@ async fn trial(
             target_id: e.target_id,
             target_type: e.target_type.clone(),
             relationship: e.relationship.clone(),
-            before: before.clone(),
-            after: after.clone(),
+            before: before.withhold_foreign(&own),
+            after: after.withhold_foreign(&own),
         };
-        if widens(&before, &after) {
+        if widened {
             out.edges_widened.push(planned);
         } else {
             out.edges_kept.push(planned);
@@ -1197,11 +1297,8 @@ async fn trial(
             out.evidence_kept.push(PlannedEvidence {
                 evidence_id: ev.id,
                 claim_id: ev.claim_id,
-                tenancy: StoredTenancy {
-                    visibility: ev.visibility,
-                    owner_group_id: ev.owner_group_id,
-                    co_owner_group_id: None,
-                },
+                tenancy: StoredTenancy::stored(ev.visibility, ev.owner_group_id, None)
+                    .withhold_foreign(&own),
             });
         }
     }
@@ -1228,12 +1325,14 @@ fn widens(before: &StoredTenancy, after: &StoredTenancy) -> bool {
     !required(before).is_subset(&required(after))
 }
 
-/// [`trial`]'s act and its reads after, inside the savepoint.
+/// [`trial`]'s act on `ids` and its reads of `movers` after, inside the
+/// savepoint.
 async fn trial_body(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     act: WideningAct,
     ids: &[Uuid],
+    movers: &[Uuid],
     reason: &str,
     limit: i64,
 ) -> Result<
@@ -1244,8 +1343,10 @@ async fn trial_body(
     VisibilityActError,
 > {
     apply(&mut *conn, viewer, act, ids, reason).await?;
-    let edges = EdgeRepository::tenancy_incident_to_claims(&mut *conn, viewer, ids, limit).await?;
-    let evidence = EvidenceRepository::tenancy_for_claims(&mut *conn, viewer, ids, limit).await?;
+    let edges =
+        EdgeRepository::tenancy_incident_to_claims(&mut *conn, viewer, movers, limit).await?;
+    let evidence =
+        EvidenceRepository::tenancy_for_claims(&mut *conn, viewer, movers, limit).await?;
     Ok((edges, evidence))
 }
 

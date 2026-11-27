@@ -25,6 +25,9 @@
 //! * a teammate reads what moved, a non-member reads nothing it did not read
 //!   before, and the one audit row names every moved id;
 //! * publicize stops at a claim the caller does not administer;
+//! * a dry run names no group the caller is not in: it reports nothing on
+//!   someone else's public claim it passes, and withholds every foreign
+//!   group id on the edges of the claims it moves;
 //! * a root the caller cannot read answers exactly as a missing one, dry run
 //!   or not; a root the act refuses is refused with the act's own reason;
 //! * a selection over the 500-claim cap is refused whole;
@@ -263,9 +266,22 @@ fn boundary_of(plan: &serde_json::Value, claim: Uuid) -> serde_json::Value {
         .unwrap_or_else(|| panic!("{claim} is not a boundary: {plan}"))
 }
 
+/// A predicted group: `Some(id or none)` as the dry run named it, or `None`
+/// when it withheld it (a group the caller is not in).
+type PredictedGroup = Option<Option<Uuid>>;
+
+fn predicted_group(t: &serde_json::Value, field: &str) -> PredictedGroup {
+    let flag = field.replace("_id", "_withheld");
+    if t[flag.as_str()] == true {
+        assert!(t[field].is_null(), "withheld yet named: {t}");
+        return None;
+    }
+    Some(t[field].as_str().map(|g| g.parse().unwrap()))
+}
+
 /// Every planned edge's predicted `after`, as `(edge_id, visibility,
 /// owner_group_id, co_owner_group_id)`.
-fn predicted(effects: &serde_json::Value) -> Vec<(Uuid, String, Uuid, Option<Uuid>)> {
+fn predicted(effects: &serde_json::Value) -> Vec<(Uuid, String, PredictedGroup, PredictedGroup)> {
     ["edges_widened", "edges_kept"]
         .iter()
         .flat_map(|k| effects[*k].as_array().cloned().unwrap_or_default())
@@ -273,35 +289,36 @@ fn predicted(effects: &serde_json::Value) -> Vec<(Uuid, String, Uuid, Option<Uui
             (
                 e["edge_id"].as_str().unwrap().parse().unwrap(),
                 e["after"]["visibility"].as_str().unwrap().to_string(),
-                e["after"]["owner_group_id"]
-                    .as_str()
-                    .unwrap()
-                    .parse()
-                    .unwrap(),
-                e["after"]["co_owner_group_id"]
-                    .as_str()
-                    .map(|c| c.parse().unwrap()),
+                predicted_group(&e["after"], "owner_group_id"),
+                predicted_group(&e["after"], "co_owner_group_id"),
             )
         })
         .collect()
 }
 
-/// The act did to each edge what the dry run predicted.
-async fn assert_predicted(pool: &PgPool, predicted: &[(Uuid, String, Uuid, Option<Uuid>)]) {
+/// The act did to each edge what the dry run predicted (a withheld group:
+/// set, as the dry run said).
+async fn assert_predicted(
+    pool: &PgPool,
+    predicted: &[(Uuid, String, PredictedGroup, PredictedGroup)],
+) {
     assert!(!predicted.is_empty());
     for (id, visibility, owner, co_owner) in predicted {
-        let actual: (String, Uuid, Option<Uuid>) = sqlx::query_as(
+        let (v, o, c): (String, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
             "SELECT visibility::text, owner_group_id, co_owner_group_id FROM edges WHERE id = $1",
         )
         .bind(id)
         .fetch_one(pool)
         .await
         .expect("edge");
-        assert_eq!(
-            actual,
-            (visibility.clone(), *owner, *co_owner),
-            "edge {id}: the act did not do what the dry run said"
-        );
+        let said = "the act did not do what the dry run said";
+        assert_eq!(&v, visibility, "edge {id}: {said}");
+        for (actual, predicted) in [(o, owner), (c, co_owner)] {
+            match predicted {
+                Some(named) => assert_eq!(actual, *named, "edge {id}: {said}"),
+                None => assert!(actual.is_some(), "edge {id}: withheld, so set: {said}"),
+            }
+        }
     }
 }
 
@@ -629,6 +646,150 @@ async fn a_publicize_selection_stops_at_a_claim_the_caller_does_not_administer(p
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, Some(eve));
     assert_eq!(audited_ids(&rows[0].1), set(&[r, a]), "{rows:?}");
+}
+
+/// A dry run names no group the caller is not in (review of 02d9e9a1).
+///
+/// Carol administers team CT and owns two public claims, P and Q, with an
+/// edge P -> Q her personal group wrote and owns, and evidence on P. Eve
+/// administers only her team ET, where her private M supports P; Carol's
+/// personal group wrote that edge too, so once M is public the edge is
+/// owned by Carol's personal group.
+///
+/// Eve dry-runs `publicize_claims` on P by id, then by a selection rooted at
+/// P: both are no-ops (P and Q are already public) and the answer names
+/// neither CT nor Carol's group, and reports no effects. Eve then dry-runs a
+/// selection rooted at M: the plan walks M, P and Q, the effects cover only
+/// M (P's evidence and the P -> Q edge are not reported), and the M -> P
+/// edge is reported widened with its new owner withheld. The act then does
+/// exactly that.
+///
+/// Verified to fail on the code before the fix (the trial reported P's
+/// evidence and its group) and with only the group redaction removed (the
+/// M -> P edge's `after` named Carol's group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dry_run_names_no_group_the_caller_is_not_in(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let ct = team(&pool, "carols-team").await;
+    let et = team(&pool, "eves-team").await;
+    let (carol, carols) = fixture::seed_agent_with_group(&pool, "sel-carol").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "sel-eve").await;
+    add_member(&pool, ct, carol, "admin").await;
+    add_member(&pool, et, eve, "admin").await;
+    let p = claim(&pool, carol, ct, "public", "carol's public claim").await;
+    let q = claim(&pool, carol, ct, "public", "carol's next public claim").await;
+    let m = claim(&pool, eve, et, "group", "eve's claim under carol's").await;
+    let pq = edge(&pool, p, q, "decomposes_to").await;
+    let mp = edge(&pool, m, p, "supports").await;
+    fixture::seed_evidence(&pool, p, "observation").await;
+    // Carol's personal group wrote both edges (120's author record); the
+    // public P -> Q is hers.
+    sqlx::query(
+        "UPDATE edges SET writer_group_id = $2, \
+                owner_group_id = CASE WHEN id = $3 THEN $2 ELSE owner_group_id END \
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![pq, mp])
+    .bind(carols)
+    .bind(pq)
+    .execute(&pool)
+    .await
+    .expect("author the edges");
+    let stored: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
+        "SELECT id, visibility::text, owner_group_id FROM edges WHERE id = ANY($1) ORDER BY id",
+    )
+    .bind(vec![pq, mp])
+    .fetch_all(&pool)
+    .await
+    .expect("edges");
+    for (id, visibility, owner) in &stored {
+        if *id == pq {
+            assert_eq!((visibility.as_str(), *owner), ("public", carols));
+        } else {
+            assert_eq!((visibility.as_str(), *owner), ("group", et));
+        }
+    }
+    let evidence_group: Uuid =
+        sqlx::query_scalar("SELECT owner_group_id FROM evidence WHERE claim_id = $1")
+            .bind(p)
+            .fetch_one(&pool)
+            .await
+            .expect("p's evidence");
+    assert_eq!(evidence_group, ct, "P's evidence is CT's");
+    let foreign = [ct, carols];
+    let names_none = |body: &serde_json::Value| {
+        let text = body.to_string();
+        for g in foreign {
+            assert!(!text.contains(&g.to_string()), "names {g}: {body}");
+        }
+    };
+
+    // By id: nothing to move, nothing reported.
+    let body = publicize_claims(
+        &s.server,
+        &viewer(&pool, eve).await,
+        PublicizeClaimsParams {
+            claim_ids: vec![p.to_string()],
+            dry_run: Some(true),
+            reason: "probe".to_string(),
+            ..PublicizeClaimsParams::default()
+        },
+        Some(&token(eve)),
+    )
+    .await
+    .map(|r| first_text(&r))
+    .expect("ids dry run");
+    assert_eq!(ids(&body["plan"]["claims"]), set(&[p]), "{body}");
+    names_none(&body);
+    let effects = &body["plan"]["effects"];
+    assert_eq!(effects["edges_widened"], serde_json::json!([]), "{body}");
+    assert_eq!(effects["edges_kept"], serde_json::json!([]), "{body}");
+    assert_eq!(effects["evidence_kept"], serde_json::json!([]), "{body}");
+
+    // By a selection rooted at P: the same.
+    let body = publicize(&pool, &s, eve, selection(p), true)
+        .await
+        .expect("selection dry run");
+    assert_eq!(ids(&body["plan"]["claims"]), set(&[p, q]), "{body}");
+    names_none(&body);
+    assert_eq!(
+        body["plan"]["effects"]["evidence_kept"],
+        serde_json::json!([]),
+        "{body}"
+    );
+
+    // Rooted at M: only M's edges and evidence, foreign groups withheld.
+    let sel = selection(m);
+    let body = publicize(&pool, &s, eve, sel.clone(), true)
+        .await
+        .expect("dry run from m");
+    assert_eq!(ids(&body["plan"]["claims"]), set(&[m, p, q]), "{body}");
+    names_none(&body);
+    let effects = &body["plan"]["effects"];
+    assert_eq!(edge_ids(&effects["edges_widened"]), set(&[mp]), "{body}");
+    assert_eq!(effects["edges_kept"], serde_json::json!([]), "{body}");
+    let widened = &effects["edges_widened"][0];
+    assert_eq!(
+        widened["before"]["owner_group_id"],
+        et.to_string(),
+        "{body}"
+    );
+    assert_eq!(widened["after"]["visibility"], "public", "{body}");
+    assert_eq!(widened["after"]["owner_group_withheld"], true, "{body}");
+    assert!(widened["after"]["owner_group_id"].is_null(), "{body}");
+    assert_eq!(effects["evidence_moved"], 0, "{body}");
+    assert_eq!(effects["evidence_kept"], serde_json::json!([]), "{body}");
+    let prediction = predicted(effects);
+
+    let body = publicize(&pool, &s, eve, sel, false)
+        .await
+        .expect("published");
+    names_none(&body);
+    assert_eq!(tenancy(&pool, m).await, ("public".to_string(), et));
+    assert_predicted(&pool, &prediction).await;
+    let rows = audits(&pool, "claim.publicized").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(audited_ids(&rows[0].1), set(&[m]), "{rows:?}");
 }
 
 /// A root the caller cannot read answers exactly as a missing one, dry run or
