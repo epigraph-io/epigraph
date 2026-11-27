@@ -7,7 +7,6 @@
 //!   Dataset)
 
 use super::ids::{AgentId, ClaimId, EvidenceId};
-use crate::traits::{ContentAddressable, Signable, Verifiable};
 use chrono::{DateTime, Utc};
 use epigraph_crypto::SIGNATURE_SIZE;
 use serde::{Deserialize, Serialize};
@@ -596,35 +595,6 @@ pub struct Evidence {
     pub created_at: DateTime<Utc>,
 }
 
-/// Content that is signed for Evidence
-///
-/// Excludes the signature field to avoid circular dependency.
-/// Uses deterministic field ordering for canonical serialization.
-#[derive(Debug, Clone, Serialize)]
-pub struct EvidenceSignableContent {
-    pub id: EvidenceId,
-    pub agent_id: AgentId,
-    pub content_hash: [u8; 32],
-    pub evidence_type: EvidenceType,
-    pub raw_content: Option<String>,
-    pub claim_id: ClaimId,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Content that is hashed for Evidence
-///
-/// Excludes the `content_hash` and signature fields to avoid circular dependency.
-/// Uses deterministic field ordering for canonical serialization.
-#[derive(Debug, Clone, Serialize)]
-pub struct EvidenceHashableContent {
-    pub id: EvidenceId,
-    pub agent_id: AgentId,
-    pub evidence_type: EvidenceType,
-    pub raw_content: Option<String>,
-    pub claim_id: ClaimId,
-    pub created_at: DateTime<Utc>,
-}
-
 impl Evidence {
     /// Create new evidence (signature must be added separately)
     #[must_use]
@@ -711,60 +681,6 @@ impl PartialEq for Evidence {
 }
 
 impl Eq for Evidence {}
-
-// ==================== Trait Implementations ====================
-
-impl Signable for Evidence {
-    type SignableContent = EvidenceSignableContent;
-
-    fn signable_content(&self) -> Self::SignableContent {
-        EvidenceSignableContent {
-            id: self.id,
-            agent_id: self.agent_id,
-            content_hash: self.content_hash,
-            evidence_type: self.evidence_type.clone(),
-            raw_content: self.raw_content.clone(),
-            claim_id: self.claim_id,
-            created_at: self.created_at,
-        }
-    }
-
-    fn signature(&self) -> Option<&[u8; SIGNATURE_SIZE]> {
-        self.signature.as_ref()
-    }
-
-    fn set_signature(&mut self, signature: [u8; SIGNATURE_SIZE]) {
-        self.signature = Some(signature);
-    }
-}
-
-impl Verifiable for Evidence {
-    fn signer_public_key(&self) -> &[u8; 32] {
-        &self.public_key
-    }
-}
-
-impl ContentAddressable for Evidence {
-    fn content_hash(&self) -> &[u8; 32] {
-        &self.content_hash
-    }
-
-    fn set_content_hash(&mut self, hash: [u8; 32]) {
-        self.content_hash = hash;
-    }
-
-    fn compute_hash(&self) -> Result<[u8; 32], epigraph_crypto::CryptoError> {
-        let hashable = EvidenceHashableContent {
-            id: self.id,
-            agent_id: self.agent_id,
-            evidence_type: self.evidence_type.clone(),
-            raw_content: self.raw_content.clone(),
-            claim_id: self.claim_id,
-            created_at: self.created_at,
-        };
-        epigraph_crypto::ContentHasher::hash_canonical(&hashable)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1042,197 +958,6 @@ mod tests {
         assert_eq!(evidence.content_hash, deserialized.content_hash);
     }
 
-    // ==================== Signable Trait Tests ====================
-
-    #[test]
-    fn evidence_sign_and_verify() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let mut evidence = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::Document {
-                source_url: Some("https://example.com/doc.pdf".to_string()),
-                mime_type: "application/pdf".to_string(),
-                checksum: None,
-            },
-            Some("test content".to_string()),
-            claim_id,
-        );
-
-        assert!(evidence.signature().is_none());
-
-        // Sign the evidence
-        evidence.sign(&signer).expect("signing should succeed");
-
-        assert!(evidence.signature().is_some());
-
-        // Verify the signature
-        let is_valid = evidence.verify().expect("verification should succeed");
-        assert!(is_valid, "Valid signature should verify");
-    }
-
-    #[test]
-    fn evidence_verify_fails_with_wrong_public_key() {
-        let signer1 = AgentSigner::generate();
-        let signer2 = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let mut evidence = Evidence::new(
-            agent_id,
-            signer2.public_key(), // Wrong public key
-            [0u8; 32],
-            EvidenceType::Document {
-                source_url: None,
-                mime_type: "text/plain".to_string(),
-                checksum: None,
-            },
-            None,
-            claim_id,
-        );
-
-        // Sign with signer1 but evidence has signer2's public key
-        evidence.sign(&signer1).expect("signing should succeed");
-
-        let is_valid = evidence.verify().expect("verification should complete");
-        assert!(!is_valid, "Wrong public key should fail verification");
-    }
-
-    #[test]
-    fn evidence_verify_fails_with_tampered_content() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let mut evidence = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::Document {
-                source_url: None,
-                mime_type: "text/plain".to_string(),
-                checksum: None,
-            },
-            Some("original content".to_string()),
-            claim_id,
-        );
-
-        evidence.sign(&signer).expect("signing should succeed");
-
-        // Tamper with the content
-        evidence.raw_content = Some("tampered content".to_string());
-
-        let is_valid = evidence.verify().expect("verification should complete");
-        assert!(!is_valid, "Tampered content should fail verification");
-    }
-
-    #[test]
-    fn evidence_verify_missing_signature_returns_error() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let evidence = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::Document {
-                source_url: None,
-                mime_type: "text/plain".to_string(),
-                checksum: None,
-            },
-            None,
-            claim_id,
-        );
-
-        // Attempt to verify without signature
-        let result = evidence.verify();
-        assert!(result.is_err(), "Missing signature should return error");
-    }
-
-    // ==================== ContentAddressable Trait Tests ====================
-
-    #[test]
-    fn evidence_content_hash_compute_and_verify() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let mut evidence = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32], // Initial zero hash
-            EvidenceType::Document {
-                source_url: None,
-                mime_type: "text/plain".to_string(),
-                checksum: None,
-            },
-            Some("content to hash".to_string()),
-            claim_id,
-        );
-
-        // Update the hash
-        evidence.update_hash().expect("hash update should succeed");
-
-        assert_ne!(
-            evidence.content_hash(),
-            &[0u8; 32],
-            "Hash should be updated from zero"
-        );
-
-        // Verify the hash
-        let is_valid = evidence
-            .verify_hash()
-            .expect("hash verification should succeed");
-        assert!(is_valid, "Hash should verify after update");
-    }
-
-    #[test]
-    fn evidence_hash_changes_with_content() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let mut evidence1 = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::Document {
-                source_url: None,
-                mime_type: "text/plain".to_string(),
-                checksum: None,
-            },
-            Some("content one".to_string()),
-            claim_id,
-        );
-
-        let mut evidence2 = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::Document {
-                source_url: None,
-                mime_type: "text/plain".to_string(),
-                checksum: None,
-            },
-            Some("content two".to_string()),
-            claim_id,
-        );
-
-        evidence1.update_hash().unwrap();
-        evidence2.update_hash().unwrap();
-
-        assert_ne!(
-            evidence1.content_hash(),
-            evidence2.content_hash(),
-            "Different content should produce different hashes"
-        );
-    }
-
     #[test]
     fn create_figure_evidence() {
         let agent_id = AgentId::new();
@@ -1307,90 +1032,6 @@ mod tests {
         } else {
             panic!("Deserialized evidence should be Figure type");
         }
-    }
-
-    #[test]
-    fn figure_evidence_sign_and_verify() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let mut evidence = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::Figure {
-                doi: "10.1000/sig".to_string(),
-                figure_id: None,
-                caption: Some("Test figure".to_string()),
-                mime_type: "image/png".to_string(),
-                page: None,
-            },
-            Some("base64-png-data".to_string()),
-            claim_id,
-        );
-
-        evidence.sign(&signer).expect("signing should succeed");
-        let is_valid = evidence.verify().expect("verification should succeed");
-        assert!(is_valid, "Figure evidence signature should verify");
-    }
-
-    #[test]
-    fn figure_evidence_content_hash() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let mut evidence = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::Figure {
-                doi: "10.1000/hash".to_string(),
-                figure_id: Some("Figure 3".to_string()),
-                caption: Some("XPS spectrum".to_string()),
-                mime_type: "image/png".to_string(),
-                page: Some(15),
-            },
-            Some("iVBORw0KGgoAAAANS...".to_string()),
-            claim_id,
-        );
-
-        evidence.update_hash().expect("hash update should succeed");
-        assert_ne!(evidence.content_hash(), &[0u8; 32]);
-
-        let is_valid = evidence
-            .verify_hash()
-            .expect("hash verification should succeed");
-        assert!(is_valid, "Figure evidence hash should verify");
-    }
-
-    #[test]
-    fn evidence_hash_detects_tampering() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-        let claim_id = ClaimId::new();
-
-        let mut evidence = Evidence::new(
-            agent_id,
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::Document {
-                source_url: None,
-                mime_type: "text/plain".to_string(),
-                checksum: None,
-            },
-            Some("original".to_string()),
-            claim_id,
-        );
-
-        evidence.update_hash().unwrap();
-
-        // Tamper with content
-        evidence.raw_content = Some("tampered".to_string());
-
-        let is_valid = evidence.verify_hash().unwrap();
-        assert!(!is_valid, "Tampered content should fail hash verification");
     }
 
     // ==================== Dataset evidence (backlog c8beb101) ====================
@@ -1562,52 +1203,23 @@ mod tests {
         );
     }
 
-    /// A dataset row signs and verifies through the in-memory `Signable`
-    /// path like every other variant, and that signature covers its
-    /// structured fields. No stored signature is made this way (writers sign
-    /// `content_hash`); the stored binding of the fields is the
-    /// [`DatasetAttestation`], tested in `dataset_attestation_*` below.
-    #[test]
-    fn dataset_evidence_sign_verify_and_tamper() {
-        let signer = AgentSigner::generate();
-        let mut evidence = Evidence::new(
-            AgentId::new(),
-            signer.public_key(),
-            [0u8; 32],
-            EvidenceType::dataset(dataset_input()).unwrap(),
-            Some("run 42 of campaign 7".to_string()),
-            ClaimId::new(),
-        );
-        evidence.update_hash().unwrap();
-        evidence.sign(&signer).unwrap();
-        assert!(
-            evidence.verify().unwrap(),
-            "a signed dataset row must verify"
-        );
-        assert!(evidence.verify_hash().unwrap());
-
-        let mut tampered = evidence.clone();
-        if let EvidenceType::Dataset { manifest_hash, .. } = &mut tampered.evidence_type {
-            *manifest_hash = format!("blake3:{}", "0".repeat(64));
-        }
-        assert!(
-            !tampered.verify().unwrap(),
-            "a changed manifest digest must not verify"
-        );
-        assert!(!tampered.verify_hash().unwrap());
-
-        let mut tampered = evidence;
-        if let EvidenceType::Dataset { file_count, .. } = &mut tampered.evidence_type {
-            *file_count += 1;
-        }
-        assert!(
-            !tampered.verify().unwrap(),
-            "a changed file count must not verify"
-        );
+    /// The field set and order of the canonical evidence form the in-memory
+    /// `ContentAddressable` impl used to hash (deleted with that impl, backlog
+    /// 8c6fc756). Kept as a test-local struct so the two digest pins below
+    /// still guard `EvidenceType`'s serde shape. Canonical JSON sorts keys and
+    /// carries no type name, so the digests are unchanged by the move.
+    #[derive(Serialize)]
+    struct CanonicalEvidenceForm {
+        id: EvidenceId,
+        agent_id: AgentId,
+        evidence_type: EvidenceType,
+        raw_content: Option<String>,
+        claim_id: ClaimId,
+        created_at: DateTime<Utc>,
     }
 
-    fn fixed_hashable(evidence_type: EvidenceType) -> EvidenceHashableContent {
-        EvidenceHashableContent {
+    fn fixed_hashable(evidence_type: EvidenceType) -> CanonicalEvidenceForm {
+        CanonicalEvidenceForm {
             id: EvidenceId::from_uuid(uuid::Uuid::from_u128(1)),
             agent_id: AgentId::from_uuid(uuid::Uuid::from_u128(2)),
             evidence_type,
@@ -1619,8 +1231,8 @@ mod tests {
         }
     }
 
-    /// Serialisation stability of the in-memory canonical form
-    /// (`EvidenceHashableContent`, which `Signable` signs): adding the Dataset
+    /// Serialisation stability of the canonical evidence form
+    /// (`CanonicalEvidenceForm` above): adding the Dataset
     /// variant must not move it for a row of an EXISTING variant. The digest
     /// is pinned to the value the pre-Dataset code computes for the same
     /// fixed row. No STORED signature covers this form (writers sign

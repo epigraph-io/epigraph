@@ -1,7 +1,12 @@
-//! Core traits for cryptographic operations on domain types
+//! Generic signing and content-hashing traits
 //!
-//! These traits define how domain entities (Evidence, `ReasoningTrace`, etc.)
-//! interact with the cryptographic layer.
+//! No domain type implements these: the impls on `Claim`, `Evidence` and
+//! `ReasoningTrace` were deleted unused (backlog 8c6fc756). Packet signing
+//! uses the `PacketSignable` structs in `epigraph-api` (`routes/submit.rs`)
+//! and in the `epigraph-cli` ingest binaries, and a stored claim's
+//! `content_hash` is BLAKE3 of its content, computed by the repository. The
+//! traits stay for any future type that really is signed; the tests below
+//! exercise them on local test types.
 
 use epigraph_crypto::{AgentSigner, ContentHasher, CryptoError, SignatureVerifier, SIGNATURE_SIZE};
 use serde::Serialize;

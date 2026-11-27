@@ -11,9 +11,7 @@
 //! - All traces must be signed by the agent who created them
 
 use super::ids::{AgentId, ClaimId, EvidenceId, TraceId};
-use crate::traits::{ContentAddressable, Signable, Verifiable};
 use chrono::{DateTime, Utc};
-use epigraph_crypto::SIGNATURE_SIZE;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 
@@ -173,37 +171,6 @@ pub struct ReasoningTrace {
     pub created_at: DateTime<Utc>,
 }
 
-/// Content that is signed for `ReasoningTrace`
-///
-/// Excludes the signature field to avoid circular dependency.
-/// Uses deterministic field ordering for canonical serialization.
-#[derive(Debug, Clone, Serialize)]
-pub struct ReasoningTraceSignableContent {
-    pub id: TraceId,
-    pub agent_id: AgentId,
-    pub content_hash: [u8; 32],
-    pub methodology: Methodology,
-    pub inputs: Vec<TraceInput>,
-    pub confidence: f64,
-    pub explanation: String,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Content that is hashed for `ReasoningTrace`
-///
-/// Excludes the `content_hash` and signature fields to avoid circular dependency.
-/// Uses deterministic field ordering for canonical serialization.
-#[derive(Debug, Clone, Serialize)]
-pub struct ReasoningTraceHashableContent {
-    pub id: TraceId,
-    pub agent_id: AgentId,
-    pub methodology: Methodology,
-    pub inputs: Vec<TraceInput>,
-    pub confidence: f64,
-    pub explanation: String,
-    pub created_at: DateTime<Utc>,
-}
-
 impl ReasoningTrace {
     /// Create a new reasoning trace (signature must be added separately)
     ///
@@ -324,66 +291,9 @@ impl PartialEq for ReasoningTrace {
 
 impl Eq for ReasoningTrace {}
 
-// ==================== Trait Implementations ====================
-
-impl Signable for ReasoningTrace {
-    type SignableContent = ReasoningTraceSignableContent;
-
-    fn signable_content(&self) -> Self::SignableContent {
-        ReasoningTraceSignableContent {
-            id: self.id,
-            agent_id: self.agent_id,
-            content_hash: self.content_hash,
-            methodology: self.methodology,
-            inputs: self.inputs.clone(),
-            confidence: self.confidence,
-            explanation: self.explanation.clone(),
-            created_at: self.created_at,
-        }
-    }
-
-    fn signature(&self) -> Option<&[u8; SIGNATURE_SIZE]> {
-        self.signature.as_ref()
-    }
-
-    fn set_signature(&mut self, signature: [u8; SIGNATURE_SIZE]) {
-        self.signature = Some(signature);
-    }
-}
-
-impl Verifiable for ReasoningTrace {
-    fn signer_public_key(&self) -> &[u8; 32] {
-        &self.public_key
-    }
-}
-
-impl ContentAddressable for ReasoningTrace {
-    fn content_hash(&self) -> &[u8; 32] {
-        &self.content_hash
-    }
-
-    fn set_content_hash(&mut self, hash: [u8; 32]) {
-        self.content_hash = hash;
-    }
-
-    fn compute_hash(&self) -> Result<[u8; 32], epigraph_crypto::CryptoError> {
-        let hashable = ReasoningTraceHashableContent {
-            id: self.id,
-            agent_id: self.agent_id,
-            methodology: self.methodology,
-            inputs: self.inputs.clone(),
-            confidence: self.confidence,
-            explanation: self.explanation.clone(),
-            created_at: self.created_at,
-        };
-        epigraph_crypto::ContentHasher::hash_canonical(&hashable)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epigraph_crypto::AgentSigner;
 
     #[test]
     fn methodology_weight_modifiers() {
@@ -694,190 +604,5 @@ mod tests {
         );
 
         assert_eq!(trace1, trace2, "Traces with same ID should be equal");
-    }
-
-    // ==================== Signable Trait Tests ====================
-
-    #[test]
-    fn reasoning_trace_sign_and_verify() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-
-        let mut trace = ReasoningTrace::new(
-            agent_id,
-            signer.public_key(),
-            Methodology::Deductive,
-            vec![TraceInput::Evidence {
-                id: EvidenceId::new(),
-            }],
-            0.9,
-            "Test reasoning".to_string(),
-        );
-
-        assert!(trace.signature().is_none());
-
-        // Sign the trace
-        trace.sign(&signer).expect("signing should succeed");
-
-        assert!(trace.signature().is_some());
-
-        // Verify the signature
-        let is_valid = trace.verify().expect("verification should succeed");
-        assert!(is_valid, "Valid signature should verify");
-    }
-
-    #[test]
-    fn reasoning_trace_verify_fails_with_wrong_public_key() {
-        let signer1 = AgentSigner::generate();
-        let signer2 = AgentSigner::generate();
-        let agent_id = AgentId::new();
-
-        let mut trace = ReasoningTrace::new(
-            agent_id,
-            signer2.public_key(), // Wrong public key
-            Methodology::Deductive,
-            vec![],
-            0.8,
-            "Test reasoning".to_string(),
-        );
-
-        // Sign with signer1 but trace has signer2's public key
-        trace.sign(&signer1).expect("signing should succeed");
-
-        let is_valid = trace.verify().expect("verification should complete");
-        assert!(!is_valid, "Wrong public key should fail verification");
-    }
-
-    #[test]
-    fn reasoning_trace_verify_fails_with_tampered_content() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-
-        let mut trace = ReasoningTrace::new(
-            agent_id,
-            signer.public_key(),
-            Methodology::Deductive,
-            vec![],
-            0.8,
-            "Original explanation".to_string(),
-        );
-
-        trace.sign(&signer).expect("signing should succeed");
-
-        // Tamper with the explanation
-        trace.explanation = "Tampered explanation".to_string();
-
-        let is_valid = trace.verify().expect("verification should complete");
-        assert!(!is_valid, "Tampered content should fail verification");
-    }
-
-    #[test]
-    fn reasoning_trace_verify_missing_signature_returns_error() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-
-        let trace = ReasoningTrace::new(
-            agent_id,
-            signer.public_key(),
-            Methodology::Deductive,
-            vec![],
-            0.8,
-            "Test".to_string(),
-        );
-
-        // Attempt to verify without signature
-        let result = trace.verify();
-        assert!(result.is_err(), "Missing signature should return error");
-    }
-
-    // ==================== ContentAddressable Trait Tests ====================
-
-    #[test]
-    fn reasoning_trace_content_hash_compute_and_verify() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-
-        let mut trace = ReasoningTrace::new(
-            agent_id,
-            signer.public_key(),
-            Methodology::Inductive,
-            vec![],
-            0.7,
-            "Content to hash".to_string(),
-        );
-
-        // Initial hash should be zero
-        assert_eq!(trace.content_hash(), &[0u8; 32]);
-
-        // Update the hash
-        trace.update_hash().expect("hash update should succeed");
-
-        assert_ne!(
-            trace.content_hash(),
-            &[0u8; 32],
-            "Hash should be updated from zero"
-        );
-
-        // Verify the hash
-        let is_valid = trace
-            .verify_hash()
-            .expect("hash verification should succeed");
-        assert!(is_valid, "Hash should verify after update");
-    }
-
-    #[test]
-    fn reasoning_trace_hash_changes_with_content() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-
-        let mut trace1 = ReasoningTrace::new(
-            agent_id,
-            signer.public_key(),
-            Methodology::Deductive,
-            vec![],
-            0.8,
-            "Explanation one".to_string(),
-        );
-
-        let mut trace2 = ReasoningTrace::new(
-            agent_id,
-            signer.public_key(),
-            Methodology::Deductive,
-            vec![],
-            0.8,
-            "Explanation two".to_string(),
-        );
-
-        trace1.update_hash().unwrap();
-        trace2.update_hash().unwrap();
-
-        assert_ne!(
-            trace1.content_hash(),
-            trace2.content_hash(),
-            "Different content should produce different hashes"
-        );
-    }
-
-    #[test]
-    fn reasoning_trace_hash_detects_tampering() {
-        let signer = AgentSigner::generate();
-        let agent_id = AgentId::new();
-
-        let mut trace = ReasoningTrace::new(
-            agent_id,
-            signer.public_key(),
-            Methodology::Abductive,
-            vec![],
-            0.6,
-            "Original explanation".to_string(),
-        );
-
-        trace.update_hash().unwrap();
-
-        // Tamper with content
-        trace.explanation = "Tampered explanation".to_string();
-
-        let is_valid = trace.verify_hash().unwrap();
-        assert!(!is_valid, "Tampered content should fail hash verification");
     }
 }
