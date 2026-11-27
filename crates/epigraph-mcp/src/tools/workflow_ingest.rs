@@ -683,50 +683,37 @@ pub async fn store_ingest_embedding(
 /// caller, into a group it writes). Since migration 183 a `workflows` row
 /// carries its plan's tenancy, so the plain pool cannot see (and so cannot
 /// update) a row declared into a group, and a row the caller does not write
-/// is left alone by row security. Without a
-/// [`ScopedPool`](epigraph_db::ScopedPool) (a superuser development server)
-/// the plain pool is used, as before. Best-effort: a failure is logged and the
-/// row stays findable by text.
+/// is left alone by row security. A server with no
+/// [`ScopedPool`](epigraph_db::ScopedPool) stores nothing: the stamped
+/// transaction refuses to open and the refusal is logged (backlog 4cbd4192;
+/// it used to fall back to the raw pool). Best-effort: a failure is logged and
+/// the row stays findable by text.
 pub(crate) async fn store_workflow_goal_embedding(
     server: &EpiGraphMcpFull,
     caller: crate::write_identity::WriteIdentity,
     workflow_id: uuid::Uuid,
     embedding: &[f32],
 ) {
-    let stored = match server.scoped.as_ref() {
-        Some(_) => {
-            let mut tx = match crate::claim_helper::begin_caller_workflow_tx(
-                server,
-                caller,
-                "workflow_goal_embedding",
-            )
-            .await
-            {
-                Ok(tx) => tx,
-                Err(e) => {
-                    tracing::warn!(workflow_id = %workflow_id, error = %e.message, "goal embedding not stored: could not begin a caller-stamped transaction");
-                    return;
-                }
-            };
-            let r = epigraph_db::WorkflowRepository::set_goal_embedding(
-                &mut *tx,
-                workflow_id,
-                embedding,
-            )
-            .await;
-            match r {
-                Ok(n) => tx.commit().await.map(|()| n).map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            }
+    let mut tx = match crate::claim_helper::begin_caller_workflow_tx(
+        server,
+        caller,
+        "workflow_goal_embedding",
+    )
+    .await
+    {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(workflow_id = %workflow_id, error = %e.message, "goal embedding not stored: could not begin a caller-stamped transaction");
+            return;
         }
-        None => epigraph_db::WorkflowRepository::set_goal_embedding(
-            &server.pool,
-            workflow_id,
-            embedding,
-        )
-        .await
-        .map_err(|e| e.to_string()),
     };
+    let stored =
+        match epigraph_db::WorkflowRepository::set_goal_embedding(&mut *tx, workflow_id, embedding)
+            .await
+        {
+            Ok(n) => tx.commit().await.map(|()| n).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
     match stored {
         Ok(1) => {}
         Ok(n) => {
@@ -878,37 +865,27 @@ pub struct ImproveWorkflowHierarchyResponse {
 /// plain pool would see public generations only and number a new generation at
 /// or below a group-private head. A generation hidden from the caller makes the
 /// walk's hidden-rows guard (migration 202) refuse it, with nothing written.
-/// Without a [`ScopedPool`](epigraph_db::ScopedPool) (a development
-/// superuser) the plain pool is read, as before.
+/// A server with no [`ScopedPool`](epigraph_db::ScopedPool) is refused by
+/// [`EpiGraphMcpFull::read_as`] with nothing read (backlog 4cbd4192): it used
+/// to fall back to the raw pool, which on the application role sees public
+/// generations only.
 async fn lineage_max_generation(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     canonical_name: &str,
 ) -> Result<Option<i32>, McpError> {
-    match server.scoped.as_ref() {
-        Some(scoped) => {
-            // Read as the CALLER: the generation it extends is one it can see.
-            // A generation it cannot see makes the new one collide with it,
-            // which the executor refuses (`WorkflowOutsideView`) with nothing
-            // written. It used to be read on the system agent's stamp, whose
-            // resolution could provision that agent's group (a write).
-            let mut tx = scoped.read_as(viewer).await.map_err(internal_error)?;
-            let max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
-                &mut *tx,
-                canonical_name,
-            )
+    // Read as the CALLER: the generation it extends is one it can see. A
+    // generation it cannot see makes the new one collide with it, which the
+    // executor refuses (`WorkflowOutsideView`) with nothing written. It used to
+    // be read on the system agent's stamp, whose resolution could provision
+    // that agent's group (a write).
+    let mut tx = server.read_as(viewer, "improve_workflow_hierarchy").await?;
+    let max =
+        epigraph_db::WorkflowRepository::max_generation_by_canonical(&mut *tx, canonical_name)
             .await
             .map_err(internal_error)?;
-            tx.commit().await.map_err(internal_error)?;
-            Ok(max)
-        }
-        None => epigraph_db::WorkflowRepository::max_generation_by_canonical(
-            &server.pool,
-            canonical_name,
-        )
-        .await
-        .map_err(internal_error),
-    }
+    tx.commit().await.map_err(internal_error)?;
+    Ok(max)
 }
 
 /// Inner helper: same as [`improve_workflow_hierarchy_via_pool`] but also
@@ -1501,6 +1478,41 @@ mod tests {
         assert_eq!(
             phase_content, "Capability Review Phase",
             "phase claim content must fall back to title when summary is empty"
+        );
+    }
+
+    /// A server with no `ScopedPool` stores no goal embedding (backlog
+    /// 4cbd4192): the store runs on a caller-stamped transaction or not at
+    /// all. The old fallback wrote it on the raw pool, so on this superuser
+    /// database the row's `goal_embedding` was set. Best-effort, so the
+    /// refusal is a warning and the row stays findable by text.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn goal_embedding_is_not_stored_without_a_scoped_pool(pool: sqlx::PgPool) {
+        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, Uuid::nil())
+            .await
+            .expect("resolve viewer");
+        let mut extraction = minimal_extraction();
+        extraction.source.canonical_name = "goal-embedding-no-scoped-pool".to_string();
+        let ingested = do_ingest_workflow_via_pool(&pool, &viewer, &extraction)
+            .await
+            .expect("seed ingest");
+        let workflow_id = Uuid::parse_str(&ingested.workflow_id).expect("workflow id");
+
+        let signer = epigraph_crypto::AgentSigner::from_bytes(&[0x4Cu8; 32]).expect("signer");
+        let embedder = crate::embed::McpEmbedder::new(pool.clone(), None);
+        let unscoped = EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
+        let caller = crate::write_identity::WriteIdentity::from_resolved(Uuid::new_v4());
+        store_workflow_goal_embedding(&unscoped, caller, workflow_id, &[0.25_f32; 1536]).await;
+
+        let stored: bool =
+            sqlx::query_scalar("SELECT goal_embedding IS NOT NULL FROM workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read the row");
+        assert!(
+            !stored,
+            "a server with no ScopedPool must not store the goal embedding on its raw pool"
         );
     }
 }

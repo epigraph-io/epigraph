@@ -1193,21 +1193,17 @@ pub async fn report_workflow_outcome(
     // Read as the CALLER (ruling R-74, migration 183): a `workflows` row
     // declared into a group the caller does not read routes exactly as an
     // unknown id does, and a member's row routes to the hierarchical path. A
-    // server with no tenancy-aware pool (a development superuser) probes on
-    // its plain pool, as before.
-    let is_hierarchical: bool = match server.scoped.as_ref() {
-        Some(scoped) => {
-            let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
-            let readable =
-                epigraph_db::WorkflowRepository::viewer_reads_row(&mut read, viewer, workflow_id)
-                    .await
-                    .map_err(internal_error)?;
-            read.commit().await.map_err(internal_error)?;
-            readable
-        }
-        None => epigraph_db::WorkflowRepository::exists(&server.pool, workflow_id)
-            .await
-            .map_err(internal_error)?,
+    // server with no `ScopedPool` is refused here with nothing read (backlog
+    // 4cbd4192): it used to probe its raw pool, where the application role
+    // admits public rows only and a member's own row would route as unknown.
+    let is_hierarchical: bool = {
+        let mut read = server.read_as(viewer, "report_workflow_outcome").await?;
+        let readable =
+            epigraph_db::WorkflowRepository::viewer_reads_row(&mut read, viewer, workflow_id)
+                .await
+                .map_err(internal_error)?;
+        read.commit().await.map_err(internal_error)?;
+        readable
     };
 
     if is_hierarchical {
