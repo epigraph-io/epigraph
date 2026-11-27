@@ -16,7 +16,7 @@ use epigraph_core::TruthValue;
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
               probability but still on the live path (epigraph-api `submission.rs`, \
-              engine `service.rs`); the invariant must keep being covered until those \
+              `routes/computation.rs`); the invariant must keep being covered until those \
               callers migrate"
 )]
 use epigraph_engine::{BayesianUpdater, DagValidator, EvidenceWeighter};
@@ -38,7 +38,7 @@ proptest! {
         deprecated,
         reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
                   probability but still on the live path (epigraph-api `submission.rs`, \
-                  engine `service.rs`); the invariant must keep being covered until those \
+                  `routes/computation.rs`); the invariant must keep being covered until those \
                   callers migrate"
     )]
     fn bayesian_update_preserves_bounds(
@@ -72,7 +72,7 @@ proptest! {
         deprecated,
         reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
                   probability but still on the live path (epigraph-api `submission.rs`, \
-                  engine `service.rs`); the invariant must keep being covered until those \
+                  `routes/computation.rs`); the invariant must keep being covered until those \
                   callers migrate"
     )]
     fn bayesian_update_with_support_preserves_bounds(
@@ -99,7 +99,7 @@ proptest! {
         deprecated,
         reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
                   probability but still on the live path (epigraph-api `submission.rs`, \
-                  engine `service.rs`); the invariant must keep being covered until those \
+                  `routes/computation.rs`); the invariant must keep being covered until those \
                   callers migrate"
     )]
     fn bayesian_update_with_refutation_preserves_bounds(
@@ -126,7 +126,7 @@ proptest! {
         deprecated,
         reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
                   probability but still on the live path (epigraph-api `submission.rs`, \
-                  engine `service.rs`); the invariant must keep being covered until those \
+                  `routes/computation.rs`); the invariant must keep being covered until those \
                   callers migrate"
     )]
     fn bayesian_update_rejects_invalid_likelihoods(
@@ -404,7 +404,7 @@ proptest! {
         deprecated,
         reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
                   probability but still on the live path (epigraph-api `submission.rs`, \
-                  engine `service.rs`); the invariant must keep being covered until those \
+                  `routes/computation.rs`); the invariant must keep being covered until those \
                   callers migrate"
     )]
     fn reputation_never_influences_initial_truth(
@@ -445,7 +445,7 @@ proptest! {
         deprecated,
         reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
                   probability but still on the live path (epigraph-api `submission.rs`, \
-                  engine `service.rs`); the invariant must keep being covered until those \
+                  `routes/computation.rs`); the invariant must keep being covered until those \
                   callers migrate"
     )]
     fn initial_truth_never_exceeds_cap(
@@ -468,7 +468,7 @@ proptest! {
         deprecated,
         reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
                   probability but still on the live path (epigraph-api `submission.rs`, \
-                  engine `service.rs`); the invariant must keep being covered until those \
+                  `routes/computation.rs`); the invariant must keep being covered until those \
                   callers migrate"
     )]
     fn zero_evidence_produces_maximum_uncertainty(

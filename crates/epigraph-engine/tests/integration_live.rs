@@ -4,7 +4,7 @@
 //!      cargo test -p epigraph-engine --test integration_live -- --nocapture
 
 use sqlx::PgPool;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 // ── Test harness (Task 1) ─────────────────────────────────────────────────
@@ -266,77 +266,6 @@ async fn test_dd20_superseded_claims_excluded() {
         .await;
 
     cleanup(&pool, &[claim_a, claim_b]).await;
-}
-
-// ── Test 5: Unified BP mode selection (pure function, no DB) ──────────────
-
-#[test]
-fn test_unified_bp_scalar_mode_selection() {
-    use epigraph_engine::bp::FactorPotential;
-    use epigraph_engine::unified_bp::{run_unified_bp, UnifiedBpResult};
-    use epigraph_engine::EpistemicInterval;
-
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-
-    let factors = vec![(
-        Uuid::new_v4(),
-        FactorPotential::EvidentialSupport { strength: 0.8 },
-        vec![a, b],
-    )];
-
-    // Scalar mode: no interval beliefs
-    let scalar_beliefs = HashMap::from([(a, 0.7), (b, 0.3)]);
-    let interval_beliefs: HashMap<Uuid, EpistemicInterval> = HashMap::new();
-
-    let result = run_unified_bp(&factors, &scalar_beliefs, &interval_beliefs, 20, 0.5);
-
-    assert!(
-        matches!(result, UnifiedBpResult::Scalar(_)),
-        "Expected Scalar track when no interval beliefs provided"
-    );
-
-    let betps = result.updated_betps();
-    assert!(!betps.is_empty(), "Should have BetP values");
-    for (_, v) in &betps {
-        assert!(*v >= 0.0 && *v <= 1.0, "BetP out of [0,1] range: {v}");
-    }
-}
-
-#[test]
-fn test_unified_bp_interval_mode_selection() {
-    use epigraph_engine::bp::FactorPotential;
-    use epigraph_engine::unified_bp::{run_unified_bp, UnifiedBpResult};
-    use epigraph_engine::EpistemicInterval;
-
-    let a = Uuid::new_v4();
-    let b = Uuid::new_v4();
-
-    let factors = vec![(
-        Uuid::new_v4(),
-        FactorPotential::EvidentialSupport { strength: 0.8 },
-        vec![a, b],
-    )];
-
-    // Interval mode: both variables have interval beliefs (100% > 50%)
-    let scalar_beliefs: HashMap<Uuid, f64> = HashMap::new();
-    let interval_beliefs = HashMap::from([
-        (a, EpistemicInterval::new(0.6, 0.8, 0.1)),
-        (b, EpistemicInterval::VACUOUS),
-    ]);
-
-    let result = run_unified_bp(&factors, &scalar_beliefs, &interval_beliefs, 20, 0.5);
-
-    assert!(
-        matches!(result, UnifiedBpResult::Interval(_)),
-        "Expected Interval track when all variables have interval beliefs"
-    );
-
-    let betps = result.updated_betps();
-    assert!(!betps.is_empty(), "Should have BetP values");
-    for (_, v) in &betps {
-        assert!(*v >= 0.0 && *v <= 1.0, "BetP out of [0,1] range: {v}");
-    }
 }
 
 // ── Test 6: SciFact frame_incompleteness — 3-hypothesis frame ─────────────

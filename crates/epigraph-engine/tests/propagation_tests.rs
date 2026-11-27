@@ -31,7 +31,7 @@ use epigraph_core::{AgentId, Claim, ClaimId, TruthValue};
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
               probability but still on the live path (epigraph-api `submission.rs`, \
-              engine `service.rs`); the invariant must keep being covered until those \
+              `routes/computation.rs`); the invariant must keep being covered until those \
               callers migrate"
 )]
 use epigraph_engine::{BayesianUpdater, DagValidator, EngineError, EvidenceWeighter};
@@ -83,7 +83,7 @@ struct PropagationAuditRecord {
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
               probability but still on the live path (epigraph-api `submission.rs`, \
-              engine `service.rs`); the invariant must keep being covered until those \
+              `routes/computation.rs`); the invariant must keep being covered until those \
               callers migrate"
 )]
 struct PropagationOrchestrator {
@@ -110,7 +110,7 @@ struct PropagationOrchestrator {
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
               probability but still on the live path (epigraph-api `submission.rs`, \
-              engine `service.rs`); the invariant must keep being covered until those \
+              `routes/computation.rs`); the invariant must keep being covered until those \
               callers migrate"
 )]
 impl PropagationOrchestrator {
