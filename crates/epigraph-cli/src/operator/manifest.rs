@@ -33,8 +33,8 @@
 //!
 //! A post record carrying `"neighbour": true` is the `(owner, visibility)` of a
 //! NEIGHBOUR claim at that batch: a claim the batch did NOT move that shares a
-//! checked row (a fragment's other provenance claim, an edge's other claim
-//! endpoint, or a claim of the batch that was held) with one it did.
+//! checked row (an edge's other claim endpoint, or a claim of the batch that
+//! was held) with one it did.
 //!
 //! Reversal uses them as a COMPARE-AND-SWAP (`reverse.rs`). A claim is reversed
 //! only if it HAS a post record (so a claim the plan recorded but no batch
