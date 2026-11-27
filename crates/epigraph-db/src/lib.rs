@@ -272,7 +272,7 @@ pub use repos::mass_function::{
 // `ownership` table on this line. The export came in from main, which still
 // carries the module, and is dropped rather than resurrected.
 pub use repos::perspective::PerspectiveRow;
-pub use repos::scoped_belief::ScopedBeliefRow;
+pub use repos::scoped_belief::{CommunityFoldsCleared, ScopedBeliefRow};
 
 // Re-export Political network monitoring types
 pub use repos::political::{
