@@ -30,8 +30,10 @@ repository root.
 main runs it, .github/workflows/cited-sha-check.yml): W4 a token in a message
 that looks like a commit sha (9-40 lowercase hex characters holding a digit and
 a letter, not part of a UUID or a longer hex run and not right after `@`; or
-7-8 hex characters right after the word `commit`) that names no commit
-REACHABLE from <head>. Reachability, not `git cat-file -e`: a full clone holds
+7-8 hex characters right after `commit(s)`, `commit hash`, `sha(s)`,
+`revert(s|ed)` or `cherry-pick(s|ed)`, also through a list such as "commits a, b
+and c") that names no commit REACHABLE from <head>. A bare 7-8 hex token is not
+read: it cannot be told from an 8-hex backlog or claim-id prefix. Reachability, not `git cat-file -e`: a full clone holds
 every branch's objects, so a sha that lives only on an unmerged or rebased-away
 branch still resolves there but is not on main. Trailer lines are not read.
 The rule it enforces: cite a commit by sha only once it is on main (or earlier
@@ -86,12 +88,19 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # such as a 64-hex content hash (the 40 cap plus the boundary), and not right
 # after `@` (an action pin or another repository's revision).
 CITED_SHA_RE = re.compile(r"(?<![0-9A-Za-z_@-])([0-9a-f]{9,40})(?![0-9A-Za-z_-])")
-# W4: a short sha (7-8 hex) counts only right after the word `commit(s)`, so an
-# 8-hex backlog claim-id prefix elsewhere is not read as a sha.
-CITED_SHORT_RE = re.compile(r"\bcommits?\s+`?([0-9a-f]{7,8})(?![0-9A-Za-z_-])", re.I)
+# W4: a short sha (7-8 hex) counts only after a word that names a commit
+# ("commit", "commit hash", "sha", "reverts", "cherry-picked"), also through a
+# list of hex tokens ("commits a, b and c"). A bare 8-hex token elsewhere is
+# most often a backlog or claim-id prefix, which no git object can resolve.
+SHA_LIST_RE = re.compile(
+    r"\b(?:commits?(?:\s+hash(?:es)?)?|shas?|reverts?|reverted|cherry-pick(?:s|ed)?)\b"
+    r"[\s:`(]*(`?[0-9a-f]{7,40}`?(?:\s*(?:[,;/&]|\band\b|\bor\b)\s*`?[0-9a-f]{7,40}`?)*)"
+    r"(?![0-9A-Za-z_-])", re.I)
+SHORT_HEX_RE = re.compile(r"(?<![0-9A-Za-z_@-])([0-9a-f]{7,8})(?![0-9A-Za-z_-])", re.I)
 # W4: a hex run labelled as a content hash just before it ("sha256 <hex>",
-# "blake3: <hex>", "hash=<hex>") is a digest, not a commit.
-HASH_LABEL_RE = re.compile(r"(?:sha-?256|sha-?512|blake3|md5|hash)[\s:=]*`?$", re.I)
+# "blake3: <hex>", "hash=<hex>") is a digest, not a commit; "commit hash" is not.
+HASH_LABEL_RE = re.compile(
+    r"(?:sha-?256|sha-?512|blake3|md5|(?<!commit\s)(?<!commit-)hash)[\s:=]*`?$", re.I)
 
 
 def is_public_ipv4(text):
@@ -242,15 +251,18 @@ def cited_shas(message):
     for line in message.split("\n"):
         if TRAILER_RE.match(line):
             continue
+        hits = [(m.start(1), m.group(1)) for m in CITED_SHA_RE.finditer(line)]
+        for lm in SHA_LIST_RE.finditer(line):
+            hits += [(lm.start(1) + m.start(1), m.group(1))
+                     for m in SHORT_HEX_RE.finditer(lm.group(1))]
         spans = []
-        for rx in (CITED_SHA_RE, CITED_SHORT_RE):
-            for m in rx.finditer(line):
-                tok = m.group(1).lower()
-                if not (re.search(r"[0-9]", tok) and re.search(r"[a-f]", tok)):
-                    continue
-                if len(tok) == 32 or HASH_LABEL_RE.search(line[:m.start(1)]):
-                    continue
-                spans.append((m.start(1), tok))
+        for start, tok in hits:
+            tok = tok.lower()
+            if not (re.search(r"[0-9]", tok) and re.search(r"[a-f]", tok)):
+                continue
+            if len(tok) == 32 or HASH_LABEL_RE.search(line[:start]):
+                continue
+            spans.append((start, tok))
         found += [tok for _, tok in sorted(set(spans))]
     return found
 

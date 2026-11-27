@@ -537,9 +537,13 @@ subject**, e.g. `#1234 "fix(db): ..."`: a branch sha stops resolving once the
 branch is rebased or squashed, and the citation is then a dead link for every
 later reader. After each merge, the `Cited sha check` workflow
 (`.github/workflows/cited-sha-check.yml`, `commit-message-lint.py --cited-shas`)
-warns (W4) about each cited sha that names no commit reachable from `main`. A
-sha-like token is 9-40 lowercase hex characters holding a digit and a letter
-(not part of a UUID or a longer hex run, not right after `@`, not 32 long, not
-labelled as a `sha256`/`blake3`/`md5`/`hash` digest), or 7-8 hex characters
-right after the word `commit`. W4 is a warning only and does not run on pull
-requests.
+warns (W4) about each cited sha that names no commit reachable from `main`.
+Write a sha so the check can read it: **at least 9 hex characters** (git's
+default abbreviation here, as `git log --oneline` prints it), or a 7-8 hex short
+sha right after `commit`, `commit hash`, `sha`, `revert(s|ed)` or
+`cherry-pick(ed)` (also through a list: "commits a, b and c"). A bare 7-8 hex
+token is not checked, because it cannot be told from an 8-hex backlog or
+claim-id prefix. A sha-like token is lowercase hex holding a digit and a letter,
+not part of a UUID or a longer hex run, not right after `@`, not 32 long and not
+labelled as a `sha256`/`blake3`/`md5`/`hash` digest. W4 is a warning only and
+does not run on pull requests.
