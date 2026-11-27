@@ -2083,7 +2083,7 @@ pub async fn evolve_step(
         let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
             epigraph_engine::admin_cascade::CascadeCause::Supersede,
             Some(agent),
-            Some(crate::routes::versioning::oauth_principal(&auth)),
+            Some(epigraph_engine::admin_cascade::OauthPrincipal::from(&auth)),
             parent_id,
             Some(result.new_claim_id),
         );

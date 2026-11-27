@@ -215,7 +215,7 @@ pub async fn consolidate_claims(
         ..epigraph_engine::admin_cascade::CascadeTrigger::new(
             epigraph_engine::admin_cascade::CascadeCause::Consolidate,
             Some(acting_agent_id),
-            crate::tools::supersede::oauth_principal(auth),
+            auth.map(epigraph_engine::admin_cascade::OauthPrincipal::from),
             result.merged_id,
             None,
         )

@@ -172,6 +172,20 @@ pub struct OauthPrincipal {
     pub agent_id: Option<Uuid>,
 }
 
+/// The principal an authenticated call's token names, for the cascade's audit
+/// row: its client, owner and agent, as the token carries them. Both
+/// transports (HTTP routes and MCP tools) build it here, from the shared
+/// `epigraph_auth::AuthContext`.
+impl From<&epigraph_auth::AuthContext> for OauthPrincipal {
+    fn from(auth: &epigraph_auth::AuthContext) -> Self {
+        Self {
+            client_id: Some(auth.client_id),
+            owner_id: auth.owner_id,
+            agent_id: auth.agent_id,
+        }
+    }
+}
+
 /// Where a replayed cascade came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayOrigin {
@@ -1949,6 +1963,42 @@ pub async fn replay_deferred(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The audit row's principal is the token's client, owner and agent, as
+    /// both transports used to build it by hand: the client always, owner and
+    /// agent only when the token carries them.
+    #[test]
+    fn an_oauth_principal_names_the_tokens_client_owner_and_agent() {
+        let token = |owner: Option<Uuid>, agent: Option<Uuid>| epigraph_auth::AuthContext {
+            client_id: Uuid::from_u128(1),
+            agent_id: agent,
+            owner_id: owner,
+            client_type: epigraph_auth::ClientType::Agent,
+            scopes: vec!["claims:write".to_string()],
+            jti: Uuid::from_u128(4),
+            family_id: Some(Uuid::from_u128(5)),
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: Some(Uuid::from_u128(6)),
+        };
+        assert_eq!(
+            OauthPrincipal::from(&token(Some(Uuid::from_u128(2)), Some(Uuid::from_u128(3)))),
+            OauthPrincipal {
+                client_id: Some(Uuid::from_u128(1)),
+                owner_id: Some(Uuid::from_u128(2)),
+                agent_id: Some(Uuid::from_u128(3)),
+            }
+        );
+        assert_eq!(
+            OauthPrincipal::from(&token(None, None)),
+            OauthPrincipal {
+                client_id: Some(Uuid::from_u128(1)),
+                owner_id: None,
+                agent_id: None,
+            }
+        );
+    }
 
     /// The act's errors split three ways (backlog dca9ed56): a designed
     /// refusal keeps its kind; a duplicate deleted after the caller read it

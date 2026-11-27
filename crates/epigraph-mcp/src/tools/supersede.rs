@@ -11,15 +11,6 @@ use epigraph_engine::admin_cascade::{
 };
 use epigraph_engine::retraction_cascade::CascadeReport;
 
-/// The OAuth principal behind an authenticated call, for the cascade's audit row.
-pub(crate) fn oauth_principal(auth: Option<&epigraph_auth::AuthContext>) -> Option<OauthPrincipal> {
-    auth.map(|a| OauthPrincipal {
-        client_id: Some(a.client_id),
-        owner_id: a.owner_id,
-        agent_id: a.agent_id,
-    })
-}
-
 pub async fn supersede_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -77,7 +68,7 @@ pub async fn supersede_claim(
     let trigger = CascadeTrigger::new(
         CascadeCause::Supersede,
         Some(actor),
-        oauth_principal(auth),
+        auth.map(OauthPrincipal::from),
         old_id,
         Some(new_id),
     );
@@ -695,7 +686,7 @@ pub(crate) async fn mark_duplicates_onto(
             CascadeTrigger::new(
                 CascadeCause::Dedup,
                 Some(actor),
-                oauth_principal(auth),
+                auth.map(OauthPrincipal::from),
                 *dup,
                 Some(canon),
             )
@@ -804,7 +795,7 @@ pub(crate) async fn mark_duplicate_pair(
     let trigger = CascadeTrigger::new(
         CascadeCause::Dedup,
         Some(actor),
-        oauth_principal(auth),
+        auth.map(OauthPrincipal::from),
         dup,
         Some(canon),
     );
@@ -1063,7 +1054,7 @@ pub(crate) async fn unmark_duplicate_expecting(
     let trigger = CascadeTrigger::new(
         CascadeCause::Undedup,
         Some(actor),
-        oauth_principal(auth),
+        auth.map(OauthPrincipal::from),
         dup,
         Some(canonical),
     );

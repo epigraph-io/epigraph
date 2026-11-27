@@ -218,7 +218,7 @@ pub async fn evolve_step(
             let trigger = CascadeTrigger::new(
                 CascadeCause::Supersede,
                 Some(agent_id),
-                crate::tools::supersede::oauth_principal(auth),
+                auth.map(epigraph_engine::admin_cascade::OauthPrincipal::from),
                 parent_uuid,
                 Some(r.new_claim_id),
             );

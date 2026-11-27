@@ -473,7 +473,7 @@ pub async fn supersede_claim(
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Supersede,
         viewer.principal(),
-        Some(oauth_principal(&auth)),
+        Some(epigraph_engine::admin_cascade::OauthPrincipal::from(&auth)),
         claim_id,
         Some(new_uuid),
     );
@@ -562,18 +562,6 @@ pub async fn supersede_claim(
             embedded,
         }),
     ))
-}
-
-/// The OAuth principal behind an authenticated request, for the cascade audit.
-#[cfg(feature = "db")]
-pub(crate) fn oauth_principal(
-    auth: &crate::middleware::bearer::AuthContext,
-) -> epigraph_engine::admin_cascade::OauthPrincipal {
-    epigraph_engine::admin_cascade::OauthPrincipal {
-        client_id: Some(auth.client_id),
-        owner_id: auth.owner_id,
-        agent_id: auth.agent_id,
-    }
 }
 
 /// The answer `supersede_claim` gives when the database refuses its act on
@@ -965,7 +953,7 @@ pub async fn mark_duplicate(
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Dedup,
         viewer.principal(),
-        Some(oauth_principal(&auth)),
+        Some(epigraph_engine::admin_cascade::OauthPrincipal::from(&auth)),
         dup_id,
         Some(req.canonical_id),
     );
@@ -1284,7 +1272,7 @@ pub async fn unmark_duplicate(
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Undedup,
         viewer.principal(),
-        Some(oauth_principal(&auth)),
+        Some(epigraph_engine::admin_cascade::OauthPrincipal::from(&auth)),
         dup_id,
         Some(canonical_id),
     );

@@ -1609,7 +1609,7 @@ async fn apply_unit(
         let trigger = CascadeTrigger::new(
             CascadeCause::Dedup,
             Some(actor),
-            crate::tools::supersede::oauth_principal(auth),
+            auth.map(epigraph_engine::admin_cascade::OauthPrincipal::from),
             m.dup,
             Some(m.canonical),
         );
