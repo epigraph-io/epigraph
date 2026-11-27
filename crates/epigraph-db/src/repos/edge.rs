@@ -66,6 +66,42 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
 /// above automatically covers the supersede path.
 pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
 
+/// Relationships whose uniqueness the SCHEMA enforces DIRECTION-AGNOSTICALLY
+/// on claim/claim edges, through a partial unique index keyed on
+/// `(LEAST(source_id, target_id), GREATEST(source_id, target_id))` with no
+/// further conjunct a merge could step outside of:
+///
+/// - `alternative_of`: `edges_alternative_of_symmetric_uniq` (migration 042,
+///   narrowed to in-force rows by 091);
+/// - `shifted_to`: `edges_shifted_to_pair_uniq` (migration 358).
+///
+/// What a relation MEANS is a different question. `alternative_of` is
+/// symmetric; `shifted_to` (temporal succession: the source held earlier, the
+/// target holds now) is DIRECTIONAL, and its pair index enforces ANTI-symmetry:
+/// `A shifted_to B` plus `B shifted_to A` is a contradiction, not two facts.
+/// Both still share the `(LEAST, GREATEST)` key, so both make the same demand
+/// of any code that re-points edges, which is the reason this list exists.
+///
+/// `ClaimRepository::mark_duplicate` (its repair) and
+/// `ClaimRepository::consolidate` move a retired claim's edges onto a
+/// survivor. Their ordinary dedup recognises same-`(source, target,
+/// relationship)` triples only, so it misses two edges of OPPOSITE orientation
+/// joining the merge's endpoints to one third claim. Re-pointing one of them
+/// then lands on an occupied pair key, trips the index and rolls the whole
+/// transaction back before `is_current` flips (backlog 2905150e / issue #286).
+/// Both sites read this list rather than naming a relationship, so a new index
+/// of this shape is one entry here.
+///
+/// Not every `(LEAST, GREATEST)` index over `edges` is listed, on purpose:
+/// - `edges_related_to_symmetric_uniq` (353) covers workflow/workflow edges
+///   only, and neither merge path re-points a non-claim endpoint;
+/// - `edges_symmetric_relationship_uniq` (090/175) covers only the
+///   cross-source matcher's `corroborates` / `contradicts` rows (its predicate
+///   reads `properties->>'source'`), so listing those relationships here would
+///   dedup every operator-written `contradicts` pair by direction-agnostic key
+///   as well. That index's own merge exposure is a separate question.
+pub const PAIR_UNIQUE_RELATIONSHIPS: &[&str] = &["alternative_of", "shifted_to"];
+
 /// SQL predicate selecting edges that are currently in force.
 ///
 /// `edges` is bitemporal via `valid_from` / `valid_to` (migration 001), but until

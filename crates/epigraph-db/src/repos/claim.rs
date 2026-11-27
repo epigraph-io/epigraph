@@ -13137,11 +13137,13 @@ impl ClaimRepository {
     ///
     /// That matters for two distinct reasons, confirmed by
     /// `docs/audits/audit-edge-collision-mark-duplicate.md`:
-    /// - `alternative_of` carries a symmetric partial unique index
-    ///   (`edges_alternative_of_symmetric_uniq`, migration 042), so a collision
-    ///   is a HARD error that rolls the whole merge back. Because the index is
-    ///   keyed on `(LEAST, GREATEST)` it is direction-agnostic, so those edges
-    ///   are deduped ignoring direction.
+    /// - The pair-unique relationships ([`crate::PAIR_UNIQUE_RELATIONSHIPS`]:
+    ///   `alternative_of`, `edges_alternative_of_symmetric_uniq`, migration
+    ///   042; `shifted_to`, `edges_shifted_to_pair_uniq`, migration 358) carry
+    ///   a partial unique index, so a collision is a HARD error that rolls the
+    ///   whole merge back. Because each index is keyed on `(LEAST, GREATEST)`
+    ///   it is direction-agnostic, so those edges are deduped ignoring
+    ///   direction (per relationship).
     /// - Every other relationship collides SILENTLY (migration 018 dropped the
     ///   triple-uniqueness constraint and nothing re-added it), producing
     ///   duplicate rows that feed the same Dempster-Shafer mass twice through
@@ -13851,16 +13853,24 @@ async fn migrate_consolidated_edges(
         } else {
             (*source_id, source_type.clone())
         };
-        // alternative_of's unique index is keyed on (LEAST, GREATEST) and
-        // is therefore direction-agnostic; every other relationship
-        // duplicates per-direction.
-        let direction = if relationship == "alternative_of" {
-            0
-        } else if src_in {
-            1
-        } else {
-            -1
-        };
+        // A pair-unique relationship (`alternative_of`, 042/091; `shifted_to`,
+        // 358; see [`crate::PAIR_UNIQUE_RELATIONSHIPS`]) carries a unique
+        // index keyed on (LEAST, GREATEST), so it is direction-agnostic: two
+        // of its edges between the merged claim and one third claim collide
+        // even when oriented oppositely, so they share ONE slot. That holds
+        // for `shifted_to` although the relationship itself is directional:
+        // the INDEX decides, not what the edge means. Every other
+        // relationship duplicates per-direction. The relationship stays in
+        // the key, so two different pair-unique relationships over one pair
+        // (separate partial indexes) never take each other's slot.
+        let direction =
+            if crate::repos::edge::PAIR_UNIQUE_RELATIONSHIPS.contains(&relationship.as_str()) {
+                0
+            } else if src_in {
+                1
+            } else {
+                -1
+            };
         let key = (other, other_type, relationship.clone(), direction);
         if seen.insert(key) {
             survivors.push(*id);
@@ -14629,32 +14639,43 @@ async fn repair_marked_duplicate(
         .await?,
     );
 
-    // Symmetric-collision guard for `alternative_of` (migration 042).
+    // Pair-key collision guard for every relationship with a
+    // direction-agnostic partial unique index: `alternative_of` (042/091) and
+    // `shifted_to` (358). [`crate::PAIR_UNIQUE_RELATIONSHIPS`] is the one list
+    // this site and `consolidate` both read.
     //
-    // That relationship is governed by `edges_alternative_of_symmetric_uniq`,
-    // a UNIQUE index on `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`
-    // — so the pair {A,B} is unique *regardless of direction*.  The two
-    // directional pre-deletes above only recognise same-`(source,target,
-    // relationship)` triples, so they miss the case where `dup` and
-    // `canonical` are joined to a common third claim T by `alternative_of`
-    // edges of *opposite* orientation (e.g. `dup→T` and `T→canonical`).
-    // Migrating `dup→canonical` would then rewrite `dup→T` into `canonical→T`,
-    // whose symmetric key {canonical,T} collides with the existing `T→canonical`
-    // edge, tripping the unique index and rolling the whole transaction back
-    // before `is_current` is flipped (backlog 2905150e / issue #286).
+    // Those indexes are keyed on
+    // `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`, so the
+    // pair {A,B} is unique *regardless of direction*, for `shifted_to` too
+    // although that relationship is directional.  The two directional
+    // pre-deletes above only recognise same-`(source,target,relationship)`
+    // triples, so they miss the case where `dup` and `canonical` are joined
+    // to a common third claim T by edges of *opposite* orientation (e.g.
+    // `dup→T` and `T→canonical`).  Migrating `dup→canonical` would then
+    // rewrite `dup→T` into `canonical→T`, whose pair key {canonical,T}
+    // collides with the existing `T→canonical` edge, tripping the unique
+    // index and rolling the whole transaction back before `is_current` is
+    // flipped (backlog 2905150e / issue #286).
     //
-    // Pre-delete the redundant dup-side `alternative_of` edge whenever
-    // `canonical` already shares a symmetric `alternative_of` edge with the
-    // same third claim.  Edges where `canonical` is itself an endpoint are
-    // left for the self-loop guards in the migration UPDATEs below. An
-    // INCOMING (`T→dup`) edge carrying the act marker is left alone: the
-    // incoming re-point keeps it on the duplicate, so it cannot collide (as
-    // in the incoming guard above).
+    // Retract the redundant dup-side edge whenever `canonical` already
+    // shares an edge OF THE SAME RELATIONSHIP with the same third claim.
+    // `e2.relationship = e.relationship`, not a second `ANY($5)`: the indexes
+    // are PER-relationship partial indexes, so an `alternative_of` and a
+    // `shifted_to` edge over one pair do not collide, and neither may retract
+    // the other.  Edges where `canonical` is itself an endpoint are left for
+    // the self-loop guards in the migration UPDATEs below. An INCOMING
+    // (`T→dup`) edge carrying the act marker is left alone: the incoming
+    // re-point keeps it on the duplicate, so it cannot collide (as in the
+    // incoming guard above).
+    let pair_unique: Vec<String> = crate::repos::edge::PAIR_UNIQUE_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     deleted_edges.extend(
         sqlx::query_as::<_, (Uuid, Uuid)>(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
              UPDATE edges AS e SET valid_to = now()
-             WHERE e.relationship = 'alternative_of'
+             WHERE e.relationship = ANY($5)
              AND e.valid_to IS NULL
              AND e.source_type = 'claim' AND e.target_type = 'claim'
              AND (e.source_id = $2 OR e.target_id = $2)
@@ -14662,7 +14683,7 @@ async fn repair_marked_duplicate(
              AND NOT (e.target_id = $2 AND COALESCE(e.properties->>$4 = ANY($3), false))
              AND EXISTS (
              SELECT 1 FROM edges e2
-             WHERE e2.relationship = 'alternative_of'
+             WHERE e2.relationship = e.relationship
              AND e2.source_type = 'claim' AND e2.target_type = 'claim'
              AND e2.id <> e.id
              AND (e2.valid_to IS NULL OR e2.valid_to > now())
@@ -14677,6 +14698,7 @@ async fn repair_marked_duplicate(
         .bind(dup_uuid)
         .bind(&act_tools)
         .bind(SUPERSEDE_ACT_PROPERTY)
+        .bind(&pair_unique)
         .fetch_all(&mut *conn)
         .await?,
     );

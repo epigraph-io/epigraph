@@ -254,7 +254,7 @@ pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{
     AttributedClaimRow, BbaCleanup, ClaimLinkRow, EdgeRefusal, EdgeRow, EdgeWithdrawal,
     SymmetricEdgeUpsert, WithdrawnEdgeBbas, EDGE_MOVES_BELIEF_SQL, EDGE_RETRACT_DEFERRAL_REASON,
-    EPISTEMIC_RELATIONSHIPS, MOVES_BELIEF_PROPERTY,
+    EPISTEMIC_RELATIONSHIPS, MOVES_BELIEF_PROPERTY, PAIR_UNIQUE_RELATIONSHIPS,
 };
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
