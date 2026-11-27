@@ -160,7 +160,7 @@ done
 # Reachability, not object existence: a sha on a side branch exists in a full
 # clone (`git cat-file -e` succeeds) but is not on main, so it must still warn.
 anc=$(git -C "$r" rev-parse HEAD)          # an ancestor of every later commit
-side=$(git -C "$r" commit-tree "HEAD^{tree}" -p HEAD -m "side")
+side=$(git -C "$r" -c user.name=ci -c user.email=ci@example.invalid commit-tree "HEAD^{tree}" -p HEAD -m "side")
 git -C "$r" update-ref refs/heads/side "$side"   # exists, not reachable from main
 git -C "$r" cat-file -e "${side:0:12}^{commit}"  # premise: the object resolves
 missing="5e1f0c0ffee12"                    # a commit-like token naming nothing
