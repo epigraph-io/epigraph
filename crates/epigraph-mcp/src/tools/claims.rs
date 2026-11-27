@@ -1527,6 +1527,163 @@ fn ds_wire_failure_message(e: &str) -> String {
     }
 }
 
+/// The Dempster-Shafer half of attaching one evidence row to a claim, on the
+/// caller's author-stamped transaction, AFTER the evidence row was written on
+/// it: the frame the evidence is filed on, its BBA combined into the claim's
+/// cached belief (`ds_auto::auto_wire_ds_update_filed_on`), and the claim's
+/// Beta-Bernoulli track and divergence row. Returns the combination.
+///
+/// Shared by `update_with_evidence` and the novelty gate's corroboration
+/// (`novelty_gate::corroborate`, backlog 4f4c6175), so a corroborating
+/// submission's evidence is combined exactly as evidence attached by hand is.
+/// It never writes the claim ROW (`truth_value`, `labels`, `content`): that is
+/// the caller's decision. `seed_truth` is `ds_auto`'s `seed_truth_prior`: true
+/// only when the caller may file the authored `truth_value` as the author's
+/// BBA (a writer of the claim's group adding evidence by hand).
+///
+/// # Errors
+/// A caller error for a promoted hypothesis whose filing frame is missing or
+/// malformed; the designed `ds_wire_failure_message` text for a failed wire
+/// (the cause is logged); an internal error otherwise. The caller drops its
+/// transaction, so nothing is written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn wire_attached_evidence_in_tx(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    agent_id: Uuid,
+    evidence_id: Uuid,
+    strength: f64,
+    supports: bool,
+    evidence_type: &str,
+    seed_truth: bool,
+    tool: &'static str,
+) -> Result<ds_auto::DsAutoResult, McpError> {
+    // Type weight from the served calibration (`CALIBRATION_PATH`, else the
+    // compiled-in copy), never a cwd file with a 0.7 fallback (backlog d83b998a).
+    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+        .get_evidence_type_weight(evidence_type);
+
+    // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
+    //
+    // #497 ("update_with_evidence best-effort") made this failure non-fatal and
+    // disclosed it as `belief_wired: false`. That was right FOR ITS TREE: there
+    // the evidence INSERT had already self-committed on the unstamped pool, the
+    // wiring ran on a sibling pool connection and was refused in production
+    // (`new row violates row-level security policy for table "claim_frames"`),
+    // so a fatal error reported total failure for a call whose evidence row the
+    // database had kept.
+    //
+    // Neither premise survives D2. The wiring runs on THIS stamped transaction,
+    // so the production refusal it was working around is the thing D2 removes,
+    // and the evidence row is uncommitted until everything below succeeds. A
+    // failure here therefore leaves NOTHING behind — no evidence, no BBA, no
+    // truth write, no labels — and an error is now the complete and truthful
+    // answer. Swallowing it instead would commit exactly the BBA-less evidence
+    // row the note above explains is worse than nothing (it blocks the identical
+    // re-submit via the same-owner evidence de-duplication). The error text keeps
+    // the failing step as its prefix (`assign_claim:`, `store BBA:`,
+    // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
+    // which is the part of #497's disclosure that still has a referent.
+    //
+    // `submit_claim` still treats its own DS wiring as best-effort, and that is
+    // not a discrepancy: there the CLAIM is the primary write and it has already
+    // committed in its own transaction before the wire runs, so the claim
+    // exists either way. Here the evidence row IS the submission, and it is in
+    // the same unit as its BBA.
+    //
+    // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
+    // A promoted hypothesis's readers read `research_validity`, never
+    // `binary_truth`, so its evidence is filed there (operator rulings R-8 and
+    // R-17), instead of on `binary_truth`, never on both: the fold reads every
+    // two-hypothesis frame and would count it twice. A missing or non-binary
+    // `research_validity` is the caller's refusal, with nothing written.
+    let file_on =
+        epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_db::DbError::InvalidData { .. }
+                | epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
+                other => internal_error(other),
+            })?
+            .map(|frame| frame.id);
+    let ds = ds_auto::auto_wire_ds_update_filed_on(
+        &mut *conn,
+        viewer,
+        claim_id,
+        agent_id,
+        strength,
+        weight, // from calibration.toml (C1 fix: single weight source)
+        supports,
+        Some(evidence_type),
+        Some(evidence_id), // C-1: evidence UUID prevents BBA upsert overwrite
+        seed_truth,
+        file_on,
+    )
+    .await
+    .map_err(|e| {
+        // Logged as well as returned. The reply is designed text
+        // (`internal_error_text`, which does not log), so without this a
+        // dropped wire here would never reach the server log, and its cause
+        // reaches only the log. #497 added this warn so that one log query
+        // ("ds auto-wire failed") finds every dropped wire, whichever tool
+        // dropped it; `submit_claim`'s path emits the same prefix with the same
+        // `claim_id`/`tool` fields. The wording differs because the outcome
+        // does: here the whole submission is rolled back.
+        tracing::warn!(
+            claim_id = %claim_id,
+            tool,
+            "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
+        );
+        crate::errors::internal_error_text(ds_wire_failure_message(&e))
+    })?;
+
+    // The claim's Beta-Bernoulli track and its DS-vs-Bayesian divergence row
+    // (backlog f50344c0), kept as `POST /frames/:id/evidence` keeps them, by
+    // the same functions: the evidence BBA's mass on TRUE (index 0 of the
+    // binary frame) goes to alpha, the rest of its non-conflict mass to beta,
+    // and the row records this call's BetP against that posterior on the
+    // cache's frame, for `get_divergence`. Every call here stores a new BBA
+    // (an identical `evidence_data` is refused at the insert), so it is always
+    // counted. Both are best-effort, each under its own savepoint: the row is
+    // claim-derived, and a non-owner of a public claim is refused it (and the
+    // Beta write) without losing the evidence. A cold start (the claim's track
+    // still at the Beta(1, 1) prior before this call) records no row: see
+    // `epigraph_engine::ds_divergence`.
+    let beta_update = epigraph_engine::ds_divergence::apply_beta_update(
+        &mut *conn,
+        viewer,
+        claim_id,
+        Some(epigraph_engine::ds_divergence::beta_increments(
+            &ds.evidence_bba,
+            Some(0),
+        )),
+        // Never a replacement: each call files its BBA under its own
+        // evidence's perspective.
+        None,
+        tool,
+    )
+    .await
+    .map_err(internal_error)?;
+    let frame_version =
+        epigraph_engine::ds_divergence::frame_version(&mut *conn, viewer, ds.frame_id, tool)
+            .await
+            .map_err(internal_error)?;
+    epigraph_engine::ds_divergence::record_divergence(
+        &mut *conn,
+        claim_id,
+        ds.frame_id,
+        ds.pignistic_prob,
+        beta_update,
+        frame_version,
+        tool,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    Ok(ds)
+}
+
 pub async fn update_with_evidence(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1767,84 +1924,20 @@ pub async fn update_with_evidence(
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
 
-    // Type weight from the served calibration (`CALIBRATION_PATH`, else the
-    // compiled-in copy), never a cwd file with a 0.7 fallback (backlog d83b998a).
-    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
-        .get_evidence_type_weight(&params.evidence_type);
-
-    // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
-    //
-    // #497 ("update_with_evidence best-effort") made this failure non-fatal and
-    // disclosed it as `belief_wired: false`. That was right FOR ITS TREE: there
-    // the evidence INSERT had already self-committed on the unstamped pool, the
-    // wiring ran on a sibling pool connection and was refused in production
-    // (`new row violates row-level security policy for table "claim_frames"`),
-    // so a fatal error reported total failure for a call whose evidence row the
-    // database had kept.
-    //
-    // Neither premise survives D2. The wiring runs on THIS stamped transaction,
-    // so the production refusal it was working around is the thing D2 removes,
-    // and the evidence row is uncommitted until everything below succeeds. A
-    // failure here therefore leaves NOTHING behind — no evidence, no BBA, no
-    // truth write, no labels — and an error is now the complete and truthful
-    // answer. Swallowing it instead would commit exactly the BBA-less evidence
-    // row the note above explains is worse than nothing (it blocks the identical
-    // re-submit via the same-owner evidence de-duplication). The error text keeps
-    // the failing step as its prefix (`assign_claim:`, `store BBA:`,
-    // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
-    // which is the part of #497's disclosure that still has a referent.
-    //
-    // `submit_claim` still treats its own DS wiring as best-effort, and that is
-    // not a discrepancy: there the CLAIM is the primary write and it has already
-    // committed in its own transaction before the wire runs, so the claim
-    // exists either way. Here the evidence row IS the submission, and it is in
-    // the same unit as its BBA.
-    //
-    // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
-    // A promoted hypothesis's readers read `research_validity`, never
-    // `binary_truth`, so its evidence is filed there (operator rulings R-8 and
-    // R-17), instead of on `binary_truth`, never on both: the fold reads every
-    // two-hypothesis frame and would count it twice. A missing or non-binary
-    // `research_validity` is the caller's refusal, with nothing written.
-    let file_on =
-        epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut tx, viewer, claim_id)
-            .await
-            .map_err(|e| match e {
-                epigraph_db::DbError::InvalidData { .. }
-                | epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
-                other => internal_error(other),
-            })?
-            .map(|frame| frame.id);
-    let ds = ds_auto::auto_wire_ds_update_filed_on(
+    let ds = wire_attached_evidence_in_tx(
         &mut tx,
         viewer,
         claim_id,
         agent_id,
+        evidence.id.as_uuid(),
         strength,
-        weight, // from calibration.toml (C1 fix: single weight source)
         params.supports,
-        Some(&params.evidence_type),
-        Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
-        !foreign_claim, // seed the authored truth_value only on a claim this caller writes
-        file_on,
+        &params.evidence_type,
+        // Seed the authored truth_value only on a claim this caller writes.
+        !foreign_claim,
+        "update_with_evidence",
     )
-    .await
-    .map_err(|e| {
-        // Logged as well as returned. The reply is designed text
-        // (`internal_error_text`, which does not log), so without this a
-        // dropped wire here would never reach the server log, and its cause
-        // reaches only the log. #497 added this warn so that one log query
-        // ("ds auto-wire failed") finds every dropped wire, whichever tool
-        // dropped it; `submit_claim`'s path emits the same prefix with the same
-        // `claim_id`/`tool` fields. The wording differs because the outcome
-        // does: here the whole submission is rolled back.
-        tracing::warn!(
-            claim_id = %claim_id,
-            tool = "update_with_evidence",
-            "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
-        );
-        crate::errors::internal_error_text(ds_wire_failure_message(&e))
-    })?;
+    .await?;
 
     // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
     //
@@ -1877,53 +1970,6 @@ pub async fn update_with_evidence(
     // MIGRATION 114: on a public claim the caller does not own, neither update
     // runs (labels were refused above) and `truth_after` reports the unchanged
     // value. The recombined DS belief is still returned below.
-    // The claim's Beta-Bernoulli track and its DS-vs-Bayesian divergence row
-    // (backlog f50344c0), kept as `POST /frames/:id/evidence` keeps them, by
-    // the same functions: the evidence BBA's mass on TRUE (index 0 of the
-    // binary frame) goes to alpha, the rest of its non-conflict mass to beta,
-    // and the row records this call's BetP against that posterior on the
-    // cache's frame, for `get_divergence`. Every call here stores a new BBA
-    // (an identical `evidence_data` is refused above), so it is always
-    // counted. Both are best-effort, each under its own savepoint: the row is
-    // claim-derived, and a non-owner of a public claim is refused it (and the
-    // Beta write) without losing the evidence. A cold start (the claim's track
-    // still at the Beta(1, 1) prior before this call) records no row: see
-    // `epigraph_engine::ds_divergence`.
-    let beta_update = epigraph_engine::ds_divergence::apply_beta_update(
-        &mut tx,
-        viewer,
-        claim_id,
-        Some(epigraph_engine::ds_divergence::beta_increments(
-            &ds.evidence_bba,
-            Some(0),
-        )),
-        // Never a replacement: each call files its BBA under its own
-        // evidence's perspective.
-        None,
-        "update_with_evidence",
-    )
-    .await
-    .map_err(internal_error)?;
-    let frame_version = epigraph_engine::ds_divergence::frame_version(
-        &mut tx,
-        viewer,
-        ds.frame_id,
-        "update_with_evidence",
-    )
-    .await
-    .map_err(internal_error)?;
-    epigraph_engine::ds_divergence::record_divergence(
-        &mut tx,
-        claim_id,
-        ds.frame_id,
-        ds.pignistic_prob,
-        beta_update,
-        frame_version,
-        "update_with_evidence",
-    )
-    .await
-    .map_err(internal_error)?;
-
     let after_truth = if foreign_claim {
         claim.truth_value
     } else {
