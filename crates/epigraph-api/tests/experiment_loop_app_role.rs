@@ -35,12 +35,18 @@
 //! caller's stamped connection: both tables carry no tenancy, so it passes on
 //! either tree, and it is not offered as proof of a defect.
 //!
-//! # The refusals the stamp brings
+//! # The refusals the stamp brings, and the catalog write's atomicity
 //!
 //! * A role-attached agent outside its holder window (migration 166, ROL01) is
 //!   now refused on these tables, because the per-statement check sees the
 //!   real principal. It answers the coded 403 every write surface answers,
 //!   not a 500 server fault.
+//! * A row-security refusal (42501) past the hypothesis gate, on the edge onto
+//!   the hypothesis, is a 403, and the experiment row written before it does
+//!   not commit.
+//! * `POST /api/v1/methods` writes the method and its capability links as one
+//!   unit: a link that fails leaves no method behind. The pre-conversion
+//!   handler kept the method, dropped the link's error and still counted it.
 #![cfg(feature = "db")]
 
 #[allow(dead_code)]
@@ -684,4 +690,98 @@ async fn create_as(
     )
     .await
     .map(|Json(v)| v)
+}
+
+/// A row-security refusal (42501) that reaches the write past the hypothesis
+/// gate is a 403 naming the hypothesis, and nothing commits.
+///
+/// How it is provoked: the gate and the edge's `WITH CHECK` both read the
+/// viewer's stamped writable set, so on a stock schema a group-write refusal
+/// is caught by the gate first (measured: a viewer resolved before its
+/// writer membership is revoked still writes, because the stamp carries the
+/// set it was resolved with). The arm is the backstop for a policy that
+/// refuses what the gate admitted. To make the database raise exactly that,
+/// this test adds a RESTRICTIVE insert policy on `edges` for the application
+/// role that refuses any edge onto this one hypothesis; the error is
+/// PostgreSQL's own "new row violates row-level security policy" (42501).
+/// The experiment row is written on the same transaction BEFORE the edge, so
+/// "nothing commits" is a real property: it is rolled back with the edge.
+///
+/// CONTROL: with the policy dropped, the same request lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_row_security_refusal_past_the_gate_is_a_403_and_nothing_commits(pool: PgPool) {
+    let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "30c84267-42501-owner").await;
+    let hypothesis = public_claim_in(&pool, owner, group, "30c84267 42501 hypothesis").await;
+    sqlx::query(&format!(
+        "CREATE POLICY test_refuse_edges_onto_hypothesis ON edges AS RESTRICTIVE FOR INSERT \
+         TO epigraph_app WITH CHECK (target_id <> '{hypothesis}'::uuid)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("add the refusing policy");
+    let state = app_role_state(&pool).await;
+    let pool_ref = &pool;
+    let viewer = move || async move { Viewer::resolve(pool_ref, owner).await.expect("resolve") };
+
+    let e = create_as(&state, viewer().await, owner, hypothesis)
+        .await
+        .expect_err("row security refuses the edge onto the hypothesis");
+    let (status, reason) = rendered(e).await;
+    assert_eq!(status, 403, "{reason}");
+    assert!(
+        reason.contains("no write authority over the group that owns this hypothesis"),
+        "the database's 42501 is the group-write 403 naming the hypothesis: {reason}"
+    );
+    assert_eq!(
+        experiments_on(&pool, hypothesis).await,
+        0,
+        "the experiment row written before the refused edge did not commit"
+    );
+
+    sqlx::query("DROP POLICY test_refuse_edges_onto_hypothesis ON edges")
+        .execute(&pool)
+        .await
+        .expect("drop the refusing policy");
+    create_as(&state, viewer().await, owner, hypothesis)
+        .await
+        .unwrap_or_else(|e| panic!("CONTROL: without the policy the request lands: {e:?}"));
+    assert_eq!(experiments_on(&pool, hypothesis).await, 1, "CONTROL");
+}
+
+/// The method and its capability links are one unit. A capability the
+/// database cannot store (a NUL byte, which PostgreSQL text refuses) fails its
+/// link, and the request fails with no method and no link left behind. The
+/// pre-conversion handler wrote the method, dropped the link's error, still
+/// counted the link and answered 200 (`capabilities_linked: 2`, one link row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_capability_link_leaves_no_method_behind(pool: PgPool) {
+    let (agent, _group) = viewer_fixture::seed_agent_with_group(&pool, "30c84267-nul").await;
+    let (addr, _shutdown) = spawn_app_role(&pool).await;
+    let name = format!("30c84267 nul method {}", Uuid::new_v4());
+
+    let (status, body) = post(
+        addr,
+        agent,
+        "/api/v1/methods",
+        json!({
+            "name": name,
+            "technique_type": "characterization",
+            "capabilities": ["lattice_constant", "bad\u{0}capability"],
+        }),
+    )
+    .await;
+    assert!(
+        status >= 400,
+        "a link that failed is an error for the whole write, not a 200: {status} {body}"
+    );
+    assert_eq!(methods_named(&pool, &name).await, 0, "no method committed");
+    let links: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM method_capabilities mc JOIN methods m ON m.id = mc.method_id \
+         WHERE m.name = $1",
+    )
+    .bind(&name)
+    .fetch_one(&pool)
+    .await
+    .expect("count capability links");
+    assert_eq!(links, 0, "no capability link committed");
 }
