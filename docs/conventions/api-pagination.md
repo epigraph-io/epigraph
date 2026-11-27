@@ -8,8 +8,9 @@ their clients already parse (see [Legacy](#legacy)). The code side is
 ## The request
 
 - `after`: optional and opaque. It is the previous page's `next_cursor`,
-  passed back unchanged. If absent, the endpoint serves the first page. A token
-  the endpoint did not issue gets a 400 that names the bad cursor.
+  passed back unchanged. If absent, the endpoint serves the first page. A
+  cursor the endpoint cannot decode gets a 400. A well-formed position the
+  endpoint never issued is accepted (see [The cursor](#the-cursor)).
 - `limit`: optional. It defaults to **20** and is clamped into **`[1, 100]`**,
   unless the endpoint documents its own bounds. A clamp is not an error.
 
