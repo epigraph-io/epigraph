@@ -3,12 +3,22 @@
 A convention line written because of an incident (a backlog item, an issue)
 is only as durable as the next edit of the file it lives in. A pin names the
 passage, the section it must stay inside, and the incident that motivated it,
-so an edit that drops or moves the rule fails `test_convention_pins.py`
-instead of passing review silently.
+so an edit that drops or moves the rule fails `test_convention_pins.py`.
+That suite runs in CI's `plan` job, whose unittest step blocks the run on
+every pull request (`.github/scripts/tests/test_conventions.py` collects it).
 
-Matching is whitespace-normalized (every run of whitespace is one space), so a
-re-wrapped paragraph keeps its pins. A section runs from the first occurrence
-of `section_start` to the first occurrence of `section_end` after it.
+Sections:
+
+- `section_end=None` (Markdown): the section is the heading line equal to
+  `section_start` and everything up to the next heading of the same or a
+  higher level, outside code fences. A heading inserted above the needle, or
+  a renamed neighbouring section, cannot silently widen or break the pin.
+- `section_end="..."` (source files, e.g. a Rust doc comment): the section
+  runs from the first occurrence of `section_start` to the first occurrence of
+  `section_end` after it.
+
+Matching is whitespace-tolerant (every run of whitespace is one space), so a
+re-wrapped paragraph keeps its pins.
 
 Adding a pin: when you add or change a convention line because of an incident,
 add a `Pin` below naming the incident (an 8-hex backlog prefix, or `#NNN` for
@@ -30,13 +40,16 @@ REPO = Path(__file__).resolve().parents[2]
 # An 8-hex backlog prefix, or a GitHub issue / PR number.
 INCIDENT_ID = re.compile(r"^(?:[0-9a-f]{8}|#[0-9]+)$")
 
+HEADING = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*$")
+FENCE = re.compile(r"^\s*(```|~~~)")
+
 
 @dataclass(frozen=True)
 class Pin:
     id: str
     file: str
     section_start: str
-    section_end: str
+    section_end: str | None
     needle: str
     incident: str
 
@@ -46,17 +59,53 @@ def normalize(text: str) -> str:
     return " ".join(text.split())
 
 
-def section(text: str, start: str, end: str) -> str | None:
-    """The normalized text from `start` up to (not including) `end`, or None."""
-    body = normalize(text)
-    s = normalize(start)
-    i = body.find(s)
-    if i < 0:
+def pattern(phrase: str) -> re.Pattern[str]:
+    """`phrase` as a regex that matches across any run of whitespace."""
+    return re.compile(r"\s+".join(re.escape(w) for w in phrase.split()))
+
+
+def headings(text: str) -> list[tuple[int, int, str]]:
+    """(offset, level, title) of every Markdown heading outside code fences."""
+    out = []
+    offset = 0
+    fenced = False
+    for line in text.splitlines(keepends=True):
+        if FENCE.match(line):
+            fenced = not fenced
+        elif not fenced:
+            m = HEADING.match(line.rstrip("\r\n"))
+            if m:
+                out.append((offset, len(m.group(1)), m.group(2)))
+        offset += len(line)
+    return out
+
+
+def section_span(text: str, start: str, end: str | None) -> tuple[int, int] | None:
+    """The [i, j) offsets of the section in `text`, or None when it is absent."""
+    if end is None:
+        want = HEADING.match(start.strip())
+        if want is None:
+            raise ValueError(f"section_end=None needs a Markdown heading, not {start!r}")
+        level, title = len(want.group(1)), normalize(want.group(2))
+        found = headings(text)
+        for k, (i, lvl, t) in enumerate(found):
+            if lvl == level and normalize(t) == title:
+                j = next((o for o, l2, _ in found[k + 1 :] if l2 <= level), len(text))
+                return i, j
         return None
-    j = body.find(normalize(end), i + len(s))
-    if j < 0:
+    s = pattern(start).search(text)
+    if s is None:
         return None
-    return body[i:j]
+    e = pattern(end).search(text, s.end())
+    if e is None:
+        return None
+    return s.start(), e.start()
+
+
+def section(text: str, start: str, end: str | None) -> str | None:
+    """The normalized text of the section, or None when it is absent."""
+    span = section_span(text, start, end)
+    return None if span is None else normalize(text[span[0] : span[1]])
 
 
 def check(pin: Pin, text: str) -> str | None:
@@ -64,7 +113,7 @@ def check(pin: Pin, text: str) -> str | None:
     body = section(text, pin.section_start, pin.section_end)
     if body is None:
         return (
-            f"{pin.id}: section {pin.section_start!r} .. {pin.section_end!r} "
+            f"{pin.id}: section {pin.section_start!r} .. {pin.section_end or 'next heading'!r} "
             f"not found in {pin.file}"
         )
     if normalize(pin.needle) not in body:
@@ -76,8 +125,8 @@ def check(pin: Pin, text: str) -> str | None:
 
 
 def delete_needle(text: str, needle: str) -> str:
-    """`text`, normalized, with every occurrence of `needle` removed."""
-    return normalize(text).replace(normalize(needle), "")
+    """`text` with every occurrence of `needle` removed; line breaks elsewhere kept."""
+    return pattern(needle).sub("", text)
 
 
 def read(pin: Pin) -> str:
@@ -90,7 +139,7 @@ PINS: tuple[Pin, ...] = (
         id="backlog-resolved-label-gated-on-every-transport",
         file="CLAUDE.md",
         section_start="## Retiring backlog items",
-        section_end="## Schema, migrations, claim mechanics",
+        section_end=None,
         needle=(
             "apply `resolve_backlog_item`'s `require_owner_or_admin` check when a "
             "call adds or removes it, on EVERY transport"
@@ -101,7 +150,7 @@ PINS: tuple[Pin, ...] = (
         id="backlog-retire-http-whole-label-mutation",
         file="CLAUDE.md",
         section_start="## Retiring backlog items",
-        section_end="## Schema, migrations, claim mechanics",
+        section_end=None,
         needle="Over HTTP the WHOLE label mutation needs that ownership, whatever the labels",
         incident="#374",
     ),
@@ -110,7 +159,7 @@ PINS: tuple[Pin, ...] = (
         id="belief-compare-with-tolerance",
         file="CLAUDE.md",
         section_start="## Belief values: f64, reproducible per platform only",
-        section_end="## Status claims bypass the novelty gate",
+        section_end=None,
         needle="compare a belief with an absolute tolerance (e.g. `1e-9`)",
         incident="de039f69",
     ),
@@ -118,7 +167,7 @@ PINS: tuple[Pin, ...] = (
         id="belief-never-hashed-or-signed",
         file="CLAUDE.md",
         section_start="## Belief values: f64, reproducible per platform only",
-        section_end="## Status claims bypass the novelty gate",
+        section_end=None,
         needle="**Never hash or sign a computed belief.**",
         incident="de039f69",
     ),
@@ -135,7 +184,7 @@ PINS: tuple[Pin, ...] = (
         id="backlog-candidate-label-defined",
         file="docs/conventions/backlog-retirement.md",
         section_start="## Filing backlog items: evidence tier",
-        section_end="## Retiring a backlog item",
+        section_end=None,
         needle=(
             "Label an item `backlog-candidate` (alongside `backlog`) when its only "
             "support is static reading"
@@ -146,7 +195,7 @@ PINS: tuple[Pin, ...] = (
         id="backlog-candidate-structural-vs-behavioural",
         file="docs/conventions/backlog-retirement.md",
         section_start="## Filing backlog items: evidence tier",
-        section_end="## Retiring a backlog item",
+        section_end=None,
         needle=(
             "*Behavioural* claims (a wrong result, a race, a refusal) need an "
             "executed test, a reproduced call, or a read"
@@ -157,7 +206,7 @@ PINS: tuple[Pin, ...] = (
         id="backlog-candidate-removed-by-re-measurer",
         file="docs/conventions/backlog-retirement.md",
         section_start="## Filing backlog items: evidence tier",
-        section_end="## Retiring a backlog item",
+        section_end=None,
         needle="**The re-measurer removes `backlog-candidate`**, citing the evidence",
         incident="d543f045",
     ),
@@ -165,7 +214,7 @@ PINS: tuple[Pin, ...] = (
         id="backlog-candidate-never-closed-unmeasured",
         file="docs/conventions/backlog-retirement.md",
         section_start="## Filing backlog items: evidence tier",
-        section_end="## Retiring a backlog item",
+        section_end=None,
         needle="**A candidate is never closed for being unmeasured.**",
         incident="d543f045",
     ),
@@ -173,7 +222,7 @@ PINS: tuple[Pin, ...] = (
         id="claude-md-points-at-evidence-tier",
         file="CLAUDE.md",
         section_start="## Retiring backlog items",
-        section_end="## Schema, migrations, claim mechanics",
+        section_end=None,
         needle=(
             "`docs/conventions/backlog-retirement.md`, \"Filing backlog items: "
             "evidence tier\""
@@ -185,7 +234,7 @@ PINS: tuple[Pin, ...] = (
         id="backlog-retirement-links-no-longer-in-force",
         file="docs/conventions/backlog-retirement.md",
         section_start="## Retiring a backlog item",
-        section_end="## Who may retire an item",
+        section_end=None,
         needle="`docs/conventions/no-longer-in-force.md`",
         incident="64eeca4e",
     ),
@@ -193,7 +242,7 @@ PINS: tuple[Pin, ...] = (
         id="claude-md-links-no-longer-in-force",
         file="CLAUDE.md",
         section_start="## Retiring backlog items",
-        section_end="## Schema, migrations, claim mechanics",
+        section_end=None,
         needle="`docs/conventions/no-longer-in-force.md`",
         incident="64eeca4e",
     ),
@@ -227,7 +276,7 @@ PINS: tuple[Pin, ...] = (
         id="test-db-fresh-and-migrated-from-empty",
         file="CLAUDE.md",
         section_start="## Test database",
-        section_end="## Workflow",
+        section_end=None,
         needle=(
             "create a FRESH database whose name ends in `_test` and migrate it "
             "from empty"
@@ -239,7 +288,7 @@ PINS: tuple[Pin, ...] = (
         id="no-first-party-route-under-ext",
         file="CLAUDE.md",
         section_start="## Adding HTTP routes from a downstream product",
-        section_end="## Retiring backlog items",
+        section_end=None,
         needle="Never register a first-party route under `/api/v1/ext`",
         incident="#481",
     ),

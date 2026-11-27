@@ -12,8 +12,9 @@ from .convention_pins import (
     REPO,
     check,
     delete_needle,
-    normalize,
+    pattern,
     read,
+    section_span,
 )
 
 
@@ -28,7 +29,7 @@ class ConventionPinsHold(unittest.TestCase):
         # A start that occurs twice would let a pin bind to the wrong section.
         for pin in PINS:
             with self.subTest(pin=pin.id):
-                n = normalize(read(pin)).count(normalize(pin.section_start))
+                n = len(pattern(pin.section_start).findall(read(pin)))
                 self.assertEqual(n, 1, f"{pin.id}: {pin.section_start!r} occurs {n} times")
 
 
@@ -42,20 +43,36 @@ class ConventionPinsCanFail(unittest.TestCase):
                 mutated = delete_needle(original, pin.needle)
                 # A needle that matched nothing would make the mutation a no-op
                 # and this test vacuous.
-                self.assertTrue(mutated != normalize(original), f"{pin.id}: deletion changed nothing")
+                self.assertTrue(mutated != original, f"{pin.id}: deletion changed nothing")
                 self.assertIsNotNone(check(pin, mutated), f"{pin.id} passed with its needle deleted")
 
     def test_every_pin_fails_with_its_needle_outside_its_section(self):
         for pin in PINS:
             with self.subTest(pin=pin.id):
-                moved = delete_needle(read(pin), pin.needle) + " " + pin.needle
+                # Prepended: above the first heading, outside every section.
+                moved = pin.needle + "\n\n" + delete_needle(read(pin), pin.needle)
                 self.assertIsNotNone(check(pin, moved), f"{pin.id} passed with its needle moved out")
 
     def test_every_pin_fails_without_its_section(self):
         for pin in PINS:
             with self.subTest(pin=pin.id):
-                text = normalize(read(pin)).replace(normalize(pin.section_start), "")
+                text = pattern(pin.section_start).sub("", read(pin))
                 self.assertIsNotNone(check(pin, text), f"{pin.id} passed with no section")
+
+    def test_every_heading_pin_fails_with_a_heading_inserted_above_its_needle(self):
+        # A new section inserted between the pinned heading and the needle
+        # moves the needle out of the pinned section; the pin must notice.
+        for pin in PINS:
+            if pin.section_end is not None:
+                continue
+            with self.subTest(pin=pin.id):
+                text = read(pin)
+                i, j = section_span(text, pin.section_start, pin.section_end)
+                m = pattern(pin.needle).search(text, i, j)
+                self.assertIsNotNone(m, f"{pin.id}: needle not in its section")
+                level = pin.section_start.split()[0]
+                inserted = text[: m.start()] + f"\n\n{level} Inserted section\n\n" + text[m.start() :]
+                self.assertIsNotNone(check(pin, inserted), f"{pin.id} passed with a heading above its needle")
 
 
 class ConventionPinsCiteIncidents(unittest.TestCase):
