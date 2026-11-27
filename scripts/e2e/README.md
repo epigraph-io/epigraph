@@ -592,8 +592,9 @@ decision or conversion before the operator drops `claims_privacy`,
    - MCP `challenge_claim`, `update_with_evidence` and `submit_ds_evidence` on a
      foreign public claim. (`mark_duplicate` with a belief-wired supporter left
      this list: fixed by batch H-b, measured OK on both configs by the review.)
-   - Dead routes: `/coalitions` and `/propaganda-techniques` name relations that
-     do not exist.
+   - Dead routes: `/coalitions` and `/propaganda-techniques` named relations that
+     did not exist; both routes were later deleted (backlog fc12975c) and now
+     answer 404.
 6. **Known shapes that meet the R3 gate's "succeeds while writing nothing"
    definition**, the same on both configs; each must be accepted or fixed:
    - MCP `deprecate_workflow` on a hierarchical id: `deprecated_ids=[id]`, but the

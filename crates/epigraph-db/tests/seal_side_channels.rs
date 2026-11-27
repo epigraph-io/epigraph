@@ -286,59 +286,6 @@ async fn seed_sealable_claim_as(pool: &PgPool, world: &World, author: Uuid, cont
     .await
     .expect("seed experiment triple");
 
-    // HARVESTER SOURCE TEXT, through the provenance join. Statement 8 of
-    // `seal_claims_conn` is the only one whose target is reached by a join
-    // rather than by an id list, so a fixture without these two rows executes it
-    // against nothing and the join could be wrong in either direction unnoticed.
-    let source: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality, status) \
-         VALUES ($1, 'text', 'completed') RETURNING id",
-    )
-    .bind(
-        claim
-            .as_bytes()
-            .iter()
-            .copied()
-            .cycle()
-            .take(32)
-            .collect::<Vec<u8>>(),
-    )
-    .fetch_one(pool)
-    .await
-    .expect("seed harvester source");
-    let fragment: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, \
-                                          context_window, status, visibility, owner_group_id) \
-         VALUES ($1, $2, $3, $3, 'completed', 'group', $4) RETURNING id",
-    )
-    .bind(source)
-    .bind(
-        claim
-            .as_bytes()
-            .iter()
-            .rev()
-            .copied()
-            .cycle()
-            .take(32)
-            .collect::<Vec<u8>>(),
-    )
-    .bind(content)
-    .bind(world.group)
-    .fetch_one(pool)
-    .await
-    .expect("seed harvester fragment");
-    sqlx::query(
-        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id, visibility, \
-                                                 owner_group_id) \
-         VALUES ($1, $2, 'group', $3)",
-    )
-    .bind(claim)
-    .bind(fragment)
-    .bind(world.group)
-    .execute(pool)
-    .await
-    .expect("seed harvester provenance");
-
     // A plaintext-derived ANN vector on BOTH vector columns, on both the claim
     // and its evidence. `embedding_3072` is absent from §6.5.4's TCB table and
     // is live in this schema; a seal that nulls one and not the other keeps a
@@ -622,22 +569,6 @@ async fn a_sealed_claim_keeps_no_plaintext_derived_column(pool: PgPool) {
             "{table} still carries a derived row for a sealed claim"
         );
     }
-
-    // Harvester source text, through the provenance join. Not recoverable on
-    // unseal, and stated in the preview before the admin clicks.
-    let fragments: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT f.content_text, f.context_window \
-           FROM harvester_fragments f \
-           JOIN harvester_claim_provenance p ON p.fragment_id = f.id \
-          WHERE p.claim_id = $1",
-    )
-    .bind(claim)
-    .fetch_all(&pool)
-    .await
-    .expect("read harvester fragments");
-    assert_eq!(fragments.len(), 1, "the fixture must seed a fragment");
-    assert_eq!(fragments[0].0, "[sealed]");
-    assert!(fragments[0].1.is_none());
 }
 
 /// The audit clause the previous revision got wrong: zero on BOTH tables.
@@ -1738,89 +1669,6 @@ async fn a_rotation_does_not_move_a_ciphertext_row_and_the_count_says_so(pool: P
             .await
             .expect("read the flag");
     assert!(flagged);
-}
-
-/// The fixture's list of derived tables IS the mutation's list.
-///
-/// Three hand-maintained lists now describe the same set: [`DERIVED_TABLES`]
-/// (what this file seeds and asserts about),
-/// `epigraph_db::repos::privatization::SEAL_DELETE_TABLES` (what the mutation
-/// deletes) and `epigraph_api::routes::privatization::SEAL_DESTROYS` (what the
-/// operator is told). `privatization_seal.rs` pins the last two to each other;
-/// this pins the first two, so all three agree transitively.
-///
-/// Without it, a table added to the mutation and to the preview but not to this
-/// fixture goes back to being asserted-about-but-unseeded — which is exactly the
-/// vacuity the calibration loop exists to prevent, arriving through the one door
-/// that loop cannot watch.
-/// A source fragment cited by a claim outside the plan is blanked ANYWAY.
-///
-/// `harvester_claim_provenance` is keyed `(claim_id, fragment_id)`, so one
-/// fragment can back several claims, and the blanking statement reaches it
-/// through that join. The choice here is between two losses and there is no
-/// third option: narrowing the statement to fragments cited only by sealed
-/// claims would leave the SEALED claim's own source text in the corpus in
-/// plaintext, which §6.5.4 calls worse than not sealing at all. So the fragment
-/// goes, the other claim's provenance text goes with it, and the seal preview's
-/// `unrecoverable` line says so before the admin clicks. This test exists so
-/// that a later slice that "fixes" the over-reach has to argue with the
-/// confidentiality direction first.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_shared_source_fragment_is_blanked_for_every_claim_that_cites_it(pool: PgPool) {
-    let world = seed_world(&pool).await;
-    let sealed = seed_sealable_claim(&pool, &world, "the claim this plan seals").await;
-    let sharer_text = "a claim outside the plan, citing the same source";
-    let sharer = seed_sealable_claim(&pool, &world, sharer_text).await;
-
-    let fragment: Uuid = sqlx::query_scalar(
-        "SELECT fragment_id FROM harvester_claim_provenance WHERE claim_id = $1",
-    )
-    .bind(sealed)
-    .fetch_one(&pool)
-    .await
-    .expect("read the sealed claim's fragment");
-    sqlx::query(
-        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id, visibility, \
-                                                 owner_group_id) \
-         VALUES ($1, $2, 'group', $3)",
-    )
-    .bind(sharer)
-    .bind(fragment)
-    .bind(world.group)
-    .execute(&pool)
-    .await
-    .expect("share the fragment with a second claim");
-
-    let payload = seal_payload(&pool, sealed).await;
-    commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
-
-    let (text, window): (String, Option<String>) = sqlx::query_as(
-        "SELECT content_text, context_window FROM harvester_fragments WHERE id = $1",
-    )
-    .bind(fragment)
-    .fetch_one(&pool)
-    .await
-    .expect("read the shared fragment");
-    assert_eq!(
-        text, "[sealed]",
-        "the sealed claim's source text must not survive the seal in any row, shared or not"
-    );
-    assert!(window.is_none());
-
-    // The out-of-plan claim itself is NOT touched: it keeps its content, and it
-    // acquires no ciphertext row. The loss is its provenance text and nothing
-    // else, which is the boundary the preview describes.
-    let (content, ciphertext_rows): (String, i64) = sqlx::query_as(
-        "SELECT c.content, \
-                (SELECT count(*) FROM claim_encryption ce WHERE ce.claim_id = c.id) \
-           FROM claims c WHERE c.id = $1",
-    )
-    .bind(sharer)
-    .fetch_one(&pool)
-    .await
-    .expect("read the out-of-plan claim");
-    assert_eq!(content, sharer_text);
-    assert_eq!(ciphertext_rows, 0);
 }
 
 /// The SHARED embedding write refuses a sealed claim, and still writes an

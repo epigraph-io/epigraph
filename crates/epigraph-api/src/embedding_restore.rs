@@ -188,14 +188,21 @@ pub fn embedding_service_from_env() -> (
 ///
 /// * [`ClaimRepository::claim_text_for_embedding`] refuses to hand over text
 ///   for a sealed claim, so the provider is never called on one;
-/// * [`ClaimRepository::store_embedding_if_unsealed`] locks the row and then
-///   re-checks in the `WHERE` of the `UPDATE`, so a claim sealed during the
-///   provider round trip is not written. The lock is load-bearing and its own
-///   doc says why: a lone single-statement `WHERE` does not see a seal that
+/// * [`ClaimRepository::store_embedding_if_unsealed_and_missing`] locks the row
+///   and then re-checks in the `WHERE` of the `UPDATE`, so a claim sealed during
+///   the provider round trip is not written. The lock is load-bearing and its
+///   own doc says why: a lone single-statement `WHERE` does not see a seal that
 ///   commits while the `UPDATE` is blocked on the row.
 ///
+/// # A vector already present is kept (backlog 1b83b2a1)
+///
+/// `already_embedded` lets the handler skip a claim that has a vector before
+/// any provider call, and the store's `embedding IS NULL` guard keeps a vector
+/// written inline during the provider round trip; the job then completes as
+/// a skip (`EmbeddingJobError::AlreadyEmbedded`) instead of overwriting it.
+///
 /// [`ClaimRepository::claim_text_for_embedding`]: epigraph_db::ClaimRepository::claim_text_for_embedding
-/// [`ClaimRepository::store_embedding_if_unsealed`]: epigraph_db::ClaimRepository::store_embedding_if_unsealed
+/// [`ClaimRepository::store_embedding_if_unsealed_and_missing`]: epigraph_db::ClaimRepository::store_embedding_if_unsealed_and_missing
 ///
 /// # What a refusal looks like from the queue
 ///
@@ -265,6 +272,28 @@ impl epigraph_jobs::EmbeddingJobService for ClaimEmbeddingJobService {
         }
     }
 
+    async fn already_embedded(
+        &self,
+        claim_id: uuid::Uuid,
+    ) -> Result<bool, epigraph_jobs::EmbeddingJobError> {
+        let (mut conn, lease) = self
+            .scoped
+            .unscoped_for_maintenance(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+            .await
+            .map_err(|e| epigraph_jobs::EmbeddingJobError::ApiError {
+                message: format!("no maintenance connection: {e}"),
+            })?;
+        let bypass = epigraph_db::visibility::Viewer::system(
+            &lease,
+            epigraph_db::visibility::SystemReason::EmbeddingBackfill,
+        );
+        epigraph_db::ClaimRepository::claim_has_embedding(&mut *conn, &bypass, claim_id)
+            .await
+            .map_err(|e| epigraph_jobs::EmbeddingJobError::ApiError {
+                message: e.to_string(),
+            })
+    }
+
     async fn generate_and_store(
         &self,
         claim_id: uuid::Uuid,
@@ -287,7 +316,10 @@ impl epigraph_jobs::EmbeddingJobService for ClaimEmbeddingJobService {
             &lease,
             epigraph_db::visibility::SystemReason::EmbeddingBackfill,
         );
-        let stored = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+        // `_and_missing`: a vector written while the provider was being called
+        // (the inline embed, a re-embed) is kept, never overwritten (backlog
+        // 1b83b2a1). The sibling without that guard re-embeds on purpose.
+        let stored = epigraph_db::ClaimRepository::store_embedding_if_unsealed_and_missing(
             &mut conn,
             &bypass,
             claim_id,
@@ -298,11 +330,20 @@ impl epigraph_jobs::EmbeddingJobService for ClaimEmbeddingJobService {
             message: e.to_string(),
         })?;
 
-        // NOT `Ok(())`. A zero-row UPDATE here means the claim was sealed while
-        // the provider was being called, or removed. Reporting success would
-        // mark the job done and leave the vector missing with nothing recording
-        // why.
+        // NOT `Ok(())`. A zero-row UPDATE here means the claim gained a vector,
+        // was sealed or was removed while the provider was being called. The
+        // first is a skip; for the others, reporting success would mark the
+        // job done and leave the vector missing with nothing recording why.
         if !stored {
+            let embedded =
+                epigraph_db::ClaimRepository::claim_has_embedding(&mut *conn, &bypass, claim_id)
+                    .await
+                    .map_err(|e| epigraph_jobs::EmbeddingJobError::ApiError {
+                        message: e.to_string(),
+                    })?;
+            if embedded {
+                return Err(epigraph_jobs::EmbeddingJobError::AlreadyEmbedded { claim_id });
+            }
             return Err(epigraph_jobs::EmbeddingJobError::NotFound { claim_id });
         }
         Ok(vector)

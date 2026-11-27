@@ -133,7 +133,6 @@ async fn applied_seal_plan(pool: &PgPool, world: &fx::World, seeds: &[Uuid]) -> 
             .is_some_and(|t| t.contains(&"entity_mentions")),
         "the seal preview must name the derived tables it destroys"
     );
-    assert!(effects.unrecoverable.is_some());
     assert!(effects.reversibility.is_some());
     // Ruling R-5: the seal KEEPS an outsider's (writer-owned) challenge,
     // unencrypted, so the preview must say so rather than list `challenges`
@@ -1683,140 +1682,49 @@ async fn a_sealed_plan_becomes_revertible_once_its_items_are_unsealed(pool: PgPo
     );
 }
 
-/// Give `claim` a harvester source fragment, and return the fragment id.
+/// Migration 354 dropped the harvester tables, so a seal blanks no source text
+/// any more: the seal preview carries neither the shared-fragment count
+/// (`D-PR21-shared-fragment-count`, the `counts.shared_source_fragments`
+/// field) nor the `side_effects.unrecoverable` sentence it qualified, and a
+/// restrict preview carries neither as before. Read from the route's own
+/// serialised response, the wire shape a client sees.
 ///
-/// The fragment inherits the claim's own tenancy, so the rows are consistent
-/// whatever visibility the claim is at when this is called.
-async fn seed_fragment(pool: &PgPool, claim: Uuid, text: &str) -> Uuid {
-    let source: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality, status) \
-         VALUES ($1, 'text', 'completed') RETURNING id",
-    )
-    // Per-call nonces: `harvester_sources.content_hash` is UNIQUE and one claim
-    // may cite more than one source, so a hash derived from the claim id alone
-    // makes the second seed a 23505.
-    .bind(Uuid::new_v4().as_bytes().to_vec())
-    .fetch_one(pool)
-    .await
-    .expect("seed harvester source");
-    let fragment: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, \
-                                          context_window, status, visibility, owner_group_id) \
-         SELECT $1, $2, $3, $3, 'completed', c.visibility, c.owner_group_id \
-           FROM claims c WHERE c.id = $4 RETURNING id",
-    )
-    .bind(source)
-    .bind(Uuid::new_v4().as_bytes().to_vec())
-    .bind(text)
-    .bind(claim)
-    .fetch_one(pool)
-    .await
-    .expect("seed harvester fragment");
-    cite_fragment(pool, claim, fragment).await;
-    fragment
-}
-
-/// Link an existing fragment to a second claim, which is what makes it SHARED.
-async fn cite_fragment(pool: &PgPool, claim: Uuid, fragment: Uuid) {
-    sqlx::query(
-        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id, visibility, \
-                                                 owner_group_id) \
-         SELECT $1, $2, c.visibility, c.owner_group_id FROM claims c WHERE c.id = $1",
-    )
-    .bind(claim)
-    .bind(fragment)
-    .execute(pool)
-    .await
-    .expect("seed harvester provenance");
-}
-
-/// `D-PR21-shared-fragment-count` — the seal preview reports the MAGNITUDE of
-/// the shared-fragment loss it already describes.
-///
-/// # What was there, and what was missing
-///
-/// `SEAL_UNRECOVERABLE` states the property unconditionally: a fragment is one
-/// row, so blanking it takes the source text from every claim that cites it,
-/// including claims outside the plan. The behaviour is deliberate and is
-/// asserted in `epigraph-db/tests/seal_side_channels.rs`. What the operator
-/// could not see is how much of it there is — a plan that blanks one shared
-/// fragment and one that blanks four hundred read identically.
-///
-/// # Two plans, and the second is what makes the first mean anything
-///
-/// A count of shared fragments is only informative if it can be zero. The
-/// unshared plan is asserted first for exactly that reason: a field hard-wired
-/// to the plan's fragment count, or to any non-zero constant, would satisfy the
-/// shared case on its own.
-///
-/// # `restrict` gets `None`, not `0`
-///
-/// A restrict plan blanks no fragments at all, so a zero there would read as
-/// "measured, and there is no sharing" rather than "this question does not
-/// arise". The distinction matters because the count exists to qualify a
-/// sentence that a restrict preview does not carry.
+/// Fails before this change: the seal preview names `unrecoverable` and
+/// serialises `shared_source_fragments` (and the route's count reads the
+/// dropped provenance table).
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_seal_preview_counts_the_source_fragments_it_would_blank_for_outsiders(pool: PgPool) {
+async fn the_seal_preview_states_no_source_text_loss(pool: PgPool) {
     let world = fx::World::seed(&pool).await;
     make_keyed(&pool, world.target_group).await;
-
-    // A plan whose fragment nobody else cites.
-    let lonely = seed_subject(&pool, &world, "a claim whose source nobody else cites").await;
-    seed_fragment(&pool, lonely, "a source only one claim cites").await;
-    assert_eq!(
-        seal_preview(&pool, &world, &[lonely])
-            .await
-            .counts
-            .shared_source_fragments,
-        Some(0),
-        "a plan whose fragments are cited by nobody outside it shares nothing; a non-zero here \
-         would mean the count is measuring the plan's own citations"
-    );
-
-    // A plan whose fragment IS cited from outside.
-    let sealed = seed_subject(&pool, &world, "a claim whose source is cited twice").await;
-    let outsider = seed_subject(&pool, &world, "a claim this plan does not touch").await;
-    let shared = seed_fragment(&pool, sealed, "a source two claims cite").await;
-    cite_fragment(&pool, outsider, shared).await;
-    seed_fragment(&pool, sealed, "a second source, cited once").await;
-
-    let preview = seal_preview(&pool, &world, &[sealed]).await;
-    assert_eq!(
-        preview.counts.total, 1,
-        "CALIBRATION: the outsider must be OUTSIDE the frozen set, or the count below is asked \
-         about a plan that contains both claims and there is nothing outside it to share with"
-    );
-    assert_eq!(
-        preview.counts.shared_source_fragments,
-        Some(1),
-        "one of this plan's two fragments is cited from outside it; the count is of FRAGMENTS \
-         that lose their text for outsiders, not of the plan's fragments and not of the outside \
-         claims affected"
+    let subject = seed_subject(&pool, &world, "a claim this plan seals").await;
+    let seal = serde_json::to_value(seal_preview(&pool, &world, &[subject]).await)
+        .expect("serialise the seal preview");
+    assert!(
+        seal["side_effects"]["destroys_derived_rows"].is_array(),
+        "CALIBRATION: this is a seal preview, which names what it destroys: {seal}"
     );
     assert!(
-        preview.side_effects.unrecoverable.is_some(),
-        "the count qualifies the unconditional sentence; it does not replace it"
+        seal["side_effects"].get("unrecoverable").is_none(),
+        "{seal}"
     );
-
-    // A restrict plan blanks no fragment, so the question does not arise.
-    let restrict = restrict_preview(&pool, &world, &[sealed]).await;
-    assert_eq!(
-        restrict.counts.shared_source_fragments, None,
-        "a restrict preview must report absence, not zero: zero would read as 'measured, and \
-         there is no sharing'"
-    );
-    assert!(restrict.side_effects.unrecoverable.is_none());
     assert!(
-        restrict.side_effects.keeps_writer_owned_rows.is_none()
-            && restrict.side_effects.kept_rows.is_none(),
-        "a restrict deletes nothing, so it keeps nothing by exception"
+        seal["counts"].get("shared_source_fragments").is_none(),
+        "{seal}"
+    );
+    let other = seed_subject(&pool, &world, "a claim this plan restricts").await;
+    let restrict = serde_json::to_value(restrict_preview(&pool, &world, &[other]).await)
+        .expect("serialise the restrict preview");
+    assert!(
+        restrict["side_effects"].get("unrecoverable").is_none()
+            && restrict["counts"].get("shared_source_fragments").is_none(),
+        "{restrict}"
     );
 }
 
 /// Create a plan through the ROUTE and return its preview, without applying it.
 ///
-/// The preview is the consent surface, so the assertions above read the field
-/// out of the route's own response. A helper that re-issued the repository's
+/// The preview is the consent surface, so the assertions above read it out of
+/// the route's own response. A helper that re-issued the repository's
 /// query would assert a copy of the statement against itself and would pass
 /// even if nothing ever reached the operator.
 async fn seal_preview(pool: &PgPool, world: &fx::World, seeds: &[Uuid]) -> routes::PlanPreview {

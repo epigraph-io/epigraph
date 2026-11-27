@@ -1,18 +1,11 @@
 //! Regression tests for the write-side semantic novelty gate (backlog
 //! `1bcaed94`, Task 6.4) as wired into `submit_claim` / `memorize`.
 //!
-//! Test-strategy note (documented per the task brief's explicit fallback):
-//! every MCP integration test server in this crate is built with
-//! `McpEmbedder::new(pool, None)` — mock mode, no OpenAI API key (see
-//! `tool_resubmit_tests.rs`, `memorize_persists_labels.rs`,
-//! `submit_claim_labels_test.rs`). `McpEmbedder::generate` unconditionally
-//! errors in that mode, so `novelty_gate::decide` always returns `None` and
-//! the gate never actually fires through `submit_claim`/`memorize` in this
-//! test process — there is no way to exercise a REAL embedding end-to-end
-//! without either a live OpenAI key or refactoring `EpiGraphMcpFull` to take
-//! a trait-object embedder (out of scope for this task; `EpiGraphMcpFull`
-//! is concretely typed over `McpEmbedder`, which hardcodes the OpenAI
-//! endpoint).
+//! Test-strategy note: this file's server is built with
+//! `McpEmbedder::new(pool, None)` and no generator, a keyless embedder whose
+//! `generate` always errors, so `novelty_gate::decide` always answers
+//! `Err(GateSkip::EmbedderUnavailable)` here and the gate never fires through
+//! `submit_claim`/`memorize` in this file.
 //!
 //! So this file proves the two things that ARE testable end-to-end at the
 //! MCP layer without a live embedder:
@@ -49,14 +42,13 @@
 //!     using `epigraph_embeddings::MockProvider` (a real deterministic
 //!     hash-derived embedder, not a stub of the decision logic).
 //!
-//! What is NOT covered anywhere: `submit_claim`/`memorize`'s glue code that
-//! ACTS on a fired decision — the `ReturnExisting` early-return response
-//! shape, the `near-duplicate` label append, and the pending-vector reuse
-//! into `store_embedding` — because exercising that requires a decision to
-//! actually fire through the concrete `EpiGraphMcpFull` server, which only
-//! ever holds a real `McpEmbedder` (hardcoded OpenAI endpoint). That code
-//! is verified by inspection only. See the task report for the full
-//! coverage boundary.
+//! The glue that ACTS on a fired decision IS covered elsewhere, by firing the
+//! gate through `McpEmbedder::with_generator` (a deterministic in-process
+//! provider): the `ReturnExisting` corroboration, its refusals and the
+//! `near-duplicate` insert in `novelty_gate_corroboration_app_role.rs`
+//! (backlogs 4f4c6175, 5578f693), and the status-label bypass with its
+//! controls in `status_claim_novelty_bypass.rs`. This file keeps the
+//! keyless-embedder (gate skipped) paths.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -182,8 +174,9 @@ async fn exact_resubmit_still_dedups_with_novelty_threshold_param_present() {
 
 /// When the embedder cannot produce a vector (mock mode — every test server
 /// in this crate; also the real production degrade-path on an OpenAI
-/// outage), `novelty_gate::decide` returns `None` and submit_claim must
-/// fall back to inserting exactly as it did before this feature existed —
+/// outage), `novelty_gate::decide` answers `Err(GateSkip::EmbedderUnavailable)`
+/// and submit_claim must fall back to inserting exactly as it did before this
+/// feature existed, and report `gate_skipped` (backlog 8482b8fc) —
 /// for genuinely new (non-duplicate) content, at ANY `novelty_threshold`
 /// value, including the nominal "always suppress near-dupes" default. The
 /// gate must never turn an embedder outage into a blocked write.
@@ -205,6 +198,17 @@ async fn distinct_content_inserts_normally_when_embedder_unavailable() {
         .await
         .unwrap_or_else(|e| panic!("submit_claim (threshold={threshold:?}) failed: {e:?}"));
         let claim_id = first_text_claim_id(&result);
+        // The fail-open is VISIBLE (backlog 8482b8fc): the claim was inserted
+        // without a novelty check, and the response says so and why.
+        let body = first_text_json(&result);
+        assert_eq!(
+            body["gate_skipped"]["reason"], "embedder_unavailable",
+            "an embedder outage must be reported, not silent (threshold={threshold:?}): {body}"
+        );
+        assert!(
+            body.get("deduplicated").is_none(),
+            "a skipped gate inserts; it is not a dedup hit: {body}"
+        );
 
         let row_count = claims_with_content_hash_count(&pool, &content).await;
         assert_eq!(
@@ -245,15 +249,77 @@ async fn memorize_distinct_content_inserts_normally_when_embedder_unavailable() 
         visibility: Some("public".to_string()),
         group_id: None,
     };
-    tools::memory::memorize(&server, &viewer, params, None)
+    let result = tools::memory::memorize(&server, &viewer, params, None)
         .await
         .expect("memorize");
+    let body = first_text_json(&result);
+    assert_eq!(
+        body["gate_skipped"]["reason"], "embedder_unavailable",
+        "memorize must report the skipped gate too: {body}"
+    );
 
     let row_count = claims_with_content_hash_count(&pool, &content).await;
     assert_eq!(
         row_count, 1,
         "memorize of distinct content must insert one row"
     );
+}
+
+/// Each `batch_submit_claims` entry carries its own `gate_skipped`, and an
+/// exact resubmit (which skips the gate on purpose, by the content-hash probe)
+/// does NOT: `gate_skipped` reports a failure of the gate, not its absence.
+#[tokio::test]
+async fn batch_entries_report_a_skipped_gate_and_an_exact_resubmit_does_not() {
+    let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
+    drop_unique_constraint(&pool).await;
+    let server = build_test_server(pool.clone(), [0x64u8; 32]).await;
+
+    let content = format!("novelty-gate batch skip {}", Uuid::new_v4());
+    let entry = |evidence: &str| -> epigraph_mcp::types::BatchClaimEntry {
+        serde_json::from_value(serde_json::json!({
+            "content": content,
+            "methodology": "deductive_logic",
+            "evidence_data": evidence,
+            "evidence_type": "logical",
+            "confidence": 0.7,
+            "visibility": "public",
+        }))
+        .expect("batch entry")
+    };
+    let result = tools::batch::batch_submit_claims(
+        &server,
+        &viewer,
+        epigraph_mcp::types::BatchSubmitClaimsParams {
+            claims: vec![entry("ev-a"), entry("ev-b")],
+        },
+        None,
+    )
+    .await
+    .expect("batch_submit_claims");
+    let body = first_text_json(&result);
+    let results = body["results"].as_array().expect("results");
+    assert_eq!(results.len(), 2, "{body}");
+    assert_eq!(
+        results[0]["gate_skipped"]["reason"], "embedder_unavailable",
+        "the first entry ran the gate, which could not embed: {body}"
+    );
+    assert!(
+        results[1].get("gate_skipped").is_none(),
+        "the second entry is an exact resubmit: the gate is skipped by design and \
+         nothing failed: {body}"
+    );
+}
+
+/// The JSON body of a tool result.
+fn first_text_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .expect("result has text content");
+    serde_json::from_str(text).expect("valid json")
 }
 
 /// Pull `claim_id` out of a `submit_claim`/`memorize` `CallToolResult`.

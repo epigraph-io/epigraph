@@ -144,12 +144,18 @@ async fn main() {
     // EdDSA tokens) nor a real EPIGRAPH_JWT_SECRET (HS256, or the accept-only
     // window beside a signing key), and with an unset/dev secret when it is
     // the only key; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. A
-    // malformed signing key refuses boot even under the opt-out. The dev
-    // fallback in AppState::default_jwt_config is unchanged so the suite still
-    // compiles and runs.
-    let allow_insecure = std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    // malformed signing key refuses boot even under the opt-out. This gate runs
+    // in EVERY environment. AppState::default_jwt_config applies the same
+    // predicate, flag parse and message whenever EPIGRAPH_ENV is set to
+    // anything but a known non-production name
+    // (state::jwt_config_from_env_values), so a library embedder in production
+    // cannot reach the dev fallback, while the test suite (EPIGRAPH_ENV unset
+    // or `test`) keeps it.
+    let allow_insecure = epigraph_api::state::allow_insecure_secret(
+        std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
+            .ok()
+            .as_deref(),
+    );
     if let Err(reason) = epigraph_auth::check_kernel_jwt_keys(
         std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR)
             .ok()
@@ -157,12 +163,7 @@ async fn main() {
         std::env::var("EPIGRAPH_JWT_SECRET").ok().as_deref(),
         allow_insecure,
     ) {
-        eprintln!(
-            "FATAL: {reason}. Set {} (64 hex characters, an Ed25519 seed) or a real \
-             EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), or set \
-             EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI.",
-            epigraph_auth::JWT_SIGNING_KEY_VAR
-        );
+        eprintln!("{}", epigraph_api::state::jwt_key_refusal(&reason));
         std::process::exit(1);
     }
 
@@ -518,7 +519,6 @@ async fn main() {
         // removed it again, so `AppState::maintenance_viewer` refuses (the
         // routes that used it answer 501 MOVED) and this pool is the process's
         // only one.
-        let pool = scoped.inner().clone();
         tracing::info!("PostgreSQL connected");
 
         // Plan §0.5 boot probe. Session-scoped `set_config` is the whole
@@ -617,20 +617,6 @@ async fn main() {
             );
         }
 
-        // The pgvector floor (backlog e30316ae): below 0.8.0 every semantic
-        // search fails (SQLSTATE 42602 on `hnsw.iterative_scan`), so refuse to
-        // serve rather than serve a corpus that cannot be searched. The same
-        // check `epigraph-migrate` runs after migrating
-        // (`migrate::check_pgvector_version`); here it also covers a server
-        // started without that deploy step, or after `EPIGRAPH_MIGRATE_ON_BOOT`.
-        match epigraph_api::migrate::check_pgvector_version(&pool).await {
-            Ok(version) => tracing::info!(pgvector = %version, "pgvector version ok"),
-            Err(e) => {
-                eprintln!("ERROR: refusing to serve: {e}");
-                std::process::exit(1);
-            }
-        }
-
         // Operator decision D9: no maintenance pool, no job pool, no job runner
         // and no reaper in this process, and the administrative cascade is
         // never enabled here. Every cascade a request triggers is deferred and
@@ -643,31 +629,28 @@ async fn main() {
             "{}",
             epigraph_db::MAINTENANCE_SURFACE_NOT_SERVED
         );
-        // The TEST-ONLY software-attestation flag (elevation plan EL-3,
-        // EQ-1 (a)) is never served on a database armed for operator binding.
-        // Checked BEFORE OQ-7's refusal below, so on a privileged DSN of an
-        // armed database the flag, not the DSN, is the reason printed.
+        // The database-posture gates, as one library call an embedder makes
+        // too (`epigraph_api::boot::check_db_posture`, whose doc gives the
+        // order and each gate's reason): the pgvector floor (backlog
+        // e30316ae); the TEST-ONLY software-attestation flag (elevation plan
+        // EL-3, EQ-1 (a)) on a database armed for operator binding, checked
+        // before OQ-7 so the flag is the reason printed; OQ-7 (b)'s refusal of
+        // a privileged DSN of an armed database (migration 122; one code path,
+        // every environment, no override; an unarmed database is not
+        // refused); the PR-16 tenancy-trigger assertion; the connection-posture
+        // warnings; and PR-17's staged RLS posture assertion. A refusal exits
+        // 1 with its reason, before anything is spawned or served.
         let allows_software = passkey_config
             .as_ref()
             .is_some_and(epigraph_passkey::PasskeyConfig::allows_software_attestation);
-        if let Err(refusal) = epigraph_api::passkey_boot::check_software_attestation_boot(
+        if let Err(refusal) = epigraph_api::boot::check_db_posture(
             scoped.inner(),
-            allows_software,
+            epigraph_api::boot::DbPostureOptions {
+                unit: "epigraph-api",
+                allows_software_attestation: allows_software,
+            },
         )
         .await
-        {
-            eprintln!("ERROR: {refusal}");
-            std::process::exit(1);
-        }
-        // Operator binding (migration 122): say at boot whether the valve is
-        // open and whether the database is armed, and REFUSE TO START on a
-        // privileged DSN of an armed database (operator ruling OQ-7 (b): on
-        // such a DSN the trigger checks the author column alone and relieves
-        // the cross-human scope). One code path, every environment, no
-        // override; an unarmed database (dev, CI) is not refused.
-        if let Err(refusal) =
-            epigraph_db::operator_binding::check_request_unit_boot(scoped.inner(), "epigraph-api")
-                .await
         {
             eprintln!("ERROR: {refusal}");
             std::process::exit(1);
@@ -710,8 +693,12 @@ async fn main() {
             .with_admin_cascade(false)
             .with_run_tokens(run_tokens_from_env())
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
+            // The browser OAuth flow's legacy redirect fallback, read once
+            // here rather than on every auth-url/exchange request.
+            .with_legacy_redirect_uri(std::env::var("EPIGRAPH_REDIRECT_URI").ok())
             .with_token_exchange_audiences(token_exchange_audiences_from_env())
             .with_oauth_redirect_origins(oauth_redirect_origins_from_env())
+            .with_assertion_v1(assertion_v1_from_env())
             .with_bp_apply(bp_apply_from_env())
             .with_bp_max_concurrent(bp_max_concurrent_from_env())
             .with_guest_reads(guest_reads)
@@ -728,42 +715,9 @@ async fn main() {
             .expect("Failed to load entity_types registry cache");
         tracing::info!("entity_types registry cache loaded");
 
-        // PR-16 boot assertions (plan §8.2 A5). Same placement and the same
-        // reason as the cache load above: `with_db` is sync and cannot SELECT.
-        //
-        // The trigger check REFUSES. After migration 074 there is no DEFAULT
-        // left to catch an undeclared write, so a disabled require-tenancy
-        // trigger is not a degraded mode — it is a corpus acquiring rows whose
-        // tenancy nobody declared, silently, until the NOT NULL backstop
-        // happens to fire.
-        state
-            .assert_tenancy_triggers_armed()
-            .await
-            .expect("refusing to serve: tenancy triggers are not armed");
-
-        // The connection-posture check WARNS. See its doc comment: making it
-        // fatal today would stop this binary booting in CI and in development,
-        // and PR-17 is the PR that repoints DATABASE_URL and can arm it.
-        if let Err(e) = state.warn_on_privileged_connection().await {
-            tracing::warn!(error = %e, "could not read the connection posture");
-        }
-
-        // PR-17's RLS posture assertion. It REFUSES, and it is STAGED on the
-        // connecting role: inert on every environment that has not performed
-        // plan §9.2 week 11d's credential split, fully armed the moment
-        // `current_user` is `epigraph_app`. `epigraph_api::state::rls_verdict`
-        // carries the whole argument, including why keying it on
-        // `relforcerowsecurity` — which is what PR-17's *Acceptance* line asks
-        // for — would brick step 11d, the 077→079 window and the documented
-        // `NO FORCE` rollback all at once.
-        //
-        // Placed AFTER `warn_on_privileged_connection` so a database whose
-        // posture is merely unusual is described in the log before this line
-        // decides whether it is fatal.
-        state
-            .assert_rls_posture()
-            .await
-            .expect("refusing to serve: RLS posture assertion failed");
+        // The PR-16 tenancy-trigger and PR-17 RLS posture assertions ran in
+        // `boot::check_db_posture` above, on the same pool, before any watch
+        // was spawned.
 
         state
     };
@@ -1207,6 +1161,22 @@ fn oauth_redirect_origins_from_env() -> epigraph_api::oauth::redirect::RedirectO
         );
     }
     origins
+}
+
+/// `EPIGRAPH_ASSERTION_V1`, read once at boot: whether a version-1 agent
+/// assertion (bound to no issuer) is still accepted. Unset is `accept`; a
+/// value that is neither `accept` nor `refuse` REFUSES the boot, so a typo
+/// never silently changes which assertions authenticate. Logged when `refuse`.
+#[cfg(feature = "db")]
+fn assertion_v1_from_env() -> epigraph_api::oauth::assertion::AssertionV1Policy {
+    let policy = epigraph_api::oauth::assertion::AssertionV1Policy::from_env()
+        .unwrap_or_else(|e| panic!("refusing to start: {e}"));
+    tracing::info!(
+        policy = policy.as_str(),
+        "version-1 agent assertions (bound to no issuer): {}",
+        policy.as_str()
+    );
+    policy
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a

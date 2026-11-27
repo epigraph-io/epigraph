@@ -183,9 +183,6 @@ const NO_WRITE: &[&str] = &[
     // Migration 165: written only through maintenance definers; the
     // application role holds SELECT only (and row security shows it nothing).
     "group_role_bindings",
-    "harvester_audit_reports",
-    "harvester_enriched_concepts",
-    "harvester_sources",
     // Migration 250: written only by the masses-write trigger definer; the
     // application role holds no privilege at all, SELECT included.
     "mass_function_masses_writes",

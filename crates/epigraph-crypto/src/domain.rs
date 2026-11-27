@@ -131,10 +131,101 @@ pub fn key_kind_declaration_message(kind: &str, public_key: &[u8; 32]) -> Vec<u8
     message
 }
 
+/// The kind tag of an OAuth agent assertion message ([`oauth_assertion_message`]).
+pub const OAUTH_ASSERTION_TAG: &str = "oauth-assertion";
+
+/// The message an agent signs to authenticate to an OAuth token endpoint with
+/// its Ed25519 key (`client_assertion_type=urn:epigraph:ed25519`), version 2:
+///
+/// ```text
+/// b"epigraph-sig-v1:oauth-assertion:" || issuer || b":" || timestamp(8, big-endian) || nonce(16)
+/// ```
+///
+/// `issuer` is the authorization server's published issuer (the `issuer` of
+/// its `/.well-known/oauth-authorization-server` document), byte for byte.
+///
+/// The version-1 assertion signed the bare 24 bytes `timestamp || nonce`, which
+/// name neither the server nor what the signature is for: one assertion was
+/// good at every server that knows the key, and the same 24 bytes signed for
+/// any other purpose were an assertion too (backlog 950696a1). This message is
+/// in the signing domain ([`SIGNING_DOMAIN_V1`]) under a kind of its own, so it
+/// never equals an entity message (whose tag is `claim`, `evidence`, `edge` or
+/// `dataset`), a legacy bare digest (32 bytes) or a version-1 assertion (24
+/// bytes), and it names the one server it is good at. The trailing 24 bytes are
+/// fixed-width, so the message parses unambiguously from its end whatever the
+/// issuer contains.
+#[must_use]
+pub fn oauth_assertion_message(issuer: &str, timestamp: u64, nonce: &[u8; 16]) -> Vec<u8> {
+    let tag = OAUTH_ASSERTION_TAG.as_bytes();
+    let mut message = Vec::with_capacity(
+        SIGNING_DOMAIN_V1.len() + tag.len() + 1 + issuer.len() + 1 + 8 + nonce.len(),
+    );
+    message.extend_from_slice(SIGNING_DOMAIN_V1);
+    message.extend_from_slice(tag);
+    message.push(b':');
+    message.extend_from_slice(issuer.as_bytes());
+    message.push(b':');
+    message.extend_from_slice(&timestamp.to_be_bytes());
+    message.extend_from_slice(nonce);
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{AgentSigner, ContentHasher, SignatureVerifier};
+
+    /// The exact v2 assertion message, byte for byte, for a client written in
+    /// another language (docs/deploy.md shows the same bytes).
+    #[test]
+    fn the_oauth_assertion_message_is_the_documented_byte_string() {
+        let nonce: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let message = oauth_assertion_message("https://epigraph.example", 0x6553_F100, &nonce);
+        let want: &[u8] = b"epigraph-sig-v1:oauth-assertion:https://epigraph.example:\
+            \x00\x00\x00\x00\x65\x53\xf1\x00\
+            \x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
+        assert_eq!(message, want);
+    }
+
+    /// The issuer is in the signed bytes: the same timestamp and nonce for
+    /// another issuer is another message, and a signature over one does not
+    /// verify over the other.
+    #[test]
+    fn an_oauth_assertion_for_one_issuer_is_not_one_for_another() {
+        let s = signer();
+        let nonce = [7u8; 16];
+        let ours = oauth_assertion_message("https://a.example", 1_700_000_000, &nonce);
+        let theirs = oauth_assertion_message("https://b.example", 1_700_000_000, &nonce);
+        assert_ne!(ours, theirs);
+        let sig = s.sign(&theirs);
+        assert!(!SignatureVerifier::verify(&s.public_key(), &ours, &sig).unwrap());
+        assert!(SignatureVerifier::verify(&s.public_key(), &theirs, &sig).unwrap());
+    }
+
+    /// No assertion message is an entity message, a legacy bare digest or a
+    /// version-1 assertion (the bare 24 bytes `timestamp || nonce`).
+    #[test]
+    fn an_oauth_assertion_message_is_no_other_signed_message() {
+        let message = oauth_assertion_message("", 0, &[0u8; 16]);
+        assert!(message.len() > HASH_SIZE, "longer than a bare digest");
+        assert!(message.len() > 24, "longer than a v1 assertion");
+        for kind in [
+            SignedEntity::Claim,
+            SignedEntity::Evidence,
+            SignedEntity::Edge,
+            SignedEntity::Dataset,
+        ] {
+            let entity = signing_message(kind, &[0u8; HASH_SIZE]);
+            let entity_prefix = &entity[..entity.len() - HASH_SIZE];
+            assert!(
+                !message.starts_with(entity_prefix),
+                "the assertion message carries the {kind:?} tag"
+            );
+        }
+    }
 
     fn signer() -> AgentSigner {
         AgentSigner::from_bytes(&[0x42; 32]).expect("signer")

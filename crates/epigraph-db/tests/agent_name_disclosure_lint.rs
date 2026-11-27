@@ -41,11 +41,6 @@ use std::path::{Path, PathBuf};
 /// Functions whose identity read decides disclosure in the statement itself.
 /// Each must name one of [`DISCLOSURE_CALLS`] in its live SQL.
 const GATED: &[(&str, &str)] = &[
-    ("epigraph-db/src/repos/political.rs", "get_claim_genealogy"),
-    (
-        "epigraph-db/src/repos/political.rs",
-        "get_inflation_leaderboard",
-    ),
     ("epigraph-db/src/repos/sources.rs", "agents"),
     ("epigraph-db/src/repos/paper.rs", "author_listing_columns"),
     ("epigraph-db/src/repos/agent.rs", "get_public_profile"),
@@ -161,7 +156,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "epigraph-db/src/repos/agent.rs",
         "get_by_id",
         "whole-`Agent` row fetcher: every route that SERIALIZES the row (agents.rs get_agent, \
-         reputation, political profile / compare, prov export) applies the disclosure; the other \
+         reputation, epistemic profile, prov export) applies the disclosure; the other \
          callers use the row for existence, its key or its id only (spec 7.J)",
     ),
     (
@@ -781,8 +776,10 @@ fn no_name_decision_falls_back_to_null() {
         scanned >= 10,
         "CALIBRATION: the scan saw only {scanned} functions naming display_name"
     );
+    // 8 -> 7 (backlog bd13e0e0): `repos/political.rs` and its name decisions
+    // (`get_claim_genealogy`, `get_inflation_leaderboard`) were deleted.
     assert!(
-        cases >= 8,
+        cases >= 7,
         "CALIBRATION: the scan saw only {cases} name decisions (CASE on `named`)"
     );
     assert!(

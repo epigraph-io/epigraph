@@ -18,7 +18,7 @@
 //! * a claim in any other state is HELD.
 //!
 //! The neighbour test is the one that catches a NEWER re-own run that shared
-//! rows with this one (a fragment, an edge between their claims). Review
+//! rows with this one (an edge between their claims). Review
 //! measured the failure it prevents: two manifests M1, M2 whose runs shared
 //! rows, reversed oldest-first, left those rows on neither their original
 //! owner nor anything the operator chose, and every run printed "invariants:
@@ -32,8 +32,8 @@
 //! them newest-first by header `created_at` (a tie is refused), so the order
 //! is the tool's, not the operator's memory.
 //!
-//! Two consequences, both deliberate. A neighbour with NO record (fragment
-//! provenance added after the run) is not compared. And a claim that shares
+//! Two consequences, both deliberate. A neighbour with NO record (a row
+//! linked after the run) is not compared. And a claim that shares
 //! rows with a claim a newer, unreversed run moved can never be reversed on
 //! its own: undoing M1 while keeping M2 applied is not offered, because the
 //! shared rows have one state and no correct value serves both.
