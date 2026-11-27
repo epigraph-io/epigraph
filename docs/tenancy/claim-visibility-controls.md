@@ -96,19 +96,30 @@ Added to:
   to every compound (thesis, section, paragraph) seed. So:
 
   * the same document ingested privately by two groups is two sets of claims. Before, the
-    second group's ingest resolved every node to the first group's rows (and on the
-    application role failed outright);
-  * a non-public ingest writes its atoms by id and never looks a claim up by its text, so it
-    converges only onto its own group's earlier ingest of the same text;
+    second group's ingest resolved every node to the first group's rows: on the application
+    role it then failed outright, and on a path that bypasses row security it converged onto
+    the first group's rows;
+  * a non-public ingest writes its atoms by id and never looks a claim up by its text outside
+    its own group's non-public rows, so it converges only onto its own group's ingest of the
+    same text;
   * a client recomputing ids locally needs the owning group for a non-public ingest; a row
     whose `properties.id_scope` is `"owner_group"` has an id and `content_hash` that are not
-    functions of its text alone (`verify_claim` reports its digest as not applicable);
+    functions of its text alone. `verify_claim` re-derives such an atom's digest from its body
+    and its current owner: `match` when they agree, `not_applicable` otherwise (a row shared
+    with a team since keeps its first owner's digest, so a body change on it goes undetected);
   * publicizing a scoped claim keeps its scoped id. It is linked to a public twin with the same
     text by cross-source matching (the matcher's embedding neighbourhood), never by id
     convergence; the content-hash blocker does not pair them, because the stored hash is
     scope-derived too;
-  * a group re-ingesting a document it ingested before ids were scope-derived keeps the ids
-    its paper already asserts, claim by claim, and writes no duplicate;
+  * a group re-ingesting a document it ingested before ids were scope-derived keeps the global
+    ids that ingest wrote, claim by claim, and writes no duplicate of them: first the ids the
+    group's own paper row already asserts, then the group's own non-public rows holding one of
+    the document's global ids or stored hashes. The second covers an ingest from before
+    migration 246, whose paper row the migration made public. A node the earlier ingest
+    resolved to a row outside the group's non-public rows (a public row, another group's, or
+    the group's own since publicized) and that the group's paper row does not record is not
+    re-used: finding it would mean a text lookup outside the ingest's scope, so the re-ingest
+    writes the group's own scoped claim for it;
   * workflow ingest still derives global ids; its adopter of the same scheme is backlog
     eb8ea9e5.
 * The operator `ingest-document` CLI, as `--visibility` / `--group-id`, resolved for its acting

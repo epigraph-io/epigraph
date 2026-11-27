@@ -31,10 +31,15 @@
 //!
 //! * The same text ingested by two groups is two claims, one per group. Before
 //!   this, a group's private ingest of a document another group had already
-//!   ingested converged onto (and reported the id of) the other group's row.
-//! * A non-public ingest never resolves a claim by its text: its atoms are
-//!   written by id, so they converge only on the same group's earlier ingest
-//!   of the same text, never on a row outside the group.
+//!   ingested resolved every node to the other group's rows: on the
+//!   application role (row security enforced) the ingest then failed outright,
+//!   and on a path that bypasses row security it converged onto, and reported
+//!   the ids of, the other group's rows.
+//! * A non-public ingest never looks a claim up by its text outside its own
+//!   group: its atoms are written by id, so they converge only on the same
+//!   group's ingest of the same text. The one text lookup it makes is
+//!   confined, in its SQL, to the group's own non-public rows (the last
+//!   bullet).
 //! * A scope-derived id is NOT a function of the text alone. A client must
 //!   know the owning group (returned as the ingest's `owner_group_id`) to
 //!   recompute it, and must recompute nothing for a row whose `properties`
@@ -45,10 +50,24 @@
 //!   text embeds identically), never by id convergence. The matcher's
 //!   content-hash blocker does not pair them, because the stored hash is
 //!   scope-derived too.
+//! * `verify_claim` re-derives a scoped atom's stored hash from its body and
+//!   the row's current owning group: an unchanged row reports `match`. A row
+//!   whose owner moved since it was written (shared with a team) reports
+//!   `not_applicable`, as does one whose body changed, so a body change on a
+//!   shared scoped atom is not detected by the hash check.
 //! * A re-ingest by the same group of a document it ingested before these ids
-//!   existed keeps the global ids recorded for that document: the ingest walk
-//!   reads the ids its in-scope `papers` row already asserts and re-uses them
-//!   claim by claim, so the re-run writes no duplicate.
+//!   existed keeps the global ids that ingest wrote, claim by claim, so the
+//!   re-run writes no duplicate of them. The walk re-uses, in this order, the
+//!   ids the group's in-scope `papers` row already asserts, then the group's
+//!   own non-public rows that hold one of the document's global ids or global
+//!   stored hashes. The second source is what covers an ingest from before the
+//!   `papers` tenancy migration (246): that migration made every existing
+//!   paper row public, so the group's own paper row is new and asserts
+//!   nothing. Not re-used: a node the earlier ingest resolved to a row OUTSIDE
+//!   the group's non-public rows (a public row, another group's row, or the
+//!   group's own row since publicized) that the group's paper row does not
+//!   record. Looking those up by text would leave the ingest's scope, so the
+//!   re-ingest writes the group's own scoped claim for that node.
 //!
 //! The workflow-side adopter of the same scheme is tracked as backlog
 //! eb8ea9e5; workflow ingest still derives global ids.
