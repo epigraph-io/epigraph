@@ -140,6 +140,9 @@ pub mod provenance;
 pub mod provenance_chain;
 pub mod rag;
 pub mod reasoning;
+/// The caller's own recall history (`GET /api/v1/recall-events`).
+#[cfg(feature = "db")]
+pub mod recall_events;
 pub mod revoke_signature;
 #[cfg(feature = "db")]
 pub mod search;
@@ -980,6 +983,13 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/agents/:id/prompt-history/blobs/:hash",
             get(agent_prompt_history::get_prompt_history_blob),
+        )
+        // The caller's OWN recall audit rows (backlog 2cf7b6a1): no agent
+        // parameter; the stamped connection's row policy and the repo's
+        // explicit `agent_id = <principal>` filter both restrict the read.
+        .route(
+            "/api/v1/recall-events",
+            get(recall_events::list_own_recall_events),
         )
         .route(
             "/api/v1/agents/:id/timeline",
