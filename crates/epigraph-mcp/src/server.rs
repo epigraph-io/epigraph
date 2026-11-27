@@ -3296,23 +3296,24 @@ impl EpiGraphMcpFull {
     /// yet / call tool-search first". That is client-side deferral, NOT a
     /// missing server tool — `tools/list` returns every registered tool.
     ///
-    /// `tool_count` is derived from the live tool router (`all_tools_json`),
-    /// so it can never drift from the registered tool set the way a
-    /// hardcoded constant would.
+    /// It states NO tool count (backlog d43cbba7). A count here could only be
+    /// the unfiltered kernel router, while `tools/list` and `list_mcp_tools`
+    /// answer per caller (elevation-gated tools are hidden from callers who
+    /// cannot reach them) and append every federated tool, so no single
+    /// number was true for every client. Clients enumerate instead.
     #[must_use]
     pub fn server_instructions(read_only: bool) -> String {
         let mode = if read_only { "read-only" } else { "full" };
-        let tool_count = Self::all_tools_json().as_array().map_or(0, Vec::len);
         format!(
-            "EpiGraph {mode} MCP server with {tool_count} epistemic tools. \
+            "EpiGraph {mode} MCP server. \
              Many EpiGraph tools are DEFERRED by your client — their names may appear but \
              their schemas are not loaded, so a direct call can fail with \
              \"not loaded yet / call tool-search first\". This is NOT a missing tool. \
              Use your client's tool-search mechanism (e.g. tool_search / ToolSearch) to load \
              a tool's schema by name before calling it (the edge-writers submit_claim, \
              link_hierarchical, supersede_claim and the graph reads get_neighborhood, traverse, \
-             query_claims are all available this way), or call list_mcp_tools to enumerate every \
-             tool with its full schema."
+             query_claims are all available this way), or call list_mcp_tools (or tools/list) to \
+             enumerate every tool you can call, federated tools included, with its full schema."
         )
     }
 }
@@ -3823,8 +3824,8 @@ mod instructions_tests {
     /// gate guidance is present there, so an agent that sees a tool name but no
     /// schema knows how to load it (rather than reporting the tool "missing").
     ///
-    /// No DB: `server_instructions` is a pure function of `read_only` + the
-    /// static tool router, so it exercises the real production code path.
+    /// No DB: `server_instructions` is a pure function of `read_only`, so it
+    /// exercises the real production code path.
     #[test]
     fn instructions_advertise_the_tool_search_gate() {
         let s = EpiGraphMcpFull::server_instructions(false);
@@ -3847,23 +3848,35 @@ mod instructions_tests {
         );
     }
 
-    /// The tool count in the instructions must equal the LIVE registered tool
-    /// count, computed dynamically here (never a hardcoded literal) — that is
-    /// exactly what stops it going stale. If a tool is added/removed and this
-    /// substring stops matching, the production string is wrong.
+    /// The handshake carries NO tool count (backlog d43cbba7). The number it
+    /// used to print was the unfiltered kernel router, while `tools/list` and
+    /// `list_mcp_tools` answer per caller and include federated tools, so no
+    /// single count was true for every client. Clients enumerate instead.
     #[test]
-    fn instructions_tool_count_matches_live_router() {
-        let n = EpiGraphMcpFull::tool_router().list_all().len();
-        let s = EpiGraphMcpFull::server_instructions(false);
-        assert!(
-            s.contains(&format!("{n} epistemic tools")),
-            "instructions must report the live tool count ({n}); got: {s}"
-        );
+    fn instructions_carry_no_tool_count() {
+        for read_only in [false, true] {
+            let s = EpiGraphMcpFull::server_instructions(read_only);
+            assert!(
+                !s.contains("epistemic tools"),
+                "the handshake must not state a tool count; got: {s}"
+            );
+            let words: Vec<&str> = s.split_whitespace().collect();
+            for pair in words.windows(2) {
+                assert!(
+                    !(pair[0].chars().all(|c| c.is_ascii_digit()) && pair[1].starts_with("tool")),
+                    "the handshake must not state a tool count ({} {}); got: {s}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            // The enumeration route the count is replaced by stays.
+            assert!(s.contains("list_mcp_tools"), "{s}");
+        }
     }
 
     /// `read_only` only changes the human-readable mode label, not the
     /// registered tool set (read-only is enforced at call time, not
-    /// registration), so the count is identical across modes.
+    /// registration).
     #[test]
     fn instructions_reflect_mode_label() {
         assert!(EpiGraphMcpFull::server_instructions(true).contains("read-only"));

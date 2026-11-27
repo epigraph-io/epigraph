@@ -43,9 +43,9 @@ use zeroize::Zeroizing;
 #[derive(Parser)]
 #[command(
     name = "epigraph-mcp-full",
-    // No tool count here: the number is derived from the router at runtime
-    // (`EpiGraphMcpFull::all_tools_json`, in the handshake instructions and
-    // the startup log), and a literal in this string goes stale.
+    // No tool count here: a literal in this string goes stale. The startup
+    // log derives the kernel and federated counts at runtime; the handshake
+    // instructions state none (backlog d43cbba7).
     about = "EpiGraph full-framework MCP server"
 )]
 struct Cli {
