@@ -31,7 +31,7 @@ use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
-use epigraph_mcp::tools::ingestion::do_ingest_document;
+use epigraph_mcp::tools::ingestion::{do_ingest_document, do_ingest_document_spine};
 use epigraph_mcp::types::{GetClaimParams, VerifyClaimParams};
 use rmcp::model::{CallToolResult, ContentBlock};
 use sqlx::PgPool;
@@ -365,4 +365,86 @@ async fn a_reingest_of_a_document_ingested_under_global_ids_writes_no_new_claim(
     assert_eq!(scoped, 0, "no scope-derived duplicate: {r}");
     assert_eq!(r["claims_ingested"], 0, "{r}");
     assert_eq!(r["already_ingested"], true, "{r}");
+}
+
+async fn spine(
+    pool: &PgPool,
+    server: &EpiGraphMcpFull,
+    agent: Uuid,
+    doi: &str,
+) -> serde_json::Value {
+    let viewer = Viewer::resolve(pool, agent).await.expect("viewer");
+    let out = json_of(
+        &do_ingest_document_spine(
+            server,
+            &viewer,
+            &extraction(doi),
+            Some(&caller_token(agent)),
+            VisibilityChoice::Private,
+        )
+        .await
+        .map_err(|e| e.message.to_string())
+        .expect("spine ingest"),
+    );
+    assert!(
+        server
+            .background_tasks()
+            .wait_idle(std::time::Duration::from_secs(60))
+            .await,
+        "the spine ingest's background work did not finish"
+    );
+    out
+}
+
+/// The spine walk (structural nodes only) derives the same scoped ids as the
+/// full walk: a private spine then a private full ingest of one document by
+/// one tenant converge node for node, and a second tenant's private spine of
+/// the same document gets its own nodes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_spine_is_scoped_and_converges_with_the_full_ingest(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "scoped-spine-a").await;
+    let (b, group_b) = fixture::seed_agent_with_group(&pool, "scoped-spine-b").await;
+    let doi = "10.9999/scoped-ids-spine";
+
+    let sa = spine(&pool, &server, a, doi).await;
+    assert_eq!(sa["paragraphs_new"], 1, "{sa}");
+    let a_spine = claim_ids_of(&pool, a).await;
+    // thesis, section, paragraph
+    assert_eq!(
+        a_spine.len(),
+        3,
+        "A's spine wrote its structural nodes: {sa}"
+    );
+
+    let fa = ingest(&pool, &server, a, doi, VisibilityChoice::Private).await;
+    assert_eq!(
+        fa["claims_skipped_dedup"], 3,
+        "the full ingest converges on the spine's three nodes: {fa}"
+    );
+    assert_eq!(fa["claims_ingested"], 2, "only the two atoms are new: {fa}");
+    assert_eq!(claim_ids_of(&pool, a).await.len(), 5);
+
+    let sb = spine(&pool, &server, b, doi).await;
+    assert_eq!(
+        sb["paragraphs_new"], 1,
+        "B's private spine writes its own paragraph: {sb}"
+    );
+    assert_eq!(sb["already_ingested"], false, "{sb}");
+    let sb_text = sb.to_string();
+    for id in claim_ids_of(&pool, a).await {
+        assert!(
+            !sb_text.contains(&id.to_string()),
+            "B's spine response names A's claim {id}: {sb}"
+        );
+    }
+    let b_ids = claim_ids_of(&pool, b).await;
+    assert_eq!(b_ids.len(), 3, "B has its own structural nodes");
+    let owners: Vec<Uuid> =
+        sqlx::query_scalar("SELECT DISTINCT owner_group_id FROM claims WHERE agent_id = $1")
+            .bind(b)
+            .fetch_all(&pool)
+            .await
+            .expect("owners");
+    assert_eq!(owners, vec![group_b]);
 }
