@@ -741,9 +741,9 @@ impl MassFunctionRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, masses_json))]
-    pub async fn store(
-        pool: &PgPool,
+    #[instrument(skip(executor, masses_json))]
+    pub async fn store<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         frame_id: Uuid,
         source_agent_id: Option<Uuid>,
@@ -755,7 +755,7 @@ impl MassFunctionRepository {
         evidence_id: Option<Uuid>, // FK to evidence(id), NULL for non-evidence BBAs (issue #197 Phase 3)
     ) -> Result<Uuid, DbError> {
         Self::store_with_perspective(
-            pool,
+            executor,
             claim_id,
             frame_id,
             source_agent_id,

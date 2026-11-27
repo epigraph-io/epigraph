@@ -184,7 +184,10 @@ pub struct MethodRepository;
 
 impl MethodRepository {
     /// Insert a new method, optionally with embedding.
-    pub async fn insert(pool: &PgPool, method: &MethodRecord) -> Result<Uuid, sqlx::Error> {
+    pub async fn insert<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        method: &MethodRecord,
+    ) -> Result<Uuid, sqlx::Error> {
         let embedding_str = method
             .embedding
             .as_ref()
@@ -210,7 +213,7 @@ impl MethodRepository {
             .bind(&method.source_claim_ids)
             .bind(&method.properties)
             .bind(emb_str)
-            .fetch_one(pool)
+            .fetch_one(executor)
             .await?
         } else {
             sqlx::query_scalar(
@@ -231,7 +234,7 @@ impl MethodRepository {
             .bind(&method.typical_conditions)
             .bind(&method.source_claim_ids)
             .bind(&method.properties)
-            .fetch_one(pool)
+            .fetch_one(executor)
             .await?
         };
 
@@ -239,8 +242,8 @@ impl MethodRepository {
     }
 
     /// Link a method to a capability (upsert).
-    pub async fn link_capability(
-        pool: &PgPool,
+    pub async fn link_capability<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         method_id: Uuid,
         capability: &str,
         specificity: i16,
@@ -256,14 +259,14 @@ impl MethodRepository {
         .bind(capability)
         .bind(specificity)
         .bind(evidence_count)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
     /// Semantic search for methods by embedding.
-    pub async fn find_by_embedding(
-        pool: &PgPool,
+    pub async fn find_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         query_embedding: &[f32],
         technique_type: Option<&str>,
         limit: i64,
@@ -286,7 +289,7 @@ impl MethodRepository {
             .bind(&vec_str)
             .bind(tt)
             .bind(limit)
-            .fetch_all(pool)
+            .fetch_all(executor)
             .await?
         } else {
             sqlx::query_as(
@@ -302,7 +305,7 @@ impl MethodRepository {
             )
             .bind(&vec_str)
             .bind(limit)
-            .fetch_all(pool)
+            .fetch_all(executor)
             .await?
         };
 
@@ -354,8 +357,8 @@ impl MethodRepository {
     }
 
     /// Get capabilities for a method.
-    pub async fn get_capabilities(
-        pool: &PgPool,
+    pub async fn get_capabilities<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         method_id: Uuid,
     ) -> Result<Vec<MethodCapability>, sqlx::Error> {
         let rows: Vec<MethodCapabilityRow> = sqlx::query_as(
@@ -364,7 +367,7 @@ impl MethodRepository {
              ORDER BY evidence_count DESC",
         )
         .bind(method_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows

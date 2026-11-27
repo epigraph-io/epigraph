@@ -4726,6 +4726,82 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          (`visible_claim_ids`, viewer-spliced) and answers an unreadable claim as not-a-compound, \
          so the bit is never learned about a claim the caller cannot read.",
     ),
+    // Backlog 30c84267: the experiment-loop and method-catalog handlers run
+    // every statement on the caller's stamped transaction or read, so the repo
+    // functions they reach on it take a generic executor. Every `&PgPool`
+    // caller (the `epigraph-cli` binaries) compiles unchanged.
+    // `ExperimentRepository::create` and `ExperimentResultRepository::create`
+    // (one row: the lint keys on file and name).
+    (
+        "experiment.rs",
+        "create",
+        "INSERT of one `experiments` or `experiment_results` row. Neither relation carries a \
+         `visibility` or `owner_group_id` column (see `get_for_hypothesis`), so a `&Viewer` would \
+         be a parameter the statement could not spend; the API's callers gate on the hypothesis \
+         first. Widened so `routes/experiment_loop.rs` writes the row with its edge on ONE \
+         stamped transaction. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    // `ExperimentRepository::get` and `ExperimentResultRepository::get`.
+    (
+        "experiment.rs",
+        "get",
+        "READ of one `experiments` or `experiment_results` row by id; the FROM is that table \
+         alone and it joins nothing, and neither carries tenancy columns or row security. \
+         `routes/experiment_loop.rs` reads it after `require_experiment_hypothesis` has read the \
+         hypothesis through the viewer and tied the result to the experiment. SCOPE: executor \
+         only; the SQL is unchanged.",
+    ),
+    (
+        "experiment.rs",
+        "add_measurements",
+        "UPDATE of one `experiment_results` row by id (appends measurements). The relation \
+         carries no `visibility` or `owner_group_id` column and no row security; \
+         `routes/experiment_loop.rs::add_measurements` runs it after the hypothesis write gate, \
+         on the caller's stamped transaction. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "method.rs",
+        "insert",
+        "INSERT of one `methods` row. `methods` is global reference data with no tenancy columns \
+         and no row security (see `method.rs::get`), so there is no predicate for a viewer to \
+         add. Widened so `routes/experiments.rs::add_method` writes the method and its capability \
+         links on ONE stamped transaction. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "method.rs",
+        "link_capability",
+        "UPSERT of one `method_capabilities` row. The relation has no tenancy columns and no row \
+         security, like `methods` (see `get_methods_for_capability`). Widened so \
+         `routes/experiments.rs::add_method` links capabilities on the transaction that wrote \
+         the method. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "method.rs",
+        "find_by_embedding",
+        "READ of `methods` ranked by vector similarity; the FROM is `methods` and a one-row \
+         query-vector CTE, nothing else. `methods` has no tenancy columns and no row security \
+         (see `method.rs::get`). Widened so `routes/experiments.rs::find_methods` reads on the \
+         caller's stamped connection. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "method.rs",
+        "get_capabilities",
+        "READ of `method_capabilities` by `method_id`; the FROM is that table alone. It has no \
+         tenancy columns and no row security (see `get_methods_for_capability`). Widened so \
+         `routes/experiments.rs::find_methods` reads it on the connection that found the methods. \
+         SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "mass_function.rs",
+        "store",
+        "The `perspective_id = NULL` wrapper over `store_with_perspective` (same INSERT, same \
+         write-side control: `mass_functions` takes its claim's tenancy and `WITH CHECK` admits \
+         only a writer of that group). Widened so \
+         `routes/experiment_loop.rs::analyze_result` stores its error-derived BBA on the \
+         caller's stamped transaction, where that check sees the caller's writable set; on the \
+         unstamped application pool it refused every group-owned hypothesis. SCOPE: executor \
+         only; the SQL is unchanged.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has
