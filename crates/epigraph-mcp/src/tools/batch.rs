@@ -240,6 +240,10 @@ pub async fn system_stats(
         .map_err(internal_error)?;
         stats["edges_signed"] = serde_json::json!(edge_signing.signed);
         stats["edges_unsigned"] = serde_json::json!(edge_signing.unsigned);
+        // The unsigned-claim metric (backlog 953d5707), the claims' twin of
+        // the edge one: readable claims with and without a signature.
+        stats["claims_signed"] = serde_json::json!(counts.signed_claims.unwrap_or(0));
+        stats["claims_unsigned"] = serde_json::json!(counts.unsigned_claims.unwrap_or(0));
     }
     read.commit().await.map_err(internal_error)?;
 

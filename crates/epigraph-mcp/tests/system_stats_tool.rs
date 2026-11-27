@@ -130,6 +130,8 @@ async fn detailed_mode_adds_the_extra_counts_beside_the_same_mode_report(pool: P
             "belief_modes",
             "challenges",
             "claims",
+            "claims_signed",
+            "claims_unsigned",
             "edges",
             "edges_signed",
             "edges_unsigned",
