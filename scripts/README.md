@@ -25,12 +25,15 @@ naming this file.
 
 A script that opens a database connection has no built-in DSN: it connects on
 `--database-url`, else `MAINTENANCE_DATABASE_URL`, else `DATABASE_URL`, and
-refuses to start with none of them (`scripts/maintenance_dsn.py`). Three
+refuses to start with none of them (`scripts/maintenance_dsn.py`). Four
 scripts differ:
 
 - `subcluster_outliers.py` is read-only and deliberately stays off the
   maintenance login: `--database-url` or `DATABASE_URL` only. Give it a
   read-only login; nothing enforces that.
+- `screen_public_claims.py` is read-only (its session is set read-only) and
+  takes `--database-url` only (required; not read from the environment). Give
+  it a read-only login.
 - `lib/tiered_enrichment.py --claim-id` takes `--database-url` only (not from
   the environment), so a privileged `DATABASE_URL` exported for another job is
   never used for it.
@@ -39,6 +42,31 @@ scripts differ:
   `DATABASE_ADMIN_URL`, and exits at startup unless both sides are set. Which jobs to schedule, and with what
 role and cadence, is in `docs/deploy.md`, "Step 10 — Schedule the maintenance
 jobs" (the theme pipeline is there too).
+
+## screen_public_claims.py
+
+Screens every public, current claim for text that should not be readable
+without a login, before guest reads are turned on: long verbatim text (content
+over 300 characters, or a quoted span of more than 40 words), internal
+identifiers (full UUIDs, internal host names and private addresses,
+home-directory and `*-private/` paths, operator-listed markers and private
+group names) and personal data (e-mail addresses, phone numbers, street
+addresses). It writes one JSON line per flagged claim (`{"claim_id",
+"reasons"}`), optionally the flagged ids in the format `epigraph-operator
+restrict-claims --claims-file` reads, and per-reason counts on stderr. It never
+prints a claim's text, a matched term or the DSN.
+
+The private group names and markers come from files the operator supplies (one
+per line, `#` comments); none is built in, because that list is itself private.
+
+```bash
+python3 scripts/screen_public_claims.py --database-url "$READONLY_DSN" \
+    --private-groups groups.txt --private-markers markers.txt \
+    --out hits.jsonl --claims-file-out restrict-candidates.txt
+```
+
+Review the hits, make the ones that should not be public private with
+`restrict-claims`, and only then turn guest reads on.
 
 ## audit_claims_content_hash_agent.py
 
