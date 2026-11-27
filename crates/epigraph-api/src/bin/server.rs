@@ -699,6 +699,9 @@ async fn main() {
             .with_admin_cascade(false)
             .with_run_tokens(run_tokens_from_env())
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
+            // The browser OAuth flow's legacy redirect fallback, read once
+            // here rather than on every auth-url/exchange request.
+            .with_legacy_redirect_uri(std::env::var("EPIGRAPH_REDIRECT_URI").ok())
             .with_token_exchange_audiences(token_exchange_audiences_from_env())
             .with_oauth_redirect_origins(oauth_redirect_origins_from_env())
             .with_bp_apply(bp_apply_from_env())

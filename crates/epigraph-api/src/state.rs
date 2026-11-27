@@ -329,6 +329,14 @@ pub struct AppState {
     /// boot.
     #[cfg(feature = "db")]
     pub run_token_models: crate::oauth::run_token::RunTokenModels,
+    /// The legacy redirect-URI fallback of the browser OAuth flow
+    /// (`crate::oauth::device`), used when neither the caller nor the
+    /// provider's config names a redirect URI. `None` in every constructor,
+    /// which leaves the `http://127.0.0.1:1` placeholder; `bin/server.rs`
+    /// reads `EPIGRAPH_REDIRECT_URI` once at boot and sets it, so no request
+    /// reads the environment.
+    #[cfg(feature = "db")]
+    pub legacy_redirect_uri: Option<String>,
     /// The federation extensions the RFC 8693 token-exchange grant may mint
     /// for (`crate::oauth::token_exchange`). EMPTY in every constructor, which
     /// refuses every exchange; `bin/server.rs` sets it from
@@ -1471,6 +1479,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
+            #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
@@ -1588,6 +1598,15 @@ impl AppState {
         models: crate::oauth::run_token::RunTokenModels,
     ) -> Self {
         self.run_token_models = models;
+        self
+    }
+
+    /// Set the browser OAuth flow's legacy redirect-URI fallback; see
+    /// [`Self::legacy_redirect_uri`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_legacy_redirect_uri(mut self, uri: Option<String>) -> Self {
+        self.legacy_redirect_uri = uri;
         self
     }
 
@@ -2091,6 +2110,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
+            #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
@@ -2177,6 +2198,8 @@ impl AppState {
             run_tokens: epigraph_db::RunTokens::Off,
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
+            #[cfg(feature = "db")]
+            legacy_redirect_uri: None,
             #[cfg(feature = "db")]
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
