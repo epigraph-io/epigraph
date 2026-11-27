@@ -21,6 +21,13 @@
 //!   blank reason, a human as the agent, a second un-revoked row for the same
 //!   key, another agent's role attachment, an edit other than the revoke, a
 //!   DELETE and a TRUNCATE are each refused.
+//! * `each_guard_arm_refuses_on_its_own`: every `AGS02` arm the guard's
+//!   header promises, each probed with an input only that arm can refuse and
+//!   asserted on that arm's own message: a back-dated `valid_from`, a supplied
+//!   `granted_by`, a supplied `created_at`, a row inserted already revoked, a
+//!   role node as the agent, a rewrite of a revoked row (and no audit row for
+//!   it), a revoke stamped at another time than now(), and a revoke that also
+//!   changes another column (sent as the superuser, past the column grant).
 //! * `the_356_undo_returns_the_catalog_below_356`: `docs/runbooks/356-undo.sql`
 //!   leaves the `public` catalog exactly as it was below 356, and a second run
 //!   changes nothing.
@@ -46,6 +53,11 @@
 //!   calibration read in `the_app_role_holds_no_privilege_on_agent_scopes`).
 //! * the guard's role-attachment arm removed: fails
 //!   `the_record_refuses_what_the_model_forbids`.
+//! * each further guard arm removed alone (the revoke-is-final arm, the
+//!   back-dating arm, the supplied-provenance arm, its `created_at` half
+//!   alone, the born-revoked arm, `'role'` dropped from the human/role list,
+//!   the `revoked_at <> now()` disjunct, the "nothing else changed" tuple
+//!   comparison): each fails `each_guard_arm_refuses_on_its_own`.
 //!
 //! Before 356 every test here fails on the missing relation or function; the
 //! mutations above are what show each assertion is not vacuous.
@@ -543,6 +555,250 @@ async fn the_record_refuses_what_the_model_forbids(pool: PgPool) {
     .await
     .expect("count");
     assert_eq!(live, 2, "the two admitted grants stand");
+}
+
+/// Assert a refusal is the guard's (55000, `AGS02`) and names the arm under
+/// test, so an earlier arm or another constraint cannot satisfy it.
+fn assert_guard_arm(r: (String, String), arm: &str, what: &str) {
+    let (code, msg) = r;
+    assert_eq!(code, "55000", "{what}: {msg}");
+    assert!(msg.starts_with("AGS02:"), "{what}: {msg}");
+    assert!(
+        msg.contains(arm),
+        "{what}: expected the arm `{arm}`, got: {msg}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_guard_arm_refuses_on_its_own(pool: PgPool) {
+    let (agent, _) = agent_and_group(&pool, "scope-arms").await;
+    // A fresh group per probe, so no probe can be refused (or, under a
+    // mutation, admitted) because of another probe's row on the same key.
+    let mut groups = Vec::new();
+    for i in 0..8 {
+        groups.push(agent_and_group(&pool, &format!("scope-arms-g{i}")).await.1);
+    }
+    let direct_insert = |group: Uuid, extra_cols: &str, extra_vals: &str| {
+        format!(
+            "INSERT INTO public.agent_scopes (agent_id, group_id, action_class, reason{extra_cols}) \
+             VALUES ('{agent}', '{group}', 'claim_write', 'direct'{extra_vals})"
+        )
+    };
+
+    // INSERT: a back-dated window, through the verb.
+    assert_guard_arm(
+        sqlstate(
+            scalar_as::<Uuid>(
+                &pool,
+                MAINT,
+                format!(
+                    "SELECT public.epigraph_agent_scope_grant('{agent}', '{}', 'claim_write', \
+                     'r', now() - interval '1 year', NULL, NULL)",
+                    groups[0]
+                ),
+            )
+            .await,
+            "back-dated grant",
+        ),
+        "never back-dated",
+        "back-dated grant",
+    );
+    // CALIBRATION: the arm allows a minute of clock slack, so it is the
+    // back-dating it refuses, not any explicit valid_from.
+    scalar_as::<Uuid>(
+        &pool,
+        MAINT,
+        format!(
+            "SELECT public.epigraph_agent_scope_grant('{agent}', '{}', 'claim_write', \
+             'r', now() - interval '30 seconds', NULL, NULL)",
+            groups[1]
+        ),
+    )
+    .await
+    .expect("CALIBRATION: a valid_from inside the slack is admitted");
+
+    // INSERT: provenance the writer supplied, each column on its own.
+    assert_guard_arm(
+        sqlstate(
+            exec_as(
+                &pool,
+                MAINT,
+                direct_insert(groups[2], ", granted_by", ", 'someone_else'"),
+            )
+            .await,
+            "forged granted_by",
+        ),
+        "recorded by the database",
+        "forged granted_by",
+    );
+    assert_guard_arm(
+        sqlstate(
+            exec_as(
+                &pool,
+                MAINT,
+                direct_insert(groups[3], ", created_at", ", now() - interval '1 day'"),
+            )
+            .await,
+            "forged created_at",
+        ),
+        "recorded by the database",
+        "forged created_at",
+    );
+
+    // INSERT: a row born revoked (fully shaped, so the revoke-shape CHECK
+    // would admit it and only the guard refuses).
+    assert_guard_arm(
+        sqlstate(
+            exec_as(
+                &pool,
+                MAINT,
+                direct_insert(
+                    groups[4],
+                    ", revoked_at, revoked_by, revoke_reason",
+                    ", now(), session_user, 'born revoked'",
+                ),
+            )
+            .await,
+            "insert revoked",
+        ),
+        "recorded live",
+        "insert revoked",
+    );
+    // CALIBRATION: the same direct INSERT without the forbidden columns is
+    // admitted, so each refusal above is its own arm's.
+    exec_as(&pool, MAINT, direct_insert(groups[5], "", ""))
+        .await
+        .expect("CALIBRATION: a plain direct maintenance INSERT is admitted");
+
+    // INSERT: a role node (agent_type 'role', not a registered human).
+    let role_node = Uuid::new_v4();
+    let pk: Vec<u8> = role_node
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'role')")
+        .bind(role_node)
+        .bind(&pk)
+        .execute(&pool)
+        .await
+        .expect("seed a role node");
+    assert_guard_arm(
+        sqlstate(
+            scalar_as::<Uuid>(
+                &pool,
+                MAINT,
+                format!(
+                    "SELECT public.epigraph_agent_scope_grant('{role_node}', '{}', \
+                     'claim_write', 'r', NULL, NULL, NULL)",
+                    groups[0]
+                ),
+            )
+            .await,
+            "role node",
+        ),
+        "human or a role node",
+        "role node",
+    );
+
+    // UPDATE: a revoked row is final. Revoked by the verb, then rewritten in
+    // a later statement (its own now()) with a revoke that would otherwise
+    // pass every other check and the column grant.
+    let revoked = grant_as_maintenance(&pool, agent, groups[6], "edge_write").await;
+    assert!(
+        scalar_as::<bool>(
+            &pool,
+            MAINT,
+            format!("SELECT public.epigraph_agent_scope_revoke('{revoked}', 'first')"),
+        )
+        .await
+        .expect("revoke"),
+        "the first revoke revokes"
+    );
+    let before = events_total(&pool).await;
+    assert_guard_arm(
+        sqlstate(
+            exec_as(
+                &pool,
+                MAINT,
+                format!(
+                    "UPDATE public.agent_scopes SET revoked_at = now(), \
+                     revoked_by = session_user, revoke_reason = 'rewritten' \
+                     WHERE id = '{revoked}'"
+                ),
+            )
+            .await,
+            "rewrite a revoke",
+        ),
+        "a revoke is final",
+        "rewrite a revoke",
+    );
+    assert_eq!(events_total(&pool).await, before, "no unaudited rewrite");
+    let reason: String =
+        sqlx::query_scalar("SELECT revoke_reason FROM public.agent_scopes WHERE id = $1")
+            .bind(revoked)
+            .fetch_one(&pool)
+            .await
+            .expect("the revoked row");
+    assert_eq!(reason, "first", "the first revoke stands");
+
+    // UPDATE: a revoke stamped at any time but now().
+    let live = grant_as_maintenance(&pool, agent, groups[7], "edge_write").await;
+    assert_guard_arm(
+        sqlstate(
+            exec_as(
+                &pool,
+                MAINT,
+                format!(
+                    "UPDATE public.agent_scopes SET revoked_at = now() - interval '1 day', \
+                     revoked_by = session_user, revoke_reason = 'back-dated' \
+                     WHERE id = '{live}'"
+                ),
+            )
+            .await,
+            "back-dated revoke",
+        ),
+        "only ever revoked",
+        "back-dated revoke",
+    );
+
+    // UPDATE: a well-formed revoke that also changes another column. The
+    // maintenance column grant would stop this first, so it is sent on the
+    // harness (superuser) pool, which the column grant and row security do
+    // not stop: only the guard's "nothing else changed" arm does.
+    assert_guard_arm(
+        sqlstate(
+            sqlx::query(&format!(
+                "UPDATE public.agent_scopes SET action_class = 'group_admin', \
+                 revoked_at = now(), revoked_by = session_user, revoke_reason = 'r' \
+                 WHERE id = '{live}'"
+            ))
+            .execute(&pool)
+            .await,
+            "revoke and widen",
+        ),
+        "only ever revoked",
+        "revoke and widen",
+    );
+
+    let (class, still_live): (String, bool) = sqlx::query_as(
+        "SELECT action_class, revoked_at IS NULL FROM public.agent_scopes WHERE id = $1",
+    )
+    .bind(live)
+    .fetch_one(&pool)
+    .await
+    .expect("the live row");
+    assert_eq!((class.as_str(), still_live), ("edge_write", true));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM public.agent_scopes")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        rows, 4,
+        "only the calibration grant, the plain INSERT and the two edge_write grants exist"
+    );
 }
 
 fn up_to(max: i64) -> sqlx::migrate::Migrator {
