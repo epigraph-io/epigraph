@@ -547,10 +547,15 @@ jobs:
   # feature-gated check) must be `skipped`, and passes; a job the plan asked
   # for must be `success`; nothing passes unless `plan` succeeded. The rule is
   # test-shard.py `gate`, unit-tested in `plan`.
+  #
+  # commit-message-lint is in `needs` too (backlog ad3001f9), so an
+  # error-class finding in a commit message (E1-E6) blocks the merge through
+  # this required check; its warnings (W2, W3) still do not. It runs on every
+  # event and the plan has no run flag for it, so the gate requires `success`.
   test:
     name: test
     if: ${{ !cancelled() }}
-    needs: [plan, test-shard, test-extra, lint-features]
+    needs: [plan, test-shard, test-extra, lint-features, commit-message-lint]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
