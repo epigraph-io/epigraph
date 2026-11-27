@@ -24,14 +24,15 @@
   (`crates/epigraph-ingest/src/common/ids.rs`).
 - A workflow root's id comes from `WORKFLOW_NAMESPACE` and
   `canonical_name:generation`.
-- `CLAUDE.md` "Embedding policy" has two rules that exist because steps are
-  shared claim nodes:
+- `CLAUDE.md` "Embedding policy" has two rules that apply to workflow steps
+  because they are claims:
   - the workflow-ingest write paths in "Write paths" (`ingest_workflow`,
     `store_workflow`, `improve_workflow_hierarchy`, `add_step`) embed the
-    claims the executor inserted or revived;
+    claims the executor inserted or revived, as every claim write path must;
   - in "Cleanup paths", `retire_for_workflow_deprecation` and
     `revive_workflow_deprecation_retired` mark a retirement and undo it when
-    a later generation or `add_step` reuses the claim.
+    a later generation or `add_step` reuses the claim. Reuse is possible
+    because the same step text is the same claim node.
 
 ## Decision
 
