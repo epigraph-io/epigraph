@@ -943,9 +943,13 @@ token, and name the team: `group_id = <team>`.
 * `GET /api/v1/claims/:id` shows the filer's agent as `authored_by.agent` and
   the operator as `authored_by.human`.
 
-**What the one membership does and does not confine.**
-* A team the operator does not write is refused `OPL02` for claims, even if
-  the agent holds a writer row there.
+**What the one membership does and does not confine.** The `OPL01` and
+`OPL02` refusals here hold only once the binding is ARMED ("Arming, and the
+valve" above). Before that, only row security and the route's team-write
+check apply.
+* Armed, a team the operator does not write is refused `OPL02` for claims,
+  even if the agent holds a writer row there. Unarmed, that writer row admits
+  the claim.
 * The filer's CLAIMS can go into EVERY team its operator writes, not only the
   team of step 4. Migration 206's `epigraph_writable_teams` gives an agent
   each team its live human writes (owner decision D-V3), and 149 makes the
@@ -967,9 +971,11 @@ at most five minutes, and the kernel refuses that token.
 call, while its SIGNER agent is allowlisted (149). So never run a listener as
 the filer's agent; the filer writes over kernel REST.
 
-**Incident response.** Revoke the allowance AND the client (above). After the
-revoke, the filer's next write is refused `OPL01`. That happens at once, with
-the same token and its membership still in place.
+**Incident response.** Revoke the allowance AND the client (above). Once the
+binding is armed, the filer's next write after the revoke is refused `OPL01`.
+That happens at once, with the same token and its membership still in place.
+Unarmed, revoking the allowance does not stop writes its membership admits,
+so revoke the client and remove the membership (`group-member remove`) too.
 
 ### Delegated run tokens (dormant until armed)
 
