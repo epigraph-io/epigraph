@@ -9,9 +9,9 @@
 //!   (`?hypothesis_id=<uuid>&required_capabilities=a,b`; see `MethodGapQuery`)
 //! - `POST /api/v1/experiments/design`        - Design an experiment protocol
 //!
-//! # Tenancy: 3 of this file's 11 raw-pool sites are converted
+//! # Tenancy: every raw-pool site in this file is converted
 //!
-//! Conversion shard 6. `method_gap_analysis` is the only wholly-convertible
+//! Conversion shard 6. `method_gap_analysis` was the only wholly-convertible
 //! handler here, and all three of its sites now run on one viewer-stamped
 //! connection from [`AppState::read_as`], reborrowed per statement inside its
 //! two nested loops. Holding one connection for a whole handler makes the work
@@ -24,14 +24,15 @@
 //! ONE does not: `get_methods_for_capability` reads `methods` JOINed to
 //! `method_capabilities`, neither of which carries RLS at migration head 92.
 //!
-//! NOT converted, blocker named per handler:
-//! * `hypothesize`, `add_method`, `design_experiment` — WRITE, so
-//!   [`AppState::read_as`] is the wrong instrument; owner is
-//!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
-//! * `find_methods` — the HANDLER: it holds no `Viewer`, so there is nothing to
-//!   stamp a connection with.
+//! `hypothesize` and `design_experiment` read on [`AppState::read_as`] (HTTP
+//! public-only reads, 2026-11-05). Backlog 30c84267 took the last four:
+//! `add_method` writes its method and capability links on ONE
+//! [`AppState::write_as`] transaction, and `find_methods` reads on the
+//! caller's stamped connection. Both now take a `ViewerExtractor`; neither
+//! table carries tenancy, so the stamp filters nothing there.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
+//! [`AppState::write_as`]: crate::AppState::write_as
 
 #[cfg(feature = "db")]
 use axum::{
@@ -359,13 +360,37 @@ pub async fn hypothesize(
     Ok(Json(response))
 }
 
+/// Map a failed write on `add_method`'s stamped transaction (nothing commits
+/// in either arm). A write-authority refusal (the role-holder check, an
+/// elevated viewer) is the coded `403` `From<DbError>` answers, with the
+/// database's text kept in the log: the stamp runs those checks with the real
+/// principal, where the unstamped pool never did. Anything else is the `500`
+/// naming `what`. `methods` and `method_capabilities` carry no row security,
+/// so there is no `42501` group refusal to name here.
+#[cfg(feature = "db")]
+fn method_write_failed(what: &str, e: epigraph_db::DbError) -> ApiError {
+    if e.is_write_authority_refusal() {
+        return ApiError::from(e);
+    }
+    ApiError::InternalError {
+        message: format!("{what}: {e}"),
+    }
+}
+
 /// POST /api/v1/methods - Add a characterization/synthesis method.
 ///
 /// Writes the shared method catalog (a method row and its capability links),
 /// so it takes `claims:write` like the experiment writes (operator ruling
 /// R-52a), checked before the embedder is called or anything is written.
+///
+/// The method and its capability links are ONE transaction stamped with the
+/// caller's viewer (backlog 30c84267): `methods` and `method_capabilities`
+/// carry no tenancy, so the stamp filters nothing here, but the links commit
+/// with their method or not at all, and `capabilities_linked` counts links
+/// that were written rather than links that were attempted.
 #[cfg(feature = "db")]
 pub async fn add_method(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<AddMethodRequest>,
@@ -410,27 +435,25 @@ pub async fn add_method(
         embedding,
     };
 
-    let method_id = epigraph_db::MethodRepository::insert(&state.db_pool, &method)
+    let mut tx = state.write_as(&viewer, "add_method").await?;
+    let method_id = epigraph_db::MethodRepository::insert(&mut *tx, &method)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to insert method: {e}"),
-        })?;
+        .map_err(|e| method_write_failed("Failed to insert method", e.into()))?;
 
-    // Link capabilities
+    // Link capabilities. A failed link aborts the transaction, so it is an
+    // error for the whole write rather than a link skipped and still counted.
     let mut caps_linked = 0;
     if let Some(ref capabilities) = request.capabilities {
         for cap in capabilities {
-            let _ = epigraph_db::MethodRepository::link_capability(
-                &state.db_pool,
-                method_id,
-                cap,
-                1,
-                0,
-            )
-            .await;
+            epigraph_db::MethodRepository::link_capability(&mut *tx, method_id, cap, 1, 0)
+                .await
+                .map_err(|e| method_write_failed("Failed to link capability", e.into()))?;
             caps_linked += 1;
         }
     }
+    tx.commit()
+        .await
+        .map_err(|e| method_write_failed("Failed to commit method", e))?;
 
     Ok(Json(serde_json::json!({
         "method_id": method_id,
@@ -441,8 +464,13 @@ pub async fn add_method(
 }
 
 /// GET /api/v1/methods/search - Search methods by embedding similarity.
+///
+/// Reads `methods` and `method_capabilities`, global reference data with no
+/// tenancy, on the caller's viewer-stamped connection (backlog 30c84267), as
+/// `methods.rs::get_method` and `method_gap_analysis` read the same tables.
 #[cfg(feature = "db")]
 pub async fn find_methods(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<FindMethodsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -460,8 +488,9 @@ pub async fn find_methods(
                 message: format!("Failed to embed query: {e}"),
             })?;
 
+    let mut read = crate::routes::open_scoped_read(&state, &viewer, "find_methods").await?;
     let methods = epigraph_db::MethodRepository::find_by_embedding(
-        &state.db_pool,
+        &mut *read,
         &query_vec,
         params.technique_type.as_deref(),
         limit,
@@ -473,9 +502,11 @@ pub async fn find_methods(
 
     let mut results = Vec::new();
     for m in &methods {
-        let capabilities = epigraph_db::MethodRepository::get_capabilities(&state.db_pool, m.id)
+        let capabilities = epigraph_db::MethodRepository::get_capabilities(&mut *read, m.id)
             .await
-            .unwrap_or_default();
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to read method capabilities: {e}"),
+            })?;
 
         results.push(serde_json::json!({
             "id": m.id,
@@ -492,6 +523,7 @@ pub async fn find_methods(
             })).collect::<Vec<_>>(),
         }));
     }
+    crate::routes::finish_scoped_read(read, "find_methods").await?;
 
     Ok(Json(serde_json::json!({
         "methods": results,
