@@ -408,7 +408,8 @@ async fn publicize_never_widens_a_declared_edge(pool: PgPool) {
     );
     let d = last_event(&pool, "claim.publicized").await;
     assert_eq!(d["declared_edges_held"], 2, "{d}");
-    assert_eq!(d["migration"], 284, "{d}");
+    // 354 re-stated the body (its harvester arms gone) and bumped the stamp.
+    assert_eq!(d["migration"], 354, "{d}");
 }
 
 // ===========================================================================
@@ -483,7 +484,8 @@ async fn share_never_re_owns_a_declared_edge_to_the_team(pool: PgPool) {
     assert!(!reads(&pool, &[team], foreign).await);
     let d = last_event(&pool, "claim.shared_with_team").await;
     assert_eq!(d["declared_evidence_edges_held"], 2, "{d}");
-    assert_eq!(d["migration"], 284, "{d}");
+    // 354 re-stated the body (its harvester arms gone) and bumped the stamp.
+    assert_eq!(d["migration"], 354, "{d}");
 }
 
 // ===========================================================================

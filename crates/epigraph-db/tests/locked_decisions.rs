@@ -207,6 +207,8 @@
 //!   pins the membership. AMENDED by migration 240 (backlog 88cf603b):
 //!   `behavioral_executions` is covered (its workflow's tenancy, FORCEd row
 //!   security) and its row goes, so the pin is 11. `webhook_subscriptions` is still not in it.
+//!   AMENDED by migration 354 (backlog a6e3dba2): the five harvester tables,
+//!   173's two neighbours included, are dropped; no registry row moves.
 //! * **No route moved between the `public` and `protected` chains.** The four
 //!   webhook routes were already on `protected` in both `create_router`
 //!   variants and still are; `public_router_allowlist.rs` is untouched.
@@ -1946,20 +1948,20 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // tenancy at INSERT, and `workflows_behavioral_executions_inherit_tenancy`
     // and `claims_behavioral_executions_inherit_tenancy` re-stamp the runs when
     // their workflow row or flat workflow claim changes its pair.
+    // 22 SINCE MIGRATION 354 (backlog a6e3dba2), and the decision is the drop:
+    // the five harvester tables go, and with them arm (c)'s provenance
+    // inheritor (17 -> 16 claim-derived tables), 089's and 173's two.
     assert_eq!(
         rows.len(),
-        26,
-        "expected 26 tenancy triggers — 3 named (claims_require_tenancy, \
+        22,
+        "expected 22 tenancy triggers — 3 named (claims_require_tenancy, \
          edges_tenancy, claims_propagate_tenancy) plus one \
-         *_inherit_tenancy per claim-derived tier-A table (17), plus migration \
-         089's harvester_claim_provenance_fragment_inherit_tenancy, plus \
-         migration 173's harvester_audit_reports_inherit_tenancy and \
-         harvester_fragments_audit_reports_inherit_tenancy, plus migration 240's \
+         *_inherit_tenancy per claim-derived tier-A table (16), plus migration 240's \
          behavioral_executions_inherit_tenancy, \
          workflows_behavioral_executions_inherit_tenancy and \
          claims_behavioral_executions_inherit_tenancy. Found {}: \
          {rows:?}. A different count means migration 070 arm (c)'s table set \
-         moved or an 089, 173 or 240 trigger is gone, which is a D1 change and \
+         moved or a 240 trigger is gone, which is a D1 change and \
          needs a decision, not a silent edit.",
         rows.len()
     );
@@ -1989,17 +1991,18 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // `atlas_map_{epochs,runs,levels}_require_tenancy`, the same root body.
     // 30 -> 31 (backlog 34864fb5): migration 246's `papers_require_tenancy`,
     // the same root body on the paper registry.
-    // 31 -> 32 (backlog f214b84e): migration 347's
-    // `harvester_enriched_concepts_require_tenancy`, the same root body.
+    // 31 -> 32 (backlog f214b84e): migration 347's enriched-concepts root,
+    // the same root body.
+    // 32 -> 28 (backlog a6e3dba2): migration 354 drops the harvester tables and
+    // their four require triggers (provenance, fragments, sources, concepts).
     assert_eq!(
         pr16.len(),
-        32,
-        "expected 32: after migration 074, 24 *_require_tenancy (claims, the 17 \
-         claim-derived tables, the 6 parentless roots) plus claims_block_widening; \
-         migration 173 adds harvester_sources_require_tenancy, migration 183 \
-         workflows_require_tenancy, migration 210 the three atlas_map_* triggers, \
-         migration 246 papers_require_tenancy and migration 347 \
-         harvester_enriched_concepts_require_tenancy. Found {}: {pr16:?}",
+        28,
+        "expected 28: after migration 354, 22 *_require_tenancy (claims, the 16 \
+         claim-derived tables, the 5 parentless roots) plus claims_block_widening; \
+         migration 183 adds workflows_require_tenancy, migration 210 the three \
+         atlas_map_* triggers and migration 246 papers_require_tenancy. Found {}: \
+         {pr16:?}",
         pr16.len()
     );
     let pr16_disabled: Vec<&(String, String)> = pr16.iter().filter(|(_, e)| e != "O").collect();
@@ -2325,7 +2328,6 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
     "claim_frames",
-    "harvester_claim_provenance",
     "challenges",
     "reasoning_traces",
     "experiment_triples",
@@ -2334,7 +2336,6 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "claim_cluster_membership",
     "claim_neighborhood_membership",
     "claim_signature_revocations",
-    "harvester_fragments",
     "frames",
     "contexts",
     "perspectives",
@@ -2369,8 +2370,6 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "agent_succession",
     "group_role_bindings",
     "role_agents",
-    "harvester_sources",
-    "harvester_audit_reports",
     // Workflow rows (183, ruling R-74): tier-A since that migration, which
     // FORCEs the table itself; reached through `tier_a` in the test below.
     "workflows",
@@ -2390,10 +2389,8 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     // Paper rows (246, backlog 34864fb5): tier-A since that migration, which
     // FORCEs the table itself; reached through `tier_a` in the test below.
     "papers",
-    // Enriched harvester concepts (347, backlog f214b84e): tier-A since that
-    // migration, which FORCEs the table itself; reached through `tier_a` in
-    // the test below.
-    "harvester_enriched_concepts",
+    // The five harvester tables (062's two, 173's two, 347's one) left this
+    // set with migration 354, which drops them.
     // Team-group invitations (263, backlog triage T75): FORCEd by the
     // migration that creates them; no tenancy columns, so reached through
     // GROUP_INVITATION_TABLES below.
@@ -2559,15 +2556,16 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     // both columns (its workflow's pair) and FORCEs it.
     // 32 -> 33 (backlog 34864fb5): migration 246 gives `papers` both tenancy
     // columns and FORCEs it.
-    // 33 -> 34 (backlog f214b84e): migration 347 gives
-    // `harvester_enriched_concepts` both tenancy columns and FORCEs it.
+    // 33 -> 34 (backlog f214b84e): migration 347 gives the enriched harvester
+    // concepts both tenancy columns and FORCEs them.
+    // 34 -> 29 (backlog a6e3dba2): migration 354 drops the five harvester
+    // tables (062's two, 173's two, 347's one).
     assert_eq!(
         tier_a.len(),
-        34,
-        "migration 062's tier_a is 25 relations, 173 adds the two harvester neighbours, \
-         183 adds workflows, 210 the three atlas_map_* tables, 240 \
-         behavioral_executions, 246 papers and 347 harvester_enriched_concepts; \
-         got {}: {tier_a:?}",
+        29,
+        "migration 062's tier_a is 25 relations less the two harvester tables 354 \
+         drops, 183 adds workflows, 210 the three atlas_map_* tables, 240 \
+         behavioral_executions and 246 papers; got {}: {tier_a:?}",
         tier_a.len()
     );
 

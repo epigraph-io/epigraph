@@ -46,8 +46,8 @@
 //! * [`TENANTED_TABLES`] names six tables: the claim graph's core (`claims`,
 //!   `edges`, `evidence`, `mass_functions`, `reasoning_traces`,
 //!   `claim_versions`). It is NOT the full tier-A list from migration 062
-//!   (`triples`, `frames`, `perspectives`, `recall_events`, the `harvester_*`
-//!   tables, and others carry tenancy too); a viewer-less pool read of one of
+//!   (`triples`, `frames`, `perspectives`, `recall_events`, and others carry
+//!   tenancy too); a viewer-less pool read of one of
 //!   those is not selected here.
 //! * Only a pool named in the PARAMETER list is seen. A repo struct that holds
 //!   its pool in a field and reads it through `&self` / `self.pool` is outside

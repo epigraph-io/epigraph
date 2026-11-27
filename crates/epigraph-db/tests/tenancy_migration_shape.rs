@@ -112,9 +112,10 @@ const DROPPED_INDEX_MIGRATIONS: &[&str] = &[
     "342_drop_idx_evidence_public_by_signer.sql",
 ];
 
-/// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
-/// re-derived the list from the migration file would pass whatever the migration
-/// did.
+/// The tier-A set migration 062 widens, less the two harvester tables
+/// migration 354 drops with their ledger rows. Duplicated here on purpose: a
+/// test that re-derived the list from the migration file would pass whatever
+/// the migration did.
 const TIER_A: &[&str] = &[
     "claims",
     "evidence",
@@ -126,7 +127,6 @@ const TIER_A: &[&str] = &[
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
     "claim_frames",
-    "harvester_claim_provenance",
     "challenges",
     "reasoning_traces",
     "experiment_triples",
@@ -135,20 +135,12 @@ const TIER_A: &[&str] = &[
     "claim_cluster_membership",
     "claim_neighborhood_membership",
     "claim_signature_revocations",
-    "harvester_fragments",
     "frames",
     "contexts",
     "perspectives",
     "communities",
     "recall_events",
 ];
-
-/// The two harvester neighbours of `harvester_fragments` that migration 173
-/// (ruling R-66) brings under tenancy. NOT part of 062's array and not seeded
-/// into `tenancy_backfill_progress`: 173 derives their owners itself (from
-/// their fragments) and refuses when it cannot, so the backfill has nothing to
-/// do for them.
-const HARVESTER_173: &[&str] = &["harvester_audit_reports", "harvester_sources"];
 
 const WORLD_GROUP: &str = "00000000-0000-0000-0000-000000000000";
 const SEED_GROUP: &str = "00000000-0000-0000-0000-00000000dead";
@@ -910,8 +902,38 @@ async fn no_public_hnsw_index_exists(pool: PgPool) {
 /// index migrations cannot be replayed this way — `CREATE INDEX CONCURRENTLY`
 /// raises 25001 inside a transaction — which is exactly why their idempotence is
 /// asserted as `indisvalid` above instead.)
-#[sqlx::test(migrations = "../../migrations")]
+///
+/// Replayed on a database migrated through 353: 062's tier-A array names the
+/// two harvester tables migration 354 drops, so the file no longer re-applies
+/// at head (its `ALTER TABLE` finds no relation). Through 353 every table it
+/// names exists, which is the database a 062 abort would have left.
+#[sqlx::test(migrations = false)]
 async fn migration_062_is_idempotent(pool: PgPool) {
+    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+    let through_353 = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 353)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        through_353
+            .run(&mut *conn)
+            .await
+            .expect("migrate through 353");
+        sqlx::query("RESET ALL")
+            .execute(&mut *conn)
+            .await
+            .expect("RESET ALL");
+    }
     let mut tx = pool.begin().await.expect("begin");
     sqlx::raw_sql(MIGRATION_062)
         .execute(&mut *tx)
@@ -1212,9 +1234,9 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
         assert_eq!(seeded, 1, "tenancy_backfill_progress is missing {table}");
     }
 
-    // Exactly 25 tables, no more, plus 173's two: a table that gained the
-    // columns without being registered in the tier-A array (or derived by the
-    // migration that gave them, as 173 does) is a table nothing backfills.
+    // Exactly the tier-A tables, no more: a table that gained the columns
+    // without being registered in the tier-A array (or derived by the
+    // migration that gave them) is a table nothing backfills.
     let widened: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM information_schema.columns \
           WHERE table_schema = 'public' AND column_name = 'owner_group_id' \
@@ -1230,7 +1252,6 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
     // backfilled by that migration itself, so it has no ledger row.
     let expected: BTreeSet<&str> = TIER_A
         .iter()
-        .chain(HARVESTER_173)
         .copied()
         .chain(std::iter::once("workflows"))
         // Plus migration 210's Atlas team-map tables (backlog 77f4bf09): new
@@ -1244,10 +1265,6 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
         // 062's shape (`papers_tenancy.rs::paper_rows_carry_the_tier_a_shape`),
         // backfilled by that migration itself, so it has no ledger row.
         .chain(std::iter::once("papers"))
-        // Plus migration 347's `harvester_enriched_concepts` (backlog
-        // f214b84e): a parentless root, backfilled by that migration itself
-        // to what every reader saw, so it has no ledger row.
-        .chain(std::iter::once("harvester_enriched_concepts"))
         .collect();
     assert_eq!(
         observed, expected,

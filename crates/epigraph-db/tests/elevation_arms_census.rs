@@ -45,8 +45,6 @@ const ARMED_READ_WRITE: &[(&str, &str)] = &[
     ("frames", "T-OWN"),
     ("group_memberships", "T-GROUP"),
     ("groups", "T-GROUP"),
-    ("harvester_claim_provenance", "T-DER"),
-    ("harvester_fragments", "T-OWN"),
     ("mass_functions", "T-DER"),
     ("perspectives", "T-OWN"),
     ("reasoning_traces", "T-DER"),
@@ -185,21 +183,6 @@ const EXCLUDED: &[(&str, &str)] = &[
     (
         "rls_canary",
         "bypass-only boot canary: the application reads and writes no row",
-    ),
-    (
-        "harvester_sources",
-        "harvester pipeline (173): the application writes no row (118 section 6), and no \
-         elevated read arm is added, so an elevated session reads only what its tenancy admits",
-    ),
-    (
-        "harvester_audit_reports",
-        "harvester pipeline (173): the application writes no row (118 section 6), and no \
-         elevated read arm is added, so an elevated session reads only what its tenancy admits",
-    ),
-    (
-        "harvester_enriched_concepts",
-        "harvester pipeline (347): the application writes no row (118 section 6), and no \
-         elevated read arm is added, so an elevated session reads only what its tenancy admits",
     ),
     (
         "atlas_map_epochs",
@@ -714,8 +697,14 @@ async fn disarm(conn: &mut sqlx::PgConnection) {
 /// Verified to fail with one block's `set_config(..., true)` made `false`
 /// (the timeout outlives the file), and with a `DROP POLICY IF EXISTS`
 /// removed (the rerun fails: the policy already exists).
-#[sqlx::test(migrations = "../../migrations")]
+///
+/// Run through 353: migration 354 drops two of the tables 126 arms (the
+/// harvester provenance and fragment tables), so 126 no longer re-applies
+/// over a database at head; through 353 it still names only tables that
+/// exist.
+#[sqlx::test(migrations = false)]
 async fn rerunning_126_changes_nothing(pool: PgPool) {
+    migrate(&pool, &up_to(353)).await;
     let before = observed(&pool).await;
     let mut conn = pool.acquire().await.expect("a connection");
     let timeout_before = lock_timeout(&mut conn).await;
@@ -729,8 +718,19 @@ async fn rerunning_126_changes_nothing(pool: PgPool) {
         "the per-table lock timeout must not outlive the file on the migrator's connection"
     );
     assert_eq!(observed(&mut *conn).await, before, "a rerun is a no-op");
+    let (harvester, rest): (
+        BTreeMap<String, BTreeSet<Pol>>,
+        BTreeMap<String, BTreeSet<Pol>>,
+    ) = before
+        .into_iter()
+        .partition(|(t, _)| t.starts_with("harvester_"));
     assert_eq!(
-        before,
+        harvester.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["harvester_claim_provenance", "harvester_fragments"],
+        "CALIBRATION: through 353, 126's two harvester tables are armed"
+    );
+    assert_eq!(
+        rest,
         expected()
             .into_iter()
             .filter(|(_, s)| !s.is_empty())
@@ -750,8 +750,11 @@ async fn rerunning_126_changes_nothing(pool: PgPool) {
 /// block and the ones before it back to the previous COMMIT roll back with
 /// the failure, so `claim_versions` is not armed) and with one block's lock
 /// timeout removed (the file waits for the lock: the 20 s bound fires).
-#[sqlx::test(migrations = "../../migrations")]
+///
+/// Run through 353, for the reason [`rerunning_126_changes_nothing`] gives.
+#[sqlx::test(migrations = false)]
 async fn a_held_lock_fails_one_table_and_a_rerun_resumes(pool: PgPool) {
+    migrate(&pool, &up_to(353)).await;
     let full = observed(&pool).await;
     let url = {
         let db: String = sqlx::query_scalar("SELECT current_database()")

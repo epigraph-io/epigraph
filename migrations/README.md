@@ -5265,6 +5265,36 @@ restart.
   `docs/runbooks/353-undo.sql`. **Deploy order:** either; a binary without the change runs on 353
   unchanged, and the change's binary runs without 353 (only the concurrent-write backstop is
   missing).
+- **354**: `drop_harvester_tables` (backlog a6e3dba2, with 04881ce9's shape and 81809c45's
+  test; the drop option of c7752f07). The five harvester tables (`harvester_sources`,
+  `harvester_fragments`, `harvester_audit_reports`, `harvester_claim_provenance`,
+  `harvester_enriched_concepts`, all created by 001) have no writer. 354 checks the md5 of the
+  four shared bodies it re-states (55000, nothing changed, over any other body), refuses unless
+  the session reads every row (42501: the tables are FORCEd) and unless all five are EMPTY
+  (55000 naming the table; it never drops a row), then re-states `epigraph_propagate_tenancy`
+  (`harvester_claim_provenance` leaves `derived[]`, 218's fragment statement goes),
+  `epigraph_record_elevated_access` (the fragment arm goes), `epigraph_publicize_claims` and
+  `epigraph_share_claims_with_team` (242's fragment hold, 215's source rule and the audit keys
+  `harvester_fragments_held` / `harvester_sources_moved` / `harvester_sources_held` go; their
+  audit rows now stamp `'migration', 354`), drops the five tables in ONE `DROP TABLE` without
+  CASCADE (their 15 triggers, 18 policies, indexes and grants go with them), drops the three
+  trigger-only functions (`epigraph_inherit_fragment_tenancy_stmt`,
+  `epigraph_audit_report_inherit_tenancy`, `epigraph_fragment_audit_reports_follow`) and deletes
+  the two harvester rows of `tenancy_backfill_progress`. Pinned by
+  `epigraph-db/tests/no_harvester_references.rs` (no body, policy, trigger, relation or
+  `crates/*/src` file names a harvester table at head; the refusals; the undo round trip).
+  **Measure first** (expected: five zeros, and the four md5s in the file's precondition):
+  `SELECT 'harvester_sources', count(*) FROM harvester_sources UNION ALL SELECT
+  'harvester_fragments', count(*) FROM harvester_fragments UNION ALL SELECT
+  'harvester_audit_reports', count(*) FROM harvester_audit_reports UNION ALL SELECT
+  'harvester_claim_provenance', count(*) FROM harvester_claim_provenance UNION ALL SELECT
+  'harvester_enriched_concepts', count(*) FROM harvester_enriched_concepts;` on the migration
+  DSN. **Deploy order:** the binaries carrying this change FIRST (they run on either side of
+  354), then 354; an older binary on a 354 database boots, but its operator CLI acts refuse and a
+  seal fails (relation does not exist). Undo: `docs/runbooks/354-undo.sql` (the five tables
+  EMPTY at their 353 shape, the three functions, the four bodies byte for byte; md5-guarded,
+  idempotent). After 354 the earlier undo runbooks that name a harvester table (001's restore,
+  070, 074, 079, 126, 215, 218, 219, 242, 246, 258, 284, 347) fail until 354 is undone first.
 
 ## `-- no-transaction` migrations
 
@@ -5374,6 +5404,16 @@ material.
   survives and is the only record of what the dropped rows declared;
   `docs/runbooks/084-undo.sql` is honest about what that does and does not
   recover.
+
+- **`harvester_sources`**, **`harvester_fragments`**, **`harvester_audit_reports`**,
+  **`harvester_claim_provenance`**, **`harvester_enriched_concepts`** — DROPPED by migration
+  **354** (backlog a6e3dba2). Created by 001 for the reflective harvester, whose in-repo crate
+  and proto were removed; no writer remained. 354 refuses over a non-empty table, so no row was
+  dropped with them, and it removed every function body, trigger and policy that named them.
+  Listed here so a later `DROP TABLE harvester_*` is recognised as a duplicate, and so the earlier
+  migrations that create or extend them (001, 062–079, 089, 110–127, 166, 168, 173, 215, 218,
+  219, 240, 242, 246, 258, 284, 347) read as history. `docs/runbooks/354-undo.sql` recreates them
+  empty.
 
 - **`embedding_shares`**, **`re_encryption_keys`** — created by
   `epigraph-enterprise/migrations/001_initial_schema.sql`, never created by any

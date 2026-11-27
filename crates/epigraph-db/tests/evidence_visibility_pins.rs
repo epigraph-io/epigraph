@@ -328,7 +328,8 @@ async fn unpinned_rows_keep_the_070_072_semantics(pool: PgPool) {
 }
 
 /// The `derived text[]` literal the operator CLI parses is still present and
-/// names the same seventeen tables in the same order, and both bodies consult
+/// names the same tables in the same order (seventeen until migration 354
+/// dropped the harvester provenance table, sixteen since), and both bodies consult
 /// the pin table (what `hide::guard_status` reads).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_bodies_keep_the_derived_literal_and_name_the_pin_table(pool: PgPool) {
@@ -344,13 +345,13 @@ async fn the_bodies_keep_the_derived_literal_and_name_the_pin_table(pool: PgPool
     let literal = "derived text[] := ARRAY[
           'triples','entity_mentions','claim_versions','mass_functions',
           'ds_combined_beliefs','ds_bayesian_divergence','claim_frames',
-          'harvester_claim_provenance','evidence',
+          'evidence',
           'challenges','reasoning_traces','experiment_triples',
           'experiment_entity_mentions','claim_clusters','claim_cluster_membership',
           'claim_neighborhood_membership','claim_signature_revocations'];";
     assert!(
         prop.contains(literal),
-        "072's derived[] literal must survive 110 byte for byte"
+        "072's derived[] literal must survive 110 byte for byte (less 354's harvester entry)"
     );
     assert!(prop.contains("evidence_visibility_pins"));
     assert!(inherit.contains("evidence_visibility_pins"));

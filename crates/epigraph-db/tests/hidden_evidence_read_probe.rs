@@ -66,8 +66,7 @@
 //! MEASURED as known surfaces in
 //! [`the_surfaces_outside_the_content_reads_are_measured`]: the claim's own
 //! text and an edge touching the hidden row stay readable to a non-member.
-//! NOT covered here: `harvester_fragments.content_text`,
-//! `mass_functions.evidence_type`, a BYPASSRLS or superuser connection with a
+//! NOT covered here: `mass_functions.evidence_type`, a BYPASSRLS or superuser connection with a
 //! bypass viewer, and anything emitted before a row was hidden. Hiding is
 //! forward-only.
 
