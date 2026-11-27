@@ -38,12 +38,10 @@
 use epigraph_core::{AgentId, Claim, ClaimId, TruthValue};
 #[allow(deprecated)]
 use epigraph_engine::BayesianUpdater;
-use epigraph_engine::{
-    ConcurrentOrchestrator, EngineError, PropagationAuditRecord, PropagationOrchestrator,
-};
+use epigraph_engine::{EngineError, PropagationAuditRecord, PropagationOrchestrator};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -892,11 +890,13 @@ fn test_propagation_visited_set_prevents_reprocessing() {
 
 #[test]
 fn test_concurrent_propagations_dont_corrupt_state() {
-    let concurrent_orch = ConcurrentOrchestrator::new();
+    // The live orchestrator shared across threads the way a caller would share
+    // it: behind `Arc<RwLock<_>>`. This also pins that it stays `Send + Sync`.
+    let concurrent_orch = Arc::new(RwLock::new(PropagationOrchestrator::new()));
 
     // Setup: Create independent branches from a single root
     {
-        let mut orch = concurrent_orch.inner.write().unwrap();
+        let mut orch = concurrent_orch.write().unwrap();
 
         // Create root claim
         let root = create_test_claim(0.5);
@@ -929,14 +929,14 @@ fn test_concurrent_propagations_dont_corrupt_state() {
     let update_counter = Arc::new(AtomicU64::new(0));
 
     for thread_idx in 0..5 {
-        let orch_clone = concurrent_orch.clone_arc();
+        let orch_clone = Arc::clone(&concurrent_orch);
         let counter_clone = Arc::clone(&update_counter);
 
         let handle = thread::spawn(move || {
             // Small sleep to ensure threads interleave
             thread::sleep(Duration::from_millis(thread_idx * 10));
 
-            let mut orch = orch_clone.inner.write().unwrap();
+            let mut orch = orch_clone.write().unwrap();
 
             // Get the first claim and update it
             if let Some((&claim_id, _)) = orch.claims().iter().next() {
@@ -958,7 +958,7 @@ fn test_concurrent_propagations_dont_corrupt_state() {
     }
 
     // Verify state integrity
-    let orch = concurrent_orch.inner.read().unwrap();
+    let orch = concurrent_orch.read().unwrap();
 
     // All claims should have valid truth values
     for claim in orch.claims().values() {

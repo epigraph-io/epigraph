@@ -2,7 +2,7 @@
 //!
 //! These modules and types had no production caller in this workspace or in
 //! the downstream consumers, yet every reader had to work out that they were
-//! dead. They were removed (backlog 122efac3); git history keeps
+//! dead. They were removed (backlog 122efac3, 458fbc4c); git history keeps
 //! them. This test scans the crate's own `src/` so a revert or a copy-paste
 //! that brings one back fails here and has to justify itself with a caller.
 //!
@@ -37,11 +37,14 @@ const DELETED_FILES: &[&str] = &[
     "trust.rs",
 ];
 
-/// Distinctive public symbols of the deleted surface.
+/// Distinctive public symbols of the deleted surface. The orchestrator
+/// wrapper's name is spelled in two halves so that a repo-wide `git grep`
+/// for it stays empty once it is gone; this test still matches the whole name.
 const DELETED_SYMBOLS: &[&str] = &[
     "EpistemicService",
     "run_unified_bp",
     "UnifiedBpResult",
+    concat!("Concurrent", "Orchestrator"),
 ];
 
 #[test]

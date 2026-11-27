@@ -272,25 +272,6 @@ impl PropagationOrchestrator {
     }
 }
 
-/// Thread-safe wrapper for concurrent testing
-struct ConcurrentOrchestrator {
-    inner: Arc<RwLock<PropagationOrchestrator>>,
-}
-
-impl ConcurrentOrchestrator {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(PropagationOrchestrator::new())),
-        }
-    }
-
-    fn clone_arc(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -691,11 +672,11 @@ fn test_concurrent_propagations_thread_safety() {
 
     use std::thread;
 
-    let orchestrator = ConcurrentOrchestrator::new();
+    let orchestrator = Arc::new(RwLock::new(PropagationOrchestrator::new()));
 
     // Setup: Create a star topology (center with multiple independent branches)
     {
-        let mut orch = orchestrator.inner.write().unwrap();
+        let mut orch = orchestrator.write().unwrap();
 
         // Center claim
         let center = create_test_claim(0.5);
@@ -719,9 +700,9 @@ fn test_concurrent_propagations_thread_safety() {
     let mut handles = vec![];
 
     for _ in 0..5 {
-        let orch_clone = orchestrator.clone_arc();
+        let orch_clone = Arc::clone(&orchestrator);
         let handle = thread::spawn(move || {
-            let mut orch = orch_clone.inner.write().unwrap();
+            let mut orch = orch_clone.write().unwrap();
             // Get the first claim (center) and update it
             if let Some((&claim_id, _)) = orch.claims.iter().next() {
                 let _ = orch
@@ -737,7 +718,7 @@ fn test_concurrent_propagations_thread_safety() {
     }
 
     // Verify the orchestrator is still in a consistent state
-    let orch = orchestrator.inner.read().unwrap();
+    let orch = orchestrator.read().unwrap();
 
     // All claims should have valid truth values
     for claim in orch.claims.values() {

@@ -101,8 +101,8 @@ pub use interval_bp::{
 };
 pub use promotion::{evaluate_promotion, PromotionFailure, PromotionInput, PromotionResult};
 pub use propagation::{
-    ClaimDependency, ConcurrentOrchestrator, DatabasePropagator, PropagationAuditRecord,
-    PropagationConfig, PropagationOrchestrator, PropagationResult,
+    ClaimDependency, DatabasePropagator, PropagationAuditRecord, PropagationConfig,
+    PropagationOrchestrator, PropagationResult,
 };
 pub use reasoning::{
     Contradiction, IndirectChallenge, ReasoningClaim, ReasoningEdge, ReasoningEngine,
