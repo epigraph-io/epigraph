@@ -149,6 +149,32 @@ Full spec: `docs/conventions/backlog-retirement.md`.
   and post-fix the returned `Claim` (see `list_by_labels` and `get_by_id`
   for the pattern).
 
+## Belief values: f64, reproducible per platform only
+
+`TruthValue` (`crates/epigraph-core/src/truth.rs`) and every Dempster-Shafer
+mass, belief and plausibility are `f64` (backlog `de039f69`, `3f6bc8bb`).
+
+- **Bit-identical on one platform.** Every fold combines its inputs in a fixed
+  order: `epigraph_ds::combination::combine_multiple` sorts them by
+  `canonical_mass_cmp` before folding, and CDST belief propagation iterates in
+  canonical order, never a `HashMap`'s (backlog `15582602`). The same inputs on
+  the same CPU architecture and build give the same bits. A fold that iterates
+  a `HashMap`, or relies on the database's unspecified row order, is a bug.
+- **Not bit-identical across platforms.** The platform's math library (`ln`,
+  `exp`, `powf`) and the compiler's code generation may differ in the last
+  bits between CPU architectures (x86_64 and aarch64, say).
+- **Compare with a tolerance.** In tests, deploy deltas and replays,
+  compare a belief with an absolute tolerance (e.g. `1e-9`), not `==`. An exact
+  comparison is right only inside one run (a determinism test) or for a value
+  stored and read back rather than recomputed.
+- **Never hash or sign a computed belief.** No content hash or signature may
+  cover a value a verifier would have to recompute, because another platform
+  recomputes other bits. Where a float already sits in a signed payload it is
+  an input as written, and verification reads the stored bytes: a signed
+  submission's `truth_value`, or a matcher edge's `score` / `features` in its
+  `properties`, which the edge attestation digests from the row as stored
+  (`crates/epigraph-db/src/repos/edge_signature.rs`).
+
 ## Status claims bypass the novelty gate
 
 MCP `submit_claim` / `memorize` / `batch_submit_claims` run a write-side

@@ -105,6 +105,31 @@ PINS: tuple[Pin, ...] = (
         needle="Over HTTP the WHOLE label mutation needs that ownership, whatever the labels",
         incident="#374",
     ),
+    # --- CLAUDE.md, "Belief values" (and the TruthValue doc pointing at it) -
+    Pin(
+        id="belief-compare-with-tolerance",
+        file="CLAUDE.md",
+        section_start="## Belief values: f64, reproducible per platform only",
+        section_end="## Status claims bypass the novelty gate",
+        needle="compare a belief with an absolute tolerance (e.g. `1e-9`)",
+        incident="de039f69",
+    ),
+    Pin(
+        id="belief-never-hashed-or-signed",
+        file="CLAUDE.md",
+        section_start="## Belief values: f64, reproducible per platform only",
+        section_end="## Status claims bypass the novelty gate",
+        needle="**Never hash or sign a computed belief.**",
+        incident="de039f69",
+    ),
+    Pin(
+        id="truth-value-doc-points-at-belief-convention",
+        file="crates/epigraph-core/src/truth.rs",
+        section_start="/// A truth value bounded to [0.0, 1.0]",
+        section_end="pub struct TruthValue(f64);",
+        needle='`CLAUDE.md`, "Belief values: f64, reproducible per platform only"',
+        incident="de039f69",
+    ),
     # --- CLAUDE.md, "Test database" ----------------------------------------
     Pin(
         id="test-db-fresh-and-migrated-from-empty",

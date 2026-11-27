@@ -42,7 +42,7 @@ class ConventionPinsCanFail(unittest.TestCase):
                 mutated = delete_needle(original, pin.needle)
                 # A needle that matched nothing would make the mutation a no-op
                 # and this test vacuous.
-                self.assertNotEqual(mutated, normalize(original), f"{pin.id}: deletion changed nothing")
+                self.assertTrue(mutated != normalize(original), f"{pin.id}: deletion changed nothing")
                 self.assertIsNotNone(check(pin, mutated), f"{pin.id} passed with its needle deleted")
 
     def test_every_pin_fails_with_its_needle_outside_its_section(self):
