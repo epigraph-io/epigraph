@@ -856,9 +856,10 @@ async fn check_token_acts_as(
             "--as-agent {agent}: GET /api/v1/agents/me answered {status}"
         ));
     }
-    let body: serde_json::Value = resp.json().await.map_err(|e| {
-        format!("--as-agent {agent}: GET /api/v1/agents/me answered no JSON: {e}")
-    })?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("--as-agent {agent}: GET /api/v1/agents/me answered no JSON: {e}"))?;
     let token_agent = body
         .get("agent_id")
         .and_then(serde_json::Value::as_str)
@@ -2345,12 +2346,20 @@ mod tests {
             server
         };
 
-        let s = answer(200, serde_json::json!({"agent_id": agent, "display_name": "a"})).await;
+        let s = answer(
+            200,
+            serde_json::json!({"agent_id": agent, "display_name": "a"}),
+        )
+        .await;
         check_token_acts_as(&http, &s.uri(), "tok", agent)
             .await
             .expect("the token's own agent passes");
 
-        let s = answer(200, serde_json::json!({"agent_id": other, "display_name": "b"})).await;
+        let s = answer(
+            200,
+            serde_json::json!({"agent_id": other, "display_name": "b"}),
+        )
+        .await;
         let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
             .await
             .unwrap_err();

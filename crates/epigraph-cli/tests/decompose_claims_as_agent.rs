@@ -886,7 +886,12 @@ async fn a_write_run_refuses_an_as_agent_its_token_does_not_act_as(pool: PgPool)
             ("DECOMPOSE_FIXTURE_PATH", s(&fixture)),
         ],
     );
-    assert_ne!(r.code, Some(0), "a mismatched --as-agent ran:\n{}", r.stderr);
+    assert_ne!(
+        r.code,
+        Some(0),
+        "a mismatched --as-agent ran:\n{}",
+        r.stderr
+    );
     assert!(
         r.stderr.contains(&format!("--as-agent {acting}"))
             && r.stderr.contains(&format!("acts as agent {token_agent}")),
