@@ -50,7 +50,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ("oauth/redirect.rs", "from_env", "settings pattern"),
     ("oauth/run_token.rs", "from_env", "settings pattern"),
     ("oauth/token_exchange.rs", "from_env", "settings pattern"),
-    // Lands with the agent-assertion PR (AssertionV1Policy::from_env).
+    // AssertionV1Policy::from_env.
     ("oauth/assertion.rs", "from_env", "settings pattern"),
     // The migrate-on-boot settings, read by the binary and epigraph-migrate.
     ("migrate.rs", "migration_dsn_from_env", "settings pattern"),
@@ -108,9 +108,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "unconstrained_analysis",
         "TODO e8e14178",
     ),
-    // TODO(25763513): the legacy EPIGRAPH_REDIRECT_URI fallback is read per
-    // auth-url request; its PR passes the value in. Delete this entry then.
-    ("oauth/device.rs", "resolve_redirect_uri", "TODO 25763513"),
     // TODO(b2017136): server.rs::main's env and config gates move into a
     // library `boot::check_env_gates()`. Narrow or delete this entry when
     // those reads move behind a settings type.
