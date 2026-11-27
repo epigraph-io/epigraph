@@ -80,6 +80,11 @@ systemd-run --user --scope -p MemoryMax=1900M \
   python3 scripts/theme_pipeline.py grow --batch-size 2000 --target-k 72 --max-size 8000
 ```
 
+- `--i-understand-full-rebuild` is **required** whenever `claim_themes` is not
+  empty, and its consequences are the point of this step: see "A projection is a
+  full rebuild" below. Without it, `grow` refuses before it clusters anything,
+  printing the theme count and the rows the cascade would drop. With it, run the
+  rebuild steps the projection prints once `grow` finishes.
 - `--max-size 8000` is **required**, and requires the fix in PR #393
   (`fix/theme-split-oversized`). Without it the 2026-08-17 run produced six themes
   holding the bulk of the corpus, the largest 51,772 claims (15.7%). See "Why the
@@ -122,7 +127,9 @@ its `cluster_labels` names survive, so the themes come back without UMAP:
    not `cluster-NN` fallbacks.
 2. **Re-project it**, as the maintenance role:
    `python3 scripts/project_to_themes.py --run-id <run>`. One transaction; the
-   names come from `cluster_labels`.
+   names come from `cluster_labels`. On an empty `claim_themes` no flag is
+   needed. If any theme is left, the projection refuses unless given
+   `--i-understand-full-rebuild` (see "A projection is a full rebuild").
 3. **Assign the claims embedded since the run** to their nearest theme. Use the
    statement in `ClaimThemeRepository::assign_unthemed_batch`, in batches, as the
    maintenance role. Then recompute each theme's centroid and `claim_count`
@@ -135,10 +142,58 @@ its `cluster_labels` names survive, so the themes come back without UMAP:
    It relabels `auto-NN`, `cluster-NN` and `cluster-split-...` labels and keeps
    every real name. `--relabel-all` renames everything.
 
-`project_run` mints new theme UUIDs on every projection. Anything that must survive
-a re-projection should key on `properties` (`cluster_run_id`, `cluster_id`, and
-`split_part` for split parts), not on `claim_themes.id`. A later re-projection of
-the same run also undoes steps 3–5, because they do not write `claim_clusters`.
+Then run the rebuild steps in the next section: the wipe took the graph
+neighbourhoods and the Atlas layout and maps with it, and the new themes have none.
+
+A later re-projection of the same run also undoes steps 3–5, because they do not
+write `claim_clusters`.
+
+## A projection is a full rebuild: theme ids are run-scoped
+
+`project_run` (both `project_to_themes.py` and `theme_pipeline.py grow` /
+`project`) deletes every `claim_themes` row and mints new theme UUIDs on every
+projection. **Theme ids are scoped to one projection.** Nothing may persist a
+`claim_themes.id` and expect it to survive one. A consumer that needs the same
+theme across projections keys on `properties` (`cluster_run_id`, `cluster_id`,
+and `split_part` for split parts). A stored theme id from before a projection
+points at nothing afterwards.
+
+The views built per run on theme ids reference `claim_themes` with
+`ON DELETE CASCADE`, so the wipe deletes them too:
+
+| Table | What goes |
+|---|---|
+| `graph_neighborhoods` (and their `claim_neighborhood_membership` and `neighborhood_edges`) | every clustering run's neighbourhoods |
+| `atlas_layout_themes` (and their `atlas_layout_theme_links`) | every theme's position in every shared layout run |
+| `atlas_map_levels` | every level of every Atlas map, the public map and every team map |
+
+So the projection refuses, before it changes anything, when `claim_themes` is not
+empty, unless it is given `--i-understand-full-rebuild`. The refusal and the
+confirmed run both print the theme count, the row count of each cascading table,
+including the tables that cascade from those (read from the foreign keys in the
+catalog, so a later one is listed too), and the maps that lose their levels. A confirmed run then prints the steps below, and the
+JSON result carries them as `rebuild_next`.
+
+**Required after every projection**, in order, as the maintenance role (the same
+sequence as "After a theme-cap split" in `docs/runbooks/atlas-nightly.md`, plus the
+maps):
+
+1. `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique`,
+   then `drain_jobs` (or wait for `epigraph-jobs-drain.timer`). A new clustering
+   run writes neighbourhoods for every theme.
+2. `python3 scripts/label_themes_llm.py --neighborhoods`. The new run's
+   neighbourhoods carry placeholder labels.
+3. `atlas_layout --apply`. A new shared layout run places the new themes.
+4. For every map the projection listed (`public`, `team:<group>`), the operator
+   build in "Before the first night: the operator build" in
+   `docs/runbooks/atlas-nightly.md` (`atlas_meaning export`, compute,
+   `atlas_links export`, compute, `atlas_links apply --apply`). `atlas_layout`
+   does not write the maps; these builders do. Then
+   `atlas_nightly --apply --map <map>`, so the map gets real leaves, positions
+   and names before anyone browses it.
+
+Until step 3 the Atlas has no positions for the new themes. Until step 4 each map
+is left with a latest run that has no levels.
 
 ## Why the first run failed (do not re-derive this)
 
@@ -158,15 +213,17 @@ splitting alone is not a sufficient gate — always assert on absolute size.**
 
 `project_run` wipes and rebuilds `claim_themes` inside **one transaction** with an
 empty-run guard, so a mid-run failure rolls back to the current state rather than
-leaving a hole. Note that this rebuilds Model A only — `claim_clusters` (Model B) is
-untouched, which is why the 2026-08-18 nightly wipe cost only the projection and the
-2026-08-19 re-run could resume from the surviving base run.
+leaving a hole. Of the clustering data it rebuilds Model A only: `claim_clusters`
+(Model B) is untouched, which is why the 2026-08-18 nightly wipe cost only the
+projection and the 2026-08-19 re-run could resume from the surviving base run. The
+views built on theme ids do not survive it: see "A projection is a full rebuild".
 
 If it dies partway through the base assign — or a wipe destroys `claim_themes` — resume
 without redoing it:
 
 ```bash
-python3 scripts/theme_pipeline.py grow --from-run-id <run_id> --batch-size 2000 --max-size 8000
+python3 scripts/theme_pipeline.py grow --from-run-id <run_id> --batch-size 2000 --max-size 8000 \
+  --i-understand-full-rebuild   # only when claim_themes is not empty
 ```
 
 ### Verify after the run
@@ -248,8 +305,12 @@ Correct split:
   recomputes only affected centroids, and reports new theme candidates. Cumulative
   growth, no wipe. Needs `EPIGRAPH_TOKEN` with `claims:write` (`claims:admin` for
   cross-owner reassign).
-- **Periodic full rebuild = `theme_pipeline.py grow`**, on the host, under the memory
-  cap, monthly or on demand. Never on the nightly cron.
+- **Full rebuild = `theme_pipeline.py grow --i-understand-full-rebuild`**, run by an
+  operator on the host, under the memory cap, on demand (for example monthly). Never
+  on the nightly cron, and never on any timer: it replaces every theme id, and the
+  cascade takes the graph neighbourhoods and every Atlas layout and map with the old
+  themes. Without the flag it refuses over existing themes; with it, run the steps in
+  "A projection is a full rebuild" straight after.
 
 Both edits are needed, or the old chain stays reachable:
 
