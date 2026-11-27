@@ -42,6 +42,12 @@ jobs:
           SCAN_BASE: ${{ github.event.before }}
           SCAN_HEAD: ${{ github.sha }}
         run: |
+          # After a forced update of main the old tip may be absent from the
+          # clone; read the head commit alone rather than fail the job.
+          if [[ -n "$SCAN_BASE" && ! "$SCAN_BASE" =~ ^0+$ ]] && ! git cat-file -e "${SCAN_BASE}^{commit}" 2>/dev/null; then
+            echo "before-sha not in the clone; reading the head commit alone"
+            SCAN_BASE=""
+          fi
           out=$(python3 .github/scripts/commit-message-lint.py --cited-shas "$SCAN_BASE" "$SCAN_HEAD")
           printf '%s\n' "$out"
           # One annotation per finding, naming only the citing commit (the
