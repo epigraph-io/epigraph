@@ -398,3 +398,50 @@ async fn an_analysis_written_by_gap_analysis_surfaces_by_claim_id(pool: PgPool) 
         ]
     );
 }
+
+/// The `gap.surfaced` event a member's surface emits names the challenged
+/// claim, so `EventRepository::list` (the reader behind `GET /api/v1/events`,
+/// the graph snapshot and MCP `list_events`) hides it from a stranger who
+/// cannot read that claim. Without the claim id the payload names only the
+/// challenge, which that claims-keyed filter does not classify, and every
+/// reader would see the member as actor plus the gap type and a severity
+/// computed from the private claim's scores.
+#[sqlx::test(migrations = "../../migrations")]
+async fn gap_surfaced_event_is_hidden_from_a_stranger(pool: PgPool) {
+    let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
+    let (member, stranger, claim) = private_claim(&pool, &embedder).await;
+    let analysis = legacy_analysis(&pool, claim, chrono::Utc::now()).await;
+    let state = production_state(&pool).await;
+
+    let body = surface(&pool, state.clone(), member, analysis)
+        .await
+        .expect("surface_gaps for the member");
+    assert_eq!(body["challenges_created"], 1, "{body}");
+
+    let events_for = |agent: Uuid| {
+        let pool = pool.clone();
+        let db = state.db_pool.clone();
+        async move {
+            let v = Viewer::resolve(&pool, agent).await.expect("viewer");
+            epigraph_db::EventRepository::list(&db, &v, Some("gap.surfaced"), None, None, 100)
+                .await
+                .expect("list events")
+        }
+    };
+
+    // Positive control: the event exists and its own author reads it.
+    let mine = events_for(member).await;
+    assert_eq!(
+        mine.len(),
+        1,
+        "the member reads their own gap.surfaced event"
+    );
+
+    let theirs = events_for(stranger).await;
+    assert!(
+        theirs.is_empty(),
+        "a stranger must not see a gap.surfaced event about a claim they cannot read: {:?}",
+        theirs.iter().map(|e| &e.payload).collect::<Vec<_>>()
+    );
+    assert_eq!(mine[0].payload["claim_id"], serde_json::json!(claim));
+}

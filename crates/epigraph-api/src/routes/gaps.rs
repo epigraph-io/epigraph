@@ -184,13 +184,18 @@ pub async fn surface_gaps(
         challenge_ids.push(challenge_id);
 
         // The event rides the challenge's fate, SAVEPOINT-wrapped so a refused
-        // event cannot abort the challenge.
+        // event cannot abort the challenge. `claim_id` is load-bearing:
+        // `EventRepository::list` (and the webhook fan-out) hide an event only
+        // when a uuid in its payload names a claim the reader cannot see, so
+        // without it a gap on a group-private claim would show every reader
+        // its challenger, gap type and severity (as `claim.challenged` does).
         epigraph_db::EventRepository::publish_or_log_conn(
             &mut tx,
             "gap.surfaced",
             Some(caller),
             &serde_json::json!({
                 "challenge_id": challenge_id,
+                "claim_id": claim_id,
                 "gap_type": gap_type,
                 "severity": severity,
             }),
