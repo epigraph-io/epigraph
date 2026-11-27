@@ -1217,11 +1217,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
     // migration 246 `PaperRepository::get_or_create_stored` writes `papers` in the ingest's declared
     // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`; since
-    // backlog b995f117 it is the only write of that row on the detached path too. The body of
-    // `do_ingest_document_reporting` (a thin wrapper now, with no SQL of its own).
+    // backlog b995f117 it is the only write of that row on the detached path too. The one
+    // document walk (backlog 3716a30b): the full ingests (`do_ingest_document_reporting`,
+    // `ingest_document_walk`) and the spine ingest (`do_ingest_document_spine`) are thin
+    // wrappers over it, with no SQL of their own; the spine level takes no atom lock and
+    // opens no second (DS) transaction, but the calls are the same fn's.
     (
         "ingestion.rs",
-        "ingest_document_walk_reporting",
+        "walk_document",
         &[
             "ClaimIngestRepository::record_signed_conn",
             "ClaimIngestRepository::record_signed_conn",
@@ -1236,45 +1239,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "PaperRepository::licence",
             "ReasoningTraceRepository::create",
             "begin_ingest_tx",
-            "begin_ingest_tx",
-            "epigraph_db::create_ingest_written_edge_if_absent_conn",
-            "epigraph_db::create_ingest_written_edge_if_absent_conn",
-            "epigraph_db::create_ingest_written_edge_if_absent_conn",
-            "epigraph_db::create_ingest_written_edge_if_absent_conn",
-            "label_resolved_claim",
-            "persist_planned_claim",
-            "resolve_ingest_visibility",
-            "spawn_ingest_embeds",
-        ],
-    ),
-    // write: `ClaimIngestRepository::record_signed_conn`,
-    // `ClaimRepository::set_properties_conn`, `ClaimRepository::update_labels_conn`,
-    // `ClaimRepository::update_trace_id_conn`,
-    // `EdgeRepository::create_if_absent_including_retracted_signed_conn`,
-    // `EdgeRepository::create_processed_by_stamp_if_absent_signed_conn`,
-    // `EvidenceRepository::create`, `PaperRepository::get_or_create_stored`,
-    // `ReasoningTraceRepository::create`,
-    // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
-    // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
-    // `resolve_ingest_visibility`; stamped: `PaperRepository::licence`, read by the id the
-    // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
-    // migration 246 `PaperRepository::get_or_create_stored` writes `papers` in the ingest's declared
-    // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`.
-    (
-        "ingestion.rs",
-        "do_ingest_document_spine",
-        &[
-            "ClaimIngestRepository::record_signed_conn",
-            "ClaimIngestRepository::record_signed_conn",
-            "ClaimRepository::set_properties_conn",
-            "ClaimRepository::update_labels_conn",
-            "ClaimRepository::update_trace_id_conn",
-            "EdgeRepository::create_if_absent_including_retracted_signed_conn",
-            "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn",
-            "EvidenceRepository::create",
-            "PaperRepository::get_or_create_stored",
-            "PaperRepository::licence",
-            "ReasoningTraceRepository::create",
             "begin_ingest_tx",
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
