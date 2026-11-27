@@ -6,16 +6,23 @@
 //! derived from its leaves, so a reader must not gate, rank or count it as if
 //! it were a belief:
 //!
-//! * the **listing** readers (`list_by_labels`, `list_filtered` /
+//! * every **gated** reader (`list_by_labels`, `list_filtered` /
 //!   `count_filtered`, `rag_hybrid_context`, `list_active_network`,
-//!   `get_claims_for_analysis`) apply the truth gate and the truth order to
-//!   non-compounds only. A compound passes the gate ungated, so no compound
-//!   disappears from a listing, and it is ranked after the atoms with no
-//!   belief term of its own;
-//! * the **attribution** readers (`get_claims_attributed_to`,
-//!   `count_claims_attributed_to`) exclude compounds when a truth gate is in
-//!   force (`min_truth > 0`); at the default `0` the gate is vacuous and
-//!   every attributed claim is listed and counted, as before.
+//!   `get_claims_attributed_to` / `count_claims_attributed_to`) FAILS CLOSED
+//!   on a compound: under a non-vacuous truth gate a compound is excluded,
+//!   whatever its cached value; under a vacuous one (`min_truth <= 0`,
+//!   `truth_max >= 1`) it is listed and counted, as before. A compound must
+//!   never pass a gate ungated, because "compound" is `decomposes_to`
+//!   structure that any `edges:write` caller can add between two public
+//!   claims: passing it would let that caller push a refuted claim, or a
+//!   policy an admin drove below the gate, past the gate;
+//! * the **ordering** readers (`list_filtered`'s truth sort,
+//!   `rag_hybrid_context`'s score, `list_active_network`,
+//!   `get_claims_for_analysis`) rank non-compounds by truth and put every
+//!   compound after them, with no belief term of its own;
+//! * the role is decided on the CALLER's connection, so a reader whose row
+//!   security hides a compound's decomposition sees that claim as a plain
+//!   claim, and a private decomposition sends an outsider no signal.
 //!
 //! A compound here is a claim with an in-force `decomposes_to` out-edge to a
 //! current child (`claim_role::IS_COMPOUND_SQL`). Every expectation is a set
@@ -93,34 +100,137 @@ fn set(v: &[Uuid]) -> BTreeSet<Uuid> {
 
 // ── list_by_labels ─────────────────────────────────────────────────────────
 
-/// `min_truth` gates atoms only: an atom below it is dropped, a compound below
-/// it is still listed.
-#[sqlx::test(migrations = "../../migrations")]
-async fn list_by_labels_gates_atoms_and_lists_every_compound(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
-    let a = agent(&pool).await;
-    let label = format!("role-aware-{}", Uuid::new_v4().simple());
-    let atom_low = claim(&pool, a, "atom low", 0.1, &[&label]).await;
-    let atom_high = claim(&pool, a, "atom high", 0.9, &[&label]).await;
-    let compound_low = compound(&pool, a, "compound low", 0.1, &[&label]).await;
-
+async fn by_label(
+    executor: impl sqlx::PgExecutor<'_>,
+    viewer: &epigraph_db::visibility::Viewer,
+    label: &str,
+    min_truth: f64,
+) -> BTreeSet<Uuid> {
+    let labels = [label.to_string()];
     let rows = ClaimRepository::list_by_labels(
-        &pool,
-        &viewer,
+        executor,
+        viewer,
         LabelQuery {
-            labels: std::slice::from_ref(&label),
-            min_truth: 0.5,
+            labels: &labels,
+            min_truth,
             limit: 50,
             ..Default::default()
         },
     )
     .await
     .expect("list_by_labels");
-    let got = set(&ids(&rows, |(c, _)| c.id.into()));
+    set(&ids(&rows, |(c, _)| c.id.into()))
+}
+
+/// Under a gate, `min_truth` lists only atoms that reach it: a compound is
+/// excluded even when its cached value would pass (fail closed). At the
+/// default `0` every labelled claim, compounds included, is listed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_by_labels_gate_fails_closed_on_compounds(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let a = agent(&pool).await;
+    let label = format!("role-aware-{}", Uuid::new_v4().simple());
+    let atom_low = claim(&pool, a, "atom low", 0.1, &[&label]).await;
+    let atom_high = claim(&pool, a, "atom high", 0.9, &[&label]).await;
+    let compound_low = compound(&pool, a, "compound low", 0.1, &[&label]).await;
+    let compound_high = compound(&pool, a, "compound high", 0.9, &[&label]).await;
+
     assert_eq!(
-        got,
-        set(&[atom_high, compound_low]),
-        "the atom below min_truth is dropped ({atom_low}); the compound below it is listed"
+        by_label(&pool, &viewer, &label, 0.5).await,
+        set(&[atom_high]),
+        "only the atom that reaches min_truth is listed: not the low atom ({atom_low}), \
+         not the low compound ({compound_low}), and not the compound whose cached 0.9 \
+         would pass ({compound_high})"
+    );
+    assert_eq!(
+        by_label(&pool, &viewer, &label, 0.0).await,
+        set(&[atom_low, atom_high, compound_low, compound_high]),
+        "with no gate every labelled claim is listed"
+    );
+}
+
+/// The role is decided on the caller's stamped application connection. A
+/// public, labelled claim whose only decomposition (edge and child) is private
+/// to a group is a compound to a member of that group, so a gate excludes it;
+/// to an outsider, whose row security hides the decomposition, it is a plain
+/// claim and its own value decides, so the outsider gets no signal that a
+/// private decomposition exists. Deciding the role with migration 193's
+/// whole-graph definer here instead would drop it for the outsider too, and
+/// that absence would disclose the hidden decomposition.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_by_labels_decides_the_role_on_the_callers_row_security(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "ef58c6ad-member").await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "ef58c6ad-outsider").await;
+    let a = agent(&pool).await;
+    let label = format!("role-aware-{}", Uuid::new_v4().simple());
+    let atom = claim(&pool, a, "public atom", 0.9, &[&label]).await;
+    let hidden = claim(&pool, a, "public, private decomposition", 0.9, &[&label]).await;
+    let child = fixture::seed_group_claim(&pool, member, group, "private child").await;
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'decomposes_to') RETURNING id",
+    )
+    .bind(hidden)
+    .bind(child)
+    .fetch_one(&pool)
+    .await
+    .expect("seed decomposes_to");
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(edge)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("make the decomposition private");
+
+    let url = fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let mut seen = Vec::new();
+    for agent in [member, outsider] {
+        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+            .await
+            .expect("resolve viewer");
+        let mut tx = scoped.begin_as(&viewer).await.expect("stamped transaction");
+        let who: String = sqlx::query_scalar("SELECT session_user::text")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("session_user");
+        assert_eq!(who, "epigraph_app", "calibration: the application role");
+        let gated = by_label(&mut *tx, &viewer, &label, 0.5).await;
+        let open = by_label(&mut *tx, &viewer, &label, 0.0).await;
+        tx.rollback().await.expect("rollback");
+        seen.push((gated, open));
+    }
+    let (member_gated, member_open) = &seen[0];
+    let (outsider_gated, outsider_open) = &seen[1];
+    assert_eq!(
+        member_open,
+        &set(&[atom, hidden]),
+        "calibration: with no gate the member lists both"
+    );
+    assert_eq!(
+        outsider_open,
+        &set(&[atom, hidden]),
+        "calibration: with no gate the outsider lists both"
+    );
+    assert_eq!(
+        member_gated,
+        &set(&[atom]),
+        "the member sees the decomposition, so the compound fails the gate closed"
+    );
+    assert_eq!(
+        outsider_gated,
+        &set(&[atom, hidden]),
+        "the outsider cannot see the decomposition: the claim is plain to it and its own \
+         0.9 passes, so its listing carries no trace of the private structure"
     );
 }
 
@@ -140,11 +250,13 @@ async fn page(
     (ids(&rows, |c| c.id.into()), total)
 }
 
-/// `truth_min` / `truth_max` gate atoms only, the count agrees with the page,
-/// and a `truth_value` sort ranks the atoms and puts every compound after
-/// them, in either direction.
+/// A non-vacuous `truth_min` / `truth_max` lists only atoms that meet it
+/// (fail closed on every compound, whatever its cached value), the count
+/// agrees with the page, vacuous bounds list everything, and a `truth_value`
+/// sort ranks the atoms and puts every compound after them, in either
+/// direction.
 #[sqlx::test(migrations = "../../migrations")]
-async fn list_filtered_gates_and_sorts_atoms_only(pool: PgPool) {
+async fn list_filtered_gates_fail_closed_and_sort_atoms_only(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let a = agent(&pool).await;
     let atom_low = claim(&pool, a, "atom low", 0.1, &[]).await;
@@ -154,7 +266,8 @@ async fn list_filtered_gates_and_sorts_atoms_only(pool: PgPool) {
     let compound_low = compound(&pool, a, "compound low", 0.1, &[]).await;
     let all = [atom_low, atom_mid, atom_high, compound_high, compound_low];
 
-    // truth_min: the low atom is gated out, both compounds pass ungated.
+    // truth_min: the low atom is gated out, and so is every compound, the
+    // 0.95 one included.
     let (rows, total) = page(
         &pool,
         &viewer,
@@ -168,34 +281,13 @@ async fn list_filtered_gates_and_sorts_atoms_only(pool: PgPool) {
     )
     .await;
     assert_eq!(
-        total, 4,
-        "count = atoms >= 0.5 plus every compound: {rows:?}"
-    );
-    assert_eq!(rows.len(), 4);
-    assert_eq!(
-        rows[..2],
+        rows,
         [atom_high, atom_mid],
-        "atoms first, by truth_value DESC (the 0.95 compound does not outrank them)"
+        "only the atoms >= 0.5, by truth_value DESC"
     );
-    assert_eq!(set(&rows[2..]), set(&[compound_high, compound_low]));
+    assert_eq!(total, 2, "the count agrees with the page");
 
-    // ASC: the atoms ascend, the compounds still come after them.
-    let (rows, _) = page(
-        &pool,
-        &viewer,
-        &ClaimListFilter {
-            ids: Some(&all),
-            truth_min: Some(0.5),
-            sort_by: ClaimSortField::TruthValue,
-            sort_order: ClaimSortOrder::Asc,
-            ..Default::default()
-        },
-    )
-    .await;
-    assert_eq!(rows[..2], [atom_mid, atom_high]);
-    assert_eq!(set(&rows[2..]), set(&[compound_high, compound_low]));
-
-    // truth_max: the 0.95 compound is not gated out either.
+    // truth_max: the 0.1 compound does not slip under it either.
     let (rows, total) = page(
         &pool,
         &viewer,
@@ -206,8 +298,55 @@ async fn list_filtered_gates_and_sorts_atoms_only(pool: PgPool) {
         },
     )
     .await;
-    assert_eq!(total, 3, "{rows:?}");
-    assert_eq!(set(&rows), set(&[atom_low, compound_high, compound_low]));
+    assert_eq!(rows, [atom_low], "only the atom <= 0.5");
+    assert_eq!(total, 1);
+
+    // Vacuous bounds gate nothing: every claim, compounds included.
+    let (rows, total) = page(
+        &pool,
+        &viewer,
+        &ClaimListFilter {
+            ids: Some(&all),
+            truth_min: Some(0.0),
+            truth_max: Some(1.0),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(set(&rows), set(&all));
+    assert_eq!(total, 5);
+
+    // The sort: atoms by truth_value, then the compounds, in both directions.
+    let (rows, _) = page(
+        &pool,
+        &viewer,
+        &ClaimListFilter {
+            ids: Some(&all),
+            sort_by: ClaimSortField::TruthValue,
+            sort_order: ClaimSortOrder::Desc,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        rows[..3],
+        [atom_high, atom_mid, atom_low],
+        "atoms first, by truth_value DESC (the 0.95 compound does not outrank them)"
+    );
+    assert_eq!(set(&rows[3..]), set(&[compound_high, compound_low]));
+    let (rows, _) = page(
+        &pool,
+        &viewer,
+        &ClaimListFilter {
+            ids: Some(&all),
+            sort_by: ClaimSortField::TruthValue,
+            sort_order: ClaimSortOrder::Asc,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(rows[..3], [atom_low, atom_mid, atom_high]);
+    assert_eq!(set(&rows[3..]), set(&[compound_high, compound_low]));
 }
 
 // ── rag_hybrid_context ─────────────────────────────────────────────────────
@@ -218,10 +357,13 @@ fn unit_vector() -> String {
     format!("[{}]", v.join(","))
 }
 
-/// `min_truth` gates atoms only, and a compound's `hybrid_score` carries no
-/// `truth_value` term, so a high cached value does not rank it above an atom.
+/// Under a gate `min_truth` keeps only atoms that reach it (fail closed on
+/// every compound, so no structural edit can put a refuted claim into the
+/// context); at `0` the compounds are kept, and a compound's `hybrid_score`
+/// carries no `truth_value` term, so a high cached value does not rank it
+/// above an atom.
 #[sqlx::test(migrations = "../../migrations")]
-async fn rag_hybrid_context_gates_and_ranks_atoms_only(pool: PgPool) {
+async fn rag_hybrid_context_gate_fails_closed_and_ranks_atoms_only(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let a = agent(&pool).await;
     let domain = format!("role-aware-{}", Uuid::new_v4().simple());
@@ -237,11 +379,21 @@ async fn rag_hybrid_context_gates_and_ranks_atoms_only(pool: PgPool) {
     let hits = ClaimRepository::rag_hybrid_context(&pool, &viewer, &vec, 0.5, Some(&domain), 10)
         .await
         .expect("rag_hybrid_context");
+    assert_eq!(
+        ids(&hits, |h| h.claim_id),
+        vec![atom_high],
+        "only the atom that reaches min_truth: not the low atom ({atom_low}), and no \
+         compound, not even the one whose cached 0.95 would pass ({compound_high})"
+    );
+
+    let hits = ClaimRepository::rag_hybrid_context(&pool, &viewer, &vec, 0.0, Some(&domain), 10)
+        .await
+        .expect("rag_hybrid_context");
     let got = ids(&hits, |h| h.claim_id);
     assert_eq!(
         set(&got),
-        set(&[atom_high, compound_high, compound_low]),
-        "the atom below min_truth is dropped ({atom_low}); both compounds are kept"
+        set(&[atom_high, atom_low, compound_high, compound_low]),
+        "with no gate every claim is kept"
     );
     assert_eq!(
         got[0], atom_high,
@@ -249,7 +401,7 @@ async fn rag_hybrid_context_gates_and_ranks_atoms_only(pool: PgPool) {
     );
     for h in &hits {
         let structural = h.similarity * 0.6 + (h.edge_count as f64 / 10.0).min(1.0) * 0.2;
-        let want = if h.claim_id == atom_high {
+        let want = if h.claim_id == atom_high || h.claim_id == atom_low {
             structural + h.truth_value * 0.2
         } else {
             structural
@@ -320,10 +472,13 @@ async fn attribution_truth_gate_excludes_compounds(pool: PgPool) {
 
 // ── list_active_network ────────────────────────────────────────────────────
 
-/// Policy claims: the truth gate and the order apply to atoms; compounds pass
-/// ungated and come after the atoms.
+/// Policy claims (an allow list): under a gate only atoms that reach it are
+/// listed, by truth DESC. A compound is excluded whatever its cached value,
+/// so a `decomposes_to` edge any `edges:write` caller can add cannot re-list
+/// a policy an admin drove below the gate (fail closed). At `0` every policy
+/// is listed, the compounds after the atoms.
 #[sqlx::test(migrations = "../../migrations")]
-async fn list_active_network_gates_and_orders_atoms_only(pool: PgPool) {
+async fn list_active_network_gate_fails_closed_on_compounds(pool: PgPool) {
     let a = agent(&pool).await;
     let labels = ["policy:active", "policy:network"];
     let atom_high = claim(&pool, a, "policy atom high", 0.9, &labels).await;
@@ -335,18 +490,23 @@ async fn list_active_network_gates_and_orders_atoms_only(pool: PgPool) {
     let rows = PolicyRepository::list_active_network(&pool, 0.5)
         .await
         .expect("list_active_network");
+    assert_eq!(
+        ids(&rows, |(id, _, _)| *id),
+        vec![atom_high, atom_mid],
+        "the low atom ({atom_low}) and both compounds ({compound_low}, {compound_high}) \
+         are out"
+    );
+
+    let rows = PolicyRepository::list_active_network(&pool, 0.0)
+        .await
+        .expect("list_active_network");
     let got = ids(&rows, |(id, _, _)| *id);
     assert_eq!(
-        got.len(),
-        4,
-        "{got:?} (the low atom {atom_low} is gated out)"
-    );
-    assert_eq!(
-        got[..2],
-        [atom_high, atom_mid],
+        got[..3],
+        [atom_high, atom_mid, atom_low],
         "atoms first, by truth DESC"
     );
-    assert_eq!(set(&got[2..]), set(&[compound_low, compound_high]));
+    assert_eq!(set(&got[3..]), set(&[compound_low, compound_high]));
 }
 
 // ── get_claims_for_analysis ────────────────────────────────────────────────

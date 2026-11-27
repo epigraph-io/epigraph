@@ -4158,10 +4158,15 @@ impl ClaimRepository {
     /// `Some`, restricts to claims carrying that label.
     ///
     /// Both the gate and the truth term read a NON-compound's `truth_value`
-    /// only (backlog ef58c6ad). A compound (`claim_role::IS_COMPOUND_SQL`)
-    /// passes `min_truth` ungated and scores `similarity * 0.6 +
-    /// min(edge_count / 10, 1) * 0.2`, ranking after a non-compound of equal
-    /// score; its row still reports its stored `truth_value`.
+    /// only (backlog ef58c6ad). Under a gate (`min_truth > 0`, and the route
+    /// defaults to 0.7) a compound (`claim_role::IS_COMPOUND_SQL`) is
+    /// EXCLUDED: it has no belief of its own to reach the gate, and "compound"
+    /// is `decomposes_to` structure any `edges:write` caller can add between
+    /// two public claims, so letting it through ungated would let that caller
+    /// put a refuted claim into the LLM's context. At `min_truth <= 0` a
+    /// compound is kept and scores `similarity * 0.6 + min(edge_count / 10, 1)
+    /// * 0.2`, ranking after a non-compound of equal score; its row still
+    /// reports its stored `truth_value`.
     ///
     /// # Why this is here and not in `routes/rag.rs`
     ///
@@ -4193,10 +4198,12 @@ impl ClaimRepository {
         limit: i64,
     ) -> Result<Vec<RagContextHit>, DbError> {
         // Role-aware (backlog ef58c6ad): a compound's cached `truth_value` is
-        // a fold of its own BBAs, not a belief, so `min_truth` gates
-        // non-compounds only and a compound's `hybrid_score` carries no truth
-        // term (similarity and connectivity alone); on an equal score the
-        // non-compound ranks first.
+        // a fold of its own BBAs, not a belief. A gate (`$2 > 0`) fails
+        // closed on it (excluded, never passed ungated), and it is applied in
+        // `base`, truth test first, so a row it prunes never pays for the
+        // `edge_count` subquery. A compound kept at `$2 <= 0` scores with no
+        // truth term (similarity and connectivity alone); on an equal score
+        // the non-compound ranks first.
         let sql = viewer.splice(
             &format!(
                 r#"
@@ -4222,19 +4229,17 @@ impl ClaimRepository {
                     {compound} AS is_compound
                 FROM claims c, query_vec q
                 WHERE c.embedding IS NOT NULL
+                  AND ($2 <= 0 OR (c.truth_value >= $2 AND NOT {compound}))
                   AND 1 - (c.embedding <=> q.vec) >= 0.0
                   AND ($3::text IS NULL OR $3 = ANY(c.labels))
                   /* {{VISIBILITY:c}} */
-            ),
-            gated AS (
-                SELECT * FROM base WHERE is_compound OR truth_value >= $2
             )
             SELECT *,
                 similarity * 0.6
                     + CASE WHEN is_compound THEN 0.0 ELSE truth_value * 0.2 END
                     + LEAST(edge_count::float / 10.0, 1.0) * 0.2
                 as hybrid_score
-            FROM gated
+            FROM base
             ORDER BY hybrid_score DESC, is_compound
             LIMIT $4
             "#,
@@ -5998,9 +6003,13 @@ impl ClaimRepository {
     ///
     /// `$2` / `$3` (`truth_min` / `truth_max`) gate a claim's cached
     /// `truth_value`, which for a compound is a fold of its own BBAs rather
-    /// than a belief (backlog ef58c6ad). The gate therefore applies to
-    /// non-compounds only and a compound passes it ungated, so no compound
-    /// disappears from a filtered listing. Deciding that needs
+    /// than a belief (backlog ef58c6ad). Only a non-compound can meet a
+    /// bound, so under a non-vacuous bound a compound is EXCLUDED (fail
+    /// closed): "compound" is `decomposes_to` structure that any
+    /// `edges:write` caller can add between two public claims, and a compound
+    /// that passed ungated would let that caller push a claim past a bound
+    /// its value fails. A vacuous bound (`truth_min <= 0`, `truth_max >= 1`)
+    /// gates nothing and lists compounds too. Deciding that needs
     /// `claim_role::IS_COMPOUND_SQL` rendered over the row, which a `const`
     /// cannot hold, so [`Self::filter_where`] appends the gate to this
     /// clause; both methods take the clause from it, and the one clause and
@@ -6016,15 +6025,17 @@ impl ClaimRepository {
     "#;
 
     /// [`Self::FILTER_WHERE`] with the role-aware truth gate on `$2` / `$3`:
-    /// a non-compound is gated on its `truth_value`, a compound
-    /// (`claim_role::IS_COMPOUND_SQL` over the unaliased `claims` row) passes
-    /// ungated. The ONE `WHERE` clause [`Self::list_filtered`] and
-    /// [`Self::count_filtered`] share.
+    /// a non-compound is gated on its `truth_value`; a compound
+    /// (`claim_role::IS_COMPOUND_SQL` over the unaliased `claims` row) fails
+    /// any non-vacuous bound and passes a vacuous one. The ONE `WHERE` clause
+    /// [`Self::list_filtered`] and [`Self::count_filtered`] share.
     fn filter_where() -> String {
         let compound = is_compound_sql("claims");
         format!(
-            "{base}  AND ($2::float8 IS NULL OR claims.truth_value >= $2 OR {compound}) \
-               AND ($3::float8 IS NULL OR claims.truth_value <= $3 OR {compound})\n",
+            "{base}  AND ($2::float8 IS NULL OR $2 <= 0 \
+                    OR (claims.truth_value >= $2 AND NOT {compound})) \
+               AND ($3::float8 IS NULL OR $3 >= 1 \
+                    OR (claims.truth_value <= $3 AND NOT {compound}))\n",
             base = Self::FILTER_WHERE,
         )
     }
@@ -6779,9 +6790,10 @@ impl ClaimRepository {
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
     /// Results are ordered by `(created_at DESC, id DESC)`, a total order, and
-    /// filtered by optional truth threshold, which gates non-compounds only:
-    /// a compound (`claim_role::IS_COMPOUND_SQL`) is listed whatever its
-    /// cached `truth_value`.
+    /// filtered by optional truth threshold. Only a non-compound can meet
+    /// it: under a gate (`min_truth > 0`) a compound
+    /// (`claim_role::IS_COMPOUND_SQL`) is excluded, fail closed; at the
+    /// default `0` every labelled claim, compounds included, is listed.
     ///
     /// # Paging
     /// - `after` (keyset, preferred): rows strictly after a [`LabelCursor`]
@@ -6843,10 +6855,12 @@ impl ClaimRepository {
 
         let limit = limit.clamp(1, 1000);
         let offset = offset.max(0);
-        // `min_truth` gates non-compounds only (backlog ef58c6ad): a
-        // compound's cached `truth_value` is a fold of its own BBAs, not a
-        // belief, so a compound passes ungated and no compound disappears
-        // from a label listing.
+        // Role-aware, fail closed (backlog ef58c6ad): a compound's cached
+        // `truth_value` is a fold of its own BBAs, not a belief, so under a
+        // gate (`$2 > 0`) it is excluded rather than passed ungated. Passing
+        // it would let any `edges:write` caller, by adding one
+        // `decomposes_to` edge, list a public claim whose value fails the
+        // gate. At `$2 <= 0` (the default) every compound is listed.
         let sql = viewer.splice(
             &format!(
                 r#"
@@ -6854,7 +6868,7 @@ impl ClaimRepository {
                    c.created_at, c.updated_at, c.labels, c.is_current, c.supersedes
             FROM claims c
             WHERE c.labels @> $1
-              AND (c.truth_value >= $2 OR {compound})
+              AND ($2 <= 0 OR (c.truth_value >= $2 AND NOT {compound}))
               AND ($3::text[] = '{{}}'::text[] OR NOT (c.labels && $3))
               AND ($4 = false OR COALESCE(c.is_current, true) = true)
               AND ($7::timestamptz IS NULL OR (c.created_at, c.id) < ($7::timestamptz, $8::uuid))
