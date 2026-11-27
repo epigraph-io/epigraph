@@ -1,0 +1,27 @@
+# Direct runtime dependencies of the operator scripts under scripts/ (the theme
+# pipeline, the maintenance scripts, the API client), at the versions the CI
+# `python` job tests them on: every pin here, and every transitive pin in the
+# compiled scripts/requirements.txt, must equal its pin in
+# tests/requirements-ci.txt (tests/ci/test_requirements_locked.py checks it).
+# The test-only packages (pytest) are not here.
+# Edit THIS file, then recompile the hash-locked scripts/requirements.txt,
+# constrained by the CI lock so the two cannot resolve apart:
+#   uv pip compile scripts/requirements.in -o scripts/requirements.txt \
+#     -c tests/requirements-ci.txt --generate-hashes --python-version 3.12 --universal
+# Install into a venv on the host that runs the scripts:
+#   python3 -m venv .venv && .venv/bin/pip install --require-hashes \
+#     --only-binary :all: -r scripts/requirements.txt
+psycopg2-binary==2.9.11
+# maintain_themes.py, _api_client.py, cleanup/reconcile_backlog_labels.py
+requests==2.33.0
+# lib/nli_stance.py, backfill_intra_source_evidence_discount.py
+httpx==0.28.1
+# the theme pipeline (theme_lib.py, cluster_claims.py, refine_clusters.py,
+# split_theme.py, maintain_themes.py's auto-split, ...)
+numpy==1.26.4
+scikit-learn==1.8.0
+umap-learn==0.5.11
+# umap-learn's JIT; pinned here as in the CI lock, which pins it for umap-learn
+numba==0.64.0
+# atlas_links_core.py (Louvain communities)
+networkx==3.6.1

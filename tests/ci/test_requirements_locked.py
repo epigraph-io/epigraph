@@ -6,7 +6,9 @@ tests/requirements-ci.txt is compiled from it (uv pip compile
 and carrying sha256 hashes. The `python` job installs it with
 --require-hashes, so a substituted or re-uploaded wheel fails the install
 instead of running in CI, and the `audit` job runs pip-audit over it.
-tests/requirements-audit.{in,txt} do the same for the pip-audit tool itself.
+tests/requirements-audit.{in,txt} do the same for the pip-audit tool itself,
+and scripts/requirements.{in,txt} for the operator scripts on the host that
+runs them (backlog 8afe831f).
 
 These tests fail when a pin loses its hash, when a requirement is added to
 the compiled file by hand without a hash, or when the `.in` file changes and
@@ -19,9 +21,13 @@ from pathlib import Path
 import pytest
 
 TESTS = Path(__file__).resolve().parents[1]
+SCRIPTS = TESTS.parent / "scripts"
+CI_LOCK = TESTS / "requirements-ci.txt"
+SCRIPTS_LOCK = SCRIPTS / "requirements.txt"
 LOCKS = [
-    (TESTS / "requirements-ci.in", TESTS / "requirements-ci.txt"),
+    (TESTS / "requirements-ci.in", CI_LOCK),
     (TESTS / "requirements-audit.in", TESTS / "requirements-audit.txt"),
+    (SCRIPTS / "requirements.in", SCRIPTS_LOCK),
 ]
 PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?==([^\s;\\]+)")
 HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}\b")
@@ -99,3 +105,27 @@ def test_the_parser_rejects_what_the_lock_must_not_contain(tmp_path):
     f.write_text(good + "numpy>=1.26\n")
     with pytest.raises(AssertionError, match="not an == pin"):
         requirements(f)
+
+
+def test_the_scripts_lock_is_the_ci_lock_restricted():
+    """scripts/requirements.txt installs nothing CI does not test: every
+    package it pins, transitive ones included, has the same version and the
+    same hashes in tests/requirements-ci.txt. So the scripts run on the
+    versions their suites passed on, and the `audit` job's pip-audit over the
+    CI lock covers every package the scripts install."""
+    ci = requirements(CI_LOCK)
+    scripts = requirements(SCRIPTS_LOCK)
+    assert scripts, SCRIPTS_LOCK
+    drift = sorted(
+        "%s==%s (CI: %s)" % (name, version, ci.get(name, ("missing",))[0])
+        for name, (version, hashes) in scripts.items()
+        if name not in ci or ci[name][0] != version or set(ci[name][1]) != set(hashes)
+    )
+    assert not drift, (
+        "scripts/requirements.txt pins what tests/requirements-ci.txt does not (recompile it "
+        "with the -c command in scripts/requirements.in): %s" % "; ".join(drift)
+    )
+    # The scripts need their own runtime packages and not the test runner.
+    for needed in ("requests", "scikit-learn", "numpy", "umap-learn", "psycopg2-binary"):
+        assert needed in scripts, needed
+    assert "pytest" not in scripts

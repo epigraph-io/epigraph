@@ -492,7 +492,7 @@ database). The `epigraph-cli` binaries refuse to start without `DATABASE_URL`
 (a `enqueue_job --dry-run` needs none) and also accept it as `--database-url`,
 while `drain_jobs` reads it from the environment only. The two theme jobs at
 the end of the table are Python scripts from `scripts/`; install their pinned
-dependencies from `tests/requirements-ci.txt` (see `scripts/README.md`). The
+dependencies from `scripts/requirements.txt` (see `scripts/README.md`). The
 scripts that open a database connection have no built-in DSN: they use
 `MAINTENANCE_DATABASE_URL`, then `DATABASE_URL`, and refuse to start with
 neither.

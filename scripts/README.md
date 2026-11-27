@@ -6,17 +6,22 @@ build; invoked manually or by the deployment's scheduled maintenance tasks
 
 ## Dependencies and database
 
-There is no `scripts/requirements.txt`. The Python packages these scripts
-import (psycopg2, numpy, scikit-learn, umap-learn, requests, ...) are pinned,
-with hashes, in `tests/requirements-ci.txt`, the file the CI `python` job
-installs and tests them against (edit `tests/requirements-ci.in` and recompile;
-its header says how). Install it into a virtual environment on the host that
-runs them:
+The Python packages these scripts import (psycopg2, numpy, scikit-learn,
+umap-learn, requests, httpx, networkx) are pinned, with hashes, in
+`scripts/requirements.txt`. It is compiled from `scripts/requirements.in`
+against `tests/requirements-ci.txt`, the file the CI `python` job installs and
+tests them against, so every version and hash in it equals the CI one
+(`tests/ci/test_requirements_locked.py` fails otherwise; the `.in` header says
+how to recompile). Install it into a virtual environment on the host that runs
+them, before the first run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install --require-hashes --only-binary :all: -r tests/requirements-ci.txt
+.venv/bin/pip install --require-hashes --only-binary :all: -r scripts/requirements.txt
 ```
+
+No script installs a package at run time: a missing one is an `ImportError`
+naming this file.
 
 A script that opens a database connection has no built-in DSN: it connects on
 `--database-url`, else `MAINTENANCE_DATABASE_URL`, else `DATABASE_URL`, and
