@@ -376,7 +376,7 @@ fn calculate_staging_truth(evidence_count: usize, methodology: &str, confidence:
     }
 
     let evidence_factor = 1.0 - (-0.3 * evidence_count as f64).exp();
-    let method_factor = methodology_weight / 1.2;
+    let method_factor = methodology_weight / epigraph_core::Methodology::MAX_WEIGHT_MODIFIER;
     let conf_factor = confidence.clamp(0.0, 1.0);
 
     (0.3 + evidence_factor * 0.5 * method_factor * conf_factor).clamp(0.0, 1.0)
@@ -614,6 +614,21 @@ mod tests {
             staging_methodology_weight("no_such_methodology"),
             M::Heuristic.weight_modifier(),
             "an unknown string weighs as heuristic"
+        );
+    }
+
+    /// Staging normalizes a methodology weight by core's top weight
+    /// (`Methodology::MAX_WEIGHT_MODIFIER`), not a copied `1.2`: the top
+    /// methodology at full confidence contributes the whole evidence factor,
+    /// whatever core sets that weight to (backlog 19e46f05).
+    #[test]
+    fn the_top_methodology_normalizes_to_exactly_one_in_staging() {
+        let evidence_factor = 1.0 - (-0.3_f64 * 3.0).exp();
+        let want = 0.3 + evidence_factor * 0.5;
+        let got = calculate_staging_truth(3, "formal_proof", 1.0);
+        assert!(
+            (got - want).abs() < 1e-12,
+            "formal_proof at full confidence must normalize to 1: got {got}, want {want}"
         );
     }
 
