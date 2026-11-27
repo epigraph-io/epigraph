@@ -4,10 +4,13 @@
 //!
 //! The property every test here pins: a retired row is returned only when the
 //! viewer can read THAT row. A predecessor never inherits its successor's
-//! visibility. The fixtures force every `supersedes` edge public (migration
-//! 070's trigger would otherwise stamp a private endpoint's group on it), so an
+//! visibility. `supersedes_edge` forces its edge public (migration 070's
+//! trigger would otherwise stamp a private endpoint's group on it), so an
 //! outsider's empty result cannot be the edge predicate's work alone: it has
-//! to be the claim predicate on the predecessor row.
+//! to be the claim predicate on the predecessor row. The last two tests pin
+//! the other predicates the same way: a private edge between public claims
+//! (the edge predicate alone), and a public edge to a private successor (the
+//! successor's own predicate alone).
 
 use epigraph_db::repos::{PredecessorHit, RetiredLexicalHit};
 use epigraph_db::visibility::Viewer;
@@ -98,6 +101,29 @@ async fn supersedes_edge(pool: &PgPool, successor: Uuid, predecessor: Uuid, rela
     .execute(pool)
     .await
     .expect("force edge public");
+}
+
+/// A `supersedes` edge `successor -> predecessor` narrowed to `group`, with
+/// both endpoints left public: only the edge predicate can hide the link.
+async fn private_supersedes_edge(pool: &PgPool, successor: Uuid, predecessor: Uuid, group: Uuid) {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supersedes') RETURNING id",
+    )
+    .bind(successor)
+    .bind(predecessor)
+    .fetch_one(pool)
+    .await
+    .expect("seed supersedes edge");
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("narrow edge to the group");
 }
 
 async fn walk(pool: &PgPool, viewer: &Viewer, ids: &[Uuid], depth: i32) -> Vec<PredecessorHit> {
@@ -364,4 +390,125 @@ async fn a_retired_rows_column_is_not_walked_into_the_claim_it_was_retired_into(
         "the supersession itself is walked; the duplicates pointing at the canonical are not \
          its predecessors, and a current claim behind an edge is not returned"
     );
+}
+
+/// The edge predicate of both reads: a group-private `supersedes` edge
+/// between two PUBLIC claims is a link an outsider cannot read, so the walk
+/// does not cross it and the lexical hit names no successor through it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_supersedes_edge_is_neither_walked_nor_named(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "history-edge").await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "history-edge-out").await;
+    let world = fixture::world_group(&pool).await;
+    let word = token();
+
+    let p1 = claim(
+        &pool,
+        owner,
+        &format!("earlier {word} version"),
+        "public",
+        world,
+        None,
+    )
+    .await;
+    // The link is the edge alone: `head.supersedes` stays NULL.
+    let head = claim(&pool, owner, "later version", "public", world, None).await;
+    private_supersedes_edge(&pool, head, p1, group).await;
+    retire(&pool, p1).await;
+
+    let owner_v = Viewer::resolve(&pool, owner).await.expect("resolve owner");
+    let outsider_v = Viewer::resolve(&pool, outsider)
+        .await
+        .expect("resolve outsider");
+
+    assert_eq!(
+        ids_of(&walk(&pool, &owner_v, &[head], 5).await),
+        vec![(p1, head, 1)],
+        "CALIBRATION: the owner walks its own private edge"
+    );
+    assert_eq!(
+        walk(&pool, &outsider_v, &[head], 5).await,
+        vec![],
+        "both claims are public, but the only link between them is private: the walk must \
+         not cross it"
+    );
+
+    let owner_hits = lexical(&pool, &owner_v, &word).await;
+    assert_eq!(
+        owner_hits
+            .iter()
+            .map(|h| (h.id, h.successor_id))
+            .collect::<Vec<_>>(),
+        vec![(p1, Some(head))],
+        "CALIBRATION: the owner's hit names the successor through its private edge"
+    );
+    let outsider_hits = lexical(&pool, &outsider_v, &word).await;
+    assert_eq!(
+        outsider_hits
+            .iter()
+            .map(|h| (h.id, h.successor_id))
+            .collect::<Vec<_>>(),
+        vec![(p1, None)],
+        "the public retired row is found, but the private edge must not name its successor"
+    );
+}
+
+/// The successor predicate of the lexical read: a visible retired hit whose
+/// only successor is private names no successor to an outsider, even though
+/// the edge to it is public.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lexical_hit_never_names_a_successor_the_viewer_cannot_read(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "history-succ").await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "history-succ-out").await;
+    let world = fixture::world_group(&pool).await;
+    let word = token();
+
+    let pred = claim(
+        &pool,
+        owner,
+        &format!("public {word} predecessor"),
+        "public",
+        world,
+        None,
+    )
+    .await;
+    let succ = claim(
+        &pool,
+        owner,
+        "private successor",
+        "group",
+        group,
+        Some(pred),
+    )
+    .await;
+    // A public edge too, so only the successor's own predicate can hide it.
+    supersedes_edge(&pool, succ, pred, "supersedes").await;
+    retire(&pool, pred).await;
+
+    let owner_v = Viewer::resolve(&pool, owner).await.expect("resolve owner");
+    let outsider_v = Viewer::resolve(&pool, outsider)
+        .await
+        .expect("resolve outsider");
+    let anon = fixture::public_viewer(&pool).await;
+
+    let owner_hits = lexical(&pool, &owner_v, &word).await;
+    assert_eq!(
+        owner_hits
+            .iter()
+            .map(|h| (h.id, h.successor_id))
+            .collect::<Vec<_>>(),
+        vec![(pred, Some(succ))],
+        "CALIBRATION: the owner's hit names its private successor"
+    );
+    for (who, v) in [("outsider", &outsider_v), ("public", &anon)] {
+        let hits = lexical(&pool, v, &word).await;
+        assert_eq!(
+            hits.iter()
+                .map(|h| (h.id, h.successor_id))
+                .collect::<Vec<_>>(),
+            vec![(pred, None)],
+            "the {who} viewer finds the public retired row, but must not learn the private \
+             successor's id"
+        );
+    }
 }
