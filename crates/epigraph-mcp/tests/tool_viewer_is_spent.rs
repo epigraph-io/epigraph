@@ -1133,17 +1133,15 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ("events.rs", "publish_event", &["EventRepository::insert"]),
     // write: `ClaimRepository::evolve_step_conn`; opener: `claim_helper::begin_author_stamped_tx`;
     // audit: `record_lineage_writes`; maintenance: `supersede::admin_session_or_deferral`; no SQL:
-    // `workflow_ingest::embed_created_workflow_claims`. With no ScopedPool the write transaction
-    // is `server.pool.begin()` (registered in `raw_pool_register.rs`). `require_lineage_authority`
+    // `workflow_ingest::embed_created_workflow_claims`. With no ScopedPool the opener refuses
+    // (backlog 4cbd4192 removed the `server.pool.begin()` fallback). `require_lineage_authority`
     // now takes the viewer (its own entry).
     (
         "evolve_step.rs",
         "evolve_step",
         &[
             "ClaimRepository::evolve_step_conn",
-            "ClaimRepository::evolve_step_conn",
             "claim_helper::begin_author_stamped_tx",
-            "record_lineage_writes",
             "record_lineage_writes",
             "supersede::admin_session_or_deferral",
             "workflow_ingest::embed_created_workflow_claims",
@@ -1855,17 +1853,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "improve_workflow_hierarchy_via_pool",
         &["WorkflowRepository::max_generation_by_canonical"],
     ),
-    // stamped or raw-pool fallback: `WorkflowRepository::max_generation_by_canonical`. Raw
-    // pool: the second `max_generation_by_canonical` is the no-ScopedPool fallback on
-    // `server.pool` (registered in `raw_pool_register.rs`); with a ScopedPool the read runs on
-    // the stamped transaction.
+    // stamped: `WorkflowRepository::max_generation_by_canonical`, on the caller's `read_as`
+    // (a server with no ScopedPool is refused there; backlog 4cbd4192 removed the raw-pool
+    // fallback).
     (
         "workflow_ingest.rs",
         "lineage_max_generation",
-        &[
-            "WorkflowRepository::max_generation_by_canonical",
-            "WorkflowRepository::max_generation_by_canonical",
-        ],
+        &["WorkflowRepository::max_generation_by_canonical"],
     ),
     // write: `ClaimRepository::retire_for_workflow_deprecation`,
     // `WorkflowRepository::admin_deprecate_row` (migration 237's audited admin definer),
@@ -1955,9 +1949,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // transaction, the second opener: the run carries its workflow's tenancy),
     // `ClaimRepository::update_truth_value_conn`, `EvidenceRepository::create`; opener:
     // `claim_helper::begin_author_stamped_tx`; authority:
-    // `foreign_attach::is_foreign_public_claim`; stamped or raw-pool fallback:
-    // `WorkflowRepository::exists`. Raw pool: `WorkflowRepository::exists` here is the no-
-    // ScopedPool fallback on `server.pool` (registered in `raw_pool_register.rs`).
+    // `foreign_attach::is_foreign_public_claim`. The dispatch probe is
+    // `WorkflowRepository::viewer_reads_row` on the caller's `read_as` (backlog 4cbd4192 removed
+    // the no-ScopedPool `WorkflowRepository::exists` fallback on `server.pool`).
     (
         "workflows.rs",
         "report_workflow_outcome",
@@ -1965,7 +1959,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "BehavioralExecutionRepository::create",
             "ClaimRepository::update_truth_value_conn",
             "EvidenceRepository::create",
-            "WorkflowRepository::exists",
             "claim_helper::begin_author_stamped_tx",
             "claim_helper::begin_author_stamped_tx",
             "foreign_attach::is_foreign_public_claim",
