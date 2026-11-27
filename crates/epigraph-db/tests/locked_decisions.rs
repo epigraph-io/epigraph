@@ -199,9 +199,9 @@
 //!   `tenancy_exempt` row (the registry is for relations the generators DO
 //!   find; `migration_068_and_069_apply_twice` pinned its cardinality at 12).
 //!   AMENDED by migration 173 (ruling R-66, backlog 154efca2): the two FK
-//!   neighbours of the manual tier-A addition `harvester_fragments`
-//!   (`harvester_sources`, `harvester_audit_reports`), which no generator
-//!   finds, are covered (tenancy columns and `harvester_fragments`'s row
+//!   neighbours of the manual tier-A addition, the harvester fragments table
+//!   (its sources and audit-reports tables), which no generator finds, are
+//!   covered (tenancy columns and the fragments table's row
 //!   security) and hold no registry row; the cardinality pin stays 12 and
 //!   `tenancy_coverage.rs::the_registry_is_exactly_the_measured_rows`
 //!   pins the membership. AMENDED by migration 240 (backlog 88cf603b):
@@ -1917,10 +1917,10 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     //
     // This assertion's message demands a decision rather than a silent edit, so
     // here is the decision. Arm (c) still covers exactly the 17 tier-A tables
-    // carrying a `claim_id`; `harvester_fragments` has none and still cannot be
+    // carrying a `claim_id`; the harvester fragments table has none and cannot be
     // one of them. What 089 adds is a SECOND AFTER INSERT trigger on
-    // `harvester_claim_provenance` — which already has arm (c)'s — stamping the
-    // `harvester_fragments` row that provenance row points at, from the same
+    // the harvester provenance table — which already has arm (c)'s — stamping the
+    // fragment row that provenance row points at, from the same
     // claim. That is the one write moment neither arm (c) (no `claim_id` to key
     // on) nor arm (d) (fires only when a claim's tenancy CHANGES) could reach,
     // and a fragment written before its provenance row was consequently stamped
@@ -1929,17 +1929,17 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // It is a D1 change in the direction D1 wants: strictly fewer ways for a row
     // to end up carrying no real owner, and it adds no way for one to become
     // public. That last clause is MEASURED and it is narrower than it looks: 062's
-    // visibility CHECKs restrict claims and harvester_fragments alike to exactly
-    // {public, group}, and harvester_fragments_group_needs_real_group makes a
+    // visibility CHECKs restrict claims and the harvester fragments table alike to exactly
+    // {public, group}, and the fragments table's real-group CHECK makes a
     // sentinel-owned fragment necessarily public, so a stamp can only move a
     // fragment public -> public or public -> group. It is NOT the wider claim that
     // the stamp's effect is independent of who writes the provenance row; that is
     // a separate question, recorded as finding F-089-F in
     // docs/tenancy/progress.json with its location and owner.
     // 23 SINCE MIGRATION 173 (ruling R-66), AND ARM (c)'s TABLE SET DID NOT
-    // MOVE EITHER. 173's `harvester_audit_reports_inherit_tenancy` stamps an
+    // MOVE EITHER. 173's audit-report stamp stamps an
     // audit report with its FRAGMENT's tenancy at INSERT (a report has no
-    // `claim_id`), and `harvester_fragments_audit_reports_inherit_tenancy`
+    // `claim_id`), and 173's fragment-follow trigger
     // re-stamps the reports when the fragment's pair changes; both are named
     // inside the pattern so that a disabled one is visible here like every
     // other stamping trigger.
@@ -1985,7 +1985,7 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     .fetch_all(&pool)
     .await
     .expect("read pg_trigger for the PR-16 set");
-    // 26 SINCE MIGRATION 173: `harvester_sources_require_tenancy`, a seventh
+    // 26 SINCE MIGRATION 173: 173's sources root trigger, a seventh
     // parentless root on 074's root body.
     // 26 -> 27 (ruling R-74): migration 183's `workflows_require_tenancy`,
     // 074's parentless-root body on another tier-A table.
@@ -1994,7 +1994,7 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // 30 -> 31 (backlog 34864fb5): migration 246's `papers_require_tenancy`,
     // the same root body on the paper registry.
     // 31 -> 32 (backlog f214b84e): migration 347's
-    // `harvester_enriched_concepts_require_tenancy`, the same root body.
+    // 347's concepts root trigger, the same root body.
     // 32 -> 28 (backlog a6e3dba2): migration 354 drops the four harvester
     // tables that carried one (a claim-derived table, 074's fragments root,
     // 173's and 347's roots).
@@ -2547,7 +2547,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     .into_iter()
     .collect();
     // 27 SINCE MIGRATION 173 (ruling R-66): 062's 25 plus the two harvester
-    // neighbours `harvester_sources` and `harvester_audit_reports`, which 173
+    // neighbours (its sources and audit-reports tables), which 173
     // gives both tenancy columns and FORCEs itself, on 078's precedent.
     // 27 -> 28 (ruling R-74): migration 183 gives `workflows` both tenancy
     // columns and FORCEs it, so it joins `tier_a` here and in the catalog.
@@ -2558,7 +2558,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     // 32 -> 33 (backlog 34864fb5): migration 246 gives `papers` both tenancy
     // columns and FORCEs it.
     // 33 -> 34 (backlog f214b84e): migration 347 gives
-    // `harvester_enriched_concepts` both tenancy columns and FORCEs it.
+    // the harvester concepts table both tenancy columns and FORCEs it.
     // 34 -> 29 (backlog a6e3dba2): migration 354 drops the five harvester
     // tables (two of 062's, 173's two and 347's one).
     assert_eq!(

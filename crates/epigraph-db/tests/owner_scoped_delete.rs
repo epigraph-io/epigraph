@@ -1931,9 +1931,9 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     // `behavioral_executions_delete_owner` and `behavioral_executions_owner_immutable`.
     // 31 -> 32 (backlog 34864fb5): migration 246's `papers`, with
     // `papers_delete_owner` and `papers_owner_immutable`.
-    // 32 -> 33 (backlog f214b84e): migration 347's `harvester_enriched_concepts`,
-    // with `harvester_enriched_concepts_delete_owner` and
-    // `harvester_enriched_concepts_owner_immutable`.
+    // 32 -> 33 (backlog f214b84e): migration 347's harvester concepts table,
+    // with its delete policy and
+    // its owner guard.
     // 33 -> 28 (backlog a6e3dba2): migration 354 drops the five harvester tables.
     assert_eq!(
         rows.len(),
@@ -1978,7 +1978,7 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     // 30 -> 31 (backlog 88cf603b): migration 240's `behavioral_executions_delete_owner`.
     // 31 -> 32 (backlog 34864fb5): migration 246's `papers_delete_owner`.
     // 32 -> 33 (backlog f214b84e): migration 347's
-    // `harvester_enriched_concepts_delete_owner`.
+    // its delete policy.
     // 33 -> 28 (backlog a6e3dba2): migration 354 drops the five harvester tables.
     assert_eq!(quals.len(), 28, "{quals:?}");
     for (table, qual) in &quals {
@@ -2124,13 +2124,13 @@ async fn a_reader_cannot_delete_its_groups_sealed_rows(pool: PgPool) {
 async fn every_unscoped_fk_cascade_into_tier_a_is_listed(pool: PgPool) {
     // Migration 118 section 6 closed four former entries by revoking the
     // application role's DELETE on the parent (graph_neighborhoods) or every
-    // write on it (experiment_entities, harvester_sources):
+    // write on it (experiment_entities, the harvester sources table):
     // experiment_entities -> experiment_entity_mentions / experiment_triples,
     // graph_neighborhoods -> claim_neighborhood_membership, and
-    // harvester_sources -> harvester_fragments. Only the cluster
+    // the harvester sources-to-fragments cascade. Only the cluster
     // materialization remains reachable. (Since migration 173
-    // `harvester_sources` also carries 115's restrictive DELETE policy, and
-    // `harvester_fragments -> harvester_audit_reports` is a cascade between
+    // the harvester sources table also carries 115's restrictive DELETE policy, and
+    // the fragments-to-audit-reports cascade ran between
     // two tables that both do, so neither pair can appear here.)
     //
     // Migration 210 (Atlas W2) adds `claim_themes -> atlas_map_levels`: a level

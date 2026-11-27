@@ -998,11 +998,11 @@ async fn every_tenancy_trigger_is_enabled(pool: PgPool) {
     //
     // 21 SINCE MIGRATION 089, AND THE REASON IS NOT THAT ARM (c)'s TABLE SET
     // MOVED. It did not: arm (c) still covers exactly the 17 tier-A tables that
-    // carry a `claim_id`, and `harvester_fragments` still cannot be one of them.
+    // carry a `claim_id`, and the harvester fragments table still cannot be one of them.
     // The 21st trigger is 089's
-    // `harvester_claim_provenance_fragment_inherit_tenancy`, a SECOND AFTER
+    // 089's fragment stamp trigger, a SECOND AFTER
     // INSERT trigger on a table that already has arm (c)'s. It stamps a
-    // different row — the `harvester_fragments` row the provenance row points at
+    // different row — the fragment row the provenance row points at
     // — from the same claim, which is the one moment no arm of 070 could cover.
     // It is named inside the `%_inherit_tenancy` pattern on purpose: a name
     // outside it would be invisible to this assertion, to
@@ -1011,9 +1011,9 @@ async fn every_tenancy_trigger_is_enabled(pool: PgPool) {
     // `AppState::assert_tenancy_triggers_armed`, so a DISABLED stamping trigger
     // would be indistinguishable from an armed one everywhere at once.
     //
-    // 23 SINCE MIGRATION 173 (ruling R-66): `harvester_audit_reports_inherit_
-    // tenancy` stamps an audit report from its fragment at INSERT, and
-    // `harvester_fragments_audit_reports_inherit_tenancy` re-stamps the reports
+    // 23 SINCE MIGRATION 173 (ruling R-66): 173's audit-report stamp stamps an
+    // audit report from its fragment at INSERT, and
+    // 173's fragment-follow trigger re-stamps the reports
     // when the fragment's pair changes; both are named inside the pattern for
     // the same reason as 089's.
     //

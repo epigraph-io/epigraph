@@ -127,7 +127,7 @@ async fn a1_no_tier_a_tenancy_column_has_a_default_or_is_nullable(pool: PgPool) 
     // `atlas_map_*` tables.
     // 31 -> 32 (backlog 88cf603b): migration 240's `behavioral_executions`.
     // 32 -> 33 (backlog 34864fb5): migration 246's `papers`.
-    // 33 -> 34 (backlog f214b84e): migration 347's `harvester_enriched_concepts`.
+    // 33 -> 34 (backlog f214b84e): migration 347's harvester concepts table.
     // 34 -> 29 (backlog a6e3dba2): migration 354 drops the five harvester tables
     // (two of 062's tier A, 173's two, 347's one).
     assert_eq!(
@@ -293,12 +293,12 @@ async fn a5_every_tenancy_trigger_is_enabled(pool: PgPool) {
         .iter()
         .filter(|(_, n, _)| n.ends_with("_require_tenancy"))
         .collect();
-    // 24 -> 25 since migration 173 (`harvester_sources_require_tenancy`);
+    // 24 -> 25 since migration 173 (173's sources root trigger);
     // 25 -> 26 (ruling R-74): migration 183's `workflows_require_tenancy`.
     // 26 -> 29 (Atlas W2): migration 210's three `atlas_map_*_require_tenancy`.
     // 29 -> 30 (backlog 34864fb5): migration 246's `papers_require_tenancy`.
     // 30 -> 31 (backlog f214b84e): migration 347's
-    // `harvester_enriched_concepts_require_tenancy`.
+    // 347's concepts root trigger.
     // 31 -> 27 (backlog a6e3dba2): migration 354 drops the four harvester
     // tables that carried one (the provenance table, a claim-derived one; the
     // fragments, 074's root; 173's sources and 347's concepts).
