@@ -15,6 +15,10 @@ members = [
     "crates/epigraph-embeddings",
     "crates/epigraph-engine",
     "crates/epigraph-auth",
+    # The transport-neutral service layer the three front ends (api, mcp, cli)
+    # share; it depends on kernel crates only, never on a front end
+    # (crates/epigraph-api/tests/crate_layering_ratchet.rs).
+    "crates/epigraph-service",
     "crates/epigraph-passkey",
     "crates/epigraph-api",
     "crates/epigraph-cli",
@@ -100,6 +104,7 @@ epigraph-crypto = { path = "crates/epigraph-crypto" }
 epigraph-privacy = { path = "crates/epigraph-privacy" }  # Client-side sealing (no DB, no key custody)
 epigraph-db = { path = "crates/epigraph-db" }
 epigraph-engine = { path = "crates/epigraph-engine" }
+epigraph-service = { path = "crates/epigraph-service" }  # Shared operations for the api/mcp/cli front ends (never depends on one)
 epigraph-api = { path = "crates/epigraph-api" }
 epigraph-cli = { path = "crates/epigraph-cli" }
 epigraph-embeddings = { path = "crates/epigraph-embeddings", features = ["openai"] }

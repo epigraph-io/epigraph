@@ -477,29 +477,57 @@ pub fn executor_caller_error(
 }
 
 /// How an HTTP twin of a tool answers one of its errors (`epigraph-api`'s
-/// `routes::mcp_twins`, backlog fff61b9e), decided by the JSON-RPC code alone
-/// so the two surfaces classify a refusal the same way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HttpClass {
-    /// `INVALID_PARAMS`: the caller's input is wrong; a 400.
-    BadRequest,
-    /// `INVALID_REQUEST`: this codebase's class for a denial of authority
-    /// ([`edge_not_owner`], [`claim_not_writer`], a missing principal); a 403.
-    Forbidden,
-    /// Every other code, `INTERNAL_ERROR` included: a server fault; a 500.
-    Internal,
+/// `routes::mcp_twins`, backlog fff61b9e). Defined in the service crate
+/// (`epigraph_service::errors`), so a front end that is not this server can
+/// classify a service error without depending on it; re-exported here for the
+/// callers that classify an [`McpError`].
+pub use epigraph_service::errors::{HttpClass, ServiceError};
+
+/// The [`ServiceError`] an [`McpError`] is, decided by the JSON-RPC code alone:
+/// `INVALID_PARAMS` is [`ServiceError::InvalidParams`], `INVALID_REQUEST` (this
+/// codebase's class for a denial of authority: [`edge_not_owner`],
+/// [`claim_not_writer`], a missing principal) is [`ServiceError::Denied`], and
+/// every other code, `INTERNAL_ERROR` included, is [`ServiceError::Internal`].
+/// The message is kept; `data` is not (a service error carries none).
+#[must_use]
+pub fn to_service(e: &McpError) -> ServiceError {
+    let message = e.message.to_string();
+    if e.code == ErrorCode::INVALID_PARAMS {
+        ServiceError::InvalidParams(message)
+    } else if e.code == ErrorCode::INVALID_REQUEST {
+        ServiceError::Denied(message)
+    } else {
+        ServiceError::Internal(message)
+    }
 }
 
-/// The [`HttpClass`] of `e`.
+/// The [`McpError`] a [`ServiceError`] is answered with: the inverse of
+/// [`to_service`] on its three codes. The message is designed, caller-facing
+/// text (the service crate's contract), so it is sent as written:
+/// [`invalid_params`], an `INVALID_REQUEST` with no `data`, or
+/// [`internal_error_text`].
+///
+/// A free function rather than a `From` impl: both types are foreign to this
+/// crate (`McpError` is rmcp's `ErrorData`), so the orphan rule allows no impl
+/// between them here, and the service crate does not depend on rmcp.
+#[must_use]
+pub fn from_service(e: ServiceError) -> McpError {
+    match e {
+        ServiceError::InvalidParams(m) => invalid_params(m),
+        ServiceError::Denied(m) => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(m),
+            data: None,
+        },
+        ServiceError::Internal(m) => internal_error_text(m),
+    }
+}
+
+/// The [`HttpClass`] of `e`: the class of the [`ServiceError`] it is
+/// ([`to_service`]), so the two surfaces classify a refusal the same way.
 #[must_use]
 pub fn http_class(e: &McpError) -> HttpClass {
-    if e.code == ErrorCode::INVALID_PARAMS {
-        HttpClass::BadRequest
-    } else if e.code == ErrorCode::INVALID_REQUEST {
-        HttpClass::Forbidden
-    } else {
-        HttpClass::Internal
-    }
+    to_service(e).http_class()
 }
 
 #[cfg(test)]
@@ -995,6 +1023,35 @@ mod tests {
                 data: None,
             }),
             HttpClass::Internal
+        );
+    }
+
+    /// Every service error survives the trip into an `McpError` and back with
+    /// its class and message, and its MCP code classifies to the same
+    /// [`HttpClass`] the service crate gives it.
+    #[test]
+    fn service_errors_round_trip_through_mcp_errors() {
+        for e in [
+            ServiceError::InvalidParams("bad input".into()),
+            ServiceError::Denied("not yours".into()),
+            ServiceError::Internal("designed fault text".into()),
+        ] {
+            let mcp = from_service(e.clone());
+            assert_eq!(http_class(&mcp), e.http_class(), "{e:?}");
+            assert_eq!(mcp.data, None, "{e:?}");
+            assert_eq!(to_service(&mcp), e);
+        }
+        assert_eq!(
+            from_service(ServiceError::InvalidParams("x".into())).code,
+            ErrorCode::INVALID_PARAMS
+        );
+        assert_eq!(
+            from_service(ServiceError::Denied("x".into())).code,
+            ErrorCode::INVALID_REQUEST
+        );
+        assert_eq!(
+            from_service(ServiceError::Internal("x".into())).code,
+            ErrorCode::INTERNAL_ERROR
         );
     }
 }

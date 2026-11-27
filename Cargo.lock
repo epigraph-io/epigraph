@@ -1795,6 +1795,7 @@ dependencies = [
  "epigraph-ingest",
  "epigraph-ingest-executor",
  "epigraph-interfaces",
+ "epigraph-service",
  "futures",
  "hex",
  "http 1.4.0",
@@ -1853,6 +1854,13 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "epigraph-service"
+version = "0.3.0"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]

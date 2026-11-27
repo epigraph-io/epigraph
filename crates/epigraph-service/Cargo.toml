@@ -1,0 +1,18 @@
+[package]
+name = "epigraph-service"
+description = "Transport-neutral operations shared by the EpiGraph front ends (HTTP API, MCP server, CLI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# This crate depends on kernel crates only. It never depends on a front end
+# (epigraph-api, epigraph-mcp, epigraph-cli): the front ends depend on it.
+# `crates/epigraph-api/tests/crate_layering_ratchet.rs` refuses an edge from
+# here to any of the three.
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
