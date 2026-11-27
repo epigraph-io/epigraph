@@ -7,6 +7,11 @@ Subcommands:
   project   run project_to_themes for the latest/--run-id run
   label     run label_themes_llm
 
+grow and project replace every theme (new ids; the graph neighbourhoods, Atlas
+layout and Atlas map levels built on the old ones are deleted by cascade), so
+over existing themes they refuse unless given --i-understand-full-rebuild. grow
+checks that before it clusters, not after (project_to_themes.py).
+
 All grow writes happen in Model B under one consolidated run_id; project
 materialises Model A; label names it.
 
@@ -185,6 +190,11 @@ def grow_result(run_id, k, label_returncode):
 
 
 def grow(conn, args):
+    if not args.dry_run:
+        # The projection at the end replaces every theme. Refuse an unconfirmed
+        # one now, before the clustering is paid for, not after it.
+        project_to_themes.check_full_rebuild(conn, args.confirm_full_rebuild)
+
     # --from-run-id resumes the split/project/label phases on an existing base
     # run (skips the ~40-min base assign); otherwise start a fresh consolidated run.
     if getattr(args, "from_run_id", None):
@@ -233,7 +243,7 @@ def grow(conn, args):
     if args.dry_run:
         return {"status": "dry-run", "run_id": run_id, "k": current_k(conn, run_id)}
 
-    project_to_themes.project_run(conn, run_id)
+    project_to_themes.project_run(conn, run_id, confirm_full_rebuild=args.confirm_full_rebuild)
     label_returncode = run_label_step(args.database_url)
     return grow_result(run_id, current_k(conn, run_id), label_returncode)
 
@@ -258,6 +268,10 @@ def main():
     p.add_argument("--from-run-id", default=None,
                    help="grow: resume split/project/label on an existing base run (skip base)")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(project_to_themes.FULL_REBUILD_FLAG, dest="confirm_full_rebuild",
+                   action="store_true",
+                   help="grow/project: replace existing themes; their graph neighbourhoods, "
+                        "Atlas layout and Atlas map levels are deleted with them")
     args = p.parse_args()
 
     # Resolved once, so the label subprocess is handed (through its
@@ -267,9 +281,22 @@ def main():
     conn = theme_lib.connect(args.database_url)
     theme_lib.set_statement_timeout(conn, ms=900000)
 
+    try:
+        exit_code = run_command(conn, args)
+    except project_to_themes.FullRebuildRefused as e:
+        conn.rollback()
+        print(f"ERROR: {e}", file=sys.stderr)
+        exit_code = 1
+    conn.close()
+    sys.exit(exit_code)
+
+
+def run_command(conn, args):
     exit_code = 0
     if args.command == "grow":
         result = grow(conn, args)
+        if result["status"] != "dry-run":
+            result["rebuild_next"] = project_to_themes.REBUILD_STEPS
         print(json.dumps(result))
         if result["status"] == "label_failed":
             exit_code = 1
@@ -285,14 +312,15 @@ def main():
         }))
     elif args.command == "project":
         run_id = args.run_id or project_to_themes.latest_run_id(conn)
-        print(json.dumps({"status": "projected", "run_id": run_id,
-                          "themes": project_to_themes.project_run(conn, run_id)}))
+        themes = project_to_themes.project_run(
+            conn, run_id, confirm_full_rebuild=args.confirm_full_rebuild)
+        print(json.dumps({"status": "projected", "run_id": run_id, "themes": themes,
+                          "rebuild_next": project_to_themes.REBUILD_STEPS}))
     elif args.command == "label":
         exit_code = run_label_step(args.database_url)
         if exit_code != 0:
             print(f"label step failed (exit {exit_code})", file=sys.stderr)
-    conn.close()
-    sys.exit(exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
