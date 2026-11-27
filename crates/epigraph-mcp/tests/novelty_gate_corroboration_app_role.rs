@@ -131,6 +131,36 @@ async fn viewer(pool: &PgPool, agent: Uuid) -> Viewer {
     Viewer::resolve(pool, agent).await.expect("viewer")
 }
 
+/// A keyed TEAM group with no members.
+async fn team(pool: &PgPool, label: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let key: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind) \
+         VALUES ($1, $2, 'did:epigraph:test-team:' || $1::text, $3, 'team')",
+    )
+    .bind(id)
+    .bind(label)
+    .bind(&key)
+    .execute(pool)
+    .await
+    .expect("seed team");
+    id
+}
+
+async fn add_member(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, $3)",
+    )
+    .bind(group)
+    .bind(agent)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("seed membership");
+}
+
 fn submit(
     content: &str,
     evidence: &str,
@@ -472,6 +502,79 @@ async fn a_memorized_paraphrase_corroborates_the_public_claim_it_duplicates(pool
     let after = claim_state(&pool, a_claim).await;
     assert_eq!(after.truth_value, before.truth_value);
     assert_eq!(after.labels, before.labels, "B's tags are not A's labels");
+}
+
+/// A's claim sits in a team where B is only a READER. B can read it (so the
+/// gate finds it) but may not write it, so B's paraphrase is inserted as B's
+/// OWN claim, labelled `near-duplicate`, and nothing of B lands on A's claim.
+/// The response names the refusal and the nearest claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reader_gets_its_own_flagged_claim_and_writes_nothing_on_the_team_claim(pool: PgPool) {
+    binary_truth(&pool).await;
+    let t = team(&pool, "corro-team").await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "corro-writer").await;
+    let (b, b_home) = fixture::seed_agent_with_group(&pool, "corro-reader").await;
+    add_member(&pool, t, a, "writer").await;
+    add_member(&pool, t, b, "reader").await;
+    let server = app_server(&pool).await;
+
+    let original = "The pilot reactor reached steady state within forty minutes";
+    let a_claim = parse_uuid_field(
+        &submit_as(
+            &pool,
+            &server,
+            a,
+            submit(original, "run sheet 12", "team", Some(t), &[]),
+        )
+        .await,
+        "claim_id",
+    );
+    let before = claim_state(&pool, a_claim).await;
+
+    let paraphrase = "Within forty minutes the pilot reactor reached steady state";
+    let b_evidence = "reader's own run sheet";
+    let body = submit_as(
+        &pool,
+        &server,
+        b,
+        submit(paraphrase, b_evidence, "private", None, &[]),
+    )
+    .await;
+
+    assert_ne!(body["claim_id"], a_claim.to_string(), "{body}");
+    assert!(
+        body.get("deduplicated").is_none(),
+        "an insert, not a dedup: {body}"
+    );
+    assert_eq!(
+        body["corroboration"]["refused"], "claim not writable by caller",
+        "{body}"
+    );
+    assert_eq!(
+        body["corroboration"]["nearest_claim_id"],
+        a_claim.to_string(),
+        "{body}"
+    );
+    let own = claims_with_content(&pool, paraphrase).await;
+    assert_eq!(own.len(), 1, "B's own claim: {own:?}");
+    let (own_id, own_owner, own_visibility, own_labels) = own[0].clone();
+    assert_eq!(body["claim_id"], own_id.to_string());
+    assert_eq!((own_owner, own_visibility.as_str()), (b_home, "group"));
+    assert!(
+        own_labels.iter().any(|l| l == "near-duplicate"),
+        "{own_labels:?}"
+    );
+
+    assert_eq!(
+        claim_state(&pool, a_claim).await,
+        before,
+        "nothing of B's on A's claim"
+    );
+    assert!(evidence_with_body(&pool, a_claim, b_evidence)
+        .await
+        .is_empty());
+    assert!(bbas_by(&pool, a_claim, b).await.is_empty());
+    assert!(authored_edges(&pool, b, a_claim).await.is_empty());
 }
 
 /// B writes PRIVATELY a paraphrase of A's PUBLIC claim (backlog fef24216). B

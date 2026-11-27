@@ -449,6 +449,11 @@ impl CorroborationOutcome {
 ///
 /// # When nothing is written ([`CorroborationOutcome::Refused`])
 ///
+/// * The caller can READ the claim but may not attach to it: its group is not
+///   one the caller writes, and it is not public (backlog 5578f693). Decided
+///   before any write; a row-security refusal of the evidence INSERT (a public
+///   claim, but no writable home group to own the attachment) is caught as
+///   the same refusal. The caller then inserts its own claim, flagged.
 /// * The claim's audience differs from the one the caller asked to write to
 ///   (backlog fef24216). An attachment takes the CLAIM's audience: a non-owner's
 ///   evidence on a public claim is public (migration 114), and a BBA on a public
@@ -498,6 +503,21 @@ pub async fn corroborate(
         return Ok(CorroborationOutcome::Refused(REFUSED_NOT_WRITABLE));
     };
 
+    // May the caller attach at all? A writer of the claim's group, or a
+    // non-owner of a PUBLIC claim (migration 114). Asked of the session itself.
+    let writes_claim_group =
+        epigraph_db::ClaimRepository::claims_not_writable_on_session(&mut tx, &[existing_id])
+            .await
+            .map_err(internal_error)?
+            .is_empty();
+    let foreign_public =
+        epigraph_db::repos::foreign_attach::is_foreign_public_claim(&mut tx, existing_id)
+            .await
+            .map_err(internal_error)?;
+    if !writes_claim_group && !foreign_public {
+        return Ok(CorroborationOutcome::Refused(REFUSED_NOT_WRITABLE));
+    }
+
     // Into the audience the caller asked for, and no other.
     let same_scope = match ev.tenancy.decl.visibility_bind() {
         Some("public") => claim_visibility == "public",
@@ -520,6 +540,17 @@ pub async fn corroborate(
     .await
     {
         Ok(_) => {}
+        // A public claim, but no writable home group to own the attachment.
+        Err(e) if crate::tools::claims::refused_by_row_security_on(&e, "evidence") => {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                claim_id = %existing_id,
+                tool = ev.tool,
+                "novelty gate corroboration refused by row security; inserting the caller's \
+                 own claim instead: {e}"
+            );
+            return Ok(CorroborationOutcome::Refused(REFUSED_NOT_WRITABLE));
+        }
         // The caller's group already attached this body to this claim (the
         // per-owner evidence de-duplication, migration 171). Nothing is new:
         // no BBA, no edge.
