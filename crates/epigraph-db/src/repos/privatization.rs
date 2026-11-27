@@ -2809,9 +2809,8 @@ impl PrivatizationRepository {
     /// # It fans out through a trigger, and that is deliberate
     ///
     /// Migration 072's statement-level `AFTER UPDATE` on `claims`
-    /// (`epigraph_propagate_tenancy`) copies the new tenancy to seventeen
-    /// derived tables, to `harvester_fragments` through the provenance join, and
-    /// recomputes the `edges` meet over BOTH endpoints. So this one statement is
+    /// (`epigraph_propagate_tenancy`) copies the new tenancy to the derived
+    /// tables and recomputes the `edges` meet over BOTH endpoints. So this one statement is
     /// the claims UPDATE, the evidence UPDATE and most of the boundary-edge meet
     /// §6.5.5 lists as three separate steps. **That is a correction to the plan,
     /// which was written before 072 existed in this form.** What the trigger
@@ -3495,62 +3494,6 @@ impl PrivatizationRepository {
         .map_err(|source| DbError::QueryFailed { source })
     }
 
-    /// How many distinct source fragments this plan would blank that are ALSO
-    /// cited by a claim outside it.
-    ///
-    /// # What it adds to the consent surface
-    ///
-    /// `SEAL_UNRECOVERABLE` already states the property: a fragment is one row,
-    /// so blanking it takes the source text from every claim that cites it,
-    /// including claims this plan does not touch. That sentence is unconditional
-    /// and needs no query — which is also its weakness. A plan that blanks one
-    /// shared fragment and a plan that blanks four hundred read identically,
-    /// and the operator is asked to consent to both with the same words.
-    ///
-    /// This is the magnitude. It is the count of FRAGMENTS, not of affected
-    /// claims: the fragment is the row that loses its text, and one shared
-    /// fragment cited by fifty outside claims is one loss, described once.
-    ///
-    /// # Read at preview time, over the FROZEN set
-    ///
-    /// Keyed on `privatization_plan_items` rather than on the selection's id
-    /// vector, so it describes the set the plan actually contains — the same
-    /// set the seal mutation will range over. A count taken over the selection
-    /// before the freeze could name a claim the freeze dropped.
-    ///
-    /// # Errors
-    ///
-    /// [`DbError`] for a query fault.
-    pub async fn shared_fragment_count_conn(
-        conn: &mut PgConnection,
-        plan_id: Uuid,
-    ) -> Result<i64, DbError> {
-        sqlx::query_scalar::<_, i64>(
-            r"
-            SELECT count(DISTINCT p.fragment_id)
-              FROM public.harvester_claim_provenance p
-              JOIN public.privatization_plan_items i
-                ON i.plan_id = $1 AND i.kind = 'claim' AND i.entity_id = p.claim_id
-             WHERE EXISTS (
-                     SELECT 1
-                       FROM public.harvester_claim_provenance p2
-                      WHERE p2.fragment_id = p.fragment_id
-                        AND NOT EXISTS (
-                              SELECT 1
-                                FROM public.privatization_plan_items i2
-                               WHERE i2.plan_id = $1
-                                 AND i2.kind = 'claim'
-                                 AND i2.entity_id = p2.claim_id
-                            )
-                   )
-            ",
-        )
-        .bind(plan_id)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|source| DbError::QueryFailed { source })
-    }
-
     // =====================================================================
     // SEAL — the two-phase, client-driven ceremony (§6.5.6).
     //
@@ -3926,8 +3869,6 @@ impl PrivatizationRepository {
     /// 7. The derived-extraction DELETEs, over
     ///    [`SEAL_DELETE_TABLES`], keeping the writer-owned rows of
     ///    [`SEAL_KEEPS_WRITER_OWNED`] (an outsider's challenge, ruling R-5).
-    /// 8. `harvester_fragments`, through the provenance join. Not recoverable
-    ///    on unseal, which the preview states.
     ///
     /// # Ordering: restrict first, then seal
     ///
@@ -4324,33 +4265,6 @@ impl PrivatizationRepository {
             .map_err(|source| DbError::QueryFailed { source })?;
         }
 
-        // 8. Harvester source text, through the provenance join. NOT restored
-        //    by unseal, and the preview says so before the admin clicks.
-        //
-        //    DELIBERATELY NOT NARROWED TO FRAGMENTS CITED ONLY BY SEALED CLAIMS.
-        //    `harvester_claim_provenance` is keyed `(claim_id, fragment_id)`, so
-        //    one fragment can back several claims, and a fragment shared with a
-        //    claim outside this plan is blanked for all of them. Adding a
-        //    `NOT EXISTS (… p2.claim_id <> ALL($1))` guard would leave the
-        //    SEALED claim's own source text sitting in the corpus in plaintext —
-        //    the direction §6.5.4 calls worse than not sealing at all. The cost
-        //    is borne by the other claim's provenance, which is a functional
-        //    loss and not a confidentiality one, and `SEAL_UNRECOVERABLE` states
-        //    it in the preview before the admin clicks.
-        sqlx::query(
-            r"
-            UPDATE public.harvester_fragments f
-               SET content_text = $2, context_window = NULL
-              FROM public.harvester_claim_provenance p
-             WHERE p.fragment_id = f.id AND p.claim_id = ANY($1)
-            ",
-        )
-        .bind(&sealed)
-        .bind(SEAL_EVIDENCE_SENTINEL)
-        .execute(&mut *conn)
-        .await
-        .map_err(|source| DbError::QueryFailed { source })?;
-
         Ok(sealed)
     }
 
@@ -4552,9 +4466,8 @@ impl PrivatizationRepository {
     ///
     /// # What unseal does NOT restore
     ///
-    /// The deleted extractions and `harvester_fragments`' source text. Both are
-    /// stated in the seal preview, and re-extraction is a separate, explicit
-    /// operation.
+    /// The deleted extractions. They are stated in the seal preview, and
+    /// re-extraction is a separate, explicit operation.
     ///
     /// # The ciphertext DELETEs are keyed on what was RESTORED, not on the claim
     ///

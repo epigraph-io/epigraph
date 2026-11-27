@@ -40,7 +40,7 @@
 //!   |---|---|---|
 //!   | `epigraph-ingest-executor` | 3 (`claims` ×2, `edges` ×1) | **request-reachable over BOTH transports** |
 //!   | `epigraph-embeddings` | 2 (`claims.embedding`) | background |
-//!   | `epigraph-cli` | 7 (`claims`, `edges`, `harvester_fragments`) | operator binaries |
+//!   | `epigraph-cli` | 7 (`claims`, `edges`, and a harvester table migration 354 dropped) | operator binaries |
 //!
 //!   The same revision named "the MCP write tools in particular" as the
 //!   uncovered surface. That was the WRONG POPULATION and it mattered: the MCP
@@ -116,8 +116,9 @@ use std::path::{Path, PathBuf};
 /// against the repos directory rather than assumed, and that measurement found
 /// two tables an eyeball pass had missed: `privatization.rs` writes
 /// `public.claim_versions` (in `seal_claims_conn` and `unseal_claims_conn`) and
-/// `public.harvester_fragments` (in `seal_claims_conn`). Both are schema-
-/// qualified, which is why the offset scan accepts the `public.` prefix.
+/// wrote a harvester table (in `seal_claims_conn`, until migration 354 dropped
+/// it). Both were schema-qualified, which is why the offset scan accepts the
+/// `public.` prefix.
 ///
 /// Adding them changed NO register row, because both functions were already
 /// named in [`UNGATED_REPO_WRITES`] on the strength of their `claims` writes —
@@ -132,7 +133,6 @@ const WRITE_GATED_TABLES: &[&str] = &[
     "edges",
     "evidence",
     "frames",
-    "harvester_fragments",
     "mass_functions",
     "perspectives",
     "recall_events",
@@ -599,9 +599,8 @@ fn inside_query_macro(body: &str, at: usize) -> bool {
 /// which is this PR's own failure mode relocated one level down.
 ///
 /// It has a named victim already. `privatization.rs::seal_claims_conn` writes
-/// `claims`, `public.claim_versions` and `public.harvester_fragments` — three
-/// scoped writes, one register row — and is exactly the shape that would go
-/// silent on partial conversion.
+/// `claims` and `public.claim_versions` — two scoped writes, one register row —
+/// and is exactly the shape that would go silent on partial conversion.
 ///
 /// **The real fix is per-statement classification**, deciding for each offset
 /// whether that statement's own `sqlx::query(..)` argument derives from a
