@@ -203,8 +203,6 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "dispute_batch", Tag::Todo { pr: "PR-R2", why: "recall's dispute read orders contradicting sources by truth_value; SPEC §7.2 dispute roll-up" }),
     ("crates/epigraph-db/src/repos/claim.rs", "frame_claims_sorted", Tag::Todo { pr: "PR-R3", why: "range list on c.belief / c.plausibility; SPEC §7.2 role predicate" }),
     ("crates/epigraph-db/src/repos/claim.rs", "get_belief_columns", Tag::Todo { pr: "PR-R1a", why: "the cache read under get_belief; SPEC §7.2 choke point" }),
-    ("crates/epigraph-db/src/repos/claim.rs", "get_high_truth", Tag::Todo { pr: "unassigned", why: "list gated on truth_value; no non-test caller and no plan row" }),
-    ("crates/epigraph-db/src/repos/claim.rs", "get_low_truth", Tag::Todo { pr: "unassigned", why: "list gated on truth_value; no non-test caller and no plan row" }),
     ("crates/epigraph-db/src/repos/claim.rs", "grounded_neighborhood", Tag::Todo { pr: "PR-W4", why: "hypothesis neighbourhood returns c.belief / c.plausibility; SPEC §4.1 W13" }),
     ("crates/epigraph-db/src/repos/claim.rs", "list_by_belief_bounds", Tag::Todo { pr: "PR-R3", why: "range list on c.belief / c.plausibility; SPEC §7.2 floor row or omitted" }),
     ("crates/epigraph-db/src/repos/claim.rs", "list_by_labels", Tag::Todo { pr: "unassigned", why: "query_claims_by_label min-truth gate on truth_value; no plan row converts it" }),
