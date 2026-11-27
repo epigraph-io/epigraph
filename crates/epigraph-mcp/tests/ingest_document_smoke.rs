@@ -740,7 +740,7 @@ fn inline_tool_wire_schema_is_self_contained() {
 /// payload: every handler test builds the params struct directly. Pin that
 /// both detached ingest tools publish a boolean `wait` and that a wire payload
 /// carrying it deserializes to `Some(true)`, so a serde or schemars change
-/// cannot silently drop it and bring back the queued-only contract.
+/// cannot silently drop it (and with it the `wait: false` opt-out).
 #[test]
 fn ingest_tools_publish_and_deserialize_the_wait_flag() {
     let tools = epigraph_mcp::server::EpiGraphMcpFull::all_tools_json();
@@ -766,7 +766,7 @@ fn ingest_tools_publish_and_deserialize_the_wait_flag() {
             .unwrap_or_default();
         assert!(
             !required.iter().any(|r| r == "wait"),
-            "{name}: `wait` is opt-in and must not be required: {required:?}"
+            "{name}: `wait` is optional (default true) and must not be required: {required:?}"
         );
     }
 
@@ -780,7 +780,7 @@ fn ingest_tools_publish_and_deserialize_the_wait_flag() {
             .expect("inline params without wait deserialize");
     assert_eq!(
         inline.wait, None,
-        "omitted `wait` keeps the queued contract"
+        "an omitted `wait` deserializes to None, which the handlers read as true"
     );
     let file: IngestDocumentParams =
         serde_json::from_value(serde_json::json!({ "file_path": "x.json", "wait": true }))
@@ -826,7 +826,7 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
     let params = IngestDocumentInlineParams {
         extraction,
-        wait: None,
+        wait: Some(false),
         visibility: Some("public".to_string()),
         group_id: None,
     };
@@ -1153,6 +1153,143 @@ async fn inline_wait_mode_returns_the_walk_result(pool: PgPool) {
         "every level is committed by the time the call returns"
     );
     assert_eq!(processed_by_edges(&pool, SMOKE_DOI).await, 1);
+}
+
+// ── Backlog 81d8afe0: an omitted `wait` waits ──
+//
+// A detached walk's failure reaches only the server log, so the queued answer
+// is the opt-in (`wait: false`), and a caller that names nothing gets the
+// walk's own result or its error.
+
+/// `ingest_document_inline` with `wait` omitted returns the walk's counts, not
+/// a queue acknowledgement, and the claims exist when it returns.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_omitted_wait_returns_the_walk_result(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+
+    let result = ingest_document_inline(&server, &viewer, inline_params(None), None)
+        .await
+        .expect("a valid document ingests with wait omitted");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    assert!(
+        json.get("status").is_none(),
+        "an omitted wait runs the walk in the request, not queued: {json}"
+    );
+    assert_eq!(json["claims_ingested"], serde_json::json!(5), "{json}");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        5,
+        "every level is committed by the time the call returns"
+    );
+    assert_eq!(processed_by_edges(&pool, SMOKE_DOI).await, 1);
+}
+
+/// The file-path `ingest_document` with `wait` omitted: the same default.
+#[sqlx::test(migrations = "../../migrations")]
+async fn file_path_omitted_wait_returns_the_walk_result(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+
+    // Under the current directory: the handler refuses a path outside it.
+    let path = std::env::current_dir().expect("current dir").join(format!(
+        "default-wait-fixture-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, FIXTURE).expect("write fixture");
+    let outcome = ingest_document(
+        &server,
+        &viewer,
+        IngestDocumentParams {
+            file_path: path.display().to_string(),
+            wait: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
+        None,
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+    let json: serde_json::Value = serde_json::from_str(&result_text(
+        &outcome.expect("a valid document ingests with wait omitted"),
+    ))
+    .expect("response JSON");
+    assert!(
+        json.get("status").is_none(),
+        "an omitted wait runs the walk in the request, not queued: {json}"
+    );
+    assert_eq!(json["claims_ingested"], serde_json::json!(5), "{json}");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        5,
+        "every level is committed by the time the call returns"
+    );
+}
+
+/// With `wait` omitted a walk that fails (here the D9 verbatim guard) is
+/// returned to the caller as an error, and leaves no `papers` row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_omitted_wait_returns_the_walk_error_and_leaves_no_paper_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction: DocumentExtraction = serde_json::from_value(serde_json::json!({
+        "source": {
+            "title": "Default Wait Drift Doc",
+            "doi": "10.1/default-wait-drift",
+            "source_type": "InternalDocument",
+            "authors": [{"name": "test", "affiliations": [], "roles": ["author"]}],
+            "metadata": {}
+        },
+        "thesis": "t",
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "S",
+            "paragraphs": [{
+                "text": "TAMPERED",
+                "span": { "start": 0, "end": 5 },
+                "atoms": ["a"],
+                "generality": [0],
+                "confidence": 0.8
+            }]
+        }],
+        "relationships": [],
+        "source_text": "alpha beta"
+    }))
+    .unwrap();
+
+    let outcome = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
+        None,
+    )
+    .await;
+    // A walk the old default would have queued is finished before the row
+    // count is read, so "no row" is not "not yet".
+    drain(&server).await;
+    let err = match outcome {
+        Ok(ok) => panic!(
+            "an omitted wait must return the walk's error, not an acknowledgement: {}",
+            result_text(&ok)
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.message.contains("verbatim guard"),
+        "the refusal must be the verbatim guard, got: {}",
+        err.message
+    );
+    assert_eq!(
+        papers_keyed(&pool, "10.1/default-wait-drift").await,
+        0,
+        "a failed walk leaves no papers row"
+    );
 }
 
 // ── DOI key canonicalization: a resolver-URL DOI keys the bare-DOI row ─────
@@ -1767,7 +1904,7 @@ async fn detached_ingest_whose_walk_fails_leaves_no_paper_row(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     refuse_every_trace_insert(&pool).await;
 
-    let queued = ingest_document_inline(&server, &viewer, inline_params(None), None)
+    let queued = ingest_document_inline(&server, &viewer, inline_params(Some(false)), None)
         .await
         .expect("the detached handler answers queued");
     let announced = paper_id_of(&queued);
@@ -1791,7 +1928,7 @@ async fn detached_ingest_whose_walk_fails_leaves_no_paper_row(pool: PgPool) {
 
     // Control: the fault removed, the same ingest lands, under the announced id.
     drop_trace_refusal(&pool).await;
-    let queued = ingest_document_inline(&server, &viewer, inline_params(None), None)
+    let queued = ingest_document_inline(&server, &viewer, inline_params(Some(false)), None)
         .await
         .expect("the detached handler answers queued");
     assert_eq!(
@@ -1864,7 +2001,7 @@ async fn ingest_responses_report_the_stored_title_not_the_callers(pool: PgPool) 
         .await
         .expect("seed the stored paper");
 
-    let queued = ingest_document_inline(&server, &viewer, inline_params(None), None)
+    let queued = ingest_document_inline(&server, &viewer, inline_params(Some(false)), None)
         .await
         .expect("queued");
     let queued: serde_json::Value =
@@ -1927,7 +2064,7 @@ async fn spine_response_reports_the_stored_title_and_a_null_title_is_filled(pool
         &viewer,
         IngestDocumentInlineParams {
             extraction: serde_json::from_value(null_titled).expect("fixture parses"),
-            wait: None,
+            wait: Some(false),
             visibility: Some("public".to_string()),
             group_id: None,
         },

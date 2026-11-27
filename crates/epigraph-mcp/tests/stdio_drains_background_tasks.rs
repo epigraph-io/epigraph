@@ -1,7 +1,7 @@
 //! A stdio server waits for the tasks its tool calls left running before it
 //! exits (backlog b928ccc1).
 //!
-//! `ingest_document` / `ingest_document_inline` answer `queued` and run their
+//! `ingest_document` / `ingest_document_inline` with `wait: false` answer `queued` and run their
 //! walk in a detached task, and both document walks embed their new claims in
 //! another one. On stdio, `main` returned as soon as the client closed the
 //! transport (`service.waiting()`), and the runtime then dropped those tasks:

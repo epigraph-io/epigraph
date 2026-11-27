@@ -81,7 +81,7 @@ async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
         &viewer,
         IngestDocumentInlineParams {
             extraction,
-            wait: None,
+            wait: Some(false),
             visibility: Some("public".to_string()),
             group_id: None,
         },
