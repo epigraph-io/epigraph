@@ -28,6 +28,7 @@
     {%- endblock %}
     <nav class="auth-nav" aria-label="Account">
       {%- if ctx.signed_in %}
+      <a class="button-quiet" href="{{ ctx.recalls_url() }}">My recalls</a>
       <form method="post" action="{{ ctx.logout_url() }}">
         <button type="submit" class="button-quiet">Sign out</button>
       </form>

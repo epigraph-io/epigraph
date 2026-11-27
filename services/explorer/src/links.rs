@@ -154,6 +154,16 @@ impl Links {
         }
     }
 
+    /// The signed-in caller's own recall history, `/recalls`.
+    pub fn recalls(&self) -> String {
+        self.path("/recalls")
+    }
+
+    /// `/recalls?after=<cursor>`: the page after the one `cursor` ended.
+    pub fn recalls_after(&self, cursor: &str) -> String {
+        format!("{}?{}", self.recalls(), query(&[("after", cursor)]))
+    }
+
     pub fn agent(&self, id: Uuid) -> String {
         self.path(&format!("/agent/{id}"))
     }
