@@ -5230,7 +5230,9 @@ restart.
   `harvester_fragments` arm), then `DROP TABLE` (RESTRICT, foreign-key order) the five and
   `DROP FUNCTION` the three trigger functions only they ran
   (`epigraph_inherit_fragment_tenancy_stmt`, `epigraph_audit_report_inherit_tenancy`,
-  `epigraph_fragment_audit_reports_follow`). No surviving function body names a harvester table.
+  `epigraph_fragment_audit_reports_follow`), and deletes the two `tenancy_backfill_progress`
+  rows 062 seeded for the tier-A harvester tables (the ledger keeps one row per tier-A table).
+  No surviving function body names a harvester table.
   The binary, operator CLI, tenancy backfill, ratchets and censuses drop the tables in the same
   change (`state.rs`'s FORCE list and the 070/074/089/173 trigger tiers, the seal, the operator's
   cascade model, `epigraph-tenancy-backfill`'s fragment entity and ownership register). Pinned by
@@ -5238,12 +5240,15 @@ restart.
   head, with a calibration below 354; the three guards; the undo). Undo:
   `docs/runbooks/354-undo.sql` re-creates the five tables EMPTY in their 347 shape (columns,
   constraints, indexes, triggers, FORCEd row security, policies, grants, comments) and the
-  replaced bodies and dropped functions byte for byte; it refuses (55000) over a body a later
-  migration re-stated. **Measure first** (guard (c)): `SELECT count(*)` of each table as a
-  superuser. **Deploy order:** the binary of this change with the migration (`epigraph-migrate`
-  as ExecStartPre): it boots on either side of 354, while an OLDER binary refuses to boot on a
-  migrated database (it requires `harvester_claim_provenance_inherit_tenancy`, 070's tier) and
-  its seal would fail (42P01). The operator CLI of this change refuses a database below 354.
+  replaced bodies and dropped functions byte for byte, and re-seeds the two ledger rows as 062
+  did; it refuses (55000) over a body a later migration re-stated. Run it BEFORE any older
+  runbook that re-states one of the four bodies or names a harvester table (284's, 258's,
+  242's, 126's, ...): those refuse over 354's bodies or fail on the absent tables. **Measure first** (guard (c)): `SELECT count(*)` of each table as a
+  superuser. **Deploy order:** the binary of this change with the migration, or before
+  it: it runs on either side of 354. An OLDER binary still boots on a migrated database (its
+  trigger check skips an absent table with a warning, and the 089/173 tiers are gated on functions
+  354 drops), but its seal fails (42P01 on `harvester_fragments`). The operator CLI of this change
+  refuses a database below 354 (its cascade model no longer attributes the provenance table).
   Apply as a superuser. **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

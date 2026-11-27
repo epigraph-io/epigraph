@@ -24,6 +24,8 @@
 --   * re-creates the five tables EMPTY in the shape they had after 347:
 --     columns, constraints, indexes, triggers, ENABLE + FORCE row security,
 --     policies, grants and table comments.
+--   * re-seeds the two `tenancy_backfill_progress` rows 354 deleted, as 062
+--     seeded them (not complete; the row is observability only).
 --
 -- WHAT IT LEAVES:
 --   * no rows: 354 refused to run while any table held one, so there is
@@ -1268,5 +1270,12 @@ GRANT SELECT,INSERT,UPDATE ON TABLE public.harvester_fragments TO epigraph_maint
 GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.harvester_fragments TO epigraph_app;
 GRANT SELECT,INSERT,UPDATE ON TABLE public.harvester_sources TO epigraph_maintenance;
 GRANT SELECT ON TABLE public.harvester_sources TO epigraph_app;
+
+-- ===================================================================
+-- 8. THE BACKFILL PROGRESS ROWS 354 DELETED, AS 062 SEEDED THEM
+-- ===================================================================
+INSERT INTO public.tenancy_backfill_progress (entity)
+VALUES ('harvester_claim_provenance'), ('harvester_fragments')
+ON CONFLICT (entity) DO NOTHING;
 
 COMMIT;

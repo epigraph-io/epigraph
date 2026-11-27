@@ -170,6 +170,17 @@ async fn harvester_relations(pool: &PgPool) -> Vec<String> {
     .expect("relations")
 }
 
+/// The backfill ledger rows (062) of the two tier-A harvester tables.
+async fn harvester_progress_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM tenancy_backfill_progress \
+          WHERE entity IN ('harvester_claim_provenance', 'harvester_fragments')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("progress rows")
+}
+
 async fn dropped_functions_present(pool: &PgPool) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT p.proname::text FROM pg_proc p \
@@ -182,16 +193,18 @@ async fn dropped_functions_present(pool: &PgPool) -> Vec<String> {
 }
 
 /// At head: no harvester relation, none of the three harvester-only trigger
-/// functions, and no function body naming one of the five tables.
+/// functions, no function body naming one of the five tables, and no backfill
+/// ledger row for one.
 ///
-/// Fails before 354: the five tables (and their indexes), the three functions
-/// and seven bodies (the three, plus propagate, publicize, share and the
-/// elevated-access recorder) are all present.
+/// Fails before 354: the five tables (and their indexes), the three functions,
+/// seven bodies (the three, plus propagate, publicize, share and the
+/// elevated-access recorder) and the two ledger rows are all present.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_harvester_table_or_body_survives_at_head(pool: PgPool) {
     assert_eq!(harvester_relations(&pool).await, Vec::<String>::new());
     assert_eq!(dropped_functions_present(&pool).await, Vec::<String>::new());
     assert_eq!(bodies_naming_a_table(&pool).await, Vec::<String>::new());
+    assert_eq!(harvester_progress_rows(&pool).await, 0);
 }
 
 /// Calibration for the body check: below 354 it names exactly the seven
@@ -237,10 +250,17 @@ async fn the_354_undo_returns_the_catalog_below_354(pool: PgPool) {
     let removed: BTreeSet<&String> = before.difference(&through_354).collect();
     for t in TABLES {
         assert!(
-            removed.iter().any(|e| e.starts_with(&format!("rel {t} r "))),
+            removed
+                .iter()
+                .any(|e| e.starts_with(&format!("rel {t} r "))),
             "CALIBRATION: 354 drops {t}"
         );
     }
+    assert_eq!(
+        harvester_progress_rows(&pool).await,
+        0,
+        "CALIBRATION: 354 deletes the two ledger rows"
+    );
     let undo = repo_file("docs/runbooks/354-undo.sql");
     for run in ["first", "second"] {
         sqlx::raw_sql(&undo)
@@ -252,6 +272,11 @@ async fn the_354_undo_returns_the_catalog_below_354(pool: PgPool) {
             after.symmetric_difference(&before).collect::<Vec<_>>(),
             Vec::<&String>::new(),
             "after the {run} run the catalog is exactly the one below 354"
+        );
+        assert_eq!(
+            harvester_progress_rows(&pool).await,
+            2,
+            "after the {run} run the two ledger rows are back"
         );
     }
 }
@@ -304,10 +329,7 @@ async fn migration_354_refuses_a_body_it_was_not_written_from(pool: PgPool) {
     let err = migrate(&pool, &through(354))
         .await
         .expect_err("354 must refuse a publicize body it was not written from");
-    assert!(
-        err.contains("is not the body 354 re-states"),
-        "{err}"
-    );
+    assert!(err.contains("is not the body 354 re-states"), "{err}");
     assert!(err.contains("55000"), "{err}");
     assert_eq!(
         catalog(&pool).await.symmetric_difference(&before).count(),

@@ -59,6 +59,10 @@
 --      `epigraph_root_require_tenancy`, `epigraph_derived_require_tenancy`,
 --      `epigraph_inherit_tenancy_stmt`, `epigraph_role_agent_write_check`)
 --      stay.
+--   5. Deletes the two `tenancy_backfill_progress` rows 062 seeded for
+--      `harvester_claim_provenance` and `harvester_fragments`: the table holds
+--      one row per tier-A table (`tenancy_migration_shape.rs`), and those two
+--      are no longer tables. The row is observability only (062).
 --
 -- NOT CHANGED: `docs/runbooks/079-undo.sql` and the other historical
 -- runbooks still name these tables; they describe the files they undo.
@@ -75,19 +79,23 @@
 -- Measure first: `SELECT count(*) FROM <each table>` as a superuser (guard
 -- (c) refuses on any row).
 --
--- Binary: the API binary of this change no longer requires the 070, 074,
--- 089 and 173 harvester triggers, and no longer names the tables in its seal
--- or its FORCE list, so it boots before and after this file. An OLDER binary
--- refuses to boot on a migrated database (it requires
--- `harvester_claim_provenance_inherit_tenancy`, 070's tier), and its seal
--- fails (42P01). Deploy the binary with this file (`epigraph-migrate` as the
--- unit's ExecStartPre does). The operator CLI of this change refuses a
--- database below 354 (its cascade model finds a table in
--- `epigraph_propagate_tenancy`'s list it no longer attributes).
+-- Binary: the API binary of this change names none of the tables (its FORCE
+-- list, its trigger tiers and its seal), so it runs on either side of this
+-- file. An OLDER binary still boots on a migrated database (its boot check
+-- skips a trigger whose table is absent, with a warning, and the 089 and 173
+-- tiers are gated on functions this file drops), but its seal statement
+-- naming `harvester_fragments` fails with 42P01, so a privatization seal
+-- fails until the new binary runs. Deploy the binary with this file, or
+-- before it. The operator CLI of this change refuses a database below 354:
+-- its cascade model finds `harvester_claim_provenance` in
+-- `epigraph_propagate_tenancy`'s list and no longer attributes it.
 --
 -- Undo: `docs/runbooks/354-undo.sql` (roll the binary back first) recreates
 -- the five tables EMPTY in their 347 shape and re-states the four bodies
--- and the three trigger functions this file replaced or dropped.
+-- and the three trigger functions this file replaced or dropped. Run it
+-- BEFORE any older runbook that re-states one of the four bodies or names a
+-- harvester table (284's, 258's, 242's, 126's, ...): those refuse over this
+-- file's bodies or fail on the absent tables.
 SET LOCAL lock_timeout = '3s';
 
 -- ===================================================================
@@ -915,3 +923,9 @@ DROP TABLE public.harvester_enriched_concepts;
 DROP FUNCTION public.epigraph_inherit_fragment_tenancy_stmt();
 DROP FUNCTION public.epigraph_audit_report_inherit_tenancy();
 DROP FUNCTION public.epigraph_fragment_audit_reports_follow();
+
+-- ===================================================================
+-- 5. THE BACKFILL PROGRESS ROWS OF THE TWO TIER-A HARVESTER TABLES
+-- ===================================================================
+DELETE FROM public.tenancy_backfill_progress
+ WHERE entity IN ('harvester_claim_provenance', 'harvester_fragments');
