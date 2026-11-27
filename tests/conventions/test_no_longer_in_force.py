@@ -124,6 +124,16 @@ class NoLongerInForcePage(unittest.TestCase):
             with self.subTest(writer=path):
                 self.assertIn(f"`{path}`", row)
 
+    def test_page_names_the_edge_bba_deletions(self):
+        # Retiring a matcher edge deletes its edge-slot BBAs; a reader who
+        # expects `unretract_bba` to bring them back must be told otherwise.
+        self.assertTrue(PAGE.is_file())
+        page = PAGE.read_text(encoding="utf-8")
+        self.assertIn("`delete_edge_bbas`", page)
+        lib = (REPO / "crates" / "epigraph-db" / "src" / "repos" / "mass_function.rs").read_text(encoding="utf-8")
+        self.assertIn("pub async fn delete_edge_bbas", lib)
+        self.assertIn("DELETE FROM mass_functions", lib)
+
     def test_retracted_bba_revives_only_through_the_audited_unretract(self):
         self.assertTrue(PAGE.is_file())
         row = " ".join(rows().get("`mass_functions`", []))
