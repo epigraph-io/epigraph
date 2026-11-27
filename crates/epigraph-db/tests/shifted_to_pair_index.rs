@@ -62,6 +62,25 @@ async fn try_edge(
     .await
 }
 
+async fn try_typed_edge(
+    pool: &PgPool,
+    (source, source_type): (Uuid, &str),
+    (target, target_type): (Uuid, &str),
+    rel: &str,
+) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    )
+    .bind(source)
+    .bind(source_type)
+    .bind(target)
+    .bind(target_type)
+    .bind(rel)
+    .fetch_one(pool)
+    .await
+}
+
 /// The document ingest's edge writer, on a connection of its own, exactly as
 /// `ingest_document`'s walk calls it for a caller's relationship.
 async fn ingest_writer(
@@ -319,4 +338,23 @@ async fn the_ingest_writer_answers_a_pair_collision_with_the_designed_refusal(po
             res.expect("the first alternative_of");
         }
     }
+}
+
+/// Review finding: the merge paths' pair guard sees claim/claim edges only,
+/// so the index is narrowed to them. A `shifted_to` with a non-claim end
+/// (here an agent) does not hold the pair, in either direction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_claim_endpoint_is_outside_the_pair_index(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let a = seed_claim(&pool, agent, "ceiling 400/s").await;
+
+    try_typed_edge(&pool, (agent, "agent"), (a, "claim"), "shifted_to")
+        .await
+        .expect("agent -> claim");
+    try_typed_edge(&pool, (a, "claim"), (agent, "agent"), "shifted_to")
+        .await
+        .expect("the reversal over a non-claim end is outside the claim/claim index");
+    try_typed_edge(&pool, (agent, "agent"), (a, "claim"), "shifted_to")
+        .await
+        .expect("so is the duplicate");
 }
