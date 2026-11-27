@@ -19,8 +19,8 @@
 //! The move is a wave of small steps (93e01896's work items), each moving one
 //! module here and re-exporting it from where it was, so no caller changes in
 //! the same step. `crates/epigraph-api/tests/crate_layering_ratchet.rs` holds
-//! the front-end edges and the per-file `epigraph_mcp::` / `epigraph_cli::`
-//! reference counts at their current values; each step lowers them, and the
+//! the front-end edges and each file's references to another front end's
+//! crate at their current values (this crate's at zero); each step lowers them, and the
 //! last one takes them to zero.
 //!
 //! # What is here so far

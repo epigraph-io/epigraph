@@ -10,7 +10,7 @@
 //! | [`Denied`](ServiceError::Denied)    | `INVALID_REQUEST`   | 403                  |
 //! | [`Internal`](ServiceError::Internal) | `INTERNAL_ERROR`   | 500                  |
 //!
-//! The mapping was `epigraph_mcp::errors::http_class` (backlog fff61b9e), which
+//! The mapping was the MCP crate's `errors::http_class` (backlog fff61b9e), which
 //! classified a JSON-RPC error by its code so the MCP tools and their HTTP
 //! twins (`epigraph-api`'s `routes::mcp_twins`) answer a refusal alike. It
 //! lives here now so a front end that is not the MCP server can classify a
@@ -57,7 +57,7 @@ impl ServiceError {
 }
 
 /// How an HTTP front end answers a [`ServiceError`] (and, through
-/// `epigraph_mcp::errors::http_class`, an MCP tool's error in an HTTP twin).
+/// the MCP crate's `errors::http_class`, an MCP tool's error in an HTTP twin).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpClass {
     /// [`ServiceError::InvalidParams`] (`INVALID_PARAMS`): the caller's input
