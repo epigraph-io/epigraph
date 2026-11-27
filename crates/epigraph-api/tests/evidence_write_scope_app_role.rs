@@ -22,9 +22,18 @@
 //!   INSERT is refused outright;
 //! * a privileged raw pool with an application-role `ScopedPool` (a deployment
 //!   whose `DATABASE_URL` is the owner): the shape in which the unstamped write
-//!   SUCCEEDED and the rows took no caller ownership. `learn_convention` is
-//!   measured here only, because it still writes its system-authored claim on
-//!   the raw pool (see the module doc of `routes/conventions.rs`).
+//!   SUCCEEDED and the rows took no caller ownership.
+//!
+//! `learn_convention` (backlog 1c822492) also wrote its convention CLAIM on the
+//! raw pool, authored by a zero-key system agent: on the application role that
+//! INSERT was refused by `claims_tenancy`'s `WITH CHECK` (a 500), and on a
+//! privileged raw pool the claim was owned by the system agent's group. A
+//! convention is now authored by its `claims:admin` caller and owned by the
+//! caller's home group, and every row of the request (claim, labels, evidence,
+//! trace, edges) is one write on the caller's stamped transaction. Its arms run
+//! on both shapes, a caller without `claims:admin` is refused with nothing
+//! written, and content an existing convention already holds is a 409 that
+//! leaves the existing convention untouched.
 #![cfg(feature = "db")]
 
 mod viewer_fixture;
@@ -258,50 +267,293 @@ async fn post_evidence_on_an_unreadable_claim_answers_as_a_missing_one(pool: PgP
     );
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn learned_convention_evidence_is_owned_by_the_callers_group(pool: PgPool) {
-    let state = privileged_raw_state(&pool).await;
-    let (admin, admin_group) = seed_agent_with_group(&pool, "convention-admin").await;
-    let request: LearnConventionRequest = serde_json::from_value(serde_json::json!({
-        "content": format!("73d4f7ff convention {}", Uuid::new_v4()),
-        "evidence": "seen in three reviews",
-    }))
-    .expect("request");
+/// `(relationship, source_type, target_type, owner_group_id, writer_group_id)`
+/// of every edge touching `claim` with no evidence endpoint (the convention's
+/// structural AUTHORED / TRACES / HAS_TRACE edges), sorted.
+///
+/// A structural edge between public endpoints stays `('public', world)` by
+/// migration 120's design, so its OWNER cannot tell who wrote it; its
+/// `writer_group_id` can: the trigger records the writing session's group on
+/// every INSERT, and NULL when no session principal was stamped.
+async fn structural_edges_of(
+    pool: &PgPool,
+    claim: Uuid,
+) -> Vec<(String, String, String, Uuid, Option<Uuid>)> {
+    let mut rows: Vec<(String, String, String, Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT relationship, source_type, target_type, owner_group_id, writer_group_id \
+           FROM edges \
+          WHERE (source_id = $1 OR target_id = $1) \
+            AND source_type <> 'evidence' AND target_type <> 'evidence'",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("structural edges");
+    rows.sort();
+    rows
+}
+
+fn convention_request(content: &str) -> Json<LearnConventionRequest> {
+    convention_request_with(content, "seen in three reviews", "rust-style")
+}
+
+fn convention_request_with(
+    content: &str,
+    evidence: &str,
+    tag: &str,
+) -> Json<LearnConventionRequest> {
+    Json(
+        serde_json::from_value(serde_json::json!({
+            "content": content,
+            "evidence": evidence,
+            "tags": [tag],
+        }))
+        .expect("request"),
+    )
+}
+
+/// A `claims:admin` caller learns a convention. The claim, its labels, its
+/// evidence and `supports` edge, its trace and its structural edges are ONE
+/// write on the caller's stamped transaction: the claim is authored by the
+/// caller and owned by the caller's home group (public), and the evidence and
+/// its edge are the caller's too.
+async fn assert_learn_convention_is_the_callers(pool: PgPool, state: AppState, label: &str) {
+    let (admin, admin_group) = seed_agent_with_group(&pool, &format!("{label}-admin")).await;
+    let content = format!("1c822492 {label} convention {}", Uuid::new_v4());
 
     let (status, Json(created)) = learn_convention(
         viewer(&pool, admin).await,
         State(state),
         auth(admin, "claims:admin"),
-        Json(request),
+        convention_request(&content),
     )
     .await
-    .expect("the convention is learned");
-    assert_eq!(status.as_u16(), 201);
+    .unwrap_or_else(|e| panic!("{label}: the convention is learned: {e:?}"));
+    assert_eq!(status.as_u16(), 201, "{label}");
 
-    // The convention claim is the system agent's, public, in another group.
-    let (visibility, claim_group): (String, Uuid) =
-        sqlx::query_as("SELECT visibility::text, owner_group_id FROM claims WHERE id = $1")
-            .bind(created.claim_id)
-            .fetch_one(&pool)
-            .await
-            .expect("the convention claim");
-    assert_eq!(visibility, "public");
-    assert_ne!(
-        claim_group, admin_group,
-        "calibration: the claim is not the caller's, so the writer-owned branch decides"
+    let (visibility, claim_group, author, has_trace, labels): (
+        String,
+        Uuid,
+        Uuid,
+        bool,
+        Vec<String>,
+    ) = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id, agent_id, trace_id IS NOT NULL, labels \
+           FROM claims WHERE id = $1",
+    )
+    .bind(created.claim_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the convention claim");
+    assert_eq!(
+        (visibility.as_str(), claim_group, author),
+        ("public", admin_group, admin),
+        "{label}: the convention is public, authored by the caller and owned by its home group"
     );
+    assert!(has_trace, "{label}: the claim carries its reasoning trace");
+    for want in ["convention", "learned", "rust-style"] {
+        assert!(
+            labels.iter().any(|l| l == want),
+            "{label}: label {want} stored: {labels:?}"
+        );
+    }
 
     let rows = evidence_on(&pool, created.claim_id).await;
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    let (evidence, owner, writer_owned) = rows[0];
-    assert_eq!(
-        (owner, writer_owned),
-        (admin_group, true),
-        "the learned convention's evidence is the caller's"
-    );
+    assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+    let (evidence, owner, _) = rows[0];
+    assert_eq!(owner, admin_group, "{label}: the evidence is the caller's");
     assert_eq!(
         edges_between(&pool, evidence, created.claim_id).await,
         vec![("supports".to_string(), admin_group)],
-        "the supports edge is the caller's, not world-owned"
+        "{label}: the supports edge is the caller's, not world-owned ({})",
+        world_group(&pool).await
+    );
+    let world = world_group(&pool).await;
+    let structural = |relationship: &str, source: &str, target: &str| {
+        (
+            relationship.to_string(),
+            source.to_string(),
+            target.to_string(),
+            world,
+            Some(admin_group),
+        )
+    };
+    assert_eq!(
+        structural_edges_of(&pool, created.claim_id).await,
+        vec![
+            structural("AUTHORED", "agent", "claim"),
+            structural("HAS_TRACE", "claim", "trace"),
+            structural("TRACES", "trace", "claim"),
+        ],
+        "{label}: the structural edges are written with the claim, on the caller's stamp \
+         (world-owned, as every public structural edge is, with the caller's writer group)"
+    );
+    let authored_by: Uuid = sqlx::query_scalar(
+        "SELECT source_id FROM edges WHERE target_id = $1 AND relationship = 'AUTHORED'",
+    )
+    .bind(created.claim_id)
+    .fetch_one(&pool)
+    .await
+    .expect("AUTHORED edge");
+    assert_eq!(
+        authored_by, admin,
+        "{label}: the caller authored the convention"
+    );
+}
+
+/// Both pools on the application role: the production shape, where the
+/// unstamped claim INSERT was refused by `claims_tenancy`'s `WITH CHECK` (a
+/// 500) before the handler reached its evidence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn learn_convention_on_the_app_role_is_owned_by_the_callers_home_group(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    assert_learn_convention_is_the_callers(pool, state, "app-role").await;
+}
+
+/// A privileged raw pool: the shape in which the unstamped claim write
+/// succeeded, authored by a zero-key system agent and owned by that agent's
+/// group rather than the caller's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn learn_convention_on_a_privileged_raw_pool_is_owned_by_the_callers_home_group(
+    pool: PgPool,
+) {
+    let state = privileged_raw_state(&pool).await;
+    assert_learn_convention_is_the_callers(pool, state, "privileged-raw").await;
+}
+
+/// A caller without `claims:admin` is refused (403) and nothing is written:
+/// no claim with the content, no evidence, no agent minted for the request.
+#[sqlx::test(migrations = "../../migrations")]
+async fn learn_convention_without_claims_admin_is_refused_and_writes_nothing(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (writer, _) = seed_agent_with_group(&pool, "convention-writer").await;
+    let content = format!("1c822492 refused convention {}", Uuid::new_v4());
+    let agents_before: i64 = sqlx::query_scalar("SELECT count(*) FROM agents")
+        .fetch_one(&pool)
+        .await
+        .expect("agents");
+
+    let res = learn_convention(
+        viewer(&pool, writer).await,
+        State(state),
+        auth(writer, "claims:write"),
+        convention_request(&content),
+    )
+    .await;
+    let (status, _) = rendered(res, Uuid::nil()).await;
+    assert_eq!(
+        status, 403,
+        "a claims:write caller may not learn a convention"
+    );
+
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .expect("claims");
+    let evidence: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM evidence WHERE raw_content = 'seen in three reviews'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("evidence");
+    let agents_after: i64 = sqlx::query_scalar("SELECT count(*) FROM agents")
+        .fetch_one(&pool)
+        .await
+        .expect("agents");
+    assert_eq!(
+        (claims, evidence, agents_after),
+        (0, 0, agents_before),
+        "nothing written"
+    );
+}
+
+/// Every row hanging off `claim` that a convention request writes: its labels,
+/// its trace id, and the counts of its evidence, reasoning traces and edges,
+/// read on the superuser harness connection so nothing is filtered.
+async fn convention_footprint(
+    pool: &PgPool,
+    claim: Uuid,
+) -> (Vec<String>, Option<Uuid>, i64, i64, i64) {
+    let (labels, trace): (Vec<String>, Option<Uuid>) =
+        sqlx::query_as("SELECT labels, trace_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("the convention claim");
+    let count = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(sql)
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect(sql)
+    };
+    (
+        labels,
+        trace,
+        count("SELECT count(*) FROM evidence WHERE claim_id = $1").await,
+        count("SELECT count(*) FROM reasoning_traces WHERE claim_id = $1").await,
+        count("SELECT count(*) FROM edges WHERE source_id = $1 OR target_id = $1").await,
+    )
+}
+
+/// A second `claims:admin` caller posting content an existing convention
+/// already holds is refused (409), and writes nothing: the content-hash dedup
+/// answers with the OTHER writer's claim, and labelling it or attaching this
+/// request's evidence, trace and edges to it would write onto a claim this
+/// request did not create.
+#[sqlx::test(migrations = "../../migrations")]
+async fn learn_convention_on_existing_content_is_a_conflict_and_writes_nothing(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (first, _) = seed_agent_with_group(&pool, "convention-first").await;
+    let (second, second_group) = seed_agent_with_group(&pool, "convention-second").await;
+    let content = format!("1c822492 duplicate convention {}", Uuid::new_v4());
+
+    let (status, Json(created)) = learn_convention(
+        viewer(&pool, first).await,
+        State(state.clone()),
+        auth(first, "claims:admin"),
+        convention_request(&content),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the first convention is learned: {e:?}"));
+    assert_eq!(status.as_u16(), 201);
+    let before = convention_footprint(&pool, created.claim_id).await;
+    let claims_before: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(&pool)
+        .await
+        .expect("claims");
+
+    let res = learn_convention(
+        viewer(&pool, second).await,
+        State(state),
+        auth(second, "claims:admin"),
+        convention_request_with(&content, "a second writer's evidence", "second-writer-tag"),
+    )
+    .await;
+    let (status, body) = rendered(res, created.claim_id).await;
+    assert_eq!(status, 409, "existing content is a conflict: {body}");
+
+    assert_eq!(
+        convention_footprint(&pool, created.claim_id).await,
+        before,
+        "the existing convention is untouched: no label, evidence, trace or edge added"
+    );
+    let claims_after: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(&pool)
+        .await
+        .expect("claims");
+    let second_rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM evidence WHERE raw_content = 'a second writer''s evidence') \
+              + (SELECT count(*) FROM edges WHERE owner_group_id = $1)",
+    )
+    .bind(second_group)
+    .fetch_one(&pool)
+    .await
+    .expect("the second writer's rows");
+    assert_eq!(
+        (claims_after, second_rows),
+        (claims_before, 0),
+        "the refused request wrote no claim, evidence or edge"
     );
 }

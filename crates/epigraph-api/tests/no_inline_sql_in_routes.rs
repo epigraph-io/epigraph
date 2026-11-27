@@ -98,7 +98,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("belief.rs", 7),
     ("claims.rs", 3),
     ("computation.rs", 4),
-    ("conventions.rs", 3),
+    ("conventions.rs", 2),
     ("cross_source.rs", 1),
     ("crud.rs", 3),
     ("edges.rs", 6),
@@ -161,7 +161,10 @@ const REGISTER: &[(&str, usize)] = &[
 /// promotion's factor move became `FactorRepository::promote_hypothesis_factors`
 /// (`hypothesis.rs` 11 -> 10). (Staging 2026-11-26: the PR's 82 -> 81 and the merged
 /// tree's 73 compose to 72.)
-const HIGH_WATER: usize = 72;
+/// Lowered to 71 by backlog 1c822492: `learn_convention`'s label write became
+/// `ClaimRepository::update_labels_conn` on the caller's stamped transaction
+/// (`conventions.rs` 3 -> 2).
+const HIGH_WATER: usize = 71;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
