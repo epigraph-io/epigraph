@@ -27,8 +27,10 @@
 --         are FORCEd, so any other session, their owner included, would count
 --         only public rows and its own groups' and pass guard (c) over rows it
 --         cannot see;
---      c. all five tables are EMPTY (55000). This file archives nothing: a
---         database that holds a harvester row needs a decision first.
+--      c. all five tables are EMPTY (55000), counted under an ACCESS
+--         EXCLUSIVE lock held to commit, so no row can arrive between the
+--         count and the drop. This file archives nothing: a database that
+--         holds a harvester row needs a decision first.
 --   2. Re-states, without their harvester arms, every surviving function whose
 --      body names one of the five tables (a catalog grep of `prosrc` after
 --      the drop finds none):
@@ -160,6 +162,14 @@ BEGIN
                         'cannot see. Nothing was changed. Run as a superuser.', current_user
             USING ERRCODE = '42501';
     END IF;
+    -- Hold the five tables until commit before counting: a writer that
+    -- commits a row after an unlocked count read 0 would otherwise lose it
+    -- to the DROP below. A writer's open transaction makes this wait (up to
+    -- the 3s lock_timeout, then 55P03 with nothing changed); once it commits,
+    -- the count sees its row and refuses.
+    LOCK TABLE public.harvester_claim_provenance, public.harvester_audit_reports,
+               public.harvester_fragments, public.harvester_sources,
+               public.harvester_enriched_concepts IN ACCESS EXCLUSIVE MODE;
     FOREACH t IN ARRAY ARRAY['harvester_claim_provenance', 'harvester_audit_reports',
                              'harvester_fragments', 'harvester_sources',
                              'harvester_enriched_concepts'] LOOP

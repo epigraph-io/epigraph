@@ -25,6 +25,9 @@
 //! [`migration_354_refuses_a_body_it_was_not_written_from`] and
 //! [`migration_354_refuses_a_session_that_cannot_read_every_row`]: 354's three
 //! guards, each refusing with nothing changed.
+//! [`migration_354_counts_a_row_committed_while_it_runs`]: guard (c) locks the
+//! five tables before counting, so a writer committing mid-migration is
+//! refused rather than dropped.
 
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -305,6 +308,77 @@ async fn migration_354_refuses_a_harvester_row(pool: PgPool) {
         0,
         "nothing was changed"
     );
+}
+
+/// A row whose writer commits while 354 runs is counted, not dropped: guard
+/// (c) holds the five tables before it counts. The writer inserts a source
+/// and keeps its transaction open; 354 starts on another connection and is
+/// observed waiting on a lock; the writer then commits. 354 must refuse with
+/// 55000 naming that row, and the row must survive.
+///
+/// Mutation: the `LOCK TABLE` removed from guard (c) -> the count runs over
+/// the uncommitted insert and reads 0, the `DROP TABLE` waits on the writer,
+/// and once it commits 354 applies and drops the committed row with its
+/// table (the migration returns Ok and the source is gone).
+#[sqlx::test(migrations = false)]
+async fn migration_354_counts_a_row_committed_while_it_runs(pool: PgPool) {
+    use sqlx::Connection;
+    migrate(&pool, &below(354)).await.expect("below 354");
+    let mut writer = pool.acquire().await.expect("writer connection");
+    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *writer)
+        .await
+        .expect("writer pid");
+    let mut tx = writer.begin().await.expect("writer begin");
+    sqlx::query(
+        "INSERT INTO harvester_sources (content_hash, modality, owner_group_id, visibility) \
+         VALUES ('\\x02'::bytea, 'text', '00000000-0000-0000-0000-000000000000', 'public')",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("an uncommitted harvester source");
+
+    let m354 = through(354);
+    // Wait until 354's session is blocked behind the writer, then commit, so
+    // the writer's row lands while 354 is mid-flight (before the count, with
+    // the lock; between the count and the drop, without it).
+    let release = async {
+        let mut blocked = false;
+        for _ in 0..500 {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                    AND $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(writer_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("blocked sessions");
+            if n > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tx.commit().await.expect("writer commit");
+        blocked
+    };
+    let (run, blocked) = tokio::join!(migrate(&pool, &m354), release);
+    drop(writer);
+    assert!(
+        blocked,
+        "PREMISE: 354 waited on the writer's open transaction"
+    );
+    let err = run.expect_err("354 must refuse the row committed while it ran");
+    assert!(err.contains("harvester_sources (1)"), "{err}");
+    assert!(err.contains("55000"), "{err}");
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM harvester_sources WHERE content_hash = '\\x02'::bytea",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the committed source is still there");
+    assert_eq!(kept, 1);
 }
 
 /// 354 refuses to apply over a publicize body other than 284's, with 55000,
