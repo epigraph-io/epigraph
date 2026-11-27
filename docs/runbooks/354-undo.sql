@@ -23,13 +23,23 @@
 --   * recreates the five tables EMPTY at their shape below 354 (001's
 --     columns, the tenancy columns and checks 062, 173 and 347 added, the
 --     constraints, indexes, 15 triggers, ENABLE + FORCE row security, 18
---     policies and the grants), owned by the role running this file, as the
---     migrations left them;
+--     policies and the grants, revoking first whatever the schema's
+--     default privileges hand a new table), with 001's table comments,
+--     owned by the role running this file, as the migrations left them;
 --   * restores the bodies of `epigraph_propagate_tenancy`,
 --     `epigraph_record_elevated_access` (127), `epigraph_publicize_claims` and
---     `epigraph_share_claims_with_team` (284) byte for byte;
---   * re-seeds the two `tenancy_backfill_progress` rows 354 deleted (062's
---     defaults: not complete, nothing done; the flag is observability only).
+--     `epigraph_share_claims_with_team` (284) byte for byte (md5 of
+--     `prosrc`, owner, ACL, `search_path`, SECURITY DEFINER);
+--   * re-seeds the two `tenancy_backfill_progress` rows 354 deleted, marked
+--     complete (the tables are empty, so nothing is left to backfill; the
+--     flag is observability only).
+--
+-- WHAT `no_harvester_references.rs` CHECKS IT RESTORES: each table's columns
+-- (types, NOT NULL, defaults, order), owner, comment, constraints, indexes,
+-- triggers, row-security flags, policies and grants; the seven functions'
+-- bodies, owners, ACLs, paths and definer flags; the progress rows' entities.
+-- Not compared: storage parameters, statistics targets and other catalog
+-- detail no migration set on these tables.
 --
 -- WHAT IT LEAVES: no row (354 refused to drop a non-empty table, so there
 -- was none to keep); 354's `_sqlx_migrations` row. Re-introducing the drop is
@@ -172,6 +182,8 @@ REVOKE ALL ON FUNCTION public.epigraph_fragment_audit_reports_follow() FROM PUBL
 -- The five tables, empty, at their shape below 354. Skipped on a second run
 -- (the precondition above admits only all five or none).
 DO $$
+DECLARE
+    g record;
 BEGIN
     IF pg_catalog.to_regclass('public.harvester_sources') IS NOT NULL THEN
         RETURN;
@@ -424,8 +436,35 @@ BEGIN
 
     CREATE POLICY harvester_sources_tenancy ON public.harvester_sources USING ((( SELECT public.epigraph_bypass() AS epigraph_bypass) OR ( SELECT public.epigraph_definer_bypass() AS epigraph_definer_bypass) OR ((visibility)::text = 'public'::text) OR (owner_group_id = ANY (( SELECT public.epigraph_session_groups() AS epigraph_session_groups)::uuid[])))) WITH CHECK ((( SELECT public.epigraph_bypass() AS epigraph_bypass) OR ( SELECT public.epigraph_definer_bypass() AS epigraph_definer_bypass) OR (owner_group_id = ANY (( SELECT public.epigraph_writable_groups() AS epigraph_writable_groups)::uuid[]))));
 
-    -- A table created now takes the schema's default privileges; the grants
-    -- below are the whole of what each role held below 354.
+    -- 001's table comments.
+    COMMENT ON TABLE public.harvester_audit_reports IS 'Council of Critics audit results per fragment extraction';
+    COMMENT ON TABLE public.harvester_claim_provenance IS 'Links extracted claims to source fragments and audit trails';
+    COMMENT ON TABLE public.harvester_enriched_concepts IS 'Concepts enriched with latent knowledge and embeddings';
+    COMMENT ON TABLE public.harvester_fragments IS 'Text fragments chunked from source documents';
+    COMMENT ON TABLE public.harvester_sources IS 'Source documents submitted for harvester extraction';
+
+    -- A table created now takes the schema's default privileges, for ANY
+    -- grantee (whatever this deployment's ALTER DEFAULT PRIVILEGES name), so
+    -- every grant but the owner's is revoked first; the grants below are the
+    -- whole of what each role held below 354.
+    FOR g IN
+        SELECT DISTINCT c.oid::regclass AS rel, x.grantee
+          FROM pg_catalog.pg_class c
+         CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) x
+         WHERE c.oid IN ('public.harvester_audit_reports'::regclass,
+                         'public.harvester_claim_provenance'::regclass,
+                         'public.harvester_enriched_concepts'::regclass,
+                         'public.harvester_fragments'::regclass,
+                         'public.harvester_sources'::regclass)
+           AND x.grantee <> c.relowner
+    LOOP
+        IF g.grantee = 0 THEN
+            EXECUTE pg_catalog.format('REVOKE ALL ON TABLE %s FROM PUBLIC', g.rel);
+        ELSE
+            EXECUTE pg_catalog.format('REVOKE ALL ON TABLE %s FROM %I', g.rel,
+                                      pg_catalog.pg_get_userbyid(g.grantee));
+        END IF;
+    END LOOP;
     REVOKE ALL ON TABLE public.harvester_audit_reports, public.harvester_claim_provenance,
         public.harvester_enriched_concepts, public.harvester_fragments,
         public.harvester_sources FROM PUBLIC, epigraph_app, epigraph_maintenance;
@@ -1325,8 +1364,10 @@ BEGIN
     RETURN QUERY SELECT u.id, 'shared'::text FROM unnest(v_cls_ids) AS u(id) ORDER BY u.id;
 END $function$;
 
-INSERT INTO public.tenancy_backfill_progress (entity)
-VALUES ('harvester_claim_provenance'), ('harvester_fragments')
+-- Re-seeded COMPLETE: the tables come back empty, so there is nothing to
+-- backfill (062 seeds a row not complete until a backfill run marks it).
+INSERT INTO public.tenancy_backfill_progress (entity, complete)
+VALUES ('harvester_claim_provenance', true), ('harvester_fragments', true)
 ON CONFLICT (entity) DO NOTHING;
 
 COMMIT;

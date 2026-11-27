@@ -8,9 +8,11 @@
 //! * 354 refuses (55000, nothing changed) while any of the five tables has a
 //!   row, naming it, and over a shared body it does not re-state; it refuses
 //!   (42501, nothing changed) a session that could not read every row;
-//! * `docs/runbooks/354-undo.sql` puts the catalog back exactly as it was
-//!   below 354, twice over, refuses over a foreign body, and 354 then applies
-//!   again (apply, undo, apply).
+//! * `docs/runbooks/354-undo.sql` puts back every catalog fact
+//!   [`harvester_catalog`] reads, as it was below 354, twice over (also when
+//!   the schema's default privileges grant the new tables to another role),
+//!   refuses over a foreign body, and 354 then applies again (apply, undo,
+//!   apply).
 
 use sqlx::migrate::Migrator;
 use sqlx::PgPool;
@@ -361,17 +363,25 @@ async fn migration_354_refuses_to_apply_over_another_body(pool: PgPool) {
 }
 
 /// Everything the undo has to put back, as sorted text lines: the five
-/// tables' columns, constraints, indexes, triggers, row-security flags,
-/// policies and grants; the seven functions' bodies (md5), owners, ACLs,
-/// paths and definer flags; the two progress rows.
+/// tables' columns (with their order), owners, comments, constraints,
+/// indexes, triggers, row-security flags, policies and grants; the seven
+/// functions' bodies (md5), owners, ACLs, paths and definer flags; the two
+/// progress rows (by entity: the undo re-seeds them complete, see its
+/// header).
 async fn harvester_catalog(pool: &PgPool) -> BTreeSet<String> {
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT 'col ' || c.relname || '.' || a.attname || ' ' \
                 || format_type(a.atttypid, a.atttypmod) || ' ' || a.attnotnull::text || ' ' \
-                || COALESCE(pg_get_expr(d.adbin, d.adrelid), '-') \
+                || COALESCE(pg_get_expr(d.adbin, d.adrelid), '-') || ' #' \
+                || row_number() OVER (PARTITION BY c.oid ORDER BY a.attnum)::text \
            FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
            LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
           WHERE c.relname = ANY($1) AND a.attnum > 0 AND NOT a.attisdropped \
+         UNION ALL \
+         SELECT 'rel ' || c.relname || ' owner ' || pg_get_userbyid(c.relowner) || ' comment ' \
+                || COALESCE(obj_description(c.oid, 'pg_class'), '-') \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'public' AND c.relname = ANY($1) AND c.relkind = 'r' \
          UNION ALL \
          SELECT 'con ' || k.conrelid::regclass::text || ' ' || k.conname || ' ' \
                 || pg_get_constraintdef(k.oid) \
@@ -440,6 +450,14 @@ async fn the_354_undo_restores_the_catalog_and_354_applies_again(pool: PgPool) {
         "CALIBRATION: 354 changed the catalog"
     );
 
+    // A schema default privilege for the role running the undo hands every
+    // table it creates to a role none of the migrations named; the undo must
+    // take that grant back too. `pg_default_acl` is per database, so the
+    // probe leaves nothing behind in the cluster.
+    sqlx::raw_sql("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO pg_monitor")
+        .execute(&pool)
+        .await
+        .expect("default privilege");
     sqlx::raw_sql(&undo)
         .execute(&pool)
         .await
