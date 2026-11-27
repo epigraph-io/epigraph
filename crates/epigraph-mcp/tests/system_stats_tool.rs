@@ -80,6 +80,7 @@ async fn default_mode_reports_the_five_corpus_counts_and_the_belief_mode_report(
         vec![
             "agents",
             "belief_modes",
+            "belief_modes_served",
             "claims",
             "edges",
             "evidence",
@@ -128,6 +129,7 @@ async fn detailed_mode_adds_the_extra_counts_beside_the_same_mode_report(pool: P
         vec![
             "agents",
             "belief_modes",
+            "belief_modes_served",
             "challenges",
             "claims",
             "claims_signed",

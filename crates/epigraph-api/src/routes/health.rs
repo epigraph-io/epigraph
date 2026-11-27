@@ -17,12 +17,19 @@ pub struct HealthResponse {
     /// bin refuses a writing run when its own modes differ from it.
     #[schema(value_type = Object)]
     pub belief_modes: epigraph_engine::belief_modes::BeliefModes,
+    /// What this process SERVES for each mode whose served value can differ
+    /// from the configured one (backlog 820c15f1): today `compound_belief`,
+    /// which is `legacy` for a configured `progressive` or `strict` (not
+    /// wired in this build). The mode check compares `belief_modes`, not
+    /// this; see `epigraph_engine::belief_view::ServedBeliefModes`.
+    #[schema(value_type = Object)]
+    pub belief_modes_served: epigraph_engine::belief_view::ServedBeliefModes,
 }
 
 /// Health check endpoint
 ///
-/// Returns the service status, version, current timestamp and the belief
-/// modes this process runs under.
+/// Returns the service status, version, current timestamp, the belief
+/// modes this process was configured with and the ones it serves.
 /// This endpoint is useful for monitoring and load balancer health checks.
 pub async fn health_check() -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -30,6 +37,7 @@ pub async fn health_check() -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now(),
         belief_modes: *epigraph_engine::belief_modes::current(),
+        belief_modes_served: epigraph_engine::belief_view::ServedBeliefModes::current(),
     })
 }
 

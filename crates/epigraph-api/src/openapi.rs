@@ -252,8 +252,9 @@ pub struct ErrorResponse {
 
 /// Health check
 ///
-/// Returns service status, version, current timestamp and `belief_modes`, the
-/// belief-mode flags this process read at startup.
+/// Returns service status, version, current timestamp, `belief_modes` (the
+/// belief-mode flags this process read at startup) and `belief_modes_served`
+/// (what it serves where that can differ from the configured mode).
 /// Used for monitoring and load balancer health checks.
 #[utoipa::path(
     get,

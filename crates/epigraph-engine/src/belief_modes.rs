@@ -25,7 +25,10 @@
 //! - the API server and the HTTP and stdio MCP servers, which journal it at
 //!   boot and report [`current`] on `/health` → `belief_modes` and
 //!   `system_stats` → `belief_modes`; the pre-flip mode check (SPEC §10.4)
-//!   compares those reports across live processes;
+//!   compares those reports across live processes. Beside it, both surfaces
+//!   report `belief_modes_served` (`belief_view::ServedBeliefModes`): what
+//!   the process serves for a flag whose served value can differ from the
+//!   configured one. The mode check never reads it;
 //! - the CLI wave bins `recompute_betp`, `backfill_factors`,
 //!   `recompute_claim_belief`, `sweep_retired_source_bbas`,
 //!   `refresh_truth_mirrors` and `decompose_claims --retarget`, which compare their own [`current`] with
@@ -40,7 +43,7 @@
 //! | flag | values | default | acted on in this build |
 //! |---|---|---|---|
 //! | `EPIGRAPH_ATOM_FOLD` | `legacy`, `aef_standalone`, `aef` | `legacy` | yes: the single atom-cache writer (`edge_factor::recompute_atom_cache`) folds with the AEF the atoms the mode covers; the CLI wave bins whose writers fold only legacy refuse a writing run under any other fold |
-//! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` | `shadow` only: MCP `get_belief` adds the atom-level `shadow` view beside the served values. `progressive` and `strict` are not wired and serve `legacy` (logged once; `/health` still reports the configured mode) |
+//! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` | `shadow` only: MCP `get_belief` adds the atom-level `shadow` view beside the served values. `progressive` and `strict` are not wired and serve `legacy` (logged once; `/health` and `system_stats` report the configured mode under `belief_modes` and the served one under `belief_modes_served`) |
 //! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | yes, on the textless BBA writers MCP `submit_ds_evidence`, REST `POST /api/v1/frames/:id/evidence` and REST `POST /api/v1/claims/:id/assess` (`compound_write_guard::decide`, role by migration 193's definer, a claim the caller cannot read left to the writer's not-found): on a compound, `warn` stores the BBA inert (a compound has no cache-owner frame, so no cache fold reads it; the per-frame side rows each writer keeps, such as its Beta track, are still written), returns `deprecated_compound_target` with the caller's visible atoms and logs the caller; `refuse` refuses it (MCP `invalid_params`, REST 422, `error: compound_target`) before anything is written. `update_with_evidence` carries evidence text and is not guarded |
 //! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` | yes: the atom display fold (`atom_items`), the atom-cache writer, BBA retraction's cache vacate and the shadow report keep or drop edge-factor rows whose source is a compound |
 //! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` | no |

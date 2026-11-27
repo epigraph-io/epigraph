@@ -56,7 +56,9 @@
 //! beside them on `get_belief`. The `progressive` and `strict` modes, which
 //! change served values, are not wired in this build: either one serves
 //! `legacy`, and the process logs that once, so no setting can move a served
-//! value. `/health` reports the configured mode, not the served one.
+//! value. `/health` and `system_stats` report the configured mode under
+//! `belief_modes` and the served one under `belief_modes_served`
+//! ([`ServedBeliefModes`]).
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -373,6 +375,35 @@ impl CompoundBeliefMode {
         match self {
             Self::Legacy => "legacy",
             Self::Shadow => "shadow",
+        }
+    }
+}
+
+/// What this process SERVES for each belief mode whose served value can
+/// differ from its configured one, as `/health` and `system_stats` report it
+/// under `belief_modes_served` (backlog 820c15f1), beside the configured
+/// `belief_modes`.
+///
+/// Only `compound_belief` is here. Every other flag this build acts on serves
+/// exactly its configured value, and a flag it does not act on
+/// (`atom_cache_mode`, `inference`: "no" in `belief_modes`' table) serves no
+/// mode at all, so it has no served value to report; reading one would
+/// itself be acting on the flag, which the `belief_mode_readers` ratchet
+/// holds to that table. The configured report keeps its contract: the
+/// cross-process skew check compares `belief_modes`, never this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ServedBeliefModes {
+    /// [`CompoundBeliefMode::current`]: `legacy` for a configured `legacy`,
+    /// `progressive` or `strict`, `shadow` for `shadow`.
+    pub compound_belief: CompoundBeliefMode,
+}
+
+impl ServedBeliefModes {
+    /// This process's served modes.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            compound_belief: CompoundBeliefMode::current(),
         }
     }
 }
