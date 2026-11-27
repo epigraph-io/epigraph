@@ -785,9 +785,22 @@ impl JobRunner {
 // ============================================================================
 
 /// Built-in job types for `EpiGraph` operations.
+///
+/// # Retired kinds
+///
+/// `TruthPropagation`, `ReputationUpdate`, `WebhookNotification` and
+/// `DataCleanup` are RETIRED ([`Self::is_retired`]): no handler for them
+/// exists, and `drain_jobs` never ran one (webhooks are delivered by the API's
+/// dispatcher, not by a job). The variants and their `job_type` strings stay so
+/// a `jobs` row already stored with one of those types still deserializes and
+/// still names its type. Such a row is reported by every drain as pending and
+/// unregistered (exit 4) until an operator cancels it with
+/// `drain_jobs --cancel-pending <TYPE>`, exactly as before the handlers were
+/// deleted, and `enqueue_job` refuses to write a new one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EpiGraphJob {
-    /// Propagate truth updates through the reasoning DAG
+    /// RETIRED (see the enum doc): propagate truth updates through the
+    /// reasoning DAG.
     TruthPropagation {
         /// ID of the source claim that triggered propagation
         source_claim_id: Uuid,
@@ -799,13 +812,13 @@ pub enum EpiGraphJob {
         claim_id: Uuid,
     },
 
-    /// Recompute an agent's reputation score
+    /// RETIRED (see the enum doc): recompute an agent's reputation score.
     ReputationUpdate {
         /// ID of the agent to update
         agent_id: Uuid,
     },
 
-    /// Send a webhook notification
+    /// RETIRED (see the enum doc): send a webhook notification.
     WebhookNotification {
         /// ID of the webhook configuration
         webhook_id: Uuid,
@@ -813,7 +826,7 @@ pub enum EpiGraphJob {
         payload: serde_json::Value,
     },
 
-    /// Clean up expired data
+    /// RETIRED (see the enum doc): clean up expired data.
     DataCleanup {
         /// Number of days to retain data
         retention_days: u32,
@@ -906,6 +919,20 @@ impl EpiGraphJob {
             Self::PrivatizationRevert { .. } => crate::privatization::REVERT_JOB_TYPE,
             Self::PrivatizationReseal { .. } => crate::privatization::RESEAL_JOB_TYPE,
         }
+    }
+
+    /// Whether this is a RETIRED kind: one no handler exists for, kept only so
+    /// a stored row still deserializes (see the enum doc). A new job of a
+    /// retired kind must not be enqueued.
+    #[must_use]
+    pub const fn is_retired(&self) -> bool {
+        matches!(
+            self,
+            Self::TruthPropagation { .. }
+                | Self::ReputationUpdate { .. }
+                | Self::WebhookNotification { .. }
+                | Self::DataCleanup { .. }
+        )
     }
 
     /// Convert this job to a generic `Job` instance.
