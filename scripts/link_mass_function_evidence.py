@@ -105,6 +105,7 @@ UPDATE mass_functions mf
   FROM single_evidence_claims sec
  WHERE mf.claim_id = sec.claim_id
    AND mf.evidence_id IS NULL
+   AND mf.retracted_at IS NULL
 """
 
 # Counters for the multi-evidence "ambiguous" and "no candidate" buckets.
@@ -113,6 +114,7 @@ AMBIGUOUS_COUNT_SQL = """
 SELECT COUNT(*)
   FROM mass_functions mf
  WHERE mf.evidence_id IS NULL
+   AND mf.retracted_at IS NULL
    AND EXISTS (
      SELECT 1 FROM evidence e
       WHERE e.claim_id = mf.claim_id
@@ -124,6 +126,7 @@ NO_CANDIDATE_COUNT_SQL = """
 SELECT COUNT(*)
   FROM mass_functions mf
  WHERE mf.evidence_id IS NULL
+   AND mf.retracted_at IS NULL
    AND NOT EXISTS (
      SELECT 1 FROM evidence e
       WHERE e.claim_id = mf.claim_id
@@ -143,6 +146,17 @@ SELECT COUNT(*)
   FROM mass_functions mf
   JOIN single_evidence_claims sec USING (claim_id)
  WHERE mf.evidence_id IS NULL
+   AND mf.retracted_at IS NULL
+"""
+
+# Retracted rows are never linked: migration 184's rewrite guard (re-created by
+# 228) refuses any change to a retracted row's `evidence_id`, so one such row
+# in the UPDATE aborted the whole transaction (RT07) and nothing was linked.
+RETRACTED_COUNT_SQL = """
+SELECT COUNT(*)
+  FROM mass_functions mf
+ WHERE mf.evidence_id IS NULL
+   AND mf.retracted_at IS NOT NULL
 """
 
 # Current state — for the BEFORE/AFTER reporting table.
@@ -223,6 +237,7 @@ def main() -> int:
     before_linked, before_unlinked = bucket_counts(conn)
     ambiguous = scalar(conn, AMBIGUOUS_COUNT_SQL)
     no_candidate = scalar(conn, NO_CANDIDATE_COUNT_SQL)
+    retracted = scalar(conn, RETRACTED_COUNT_SQL)
 
     if not args.execute:
         would_link = scalar(conn, DELTA_LINK_SQL)
@@ -242,14 +257,18 @@ def main() -> int:
             f"  would skip (none) = {no_candidate:>10} (claim has no evidence "
             f"rows; nothing to link)"
         )
+        print(
+            f"  would skip (retr) = {retracted:>10} (retracted BBA; its "
+            f"evidence_id is frozen)"
+        )
         print()
-        # Sanity check: the three numbers should partition the unlinked total.
-        partition = would_link + ambiguous + no_candidate
+        # Sanity check: the four numbers should partition the unlinked total.
+        partition = would_link + ambiguous + no_candidate + retracted
         if partition != before_unlinked:
             # Not fatal — could be a race or a non-canonical state — but
             # surfacing the discrepancy is operator-useful.
             print(
-                f"  NOTE: would_link + ambiguous + no_candidate = "
+                f"  NOTE: would_link + ambiguous + no_candidate + retracted = "
                 f"{partition} != unlinked total {before_unlinked}. "
                 f"Likely benign (race or interleaved write); investigate "
                 f"if delta > 0 persists across runs.",

@@ -175,6 +175,14 @@ const EXEMPT: &[(&str, &str)] = &[
          harness superuser, which it needs to retract a row through migration 184's definer \
          on a stamped epigraph_app session.",
     ),
+    (
+        "scripts/tests/test_link_mass_function_evidence_db.py",
+        "A pytest DB arm, not an operator script: its fixture connects only to the \
+         CI-provisioned disposable database named by DEDUP_TEST_DATABASE_URL, refuses any \
+         name not ending in _test, and seeds and removes its own rows as the harness \
+         superuser (it retracts one through migration 184's definer). The script under \
+         test runs on the maintenance login (tests/db_roles.py).",
+    ),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is
