@@ -1,4 +1,5 @@
-//! The experiment loop over HTTP on the APPLICATION ROLE (backlog 30c84267).
+//! The experiment loop and the method catalog over HTTP on the APPLICATION
+//! ROLE (backlog 30c84267).
 //!
 //! # What was wrong, measured before this file
 //!
@@ -29,15 +30,20 @@
 //!
 //! Verified to fail on the pre-conversion handlers: the loop arm fails at its
 //! first edge check (`tests_hypothesis` edge count 0, expected 1), and with
-//! that check removed at `analyze` (500).
+//! that check removed at `analyze` (500). The method-catalog arm is a
+//! regression pin for the two `routes/experiments.rs` handlers moved onto the
+//! caller's stamped connection: both tables carry no tenancy, so it passes on
+//! either tree, and it is not offered as proof of a defect.
 #![cfg(feature = "db")]
 
 #[allow(dead_code)]
 mod common;
 mod viewer_fixture;
 
+use epigraph_api::embedding_restore::EmbeddingProviderKind;
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::{ScopedPool, SessionGucMode};
+use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::net::SocketAddr;
@@ -46,7 +52,9 @@ use uuid::Uuid;
 
 const RW: &[&str] = &["claims:read", "claims:write"];
 
-/// The app under test: raw and stamped pools both `epigraph_app`.
+/// The app under test: raw and stamped pools both `epigraph_app`, with a mock
+/// embedder declared as the provider that owns the stored vector columns (so
+/// `POST /api/v1/methods` stores a method embedding `find_methods` can rank).
 async fn spawn_app_role(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
     let bypassrls: bool =
         sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
@@ -63,7 +71,11 @@ async fn spawn_app_role(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
             .await
             .expect("app-role ScopedPool");
     let raw = viewer_fixture::downgraded_pool(pool, "epigraph_app").await;
-    let mut state = AppState::with_db(raw, ApiConfig::default());
+    let service: std::sync::Arc<dyn EmbeddingService> =
+        std::sync::Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
+    let mut state = AppState::with_db(raw, ApiConfig::default())
+        .with_embedding_service(service)
+        .with_embedding_provider(EmbeddingProviderKind::OpenAi);
     state.scoped = Some(scoped);
     state
         .load_entity_type_cache()
@@ -306,4 +318,62 @@ async fn a_group_writer_runs_the_experiment_loop_on_the_application_role(pool: P
         vec![experiment.to_string().as_str()],
         "list: {body}"
     );
+}
+
+/// Regression pin: the method catalog's write and search run on the caller's
+/// stamped connection on the application role. Not a defect proof (see the
+/// module doc).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_method_catalog_writes_and_searches_on_the_application_role(pool: PgPool) {
+    let (agent, _group) = viewer_fixture::seed_agent_with_group(&pool, "30c84267-methods").await;
+    let (addr, _shutdown) = spawn_app_role(&pool).await;
+    let name = format!("30c84267 method {}", Uuid::new_v4());
+
+    let (status, body) = post(
+        addr,
+        agent,
+        "/api/v1/methods",
+        json!({
+            "name": name,
+            "technique_type": "characterization",
+            "measures": "lattice constant",
+            "capabilities": ["lattice_constant", "phase_identification"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "add_method: {body}");
+    let method = uuid_at(&body, "method_id");
+    assert_eq!(body["capabilities_linked"], 2, "add_method: {body}");
+    assert_eq!(body["embedded"], true, "add_method: {body}");
+    let links: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM method_capabilities WHERE method_id = $1")
+            .bind(method)
+            .fetch_one(&pool)
+            .await
+            .expect("count capability links");
+    assert_eq!(links, 2, "both capability links committed with the method");
+
+    let (status, body) = send(
+        addr,
+        agent,
+        reqwest::Method::GET,
+        "/api/v1/methods/search?query=lattice%20constant&technique_type=characterization&limit=50",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "find_methods: {body}");
+    let hit = body["methods"]
+        .as_array()
+        .expect("methods array")
+        .iter()
+        .find(|m| m["id"] == json!(method))
+        .unwrap_or_else(|| panic!("find_methods must return the new method: {body}"));
+    let mut caps: Vec<&str> = hit["capabilities"]
+        .as_array()
+        .expect("capabilities array")
+        .iter()
+        .filter_map(|c| c["capability"].as_str())
+        .collect();
+    caps.sort_unstable();
+    assert_eq!(caps, vec!["lattice_constant", "phase_identification"]);
 }

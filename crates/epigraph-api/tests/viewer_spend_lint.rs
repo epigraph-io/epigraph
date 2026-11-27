@@ -907,11 +907,31 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ExperimentResultRepository::create",
         ],
     ),
+    // untenanted: the method catalog (`methods`, `method_capabilities`), on
+    // the caller's stamped transaction (backlog 30c84267).
+    (
+        "experiments.rs",
+        "add_method",
+        &[
+            "MethodRepository::insert",
+            "MethodRepository::link_capability",
+        ],
+    ),
     // untenanted: methods.
     (
         "experiments.rs",
         "design_experiment",
         &["MethodRepository::get"],
+    ),
+    // untenanted: the method catalog, on the caller's stamped read (backlog
+    // 30c84267).
+    (
+        "experiments.rs",
+        "find_methods",
+        &[
+            "MethodRepository::find_by_embedding",
+            "MethodRepository::get_capabilities",
+        ],
     ),
     (
         "experiments.rs",

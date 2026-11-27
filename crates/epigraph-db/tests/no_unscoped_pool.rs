@@ -893,7 +893,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// transaction and `list_experiments` reads on the caller's stamped
 /// connection; `routes/experiment_loop.rs` 20 -> 0, key DELETED
 /// (`HIGH_WATER_FILES` falls by one with it).
-const HIGH_WATER: usize = 130;
+/// 130 -> 126 (backlog 30c84267): `add_method` writes its method and
+/// capability links on ONE `AppState::write_as` transaction and `find_methods`
+/// reads on the caller's stamped connection, both now holding a `Viewer`;
+/// `routes/experiments.rs` 4 -> 0, key DELETED (`HIGH_WATER_FILES` falls by
+/// one with it).
+const HIGH_WATER: usize = 126;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -970,7 +975,8 @@ const HIGH_WATER: usize = 130;
 /// 33 -> 32 when `routes/computation.rs` reached zero (backlog 52b96600).
 /// 32 -> 31 when `routes/clusters.rs` reached zero (backlog 67c905a3).
 /// 31 -> 30 when `routes/experiment_loop.rs` reached zero (backlog 30c84267).
-const HIGH_WATER_FILES: usize = 30;
+/// 30 -> 29 when `routes/experiments.rs` reached zero (backlog 30c84267).
+const HIGH_WATER_FILES: usize = 29;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1151,11 +1157,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `routes/experiment_loop.rs` was 20 and is GONE (backlog 30c84267): its
     // five write handlers each run on ONE `AppState::write_as` transaction and
     // `list_experiments` reads on the caller's stamped connection.
-    // 8 -> 4 (HTTP public-only reads, 2026-11-05): `hypothesize` (2) and
-    // `design_experiment` (2) moved onto `AppState::read_as`. The 4 that remain
-    // hold no `Viewer`: `add_method` (writes) and `find_methods` (reads
-    // `methods` / `method_capabilities`, which carry no row security).
-    ("routes/experiments.rs", 4),
+    // `routes/experiments.rs` was 4 and is GONE (backlog 30c84267; 8 -> 4 by
+    // the HTTP public-only reads of 2026-11-05): `add_method` writes on
+    // `AppState::write_as` and `find_methods` reads on `AppState::read_as`,
+    // both now holding a `Viewer`.
     // UNCHANGED at 5, deliberately (HTTP public-only reads, 2026-11-05).
     // `gap_analysis` holds a `Viewer` and its claim search is a read, but the
     // result feeds `GapRepository::store_gap_analysis`, which persists claim
