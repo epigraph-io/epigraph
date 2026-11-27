@@ -291,6 +291,13 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Self-test the e2e DSN guard
+        # scripts/e2e/dsn-guard.sh keeps the hand-run e2e harness off the
+        # production cluster (it refuses a DSN with no host, no port, or port
+        # 5432) and hands every psql call the DSN's own host and port. Nothing
+        # else runs its parsers, so a regression to a hard-coded loopback host
+        # would go unseen. Synthetic DSNs only: no database, no network.
+        run: scripts/e2e/test-dsn-guard.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable

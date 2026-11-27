@@ -48,6 +48,9 @@ over, and outlived the port fix: every `psql` call hard-coded `-h 127.0.0.1`, so
 a DSN naming another host (a container network, a CI service host) had its
 verdict queries run against whatever listened on loopback while the server
 binary wrote to the host the DSN named.
+The parsers and the refusal rule live in `dsn-lib.sh` (which `dsn-guard.sh`
+sources before it runs the guard), and `test-dsn-guard.sh` tests them on
+synthetic DSNs; CI's lint job runs it.
 
 The database must be migrated `001 → head` from empty and its name should end in
 `_test`. `epigraph_db_repo_test` will **not** work: it has no tenancy migrations
