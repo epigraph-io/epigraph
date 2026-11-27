@@ -2943,6 +2943,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // roster write refused: loud, fail-closed). Registered so the pre-flight
     // sees an owner the guarded `OWNER TO` failed to set.
     ("epigraph_is_group_admin", 346),
+    // 360 (backlog 6e633456), the host's owner-role question for a role's
+    // schedule. Reads the FORCEd `role_agents` and `role_assignments` through
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner both
+    // reads see no row, so every identity answers `not_attached`: fail
+    // CLOSED (the host skips every owner-role schedule), but with a
+    // misleading reason, which this entry reports.
+    ("epigraph_role_owner_may_run", 360),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4299,6 +4306,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "epigraph_edge_bbas_keyed",
         "public.epigraph_edge_bbas_keyed(uuid)",
         true,
+    ),
+    // 360: the host asks it on the attestor's login; the application role
+    // never does (an app grant would let a request DSN rebuild the role
+    // roster one (role, agent) pair at a time).
+    (
+        "epigraph_role_owner_may_run",
+        "public.epigraph_role_owner_may_run(uuid, uuid)",
+        false,
     ),
 ];
 
