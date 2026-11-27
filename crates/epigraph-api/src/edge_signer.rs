@@ -404,12 +404,14 @@ pub async fn watch_admission(
 }
 
 /// Spawn [`watch_admission`] for `bin/server.rs`, at the interval
-/// [`ENV_RECHECK_SECS`] sets, and EXIT the process (status 1, the stop text on
-/// stderr) when it returns. Call it right after [`boot`] returns a signer.
-pub fn spawn_admission_watch(pool: PgPool, signer: Arc<ApiEdgeSigner>) {
-    let interval = epigraph_db::operator_binding::recheck_interval_from_env_value(
-        std::env::var(ENV_RECHECK_SECS).ok().as_deref(),
-    );
+/// `recheck_secs` (the value of [`ENV_RECHECK_SECS`], which the binary reads)
+/// sets, and EXIT the process (status 1, the stop text on stderr) when it
+/// returns. Call it right after [`boot`] returns a signer.
+///
+/// The value is an argument, not an environment read here, so this library
+/// reads no configuration of its own (`tests/no_library_env_reads.rs`).
+pub fn spawn_admission_watch(pool: PgPool, signer: Arc<ApiEdgeSigner>, recheck_secs: Option<&str>) {
+    let interval = epigraph_db::operator_binding::recheck_interval_from_env_value(recheck_secs);
     tokio::spawn(async move {
         let stop = watch_admission(pool, signer, interval).await;
         eprintln!("ERROR: {stop}");
@@ -426,11 +428,13 @@ pub async fn load(pool: &PgPool, key_file: Option<&str>) -> Result<Option<ApiEdg
     decide(pool, key_file).await.map(|d| d.signer)
 }
 
-/// [`decide`] from the environment, for `bin/server.rs`: logs the outcome and
-/// each warning once, and exits the process non-zero on a configured key it
-/// cannot use. The only part not under test: the logging and the exit.
-pub async fn boot(pool: &PgPool) -> Option<Arc<ApiEdgeSigner>> {
-    match decide(pool, std::env::var(ENV_KEY_FILE).ok().as_deref()).await {
+/// [`decide`] on `key_file` (the value of [`ENV_KEY_FILE`], which
+/// `bin/server.rs` reads from the environment), for `bin/server.rs`: logs the
+/// outcome and each warning once, and exits the process non-zero on a
+/// configured key it cannot use. The only part not under test: the logging and
+/// the exit.
+pub async fn boot(pool: &PgPool, key_file: Option<&str>) -> Option<Arc<ApiEdgeSigner>> {
+    match decide(pool, key_file).await {
         Ok(decision) => {
             for w in &decision.warnings {
                 tracing::warn!("{w}");

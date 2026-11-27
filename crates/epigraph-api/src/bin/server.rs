@@ -687,11 +687,21 @@ async fn main() {
         // logged once; set but unusable = refuse to start. And while it
         // serves: a key the verifier stops admitting (revoked, rotated out,
         // window closed) stops the process, as it would refuse the boot.
-        let edge_signer = epigraph_api::edge_signer::boot(scoped.inner()).await;
+        // The binary reads both variables; the library takes their values.
+        let edge_signer = epigraph_api::edge_signer::boot(
+            scoped.inner(),
+            std::env::var(epigraph_api::edge_signer::ENV_KEY_FILE)
+                .ok()
+                .as_deref(),
+        )
+        .await;
         if let Some(signer) = &edge_signer {
             epigraph_api::edge_signer::spawn_admission_watch(
                 scoped.inner().clone(),
                 std::sync::Arc::clone(signer),
+                std::env::var(epigraph_api::edge_signer::ENV_RECHECK_SECS)
+                    .ok()
+                    .as_deref(),
             );
         }
         let state = AppState::with_scoped_pool(scoped, config)
