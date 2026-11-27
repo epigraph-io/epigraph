@@ -3186,6 +3186,51 @@ pub struct FindWorkflowResult {
     /// generation of the same lineage exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_generation: Option<i64>,
+    /// Hierarchical results only (absent for flat workflow claims, and when
+    /// the lookup failed): the in-force workflow references touching this
+    /// workflow that the caller can read (backlog 41d7b27a), `[]` when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub references: Option<Vec<WorkflowReference>>,
+}
+
+/// One workflow reference of a hierarchical workflow, as `find_workflow` and
+/// `find_workflow_hierarchical` surface it (backlog 41d7b27a).
+#[derive(Debug, Serialize)]
+pub struct WorkflowReference {
+    /// `invokes`, `depends_on`, `related_to` or `alternative_of`.
+    pub relationship: String,
+    /// `outgoing` (this workflow, or one of its steps, references the other),
+    /// `incoming` (the other workflow, or one of its steps, references this
+    /// one), or `mutual` for the symmetric `related_to` and `alternative_of`.
+    pub direction: String,
+    /// The workflow at the other end.
+    pub workflow_id: String,
+    pub canonical_name: String,
+    pub generation: i64,
+    pub goal: String,
+    /// A step claim's `invokes`: the step claim it is written from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_step_claim_id: Option<String>,
+    /// `invokes` only: the step index it was written with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_step: Option<i64>,
+    pub edge_id: String,
+}
+
+impl From<epigraph_db::WorkflowReferenceRow> for WorkflowReference {
+    fn from(r: epigraph_db::WorkflowReferenceRow) -> Self {
+        Self {
+            relationship: r.relationship,
+            direction: r.direction,
+            workflow_id: r.other_workflow_id.to_string(),
+            canonical_name: r.other_canonical_name,
+            generation: i64::from(r.other_generation),
+            goal: r.other_goal,
+            via_step_claim_id: r.via_step_claim_id.map(|id| id.to_string()),
+            at_step: r.at_step,
+            edge_id: r.edge_id.to_string(),
+        }
+    }
 }
 
 /// One frozen step of a hierarchical [`FindWorkflowResult`] whose lineage head

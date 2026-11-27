@@ -305,7 +305,7 @@ pub use workflow::{
     HierarchicalOutcomeCounters, HierarchicalOutcomeRecord, HierarchicalOutcomeResult,
     HierarchicalWorkflowRow, NewHierarchicalOutcomeReport, ResolvedStep,
     ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository,
+    WorkflowReferenceRow, WorkflowRepository,
 };
 
 // Privacy / encryption repositories

@@ -1,9 +1,12 @@
 //! Workflow references, backlog 41d7b27a (the half after `invokes` and
 //! `depends_on` landed).
 //!
-//! Before: `related_to` was no relationship any tool wrote, and
-//! `link_alternative` took claims only (its endpoint types were not
-//! caller-controllable). These drive the tools on the stdio path against workflows stored
+//! Before: `related_to` was no relationship any tool wrote, `link_alternative`
+//! took claims only (its endpoint types were not caller-controllable), and
+//! neither workflow reader (`find_workflow`, `find_workflow_hierarchical`)
+//! surfaced any reference at all, so a caller could write `invokes` and
+//! `depends_on` but never read them back from the tools named to find a
+//! workflow. These drive the tools on the stdio path against workflows stored
 //! through `store_workflow`, the rows a live plan reads.
 
 #[path = "viewer_fixture.rs"]
@@ -14,7 +17,10 @@ use common::*;
 
 use epigraph_mcp::tools::link_alternative::do_link_alternative;
 use epigraph_mcp::tools::link_hierarchical::do_link_hierarchical;
-use epigraph_mcp::types::{LinkAlternativeParams, LinkHierarchicalParams, StoreWorkflowParams};
+use epigraph_mcp::types::{
+    FindWorkflowHierarchicalParams, FindWorkflowParams, LinkAlternativeParams,
+    LinkHierarchicalParams, StoreWorkflowParams,
+};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -39,6 +45,27 @@ async fn store(server: &epigraph_mcp::EpiGraphMcpFull, steps: &[&str]) -> Uuid {
     .await
     .expect("store_workflow");
     parse_uuid_field(&first_text(&stored), "workflow_id")
+}
+
+async fn goal_of(pool: &PgPool, workflow: Uuid) -> String {
+    sqlx::query_scalar("SELECT goal FROM workflows WHERE id = $1")
+        .bind(workflow)
+        .fetch_one(pool)
+        .await
+        .expect("the workflow's goal")
+}
+
+async fn step_claim(pool: &PgPool, workflow: Uuid, content: &str) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT c.id FROM edges e JOIN claims c ON c.id = e.target_id \
+         WHERE e.source_id = $1 AND e.relationship = 'executes' AND c.content = $2 \
+           AND e.valid_to IS NULL",
+    )
+    .bind(workflow)
+    .bind(content)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("executes edge for {content:?}: {e}"))
 }
 
 /// In-force `relationship` edges between `a` and `b`, in EITHER direction.
@@ -313,4 +340,320 @@ async fn link_alternative_marks_two_rival_workflows(pool: PgPool) {
     .await
     .expect("a claim pair is linked as before");
     assert_eq!(pair_edges(&pool, c1, c2, "alternative_of").await, 1);
+}
+
+async fn find_hierarchical(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    query: &str,
+) -> Value {
+    let out = epigraph_mcp::tools::workflow_hierarchical::find_workflow_hierarchical(
+        server,
+        viewer,
+        FindWorkflowHierarchicalParams {
+            query: query.to_string(),
+            limit: None,
+            resolve_to_latest: None,
+            min_truth: None,
+        },
+    )
+    .await
+    .expect("find_workflow_hierarchical");
+    first_text(&out)
+}
+
+async fn find_flat_and_hierarchical(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    goal: &str,
+) -> Value {
+    // No embedder in tests: the text legs of both stores answer.
+    let out = epigraph_mcp::tools::workflows::__test_only::find_workflow_with_pgvec(
+        server,
+        viewer,
+        FindWorkflowParams {
+            goal: goal.to_string(),
+            min_truth: None,
+            limit: None,
+        },
+        None,
+    )
+    .await
+    .expect("find_workflow");
+    first_text(&out)
+}
+
+/// The `references` of `workflow` in a reader's answer: `find_workflow`
+/// returns an array of results, `find_workflow_hierarchical` an object with a
+/// `workflows` array.
+fn references_of(answer: &Value, workflow: Uuid) -> Vec<Value> {
+    let rows = answer
+        .get("workflows")
+        .unwrap_or(answer)
+        .as_array()
+        .unwrap_or_else(|| panic!("no result list in {answer}"));
+    let row = rows
+        .iter()
+        .find(|r| r["workflow_id"].as_str() == Some(workflow.to_string().as_str()))
+        .unwrap_or_else(|| panic!("{workflow} is not in {answer}"));
+    row["references"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no references on {row}"))
+        .clone()
+}
+
+/// `(relationship, direction, other workflow, via step, at_step)`.
+type RefShape = (String, String, String, Option<String>, Option<i64>);
+
+/// Each reference's [`RefShape`], sorted.
+fn shape(refs: &[Value]) -> Vec<RefShape> {
+    let mut out: Vec<_> = refs
+        .iter()
+        .map(|r| {
+            (
+                r["relationship"].as_str().unwrap_or_default().to_string(),
+                r["direction"].as_str().unwrap_or_default().to_string(),
+                r["workflow_id"].as_str().unwrap_or_default().to_string(),
+                r["via_step_claim_id"].as_str().map(String::from),
+                r["at_step"].as_i64(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Both workflow readers list every reference kind touching a workflow: its
+/// own `invokes` (with `at_step`), a step's `invokes` (with the step claim),
+/// `depends_on`, the symmetric `related_to` and `alternative_of` (`mutual`,
+/// seen from either end), and another workflow's step invoking it
+/// (`incoming`). A retracted reference is not listed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn both_workflow_readers_surface_every_reference_kind(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let hub = store(&server, &["call the sub-workflow", "finish"]).await;
+    let sub = store(&server, &["sub step"]).await;
+    let prereq = store(&server, &["prerequisite step"]).await;
+    let see_also = store(&server, &["see-also step"]).await;
+    let rival = store(&server, &["rival step"]).await;
+    let caller = store(&server, &["call the hub"]).await;
+    let dropped = store(&server, &["dropped step"]).await;
+    let hub_step = step_claim(&pool, hub, "call the sub-workflow").await;
+    let caller_step = step_claim(&pool, caller, "call the hub").await;
+
+    let mut direct = link(hub, "workflow", sub, "workflow", "invokes");
+    direct.at_step = Some(1);
+    for params in [
+        direct,
+        link(hub_step, "claim", sub, "workflow", "invokes"),
+        link(hub, "workflow", prereq, "workflow", "depends_on"),
+        link(see_also, "workflow", hub, "workflow", "related_to"),
+        link(caller_step, "claim", hub, "workflow", "invokes"),
+        link(hub, "workflow", dropped, "workflow", "depends_on"),
+    ] {
+        do_link_hierarchical(&server, &viewer, params, None)
+            .await
+            .expect("the reference is written");
+    }
+    do_link_alternative(&server, &viewer, rivals(rival, hub), None)
+        .await
+        .expect("the rival is linked");
+    sqlx::query(
+        "UPDATE edges SET valid_to = now() WHERE source_id = $1 AND target_id = $2 \
+           AND relationship = 'depends_on'",
+    )
+    .bind(hub)
+    .bind(dropped)
+    .execute(&pool)
+    .await
+    .expect("retract one reference");
+
+    let s = |u: Uuid| u.to_string();
+    let expected = {
+        let mut v = vec![
+            (
+                "alternative_of".into(),
+                "mutual".into(),
+                s(rival),
+                None,
+                None,
+            ),
+            (
+                "depends_on".into(),
+                "outgoing".into(),
+                s(prereq),
+                None,
+                None,
+            ),
+            (
+                "invokes".into(),
+                "incoming".into(),
+                s(caller),
+                Some(s(caller_step)),
+                None,
+            ),
+            ("invokes".into(), "outgoing".into(), s(sub), None, Some(1)),
+            (
+                "invokes".into(),
+                "outgoing".into(),
+                s(sub),
+                Some(s(hub_step)),
+                None,
+            ),
+            (
+                "related_to".into(),
+                "mutual".into(),
+                s(see_also),
+                None,
+                None,
+            ),
+        ];
+        v.sort();
+        v
+    };
+
+    let hub_goal = goal_of(&pool, hub).await;
+    let hierarchical = find_hierarchical(&server, &viewer, &hub_goal).await;
+    assert_eq!(
+        shape(&references_of(&hierarchical, hub)),
+        expected,
+        "find_workflow_hierarchical: {hierarchical}"
+    );
+    let flat = find_flat_and_hierarchical(&server, &viewer, &hub_goal).await;
+    assert_eq!(
+        shape(&references_of(&flat, hub)),
+        expected,
+        "find_workflow: {flat}"
+    );
+
+    // The other end of a reference sees it too, from its side.
+    let sub_goal = goal_of(&pool, sub).await;
+    let sub_refs = shape(&references_of(
+        &find_hierarchical(&server, &viewer, &sub_goal).await,
+        sub,
+    ));
+    assert_eq!(
+        sub_refs,
+        {
+            let mut v = vec![
+                (
+                    "invokes".to_string(),
+                    "incoming".to_string(),
+                    s(hub),
+                    None,
+                    Some(1),
+                ),
+                (
+                    "invokes".to_string(),
+                    "incoming".to_string(),
+                    s(hub),
+                    Some(s(hub_step)),
+                    None,
+                ),
+            ];
+            v.sort();
+            v
+        },
+        "the sub-workflow lists who invokes it"
+    );
+    let see_also_goal = goal_of(&pool, see_also).await;
+    assert_eq!(
+        shape(&references_of(
+            &find_flat_and_hierarchical(&server, &viewer, &see_also_goal).await,
+            see_also,
+        )),
+        vec![(
+            "related_to".to_string(),
+            "mutual".to_string(),
+            s(hub),
+            None,
+            None
+        )],
+    );
+    // A workflow with no reference lists none, rather than omitting the key.
+    let dropped_goal = goal_of(&pool, dropped).await;
+    assert!(references_of(
+        &find_hierarchical(&server, &viewer, &dropped_goal).await,
+        dropped
+    )
+    .is_empty());
+}
+
+/// A group-private plan's group-private step may invoke a public workflow
+/// (only workflow ends must be public; the edge takes the step's tenancy).
+/// The public workflow's readers name that caller to a member of the group,
+/// and to nobody else: an outsider finds the public workflow with no
+/// reference at all, neither the private plan nor its step.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_steps_reference_is_named_to_members_only(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let outsider = outsider_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let outsider_viewer = own_viewer(&outsider).await;
+    let plan = store(&server, &["private call"]).await;
+    let public = store(&server, &["public sub step"]).await;
+    let step = step_claim(&pool, plan, "private call").await;
+    let group = make_private(&pool, plan).await;
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(step)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("give the step the plan's tenancy");
+
+    let written = do_link_hierarchical(
+        &server,
+        &viewer,
+        link(step, "claim", public, "workflow", "invokes"),
+        None,
+    )
+    .await
+    .expect("a private step invokes a public workflow");
+    let (vis,): (String,) =
+        sqlx::query_as("SELECT visibility::text FROM edges WHERE id = $1::uuid")
+            .bind(first_text(&written)["edge_id"].as_str().expect("edge_id"))
+            .fetch_one(&pool)
+            .await
+            .expect("the edge");
+    assert_eq!(vis, "group", "the edge takes the step's tenancy");
+
+    let goal = goal_of(&pool, public).await;
+    let member_view = vec![(
+        "invokes".to_string(),
+        "incoming".to_string(),
+        plan.to_string(),
+        Some(step.to_string()),
+        None,
+    )];
+    assert_eq!(
+        shape(&references_of(
+            &find_hierarchical(&server, &viewer, &goal).await,
+            public
+        )),
+        member_view
+    );
+    assert_eq!(
+        shape(&references_of(
+            &find_flat_and_hierarchical(&server, &viewer, &goal).await,
+            public
+        )),
+        member_view
+    );
+
+    let outsider_hier = find_hierarchical(&outsider, &outsider_viewer, &goal).await;
+    assert!(
+        references_of(&outsider_hier, public).is_empty(),
+        "an outsider is named nothing: {outsider_hier}"
+    );
+    let outsider_flat = find_flat_and_hierarchical(&outsider, &outsider_viewer, &goal).await;
+    assert!(
+        references_of(&outsider_flat, public).is_empty(),
+        "an outsider is named nothing: {outsider_flat}"
+    );
+    for answer in [&outsider_hier, &outsider_flat] {
+        let text = answer.to_string();
+        assert!(!text.contains(&plan.to_string()), "{text}");
+        assert!(!text.contains(&step.to_string()), "{text}");
+    }
 }

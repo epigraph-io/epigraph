@@ -6,7 +6,9 @@
 //!
 //! - `find_workflow_hierarchical` — ILIKE search over goal and a
 //!   hyphen-normalized canonical_name; filters by `min_truth` so deprecated
-//!   rows (truth=0.05) drop out by default.
+//!   rows (truth=0.05) drop out by default. Each row lists its workflow
+//!   references (`invokes`, `depends_on`, `related_to`, `alternative_of`;
+//!   backlog 41d7b27a).
 //! - `list_workflows` — keyset-paginated enumeration of every hierarchical
 //!   lineage head and flat workflow claim the caller reads, with no text
 //!   filter.
@@ -143,6 +145,15 @@ pub async fn find_workflow_hierarchical(
     // highest generation per group in `rows` IS the lineage head.
     let heads = resolve_to_latest.then(|| epigraph_db::repos::workflow::lineage_heads_in(&rows));
 
+    // The workflow references touching each row (backlog 41d7b27a), read in
+    // one statement on the same viewer-stamped read: only references, steps
+    // and workflows the caller reads are named.
+    let row_ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let mut references =
+        epigraph_db::WorkflowRepository::references_of_conn(&mut read, viewer, &row_ids)
+            .await
+            .map_err(internal_error)?;
+
     let mut workflows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for r in rows {
         let lineage = heads
@@ -159,6 +170,13 @@ pub async fn find_workflow_hierarchical(
             "created_at": r.created_at,
             "truth_value": r.truth_value,
         });
+        let refs: Vec<crate::types::WorkflowReference> = references
+            .remove(&r.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        entry["references"] = serde_json::to_value(refs).map_err(internal_error)?;
 
         if let Some((head_id, head_generation, head_truth)) = lineage {
             entry["is_lineage_head"] = serde_json::json!(head_id == r.id);

@@ -728,6 +728,8 @@ async fn find_workflow_post_embed(
 
     // Build results, enriching with behavioral data
     let mut results = Vec::new();
+    // The `workflows` ids among `results`, for the references pass below.
+    let mut hierarchical_results: Vec<uuid::Uuid> = Vec::new();
     for (_, candidate) in candidates {
         if results.len() >= limit as usize {
             break;
@@ -762,6 +764,7 @@ async fn find_workflow_post_embed(
                     hierarchical_workflow_result(&mut read, viewer, &row, steps, &affinity_map)
                         .await
                 {
+                    hierarchical_results.push(row.id);
                     results.push(r);
                 }
             }
@@ -875,13 +878,74 @@ async fn find_workflow_post_embed(
             if let Some(r) =
                 hierarchical_workflow_result(&mut read, viewer, &scored, steps, &affinity_map).await
             {
+                hierarchical_results.push(scored.id);
                 results.push(r);
             }
         }
     }
 
+    attach_workflow_references(&mut read, viewer, &hierarchical_results, &mut results).await;
+
     read.commit().await.map_err(internal_error)?;
     success_json(&results)
+}
+
+/// Fill `references` on the hierarchical entries of `results` (backlog
+/// 41d7b27a): the in-force `invokes`, `depends_on`, `related_to` and
+/// `alternative_of` references touching each workflow, as `viewer` reads
+/// them, in ONE statement on the caller's stamped read. Best-effort, like the
+/// other hierarchical enrichments: the read runs in its own savepoint, so a
+/// failure leaves `references` absent and the rest of the read usable.
+async fn attach_workflow_references(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    workflow_ids: &[uuid::Uuid],
+    results: &mut [FindWorkflowResult],
+) {
+    use sqlx::Acquire;
+    if workflow_ids.is_empty() {
+        return;
+    }
+    let mut sp = match conn.begin().await {
+        Ok(sp) => sp,
+        Err(e) => {
+            tracing::warn!("find_workflow: could not open the references read: {e}");
+            return;
+        }
+    };
+    let mut found =
+        match WorkflowRepository::references_of_conn(&mut sp, viewer, workflow_ids).await {
+            Ok(found) => {
+                if let Err(e) = sp.commit().await {
+                    tracing::warn!("find_workflow: could not end the references read: {e}");
+                    return;
+                }
+                found
+            }
+            Err(e) => {
+                tracing::warn!("find_workflow: workflow references lookup failed: {e}");
+                let _ = sp.rollback().await;
+                return;
+            }
+        };
+    let wanted: std::collections::HashSet<String> =
+        workflow_ids.iter().map(ToString::to_string).collect();
+    for result in results.iter_mut() {
+        if !wanted.contains(&result.workflow_id) {
+            continue;
+        }
+        let Ok(id) = result.workflow_id.parse::<uuid::Uuid>() else {
+            continue;
+        };
+        result.references = Some(
+            found
+                .remove(&id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        );
+    }
 }
 
 /// Render a hierarchical `workflows` row into the same `FindWorkflowResult`
@@ -1033,6 +1097,8 @@ async fn hierarchical_workflow_result(
         has_evolved_steps,
         evolved_steps,
         latest_generation,
+        // Filled for every hierarchical result by `attach_workflow_references`.
+        references: None,
     })
 }
 
@@ -1130,6 +1196,9 @@ async fn enrich_workflow_result(
         has_evolved_steps: None,
         evolved_steps: None,
         latest_generation: None,
+        // A flat workflow claim is no `workflows` row, so no workflow
+        // reference names it.
+        references: None,
     })
 }
 
