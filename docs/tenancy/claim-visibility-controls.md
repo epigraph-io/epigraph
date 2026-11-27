@@ -101,7 +101,7 @@ Added to:
     the first group's rows;
   * a non-public ingest writes its atoms by id and never looks a claim up by its text outside
     its own group's non-public rows, so it converges only onto its own group's ingest of the
-    same text;
+    same text, or onto what that group's earlier ingest of the document recorded;
   * a client recomputing ids locally needs the owning group for a non-public ingest; a row
     whose `properties.id_scope` is `"owner_group"` has an id and `content_hash` that are not
     functions of its text alone. `verify_claim` re-derives such an atom's digest from its body
@@ -114,12 +114,12 @@ Added to:
   * a group re-ingesting a document it ingested before ids were scope-derived keeps the global
     ids that ingest wrote, claim by claim, and writes no duplicate of them: first the ids the
     group's own paper row already asserts, then the group's own non-public rows holding one of
-    the document's global ids or stored hashes. The second covers an ingest from before
-    migration 246, whose paper row the migration made public. A node the earlier ingest
-    resolved to a row outside the group's non-public rows (a public row, another group's, or
-    the group's own since publicized) and that the group's paper row does not record is not
-    re-used: finding it would mean a text lookup outside the ingest's scope, so the re-ingest
-    writes the group's own scoped claim for it;
+    the document's global ids or stored hashes, then (only when the document key's public paper
+    row asserts one of the group's own non-public rows) the group's and the public rows that
+    public row asserts. The last two cover an ingest from before migration 246: a document then
+    had one paper row, which the migration made public, and an atom that ingest converged onto
+    an existing public row is recorded only there. Another group's non-public row is never
+    re-used; a node the earlier ingest resolved to one gets the group's own scoped claim;
   * workflow ingest still derives global ids; its adopter of the same scheme is backlog
     eb8ea9e5.
 * The operator `ingest-document` CLI, as `--visibility` / `--group-id`, resolved for its acting

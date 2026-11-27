@@ -37,9 +37,9 @@
 //!   the ids of, the other group's rows.
 //! * A non-public ingest never looks a claim up by its text outside its own
 //!   group: its atoms are written by id, so they converge only on the same
-//!   group's ingest of the same text. The one text lookup it makes is
-//!   confined, in its SQL, to the group's own non-public rows (the last
-//!   bullet).
+//!   group's ingest of the same text, or on what the document's earlier
+//!   ingest by that group recorded. The one text lookup it makes is confined,
+//!   in its SQL, to the group's own non-public rows (the last bullet).
 //! * A scope-derived id is NOT a function of the text alone. A client must
 //!   know the owning group (returned as the ingest's `owner_group_id`) to
 //!   recompute it, and must recompute nothing for a row whose `properties`
@@ -58,16 +58,17 @@
 //! * A re-ingest by the same group of a document it ingested before these ids
 //!   existed keeps the global ids that ingest wrote, claim by claim, so the
 //!   re-run writes no duplicate of them. The walk re-uses, in this order, the
-//!   ids the group's in-scope `papers` row already asserts, then the group's
-//!   own non-public rows that hold one of the document's global ids or global
-//!   stored hashes. The second source is what covers an ingest from before the
-//!   `papers` tenancy migration (246): that migration made every existing
-//!   paper row public, so the group's own paper row is new and asserts
-//!   nothing. Not re-used: a node the earlier ingest resolved to a row OUTSIDE
-//!   the group's non-public rows (a public row, another group's row, or the
-//!   group's own row since publicized) that the group's paper row does not
-//!   record. Looking those up by text would leave the ingest's scope, so the
-//!   re-ingest writes the group's own scoped claim for that node.
+//!   ids the group's in-scope `papers` row already asserts; the group's own
+//!   non-public rows that hold one of the document's global ids or global
+//!   stored hashes; and, when the document key's PUBLIC `papers` row asserts
+//!   one of the group's own non-public rows, the group's and the public rows
+//!   that public row asserts. The last two cover an ingest from before the
+//!   `papers` tenancy migration (246): a document then had one paper row,
+//!   which that migration made public, so the group's own paper row is new
+//!   and asserts nothing, and an atom that ingest converged onto an existing
+//!   public row is recorded only on the public row. Never re-used: another
+//!   group's non-public row. A node the earlier ingest resolved to one gets
+//!   the group's own scoped claim.
 //!
 //! The workflow-side adopter of the same scheme is tracked as backlog
 //! eb8ea9e5; workflow ingest still derives global ids.
