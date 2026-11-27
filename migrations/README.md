@@ -5235,8 +5235,15 @@ restart.
   `the_352_undo_restores_the_family_on_its_public_path`) and, behaviourally,
   `system_agent_registry.rs`. Undo: `docs/runbooks/352-undo.sql` (148's and 176's bodies on
   `public, pg_temp`, byte for byte; md5-guarded, idempotent). No binary depends on it; no deploy
-  order. Measure first (the precondition): `SELECT p.oid::regprocedure, md5(p.prosrc) FROM pg_proc
-  p WHERE p.proname LIKE 'epigraph\_%system\_agent%'` matches the md5s in the file.
+  order. Measure first (the precondition; seven rows, by signature, a missing function shows a
+  NULL md5): `SELECT s.sig, md5(p.prosrc) FROM unnest(ARRAY[
+  'public.epigraph_system_agents_guard_insert()', 'public.epigraph_system_agents_immutable()',
+  'public.epigraph_system_agents_audit()', 'public.epigraph_agents_refuse_registered_system_key()',
+  'public.epigraph_human_operators_refuse_system_agent()',
+  'public.epigraph_operator_links_refuse_retired_system_agent()',
+  'public.epigraph_register_system_agent(text, uuid, text)']) AS s(sig) LEFT JOIN pg_proc p ON
+  p.oid = to_regprocedure(s.sig)` matches the seven md5s in the file (pinned by
+  `the_352_measure_first_query_reads_the_whole_family`).
 
 ## `-- no-transaction` migrations
 

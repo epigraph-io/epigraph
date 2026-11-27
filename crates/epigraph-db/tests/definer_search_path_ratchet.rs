@@ -2245,3 +2245,76 @@ async fn the_352_undo_restores_the_family_on_its_public_path(pool: PgPool) {
         "the undo left the foreign body"
     );
 }
+
+/// The README's "measure first" query for 352 (what an operator runs on a
+/// live database before deploying it) reads every function 352's
+/// precondition checks, by signature, and nothing else: on a database below
+/// 352 it returns one row per family member, each carrying the md5 352's
+/// precondition expects. A name pattern missed the `agents` guard, whose
+/// name says `system_key`, so a six-row match could pass for a safe deploy.
+#[sqlx::test(migrations = false)]
+async fn the_352_measure_first_query_reads_the_whole_family(pool: PgPool) {
+    let readme = repo_text("migrations/README.md");
+    let entry = readme
+        .split("\n- **352**:")
+        .nth(1)
+        .expect("the README's 352 entry");
+    let entry = entry.split("\n- **").next().unwrap_or(entry);
+    let after = entry
+        .split("Measure first")
+        .nth(1)
+        .expect("the 352 entry's measure-first step");
+    let query = after
+        .split('`')
+        .nth(1)
+        .expect("the measure-first query, in backticks");
+    let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let migration = repo_text("migrations/352_system_agent_definers_pg_catalog_path.sql");
+    let expected: BTreeMap<String, String> = migration
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim().strip_prefix("('")?;
+            let (sig, rest) = l.split_once("', '")?;
+            let md5 = rest.get(..32)?;
+            md5.bytes()
+                .all(|b| b.is_ascii_hexdigit())
+                .then(|| (sig.to_string(), md5.to_string()))
+        })
+        .collect();
+    let family: BTreeSet<String> = SYSTEM_AGENT_FAMILY_352
+        .iter()
+        .map(|(s, _)| s.to_string())
+        .collect();
+    assert_eq!(
+        expected.keys().cloned().collect::<BTreeSet<_>>(),
+        family,
+        "CALIBRATION: 352's precondition lists the family's md5s"
+    );
+
+    migrate(&pool, &below(352))
+        .await
+        .expect("migrate below 352");
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(&query)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("the measure-first query runs: {e}\n{query}"));
+    assert_eq!(
+        rows.len(),
+        family.len(),
+        "one row per family member: {rows:?}"
+    );
+    let measured: BTreeMap<String, Option<String>> = rows.into_iter().collect();
+    assert_eq!(
+        measured.keys().cloned().collect::<BTreeSet<_>>(),
+        family,
+        "the query reads exactly 352's family"
+    );
+    for (sig, md5) in &expected {
+        assert_eq!(
+            measured[sig].as_deref(),
+            Some(md5.as_str()),
+            "{sig}: the query's md5 is the one 352 checks"
+        );
+    }
+}
