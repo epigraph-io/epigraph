@@ -5,6 +5,84 @@
 //! node. Compound nodes (thesis, section/phase, paragraph/step) are scoped by
 //! a per-artifact seed (the document title, or the workflow's canonical_name)
 //! so they do NOT converge across artifacts even when their text matches.
+//!
+//! # Scope-derived ids (non-public document ingest)
+//!
+//! The paragraph above is the rule for a PUBLIC ingest only. A document
+//! ingested as `private` or `team` mixes the group that owns its rows (the
+//! ingest's `owner_group_id`) into every id and stored hash it derives:
+//!
+//! | node | public ingest (`scope = None`) | non-public ingest (`scope = Some(g)`) |
+//! |---|---|---|
+//! | atom id | `uuid_v5(ATOM, blake3(text))` | `uuid_v5(ATOM, blake3(text) \|\| g.as_bytes())` |
+//! | atom stored hash | `blake3(text)` | `blake3(blake3(text) \|\| g.as_bytes())` |
+//! | compound id | `uuid_v5(COMPOUND, blake3(text) \|\| seed)` | the same, with `seed + ":" + g` |
+//! | compound stored hash | `blake3(blake3(text) \|\| seed)` | the same, with `seed + ":" + g` |
+//!
+//! `g.as_bytes()` is the group id's 16 raw bytes; `":" + g` is its lowercase
+//! hyphenated text form. `seed` is the per-node seed the builder already uses
+//! (`"{title}\u{1f}{path}"` for a document). Use [`scoped_atom_id`],
+//! [`scoped_atom_content_hash`] and [`scoped_seed`] rather than re-spelling
+//! these; with `scope = None` each returns exactly the public value, byte for
+//! byte, so a public ingest's ids are unchanged.
+//!
+//! What follows from it, for a client that recomputes ids locally and for the
+//! cross-source matcher:
+//!
+//! * The same text ingested by two groups is two claims, one per group. Before
+//!   this, a group's private ingest of a document another group had already
+//!   ingested converged onto (and reported the id of) the other group's row.
+//! * A non-public ingest never resolves a claim by its text: its atoms are
+//!   written by id, so they converge only on the same group's earlier ingest
+//!   of the same text, never on a row outside the group.
+//! * A scope-derived id is NOT a function of the text alone. A client must
+//!   know the owning group (returned as the ingest's `owner_group_id`) to
+//!   recompute it, and must recompute nothing for a row whose `properties`
+//!   carry [`ID_SCOPE_KEY`] `=` [`ID_SCOPE_OWNER_GROUP`] from the text alone.
+//! * Publicizing a scoped claim later keeps its scoped id; it does not merge
+//!   into the public twin that shares its text. The two are linked by
+//!   cross-source matching (the matcher's embedding neighbourhood: identical
+//!   text embeds identically), never by id convergence. The matcher's
+//!   content-hash blocker does not pair them, because the stored hash is
+//!   scope-derived too.
+//! * A re-ingest by the same group of a document it ingested before these ids
+//!   existed keeps the global ids recorded for that document: the ingest walk
+//!   reads the ids its in-scope `papers` row already asserts and re-uses them
+//!   claim by claim, so the re-run writes no duplicate.
+//!
+//! The workflow-side adopter of the same scheme is tracked as backlog
+//! eb8ea9e5; workflow ingest still derives global ids.
+//!
+//! ```
+//! use epigraph_ingest::common::ids::{
+//!     atom_id, compound_claim_id, content_hash, scoped_atom_id, scoped_seed,
+//! };
+//! use uuid::Uuid;
+//!
+//! let h = content_hash("Water boils at 100 C at sea level.");
+//! let group = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+//!
+//! // Public: exactly the global id.
+//! assert_eq!(scoped_atom_id(&h, None), atom_id(&h));
+//! // Non-public: the owning group is part of the id.
+//! let scoped = scoped_atom_id(&h, Some(group));
+//! assert_ne!(scoped, atom_id(&h));
+//! let mut material = h.to_vec();
+//! material.extend_from_slice(group.as_bytes());
+//! assert_eq!(scoped, Uuid::new_v5(&epigraph_ingest::common::ids::ATOM_NAMESPACE, &material));
+//!
+//! // Compound seeds gain ":" + the group id.
+//! let seed = "My Paper\u{1f}sections[0]";
+//! assert_eq!(scoped_seed(seed, None), seed);
+//! assert_eq!(
+//!     scoped_seed(seed, Some(group)),
+//!     "My Paper\u{1f}sections[0]:01234567-89ab-cdef-0123-456789abcdef"
+//! );
+//! assert_ne!(
+//!     compound_claim_id(&h, &scoped_seed(seed, Some(group))),
+//!     compound_claim_id(&h, seed)
+//! );
+//! ```
 
 use uuid::Uuid;
 
