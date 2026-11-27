@@ -1927,6 +1927,34 @@ mod refusal_table {
         }
     }
 
+    /// Every REVIEWED code raised as a `42501` keeps its own coded answer
+    /// (`From<DbError>`), never the group-write 403. The act's classifier
+    /// only routes a `42501` to the reviewed-code arm when the message has
+    /// the code SHAPE (`epigraph_auth::claim_act::is_coded_refusal`), so a
+    /// reviewed list entry outside that grammar (say `SR100`) would silently
+    /// read as the group-write refusal; this ties the two lists to it.
+    #[test]
+    fn every_reviewed_code_raised_as_42501_keeps_its_coded_answer() {
+        let c = Uuid::new_v4();
+        for code in epigraph_db::CALLER_REFUSAL_CODES
+            .iter()
+            .chain(epigraph_db::SUPERSEDE_REFUSAL_CODES)
+        {
+            let message = format!("{code}: a reviewed refusal");
+            assert!(
+                epigraph_auth::claim_act::is_coded_refusal(&message),
+                "{code} is outside the refusal-code grammar"
+            );
+            let got = supersede_refusal(c, db("42501", &message));
+            same(&got, &ApiError::from(db("42501", &message)), code);
+            assert_ne!(
+                format!("{got:?}"),
+                format!("{:?}", group_write()),
+                "{code} read as the group-write refusal"
+            );
+        }
+    }
+
     /// The DEFERRAL: CX03 is the act's own 403, byte for byte; any other
     /// refusal (the missing EXECUTE grant's uncoded 42501 included) is the
     /// deferral's 500 with the error, never the group-write 403.
