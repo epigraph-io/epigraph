@@ -36,7 +36,12 @@
 # live in dsn-lib.sh, which scripts/e2e/test-dsn-guard.sh tests. BASH_SOURCE,
 # not $0: $0 is the script that sourced this file.
 # shellcheck source=dsn-lib.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dsn-lib.sh"
+# Fail closed: the callers run without `set -e`, so a lib that cannot be loaded
+# would otherwise leave e2e_guard_dsn undefined and the guard a no-op.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dsn-lib.sh" || {
+  echo "dsn-guard.sh: cannot load dsn-lib.sh; refusing to run the e2e harness" >&2
+  exit 2
+}
 
 e2e_guard_dsn E2E_SU_DSN
 e2e_guard_dsn E2E_APP_DSN

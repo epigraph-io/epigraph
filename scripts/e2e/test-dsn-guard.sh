@@ -10,7 +10,8 @@
 #      refuses (exit 2, with the reason) one with no host, no port, or port
 #      5432, the production cluster's;
 #   3. dsn-guard.sh itself, sourced as the e2e scripts source it, exports the
-#      superuser DSN's host and port, and stops a script on a refused DSN.
+#      superuser DSN's host and port, and stops a script on a refused DSN or
+#      when dsn-lib.sh cannot be loaded.
 # A regression to a hard-coded loopback host (the defect behind backlog
 # 8a0a09d8) fails case 1.
 #
@@ -76,6 +77,17 @@ out=$(E2E_SU_DSN='postgres://su:pw@db.internal:5433/x' E2E_APP_DSN='postgres://a
   bash -c '. "$1/dsn-guard.sh"; echo reached' _ "$here" 2>&1) || rc=$?
 if [[ $rc == 2 ]] && ! grep -q reached <<<"$out"; then pass "dsn-guard.sh stops the script on an app DSN on 5432"
 else fail "dsn-guard.sh stops the script on an app DSN on 5432 (rc=$rc)"; sed 's/^/       | /' <<<"$out"; fi
+
+# A copy of dsn-guard.sh without its lib must stop the script, not run unguarded.
+lone=$(mktemp -d)
+cp "$here/dsn-guard.sh" "$lone/"
+rc=0
+out=$(E2E_SU_DSN='postgres://su:pw@db.internal:5432/x' E2E_APP_DSN='postgres://app:pw@db.internal:5432/x' \
+  bash -c 'set -uo pipefail; . "$1/dsn-guard.sh"; echo reached' _ "$lone" 2>&1) || rc=$?
+rm -rf "$lone"
+if [[ $rc == 2 ]] && ! grep -q reached <<<"$out" && grep -qF "cannot load dsn-lib.sh" <<<"$out"; then
+  pass "dsn-guard.sh without dsn-lib.sh stops the script"
+else fail "dsn-guard.sh without dsn-lib.sh stops the script (rc=$rc)"; sed 's/^/       | /' <<<"$out"; fi
 
 if ((failures)); then
   echo "test-dsn-guard: $failures case(s) failed" >&2
