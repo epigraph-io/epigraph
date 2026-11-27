@@ -12,6 +12,8 @@
 //! Nothing on a served path calls this module yet: the single atom-cache
 //! writer [`crate::edge_factor::recompute_atom_cache`] is wired to its call
 //! sites separately, behind `EPIGRAPH_ATOM_FOLD` (default `legacy`).
+//!
+//! Rollout status: see the crate doc ([`crate`], "Atom-level belief").
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

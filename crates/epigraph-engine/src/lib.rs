@@ -15,6 +15,38 @@
 //! Truth values are **derived from evidence**, not from agent reputation.
 //! A high-reputation agent making an unsupported claim gets low truth value.
 //! This prevents the "Appeal to Authority" fallacy.
+//!
+//! # Atom-level belief (rolling out)
+//!
+//! An atom's belief as the fold of its own evidence, and a compound's belief
+//! as a query over its visible leaves, are being rolled out in stages. Until
+//! the rollout completes, a large part of this crate is `pub` but reached
+//! from no request path. Today these are reached ONLY from the CLI
+//! maintenance bins (`recompute_betp`, `backfill_factors` and the other wave
+//! bins) and from MCP `get_belief`'s `shadow` view, which is the one served
+//! consumer and only adds a view beside the served values:
+//!
+//! - [`atom_items`]: the atom evidence fold (AEF);
+//! - [`compound_belief`]: a compound's belief derived from its leaves;
+//! - [`belief_view`]'s `progressive` and `strict` modes, which this build
+//!   does not wire: both serve `legacy`
+//!   ([`belief_view::CompoundBeliefMode::serving`]);
+//! - the parameter groups of [`belief_profile`] marked "(not yet consumed)";
+//! - [`edge_factor::recompute_atom_cache`], the single atom-cache writer,
+//!   whose non-test callers are the CLI bins.
+//!
+//! [`belief_modes`] is the authoritative per-flag table of what this build
+//! acts on (`EPIGRAPH_ATOM_FOLD`, `EPIGRAPH_COMPOUND_BELIEF` and the rest);
+//! a flag's reported mode is configuration, not behaviour, wherever that
+//! table says the flag is not acted on. Read it there rather than here.
+//!
+//! **Exit criterion.** The legacy per-site folds (and the `LegacyFold` arms
+//! of the atom-cache writer) are deleted once `EPIGRAPH_COMPOUND_BELIEF=strict`
+//! has served on every process for N days with no rollback, N = 30 unless
+//! the operator sets another value at the `strict` flip. That deletes fold
+//! CODE only: stored BBA rows are kept as rollback and attribution input.
+//! The remaining rollout steps and this criterion are tracked in the backlog
+//! (85c03e90).
 
 pub mod admin_cascade;
 pub mod agent_assessment;
