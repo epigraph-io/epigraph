@@ -237,8 +237,8 @@ async fn two_tenants_private_ingests_of_one_document_are_two_sets_of_claims(pool
         );
     }
 
-    // A scoped atom's stored digest folds in its group, and verify_claim says
-    // so (not applicable) instead of calling it tampered.
+    // A scoped atom's stored digest folds in its group, and verify_claim
+    // re-derives it from the row's owner: an unchanged row matches.
     let b_atoms: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id FROM claims WHERE agent_id = $1 AND properties->>'level' = '3' \
            AND properties->>'id_scope' = 'owner_group'",
@@ -260,8 +260,26 @@ async fn two_tenants_private_ingests_of_one_document_are_two_sets_of_claims(pool
             .await
             .expect("verify_claim"),
         );
-        assert_eq!(v["hash_check"], "not_applicable", "{v}");
+        assert_eq!(v["hash_check"], "match", "{v}");
     }
+    // A body changed under the row (direct table access) no longer matches.
+    sqlx::query("UPDATE claims SET content = content || ' (altered)' WHERE id = $1")
+        .bind(b_atoms[0])
+        .execute(&pool)
+        .await
+        .expect("tamper");
+    let v = json_of(
+        &tools::claims::verify_claim(
+            &server,
+            &vb,
+            VerifyClaimParams {
+                claim_id: b_atoms[0].to_string(),
+            },
+        )
+        .await
+        .expect("verify_claim"),
+    );
+    assert_ne!(v["hash_check"], "match", "a changed body verified: {v}");
 
     // B's paper asserts only B's claims.
     let b_paper: Uuid = rb["paper_id"].as_str().expect("B's paper").parse().unwrap();

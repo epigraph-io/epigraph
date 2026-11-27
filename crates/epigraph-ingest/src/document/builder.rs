@@ -128,7 +128,9 @@ const WORKFLOW_SOURCE_TYPE: &str = "workflow";
 /// stores `blake3(blake3(text) || owner_group)` on its atoms
 /// ([`crate::common::ids::scoped_atom_content_hash`]). An UNMARKED atom keeps
 /// the plain digest, so for it a body/digest disagreement is still a
-/// mismatch.
+/// mismatch. For a marked atom, [`scoped_atom_hash_matches`] re-derives the
+/// digest from the row's current owner, so `verify_claim` reports `match` for
+/// an unchanged row instead of `not_applicable`.
 #[must_use]
 pub fn stored_content_hash_is_seed_scoped(properties: &serde_json::Value) -> bool {
     let is_document = properties
@@ -139,6 +141,39 @@ pub fn stored_content_hash_is_seed_scoped(properties: &serde_json::Value) -> boo
     // comment above.
     (is_compound_level(properties) && (is_document || is_scoped_workflow(properties)))
         || (is_document && is_scoped_atom(properties))
+}
+
+/// Re-derive a scope-derived document atom's stored digest from its body and
+/// the group that owns the row NOW: `Some(true)` when
+/// `blake3(blake3(content) || owner_group)` is `stored`, `Some(false)` when it
+/// is not, and `None` when `properties` is not a scope-derived document atom
+/// (the caller then classifies the row as before).
+///
+/// `Some(false)` is NOT proof of tampering: a row
+/// `share_claims_with_team` moved to a team keeps the digest its first owner
+/// derived. `verify_claim` therefore reports `match` on `Some(true)` and
+/// `not_applicable` otherwise, so an honest row still verifies and only a row
+/// whose body or owner changed since it was written loses the check.
+#[must_use]
+pub fn scoped_atom_hash_matches(
+    properties: &serde_json::Value,
+    content: &str,
+    stored: &[u8; 32],
+    owner_group: Uuid,
+) -> Option<bool> {
+    let is_document = properties
+        .get("source_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|st| DOCUMENT_SOURCE_TYPES.contains(&st));
+    if !(is_document && is_scoped_atom(properties)) {
+        return None;
+    }
+    Some(
+        crate::common::ids::scoped_atom_content_hash(
+            &crate::common::ids::content_hash(content),
+            Some(owner_group),
+        ) == *stored,
+    )
 }
 
 /// A level-3 row carrying the scope-derived id marker.

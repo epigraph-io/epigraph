@@ -17,7 +17,8 @@ use epigraph_ingest::common::ids::{
     scoped_atom_id, scoped_seed, ID_SCOPE_KEY, ID_SCOPE_OWNER_GROUP,
 };
 use epigraph_ingest::document::{
-    adopt_recorded_ids, build_ingest_plan, build_ingest_plan_scoped, DocumentExtraction,
+    adopt_recorded_ids, build_ingest_plan, build_ingest_plan_scoped, scoped_atom_hash_matches,
+    DocumentExtraction,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -274,4 +275,38 @@ fn the_first_recorded_row_wins_a_shared_hash() {
         .iter()
         .filter(|c| c.content == atom.content)
         .all(|c| c.id == first));
+}
+
+/// `verify_claim`'s re-derivation of a scoped atom's digest: it matches under
+/// the group that wrote it, not under another group or for another body, and
+/// does not apply to an unmarked atom.
+#[test]
+fn a_scoped_atoms_digest_is_re_derived_from_its_owner() {
+    let ex = extraction();
+    let scoped = build_ingest_plan_scoped(&ex, Some(group()));
+    let atom = scoped.claims.iter().find(|c| c.level == 3).expect("atom");
+    let props = &atom.properties;
+    assert_eq!(
+        scoped_atom_hash_matches(props, &atom.content, &atom.content_hash, group()),
+        Some(true)
+    );
+    assert_eq!(
+        scoped_atom_hash_matches(props, &atom.content, &atom.content_hash, Uuid::from_u128(7)),
+        Some(false)
+    );
+    assert_eq!(
+        scoped_atom_hash_matches(props, "another body", &atom.content_hash, group()),
+        Some(false)
+    );
+    let global = build_ingest_plan(&ex);
+    let plain = global.claims.iter().find(|c| c.level == 3).expect("atom");
+    assert_eq!(
+        scoped_atom_hash_matches(
+            &plain.properties,
+            &plain.content,
+            &plain.content_hash,
+            group()
+        ),
+        None
+    );
 }
