@@ -84,8 +84,12 @@ class PrTextFindings(unittest.TestCase):
         self.assertEqual(self.classes("t", "Co-Authored-By: A Person <" + BAD_EMAIL + ">"),
                          [("body line 1", "E1")])
 
-    def test_crlf_body_numbers_lines_like_lf(self):
-        self.assertEqual(self.classes("t", "a\r\nb\r\nsee " + BAD_HOME), [("body line 3", "E2")])
+    def test_cr_and_crlf_bodies_number_lines_like_lf(self):
+        # A bare CR (and a mix of endings) must split too: with an LF-only
+        # split, both bodies below would be one line and report "body line 1".
+        for body in ("a\rb\rsee " + BAD_HOME, "a\r\nb\rsee " + BAD_HOME, "a\r\nb\r\nsee " + BAD_HOME):
+            with self.subTest(body=body[:6]):
+                self.assertEqual(self.classes("t", body), [("body line 3", "E2")])
 
     def test_clean_text_passes(self):
         body = ("Backlog: 82f1faf6\n\nExample: user@example.com in "
