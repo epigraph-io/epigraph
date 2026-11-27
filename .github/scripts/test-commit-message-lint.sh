@@ -12,7 +12,11 @@
 #                 and loopback addresses, and a clean protocol message pass
 #                 with no finding at all;
 #   4. redacted — no output ever contains the offending value (public CI logs);
-#   5. range    — only <base>..<head> is read; an empty base reads <head> only.
+#   5. range    — only <base>..<head> is read; an empty base reads <head> only;
+#   6. W4       — `--cited-shas` warns (exit 0) for a cited sha that names no
+#                 commit reachable from <head> (a side-branch sha included),
+#                 skips UUIDs, backlog ids, digests, numbers and trailers,
+#                 never prints the token, and the default run never reports W4.
 #
 # Host-shaped values are assembled from pieces at run time so no encoded
 # wildcard-DNS name appears in this file (the repo's source guard scans *.sh).
@@ -150,6 +154,55 @@ for b in "$base" ""  "0000000000000000000000000000000000000000"; do
   if [[ $rc == 0 ]]; then echo "ok   - range: base '${b:0:7}' reads only the added commit(s)"
   else echo "FAIL - range: base '${b:0:7}' read history it should not (rc=$rc)"; failures=$((failures + 1)); fi
 done
+
+# --- W4: cited commit shas (--cited-shas mode) --------------------------------
+# A cited sha must name a commit reachable from <head> (on main, from main).
+# Reachability, not object existence: a sha on a side branch exists in a full
+# clone (`git cat-file -e` succeeds) but is not on main, so it must still warn.
+anc=$(git -C "$r" rev-parse HEAD)          # an ancestor of every later commit
+side=$(git -C "$r" commit-tree "HEAD^{tree}" -p HEAD -m "side")
+git -C "$r" update-ref refs/heads/side "$side"   # exists, not reachable from main
+git -C "$r" cat-file -e "${side:0:12}^{commit}"  # premise: the object resolves
+missing="5e1f0c0ffee12"                    # a commit-like token naming nothing
+# check_cited <name> <message> <want W4 count> <value|->: commit <message>, run
+# --cited-shas over exactly that commit, assert exit 0, the W4 count and that
+# <value> never appears in the output (a hex run could be a secret).
+check_cited() {
+  local name=$1 message=$2 want=$3 value=$4 rc=0 base out got ok=1
+  base=$(git -C "$r" rev-parse HEAD)
+  commit "$message"
+  out=$(cd "$r" && python3 "$lint" --cited-shas "$base" HEAD 2>&1) || rc=$?
+  got=$(grep -c '^warning W4 ' <<<"$out" || true)
+  [[ $rc == 0 ]] || { echo "FAIL - $name: want rc=0, got rc=$rc"; ok=0; }
+  [[ $got == "$want" ]] || { echo "FAIL - $name: want $want W4, got $got"; ok=0; }
+  grep -Eq '^(error|warning) (E|W[23] )' <<<"$out" && { echo "FAIL - $name: mode reported a non-W4 class"; ok=0; }
+  if [[ $value != - ]] && grep -qF -- "$value" <<<"$out"; then
+    echo "FAIL - $name: output contains the cited token"; ok=0
+  fi
+  if ((ok)); then echo "ok   - $name"; else sed 's/^/       | /' <<<"$out"; failures=$((failures + 1)); fi
+}
+check_cited "W4 ok full sha of an ancestor"        "fix(x): t$good_body"$'\n\nfollows '"$anc" 0 -
+check_cited "W4 ok 12-char prefix of an ancestor"  "fix(x): t$good_body"$'\n\nfollows '"${anc:0:12}" 0 -
+check_cited "W4 ok 7 hex after 'commit', ancestor" "fix(x): t$good_body"$'\n\nas in commit `'"${anc:0:7}"'`' 0 -
+check_cited "W4 side-branch sha not on main"       "fix(x): t$good_body"$'\n\nfollows '"${side:0:12}" 1 "${side:0:12}"
+check_cited "W4 sha that names nothing"            "fix(x): t$good_body"$'\n\nfollows '"$missing" 1 "$missing"
+check_cited "W4 7 hex after 'commit', unresolved"  "fix(x): t$good_body"$'\n\nreverts commit 5e1f0c0' 1 "5e1f0c0"
+check_cited "W4 'commit hash' is not a digest label" "fix(x): t$good_body"$'\n\nreverts commit hash 5e1f0c0f' 1 "5e1f0c0f"
+check_cited "W4 short shas through a 'commits' list" "fix(x): t$good_body"$'\n\ncommits 5e1f0c0f, `6a7b8c9d` and 7e8f9a0b' 3 "6a7b8c9d"
+check_cited "W4 short shas after sha/revert/cherry-pick" "fix(x): t$good_body"$'\n\nsha: 5e1f0c0f; reverted 6a7b8c9d; cherry-picked 7e8f9a0' 3 "7e8f9a0"
+check_cited "W4 ok short shas of ancestors in a list" "fix(x): t$good_body"$'\n\ncommits '"${anc:0:8}"' and '"${anc:0:7}" 0 -
+# A bare 7-8 hex token is not read: it cannot be told from an 8-hex backlog or
+# claim-id prefix, which names no git object (the commonest shapes below).
+check_cited "W4 bare 8-hex ids are not shas"       "fix(x): t$good_body"$'\n\n- Review of backlog batch D0101-01 (c0ffee42): x\n- the residual of 5e1f0c0f: y\n- Scoped gate on 6a7b8c9d: failed' 0 -
+check_cited "W4 counts each unresolved token"      "fix(x): t $missing$good_body"$'\n\nsee '"${side:0:12}"' and '"$anc" 2 "$missing"
+check_cited "W4 not-sha shapes are not cited"      "fix(x): t$good_body"$'\n\nclaim 2a2d527f-387f-4ef4-89e0-1a645dfeaf49, backlog 114b17a4,\nhash 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08,\nnumber 17000000001234, word deadbeefcafe, pin actions/checkout@'"$missing"$',\nuuid 2a2d527f387f4ef489e01a645dfeaf49, digest (sha256 '"$missing"') blake3: '"$missing" 0 -
+check_cited "W4 trailer lines are not read"        "fix(x): t$good_body"$'\n\nCo-Authored-By: A <a@example.com> '"$missing" 0 -
+# The default (no-flag) run is unchanged: it never reports W4.
+rc=0; base=$(git -C "$r" rev-parse HEAD)
+commit "fix(x): t$good_body"$'\n\nfollows '"$missing"
+out=$(cd "$r" && python3 "$lint" "$base" HEAD 2>&1) || rc=$?
+if [[ $rc == 0 ]] && ! grep -q ' W4 ' <<<"$out"; then echo "ok   - W4 default run does not check cited shas"
+else echo "FAIL - W4 default run does not check cited shas (rc=$rc)"; sed 's/^/       | /' <<<"$out"; failures=$((failures + 1)); fi
 
 if ((failures)); then
   echo "test-commit-message-lint: $failures case(s) failed" >&2
