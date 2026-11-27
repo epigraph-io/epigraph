@@ -14,10 +14,12 @@
 //! A custom SQLSTATE is read first. The [`Answer`] says what the code becomes
 //! and so what each transport answers; [`Answer::kind`] is its
 //! [`RefusalKind`] when it has one. Nothing outside this file matches a code
-//! literal (`tests/refusal_code_matches_ratchet.rs`): a repo converts its
-//! definers' refusals with `DbError::from_definer`, `From<sqlx::Error>` asks
-//! [`lookup`] for the codes it answers for every caller, and a route that
-//! answers a code itself compares [`route_code`] with this file's constant.
+//! (`tests/refusal_code_matches_ratchet.rs`): a repo converts its definers'
+//! refusals with `DbError::from_definer`, `From<sqlx::Error>` asks [`lookup`]
+//! for the codes it answers for every caller, and a route that answers a code
+//! itself compares [`route_code`] with this file's constant. The one
+//! exception is `CX03`, recognised in `epigraph-auth` (which does not depend
+//! on this crate) and registered here as well; the ratchet names it.
 //!
 //! # The HTTP-disclosed lists
 //!
@@ -99,6 +101,23 @@ pub const ELV07: &str = "ELV07";
 pub const ELV08: &str = "ELV08";
 /// SQLSTATE `CUS04` (migration 123): the custodial act's assignment has ended.
 pub const CUS04: &str = "CUS04";
+
+/// `ADM02: ` as `42501` (migrations 111, 112, 237, 252): the token carries
+/// `claims:admin`, but its client record grants no live `claims:admin` to the
+/// principal. The agent-key routes answer it on the admin audit write.
+pub const ADM02: &str = "ADM02";
+/// `AK02: ` as `42501` (migrations 161, 162, 163, 239): a `signing` (or
+/// `identity-legacy`) agent key is attested state, changed only by the host's
+/// identity registration or a maintenance session.
+pub const AK02: &str = "AK02";
+/// `AK03: ` as `42501` (migration 239): the key's agent is not the stamped
+/// principal, and the database does not hold the caller to be an admin.
+pub const AK03: &str = "AK03";
+
+/// SQLSTATE `AID06` (migrations 161, 268, 276): the prompt history of an
+/// agent is readable only by its operator and by an admin. The prompt-history
+/// routes answer it as the not-found every other miss gets.
+pub const PROMPT_HISTORY_REFUSED: &str = "AID06";
 
 /// How a refusal carries its code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +217,16 @@ const fn sqlstate(code: &'static str, answer: Answer) -> RefusalCode {
     }
 }
 
+const fn in_42501(code: &'static str, answer: Answer) -> RefusalCode {
+    RefusalCode {
+        code,
+        carrier: Carrier::Prefix {
+            sqlstate: Some("42501"),
+        },
+        answer,
+    }
+}
+
 const AUTHORITY: Answer = Answer::Refused(RefusalKind::Authority);
 const INPUT: Answer = Answer::Refused(RefusalKind::Input);
 const STATE: Answer = Answer::Refused(RefusalKind::State);
@@ -248,6 +277,19 @@ pub const REGISTRY: &[RefusalCode] = &[
     sqlstate(ELV08, Answer::Route),
     // Migration 123: a custodial act's ended assignment.
     sqlstate(CUS04, Answer::Route),
+    // The agent-key definers' refusals (migrations 161 to 163 and 239) and
+    // the admin grant check (111, 112, 237, 252), all as 42501.
+    in_42501(AK02, Answer::Route), in_42501(AK03, Answer::Route),
+    in_42501(ADM02, Answer::Route),
+    // Migrations 161, 268 and 276: the prompt history's reader.
+    sqlstate(PROMPT_HISTORY_REFUSED, Answer::Route),
+    // Migration 120's cascade-deferral definer, answered by the supersede
+    // route and tool. Recognised by `epigraph_auth::claim_act::
+    // is_cascade_deferral_refusal`, which takes a SQLSTATE and a message so
+    // that `epigraph-auth` stays free of the database layer; listed here so
+    // the registry knows every code a caller answers (the ratchet ties the
+    // two: tests/refusal_code_matches_ratchet.rs).
+    in_42501("CX03", Answer::Route),
 ];
 
 /// A family of codes one definer (or one migration's definers) raises, and
@@ -517,6 +559,41 @@ mod tests {
         assert_eq!(route_code(&q("22004", "x")), None);
         // Only a QueryFailed carries the driver's SQLSTATE.
         assert_eq!(route_code(&DbError::from(error("RVK01", "x"))), None);
+    }
+
+    /// The agent-key, admin-grant, prompt-history and cascade-deferral codes
+    /// a route answers itself: each only as its definer raises it.
+    #[test]
+    fn the_route_answered_key_grant_history_and_deferral_codes() {
+        let q = |code, message| DbError::QueryFailed {
+            source: error(code, message),
+        };
+        assert_eq!(route_code(&q("42501", "AK02: x")), Some(AK02));
+        assert_eq!(route_code(&q("42501", "AK03: x")), Some(AK03));
+        assert_eq!(route_code(&q("42501", "ADM02: x")), Some(ADM02));
+        assert_eq!(route_code(&q("42501", "CX03: x")), Some("CX03"));
+        assert_eq!(
+            route_code(&q("AID06", "AID06: x")),
+            Some(PROMPT_HISTORY_REFUSED)
+        );
+        for (state, message) in [
+            // Not 42501: another refusal that happens to open the same way.
+            ("P0001", "AK02: x"),
+            ("55000", "ADM02: x"),
+            ("P0001", "CX03: x"),
+            // The code is the SQLSTATE, not the text.
+            ("42501", "AID06: x"),
+            // Not at the start, or not followed by ": ".
+            ("42501", "permission denied: AK02: x"),
+            ("42501", "AK02 x"),
+            // A plain role-privilege refusal.
+            (
+                "42501",
+                "permission denied for function epigraph_agent_key_rotate",
+            ),
+        ] {
+            assert_eq!(route_code(&q(state, message)), None, "{state} {message:?}");
+        }
     }
 
     #[test]

@@ -99,7 +99,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use epigraph_core::AgentId;
-use epigraph_db::agent_identity::PROMPT_HISTORY_REFUSED;
+use epigraph_db::refusal_codes::{route_code, PROMPT_HISTORY_REFUSED};
 use epigraph_db::{
     AgentIdentityRepository, AgentRepository, DbError, PromptBlob, PromptBlobRead,
     PromptHistoryCursor, PromptHistoryIndexEntry, PromptSnapshotIndex,
@@ -385,13 +385,7 @@ pub fn group_history(
 
 /// True when the definer refused the caller (neither operator nor admin).
 fn is_refused(e: &DbError) -> bool {
-    match e {
-        DbError::QueryFailed { source } => source
-            .as_database_error()
-            .and_then(|d| d.code())
-            .is_some_and(|c| c == PROMPT_HISTORY_REFUSED),
-        _ => false,
-    }
+    route_code(e) == Some(PROMPT_HISTORY_REFUSED)
 }
 
 fn not_found(id: Uuid) -> ApiError {
