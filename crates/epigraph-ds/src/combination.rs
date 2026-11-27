@@ -399,12 +399,13 @@ pub fn conflict_coefficient(m1: &MassFunction, m2: &MassFunction) -> Result<f64,
     Ok(k)
 }
 
-/// Which combination rule to use, selected adaptively based on conflict and open-world fraction
+/// The four conflict-handling regimes the old adaptive fold chose between.
 ///
-/// This is the output of [`select_combination_rule`]. It no longer drives
-/// [`combine_multiple`], which folds with Dempster's rule at every step
-/// (drain unit U025); it is kept as public API for callers that want the
-/// classification itself.
+/// Nothing in this crate produces or consumes it any more: [`combine_multiple`]
+/// folds with Dempster's rule at every step (drain unit U025), and the
+/// per-step selector that returned this enum was deleted as unused (backlog
+/// 593c1852). It is kept as public API only because it is a plain
+/// serialisable label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CombinationRule {
     /// Low conflict: Dempster normalization is safe
@@ -415,30 +416,6 @@ pub enum CombinationRule {
     YagerOpen,
     /// High conflict + closed-world: Inagaki parametric redistribution
     Inagaki,
-}
-
-/// Select the appropriate combination rule based on conflict level and open-world fraction
-///
-/// Not used by [`combine_multiple`] (see its doc comment, drain unit U025):
-/// re-selecting per step from accumulated state made that fold non-monotone
-/// under supporting evidence.
-///
-/// Decision boundaries:
-/// - K < 0.1: low conflict, Dempster normalization is safe
-/// - 0.1 <= K < 0.5: moderate conflict, preserve via CDST conjunctive
-/// - K >= 0.5 + open-world fraction > 0.03: redirect to open-world ignorance (Yager)
-/// - K >= 0.5 + closed world: Inagaki parametric redistribution
-#[must_use]
-pub fn select_combination_rule(conflict_k: f64, open_world_fraction: f64) -> CombinationRule {
-    if conflict_k < 0.1 {
-        CombinationRule::Dempster
-    } else if conflict_k < 0.5 {
-        CombinationRule::CdstConjunctive
-    } else if open_world_fraction > 0.03 {
-        CombinationRule::YagerOpen
-    } else {
-        CombinationRule::Inagaki
-    }
 }
 
 /// Adaptive combination: choose method based on conflict level
@@ -550,13 +527,13 @@ pub fn fold_conflict(combined: &MassFunction, reports: &[CombinationReport]) -> 
 /// `tests/supports_monotonicity.rs`.
 ///
 /// History (drain unit U025, backlog 9d4821c1): this used to re-pick a rule
-/// per step via [`select_combination_rule`] (Dempster / CDST conjunctive /
-/// Yager-open / Inagaki). Because the choice depended on accumulated state and
-/// the inputs are re-sorted on every call, appending one BBA re-routed earlier
-/// steps; the result was non-monotone under supporting evidence, and the
-/// Inagaki arms seeded and then ratcheted mass on `(Omega, true)` on closed
-/// frames (claim f8cf28d0). [`select_combination_rule`] and
-/// [`CombinationRule`] are kept as public API but are no longer consulted here.
+/// per step with an adaptive selector (Dempster / CDST conjunctive /
+/// Yager-open / Inagaki, see [`CombinationRule`]). Because the choice depended
+/// on accumulated state and the inputs are re-sorted on every call, appending
+/// one BBA re-routed earlier steps; the result was non-monotone under
+/// supporting evidence, and the Inagaki arms seeded and then ratcheted mass on
+/// `(Omega, true)` on closed frames (claim f8cf28d0). The selector was later
+/// deleted as unused (backlog 593c1852).
 ///
 /// Conflict stays visible in the per-step [`CombinationReport::conflict_k`];
 /// use [`aggregate_conflict`] for the fold-level value. Mass on
@@ -948,26 +925,6 @@ fn superset_mobius(v: &mut [f64], bits: usize) {
     }
 }
 
-/// Cross-frame combination
-///
-/// Builds the union frame from both mass functions' frames, reindexes both
-/// to the union frame, then combines using the specified method.
-///
-/// # Errors
-/// - `DsError::IncompatibleFrames` if reindexing fails
-/// - Propagates errors from the chosen combination method
-pub fn cross_frame_combine(
-    m1: &MassFunction,
-    m2: &MassFunction,
-    method: CombinationMethod,
-    gamma: Option<f64>,
-) -> Result<MassFunction, DsError> {
-    let union_frame = m1.frame().union(m2.frame());
-    let m1_reindexed = m1.reindex_to_frame(&union_frame)?;
-    let m2_reindexed = m2.reindex_to_frame(&union_frame)?;
-    redistribute(&m1_reindexed, &m2_reindexed, method, gamma)
-}
-
 /// Check that two mass functions are defined on the same frame: the same id
 /// AND the same hypotheses in the same order, which is what
 /// `FrameOfDiscernment`'s `PartialEq` means by equal.
@@ -976,8 +933,8 @@ pub fn cross_frame_combine(
 /// id and differ in hypotheses, which `FrameOfDiscernment::extend` produces by
 /// construction. Focal sets are indices into the frame, so combining across
 /// such a pair reads one operand's indices against the other's hypothesis
-/// list. That is what `cross_frame_combine` (reindex onto the union frame) is
-/// for.
+/// list. Reindex both operands onto a common frame
+/// (`MassFunction::reindex_to_frame`) before combining them.
 fn check_frame_compat(m1: &MassFunction, m2: &MassFunction) -> Result<(), DsError> {
     if m1.frame() != m2.frame() {
         return Err(DsError::IncompatibleFrames {
@@ -1911,83 +1868,6 @@ mod tests {
         );
     }
 
-    // ======== Cross-frame combination ========
-
-    #[test]
-    fn cross_frame_combine_different_frames() {
-        let f1 = FrameOfDiscernment::new("f1", vec!["a".into(), "b".into()]).unwrap();
-        let f2 = FrameOfDiscernment::new("f2", vec!["b".into(), "c".into()]).unwrap();
-
-        let m1 = MassFunction::simple(f1, BTreeSet::from([0]), 0.7).unwrap();
-        let m2 = MassFunction::simple(f2, BTreeSet::from([0]), 0.6).unwrap();
-
-        let result = cross_frame_combine(&m1, &m2, CombinationMethod::Dempster, None).unwrap();
-
-        // Union frame should have 3 hypotheses: a, b, c
-        assert_eq!(result.frame().hypothesis_count(), 3);
-        assert_eq!(result.frame().id, "f1+f2");
-    }
-
-    #[test]
-    fn cross_frame_combine_same_frame_matches_direct() {
-        let frame = binary_frame();
-        let m1 = MassFunction::simple(frame.clone(), BTreeSet::from([0]), 0.7).unwrap();
-        let m2 = MassFunction::simple(frame, BTreeSet::from([0]), 0.6).unwrap();
-
-        let cross = cross_frame_combine(&m1, &m2, CombinationMethod::Dempster, None).unwrap();
-        let direct = dempster_combine(&m1, &m2).unwrap();
-
-        // Results should match (same-frame cross-frame == direct)
-        let fe0_cross = FocalElement::positive(BTreeSet::from([0]));
-        let fe0_direct = FocalElement::positive(BTreeSet::from([0]));
-        assert!((cross.mass_of(&fe0_cross) - direct.mass_of(&fe0_direct)).abs() < 1e-10,);
-    }
-
-    // ======== Adaptive rule selection ========
-
-    #[test]
-    fn select_rule_low_conflict_returns_dempster() {
-        assert_eq!(
-            select_combination_rule(0.05, 0.0),
-            CombinationRule::Dempster
-        );
-        assert_eq!(select_combination_rule(0.0, 0.5), CombinationRule::Dempster);
-    }
-
-    #[test]
-    fn select_rule_moderate_conflict_returns_cdst_conjunctive() {
-        assert_eq!(
-            select_combination_rule(0.1, 0.0),
-            CombinationRule::CdstConjunctive
-        );
-        assert_eq!(
-            select_combination_rule(0.3, 0.5),
-            CombinationRule::CdstConjunctive
-        );
-        assert_eq!(
-            select_combination_rule(0.49, 0.0),
-            CombinationRule::CdstConjunctive
-        );
-    }
-
-    #[test]
-    fn select_rule_high_conflict_open_world_returns_yager() {
-        assert_eq!(
-            select_combination_rule(0.5, 0.1),
-            CombinationRule::YagerOpen
-        );
-        assert_eq!(
-            select_combination_rule(0.9, 0.04),
-            CombinationRule::YagerOpen
-        );
-    }
-
-    #[test]
-    fn select_rule_high_conflict_closed_world_returns_inagaki() {
-        assert_eq!(select_combination_rule(0.5, 0.0), CombinationRule::Inagaki);
-        assert_eq!(select_combination_rule(0.8, 0.03), CombinationRule::Inagaki);
-    }
-
     #[test]
     fn combine_multiple_uses_dempster_for_low_conflict() {
         let frame = binary_frame();
@@ -2063,11 +1943,6 @@ mod tests {
             "input must be in the old high-conflict regime; got {k}"
         );
         assert!(m1.open_world_fraction() > 0.03, "input must be open-world");
-        assert_eq!(
-            select_combination_rule(k, m1.open_world_fraction()),
-            CombinationRule::YagerOpen,
-            "the old selector would have routed this pair to YagerOpen"
-        );
 
         let (result, reports) = combine_multiple(&[m1.clone(), m2.clone()], 0.1).unwrap();
         assert_eq!(reports[0].method_used, CombinationMethod::Dempster);
