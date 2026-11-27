@@ -5306,6 +5306,29 @@ restart.
   `harvester_fragments`). The operator CLI of this change refuses a database below 354 (its
   cascade model no longer attributes the provenance table).
   Apply as a superuser. **Applied to throwaway databases only, NOT to any deployed database.**
+- **355**: `papers_declare_abstract_text_properties` (backlog 158b7ce4). A deployed database's
+  `papers` carries two columns no earlier migration creates: `abstract_text text` (nullable, no
+  default; read by `scripts/run_assessment_worker.py`) and `properties jsonb NOT NULL DEFAULT
+  '{}'::jsonb` (read by no crate; it may hold data there, so it is declared, not dropped). 255
+  grants `epigraph_app` INSERT on every `papers` column but `licence` from the live column list,
+  so where the two columns predated 255 they gained INSERT, and a database migrated from empty
+  differed in both columns and column ACLs. 355 adds each column only where `pg_attribute` shows
+  it missing (so where both exist no ALTER TABLE runs and `papers` is not locked), with the
+  deployed definition, then `GRANT INSERT (abstract_text, properties) ON papers TO epigraph_app`
+  (no UPDATE: 255's UPDATE allowlist stays `title` and `journal`). **On a deployed database whose
+  columns and grants predate it, 355 changes nothing, so it has nothing to reverse there.** A
+  column that already exists with a different definition is left as it is, without a warning
+  (the `ADD COLUMN IF NOT EXISTS` behaviour); only the end-state catalog check shows it. **No
+  undo runbook ships**: an undo would have to DROP the two columns, nothing records which database
+  355 created them on, and on a deployed database that would destroy data. Pinned by
+  `epigraph-db/tests/paper_licence_operator_only.rs`
+  (`papers_declares_abstract_text_and_properties_insert_only`,
+  `the_app_role_inserts_the_declared_paper_columns_but_never_updates_them`,
+  `migration_355_keeps_columns_that_predate_255`, and 255's
+  `the_app_role_writes_only_the_allowlisted_paper_columns`). No binary depends on it; no deploy
+  order. **Measure after deploy**: the deploy's end-state catalog check should show no `papers`
+  column or column-ACL drift between a fresh migrate and the deployed database; this change did
+  not measure parity with a deployed database.
 
 ## `-- no-transaction` migrations
 
