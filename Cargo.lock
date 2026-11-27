@@ -1673,6 +1673,7 @@ dependencies = [
  "chrono",
  "criterion",
  "epigraph-atlas-contract",
+ "epigraph-auth",
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-db",

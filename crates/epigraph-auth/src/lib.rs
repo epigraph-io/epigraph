@@ -53,6 +53,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod claim_act;
+pub mod relationships;
+pub mod resource_metadata;
 
 /// The committed development JWT secret. NEVER acceptable in production.
 /// Single source of truth — every consumer must reference this const, not a

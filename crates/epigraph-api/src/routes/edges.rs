@@ -159,25 +159,26 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "decomposes_to",  // claim → claim (atomic decomposition)
     // Closure basis: resolution claim → the claims that justified closing a
     // backlog item. Written by MCP `resolve_backlog_item`; registered here so
-    // the same edge can be asserted and inspected over HTTP. The byte string
-    // must stay identical to `epigraph_mcp::tools::claims::JUSTIFIES_RELATIONSHIP`
-    // — this list is matched case-sensitively outside the case-folded four.
-    "justifies",             // claim → claim (closure basis; reopenable via supersede)
-    "section_follows",       // claim → claim (sibling section ordering within a document)
-    "continues_argument",    // claim → claim (sibling paragraph ordering within a section)
-    "same_as",               // claim → claim (deduplication identity)
-    "AUTHORED",              // agent → claim (materialized authorship)
-    "ATTRIBUTED_TO",         // claim → agent (prov:wasAttributedTo)
-    "refines",               // claim → claim (refinement)
-    "cites",                 // claim → claim (citation link)
-    "qualifies",             // claim → claim (scope caveat; belief-neutral, lower-case only)
-    "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
-    "revises",               // claim → claim (concurrent branch from common ancestor)
-    "enables",               // claim → claim (enablement)
+    // the same edge can be asserted and inspected over HTTP. One constant,
+    // shared with the MCP tool, because this list is matched case-sensitively
+    // outside the case-folded four. claim → claim (closure basis; reopenable
+    // via supersede).
+    epigraph_auth::relationships::JUSTIFIES_RELATIONSHIP,
+    "section_follows", // claim → claim (sibling section ordering within a document)
+    "continues_argument", // claim → claim (sibling paragraph ordering within a section)
+    "same_as",         // claim → claim (deduplication identity)
+    "AUTHORED",        // agent → claim (materialized authorship)
+    "ATTRIBUTED_TO",   // claim → agent (prov:wasAttributedTo)
+    "refines",         // claim → claim (refinement)
+    "cites",           // claim → claim (citation link)
+    "qualifies",       // claim → claim (scope caveat; belief-neutral, lower-case only)
+    "EQUIVALENT_TO",   // claim → claim (semantic equivalence)
+    "revises",         // claim → claim (concurrent branch from common ancestor)
+    "enables",         // claim → claim (enablement)
     "has_method_capability", // method → capability (method graph)
-    "interpreted_by",        // claim → agent (interpretation provenance)
-    "concludes",             // trace → claim (reasoning conclusion)
-    "HAS_TRACE",             // claim → trace (reasoning trace link)
+    "interpreted_by",  // claim → agent (interpretation provenance)
+    "concludes",       // trace → claim (reasoning conclusion)
+    "HAS_TRACE",       // claim → trace (reasoning trace link)
     // AI development patterns — context persistence, issue generation, observability
     "OBSERVED_DURING", // claim → claim (design decision observed during feature work)
     "INFORMS",         // claim → claim (decision informs future work)
@@ -3254,6 +3255,18 @@ mod tests {
                 "{r}: sort it into exactly one of credited, reserved or neither"
             );
         }
+    }
+
+    /// The closure-basis edge MCP `resolve_backlog_item` writes is one this
+    /// route accepts: the allow-list and the tool name the one constant
+    /// `epigraph_auth::relationships::JUSTIFIES_RELATIONSHIP`, byte for byte
+    /// (not case-folded: `justifies` is outside the folded four).
+    #[test]
+    fn the_closure_basis_relationship_is_the_shared_constant() {
+        let justifies = epigraph_auth::relationships::JUSTIFIES_RELATIONSHIP;
+        assert_eq!(justifies, "justifies");
+        assert!(VALID_RELATIONSHIPS.contains(&justifies));
+        assert!(is_valid_relationship(justifies));
     }
 
     #[test]

@@ -577,7 +577,7 @@ For the others, anything else is off.
 | `EPIGRAPH_ALLOW_ALL_IDENTITIES` | off | Exactly `true` lets any identity an auto-provisioning provider authenticates provision. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `EPIGRAPH_REDIRECT_URI` | — | Read only because `providers.toml.example`'s Google provider names them (`client_id_env`, `client_secret_env`, `audience_env`, `redirect_uri_env`). Missing while the provider is configured → startup refusal (`env var ... not set`). |
 | `EPIGRAPH_PUBLIC_BASE_URL` | `http://localhost:8080` | The public origin, with no trailing slash. |
-| `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that cannot go in an HTTP header → exit 1. |
+| `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that is empty, non-ASCII, contains a TAB, is not an absolute `http(s)://` URL, or cannot go in an HTTP header → exit 1. |
 | `EPIGRAPH_PORT` | `8080` | The application port. |
 | `EPIGRAPH_BIND_ADDR` | `0.0.0.0` | The IP address the application listener binds (for example `127.0.0.1` behind a reverse proxy on the same host, or `::`). An IP address only; the port is `EPIGRAPH_PORT`. Not an IP address → exit 1. |
 | `EPIGRAPH_REQUEST_TIMEOUT_SECS` | `300` | Seconds a request may take before the server answers it `408 Request Timeout` and drops the handler. `0` turns the timeout off (warned at boot). The bound covers the time to the response headers, not a streamed body. A timeout that fires after a handler committed answers 408 for a write that happened, so keep it above your slowest legitimate request. Not a whole number → exit 1. |
@@ -637,7 +637,7 @@ For the others, anything else is off.
 | `--allowed-host` / `EPIGRAPH_MCP_ALLOWED_HOSTS` | — | Extra `Host`/`Origin` names for the HTTP listener. |
 | `--read-only` | off | Query tools only. |
 | `--operator-id` / `EPIGRAPH_OPERATOR_ID` | unset | Records `signer --OPERATED_BY--> operator` at startup. stdio only, with a declared identity. The link function is maintenance-only, so the startup fails on an application DSN; run `epigraph-operator link` from the host instead (section 9). |
-| `--resource-metadata-url` / `EPIGRAPH_RESOURCE_METADATA_URL` | unset | Advertised in the HTTP listener's 401 challenges. |
+| `--resource-metadata-url` / `EPIGRAPH_RESOURCE_METADATA_URL` | unset | Advertised in the HTTP listener's 401 challenges. Set but empty, non-ASCII, containing a TAB, not an absolute `http(s)://` URL, or not a valid HTTP header value → exit 1 at boot. |
 | `EPIGRAPH_PUBLIC_BASE_URL` | unset | The API's public origin. HTTP transport only. `sudo` and `propose_admin_act` refuse without it. |
 | `EPIGRAPH_MCP_CONNECTOR_ELEVATION` | off | `on` lets the HTTP transport elevate connector-mode sessions. Leave it unset (section 10). |
 | `EPIGRAPH_RUN_TOKENS` | `off` | As for the API. |
@@ -1634,10 +1634,12 @@ than reading zero.
 Defaults to `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource`,
 which is the document the API serves, so most deployments need nothing. Set
 it only when the metadata document is served from a different host. A value
-that cannot go into an HTTP header (control characters, non-ASCII, an
-embedded newline) makes the process `exit(1)` at boot, rather than silently
-dropping the challenge from every 401. `epigraph-mcp`'s
-`--resource-metadata-url` fails fast the same way.
+that is empty, contains non-ASCII bytes or a TAB, is not an absolute
+`http://` / `https://` URL, or cannot go into an HTTP header (control
+characters, an embedded newline) makes the process `exit(1)` at boot, rather
+than silently dropping the challenge from every 401 or advertising one a
+client cannot use. `epigraph-mcp`'s `--resource-metadata-url` (which also
+reads this variable) applies the same rules.
 
 ### `EPIGRAPH_REQUIRE_SIGNATURES`
 
@@ -5087,7 +5089,8 @@ Do not improvise it against a live database without that entry's context.
 | `failed to build providers registry: "providers.toml not found at ..."` | Create `providers.toml` (empty is valid) or set `EPIGRAPH_PROVIDERS_CONFIG`. The template is `providers.toml.example`. |
 | `failed to build providers registry: "provider '...': auto_provision is enabled with no allowed_emails/allowed_domains ..."` | Populate the allowlists, or set `EPIGRAPH_ALLOW_ALL_IDENTITIES=true`. `EPIGRAPH_ENV` unset counts as production. |
 | `failed to build providers registry: ... env var GOOGLE_CLIENT_ID not set` | A configured provider names environment variables that are unset. |
-| `EPIGRAPH_RESOURCE_METADATA_URL is unusable; refusing to start` | The value cannot go in an HTTP header. |
+| `EPIGRAPH_RESOURCE_METADATA_URL is unusable; refusing to start` (API) | The value is empty, non-ASCII, contains a TAB, is not an absolute `http://` / `https://` URL, or cannot go in an HTTP header; the logged `error` names which. Fix the value, or unset it to use the default. |
+| `ERROR: --resource-metadata-url is set but empty ...` / `... contains non-ASCII bytes ...` / `... contains a TAB ...` / `... must be an absolute http(s) URL ...` / `... is not a valid HTTP header value ...` (MCP) | The same rules for `epigraph-mcp`. A set-but-empty `EPIGRAPH_RESOURCE_METADATA_URL` counts as set: unset it, or give an absolute ASCII `http(s)://` URL. |
 | A passkey configuration error at boot (`ERROR: ...`), or `passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the enrollment ceremony answers 503` | Set both `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`, or neither. |
 | `FATAL: session GUCs do not survive between statements on one pooled connection. ...` | A transaction-mode pooler. Use a session-mode endpoint, or `EPIGRAPH_SESSION_GUC_MODE=transaction` (section 6). |
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |
