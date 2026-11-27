@@ -39,6 +39,27 @@ def defines_column(sql, table, column):
     return re.search(alter, sql) is not None
 
 
+# A call that writes the workflows sentinel: `set_truth_value(<conn>, <id>, 0.05)`.
+SENTINEL_WRITE = re.compile(r"WorkflowRepository::set_truth_value\([^;]*?\b0\.05\)", re.S)
+
+
+def sentinel_writers():
+    """Every non-test source file under crates/ that writes the 0.05 sentinel.
+
+    Walks the tree (no git: the suite also runs on copies that are not
+    checkouts) and ignores each file's `#[cfg(test)] mod tests` tail.
+    """
+    out = set()
+    for path in sorted((REPO / "crates").glob("*/src/**/*.rs")):
+        text = path.read_text(encoding="utf-8")
+        cut = re.search(r"^#\[cfg\(test\)\]\s*\nmod tests\b", text, re.M)
+        if cut:
+            text = text[: cut.start()]
+        if SENTINEL_WRITE.search(text):
+            out.add(path.relative_to(REPO).as_posix())
+    return out
+
+
 def rows():
     """{first cell: [cells]} for every body row of the page's table."""
     out = {}
@@ -91,6 +112,17 @@ class NoLongerInForcePage(unittest.TestCase):
         row = " ".join(rows().get("`workflows`", []))
         self.assertIn("transitional", row.lower())
         self.assertIn("99f6dd92", row)
+
+    def test_workflow_row_cites_every_sentinel_writer(self):
+        # The sentinel's replacement (99f6dd92) uses this row as its list of
+        # writers to convert; a writer missing here would keep writing 0.05.
+        self.assertTrue(PAGE.is_file())
+        row = " ".join(rows().get("`workflows`", []))
+        writers = sentinel_writers()
+        self.assertTrue(writers, "no sentinel writer found: has 99f6dd92 landed? update the row")
+        for path in sorted(writers):
+            with self.subTest(writer=path):
+                self.assertIn(f"`{path}`", row)
 
     def test_retracted_bba_revives_only_through_the_audited_unretract(self):
         self.assertTrue(PAGE.is_file())
