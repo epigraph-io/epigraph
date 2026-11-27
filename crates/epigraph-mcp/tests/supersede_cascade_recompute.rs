@@ -310,7 +310,8 @@ async fn cascade_does_not_touch_unrelated_bbas_or_claims(pool: PgPool) {
 /// (PREREGISTRATION F5 / BCH-EG-K04).
 ///
 /// The unbacked marker is the **explicit vacuous cache** (backlog 75726018,
-/// aligning the cascade with ruling R-80 and the atom-cache writer): Bel 0,
+/// aligning the cascade with the BBA-retraction route's vacate and the
+/// atom-cache writer): Bel 0,
 /// Pl 1, BetP 0.5, no conflict or missing mass, classification
 /// `not_enough_info`, NOT NULL. It reads back as `unproven`, so a reader can
 /// still distinguish "unbacked" from "believed at 0.79". (Before 75726018 the

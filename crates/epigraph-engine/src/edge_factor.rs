@@ -2354,15 +2354,20 @@ pub async fn vacate_atom_cache(
 /// (Bel 0, Pl 1, BetP .5, no conflict or missing mass, stamped
 /// `binary_truth`), with the classification the classifier gives it
 /// (`not_enough_info`) when the cache took it. It reads back as `unproven`,
-/// and it is the value ruling R-80's vacate and the atom-cache writer's
-/// vacates write. **Never NULL** (backlog 75726018: a cache is vacated, not
-/// cleared, on every path that empties a claim's evidence).
+/// and it is the value the recompute's every-input-inadmissible vacate, the
+/// BBA-retraction route and the atom-cache writer's vacates write. **Never
+/// NULL** (backlog 75726018: the paths that vacate a cache share this write
+/// and do not clear it). One writer still NULLs: the `backfill_factors`
+/// maintenance bin, through `MassFunctionRepository::clear_claim_belief`.
 ///
 /// Writes unconditionally: the CALLER decides that the claim is to be
 /// vacated, and that it holds a cache to vacate (a vacuous value written
 /// where there was none would tell readers that an unseen BBA exists).
-/// [`vacate_atom_cache`] and the retraction cascade's unbacked arm
-/// (`crate::retraction_cascade`) call it after their own checks.
+/// [`vacate_atom_cache`] calls it after its refusal ladder (not current,
+/// compound, AEF input). The retraction cascade's unbacked arm
+/// (`crate::retraction_cascade`) calls it after its own, narrower checks:
+/// no BBA left on any frame, and a cache present. It does NOT apply that
+/// ladder, so it also vacates a compound's or a retired duplicate's cache.
 ///
 /// Returns whether the cache took it: `false` when the database declined the
 /// write (migration 114's non-owner rule, see

@@ -37,7 +37,8 @@
 //! pre-retraction number with zero evidence behind it.
 //!
 //! **Decision: such a claim is marked _unbacked_ by an explicit vacuous
-//! cache** (backlog 75726018, aligning this cascade with ruling R-80 and the
+//! cache** (backlog 75726018, aligning this cascade with the recompute's
+//! every-input-inadmissible vacate, the BBA-retraction route and the
 //! atom-cache writer, under which a cache is vacated and never NULLed): Bel
 //! 0, Pl 1, BetP 0.5, no conflict or missing mass, stamped `binary_truth`,
 //! classification `not_enough_info`

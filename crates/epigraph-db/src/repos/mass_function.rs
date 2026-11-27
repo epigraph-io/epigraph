@@ -1690,10 +1690,13 @@ impl MassFunctionRepository {
     /// claim whose last supporter was retracted would otherwise keep believing
     /// its pre-retraction number with no evidence behind it.
     ///
-    /// NULL is the same state a claim carries before it ever acquires a BBA,
-    /// which lets readers distinguish "unbacked" from "believed at 0.79" —
-    /// a vacuous 0.5 could not be distinguished from a genuine maximally
-    /// uncertain combine result.
+    /// **Not the retraction cascade's write.** Since backlog 75726018 the
+    /// cascade's unbacked arm vacates a cache to the explicit vacuous value
+    /// (`epigraph_engine::edge_factor::write_vacuous_cache`: Bel 0, Pl 1,
+    /// BetP 0.5, `not_enough_info`), as the BBA-retraction route and the
+    /// atom-cache writer do, rather than NULLing it. This clear remains for
+    /// its other caller (the `backfill_factors` maintenance bin), which still
+    /// NULLs and is a separate writer to align.
     ///
     /// # Only clears a cache that exists
     /// The `WHERE` clause requires at least one derived column to be non-NULL,
