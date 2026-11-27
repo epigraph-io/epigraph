@@ -187,7 +187,7 @@ The bearer-token's `agent_id` claim — when present — pins the resulting writ
 
 Practical implication for new code: never generate an Ed25519 keypair on each run "to identify this process" (rung 4 above is the fallback, not a pattern to copy). Give the process a stable identity: a fixed key generated once and stored (`--agent-key`), or the deterministic helper that matches the actor type: `did_key_for_author` for human authors, fixed system-agent seed helpers for named infrastructure agents, and `keypair_from_llm_agent(model_id, system_prompt)` for autonomous LLM agents (`did_key_for_llm_agent` returns the `did:key` of the same keypair). The LLM helper hashes the system prompt and combines it with the model identifier, so the same model+prompt pair gets the same DID across hosts while any model or prompt revision becomes a distinct signing identity. Let the get-or-create pattern in `system_agent.rs` find or insert the matching `agents` row. The same role on a different machine then writes against the same agent UUID and the same signing key, so attribution composes cleanly across hosts.
 
-**See also:** [`crates/epigraph-crypto/src/did_key.rs`](../../crates/epigraph-crypto/src/did_key.rs) for `did:key` derivation; [`crates/epigraph-ingest-executor/src/system_agent.rs`](../../crates/epigraph-ingest-executor/src/system_agent.rs) for the get-or-create pattern; user-memory `reference_epigraph_oauth_mint.md` for the Ed25519 client-assertion shape against `/oauth/token`.
+**See also:** [`crates/epigraph-crypto/src/did_key.rs`](../../crates/epigraph-crypto/src/did_key.rs) for `did:key` derivation; [`crates/epigraph-ingest-executor/src/system_agent.rs`](../../crates/epigraph-ingest-executor/src/system_agent.rs) for the get-or-create pattern; [`crates/epigraph-api/src/oauth/token.rs`](../../crates/epigraph-api/src/oauth/token.rs) (`verify_agent_assertion`) for the Ed25519 client-assertion shape against `/oauth/token`: the signature covers the 24 bytes `timestamp || nonce`, the timestamp may be at most 5 minutes old and 30 seconds ahead, and each nonce is accepted once per key.
 
 ---
 
@@ -410,8 +410,7 @@ are worth knowing about:
   populating the primary embedding column with Jina vectors broke
   `recall_with_context` because the column held vectors from a
   model the kNN index was not built against. Never put Jina
-  embeddings in the primary embedding column (user-memory
-  `feedback_tier1_ingestion_only.md`).
+  embeddings in the primary embedding column.
 - **Flat extraction without the level-2 paragraph layer.** Without
   paragraphs, `recall_with_context` still finds the flat claims, but
   it has no paragraph-granularity hits and no structure to batch in
