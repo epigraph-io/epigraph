@@ -21,7 +21,8 @@
 //!   (`require_workflow_authority`, the gate `add_step` uses), and the write
 //!   is recorded as that gate's writes are. A step-claim source of `invokes`
 //!   requires that authority over every workflow executing the step, and a
-//!   claim no workflow executes is refused,
+//!   claim no workflow executes is refused. A symmetric `related_to` requires
+//!   it over BOTH workflows, since both readers list it as `mutual`,
 //! - `executes` writes from the HEAD generation of a lineage only (as
 //!   `add_step` does), so a frozen older generation's plan is not extended;
 //!   its target is a claim of the plan's own lineage (any level: the repair
@@ -381,8 +382,14 @@ pub async fn do_link_hierarchical(
     // step-claim source of `invokes` is that step's workflows' reference
     // ([`cycle_walk_for`]), so it takes the same authority over EVERY
     // workflow that executes the step's lineage; a claim no workflow executes
-    // is not a step and is refused.
-    let governed: Vec<uuid::Uuid> = if source_type == "workflow" {
+    // is not a step and is refused. A SYMMETRIC reference is a statement
+    // about BOTH workflows (each reader lists it as `mutual`), so it takes
+    // that authority over both ends: otherwise any agent could pin a
+    // see-also naming its own workflow onto another agent's, readable on
+    // every search for it and retractable by neither.
+    let governed: Vec<uuid::Uuid> = if is_symmetric_reference(&params.relationship) {
+        vec![source_id, target_id]
+    } else if source_type == "workflow" {
         vec![source_id]
     } else if params.relationship == "invokes" {
         let executing =

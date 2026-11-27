@@ -15,12 +15,14 @@
 //! - a workflow pair is held to `link_hierarchical`'s workflow-reference
 //!   rules: both workflows readable and PUBLIC (the edges trigger takes no
 //!   tenancy from a workflow end, so the edge would be stored public and name
-//!   a private workflow to every reader), and authority over `claim_a`'s
-//!   workflow (`require_workflow_authority`, the gate `add_step` and a
+//!   a private workflow to every reader), and authority over BOTH workflows
+//!   (`require_workflow_authority`, the gate `add_step` and a
 //!   `link_hierarchical` workflow source take), recorded as that gate's writes
-//!   are. CDST BP's alternative sets read claim-to-claim edges only
-//!   (`FactorRepository::bp_alternative_sets`), so a workflow pair moves no
-//!   belief,
+//!   are: the pair is listed as `mutual` on each workflow's readers, so it is
+//!   a statement about both, and neither owner's workflow is marked a rival by
+//!   someone without a say over it. CDST BP's alternative sets read
+//!   claim-to-claim edges only (`FactorRepository::bp_alternative_sets`), so
+//!   a workflow pair moves no belief,
 //! - the edge is **symmetric**: `{claim_a, claim_b}` is one edge regardless of
 //!   order (migration 042's `edges_alternative_of_symmetric_uniq`, which has no
 //!   endpoint-type conjunct and so covers a workflow pair too), so the call
@@ -107,9 +109,9 @@ pub async fn do_link_alternative(
     // Verify both endpoints exist via the repo layer (SQL stays in epigraph-db
     // per CLAUDE.md). Disambiguate which side is missing so the caller can fix
     // the right end of the pair.
-    let mut grant = None;
+    let mut grants = Vec::new();
     if endpoint_type == "workflow" {
-        grant = Some(rival_workflows_gate(server, &mut tx, viewer, auth, actor, a, b).await?);
+        grants = rival_workflows_gate(server, &mut tx, viewer, auth, actor, a, b).await?;
     } else {
         if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(a))
             .await
@@ -162,13 +164,13 @@ pub async fn do_link_alternative(
     )
     .await
     .map_err(internal_error)?;
-    if let Some(grant) = grant {
+    for (workflow_id, grant) in grants {
         crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
             auth,
             actor,
             "link_alternative",
-            a,
+            workflow_id,
             grant,
             serde_json::json!({
                 "edge_id": edge_id,
@@ -190,8 +192,9 @@ pub async fn do_link_alternative(
 
 /// The workflow pair's gate, on the write transaction, before anything is
 /// written: both workflows readable (an unreadable one reports not found),
-/// both PUBLIC, and authority over `a`'s workflow, the rule
-/// `link_hierarchical` applies to a workflow-sourced reference.
+/// both PUBLIC, and authority over BOTH workflows, the rule
+/// `link_hierarchical` applies to a symmetric `related_to`. Returns each
+/// workflow's grant, for the write record.
 async fn rival_workflows_gate(
     server: &EpiGraphMcpFull,
     tx: &mut sqlx::PgConnection,
@@ -200,7 +203,7 @@ async fn rival_workflows_gate(
     actor: WriteIdentity,
     a: uuid::Uuid,
     b: uuid::Uuid,
-) -> Result<crate::tools::workflow_authority::WorkflowGrant, McpError> {
+) -> Result<Vec<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)>, McpError> {
     for (side, id) in [("claim_a", a), ("claim_b", b)] {
         if !epigraph_db::WorkflowRepository::viewer_reads_row(&mut *tx, viewer, id)
             .await
@@ -223,16 +226,21 @@ async fn rival_workflows_gate(
             )));
         }
     }
-    let not_found = move || invalid_params(format!("workflow {a} not found"));
-    crate::tools::workflow_authority::require_workflow_authority(
-        server,
-        tx,
-        auth,
-        actor,
-        viewer,
-        a,
-        "link_alternative",
-        &not_found,
-    )
-    .await
+    let mut grants = Vec::with_capacity(2);
+    for (side, id) in [("claim_a", a), ("claim_b", b)] {
+        let not_found = move || invalid_params(format!("{side} workflow {id} not found"));
+        let grant = crate::tools::workflow_authority::require_workflow_authority(
+            server,
+            &mut *tx,
+            auth,
+            actor,
+            viewer,
+            id,
+            "link_alternative",
+            &not_found,
+        )
+        .await?;
+        grants.push((id, grant));
+    }
+    Ok(grants)
 }

@@ -657,3 +657,71 @@ async fn a_private_steps_reference_is_named_to_members_only(pool: PgPool) {
         assert!(!text.contains(&step.to_string()), "{text}");
     }
 }
+
+/// A symmetric reference is a statement about BOTH workflows (each reader
+/// lists it as `mutual`), so `related_to` and a rival `alternative_of` need
+/// authority over both ends. An agent may link two of its own workflows, but
+/// it may not pin its workflow onto another agent's as a see-also or a
+/// rival, in either order and from either side, which would otherwise show
+/// its text on every search for the other workflow with no way for that
+/// workflow's owner to retract it. A directional `depends_on` onto another
+/// agent's public workflow is unchanged: it is the declaring workflow's own
+/// statement, listed as `incoming` on the other end.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_symmetric_reference_needs_authority_over_both_workflows(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let outsider = outsider_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let outsider_viewer = own_viewer(&outsider).await;
+    let theirs = store(&server, &["their step"]).await;
+    let mine = store(&outsider, &["my step"]).await;
+    let mine_too = store(&outsider, &["my other step"]).await;
+
+    // Control: the outsider links two of its own workflows.
+    do_link_hierarchical(
+        &outsider,
+        &outsider_viewer,
+        link(mine, "workflow", mine_too, "workflow", "related_to"),
+        None,
+    )
+    .await
+    .expect("an agent links two of its own workflows as a see-also");
+    do_link_alternative(&outsider, &outsider_viewer, rivals(mine, mine_too), None)
+        .await
+        .expect("an agent marks two of its own workflows as rivals");
+
+    // Neither agent pins a see-also across owners, in either order.
+    for (who, who_viewer, s, t) in [
+        (&outsider, &outsider_viewer, mine, theirs),
+        (&outsider, &outsider_viewer, theirs, mine),
+        (&server, &viewer, theirs, mine),
+        (&server, &viewer, mine, theirs),
+    ] {
+        let err = do_link_hierarchical(
+            who,
+            who_viewer,
+            link(s, "workflow", t, "workflow", "related_to"),
+            None,
+        )
+        .await
+        .expect_err("a see-also onto another agent's workflow is refused");
+        assert!(err.message.contains("submitter"), "{}", err.message);
+        let err = do_link_alternative(who, who_viewer, rivals(s, t), None)
+            .await
+            .expect_err("a rival onto another agent's workflow is refused");
+        assert!(err.message.contains("submitter"), "{}", err.message);
+    }
+    assert_eq!(pair_edges(&pool, mine, theirs, "related_to").await, 0);
+    assert_eq!(pair_edges(&pool, mine, theirs, "alternative_of").await, 0);
+
+    // A directional prerequisite onto another agent's public workflow stays
+    // the declaring workflow's own statement.
+    do_link_hierarchical(
+        &outsider,
+        &outsider_viewer,
+        link(mine, "workflow", theirs, "workflow", "depends_on"),
+        None,
+    )
+    .await
+    .expect("a workflow may declare another agent's public workflow a prerequisite");
+}
