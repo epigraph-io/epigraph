@@ -5673,6 +5673,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "store_embedding_if_unsealed",
         &["sqlx::query(SELECT).fetch_optional"],
     ),
+    // write: the same `FOR UPDATE` row lock before the `{WRITABLE}` update that also
+    // requires `embedding IS NULL` (backlog 1b83b2a1); it returns nothing.
+    (
+        "claim.rs",
+        "store_embedding_if_unsealed_and_missing",
+        &["sqlx::query(SELECT).fetch_optional"],
+    ),
     // privileged: refuses unless the session is the privileged maintenance session, then
     // reverses the repair recorded for the mark the viewed un-mark just undid.
     (
