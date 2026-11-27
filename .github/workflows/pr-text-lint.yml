@@ -13,7 +13,10 @@ name: PR text lint
 # re-run (and, through ci.yml's per-PR concurrency group, cancel) the whole CI.
 #
 # `pull_request`, not `pull_request_target`: the job holds only a read token,
-# and a fork's run gets no secrets (E6 then reports "not configured").
+# and a fork's run gets no secrets (E6 then reports "not configured"). The run
+# uses the PR's own copy of the script, and GitHub skips `pull_request` runs
+# while the PR has a merge conflict, so this is prevention for trusted
+# contributors' mistakes, not a guarantee (CLAUDE.md lists the limits).
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]

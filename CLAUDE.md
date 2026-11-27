@@ -558,7 +558,11 @@ applies E1, E2, E3 and E6 to the PR's title and body on every open, edit and
 push, and fails on a finding. Every line is read, trailer-shaped lines included
 (a PR body has no git attribution to protect). A finding names the rule and
 `title` or `body line <n>`, never the text. It checks new and edited PR text
-only; it does not rewrite PR bodies that were already published.
+only; it does not rewrite PR bodies that were already published. Its limits:
+GitHub runs no `pull_request` workflow while a PR has a merge conflict, so an
+edit made then is not checked until the next push; the job runs the PR's own
+copy of the script, so a PR can weaken the check on itself (as with the commit
+lint); and E2 matches a home path only with a segment after the account name.
 
 **Citing commits.** Cite a commit by sha only once it is on `main`, or when it
 is an earlier commit of the same change. Cite anything else (a commit on
