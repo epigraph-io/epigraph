@@ -759,6 +759,32 @@ class Workflow(unittest.TestCase):
         env = [s for s in gate["steps"] if "run" in s][0]["env"]
         self.assertEqual(env["NEEDS"], "${{ toJSON(needs) }}")
 
+    # The jobs a light plan (fix/triage-* heads) keeps. Every other job of
+    # ci.yml must be turned off by the plan: a run flag, or `mode`.
+    LIGHT_KEEPS = {"plan", "test-shard", "test", "lint", "secrets", "commit-message-lint"}
+    LIGHT_IF = "${{ !cancelled() && needs.plan.outputs.mode != 'light' }}"
+
+    def test_a_light_plan_turns_off_every_job_it_does_not_keep(self):
+        for name, job in self.jobs.items():
+            if name in self.LIGHT_KEEPS:
+                self.assertNotIn("outputs.mode", json.dumps(job.get("if", "")), name)
+                continue
+            if name in ts.EXTRA_JOBS:
+                continue  # their run flag; LightPlan pins it off
+            self.assertEqual(job.get("needs"), "plan", name)
+            self.assertEqual(job.get("if"), self.LIGHT_IF, name)
+        self.assertEqual(self.jobs["plan"]["outputs"]["mode"], "${{ steps.plan.outputs.mode }}")
+
+    def test_msrv_is_skipped_on_light_heads_unless_labelled(self):
+        import yaml
+
+        with open(os.path.join(os.path.dirname(WORKFLOW), "msrv.yml")) as fh:
+            msrv = yaml.safe_load(fh)
+        cond = msrv["jobs"]["msrv"]["if"]
+        self.assertIn("!startsWith(github.head_ref, 'fix/triage-')", cond)
+        self.assertIn("'ci:full'", cond)
+        self.assertEqual(ts.LIGHT_BRANCHES, ("fix/triage-*",))
+
     def test_plan_outputs_are_the_ones_the_jobs_read(self):
         outputs = set(self.jobs["plan"]["outputs"])
         used = set(__import__("re").findall(r"needs\.plan\.outputs\.(\w+)", self.text))
