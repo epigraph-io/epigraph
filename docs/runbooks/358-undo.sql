@@ -1,0 +1,18 @@
+-- ===================================================================
+-- 358-undo.sql: take migration 358 (`edges_shifted_to_pair_uniq`;
+-- backlog d639d492) back out, on the migration (superuser) DSN.
+--
+-- ORDER: no binary needs the index to run. A binary with the
+-- `PAIR_UNIQUE_RELATIONSHIPS` merge-path handling keeps working without it
+-- (it only dedups `shifted_to` edges by pair key, which is then stricter
+-- than the schema asks). What goes is the schema's refusal of a duplicate
+-- or reversed in-force `shifted_to` pair.
+--
+-- WHAT IT DOES: drops the index, CONCURRENTLY (run it outside a transaction
+-- block, as its own statement), so edge writes are not blocked.
+--
+-- WHAT IT LEAVES: every `edges` row, `shifted_to` edges included; 358's
+-- `_sqlx_migrations` row. Re-introducing the index is a NEW migration,
+-- never a re-run of 358.
+-- ===================================================================
+DROP INDEX CONCURRENTLY IF EXISTS public.edges_shifted_to_pair_uniq;

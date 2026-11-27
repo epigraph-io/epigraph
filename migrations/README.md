@@ -5265,6 +5265,26 @@ restart.
   `docs/runbooks/353-undo.sql`. **Deploy order:** either; a binary without the change runs on 353
   unchanged, and the change's binary runs without 353 (only the concurrent-write backstop is
   missing).
+- **358**: `shifted_to_edge_type` (backlog d639d492, split 1/2 of 52eff3ab's port of the
+  `shifted_to` temporal-succession edge). One partial unique index,
+  `edges_shifted_to_pair_uniq ON edges (LEAST(source_id, target_id), GREATEST(source_id,
+  target_id)) WHERE relationship = 'shifted_to' AND valid_to IS NULL`: on a DIRECTIONAL relation the
+  pair key enforces anti-symmetry, so it refuses both an exact duplicate and the reversal of an
+  in-force `shifted_to`, while a chain `A -> B -> C` stays legal. `valid_to IS NULL` is a
+  deliberate divergence from the ported source (091's rule: a retracted row must not hold the slot).
+  `shifted_to` has no `edge_to_factor_type` row (175's body), so it mints no factor. The merge paths
+  pay the index's cost: `ClaimRepository::mark_duplicate`'s repair and `consolidate` dedup
+  `epigraph_db::PAIR_UNIQUE_RELATIONSHIPS` (`alternative_of`, `shifted_to`) by pair key, so a merge
+  never re-points a `shifted_to` edge into an occupied pair. `-- no-transaction`, one `CREATE
+  UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` statement (registered in `tenancy_migration_shape.rs`'s
+  `INDEX_MIGRATIONS`). Pinned by `epigraph-db/tests/shifted_to_pair_index.rs` (duplicate and
+  reversal refused, chain and post-retraction re-assertion admitted, undo runbook drops it) and
+  the merge fixtures in `consolidate_test.rs` / `mark_duplicate_repo.rs`. **Measure first**
+  (expected zero rows): `SELECT LEAST(source_id, target_id), GREATEST(source_id, target_id),
+  count(*) FROM edges WHERE relationship = 'shifted_to' AND valid_to IS NULL GROUP BY 1, 2 HAVING
+  count(*) > 1;`. Undo: `docs/runbooks/358-undo.sql`. **Deploy order:** migrate BEFORE any binary
+  that writes `shifted_to` (the second half of the port); the merge-path change runs with or
+  without 358.
 
 ## `-- no-transaction` migrations
 
