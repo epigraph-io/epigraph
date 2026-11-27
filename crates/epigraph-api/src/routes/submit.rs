@@ -2715,38 +2715,50 @@ mod signature_verification_tests {
         assert!(body["details"]["details"].is_string(), "{body}");
     }
 
-    /// A server fault is the central redacted 500: the error key survives,
-    /// and the driver's text (here, the closed pool's) reaches the log only.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn a_server_fault_is_the_central_redacted_500(pool: PgPool) {
-        let state = test_state_with_required_signatures(pool.clone());
-        // Close the pool so the route's first database read fails.
-        pool.close().await;
-        let packet = EpistemicPacket {
-            claim: build_test_claim_submission(Uuid::new_v4(), "a claim on a closed pool"),
-            evidence: vec![],
-            reasoning_trace: build_test_trace(),
-            signature: "0".repeat(128),
-            visibility: None,
-            group_id: None,
+    /// A server fault this route builds itself is the central redacted 500:
+    /// `author_tenancy_error`'s fallback and `visibility_error`'s pass-through
+    /// arm, given a query failure carrying the driver's text, answer the
+    /// `DatabaseError` body, and the text stays in the server log.
+    #[tokio::test]
+    async fn a_route_built_server_fault_is_the_central_redacted_500() {
+        use http_body_util::BodyExt;
+        let driver = "relation \"tenancy_secret_shadow\" does not exist";
+        let query_failed = || epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Protocol(driver.to_string()),
         };
-        let (status, challenged, body) =
-            status_challenge_body(submit_packet_endpoint(state, packet).await).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-        assert!(!challenged);
-        assert_eq!(
-            body,
-            serde_json::json!({
-                "error": "DatabaseError",
-                "message": format!("Database error: {}", crate::errors::DATABASE_ERROR_BODY),
-                "details": { "message": crate::errors::DATABASE_ERROR_BODY },
-            })
-        );
-        let text = body.to_string();
-        assert!(
-            !text.contains("closed") && !text.contains("pool") && !text.contains("submit/packet"),
-            "the driver's text must stay server-side: {text}"
-        );
+        for (site, err) in [
+            ("author_tenancy_error", author_tenancy_error(query_failed())),
+            ("visibility_error", visibility_error(query_failed())),
+        ] {
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{site}"
+            );
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(axum::http::header::WWW_AUTHENTICATE),
+                "{site}"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "DatabaseError",
+                    "message": format!("Database error: {}", crate::errors::DATABASE_ERROR_BODY),
+                    "details": { "message": crate::errors::DATABASE_ERROR_BODY },
+                }),
+                "{site}"
+            );
+            let text = body.to_string();
+            assert!(
+                !text.contains("tenancy_secret_shadow") && !text.contains("submit/packet"),
+                "{site}: the driver's text must stay server-side: {text}"
+            );
+        }
     }
 
     /// `evidence_insert_error` on anything but a CHECK refusal is the central
