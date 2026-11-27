@@ -29,9 +29,9 @@ Canonical-rep choice mirrors fuzzy_dedup_claims.py:
 (reasoning_trace count, mass_function count, edge count) descending,
 breaking ties by oldest created_at.
 
-Usage:
-    python3 scripts/compute_semantic_dedup.py
-    python3 scripts/compute_semantic_dedup.py --threshold 0.92 --top-k 10
+Usage (--output is required; there is no default location):
+    python3 scripts/compute_semantic_dedup.py --output semantic-dedup.json
+    python3 scripts/compute_semantic_dedup.py --threshold 0.92 --top-k 10 --output semantic-dedup.json
     python3 scripts/compute_semantic_dedup.py --limit 5000 --output /tmp/quick-dedup.json
 """
 
@@ -49,7 +49,6 @@ import psycopg2.extras
 
 from maintenance_dsn import maintenance_dsn
 
-DEFAULT_OUTPUT = "/home/jeremy/epigraph-gui/public/semantic-dedup.json"
 
 
 class UnionFind:
@@ -244,8 +243,8 @@ def main() -> int:
         help="Cap claims walked (smoke-test convenience)",
     )
     parser.add_argument(
-        "--output", default=DEFAULT_OUTPUT,
-        help=f"Output path (default {DEFAULT_OUTPUT})",
+        "--output", required=True,
+        help="Path to write the snapshot JSON to (required; no default)",
     )
     parser.add_argument(
         "--progress-every", type=int, default=5000,

@@ -24,8 +24,11 @@ onto the live hierarchical DocumentExtraction (crates/epigraph-ingest/src/docume
 
 Usage:
     git clone --depth 1 https://github.com/openstax/osbooks-college-physics.git /tmp/phys
-    python3 scripts/extract_textbook.py /tmp/phys --output /home/jeremy/tmp/extractions/
-    python3 scripts/extract_textbook.py /tmp/phys --book college-physics --max-modules 5
+    python3 scripts/extract_textbook.py /tmp/phys --output extractions/
+    python3 scripts/extract_textbook.py /tmp/phys --book college-physics --max-modules 5 --output extractions/
+
+--output (the directory the JSON is written to) is required; there is no
+default location.
 """
 
 import argparse
@@ -348,7 +351,10 @@ def main():
     ap.add_argument("repo_path", help="Path to a cloned OpenStax repo")
     ap.add_argument("--book", help="Process only this book slug (default: all)")
     ap.add_argument("--max-modules", type=int, default=0, help="Cap modules per book (0 = all)")
-    ap.add_argument("--output", default="/home/jeremy/tmp/extractions/")
+    ap.add_argument(
+        "--output", required=True,
+        help="Directory to write openstax_<book>_extraction.json to (required; no default)",
+    )
     args = ap.parse_args()
 
     repo_path = Path(args.repo_path)

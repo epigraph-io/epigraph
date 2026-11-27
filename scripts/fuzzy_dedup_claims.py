@@ -69,7 +69,6 @@ import psycopg2.extras
 from maintenance_dsn import maintenance_dsn
 
 DEFAULT_API_BASE = "http://127.0.0.1:8080"
-DEFAULT_INPUT_PATH = "/home/jeremy/epigraph-gui/public/semantic-dedup.json"
 
 
 @dataclass
@@ -236,8 +235,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--input",
-        default=DEFAULT_INPUT_PATH,
-        help=f"Path to semantic-dedup.json snapshot (default: {DEFAULT_INPUT_PATH})",
+        required=True,
+        help="Path to the semantic-dedup.json snapshot compute_semantic_dedup.py wrote (required; no default)",
     )
     parser.add_argument(
         "--database-url",
