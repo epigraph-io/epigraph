@@ -929,7 +929,7 @@ the application role, with the token the client really mints.
    `epigraph-operator group-member add --group <team> --agent <filer agent>
    --role writer --reason <text> --apply`. The command refuses with `GRP04`
    before step 3 (the agent belongs to no human yet) and with `GRP03` for a
-   team the operator does not write.
+   team the operator does not write; the test asserts both.
 
 **Writing.** Call the kernel REST API (for example `POST
 /api/v1/submit/packet`, a claim with its evidence) with the client's bearer
@@ -957,7 +957,12 @@ check apply.
   with no membership of the filer's own. The test pins this as observed.
 * Migration 149 leaves evidence, edge and belief writes outside a packet to
   the membership, not to the binding (the door gap above). For those writes,
-  the membership is the limit.
+  the membership is the limit. The test shows it: `POST /api/v1/evidence` on
+  the filer's claim in its own team is written, and on its claim in another
+  team of the operator it is refused 403.
+* So a claim the filer files into another of the operator's teams (for
+  example by omitting or mistyping `group_id`) is stranded: the filer cannot
+  later attach evidence or edges to it outside a packet.
 * To keep a filer's claims out of the operator's other teams, choose an
   operator who writes only the target team. Whether D-V3 should exclude
   allowlisted agents is an open question.
@@ -972,10 +977,20 @@ call, while its SIGNER agent is allowlisted (149). So never run a listener as
 the filer's agent; the filer writes over kernel REST.
 
 **Incident response.** Revoke the allowance AND the client (above). Once the
-binding is armed, the filer's next write after the revoke is refused `OPL01`.
-That happens at once, with the same token and its membership still in place.
-Unarmed, revoking the allowance does not stop writes its membership admits,
-so revoke the client and remove the membership (`group-member remove`) too.
+binding is armed, the filer's next claim write after the revoke is refused
+`OPL01`. That happens at once, with the same token and its membership still in
+place.
+* Its other writes to the team fail because the membership no longer counts:
+  a membership of a keyless team made by the team verb (step 4, a
+  `did:epigraph:group:` key) counts only while the agent has a live human
+  (migration 236's `epigraph_live_memberships_unbound`), so once the
+  allowance is revoked the team's claims read as missing to the filer (404),
+  armed or not. The test shows this, armed, for an evidence write.
+* A membership of a group with its own key (not made by the team verb) does
+  not lapse that way. Unarmed, revoking the allowance does not stop the
+  writes such a membership admits, so revoke that membership as well,
+  through the group's own membership path (the team verb's `group-member
+  remove` acts only on verb-made teams).
 
 ### Delegated run tokens (dormant until armed)
 
