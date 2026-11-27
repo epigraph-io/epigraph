@@ -245,36 +245,11 @@ fn label_of(visibility: Visibility, owner: Uuid, home: Uuid) -> &'static str {
     }
 }
 
-/// Map a migration-206 refusal (`VIS01`..`VIS04`) to a designed refusal, and
-/// anything else to the ordinary conversion.
+/// Map a migration-206/209 refusal (`VIS01`..`VIS06`) to a designed refusal
+/// of the kind the refusal-code registry gives it, and anything else to the
+/// ordinary conversion.
 fn map_vis_error(e: sqlx::Error) -> DbError {
-    if let sqlx::Error::Database(db) = &e {
-        let msg = db.message();
-        // VIS05 (209): neither the agent itself nor its live human operator.
-        if msg.starts_with("VIS01") || msg.starts_with("VIS02") || msg.starts_with("VIS05") {
-            return DbError::Refused {
-                kind: RefusalKind::Authority,
-                message: msg.to_string(),
-            };
-        }
-        if msg.starts_with("VIS03") {
-            return DbError::Refused {
-                kind: RefusalKind::Input,
-                message: msg.to_string(),
-            };
-        }
-        // A claim changed under the act after it was classified (migration
-        // 206, "DECIDED ON THE ROWS IT WRITES"); nothing was changed and a
-        // retry classifies the new state.
-        // VIS06 (209): the default's row did not move; nothing was changed.
-        if msg.starts_with("VIS04") || msg.starts_with("VIS06") {
-            return DbError::Refused {
-                kind: RefusalKind::State,
-                message: msg.to_string(),
-            };
-        }
-    }
-    DbError::from(e)
+    DbError::from_definer(e, crate::refusal_codes::Family::Vis)
 }
 
 /// The refusal for one act's classification, or the outcomes when every claim
@@ -1003,6 +978,31 @@ impl ClaimRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Migrations 206 and 209's VIS codes, each answered by its kind with
+    /// the database's text; anything else is the ordinary conversion.
+    #[test]
+    fn vis_codes_are_answered_by_their_kind() {
+        use crate::errors::fake_db::{error, shape};
+        for (code, message, want) in [
+            ("42501", "VIS01: x", "Refused(Authority): VIS01: x"),
+            ("42501", "VIS02: x", "Refused(Authority): VIS02: x"),
+            ("22023", "VIS03: x", "Refused(Input): VIS03: x"),
+            ("40001", "VIS04: x", "Refused(State): VIS04: x"),
+            ("42501", "VIS05: x", "Refused(Authority): VIS05: x"),
+            ("55000", "VIS06: x", "Refused(State): VIS06: x"),
+            ("P0001", "VIS07: x", "QueryFailed"),
+            ("P0001", "x VIS01: x", "QueryFailed"),
+            ("OPL02", "OPL02: x", "OperatorScopeRefused: OPL02: x"),
+            ("P0001", "PVS01: x", "QueryFailed"),
+        ] {
+            assert_eq!(
+                shape(&map_vis_error(error(code, message))),
+                want,
+                "{message}"
+            );
+        }
+    }
 
     fn g(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])

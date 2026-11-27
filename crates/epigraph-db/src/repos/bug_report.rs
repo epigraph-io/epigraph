@@ -171,23 +171,15 @@ impl BugReportInput {
     }
 }
 
-/// Classify a definer refusal by its code. `None` for anything that is not a
-/// `BUGnn:` refusal.
+/// Classify a definer refusal by its code, as the refusal-code registry
+/// does. `None` for anything that is not a registered `BUGnn: ` refusal.
 fn refusal_kind(message: &str) -> Option<RefusalKind> {
-    let b = message.as_bytes();
-    if b.len() < 6
-        || !b.starts_with(b"BUG")
-        || !b[3].is_ascii_digit()
-        || !b[4].is_ascii_digit()
-        || b[5] != b':'
-    {
-        return None;
-    }
-    Some(match &message[..5] {
-        "BUG04" | "BUG05" => RefusalKind::Input,
-        "BUG03" | "BUG08" => RefusalKind::State,
-        _ => RefusalKind::Authority,
-    })
+    crate::refusal_codes::lookup_message(message)
+        .filter(|c| crate::refusal_codes::Family::Bug.holds(c.code))
+        .and_then(|c| match c.answer {
+            crate::refusal_codes::Answer::Refused(kind) => Some(kind),
+            _ => None,
+        })
 }
 
 /// A `BUGnn:` refusal as [`DbError::Refused`] carrying the database's message;
@@ -317,6 +309,35 @@ impl BugReportRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Migration 207's BUG codes, each answered by its kind with the
+    /// database's text; anything else is the ordinary conversion.
+    #[test]
+    fn bug_codes_are_answered_by_their_kind() {
+        use crate::errors::fake_db::{error, shape};
+        for (message, want) in [
+            ("BUG01: x", "Refused(Authority): BUG01: x"),
+            ("BUG02: x", "Refused(Authority): BUG02: x"),
+            ("BUG03: x", "Refused(State): BUG03: x"),
+            ("BUG04: x", "Refused(Input): BUG04: x"),
+            ("BUG05: x", "Refused(Input): BUG05: x"),
+            ("BUG06: x", "Refused(Authority): BUG06: x"),
+            ("BUG07: x", "Refused(Authority): BUG07: x"),
+            ("BUG08: x", "Refused(State): BUG08: x"),
+            ("VIS01: x", "QueryFailed"),
+        ] {
+            assert_eq!(
+                shape(&map_refusal(error("P0001", message))),
+                want,
+                "{message}"
+            );
+        }
+        // 207's caller check ends with 166's ROL01, which stays central.
+        assert_eq!(
+            shape(&map_refusal(error("ROL01", "ROL01: x"))),
+            "RoleHolderRequired: ROL01: x"
+        );
+    }
 
     #[test]
     fn content_is_title_blank_line_description_then_the_repro_heading() {

@@ -11,40 +11,14 @@ use uuid::Uuid;
 /// drift.
 const CHECK_VIOLATION: &str = "23514";
 
-/// SQLSTATE `RVK01`: `epigraph_ensure_personal_group` refused because the agent
-/// holds only REVOKED membership rows of its personal group (migration 105).
-///
-/// A custom class on purpose: `RV` is outside the standard's reserved `0-4` /
-/// `A-H` classes and outside every class PostgreSQL itself raises, so no
-/// server-side error can be mistaken for this refusal. Spelled once, here, for
-/// the same reason [`CHECK_VIOLATION`] is.
-pub const PERSONAL_MEMBERSHIP_REVOKED: &str = "RVK01";
-
-/// SQLSTATE `RVK02`: `epigraph_ensure_personal_group` refused because the group
-/// under the agent's canonical personal did_key is not the agent's own — not
-/// `kind = 'personal'`, or created by another agent (a squat). Migration 105.
-/// Same class as [`PERSONAL_MEMBERSHIP_REVOKED`], for the same reason.
-pub const PERSONAL_GROUP_NOT_OWNED: &str = "RVK02";
-
-/// SQLSTATE `OPL01`: a claim write named an author that is not bound to a human
-/// operator (migration 122). Raised by `epigraph_require_bound_author`, which the
-/// `claims_require_tenancy_then_operator_binding` trigger and
-/// `ClaimRepository::default_decl_for_author` both call, once the database is
-/// armed. Same custom-class reasoning as [`PERSONAL_MEMBERSHIP_REVOKED`].
-pub const OPERATOR_LINK_REQUIRED: &str = "OPL01";
-
-/// SQLSTATE `OPL02`: a live-linked agent was named on a row owned by a group its
-/// OPERATOR holds no writer/admin membership in, or given a writer/admin row in
-/// such a group (migration 122 section 1b). Every agent writes only where its
-/// own human writes; admin access is the only thing that crosses groups.
-pub const OPERATOR_SCOPE_REFUSED: &str = "OPL02";
-
-/// SQLSTATE `ROL01`: a claim was written or attributed by an agent attached to
-/// a role (`role_agents`, migration 166) while no human holds that role, or
-/// while the agent's linked human is not the holder. Raised by
-/// `epigraph_require_role_holder`, which the claims trigger's operator-binding
-/// checks call once the database is armed; the valve does not relieve it.
-pub const ROLE_HOLDER_REQUIRED: &str = "ROL01";
+// The custom-SQLSTATE codes this file's typed variants name live in the
+// refusal-code registry, with every other code; re-exported so their paths
+// stay `epigraph_db::errors::*` and `epigraph_db::*`.
+use crate::refusal_codes::{self, Answer};
+pub use crate::refusal_codes::{
+    OPERATOR_LINK_REQUIRED, OPERATOR_SCOPE_REFUSED, PERSONAL_GROUP_NOT_OWNED,
+    PERSONAL_MEMBERSHIP_REVOKED, ROLE_HOLDER_REQUIRED,
+};
 
 /// The message prefix of migration 184's RT07 refusal (SQLSTATE 42501): a
 /// write to the key of a RETRACTED mass function (operator ruling R-103).
@@ -370,74 +344,78 @@ impl From<sqlx::Error> for DbError {
                     message: db_err.message().to_string(),
                 }
             }
-            // RVK01, migration 105's refusal to revive a revoked personal
-            // membership. Named so no caller has to string-match a message.
-            sqlx::Error::Database(db_err)
-                if db_err.code().as_deref() == Some(PERSONAL_MEMBERSHIP_REVOKED) =>
-            {
-                Self::MembershipRevoked {
-                    message: db_err.message().to_string(),
+            // A coded refusal the registry answers for every caller: migration
+            // 105's RVK01/RVK02, 122's OPL01/OPL02, 166's ROL01 (each a typed
+            // DENIAL, so no caller has to string-match a message), and 184's
+            // RT07 (operator ruling R-103): a write to the key of a retracted
+            // BBA, a designed refusal of the target's STATE (the remedy is
+            // the explicit un-retract), so every surface answers it as one
+            // (HTTP 409, the MCP tool error) rather than as a redacted fault.
+            // RT07's text is built here; only the row id is taken from the
+            // database, from DETAIL, parsed as a uuid. Every other code
+            // (a repo's own, a route's, a disclosed one) stays QueryFailed.
+            sqlx::Error::Database(db_err) => {
+                let message = || db_err.message().to_string();
+                match refusal_codes::lookup(&*db_err).map(|c| c.answer) {
+                    Some(Answer::MembershipRevoked) => {
+                        Self::MembershipRevoked { message: message() }
+                    }
+                    Some(Answer::PersonalGroupNotOwned) => {
+                        Self::PersonalGroupNotOwned { message: message() }
+                    }
+                    Some(Answer::OperatorLinkRequired) => {
+                        Self::OperatorLinkRequired { message: message() }
+                    }
+                    Some(Answer::OperatorScopeRefused) => {
+                        Self::OperatorScopeRefused { message: message() }
+                    }
+                    Some(Answer::RoleHolderRequired) => {
+                        Self::RoleHolderRequired { message: message() }
+                    }
+                    Some(Answer::RetractedBbaRewrite) => {
+                        let id = db_err
+                            .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                            .and_then(sqlx::postgres::PgDatabaseError::detail)
+                            .and_then(|d| Uuid::parse_str(d.trim()).ok());
+                        Self::Refused {
+                            kind: RefusalKind::State,
+                            message: retracted_bba_rewrite_message(id),
+                        }
+                    }
+                    _ => Self::QueryFailed {
+                        source: sqlx::Error::Database(db_err),
+                    },
                 }
             }
-            // RVK02, migration 105's refusal to join a squatted personal group.
-            sqlx::Error::Database(db_err)
-                if db_err.code().as_deref() == Some(PERSONAL_GROUP_NOT_OWNED) =>
-            {
-                Self::PersonalGroupNotOwned {
-                    message: db_err.message().to_string(),
-                }
-            }
-            // OPL01, migration 122's refusal of an author not bound to a human
-            // operator.
-            sqlx::Error::Database(db_err)
-                if db_err.code().as_deref() == Some(OPERATOR_LINK_REQUIRED) =>
-            {
-                Self::OperatorLinkRequired {
-                    message: db_err.message().to_string(),
-                }
-            }
-            // OPL02, migration 122 section 1b: outside the operator's groups.
-            sqlx::Error::Database(db_err)
-                if db_err.code().as_deref() == Some(OPERATOR_SCOPE_REFUSED) =>
-            {
-                Self::OperatorScopeRefused {
-                    message: db_err.message().to_string(),
-                }
-            }
-            // ROL01, migration 166: a role's agent with no live holder of its own.
-            sqlx::Error::Database(db_err)
-                if db_err.code().as_deref() == Some(ROLE_HOLDER_REQUIRED) =>
-            {
-                Self::RoleHolderRequired {
-                    message: db_err.message().to_string(),
-                }
-            }
-            // RT07, migration 184 (operator ruling R-103): a write to the key
-            // of a retracted BBA. A designed refusal of the target's STATE (the
-            // remedy is the explicit un-retract), so every surface answers it
-            // as one (HTTP 409, the MCP tool error) rather than as a redacted
-            // fault. The text is built here; only the row id is taken from the
-            // database, from DETAIL, parsed as a uuid.
-            sqlx::Error::Database(db_err)
-                if db_err.code().as_deref() == Some("42501")
-                    && db_err.message().starts_with(RETRACTED_BBA_REWRITE_PREFIX) =>
-            {
-                let id = db_err
-                    .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
-                    .and_then(sqlx::postgres::PgDatabaseError::detail)
-                    .and_then(|d| Uuid::parse_str(d.trim()).ok());
-                Self::Refused {
-                    kind: RefusalKind::State,
-                    message: retracted_bba_rewrite_message(id),
-                }
-            }
-            // All other database errors become QueryFailed
+            // All other errors become QueryFailed
             other => Self::QueryFailed { source: other },
         }
     }
 }
 
 impl DbError {
+    /// The answer to an error from a definer of `family`, whose coded
+    /// refusals the caller answers: a code of that family the registry
+    /// answers as a site refusal ([`Answer::Refused`]) becomes
+    /// [`Self::Refused`] of its kind with the database's text; anything else
+    /// is the ordinary conversion. Only a repo that calls a coded definer
+    /// converts this way, so the same code reached through any other
+    /// statement stays a database error.
+    #[must_use]
+    pub(crate) fn from_definer(e: sqlx::Error, family: refusal_codes::Family) -> Self {
+        if let sqlx::Error::Database(db) = &e {
+            if let Some(Answer::Refused(kind)) =
+                refusal_codes::lookup_in(&**db, family).map(|c| c.answer)
+            {
+                return Self::Refused {
+                    kind,
+                    message: db.message().to_string(),
+                };
+            }
+        }
+        Self::from(e)
+    }
+
     /// `true` for migration 105's two refusals of a personal-group provisioning
     /// call ([`Self::MembershipRevoked`], [`Self::PersonalGroupNotOwned`]): a
     /// denial the caller cannot fix, never a server fault. Every surface that
@@ -481,5 +459,154 @@ impl From<serde_json::Error> for DbError {
 impl From<epigraph_core::CoreError> for DbError {
     fn from(err: epigraph_core::CoreError) -> Self {
         Self::CoreError { source: err }
+    }
+}
+
+/// A driver error built in memory, for the unit tests that pin how a coded
+/// database refusal becomes a [`DbError`] (no database needed).
+#[cfg(test)]
+pub(crate) mod fake_db {
+    use super::DbError;
+    use std::borrow::Cow;
+
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: &'static str,
+        message: String,
+    }
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+    impl std::error::Error for FakeDbError {}
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// A database error with SQLSTATE `code` and message `message`.
+    pub(crate) fn error(code: &'static str, message: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError {
+            code,
+            message: message.to_string(),
+        }))
+    }
+
+    /// The variant `e` is, with the kind of a `Refused` and the text of a
+    /// message-carrying variant: what a transport answers from.
+    pub(crate) fn shape(e: &DbError) -> String {
+        match e {
+            DbError::Refused { kind, message } => format!("Refused({kind:?}): {message}"),
+            DbError::QueryFailed { .. } => "QueryFailed".to_string(),
+            DbError::NotFound { entity, id } => format!("NotFound({entity} {id})"),
+            DbError::MembershipRevoked { message } => format!("MembershipRevoked: {message}"),
+            DbError::PersonalGroupNotOwned { message } => {
+                format!("PersonalGroupNotOwned: {message}")
+            }
+            DbError::OperatorLinkRequired { message } => {
+                format!("OperatorLinkRequired: {message}")
+            }
+            DbError::OperatorScopeRefused { message } => {
+                format!("OperatorScopeRefused: {message}")
+            }
+            DbError::RoleHolderRequired { message } => format!("RoleHolderRequired: {message}"),
+            other => format!("other: {other}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake_db::{error, shape};
+    use super::*;
+
+    /// Every coded refusal `From<sqlx::Error>` answers for all callers, and
+    /// the site-answered codes it must leave alone (a repo that calls the
+    /// family's definer converts those, never the central mapping).
+    #[test]
+    fn the_central_conversion_answers_exactly_its_coded_refusals() {
+        let rt07 = retracted_bba_rewrite_message(None);
+        for (code, message, want) in [
+            (
+                "RVK01",
+                "RVK01: x",
+                "MembershipRevoked: RVK01: x".to_string(),
+            ),
+            (
+                "RVK02",
+                "RVK02: x",
+                "PersonalGroupNotOwned: RVK02: x".to_string(),
+            ),
+            (
+                "OPL01",
+                "OPL01: x",
+                "OperatorLinkRequired: OPL01: x".to_string(),
+            ),
+            (
+                "OPL02",
+                "OPL02: x",
+                "OperatorScopeRefused: OPL02: x".to_string(),
+            ),
+            (
+                "ROL01",
+                "ROL01: x",
+                "RoleHolderRequired: ROL01: x".to_string(),
+            ),
+            // RT07 is 42501 plus the prefix; the text is rebuilt here (no
+            // DETAIL on an in-memory error, so no row id).
+            (
+                "42501",
+                "RT07: mass function 1 is retracted",
+                format!("Refused(State): {rt07}"),
+            ),
+            // RT07 under another SQLSTATE, or without ": ", is not RT07.
+            (
+                "P0001",
+                "RT07: mass function 1 is retracted",
+                "QueryFailed".to_string(),
+            ),
+            (
+                "42501",
+                "RT07 mass function 1 is retracted",
+                "QueryFailed".to_string(),
+            ),
+            // A site-answered code stays a database error centrally.
+            ("P0001", "VIS01: x", "QueryFailed".to_string()),
+            ("P0001", "PVS01: x", "QueryFailed".to_string()),
+            ("42501", "CSG01: x", "QueryFailed".to_string()),
+            ("P0001", "BUG01: x", "QueryFailed".to_string()),
+            ("TGP01", "TGP01: x", "QueryFailed".to_string()),
+            ("TGP08", "TGP08: x", "QueryFailed".to_string()),
+            ("ELV04", "ELV04: x", "QueryFailed".to_string()),
+            ("CUS04", "CUS04: x", "QueryFailed".to_string()),
+            // A reviewed 176 code is disclosed by the HTTP layer, not here.
+            ("42501", "GRM05: x", "QueryFailed".to_string()),
+            ("55000", "SR09: x", "QueryFailed".to_string()),
+            // A custom SQLSTATE no one maps.
+            ("ELV05", "ELV05: x", "QueryFailed".to_string()),
+        ] {
+            assert_eq!(
+                shape(&DbError::from(error(code, message))),
+                want,
+                "{code} {message:?}"
+            );
+        }
     }
 }

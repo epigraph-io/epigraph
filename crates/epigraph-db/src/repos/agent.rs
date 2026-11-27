@@ -305,29 +305,11 @@ pub struct ProfileVisibilitySet {
     pub named_to_everyone: bool,
 }
 
-/// Map migration 310's refusals to designed refusals (the VIS pattern,
-/// `claim_visibility.rs::map_vis_error`). `refusal_codes.rs` is pinned to
-/// migration 176's codes, so the PVS codes are mapped here instead.
+/// Map migration 310's refusals (`PVS01`..`PVS05`) to designed refusals of
+/// the kind the refusal-code registry gives them (the VIS pattern,
+/// `claim_visibility.rs::map_vis_error`).
 fn map_profile_visibility_error(e: sqlx::Error) -> DbError {
-    if let sqlx::Error::Database(db) = &e {
-        let msg = db.message();
-        let kind = if msg.starts_with("PVS01") || msg.starts_with("PVS05") {
-            Some(crate::errors::RefusalKind::Authority)
-        } else if msg.starts_with("PVS02") {
-            Some(crate::errors::RefusalKind::Input)
-        } else if msg.starts_with("PVS04") {
-            Some(crate::errors::RefusalKind::State)
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            return DbError::Refused {
-                kind,
-                message: msg.to_string(),
-            };
-        }
-    }
-    DbError::from(e)
+    DbError::from_definer(e, crate::refusal_codes::Family::Pvs)
 }
 
 #[derive(Debug, Clone)]
@@ -3252,6 +3234,29 @@ mod author_naming_tests {
 #[cfg(test)]
 mod tests {
     use super::{provider_asserted_person_name, RunTokens};
+
+    /// Migration 310's PVS codes, each answered by its kind with the
+    /// database's text; anything else is the ordinary conversion.
+    #[test]
+    fn pvs_codes_are_answered_by_their_kind() {
+        use crate::errors::fake_db::{error, shape};
+        for (message, want) in [
+            ("PVS01: x", "Refused(Authority): PVS01: x"),
+            ("PVS02: x", "Refused(Input): PVS02: x"),
+            ("PVS03: x", "QueryFailed"),
+            ("PVS04: x", "Refused(State): PVS04: x"),
+            ("PVS05: x", "Refused(Authority): PVS05: x"),
+            ("VIS01: x", "QueryFailed"),
+        ] {
+            assert_eq!(
+                shape(&super::map_profile_visibility_error(error(
+                    "P0001", message
+                ))),
+                want,
+                "{message}"
+            );
+        }
+    }
 
     const EMAIL: Option<&str> = Some("ada.example@example.test");
 
