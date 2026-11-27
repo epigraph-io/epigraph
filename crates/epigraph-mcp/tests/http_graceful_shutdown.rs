@@ -537,7 +537,7 @@ async fn sigterm_waits_for_a_queued_walk_of_an_http_session(pool: PgPool) {
             serde_json::json!({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
                 "params": {"name": "ingest_document_inline",
-                           "arguments": {"extraction": extraction}}
+                           "arguments": {"extraction": extraction, "wait": false}}
             }),
         )
         .await;

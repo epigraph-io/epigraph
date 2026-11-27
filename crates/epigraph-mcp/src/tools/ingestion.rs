@@ -240,7 +240,10 @@ pub async fn ingest_document(
     .await?;
     // Warn-only, from the payload, before the walk detaches (backlog 72850d43).
     let atomicity = extraction_atomicity(&extraction);
-    if params.wait.unwrap_or(false) {
+    // `wait` defaults to TRUE (backlog 81d8afe0): a detached walk's failure
+    // reaches only the server log, so the queued answer is the explicit
+    // `wait: false` opt-in, never what a caller gets by naming nothing.
+    if params.wait.unwrap_or(true) {
         return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice)
             .await
             .map(|r| with_atomicity(r, atomicity));
@@ -385,7 +388,8 @@ pub async fn ingest_document_inline(
     params: IngestDocumentInlineParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let wait = params.wait.unwrap_or(false);
+    // Defaults to TRUE, as in `ingest_document` above (backlog 81d8afe0).
+    let wait = params.wait.unwrap_or(true);
     let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
@@ -463,8 +467,10 @@ pub async fn ingest_document_inline(
     ))
 }
 
-/// The `wait: true` arm of the two detached ingest handlers: run the walk IN
-/// the request and hand its result, or its error, to the caller.
+/// The `wait: true` arm of the two document ingest handlers, which is their
+/// DEFAULT (backlog 81d8afe0): run the walk IN the request and hand its
+/// result, or its error, to the caller. Only an explicit `wait: false`
+/// detaches it.
 ///
 /// Detached, a walk that fails past [`preflight_write_authority`] (a constraint
 /// on one of the document's rows, a refused trace, a malformed axis) reaches
@@ -602,10 +608,11 @@ fn queued_response(
     atomicity: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let mut note = String::from(
-        "DB writes are running as a detached background task, as ONE transaction that also \
-         writes the papers row: for a new document, query_paper(`document_key`) finds nothing \
-         until the walk commits, and a document that never appears means the walk failed \
-         (see the server log); resubmit with wait=true to see the error. Confirm the writes \
+        "wait=false: DB writes are running as a detached background task, as ONE transaction \
+         that also writes the papers row: for a new document, query_paper(`document_key`) finds \
+         nothing until the walk commits, and a document that never appears means the walk \
+         failed (see the server log); resubmit with wait omitted (it defaults to true) to see \
+         the error. Confirm the writes \
          landed by query_paper's claim_count rising, not with check_already_ingested, which is \
          already true after ingest_document_spine or any earlier ingest of this document. \
          `title` is the title the papers row holds, which an earlier ingest may have set.",

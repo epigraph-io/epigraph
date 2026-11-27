@@ -575,7 +575,7 @@ async fn an_absent_agent_id_keeps_the_name_derived_node_created_then_matched(poo
     assert_eq!(authored_edges(&pool, key_node, doi2).await, 1);
 }
 
-/// Each refusal reaches the caller of the QUEUED path (`wait` omitted), before
+/// Each refusal reaches the caller of the QUEUED path (`wait: false`), before
 /// anything is written (the walk, not the handler, writes the `papers` row).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool: PgPool) {
@@ -635,7 +635,7 @@ async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool:
             &viewer,
             IngestDocumentInlineParams {
                 extraction: doc(&doi, authors),
-                wait: None,
+                wait: Some(false),
                 visibility: Some("public".to_string()),
                 group_id: None,
             },
@@ -674,7 +674,7 @@ async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool:
         &viewer,
         IngestDocumentParams {
             file_path: path.display().to_string(),
-            wait: None,
+            wait: Some(false),
             visibility: Some("public".to_string()),
             group_id: None,
         },
