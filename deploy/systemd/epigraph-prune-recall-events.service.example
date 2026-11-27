@@ -2,7 +2,9 @@
 #
 # A TEMPLATE: nothing in this repository installs it. Copy it, replace the
 # placeholders (the binary path, the service user, the environment file) and
-# install it by hand: docs/deploy.md, step 10.
+# install it by hand, without the `.example` suffix, as
+# /etc/systemd/system/epigraph-prune-recall-events.service
+# (docs/deploy.md, step 10).
 #
 # Deletes recall_events rows and telemetry events rows older than
 # RECALL_EVENTS_RETENTION_DAYS (default 90; set it in the environment file to

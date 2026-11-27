@@ -1,5 +1,7 @@
 # Runs epigraph-cascade-replay.service every 90 s, the interval the binary
 # documents. A TEMPLATE: see the service file and docs/deploy.md step 10.
+# Install it without the `.example` suffix, as
+# /etc/systemd/system/epigraph-cascade-replay.timer.
 #
 # OnUnitActiveSec counts from the last start, so a run still going when the
 # interval elapses is not started twice; the replay's own advisory lock

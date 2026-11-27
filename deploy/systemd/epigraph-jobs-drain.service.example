@@ -2,7 +2,9 @@
 #
 # A TEMPLATE: nothing in this repository installs it. Copy it, replace the
 # placeholders (the binary path, the service user, the environment file) and
-# install it by hand: docs/deploy.md, step 10 and section 5.
+# install it by hand, without the `.example` suffix, as
+# /etc/systemd/system/epigraph-jobs-drain.service
+# (docs/deploy.md, step 10 and section 5).
 #
 # No request-serving process runs jobs: they are drained here. The API and MCP
 # server name this unit's timer in their start-up line.

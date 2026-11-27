@@ -20,14 +20,15 @@ Background for the features named here is in [`docs/tenancy.md`](tenancy.md)
 migration's own header is the authoritative record of what it does. This
 runbook gives the order in which to do things.
 
-Throughout, `<placeholders>` stand for values from your own deployment. No
-container images or host paths ship in this repository. Template systemd
-units for the scheduled jobs do ship, in [`deploy/systemd/`](../deploy/systemd/):
-the maintenance timers of step 10 and the Atlas nightly. They carry
-placeholders (binary path, service user, environment file) and nothing
+Throughout, `<placeholders>` stand for values from your own deployment. This
+runbook does not prescribe your hosts' layout, and no container image for the
+kernel ships here. Template systemd units do ship, in
+[`deploy/systemd/`](../deploy/systemd/), for four of the maintenance jobs of
+step 10 (as `<unit>.example`) and for the Atlas nightly. Their binary path,
+service user and environment file are placeholders to replace, and nothing
 installs them. Where a refusal message names a unit
-(`epigraph-cascade-replay.timer`, `epigraph-jobs-drain.timer`), it is the
-template of that name; you may install it under another.
+(`epigraph-cascade-replay.timer`, `epigraph-jobs-drain.timer`), that is the
+installed name of the template; you may install it under another.
 
 ## Contents
 
@@ -507,14 +508,16 @@ neither.
 | Theme rebuild | `python3 scripts/theme_pipeline.py grow` | weekly or monthly, and after a large ingest | The full UMAP rebuild `theme_cluster` used to point at: base clustering, split loop, projection onto `claim_themes`, then labelling. Connects on `MAINTENANCE_DATABASE_URL` (an application login under row security clusters only the rows it can see and still exits 0); every statement is bounded at 15 minutes. The label step runs `scripts/label_themes_llm.py --relabel-all`, which calls the `claude` CLI, so the unit's user needs that CLI installed and signed in; when labelling fails the run prints `"status": "label_failed"` and exits 1 with the clustering already committed, and `theme_pipeline.py label` retries just that step. The base assignment alone has taken about 40 minutes; `--from-run-id <run>` resumes the split, projection and label phases on an existing run. Memory: budget about 3 GB. `cluster_claims.py` documents a 620 MB UMAP reducer and a 2.6 GB peak at a 100K batch (this job's default `--batch-size` is 20000), and `refine_clusters.py` fits UMAP on a capped sample; measure the peak on your corpus before you tighten a cgroup limit. Writes the fitted reducer to `data/umap_reducer.pkl` in the checkout. `--dry-run` writes nothing: with `--from-run-id <run>` it lists the clusters the split loop would act on in that run; without it, it only says a fresh run would start with base clustering (base clustering commits a run, so it is not run as a preview). `theme_pipeline.py discover` previews the latest run. |
 
 Template units for the first, second, fourth and fifth rows ship in
-[`deploy/systemd/`](../deploy/systemd/): `epigraph-cascade-replay.timer`,
-`epigraph-jobs-drain.timer`, `epigraph-embed-backfill.timer` and
-`epigraph-prune-recall-events.timer`, each with its `.service`. Each service
-is a oneshot that runs the binary with the command and exit-code handling of
-this table, reads one environment file (`/etc/epigraph/maintenance.env`, a
-placeholder) and runs as a placeholder service user. Copy them, replace the
-placeholders, and enable the timers; the comments in each file say what to
-change.
+[`deploy/systemd/`](../deploy/systemd/): `epigraph-cascade-replay.timer.example`,
+`epigraph-jobs-drain.timer.example`, `epigraph-embed-backfill.timer.example`
+and `epigraph-prune-recall-events.timer.example`, each with its
+`.service.example`. Each service is a oneshot that runs the binary with the
+command and exit-code handling of this table, reads one environment file
+(`/etc/epigraph/maintenance.env`, a placeholder) and runs as a placeholder
+service user. Install each without the `.example` suffix (for example as
+`/etc/systemd/system/epigraph-cascade-replay.timer`), replace the placeholders,
+and enable the timers; the comments in each file say what to change. The other
+rows have no template; schedule them the same way.
 
 `replay_deferred_cascades` and `drain_jobs` each take their own session
 advisory lock, so an overlapping or hand-started run prints

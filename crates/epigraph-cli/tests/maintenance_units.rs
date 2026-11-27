@@ -1,19 +1,23 @@
 //! The maintenance jobs' systemd units (`deploy/systemd/`, backlog 21be383b):
-//! templates the operator copies and installs by hand, beside the Atlas
-//! nightly's. Request processes refuse to apply cascades or run jobs and name
-//! the timers that do (`epigraph-cascade-replay.timer`,
-//! `epigraph-jobs-drain.timer`); those names must exist here.
+//! templates the operator copies and installs by hand, shipped as
+//! `<unit>.example` like the explorer's service. Request processes refuse to
+//! apply cascades or run jobs and name the timers that do
+//! (`epigraph-cascade-replay.timer`, `epigraph-jobs-drain.timer`); a template
+//! of each name must exist here.
 //!
 //! * `every_timer_the_code_names_ships`: every `<name>.timer` named anywhere
-//!   under `crates/*/src` has a timer file here whose `Unit=` service also
-//!   ships. A refusal that names a unit nobody can find is the defect this
-//!   closes.
-//! * `the_units_run_what_deploy_md_promises`: each service runs its binary
-//!   with the flags and exit-code handling `docs/deploy.md` step 10 gives it;
-//!   each timer fires (a monotonic timer needs a first trigger too).
+//!   under `crates/*/src` ships here, as `<name>.timer` (the Atlas nightly's)
+//!   or `<name>.timer.example`, and so does its `Unit=` service. A refusal
+//!   that names a unit nobody can find is the defect this closes.
+//! * `the_maintenance_units_ship_as_examples`: the four jobs' units ship only
+//!   under the `.example` name, so none is mistaken for an installed unit.
+//! * `the_units_keep_the_binaries_contracts`: each service runs its binary
+//!   with the flags and exit-code handling the binary documents (the values
+//!   are written here, not read from `docs/deploy.md`); each timer fires (a
+//!   monotonic timer needs a first trigger too).
 //! * `the_units_carry_only_placeholders`: the repository is public.
 //! * `deploy_md_points_at_the_units`: the runbook names the directory and
-//!   every timer, and no longer says no unit files ship.
+//!   every timer's template, and no longer says no unit files ship.
 //! * `systemd_analyze_verifies_the_units` (when `systemd-analyze` is on the
 //!   host): every file, with `ExecStart=` pointed at `/bin/true`, passes
 //!   `systemd-analyze verify` with no complaint about any of them.
@@ -66,9 +70,19 @@ fn parse(name: &str, text: &str) -> Unit {
     out
 }
 
+/// Where the unit `name` ships: `deploy/systemd/<name>` or, for a template,
+/// `deploy/systemd/<name>.example`.
+fn shipped(name: &str) -> Option<PathBuf> {
+    [name.to_string(), format!("{name}.example")]
+        .into_iter()
+        .map(|n| units_dir().join(n))
+        .find(|p| p.is_file())
+}
+
 fn read(name: &str) -> String {
-    std::fs::read_to_string(units_dir().join(name))
-        .unwrap_or_else(|e| panic!("deploy/systemd/{name}: {e}"))
+    let path =
+        shipped(name).unwrap_or_else(|| panic!("deploy/systemd/{name}(.example) does not ship"));
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 fn unit(name: &str) -> Unit {
@@ -147,10 +161,7 @@ fn every_timer_the_code_names_ships() {
             "the scan no longer finds {must}: {named:?}"
         );
     }
-    let missing: Vec<&String> = named
-        .iter()
-        .filter(|t| !units_dir().join(t.as_str()).is_file())
-        .collect();
+    let missing: Vec<&String> = named.iter().filter(|t| shipped(t).is_none()).collect();
     assert!(
         missing.is_empty(),
         "timers named under crates/*/src with no file in deploy/systemd/: {missing:?}"
@@ -159,9 +170,26 @@ fn every_timer_the_code_names_ships() {
         let timer = unit(t);
         let service = one(&timer, t, "Timer", "Unit");
         assert!(
-            units_dir().join(service).is_file(),
+            shipped(service).is_some(),
             "{t}: Unit={service} does not ship"
         );
+    }
+}
+
+#[test]
+fn the_maintenance_units_ship_as_examples() {
+    for (stem, _) in JOBS {
+        for kind in ["service", "timer"] {
+            let name = format!("{stem}.{kind}");
+            assert!(
+                units_dir().join(format!("{name}.example")).is_file(),
+                "deploy/systemd/{name}.example does not ship"
+            );
+            assert!(
+                !units_dir().join(&name).exists(),
+                "deploy/systemd/{name} ships under its installed name; a template is {name}.example"
+            );
+        }
     }
 }
 
@@ -207,7 +235,7 @@ fn ok_codes(service: &Unit) -> Vec<String> {
 }
 
 #[test]
-fn the_units_run_what_deploy_md_promises() {
+fn the_units_keep_the_binaries_contracts() {
     for (stem, binary) in JOBS {
         let sname = format!("{stem}.service");
         let tname = format!("{stem}.timer");
@@ -366,8 +394,8 @@ fn deploy_md_points_at_the_units() {
     );
     for (stem, _) in JOBS {
         assert!(
-            flat.contains(&format!("{stem}.timer")),
-            "docs/deploy.md never names {stem}.timer"
+            flat.contains(&format!("{stem}.timer.example")),
+            "docs/deploy.md never names the template {stem}.timer.example"
         );
     }
 }
