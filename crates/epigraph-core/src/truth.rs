@@ -20,9 +20,10 @@ use std::fmt;
 ///
 /// # Numeric reproducibility
 ///
-/// An `f64`: bit-identical on one platform (every fold uses a fixed order),
-/// not across CPU architectures. Compare with a tolerance, and never hash or
-/// sign a computed value. See `CLAUDE.md`, "Belief values: f64, reproducible per platform only".
+/// An `f64`: bit-identical on one platform (DS combination and belief
+/// propagation fold in a fixed order), not across CPU architectures. Compare
+/// with a tolerance, and never hash or sign a computed value. See
+/// `CLAUDE.md`, "Belief values: f64, reproducible per platform only".
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(try_from = "f64", into = "f64")]
 pub struct TruthValue(f64);

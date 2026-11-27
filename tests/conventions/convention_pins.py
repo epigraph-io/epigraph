@@ -164,6 +164,14 @@ PINS: tuple[Pin, ...] = (
         incident="de039f69",
     ),
     Pin(
+        id="belief-unordered-aggregates-are-defects",
+        file="CLAUDE.md",
+        section_start="## Belief values: f64, reproducible per platform only",
+        section_end=None,
+        needle="A new fold must fix its order; an existing unordered one is a defect to file",
+        incident="de039f69",
+    ),
+    Pin(
         id="belief-never-hashed-or-signed",
         file="CLAUDE.md",
         section_start="## Belief values: f64, reproducible per platform only",

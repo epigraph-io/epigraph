@@ -159,12 +159,16 @@ retires a row, and the filter each reader applies:
 `TruthValue` (`crates/epigraph-core/src/truth.rs`) and every Dempster-Shafer
 mass, belief and plausibility are `f64` (backlog `de039f69`, `3f6bc8bb`).
 
-- **Bit-identical on one platform.** Every fold combines its inputs in a fixed
-  order: `epigraph_ds::combination::combine_multiple` sorts them by
+- **Bit-identical on one platform.** The DS combination and belief
+  propagation folds combine their inputs in a fixed order:
+  `epigraph_ds::combination::combine_multiple` sorts them by
   `canonical_mass_cmp` before folding, and CDST belief propagation iterates in
   canonical order, never a `HashMap`'s (backlog `15582602`). The same inputs on
-  the same CPU architecture and build give the same bits. A fold that iterates
-  a `HashMap`, or relies on the database's unspecified row order, is a bug.
+  the same CPU architecture and build give the same bits from those folds.
+  Not every aggregate over beliefs is ordered yet: a sum accumulated in a
+  `HashMap` or a SQL `AVG` over unordered rows can differ in the last bits
+  between two runs. A new fold must fix its order; an existing unordered one
+  is a defect to file, not a reason to widen a tolerance.
 - **Not bit-identical across platforms.** The platform's math library (`ln`,
   `exp`, `powf`) and the compiler's code generation may differ in the last
   bits between CPU architectures (x86_64 and aarch64, say).
