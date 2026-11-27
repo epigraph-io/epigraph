@@ -15,6 +15,7 @@ use epigraph_db::{
 };
 
 use epigraph_db::pgvector_literal;
+use epigraph_engine::workflow_promotion::PROMOTION_BASIS;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -161,6 +162,7 @@ impl PromotionAssessment {
                 "workflow_id": self.variant_id,
                 "parent_id": serde_json::Value::Null,
                 "promotable": false,
+                "promotion_basis": PROMOTION_BASIS,
                 "reason": "workflow has no variant_of/supersedes parent (it is a lineage root); nothing to promote over",
             }),
             Some(v) => serde_json::json!({
@@ -171,6 +173,7 @@ impl PromotionAssessment {
                 "variant": { "successes": self.variant.0, "total": self.variant.1 },
                 "parent": { "successes": self.parent.0, "total": self.parent.1, "success_rate": self.parent_rate() },
                 "promotable": v.promotable,
+                "promotion_basis": PROMOTION_BASIS,
                 "variant_lower_bound": v.variant_lower_bound,
                 "parent_rate": v.parent_rate,
                 "reason": v.reason,
@@ -306,6 +309,7 @@ pub async fn refresh_workflow_promotion(
         "parent_id": assessment.parent_id,
         "refreshed": true,
         "promotable": verdict.promotable,
+        "promotion_basis": PROMOTION_BASIS,
         "variant_lower_bound": verdict.variant_lower_bound,
         "parent_rate": verdict.parent_rate,
         "reason": verdict.reason,
@@ -1111,7 +1115,7 @@ async fn hierarchical_workflow_result(
         // `promotable` is written by `refresh_workflow_promotion` onto the FLAT
         // claim's `properties.promotion`; hierarchical rows have no equivalent
         // field, so it stays absent rather than being faked as `false`.
-        promotable: None,
+        promotion: None,
         has_evolved_steps,
         evolved_steps,
         latest_generation,
@@ -1189,11 +1193,13 @@ async fn enrich_workflow_result(
     };
 
     // Promotion flag set by the refresh_workflow_promotion maintenance pass.
-    // Advisory metadata; best-effort (a lookup failure must not drop the result).
-    let promotable =
+    // Advisory metadata, labelled with its self-reported basis; best-effort (a
+    // lookup failure must not drop the result).
+    let promotion =
         ClaimRepository::promotion_flag(&mut *conn, viewer, ClaimId::from_uuid(workflow_id))
             .await
-            .unwrap_or(None);
+            .unwrap_or(None)
+            .map(PromotionFlag::new);
 
     Some(FindWorkflowResult {
         workflow_id: workflow_id.to_string(),
@@ -1208,7 +1214,7 @@ async fn enrich_workflow_result(
         behavioral_affinity,
         behavioral_success_rate,
         behavioral_execution_count,
-        promotable,
+        promotion,
         // Flat workflow claims carry their steps inline; there is no step
         // lineage to disclose.
         has_evolved_steps: None,

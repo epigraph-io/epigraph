@@ -3163,11 +3163,10 @@ pub struct FindWorkflowResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behavioral_execution_count: Option<i64>,
     /// Set by the workflow-promotion maintenance pass (`refresh_workflow_promotion`)
-    /// from the variant's `properties.promotion.promotable`. `Some(true)` means
-    /// the gate found this variant statistically better than its parent; absent
-    /// when never evaluated. Advisory — callers may prefer promoted variants.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub promotable: Option<bool>,
+    /// from the variant's `properties.promotion.promotable`, serialized flat as
+    /// `promotable` plus `promotion_basis`; absent when never evaluated.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<PromotionFlag>,
     /// Hierarchical results only (absent for flat workflow claims). `steps` is
     /// the FROZEN plan text: the claims the workflow's `executes` edges named
     /// at ingest. `Some(true)` when at least one of those steps has since been
@@ -3191,6 +3190,30 @@ pub struct FindWorkflowResult {
     /// workflow that the caller can read (backlog 41d7b27a), `[]` when none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub references: Option<Vec<WorkflowReference>>,
+}
+
+/// The promotion gate's verdict on a workflow variant as discovery shows it.
+///
+/// `promotable: true` means the gate found the variant statistically better
+/// than its parent. It is ADVISORY (backlog 74eedb3a): the executions it
+/// counts are outcome reports the callers submitted themselves, so the flag
+/// never appears without `promotion_basis` naming that basis
+/// ([`epigraph_engine::workflow_promotion::PROMOTION_BASIS`]). One struct, so
+/// the two fields cannot be emitted apart.
+#[derive(Debug, Serialize)]
+pub struct PromotionFlag {
+    pub promotable: bool,
+    pub promotion_basis: &'static str,
+}
+
+impl PromotionFlag {
+    #[must_use]
+    pub fn new(promotable: bool) -> Self {
+        Self {
+            promotable,
+            promotion_basis: epigraph_engine::workflow_promotion::PROMOTION_BASIS,
+        }
+    }
 }
 
 /// One workflow reference of a hierarchical workflow, as `find_workflow` and

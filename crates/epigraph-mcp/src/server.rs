@@ -2502,7 +2502,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array. For a hierarchical result, `steps` is the frozen plan text recorded at ingest, not the current step versions: `has_evolved_steps` is true when a step has since been evolved (evolve_step), `evolved_steps` lists each such step with its current head (`head_claim_id`, `head_content`: the newest head with is_current=true, the one evolve_step acts on; `is_current` is false when every head of that step is retired; `pending_resolution` when concurrent heads exist), and `latest_generation` is the newest generation of the same canonical_name (a newer generation exists when it exceeds `generation`). Use find_workflow_hierarchical with resolve_to_latest=true for the full per-step head view. A hierarchical result also lists `references`: the in-force workflow references you can read (invokes, depends_on, related_to, alternative_of), each with its `direction` (outgoing, incoming, or mutual for the symmetric two), the other workflow's id, canonical_name, generation and goal, and for a step claim's invokes `via_step_claim_id`."
+        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array. For a hierarchical result, `steps` is the frozen plan text recorded at ingest, not the current step versions: `has_evolved_steps` is true when a step has since been evolved (evolve_step), `evolved_steps` lists each such step with its current head (`head_claim_id`, `head_content`: the newest head with is_current=true, the one evolve_step acts on; `is_current` is false when every head of that step is retired; `pending_resolution` when concurrent heads exist), and `latest_generation` is the newest generation of the same canonical_name (a newer generation exists when it exceeds `generation`). Use find_workflow_hierarchical with resolve_to_latest=true for the full per-step head view. A hierarchical result also lists `references`: the in-force workflow references you can read (invokes, depends_on, related_to, alternative_of), each with its `direction` (outgoing, incoming, or mutual for the symmetric two), the other workflow's id, canonical_name, generation and goal, and for a step claim's invokes `via_step_claim_id`. A flat result may carry `promotable` with `promotion_basis: \"self_reported\"`: advisory only, computed from outcome reports callers submitted themselves, with no independent review."
     )]
     async fn find_workflow(
         &self,
@@ -2528,7 +2528,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Evaluate whether a workflow variant is statistically ready to be promoted over its immediate (variant_of) parent: the Wilson lower bound of the variant's behavioral success rate vs the parent's rate, over the same window, gated on a minimum sample. Read-only — returns a verdict, does not promote."
+        description = "Evaluate whether a workflow variant is statistically ready to be promoted over its immediate (variant_of) parent: the Wilson lower bound of the variant's behavioral success rate vs the parent's rate, over the same window, gated on a minimum sample. Read-only — returns a verdict, does not promote. The verdict is advisory and its promotion_basis is self_reported: the runs it counts are outcome reports callers submitted themselves, with no independent review."
     )]
     async fn evaluate_workflow_promotion(
         &self,
@@ -2541,7 +2541,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Re-evaluate a workflow variant's promotion verdict and write it to the variant's properties.promotion, overwriting any prior value (so a regressed variant is demoted, not left stale). The apply layer of the workflow-evolution gate; the maintenance pass calls this per candidate variant. Write."
+        description = "Re-evaluate a workflow variant's promotion verdict and write it to the variant's properties.promotion, overwriting any prior value (so a regressed variant is demoted, not left stale). The apply layer of the workflow-evolution gate; the maintenance pass calls this per candidate variant. Write. The flag is advisory (promotion_basis self_reported: it rests on outcome reports callers submitted themselves); nothing acts on it automatically."
     )]
     async fn refresh_workflow_promotion(
         &self,

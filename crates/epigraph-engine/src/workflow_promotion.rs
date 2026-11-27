@@ -17,8 +17,55 @@
 //!
 //! This is the autonomous statistical gate: a maintenance pass evaluates it and
 //! sets a `promotable` flag, keeping `find_workflow` read-only and cheap.
+//!
+//! # The flag is advisory and self-reported (backlog 74eedb3a)
+//!
+//! The executions the gate counts are outcome reports the callers submit
+//! themselves (`report_workflow_outcome` / `report_hierarchical_outcome`, each
+//! carrying the reporter's own `success` and `quality`). Today every recorded
+//! execution of the workflow in the window counts, whoever reported it: a
+//! caller that can read a workflow's steps can report on it, with no ownership
+//! check. Counting only reports from the plan's own authority is planned
+//! (backlog b446d2a4) and is not in this tree. Nothing reviews a report
+//! independently.
+//!
+//! So `promotable` is a hint an agent may weigh, never a decision: every
+//! surface that shows it labels its basis with [`PROMOTION_BASIS`] (MCP
+//! `find_workflow`, `evaluate_workflow_promotion`, `refresh_workflow_promotion`;
+//! REST `GET /api/v1/workflows` and `GET /api/v1/workflows/:id` via
+//! [`label_promotion_basis`]). Nothing acts on the flag automatically. Any
+//! future automatic use of `promotable` (auto-preferring a variant, retiring
+//! a parent) must first add sampled independent review of the outcome reports
+//! at the promotion boundary; a self-reported success rate is not a basis for
+//! an unreviewed action.
 
 use serde::Serialize;
+
+/// What the `promotable` verdict rests on, shown next to it on every surface:
+/// outcome reports the callers submitted themselves, with no independent
+/// review. When counting narrows to the plan authority's reports (backlog
+/// b446d2a4) this value should change with it, so a consumer can tell the two
+/// bases apart.
+pub const PROMOTION_BASIS: &str = "self_reported";
+
+/// Label a stored `properties.promotion` verdict with [`PROMOTION_BASIS`],
+/// in place: when `properties.promotion.promotable` is present, set
+/// `properties.promotion.promotion_basis`. Anything else is left untouched,
+/// so a workflow never evaluated gains no `promotion` block. For the read
+/// surfaces that return a workflow claim's raw properties.
+pub fn label_promotion_basis(properties: &mut serde_json::Value) {
+    if let Some(promotion) = properties
+        .get_mut("promotion")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if promotion.contains_key("promotable") {
+            promotion.insert(
+                "promotion_basis".to_string(),
+                serde_json::Value::from(PROMOTION_BASIS),
+            );
+        }
+    }
+}
 
 /// Tunables for the promotion gate.
 #[derive(Debug, Clone)]
@@ -132,6 +179,30 @@ pub fn evaluate_workflow_promotion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_promotion_basis_labels_only_a_stored_verdict() {
+        let mut evaluated = serde_json::json!({
+            "use_count": 3,
+            "promotion": {"promotable": false, "lower_bound": 0.2},
+        });
+        label_promotion_basis(&mut evaluated);
+        assert_eq!(evaluated["promotion"]["promotion_basis"], PROMOTION_BASIS);
+        assert_eq!(evaluated["promotion"]["promotable"], false);
+        assert_eq!(evaluated["use_count"], 3);
+
+        let mut never = serde_json::json!({"use_count": 0});
+        label_promotion_basis(&mut never);
+        assert_eq!(never, serde_json::json!({"use_count": 0}));
+
+        let mut no_flag = serde_json::json!({"promotion": {"n": 4}});
+        label_promotion_basis(&mut no_flag);
+        assert_eq!(no_flag, serde_json::json!({"promotion": {"n": 4}}));
+
+        let mut null = serde_json::Value::Null;
+        label_promotion_basis(&mut null);
+        assert!(null.is_null());
+    }
 
     fn approx(a: f64, b: f64) {
         assert!((a - b).abs() < 0.005, "expected ~{b}, got {a}");
