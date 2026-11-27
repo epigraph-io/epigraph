@@ -4,7 +4,7 @@
 //! # What was wrong, measured before this file
 //!
 //! `routes/experiment_loop.rs` gated every route on the hypothesis through the
-//! caller's viewer (R-51) and then wrote on `state.db_pool`. On a production
+//! caller's viewer (the hypothesis write gate) and then wrote on `state.db_pool`. On a production
 //! deployment that pool is `epigraph_app` with no tenancy stamp, under FORCEd
 //! row security. Two of the loop's writes take the HYPOTHESIS's tenancy: the
 //! `tests_hypothesis` / `provides_evidence` edges onto it and the
@@ -34,16 +34,33 @@
 //! regression pin for the two `routes/experiments.rs` handlers moved onto the
 //! caller's stamped connection: both tables carry no tenancy, so it passes on
 //! either tree, and it is not offered as proof of a defect.
+//!
+//! # The refusals the stamp brings
+//!
+//! * A role-attached agent outside its holder window (migration 166, ROL01) is
+//!   now refused on these tables, because the per-statement check sees the
+//!   real principal. It answers the coded 403 every write surface answers,
+//!   not a 500 server fault.
 #![cfg(feature = "db")]
 
 #[allow(dead_code)]
 mod common;
 mod viewer_fixture;
 
+use axum::extract::State;
+use axum::response::IntoResponse;
+use axum::{Extension, Json};
 use epigraph_api::embedding_restore::EmbeddingProviderKind;
+use epigraph_api::errors::ApiError;
+use epigraph_api::middleware::bearer::{AuthContext, ViewerExtractor};
+use epigraph_api::middleware::ClientType;
+use epigraph_api::routes::experiment_loop::{create_experiment, CreateExperimentRequest};
+use epigraph_api::routes::experiments::{add_method, AddMethodRequest};
 use epigraph_api::state::{ApiConfig, AppState};
+use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::net::SocketAddr;
@@ -52,10 +69,11 @@ use uuid::Uuid;
 
 const RW: &[&str] = &["claims:read", "claims:write"];
 
-/// The app under test: raw and stamped pools both `epigraph_app`, with a mock
-/// embedder declared as the provider that owns the stored vector columns (so
-/// `POST /api/v1/methods` stores a method embedding `find_methods` can rank).
-async fn spawn_app_role(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
+/// The state under test: raw and stamped pools both `epigraph_app`, with a
+/// mock embedder declared as the provider that owns the stored vector columns
+/// (so `POST /api/v1/methods` stores a method embedding `find_methods` can
+/// rank).
+async fn app_role_state(pool: &PgPool) -> AppState {
     let bypassrls: bool =
         sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
             .fetch_one(pool)
@@ -81,7 +99,12 @@ async fn spawn_app_role(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
         .load_entity_type_cache()
         .await
         .expect("load the entity-type cache");
-    let app = epigraph_api::routes::create_router(state);
+    state
+}
+
+/// The app under test, served over HTTP on [`app_role_state`].
+async fn spawn_app_role(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
+    let app = epigraph_api::routes::create_router(app_role_state(pool).await);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
@@ -376,4 +399,289 @@ async fn the_method_catalog_writes_and_searches_on_the_application_role(pool: Pg
         .collect();
     caps.sort_unstable();
     assert_eq!(caps, vec!["lattice_constant", "phase_identification"]);
+}
+
+// ── The refusals the stamp brings ─────────────────────────────────────────
+
+/// A `public` claim owned by `group` (not the world group), so the hypothesis
+/// write gate admits exactly the members who write `group`, while any viewer
+/// can read it.
+async fn public_claim_in(pool: &PgPool, agent: Uuid, group: Uuid, content: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed public claim");
+    let (visibility, owner): (String, Uuid) =
+        sqlx::query_as("SELECT visibility, owner_group_id FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the seeded claim back");
+    assert_eq!(
+        (visibility.as_str(), owner),
+        ("public", group),
+        "fixture: a public claim owned by the group"
+    );
+    id
+}
+
+/// Experiments filed against `hypothesis`, read as superuser.
+async fn experiments_on(pool: &PgPool, hypothesis: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM experiments WHERE hypothesis_id = $1")
+        .bind(hypothesis)
+        .fetch_one(pool)
+        .await
+        .expect("count experiments")
+}
+
+/// Methods named `name`, read as superuser.
+async fn methods_named(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM methods WHERE name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("count methods")
+}
+
+/// The role the ROL01 fixture attaches an agent to.
+const ROL01_ROLE: &str = "role:test-experiment-loop-rol01";
+
+/// A platform role with its role node (as `role_attached_agents.rs` seeds it).
+async fn seed_role(pool: &PgPool, key: &str) {
+    let node = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type, role, labels) \
+         VALUES ($1, uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), $2, 'role', \
+                 'custom', ARRAY['role'])",
+    )
+    .bind(node)
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("role node");
+    sqlx::query(
+        "INSERT INTO platform_roles (key, elevates, reads_audit, role_node_id, description) \
+         VALUES ($1, false, false, $2, 'test role')",
+    )
+    .bind(key)
+    .bind(node)
+    .execute(pool)
+    .await
+    .expect("platform role");
+}
+
+/// Attach `agent` to `role` through the maintenance definer, live from a few
+/// seconds ago.
+async fn attach_to_role(pool: &PgPool, role: &str, agent: Uuid) {
+    let role = role.to_string();
+    viewer_fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let _: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, ())
+    })
+    .await;
+}
+
+/// Grant `role` to `holder`, live from a few seconds ago, open-ended.
+async fn grant_role(pool: &PgPool, role: &str, holder: Uuid) {
+    let _: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role($1, $2, now() - interval '5 seconds', NULL, NULL, \
+                'test grant')",
+    )
+    .bind(role)
+    .bind(holder)
+    .fetch_one(pool)
+    .await
+    .expect("grant role");
+}
+
+/// The body's reason text, whichever key the error renders it under.
+fn reason_of(body: &Value) -> String {
+    body["details"]["reason"]
+        .as_str()
+        .or_else(|| body["reason"].as_str())
+        .or_else(|| body["message"].as_str())
+        .map_or_else(|| body.to_string(), str::to_string)
+}
+
+/// The ROL01 (migration 166) fixture. X is bound to human A and writes A's
+/// group, but X is attached to a role nobody holds, so once armed the
+/// database's per-statement check refuses X's first write on any table the
+/// application role writes. Returns `(state, a, x, hypothesis)`, the
+/// hypothesis public and owned by A's group.
+///
+/// The handlers are called directly with X's resolved viewer, as
+/// `supersede_coded_denials_http.rs` drives its ROL01 pin: the HTTP bearer
+/// layer refuses an operated agent's token before any handler runs, and what
+/// is under test is how the handler maps the database's refusal. The
+/// unstamped pool never ran the check at all (no principal).
+async fn rol01_fixture(pool: &PgPool, label: &str) -> (AppState, Uuid, Uuid, Uuid) {
+    seed_role(pool, ROL01_ROLE).await;
+    let (a, ag) = viewer_fixture::seed_human_operator(pool, &format!("{label}-human-a")).await;
+    let (x, _) = viewer_fixture::seed_agent_with_group(pool, &format!("{label}-agent-x")).await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, x, a)
+            .await
+            .expect("live link");
+    }
+    let hypothesis = public_claim_in(pool, a, ag, &format!("{label} hypothesis")).await;
+    attach_to_role(pool, ROL01_ROLE, x).await;
+    sqlx::query("INSERT INTO operator_binding_arming DEFAULT VALUES")
+        .execute(pool)
+        .await
+        .expect("arm (the harness stands in for the maintenance role)");
+    (app_role_state(pool).await, a, x, hypothesis)
+}
+
+/// ROL01 on the experiment loop: filing an experiment as an agent of an
+/// unheld role is the coded 403 every write surface answers, with nothing
+/// written. Before, the refusal came back as a 500, a server fault the
+/// caller could not act on.
+///
+/// CONTROL: once A holds the role, the same request lands with its edge, so
+/// the refusal was the role's and nothing else (not the hypothesis gate).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_role_attached_agent_without_its_holder_files_no_experiment(pool: PgPool) {
+    let (state, a, x, hypothesis) = rol01_fixture(&pool, "30c84267-rol01-loop").await;
+
+    let viewer = Viewer::resolve(&pool, x).await.expect("resolve");
+    let e = create_as(&state, viewer, x, hypothesis)
+        .await
+        .expect_err("an agent of an unheld role may not file an experiment once armed");
+    let (status, reason) = rendered(e).await;
+    assert_eq!(status, 403, "{reason}");
+    assert!(reason.starts_with("ROL01"), "the code is named: {reason}");
+    assert!(
+        !reason.contains(&x.to_string()),
+        "the database's text (naming the agent) stays in the log: {reason}"
+    );
+    assert_eq!(
+        experiments_on(&pool, hypothesis).await,
+        0,
+        "nothing written"
+    );
+
+    grant_role(&pool, ROL01_ROLE, a).await;
+    let viewer = Viewer::resolve(&pool, x).await.expect("resolve");
+    let created = create_as(&state, viewer, x, hypothesis)
+        .await
+        .unwrap_or_else(|e| panic!("CONTROL: A now holds the role: {e:?}"));
+    let experiment = uuid_at(&created, "experiment_id");
+    assert_eq!(
+        edges(&pool, experiment, hypothesis, "tests_hypothesis").await,
+        1
+    );
+}
+
+/// ROL01 on the method catalog: `POST /api/v1/methods` as an agent of an
+/// unheld role is the coded 403, with no method written.
+///
+/// CONTROL: once A holds the role, the same request lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_role_attached_agent_without_its_holder_adds_no_method(pool: PgPool) {
+    let (state, a, x, _hypothesis) = rol01_fixture(&pool, "30c84267-rol01-method").await;
+    let name = format!("30c84267 rol01 method {}", Uuid::new_v4());
+    let request = || {
+        Json(AddMethodRequest {
+            name: name.clone(),
+            technique_type: "characterization".into(),
+            measures: None,
+            resolution: None,
+            limitations: None,
+            required_equipment: None,
+            conditions: None,
+            capabilities: Some(vec!["lattice_constant".into()]),
+        })
+    };
+
+    let viewer = Viewer::resolve(&pool, x).await.expect("resolve");
+    let e = add_method(
+        ViewerExtractor(viewer),
+        State(state.clone()),
+        bearer(x),
+        request(),
+    )
+    .await
+    .expect_err("an agent of an unheld role may not add a method once armed");
+    let (status, reason) = rendered(e).await;
+    assert_eq!(status, 403, "{reason}");
+    assert!(reason.starts_with("ROL01"), "the code is named: {reason}");
+    assert_eq!(methods_named(&pool, &name).await, 0, "nothing written");
+
+    grant_role(&pool, ROL01_ROLE, a).await;
+    let viewer = Viewer::resolve(&pool, x).await.expect("resolve");
+    let Json(body) = add_method(
+        ViewerExtractor(viewer),
+        State(state.clone()),
+        bearer(x),
+        request(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("CONTROL: A now holds the role: {e:?}"));
+    assert_eq!(body["capabilities_linked"], 1, "CONTROL: {body}");
+    assert_eq!(methods_named(&pool, &name).await, 1, "CONTROL: it landed");
+}
+
+fn bearer(agent: Uuid) -> Option<Extension<AuthContext>> {
+    Some(Extension(AuthContext {
+        client_id: Uuid::new_v4(),
+        agent_id: Some(agent),
+        owner_id: Some(Uuid::new_v4()),
+        client_type: ClientType::Agent,
+        scopes: RW.iter().map(|s| (*s).to_string()).collect(),
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    }))
+}
+
+async fn rendered(e: ApiError) -> (u16, String) {
+    let resp = e.into_response();
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, reason_of(&body))
+}
+
+async fn create_as(
+    state: &AppState,
+    viewer: Viewer,
+    caller: Uuid,
+    hypothesis: Uuid,
+) -> Result<Value, ApiError> {
+    create_experiment(
+        ViewerExtractor(viewer),
+        State(state.clone()),
+        bearer(caller),
+        Json(CreateExperimentRequest {
+            hypothesis_id: hypothesis,
+            agent_id: None,
+            method_ids: None,
+            protocol: Some("30c84267 direct call".into()),
+        }),
+    )
+    .await
+    .map(|Json(v)| v)
 }

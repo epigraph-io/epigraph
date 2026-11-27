@@ -246,11 +246,21 @@ async fn require_experiment_hypothesis(
     Ok(hypothesis_id)
 }
 
-/// Map a failed write on the caller's stamped transaction: the database's
-/// `42501` refusal is `403` naming the hypothesis (nothing commits), anything
-/// else is the `500` naming `what` that the handler answered before.
+/// Map a failed write on the caller's stamped transaction (nothing commits in
+/// any arm):
+///
+/// * a write-authority refusal (the role-holder check, an elevated viewer, the
+///   operator binding) is the coded `403` `From<DbError>` answers, with the
+///   database's text kept in the log. The stamp runs those checks with the
+///   real principal, so they fire here where the unstamped pool never did;
+/// * the database's `42501` row-security refusal is `403` naming the
+///   hypothesis;
+/// * anything else is the `500` naming `what` that the handler answered before.
 #[cfg(feature = "db")]
 fn stamped_write_failed(what: &str, e: epigraph_db::DbError) -> ApiError {
+    if e.is_write_authority_refusal() {
+        return ApiError::from(e);
+    }
     if crate::errors::db_is_insufficient_privilege(&e) {
         return crate::errors::write_refused("hypothesis");
     }
@@ -683,7 +693,7 @@ pub async fn analyze_result(
     }))
     .fetch_one(&mut *tx)
     .await
-    .map_err(|e| ApiError::InternalError { message: format!("Failed to create analysis: {e}") })?;
+    .map_err(|e| stamped_write_failed("Failed to create analysis", epigraph_db::DbError::from(e)))?;
 
     // Create analyzes edge (analysis → result)
     epigraph_db::EdgeRepository::create_signed_conn(

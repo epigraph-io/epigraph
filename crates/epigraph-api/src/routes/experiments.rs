@@ -360,6 +360,23 @@ pub async fn hypothesize(
     Ok(Json(response))
 }
 
+/// Map a failed write on `add_method`'s stamped transaction (nothing commits
+/// in either arm). A write-authority refusal (the role-holder check, an
+/// elevated viewer) is the coded `403` `From<DbError>` answers, with the
+/// database's text kept in the log: the stamp runs those checks with the real
+/// principal, where the unstamped pool never did. Anything else is the `500`
+/// naming `what`. `methods` and `method_capabilities` carry no row security,
+/// so there is no `42501` group refusal to name here.
+#[cfg(feature = "db")]
+fn method_write_failed(what: &str, e: epigraph_db::DbError) -> ApiError {
+    if e.is_write_authority_refusal() {
+        return ApiError::from(e);
+    }
+    ApiError::InternalError {
+        message: format!("{what}: {e}"),
+    }
+}
+
 /// POST /api/v1/methods - Add a characterization/synthesis method.
 ///
 /// Writes the shared method catalog (a method row and its capability links),
@@ -421,9 +438,7 @@ pub async fn add_method(
     let mut tx = state.write_as(&viewer, "add_method").await?;
     let method_id = epigraph_db::MethodRepository::insert(&mut *tx, &method)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to insert method: {e}"),
-        })?;
+        .map_err(|e| method_write_failed("Failed to insert method", e.into()))?;
 
     // Link capabilities. A failed link aborts the transaction, so it is an
     // error for the whole write rather than a link skipped and still counted.
@@ -432,15 +447,13 @@ pub async fn add_method(
         for cap in capabilities {
             epigraph_db::MethodRepository::link_capability(&mut *tx, method_id, cap, 1, 0)
                 .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to link capability: {e}"),
-                })?;
+                .map_err(|e| method_write_failed("Failed to link capability", e.into()))?;
             caps_linked += 1;
         }
     }
-    tx.commit().await.map_err(|e| ApiError::InternalError {
-        message: format!("Failed to commit method: {e}"),
-    })?;
+    tx.commit()
+        .await
+        .map_err(|e| method_write_failed("Failed to commit method", e))?;
 
     Ok(Json(serde_json::json!({
         "method_id": method_id,
