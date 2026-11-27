@@ -30,10 +30,13 @@
 //! independently.
 //!
 //! So `promotable` is a hint an agent may weigh, never a decision: every
-//! surface that shows it labels its basis with [`PROMOTION_BASIS`] (MCP
-//! `find_workflow`, `evaluate_workflow_promotion`, `refresh_workflow_promotion`;
-//! REST `GET /api/v1/workflows` and `GET /api/v1/workflows/:id` via
-//! [`label_promotion_basis`]). Nothing acts on the flag automatically. Any
+//! workflow discovery surface that shows it labels its basis with
+//! [`PROMOTION_BASIS`] (MCP `find_workflow`, `evaluate_workflow_promotion`,
+//! `refresh_workflow_promotion`; REST `GET /api/v1/workflows` and
+//! `GET /api/v1/workflows/:id` via [`label_promotion_basis`]). A generic claim
+//! read that returns a claim's raw `properties` is not a workflow surface and
+//! shows the stored verdict unlabelled. Nothing acts on the flag
+//! automatically. Any
 //! future automatic use of `promotable` (auto-preferring a variant, retiring
 //! a parent) must first add sampled independent review of the outcome reports
 //! at the promotion boundary; a self-reported success rate is not a basis for
