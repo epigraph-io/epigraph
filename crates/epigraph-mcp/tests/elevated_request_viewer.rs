@@ -323,6 +323,7 @@ fn recall_params(query: &str) -> epigraph_mcp::types::RecallParams {
         offset: None,
         epistemic_partition: false,
         diversity_radius: None,
+        route: None,
     }
 }
 

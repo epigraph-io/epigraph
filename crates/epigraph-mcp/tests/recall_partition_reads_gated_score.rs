@@ -191,6 +191,7 @@ fn recall_params(query: &str, min_truth: f64) -> RecallParams {
         offset: None,
         epistemic_partition: true,
         diversity_radius: None,
+        route: None,
     }
 }
 
