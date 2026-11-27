@@ -243,7 +243,7 @@ pub const REGISTRY: &[RefusalCode] = &[
     sqlstate(OPERATOR_SCOPE_REFUSED, Answer::OperatorScopeRefused),
     // Migration 166: a role's agent with no live holder of its own.
     sqlstate(ROLE_HOLDER_REQUIRED, Answer::RoleHolderRequired),
-    // Migration 184 (operator ruling R-103), re-raised by 251 and 274: a
+    // Migration 184, re-raised by 251 and 274: a
     // write to the key of a retracted BBA. Only as 42501.
     RefusalCode {
         code: "RT07",
