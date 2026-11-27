@@ -1360,6 +1360,223 @@ async fn unembedded_members_are_counted_in_every_theme_of_the_map(pool: PgPool) 
     assert_eq!(b["unembedded_members"], 1, "{b:#}");
 }
 
+// ── members with no embedding (backlog 029392cb) ────────────────────────────
+
+/// `n` current claims of `theme` with NO embedding.
+async fn bare(pool: &PgPool, theme: Uuid, filer: Uuid, owner: Uuid, n: u32) -> Vec<Uuid> {
+    let ids = claims(pool, Some(theme), filer, Some(owner), n, 900).await;
+    sqlx::query("UPDATE claims SET embedding = NULL WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(pool)
+        .await
+        .unwrap();
+    ids
+}
+
+/// Every stored leaf of `run` in `h`: leaf id -> (theme, its claims).
+async fn leaves_of(
+    pool: &PgPool,
+    run: Uuid,
+    h: AtlasHierarchy,
+) -> BTreeMap<Uuid, (Uuid, BTreeSet<Uuid>)> {
+    levels(pool, run)
+        .await
+        .into_iter()
+        .filter(|((hh, _), (_, p))| hh == h.as_str() && p["kind"] == "leaf")
+        .map(|((_, id), (t, p))| {
+            let claims = p["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["kind"] == "claim")
+                .map(|n| serde_json::from_value(n["id"].clone()).unwrap())
+                .collect();
+            (id, (t, claims))
+        })
+        .collect()
+}
+
+/// Each claim of `leaves` by the leaf that holds it; a claim in two leaves
+/// fails the test.
+fn leaf_of_claim(leaves: &BTreeMap<Uuid, (Uuid, BTreeSet<Uuid>)>) -> BTreeMap<Uuid, Uuid> {
+    let mut out = BTreeMap::new();
+    for (leaf, (_, claims)) in leaves {
+        for c in claims {
+            assert!(
+                out.insert(*c, *leaf).is_none(),
+                "claim {c} is in two leaves"
+            );
+        }
+    }
+    out
+}
+
+async fn run_params(pool: &PgPool, run: Uuid) -> Value {
+    sqlx::query_scalar("SELECT params FROM atlas_map_runs WHERE id = $1")
+        .bind(run)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The run's record of its "not yet placed" leaves.
+fn unplaced_record(params: &Value) -> BTreeSet<Uuid> {
+    serde_json::from_value(params["unplaced_leaves"].clone())
+        .unwrap_or_else(|e| panic!("no unplaced_leaves record ({e}): {params:#}"))
+}
+
+/// Team A's current themed claims of the corpus plus `more`.
+fn a_members(c: &Corpus, more: &[&[Uuid]]) -> BTreeSet<Uuid> {
+    let mut want: BTreeSet<Uuid> = c.a.iter().chain(&c.b).chain(&c.t2c).copied().collect();
+    want.extend(c.up());
+    for m in more {
+        want.extend(m.iter().copied());
+    }
+    want
+}
+
+/// Asserts where team A's map draws the claims with no embedding: `in_t1`
+/// in its own "not yet placed" leaf of `t1`, apart from the clustered claims,
+/// and `in_t4` (a theme with no embedded member) as `t4`'s one root leaf;
+/// every current themed claim A's map may draw in exactly one leaf of each
+/// hierarchy; the meaning leaf switching to the links one; and the run's
+/// record naming exactly those leaves.
+async fn assert_waiting_leaves(
+    pool: &PgPool,
+    c: &Corpus,
+    t4: Uuid,
+    in_t1: &[Uuid],
+    in_t4: &[Uuid],
+) {
+    let a_map = AtlasMap::Team(c.a_team);
+    let run = latest(pool, a_map).await;
+    for h in [M, L] {
+        let leaves = leaves_of(pool, run, h).await;
+        let at = leaf_of_claim(&leaves);
+        assert_eq!(
+            at.keys().copied().collect::<BTreeSet<Uuid>>(),
+            a_members(c, &[in_t1, in_t4]),
+            "{}: every current themed claim of the map, each once",
+            h.as_str()
+        );
+        let waiting = group_id(a_map, h, c.t1, &set(in_t1));
+        assert_eq!(at[&in_t1[0]], waiting, "{}", h.as_str());
+        assert_eq!(leaves[&waiting], (c.t1, set(in_t1)));
+        assert_eq!(
+            leaves.get(&root_id(a_map, h, t4)),
+            Some(&(t4, set(in_t4))),
+            "{}: t4 is one root leaf",
+            h.as_str()
+        );
+    }
+    let stored = levels(pool, run).await;
+    let waiting_m = group_id(a_map, M, c.t1, &set(in_t1));
+    assert_eq!(
+        stored[&("meaning".to_string(), waiting_m)].1["switch"]["level_id"],
+        serde_json::json!(group_id(a_map, L, c.t1, &set(in_t1)))
+    );
+    assert_eq!(
+        unplaced_record(&run_params(pool, run).await),
+        [
+            waiting_m,
+            group_id(a_map, L, c.t1, &set(in_t1)),
+            root_id(a_map, M, t4),
+            root_id(a_map, L, t4),
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+/// Done when (029392cb): every current themed claim a map may draw is in a
+/// leaf, also one with no embedding. The nightly puts a theme's members with
+/// no embedding in a "not yet placed" leaf apart from its clustered members,
+/// and draws a theme with no embedded member as one such root leaf; another
+/// team's claim and a retired one stay off the map. A second night over
+/// unchanged input writes nothing, and a claim embedded since leaves its
+/// waiting leaf and joins its nearest meaning leaf.
+#[sqlx::test(migrations = "../../migrations")]
+async fn members_with_no_embedding_are_drawn_in_not_yet_placed_leaves(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let t4 = theme(&pool, "nightly t4", 500).await;
+    let in_t1 = bare(&pool, c.t1, c.fa, c.a_team, 1).await;
+    let in_t4 = bare(&pool, t4, c.fa, c.a_team, 2).await;
+    let b_t4 = bare(&pool, t4, c.fa, c.b_team, 1).await;
+    let retired = claims(&pool, Some(c.t1), c.fa, Some(c.a_team), 1, 0).await;
+    sqlx::query("UPDATE claims SET is_current = false, embedding = NULL WHERE id = ANY($1)")
+        .bind(&retired)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let a_map = AtlasMap::Team(c.a_team);
+    let b_map = AtlasMap::Team(c.b_team);
+    let backend = namer();
+
+    let first = night(&pool, &viewer, &backend, &opts()).await;
+    for m in [a_map, b_map] {
+        assert_eq!(map_report(&first, m)["status"], "written", "{first:#}");
+    }
+    assert_waiting_leaves(&pool, &c, t4, &in_t1, &in_t4).await;
+    let b_run = latest(&pool, b_map).await;
+    for h in [M, L] {
+        let leaves = leaves_of(&pool, b_run, h).await;
+        assert_eq!(leaves[&root_id(b_map, h, t4)], (t4, set(&b_t4)));
+        assert!(!leaf_of_claim(&leaves).contains_key(&retired[0]));
+    }
+
+    let second = night(&pool, &viewer, &backend, &opts()).await;
+    assert_eq!(
+        map_report(&second, a_map)["status"],
+        "unchanged",
+        "{second:#}"
+    );
+
+    // Embedded since: placed by meaning, next to its nearest claims (leaf
+    // `a`, around axis 0), not kept in the leaf where it waited.
+    sqlx::query("UPDATE claims SET embedding = $2::vector WHERE id = $1")
+        .bind(in_t1[0])
+        .bind(vector(0, 99))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let third = night(&pool, &viewer, &backend, &opts()).await;
+    assert_eq!(map_report(&third, a_map)["status"], "written", "{third:#}");
+    let run = latest(&pool, a_map).await;
+    let at = leaf_of_claim(&leaves_of(&pool, run, M).await);
+    assert_eq!(
+        at[&in_t1[0]], at[&c.a[0]],
+        "placed next to its nearest claims"
+    );
+    assert_eq!(
+        unplaced_record(&run_params(&pool, run).await),
+        [root_id(a_map, M, t4), root_id(a_map, L, t4)]
+            .into_iter()
+            .collect()
+    );
+}
+
+/// Done when (029392cb): an operator build (W5's apply of both results,
+/// which an export computes over the embedded members only) draws the
+/// members with no embedding as the nightly does, and records their leaves,
+/// so the first night keeps them where they are.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_build_draws_members_with_no_embedding_in_not_yet_placed_leaves(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let t4 = theme(&pool, "nightly t4", 500).await;
+    let in_t1 = bare(&pool, c.t1, c.fa, c.a_team, 1).await;
+    let in_t4 = bare(&pool, t4, c.fa, c.a_team, 2).await;
+    build_all(&pool, &viewer, &c).await;
+    assert_waiting_leaves(&pool, &c, t4, &in_t1, &in_t4).await;
+
+    let summary = night(&pool, &viewer, &namer(), &opts()).await;
+    let r = map_report(&summary, AtlasMap::Team(c.a_team));
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert_waiting_leaves(&pool, &c, t4, &in_t1, &in_t4).await;
+}
+
 // ── cross-group links ───────────────────────────────────────────────────────
 
 /// A stored claim-to-claim edge; returns its id.
