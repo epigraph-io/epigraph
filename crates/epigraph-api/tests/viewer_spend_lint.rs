@@ -548,16 +548,22 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["ConflictDensityRepository::scan"],
     ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
-    // The refuting evidence and its signed `refutes` edge (backlog 2d60f619)
-    // are ONE write on a transaction stamped with the caller's viewer
-    // (`state.write_as(&viewer, ..)`, passed as `&mut *tx`): the evidence and
-    // edge triggers and WITH CHECK decide the write, as for create_edge.
+    // The read, its tenancy (through the viewer, for the writer-only rule on
+    // a private convention, backlog 5b98b7ce), the refuting evidence with its
+    // signed `refutes` edge (backlog 2d60f619) and the labels read are ONE
+    // transaction stamped with the caller's viewer (`state.write_as(&viewer,
+    // ..)`, passed as `&mut *tx`): the evidence and edge triggers and WITH
+    // CHECK decide the write. The truth update joins it on a private
+    // convention, and stays on the raw pool after the commit on a public one.
     (
         "conventions.rs",
         "forget_convention",
         &[
             "AgentRepository::create",
             "AgentRepository::get_by_public_key",
+            // Twice: on the stamped transaction (private), on the raw pool
+            // after the commit (public).
+            "ClaimRepository::update_truth_value",
             "ClaimRepository::update_truth_value",
             "EvidenceRepository::create",
             "sqlx::query_scalar(SELECT).fetch_optional",
