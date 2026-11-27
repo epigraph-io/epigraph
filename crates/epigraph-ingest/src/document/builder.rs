@@ -607,16 +607,20 @@ pub fn build_ingest_plan_scoped(
 /// writing scoped duplicates.
 ///
 /// `scoped` and `global` are [`build_ingest_plan_scoped`] of ONE extraction
-/// with `Some(owner_group)` and `None`; they twin by index. `recorded` is what
-/// the ingest's in-scope `papers` row already asserts: each claim's id and,
-/// when the caller can read the row, its stored `content_hash` (the caller
-/// reads it from that paper's ingest-written `asserts` edges). A claim is
-/// adopted when its global twin's id is recorded, or when its global twin's
-/// stored hash is a recorded claim's hash (an atom the earlier ingest
-/// converged onto an existing row with that text, whose id is not the
-/// content address). An adopted claim is its global twin under the recorded
-/// id, and every edge and path of the plan is re-pointed with it; every other
-/// claim keeps its scoped id.
+/// with `Some(owner_group)` and `None`; they twin by index. `recorded` is
+/// each recorded claim's id and, when the caller can read the row, its
+/// stored `content_hash`, in order of preference (the first entry wins a
+/// hash two entries share). The MCP walk passes what the ingest's in-scope
+/// `papers` row already asserts through ingest-written `asserts` edges,
+/// followed by the owning group's own non-public rows that hold one of the
+/// global plan's ids or stored hashes (an ingest from before migration 246,
+/// whose paper row was backfilled public, recorded nothing on the group's
+/// row). A claim is adopted when its global twin's id is recorded, or when
+/// its global twin's stored hash is a recorded claim's hash (an atom the
+/// earlier ingest converged onto an existing row with that text, whose id is
+/// not the content address). An adopted claim is its global twin under the
+/// recorded id, and every edge and path of the plan is re-pointed with it;
+/// every other claim keeps its scoped id.
 ///
 /// Returns the plan and the set of adopted ids. A write path MUST write an
 /// adopted claim BY ID, like a scoped one, even though it is a global atom
@@ -643,10 +647,14 @@ pub fn adopt_recorded_ids(
         return (scoped, adopted);
     }
     let ids: HashSet<Uuid> = recorded.iter().map(|(id, _)| *id).collect();
-    let by_hash: HashMap<[u8; 32], Uuid> = recorded
-        .iter()
-        .filter_map(|(id, hash)| hash.map(|h| (h, *id)))
-        .collect();
+    // First entry wins: `recorded` is in the caller's order of preference
+    // (what the document's paper recorded, then the oldest own-scope row).
+    let mut by_hash: HashMap<[u8; 32], Uuid> = HashMap::new();
+    for (id, hash) in recorded {
+        if let Some(h) = hash {
+            by_hash.entry(*h).or_insert(*id);
+        }
+    }
     let mut remap: HashMap<Uuid, Uuid> = HashMap::new();
     for (claim, twin) in scoped.claims.iter_mut().zip(&global.claims) {
         let Some(id) = ids

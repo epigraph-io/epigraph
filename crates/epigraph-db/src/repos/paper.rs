@@ -585,6 +585,56 @@ impl PaperRepository {
         Ok(rows)
     }
 
+    /// The claims the group `owner_group_id` itself owns, NON-PUBLIC, that
+    /// hold one of `ids` or one of the stored hashes `hashes`, oldest first,
+    /// each with its stored `content_hash`.
+    ///
+    /// For the document ingest walk, which asks it on its own author-stamped
+    /// transaction with the GLOBAL plan's ids and stored hashes of the document
+    /// it is about to write in `owner_group_id`'s non-public scope (backlog
+    /// 8f56a641): the rows that group's earlier ingest of the same text wrote
+    /// under global ids, before ids were scope-derived, so the re-ingest
+    /// converges on them instead of writing scoped duplicates. It covers what
+    /// [`Self::asserted_claims_conn`] cannot: an ingest from before migration
+    /// 246, whose `papers` row was backfilled PUBLIC, so the group's own
+    /// in-scope paper row is new and asserts nothing.
+    ///
+    /// The scope is the SQL itself, not only row security (the operator CLI's
+    /// maintenance pool bypasses it): `owner_group_id = $1` keeps every other
+    /// group's row out, and `visibility <> 'public'` keeps out the group's own
+    /// PUBLIC rows (a public ingest's claims are owned by its author's group
+    /// too, and a later non-public ingest must not fold into them). Oldest
+    /// first, so a hash two rows share resolves to the same row every time.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, ids, hashes))]
+    pub async fn own_group_legacy_claims_conn(
+        conn: &mut sqlx::PgConnection,
+        owner_group_id: Uuid,
+        ids: &[Uuid],
+        hashes: &[Vec<u8>],
+    ) -> Result<Vec<AssertedClaim>, DbError> {
+        if ids.is_empty() && hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Runtime-checked, not `query!`: see `get_or_create`.
+        let rows: Vec<AssertedClaim> = sqlx::query_as(
+            "SELECT c.id, c.content_hash \
+               FROM claims c \
+              WHERE c.owner_group_id = $1 \
+                AND c.visibility::text <> 'public' \
+                AND (c.id = ANY($2) OR c.content_hash = ANY($3)) \
+              ORDER BY c.created_at, c.id",
+        )
+        .bind(owner_group_id)
+        .bind(ids)
+        .bind(hashes)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(rows)
+    }
+
     /// Returns true if the paper has any outgoing `processed_by` edge whose
     /// `properties.pipeline` matches `pipeline_version`. Used as the
     /// re-ingestion version gate by hierarchical ingestion.

@@ -918,6 +918,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          scope, and it is used only to re-use those ids, never returned to a caller.",
     ),
     (
+        "paper.rs",
+        "own_group_legacy_claims_conn",
+        "READ of the ids and stored content_hash of the claims ONE group owns, non-public, \
+         that hold one of the document ingest's global plan ids or stored hashes, on that \
+         ingest's own author-stamped transaction, for the group the ingest writes into \
+         (backlog 8f56a641: a pre-246 ingest of the same document by that group). The scope is \
+         in the SQL (`owner_group_id = $1 AND visibility <> 'public'`), not only row security, \
+         so the operator CLI's RLS-bypassing pool reads no other group's row either; used only \
+         to re-use the group's own ids, never returned to a caller.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \

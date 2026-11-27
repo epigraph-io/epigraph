@@ -1221,7 +1221,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `do_ingest_document_reporting` (a thin wrapper now, with no SQL of its own). stamped:
     // `ingest_plan_for_scope` (backlog 8f56a641) reads `PaperRepository::asserted_claims_conn`
     // on the same stamped transaction, for the paper row the walk got or created in its own
-    // declared scope: the ids that scope's earlier ingest of the document recorded.
+    // declared scope: the ids that scope's earlier ingest of the document recorded; then
+    // `PaperRepository::own_group_legacy_claims_conn`, the owning group's own non-public rows
+    // under the global plan's ids or hashes (scoped in its SQL), for a pre-246 ingest.
     (
         "ingestion.rs",
         "ingest_document_walk_reporting",

@@ -16,7 +16,12 @@
 //!   claims are unchanged.
 //! * A tenant re-ingesting a document it ingested under GLOBAL ids (before
 //!   ids were scope-derived) writes no new claim: the walk re-uses the ids its
-//!   paper recorded.
+//!   paper recorded, and, for an ingest from before migration 246 whose paper
+//!   row that migration made public, the group's own non-public rows under
+//!   the document's global ids (full walk and spine walk).
+//! * That second read never reaches outside the ingest's own non-public
+//!   scope: not a team the author belongs to, not the author's own public
+//!   rows.
 //!
 //! Both server pools are `epigraph_app` (row security enforced); the harness
 //! superuser seeds agents, seeds the pre-change state, and reads rows back.
@@ -69,14 +74,15 @@ fn caller_token(agent: Uuid) -> AuthContext {
 
 /// One document, byte for byte, for every tenant: same title, same key, same
 /// text. No authors: author agents are shared identity rows, not the question.
+/// The text names the key, so two keys in one test are two documents.
 fn extraction(doi: &str) -> DocumentExtraction {
     serde_json::from_value(serde_json::json!({
         "source": {"title": "Shared Title Paper", "doi": doi, "source_type": "Paper", "authors": []},
-        "thesis": "Scoped ingest thesis",
+        "thesis": format!("Scoped ingest thesis ({doi})"),
         "thesis_derivation": "TopDown",
-        "sections": [{"title": "Results", "paragraphs": [{
-            "text": "Scoped ingest paragraph.",
-            "atoms": ["Scoped ingest atom one.", "Scoped ingest atom two."],
+        "sections": [{"title": format!("Results ({doi})"), "paragraphs": [{
+            "text": format!("Scoped ingest paragraph ({doi})."),
+            "atoms": [format!("Scoped ingest atom one ({doi})."), format!("Scoped ingest atom two ({doi}).")],
             "generality": [1, 2], "confidence": 0.8
         }]}],
         "relationships": []
@@ -288,6 +294,24 @@ async fn two_tenants_private_ingests_of_one_document_are_two_sets_of_claims(pool
 /// by the tenant's group, asserted by its in-scope paper through ingest-written
 /// edges, as the walk wrote them before ids were scope-derived.
 async fn seed_pre_change_ingest(pool: &PgPool, agent: Uuid, group: Uuid, doi: &str) -> Vec<Uuid> {
+    seed_global_ingest(pool, agent, group, doi, TenancyDecl::group(group)).await
+}
+
+/// The state a group's ingest from before migration 246 is in now: its
+/// claims under the GLOBAL plan's ids, owned by `group`, asserted by a paper
+/// row 246's backfill made PUBLIC (owned by the all-zero world group). The
+/// group has no in-scope paper row of its own.
+async fn seed_pre_246_ingest(pool: &PgPool, agent: Uuid, group: Uuid, doi: &str) -> Vec<Uuid> {
+    seed_global_ingest(pool, agent, group, doi, TenancyDecl::public(Uuid::nil())).await
+}
+
+async fn seed_global_ingest(
+    pool: &PgPool,
+    agent: Uuid,
+    group: Uuid,
+    doi: &str,
+    paper_decl: TenancyDecl,
+) -> Vec<Uuid> {
     let decl = TenancyDecl::group(group);
     let mut conn = pool.acquire().await.expect("conn");
     let paper = epigraph_db::PaperRepository::get_or_create_stored(
@@ -295,7 +319,7 @@ async fn seed_pre_change_ingest(pool: &PgPool, agent: Uuid, group: Uuid, doi: &s
         doi,
         Some("Shared Title Paper"),
         None,
-        decl,
+        paper_decl,
         None,
     )
     .await
@@ -365,6 +389,150 @@ async fn a_reingest_of_a_document_ingested_under_global_ids_writes_no_new_claim(
     assert_eq!(scoped, 0, "no scope-derived duplicate: {r}");
     assert_eq!(r["claims_ingested"], 0, "{r}");
     assert_eq!(r["already_ingested"], true, "{r}");
+}
+
+async fn scoped_count(pool: &PgPool, agent: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE agent_id = $1 AND properties ? 'id_scope'",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("count")
+}
+
+/// The pre-246 shape: the group's claims are asserted only through a paper
+/// row 246 made public, so the group's own paper row is new and records
+/// nothing. MEASURED before the own-group read: 5 claims before, 10 after
+/// (`claims_ingested 5`); the global-id walk converged (`claims_skipped_dedup
+/// 5`, `already_ingested true`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reingest_of_a_pre_246_ingest_whose_paper_is_public_writes_no_new_claim(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (a, group_a) = fixture::seed_agent_with_group(&pool, "scoped-pre246").await;
+    let doi = "10.9999/scoped-ids-pre246";
+    let mut global = seed_pre_246_ingest(&pool, a, group_a, doi).await;
+    global.sort();
+    global.dedup();
+    assert_eq!(claim_ids_of(&pool, a).await, global, "fixture");
+
+    let r = ingest(&pool, &server, a, doi, VisibilityChoice::Private).await;
+
+    assert_eq!(
+        claim_ids_of(&pool, a).await,
+        global,
+        "the re-ingest wrote claims beside the group's own pre-246 rows: {r}"
+    );
+    assert_eq!(scoped_count(&pool, a).await, 0, "{r}");
+    assert_eq!(r["claims_ingested"], 0, "{r}");
+    assert_eq!(r["claims_skipped_dedup"], 5, "{r}");
+    assert_eq!(r["already_ingested"], true, "{r}");
+}
+
+/// The spine walk re-uses the same pre-246 rows: no structural node is
+/// written again under a scoped id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_spine_of_a_pre_246_ingest_writes_no_new_node(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (a, group_a) = fixture::seed_agent_with_group(&pool, "scoped-pre246-spine").await;
+    let doi = "10.9999/scoped-ids-pre246-spine";
+    let mut global = seed_pre_246_ingest(&pool, a, group_a, doi).await;
+    global.sort();
+    global.dedup();
+
+    let r = spine(&pool, &server, a, doi).await;
+
+    assert_eq!(
+        claim_ids_of(&pool, a).await,
+        global,
+        "the spine wrote structural nodes beside the group's own pre-246 rows: {r}"
+    );
+    assert_eq!(scoped_count(&pool, a).await, 0, "{r}");
+    assert_eq!(r["paragraphs_new"], 0, "{r}");
+}
+
+/// The own-group read is scoped in its SQL, not by what row security lets the
+/// author see. (1) A team's pre-246 rows, readable by a member: that member's
+/// PRIVATE ingest of the document writes its own scoped claims and leaves the
+/// team's alone. (2) The author's own PUBLIC ingest (owned by its personal
+/// group too): its later private ingest of the document writes its own
+/// non-public claims rather than folding into the public rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_own_group_read_stays_inside_the_ingests_non_public_scope(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (h, personal) = fixture::seed_human_operator(&pool, "scoped-own-scope").await;
+    let team = fixture::verb_team_group(&pool, "scoped-own-scope-team", h).await;
+
+    // (1) a team's pre-246 rows, which h can read.
+    let doi_team = "10.9999/scoped-ids-team-legacy";
+    let team_rows =
+        seed_global_ingest(&pool, h, team, doi_team, TenancyDecl::public(Uuid::nil())).await;
+    let vh = Viewer::resolve(&pool, h).await.expect("viewer h");
+    assert!(
+        reads(&server, &vh, team_rows[0]).await,
+        "control: the team member cannot read the team's row, so the case proves nothing"
+    );
+    let owned_by = |g: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM claims WHERE owner_group_id = $1 ORDER BY id",
+            )
+            .bind(g)
+            .fetch_all(&pool)
+            .await
+            .expect("owned")
+        }
+    };
+    let team_before = owned_by(team).await;
+    let r1 = ingest(&pool, &server, h, doi_team, VisibilityChoice::Private).await;
+    assert_eq!(
+        r1["claims_ingested"], 5,
+        "the private ingest folded into the team's rows: {r1}"
+    );
+    assert_eq!(owned_by(team).await, team_before, "{r1}");
+    let private_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE owner_group_id = $1 \
+            AND visibility::text <> 'public' AND properties ? 'id_scope'",
+    )
+    .bind(personal)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(private_rows, 5, "{r1}");
+
+    // (2) the author's own public ingest, then a private one.
+    let doi_pub = "10.9999/scoped-ids-own-public";
+    let rp = ingest(&pool, &server, h, doi_pub, VisibilityChoice::Public).await;
+    assert_eq!(rp["claims_ingested"], 5, "{rp}");
+    let public_owner: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT owner_group_id FROM claims \
+          WHERE visibility::text = 'public' AND agent_id = $1",
+    )
+    .bind(h)
+    .fetch_all(&pool)
+    .await
+    .expect("public owner");
+    assert_eq!(
+        public_owner,
+        vec![personal],
+        "control: the public ingest's rows are not owned by the author's group, so the case \
+         proves nothing"
+    );
+    let r2 = ingest(&pool, &server, h, doi_pub, VisibilityChoice::Private).await;
+    assert_eq!(
+        r2["claims_ingested"], 5,
+        "the private ingest folded into the author's public rows: {r2}"
+    );
+    let private_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE owner_group_id = $1 \
+            AND visibility::text <> 'public' AND properties ? 'id_scope'",
+    )
+    .bind(personal)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(private_rows, 10, "{r2}");
 }
 
 async fn spine(

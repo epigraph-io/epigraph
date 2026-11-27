@@ -246,3 +246,32 @@ fn nothing_recorded_keeps_every_scoped_id() {
     assert!(adopted.is_empty());
     assert_eq!(rows(&merged), before);
 }
+
+/// Two recorded rows sharing an atom's stored hash: the FIRST one listed is
+/// adopted (the caller lists the paper's records first, then the oldest
+/// own-group row), so the choice is deterministic and prefers the document's
+/// own record.
+#[test]
+fn the_first_recorded_row_wins_a_shared_hash() {
+    let ex = extraction();
+    let global = build_ingest_plan(&ex);
+    let scoped = build_ingest_plan_scoped(&ex, Some(group()));
+    let atom = global.claims.iter().find(|c| c.level == 3).expect("atom");
+    let first = Uuid::from_u128(1);
+    let second = Uuid::from_u128(2);
+    let (merged, adopted) = adopt_recorded_ids(
+        scoped,
+        &global,
+        &[
+            (first, Some(atom.content_hash)),
+            (second, Some(atom.content_hash)),
+        ],
+    );
+    assert!(adopted.contains(&first), "{adopted:?}");
+    assert!(!adopted.contains(&second), "{adopted:?}");
+    assert!(merged
+        .claims
+        .iter()
+        .filter(|c| c.content == atom.content)
+        .all(|c| c.id == first));
+}

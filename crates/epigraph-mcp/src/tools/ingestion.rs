@@ -2452,9 +2452,17 @@ fn writes_by_id(planned: &PlannedClaim, adopted: &HashSet<Uuid>) -> bool {
 /// onto, or report, the other's rows. Re-ingesting a document this scope
 /// already ingested under GLOBAL ids (before ids were scope-derived) keeps
 /// those ids, claim by claim: [`adopt_recorded_ids`] over what the in-scope
-/// paper already asserts ([`PaperRepository::asserted_claims_conn`], read on
-/// `conn`, so row security decides what is seen). Returns the plan and the
-/// adopted ids, which the walk writes by id ([`writes_by_id`]).
+/// paper already asserts ([`PaperRepository::asserted_claims_conn`]) and
+/// then over the owning group's own non-public rows holding one of the global
+/// plan's ids or stored hashes
+/// ([`PaperRepository::own_group_legacy_claims_conn`], the pre-246 case whose
+/// paper row was backfilled public). Both are read on `conn`; the second is
+/// scoped to the group in its SQL, so nothing outside the ingest's own scope
+/// is looked up by its text. A row the earlier ingest resolved to OUTSIDE the
+/// group (a public row, another group's) and that this scope's paper did not
+/// record is not adopted: that node gets the group's own scoped claim.
+/// Returns the plan and the adopted ids, which the walk writes by id
+/// ([`writes_by_id`]).
 ///
 /// Not a short-circuit on the paper's `processed_by` stamp: chunked ingests
 /// and an abstract-then-full-text re-ingest of one document key rely on
@@ -2481,21 +2489,40 @@ async fn ingest_plan_for_scope(
         return Ok((build_ingest_plan(extraction), HashSet::new()));
     };
     let scoped = build_ingest_plan_scoped(extraction, Some(group));
-    let recorded: Vec<(Uuid, Option<[u8; 32]>)> =
-        PaperRepository::asserted_claims_conn(&mut *conn, paper_id)
-            .await
-            .map_err(internal_error)?
-            .into_iter()
-            .map(|(id, hash)| (id, hash.and_then(|h| <[u8; 32]>::try_from(h).ok())))
-            .collect();
+    let global = build_ingest_plan(extraction);
+    // What this scope's own paper row recorded first, then the group's own
+    // non-public rows under the global plan's ids or stored hashes: an ingest
+    // from before migration 246 left its claims asserted by a paper row the
+    // migration made public, so the group's in-scope row is new and records
+    // nothing (measured: without the second read, its re-ingest wrote every
+    // node again under a scoped id).
+    let mut recorded_raw = PaperRepository::asserted_claims_conn(&mut *conn, paper_id)
+        .await
+        .map_err(internal_error)?;
+    let global_ids: Vec<Uuid> = global.claims.iter().map(|c| c.id).collect();
+    let global_hashes: Vec<Vec<u8>> = global
+        .claims
+        .iter()
+        .map(|c| c.content_hash.to_vec())
+        .collect();
+    recorded_raw.extend(
+        PaperRepository::own_group_legacy_claims_conn(
+            &mut *conn,
+            group,
+            &global_ids,
+            &global_hashes,
+        )
+        .await
+        .map_err(internal_error)?,
+    );
+    let recorded: Vec<(Uuid, Option<[u8; 32]>)> = recorded_raw
+        .into_iter()
+        .map(|(id, hash)| (id, hash.and_then(|h| <[u8; 32]>::try_from(h).ok())))
+        .collect();
     if recorded.is_empty() {
         return Ok((scoped, HashSet::new()));
     }
-    Ok(adopt_recorded_ids(
-        scoped,
-        &build_ingest_plan(extraction),
-        &recorded,
-    ))
+    Ok(adopt_recorded_ids(scoped, &global, &recorded))
 }
 
 /// Persist one planned claim, routing on the identity class the PLANNER chose.
@@ -2535,7 +2562,8 @@ async fn ingest_plan_for_scope(
 /// first branch, by id. The content-hash branch looks the text up across
 /// every scope and would converge onto (and report) another tenant's row.
 /// So does an id [`adopt_recorded_ids`] re-used from this scope's earlier
-/// ingest of the document: only that recorded row may be resolved to.
+/// ingest (what its paper recorded, or the group's own non-public row): only
+/// that row may be resolved to.
 #[allow(clippy::too_many_arguments)]
 async fn persist_planned_claim(
     conn: &mut sqlx::PgConnection,
