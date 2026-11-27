@@ -15,16 +15,21 @@
 //!   mint first);
 //! * CONTROL: before the allowance the filer is unbound: its packet is refused
 //!   `OPL01` with nothing written, and the team verb will not add it to G
-//!   (`GRP04`);
-//! * after it, `POST /api/v1/submit/packet` (a claim with one evidence row)
-//!   with `group_id = G` lands in G, authored by the filer's agent, and
+//!   (`GRP04`, no row written);
+//! * after it, the team verb still refuses a team H does not write (`GRP03`);
+//! * `POST /api/v1/submit/packet` (a claim with one evidence row) with
+//!   `group_id = G` lands in G, authored by the filer's agent, and
 //!   `GET /api/v1/claims/:id` names that agent and H in `authored_by`;
+//! * `POST /api/v1/evidence` (outside a packet) on that G claim is written:
+//!   the writer membership of G admits it;
 //! * a team the filer is a writer of but H does not write is refused `OPL02`,
 //!   and H's personal group is refused 403 (a personal group is never a team);
 //! * the token exchanges for the `episcience` audience, for the same
 //!   principal and scopes, and the exchanged token is refused on the kernel;
 //! * revoking the allowance unbinds the filer at once (`OPL01`), with the same
-//!   token and the membership still in place.
+//!   token and the membership still in place; its next evidence write on the
+//!   G claim is refused too, as a missing claim (404), because a verb-made
+//!   team's membership stops counting once the agent has no live human (236).
 //!
 //! PINNED AS OBSERVED, not defended: a team H writes that the filer is NOT a
 //! member of (G2) ADMITS the filer's claim. Migration 206's
@@ -33,13 +38,17 @@
 //! H for an allowlisted agent (149), so the packet route stamps G2 into the
 //! write. The writer membership of G therefore does NOT confine the filer's
 //! CLAIMS: 149 scopes them to "groups its operator writes". It bounds the
-//! non-claim writes the binding does not gate (149's door gap). Whether D-V3
-//! should exclude allowlisted agents is an open operator question; if it is
-//! narrowed, the G2 arm flips to a refusal and this pin must change with it.
+//! non-claim writes the binding does not gate (149's door gap): evidence
+//! outside a packet on the G2 claim is refused 403, so a claim filed into G2
+//! is stranded for later evidence. Whether D-V3 should exclude allowlisted
+//! agents is an open operator question; if it is narrowed, the G2 arm flips
+//! to a refusal and this pin must change with it.
 //!
 //! Verified to fail: without the allowance the team verb refuses S (`GRP04`);
-//! with `authored_by`'s filer human dropped (`authored_by.rs`), the read-back
-//! names no human.
+//! with 235's `GRP04` refusal disabled, the unbound control fails (the verb
+//! adds S); with `authored_by`'s filer human dropped (`authored_by.rs`), the
+//! read-back names no human; without S's writer row in G, the G packet is
+//! still admitted (D-V3) but the evidence write on the G claim is refused.
 
 mod viewer_fixture;
 
@@ -193,6 +202,89 @@ async fn assert_refused(
     );
 }
 
+/// `POST /api/v1/evidence` with `bearer`: one fresh observation by `author`
+/// on `claim`, outside any packet: `(status, body, raw_content)`.
+async fn attach(
+    state: &AppState,
+    bearer: &str,
+    author: Uuid,
+    claim: Uuid,
+    label: &str,
+) -> (StatusCode, Value, String) {
+    let raw = format!("attached evidence: {label} {}", Uuid::new_v4());
+    let (status, body) = send(
+        state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/evidence")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::from(
+                json!({
+                    "agent_id": author,
+                    "claim_id": claim,
+                    "raw_content": raw,
+                    "evidence_type": {
+                        "type": "observation",
+                        "observed_at": chrono::Utc::now(),
+                        "method": "instrument run",
+                        "location": null
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("request"),
+    )
+    .await;
+    (status, body, raw)
+}
+
+/// The claim of every evidence row whose body is `raw`, read on the harness
+/// (superuser) pool.
+async fn evidence_with_body(pool: &PgPool, raw: &str) -> Vec<Uuid> {
+    sqlx::query_scalar("SELECT claim_id FROM evidence WHERE content_hash = $1")
+        .bind(blake3::hash(raw.as_bytes()).as_bytes().as_slice())
+        .fetch_all(pool)
+        .await
+        .expect("read back evidence")
+}
+
+/// An evidence write refused with `want` that leaves nothing written.
+async fn assert_attach_refused(
+    pool: &PgPool,
+    (status, body, raw): (StatusCode, Value, String),
+    want: StatusCode,
+    arm: &str,
+) {
+    assert_eq!(status, want, "{arm}: {body}");
+    assert!(
+        evidence_with_body(pool, &raw).await.is_empty(),
+        "{arm}: nothing written"
+    );
+}
+
+/// The SQLSTATE of the team verb's refusal to add `agent` to `group` as a
+/// writer, run on the maintenance role; `None` if it added the row.
+async fn verb_add_refusal(pool: &PgPool, group: Uuid, agent: Uuid) -> Option<String> {
+    as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query("SELECT * FROM public.epigraph_team_group_add_member($1, $2, $3, $4)")
+            .bind(group)
+            .bind(agent)
+            .bind("writer")
+            .bind("service filer control")
+            .fetch_all(&mut *conn)
+            .await;
+        let code = r.err().map(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|| format!("not a database error: {e}"))
+        });
+        (conn, code)
+    })
+    .await
+}
+
 /// One row's first column of `sql`, run with `binds` on a session downgraded
 /// to `epigraph_maintenance` (the operator CLI's role).
 async fn maintenance<T>(pool: &PgPool, sql: &'static str, binds: &[Uuid]) -> T
@@ -303,6 +395,16 @@ async fn an_allowlisted_service_filer_writes_its_team_over_rest_as_its_own_agent
         "unbound",
     )
     .await;
+    // CONTROL: nor will the team verb add it to G: it belongs to no human.
+    assert_eq!(
+        verb_add_refusal(&pool, g, s).await.as_deref(),
+        Some("GRP04"),
+        "the team verb refuses an unbound agent"
+    );
+    assert!(
+        !viewer_fixture::has_unrevoked_row(&pool, g, s).await,
+        "GRP04: nothing written"
+    );
 
     // The allowance, on the maintenance role (`epigraph-operator
     // allow-author-binding-client`'s definer).
@@ -314,6 +416,13 @@ async fn an_allowlisted_service_filer_writes_its_team_over_rest_as_its_own_agent
     )
     .await;
     assert_eq!(binding, "client_allowlist", "the allowance binds S");
+    // The verb still refuses a team H does not write (GRP03 is checked before
+    // the "already a member" refusal, so S's direct G3 row does not mask it).
+    assert_eq!(
+        verb_add_refusal(&pool, g3, s).await.as_deref(),
+        Some("GRP03"),
+        "the team verb refuses a team the operator does not write"
+    );
     // Only now may the team verb add S to G: it needs S's live human, and
     // that H writes G.
     viewer_fixture::verb_team_group_add(&pool, g, s, "writer").await;
@@ -351,6 +460,11 @@ async fn an_allowlisted_service_filer_writes_its_team_over_rest_as_its_own_agent
     assert_eq!(authored["agent"]["id"], json!(s), "{authored}");
     assert_eq!(authored["human"]["id"], json!(h), "{authored}");
 
+    // Evidence outside a packet, on the G claim: the membership admits it.
+    let (status, body, raw) = attach(&state, &bearer, s, claim, "on the G claim").await;
+    assert_eq!(status, StatusCode::CREATED, "evidence on G: {body}");
+    assert_eq!(evidence_with_body(&pool, &raw).await, vec![claim]);
+
     // Outside what H writes: refused by the binding, nothing written.
     assert_refused(
         &pool,
@@ -379,6 +493,17 @@ async fn an_allowlisted_service_filer_writes_its_team_over_rest_as_its_own_agent
     let (status, body, content) = file(&state, &bearer, s, g2, "H's other team").await;
     assert_eq!(status, StatusCode::CREATED, "G2: {body}");
     assert_eq!(claims_with_content(&pool, &content).await, vec![(s, g2)]);
+    // ...but evidence outside a packet on that G2 claim is refused: for
+    // non-claim writes the membership, which S lacks in G2, is the limit. A
+    // claim filed into G2 is stranded for later evidence and edges.
+    let g2_claim: Uuid = serde_json::from_value(body["claim_id"].clone()).expect("claim_id");
+    assert_attach_refused(
+        &pool,
+        attach(&state, &bearer, s, g2_claim, "on the G2 claim").await,
+        StatusCode::FORBIDDEN,
+        "evidence on G2",
+    )
+    .await;
 
     // The token exchange for the extension: same principal, same scopes, at
     // most five minutes, and refused on the kernel.
@@ -444,6 +569,16 @@ async fn an_allowlisted_service_filer_writes_its_team_over_rest_as_its_own_agent
         StatusCode::FORBIDDEN,
         "OPL01",
         "revoked",
+    )
+    .await;
+    // Evidence outside a packet is not gated by the binding; it fails because
+    // the G membership (a verb-made team) stops counting once S has no live
+    // human (236), so the G claim reads as missing to S.
+    assert_attach_refused(
+        &pool,
+        attach(&state, &bearer, s, claim, "after the revoke").await,
+        StatusCode::NOT_FOUND,
+        "evidence after the revoke",
     )
     .await;
 }
