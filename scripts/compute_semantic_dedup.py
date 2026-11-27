@@ -50,7 +50,6 @@ import psycopg2.extras
 from maintenance_dsn import maintenance_dsn
 
 
-
 class UnionFind:
     """Path-compression union-find keyed on UUID strings."""
 
