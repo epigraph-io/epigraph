@@ -106,3 +106,56 @@ fn the_definition_scan_tells_the_two_helpers_apart() {
     );
     assert!(definitions("begin_author_stamped_tx(server, a, \"t\")").is_empty());
 }
+
+/// `Ctx::seed_agent_id_for_tests` sets the process's own agent, which every
+/// stdio write authors as, so its `test-support` feature must never reach a
+/// normal build: a crate may enable it only under `[dev-dependencies]`.
+/// (`epigraph-db` keeps its viewer fixture `#[cfg(test)]` for the same reason:
+/// a feature switched on in a dependent's build graph reaches production.)
+///
+/// Verified by planting `epigraph-service = { workspace = true, features =
+/// ["test-support"] }` in a `[dependencies]` table: it fails.
+#[test]
+fn the_test_support_feature_is_enabled_by_dev_dependencies_only() {
+    let workspace = crates_root().join("..");
+    let mut manifests = vec![workspace.join("Cargo.toml")];
+    for group in ["crates", "tests"] {
+        let Ok(entries) = std::fs::read_dir(workspace.join(group)) else {
+            continue;
+        };
+        for entry in entries {
+            let manifest = entry.expect("entry").path().join("Cargo.toml");
+            if manifest.is_file() {
+                manifests.push(manifest);
+            }
+        }
+    }
+    assert!(manifests.len() > 15, "saw {} manifests", manifests.len());
+    let mut offenders = Vec::new();
+    for manifest in &manifests {
+        let text = std::fs::read_to_string(manifest).expect("read manifest");
+        let mut section = String::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                section = trimmed.to_string();
+                continue;
+            }
+            let code = trimmed.split('#').next().unwrap_or("");
+            // An inline dependency entry or a `[features]` entry that names
+            // both the crate and the feature. (A `[dependencies.epigraph-service]`
+            // table with `features` on its own line is not read; none exists.)
+            if code.contains("epigraph-service")
+                && code.contains("test-support")
+                && !section.ends_with("dev-dependencies]")
+            {
+                offenders.push(format!("{} {section}: {trimmed}", manifest.display()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "epigraph-service's test-support is enabled outside [dev-dependencies]:\n{}",
+        offenders.join("\n")
+    );
+}

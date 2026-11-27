@@ -401,6 +401,80 @@ fn only_begin_claim_act_borrows_the_server_stamp() {
     );
 }
 
+/// Scans 1 and 7 across the WORKSPACE (backlog 30133ca8). Moving the
+/// resolvers to `epigraph_service::Ctx` made them `pub` there, and
+/// `EpiGraphMcpFull` derefs to its `Ctx`, so a crate that is neither this one
+/// nor the service crate could now borrow the server agent's stamp
+/// (`admin_borrowed_server_identity`) or resolve the server agent itself
+/// (`Ctx::agent_id`), where before both were `pub(crate)` here. Scans 1 and 7
+/// read only this crate's and the service crate's sources, so this one reads
+/// every other `crates/*/src` and `tests/*/src` and allows none: a front end
+/// that needs either is a new borrower or a new author resolution, and needs
+/// its own review and its own row in scans 1 / 7.
+///
+/// Verified load-bearing by planting: a call to
+/// `admin_borrowed_server_identity(` in an `epigraph-cli` source file fails it.
+#[test]
+fn no_other_crate_borrows_the_stamp_or_resolves_the_server_agent() {
+    const NEEDLES: &[&str] = &[
+        "admin_borrowed_server_identity(",
+        "Ctx::agent_id(",
+        "ctx().agent_id()",
+        "ctx.agent_id()",
+        ".server_agent_id()",
+    ];
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut roots = Vec::new();
+    for group in ["crates", "tests"] {
+        let Ok(entries) = std::fs::read_dir(workspace.join(group)) else {
+            continue;
+        };
+        for entry in entries {
+            let dir = entry.expect("entry").path();
+            let name = dir.file_name().unwrap().to_string_lossy().to_string();
+            if name == "epigraph-mcp" || name == "epigraph-service" {
+                continue;
+            }
+            if dir.join("src").is_dir() {
+                roots.push(dir.join("src"));
+            }
+        }
+    }
+    assert!(
+        roots.len() >= 15,
+        "the scan must see the workspace's crates; saw {}",
+        roots.len()
+    );
+    let mut offenders = Vec::new();
+    let mut scanned = 0usize;
+    while let Some(dir) = roots.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                roots.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            scanned += 1;
+            let text = strip_line_comments(&std::fs::read_to_string(&path).expect("read"));
+            for (i, line) in text.lines().enumerate() {
+                if NEEDLES.iter().any(|n| line.contains(n)) {
+                    offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(scanned > 300, "the scan saw only {scanned} files");
+    assert!(
+        offenders.is_empty(),
+        "a crate other than epigraph-mcp / epigraph-service borrows the server agent's stamp or \
+         resolves the server agent through its Ctx; that needs its own review (scans 1 and 7):\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// `#[tool]` bodies that run a WRITE (they call `reject_if_read_only`) and do
 /// NOT forward the request's `auth`, each with the reason. A new write tool
 /// that forgets `auth` is invisible to scan 2, which only sees a literal
