@@ -86,16 +86,28 @@ pub struct CacheWriteNotes {
     /// The prior the clamp bounded BetP by (the cached `pignistic_prob`, or
     /// the claim's `truth_value` when it had no cache), when it fired.
     pub clamp_prior: Option<Prob>,
-    /// The frame the claim's cache recorded (`claims.belief_frame_id`) before
-    /// this call, when the cache was written and that frame is not the one
-    /// this call wrote: the cache was RE-POINTED from it to `binary_truth`.
-    pub repointed_from: Option<Uuid>,
+    /// Set when the cache was written and the frame it recorded
+    /// (`claims.belief_frame_id`) before this call is not the one this call
+    /// wrote: the cache was RE-POINTED from it to `binary_truth`.
+    pub repointed_from: Option<RepointedFrom>,
     /// The frame the cache-owner rule elects after this call, when the cache
     /// was written and the rule does NOT elect the frame this call wrote:
     /// `Some(None)` when the claim has no owner (a compound, or template-only
     /// input). The next owner recompute refolds the cache there (or, with no
     /// owner, never from these BBAs), so the written value will not stand.
     pub owner_elsewhere: Option<Option<Uuid>>,
+}
+
+/// The frame a re-pointed cache was carried on before this call, as far as
+/// the caller may be told (frames are tenanted, so a response names only a
+/// frame the caller can see).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepointedFrom {
+    /// A frame the caller can see: its id.
+    Frame(Uuid),
+    /// A frame the caller cannot see (or whose visibility read failed): the
+    /// re-point is still reported, without the id.
+    Hidden,
 }
 
 /// Entry for batch DS wiring (used by `do_ingest_document`).
@@ -461,6 +473,37 @@ async fn frame_profile_overrides(
                 .await
                 .map_err(|e| format!("{what}: could not roll back to the savepoint: {e}"))?;
             Ok(None)
+        }
+    }
+}
+
+/// Whether `viewer` can see frame `frame_id`, read under a savepoint: an
+/// optional read whose failure answers `false` (fail closed) and must not
+/// abort the caller's transaction. Backlog 8ff648c9: decides whether a
+/// re-pointed cache's previous frame may be named in a response.
+async fn frame_visible_to(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    frame_id: Uuid,
+) -> Result<bool, String> {
+    let what = "frame visibility";
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("{what}: could not open a savepoint: {e}"))?;
+    match FrameRepository::get_by_id(&mut *sp, viewer, frame_id).await {
+        Ok(row) => {
+            sp.commit()
+                .await
+                .map_err(|e| format!("{what}: could not release the savepoint: {e}"))?;
+            Ok(row.is_some())
+        }
+        Err(e) => {
+            tracing::warn!(read = what, error = %e, "optional read failed; treated as invisible");
+            sp.rollback()
+                .await
+                .map_err(|e| format!("{what}: could not roll back to the savepoint: {e}"))?;
+            Ok(false)
         }
     }
 }
@@ -1007,7 +1050,17 @@ pub async fn auto_wire_ds_update_filed_on(
     // the one every later recompute elects (this call's BBA included).
     if cache_written {
         let recorded_before = claim_prior.and_then(|(_, _, _, recorded)| recorded);
-        notes.repointed_from = recorded_before.filter(|recorded| *recorded != frame_id);
+        if let Some(from) = recorded_before.filter(|recorded| *recorded != frame_id) {
+            // The recorded frame's id is disclosed only to a caller who can
+            // see that frame (frames are tenanted). An invisible frame, or a
+            // failed read, still reports the re-point, without the id.
+            let visible = frame_visible_to(&mut *conn, viewer, from).await?;
+            notes.repointed_from = Some(if visible {
+                RepointedFrom::Frame(from)
+            } else {
+                RepointedFrom::Hidden
+            });
+        }
         let owner =
             MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, claim_id)
                 .await

@@ -1481,6 +1481,7 @@ const DS_UPDATE_STEPS: &[&str] = &[
     "evidence source_url read",
     "evidence_type_weights",
     "fallback get_by_name",
+    "frame visibility",
     "get_by_name",
     "get_for_claim_binary_frames",
     "intra_evidence_locality_factor",
@@ -1975,9 +1976,15 @@ pub async fn update_with_evidence(
             ds.pignistic_prob
         ));
     }
+    // The previous frame's id is named only when the caller can see that
+    // frame (frames are tenanted); otherwise the re-point is still reported.
     if let Some(from) = notes.repointed_from {
+        let carried_on = match from {
+            ds_auto::RepointedFrom::Frame(id) => format!("frame {id}"),
+            ds_auto::RepointedFrom::Hidden => "a frame not visible to this caller".to_string(),
+        };
         warnings.push(format!(
-            "claim {claim_id}'s cached belief was carried on frame {from}; this call replaced \
+            "claim {claim_id}'s cached belief was carried on {carried_on}; this call replaced \
              it with its fold and re-pointed the cache to {} (belief_frame_id).",
             ds.frame_id
         ));
@@ -2024,7 +2031,10 @@ pub async fn update_with_evidence(
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),
         fold_pignistic_prob: notes.clamped_from,
-        cache_repointed_from: notes.repointed_from.map(|f| f.to_string()),
+        cache_repointed_from: notes.repointed_from.map(|from| match from {
+            ds_auto::RepointedFrom::Frame(id) => id.to_string(),
+            ds_auto::RepointedFrom::Hidden => "hidden".to_string(),
+        }),
         cache_owner_frame_id: notes
             .owner_elsewhere
             .map(|owner| owner.map_or_else(|| "none".to_string(), |f| f.to_string())),

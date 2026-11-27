@@ -2041,9 +2041,10 @@ pub struct UpdateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fold_pignistic_prob: Option<f64>,
     /// Present only when this call wrote the claim's cache and the cache had
-    /// been carried on ANOTHER frame (`belief_frame_id`): that frame's id. The
-    /// cache now records `binary_truth` and holds this call's fold (backlog
-    /// 8ff648c9). `warning` says so.
+    /// been carried on ANOTHER frame (`belief_frame_id`): that frame's id, or
+    /// `"hidden"` when the caller cannot see that frame (frames are tenanted,
+    /// so its id is not disclosed). The cache now records `binary_truth` and
+    /// holds this call's fold (backlog 8ff648c9). `warning` says so.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_repointed_from: Option<String>,
     /// Present only when this call wrote the claim's cache and the cache-owner

@@ -221,3 +221,50 @@ async fn a_cache_written_on_a_claim_with_no_owner_frame_is_reported(pool: PgPool
         "{json}"
     );
 }
+
+/// Frames are tenanted. When the frame a re-pointed cache was carried on is
+/// one the caller cannot see (a group-private frame of a group the caller is
+/// not in), the response still reports the re-point, but never that frame's
+/// id: not in `cache_repointed_from`, not in `warning`, nowhere.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_repointed_cache_does_not_name_a_frame_the_caller_cannot_see(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (claim, other) = seed_other_frame_cache(&pool, &viewer).await;
+    let (_, other_group) = fixture::seed_agent_with_group(&pool, "8ff648c9 frame owner").await;
+    sqlx::query("UPDATE frames SET visibility = 'group', owner_group_id = $1 WHERE id = $2")
+        .bind(other_group)
+        .bind(other)
+        .execute(&pool)
+        .await
+        .expect("make the ternary frame private to another group");
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    let json = run_update(&server, &viewer, claim).await;
+    assert_eq!(
+        json["cache_written"],
+        serde_json::Value::Bool(true),
+        "fixture premise: the caller writes the claim's cache: {json}"
+    );
+    let recorded = recorded_frame(&pool, claim).await;
+    assert_ne!(
+        recorded,
+        Some(other),
+        "fixture premise: the write re-points the cache off the private frame: {json}"
+    );
+
+    let text = json.to_string();
+    assert!(
+        !text.contains(&other.to_string()),
+        "the response names {other}, a frame private to a group the caller is not in: {json}"
+    );
+    assert_eq!(
+        json["cache_repointed_from"].as_str(),
+        Some("hidden"),
+        "the re-point is still reported, without the invisible frame's id: {json}"
+    );
+    let warning = json["warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("re-pointed") && warning.contains("not visible to this caller"),
+        "the re-point off an invisible frame must still be named in `warning`: {json}"
+    );
+}
