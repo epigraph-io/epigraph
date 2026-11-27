@@ -155,8 +155,11 @@ enum Tag {
     /// A reader, converted by the named plan PR.
     Todo { pr: &'static str, why: &'static str },
     /// A reader that stays role-blind BY DESIGN, on an operator ruling: it
-    /// must read every claim's raw cache columns, compounds included, for a
-    /// bit-exact record or restore. Not D5 debt; the reason names the ruling.
+    /// must read every claim's raw cache columns, compounds included (a
+    /// bit-exact record or restore, a dry-run delta, a cache-presence
+    /// report), or it reads a procedural claim's `truth_value`, which is a
+    /// workflow lifecycle marker and not a belief. Not D5 debt; the reason
+    /// names the ruling.
     ByDesign(&'static str),
 }
 
@@ -196,8 +199,8 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     // --- epigraph-db --------------------------------------------------------
     ("crates/epigraph-db/src/repos/alternative_set.rs", "scan_candidates", Tag::Todo { pr: "PR-R5", why: "suggest_alternative_sets scores pairs by LEAST(COALESCE(pignistic_prob, 0)); SPEC §7.2 excludes compounds, no NULL as 0" }),
     ("crates/epigraph-db/src/repos/analysis.rs", "get_claims_for_analysis", Tag::Todo { pr: "unassigned", why: "analysis selection ordered on truth_value; no plan row converts it" }),
-    ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_hierarchical", Tag::Todo { pr: "unassigned", why: "workflow selection gated on truth_value; procedural trees are out of scope (SPEC §4.1 W11), no plan row splices the role" }),
-    ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_lineage", Tag::Todo { pr: "unassigned", why: "workflow selection gated on truth_value; procedural, no plan row splices the role" }),
+    ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_hierarchical", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow selection gated on it")),
+    ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_lineage", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow selection gated on it")),
     ("crates/epigraph-db/src/repos/claim.rs", "const EFFECTIVE_BELIEF_SCORE_SQL", Tag::Todo { pr: "PR-R1a", why: "the effective-belief choke point (recall, traverse, query_claims); SPEC §7.2 dispatches on role" }),
     ("crates/epigraph-db/src/repos/claim.rs", "const FILTER_WHERE", Tag::Todo { pr: "unassigned", why: "ClaimRepository::list min/max truth filter on truth_value; no plan row converts it" }),
     ("crates/epigraph-db/src/repos/claim.rs", "dispute_batch", Tag::Todo { pr: "PR-R2", why: "recall's dispute read orders contradicting sources by truth_value; SPEC §7.2 dispute roll-up" }),
@@ -208,7 +211,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "list_by_labels", Tag::Todo { pr: "unassigned", why: "query_claims_by_label min-truth gate on truth_value; no plan row converts it" }),
     ("crates/epigraph-db/src/repos/claim.rs", "rag_hybrid_context", Tag::Todo { pr: "unassigned", why: "RAG context ranked and gated on truth_value; no plan row converts it" }),
     ("crates/epigraph-db/src/repos/claim.rs", "retire_for_workflow_deprecation", Tag::Writer("one UPDATE retires a workflow claim and records its own prior truth_value in properties for a later revival (backlog 1767f2ae); it serves no belief")),
-    ("crates/epigraph-db/src/repos/claim.rs", "search_by_label_and_text", Tag::Todo { pr: "unassigned", why: "workflow text search gated on truth_value; procedural, no plan row" }),
+    ("crates/epigraph-db/src/repos/claim.rs", "search_by_label_and_text", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow text search gated on it")),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_graph_neighbors", Tag::Todo { pr: "PR-R5", why: "semantic search graph expansion returns c.belief / c.plausibility; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_search_flat_on", Tag::Todo { pr: "PR-R5", why: "the semantic_search_flat row carries c.belief / c.plausibility (the statement moved into the connection form, backlog 28b79b1e); SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_selected_claims", Tag::Todo { pr: "PR-R5", why: "the diverse /search/semantic row carries c.belief / c.plausibility, the read moved out of routes/search.rs's inline full_sql (backlog 67c905a3); SPEC §7.2" }),
@@ -237,19 +240,19 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/sheaf.rs", "get_claim_neighbor_betp_pairs", Tag::Todo { pr: "PR-M1", why: "sheaf neighbour BetP pairs include compound endpoints; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/sheaf.rs", "get_epistemic_edge_pairs", Tag::Todo { pr: "PR-M1", why: "sheaf edge pairs include compound endpoints; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/structural.rs", "belief_intervals", Tag::Todo { pr: "PR-M2", why: "structural belief intervals over claims, compounds included; SPEC §7.2 excludes compounds" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "executed_structural_claims", Tag::Todo { pr: "unassigned", why: "workflow claims gated on truth_value; procedural (SPEC §4.1 W11), no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "find_by_embedding", Tag::Todo { pr: "unassigned", why: "workflow search gated and scored on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "find_by_text", Tag::Todo { pr: "unassigned", why: "workflow search gated and scored on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "find_hierarchical_by_embedding", Tag::Todo { pr: "unassigned", why: "workflow search gated on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "list", Tag::Todo { pr: "unassigned", why: "workflow list ordered on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "list_hierarchical_lineage_heads", Tag::Todo { pr: "unassigned", why: "workflow lineage enumeration gated on its generations' truth_value (deprecation, highest live generation); procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_embedding_scored", Tag::Todo { pr: "unassigned", why: "workflow search scored on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_text", Tag::Todo { pr: "unassigned", why: "workflow search scored on truth_value; procedural, no plan row" }),
+    ("crates/epigraph-db/src/repos/workflow.rs", "executed_structural_claims", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow claims gated on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "find_by_embedding", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search gated and scored on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "find_by_text", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search gated and scored on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "find_hierarchical_by_embedding", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search gated on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "list", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow list ordered on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "list_hierarchical_lineage_heads", Tag::ByDesign("operator ruling (2026-11-24, backlog 5a4d94b7): stays role-blind by design; the workflow lineage enumeration is gated on its generations' truth_value (deprecation, highest live generation), which joins the procedural class: a workflow's truth_value is a lifecycle marker, not a belief")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_embedding_scored", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search scored on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_text", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search scored on it")),
     // --- epigraph-engine ----------------------------------------------------
     ("crates/epigraph-engine/src/belief_query.rs", "get_belief_conn", Tag::Todo { pr: "PR-R1a", why: "the get_belief choke point (body in get_belief_conn; the pool forms delegate) serves the cache columns; SPEC §7.2 dispatches on role" }),
     ("crates/epigraph-engine/src/edge_factor.rs", "auto_wire_ds_for_edge", Tag::Todo { pr: "PR-F2", why: "builds an edge BBA from the source's cached Bel/Pl, compound sources included; SPEC §4.1 W8" }),
-    ("crates/epigraph-engine/src/retraction_cascade.rs", "claim_holds_belief_cache", Tag::Todo { pr: "unassigned", why: "the retraction cascade's report reads whether a claim still holds any cache column (the columns clear_claim_belief's guard tests) to tell a declined clear from nothing to clear, compounds included; it decides only the report's bucket and serves no belief" }),
-    ("crates/epigraph-engine/src/supersede_delta.rs", "delta_block", Tag::Todo { pr: "unassigned", why: "the supersede dry-run delta (supersede SPEC §11 K0) reads the raw cache that the supersede cascade's repair recomputes, compounds included, to report old beside new; role-aware when that repair is" }),
+    ("crates/epigraph-engine/src/retraction_cascade.rs", "claim_holds_belief_cache", Tag::ByDesign("operator ruling (2026-11-24, backlog 5a4d94b7): stays role-blind by design; the retraction cascade's report reads whether a claim still holds any raw cache column (the columns clear_claim_belief's guard tests), compounds included, to tell a declined clear from nothing to clear; it decides only the report's bucket and serves no belief")),
+    ("crates/epigraph-engine/src/supersede_delta.rs", "delta_block", Tag::ByDesign("operator ruling (2026-11-17) and backlog 5a4d94b7 (2026-11-24): stays role-blind by design; the supersede dry-run delta (supersede SPEC §11 K0) must read the raw cache the supersede cascade's repair recomputes, compounds included, to report old beside new; it serves no belief")),
     // --- epigraph-jobs ------------------------------------------------------
     ("crates/epigraph-jobs/src/cluster_graph/neighborhood.rs", "run_one_theme", Tag::Todo { pr: "unassigned", why: "theme neighbourhood BetP; SPEC §7.2 calls it atoms-only, but the predicate is not the IS_COMPOUND_SQL spelling" }),
     ("crates/epigraph-jobs/src/cluster_graph/runner.rs", "run_clustering", Tag::Todo { pr: "PR-M2", why: "cluster mean_betp over claims, compounds included; SPEC §7.2" }),
