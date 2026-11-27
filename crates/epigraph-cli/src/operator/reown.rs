@@ -12,9 +12,8 @@
 //!    `kind = 'personal'` group the author itself created — the creator test
 //!    branch A applies to operator groups, so a squatted group does not count);
 //! 3. every row it would carry with it is `public`: the claim, every row of
-//!    every table `epigraph_propagate_tenancy` cascades to, every harvester
-//!    fragment it is the provenance of, and every edge touching it, including
-//!    that edge's other endpoint.
+//!    every table `epigraph_propagate_tenancy` cascades to, and every edge
+//!    touching it, including that edge's other endpoint.
 //!
 //! Every other listed claim is HELD, reported with its reason, and never
 //! written. Rule 3 is the operator's 2026-09-23 directive: the trigger copies
@@ -242,9 +241,9 @@ pub struct Caches {
 /// its batch would therefore keep a STALE prior record, and a reversal would
 /// restore the stale owner (review finding). So each batch compares what it
 /// finds under the lock with this map and HOLDS every claim a changed row
-/// hangs off. A change made by THIS run's earlier batch (a shared edge or
-/// fragment) is expected, not a change: committed batches write their
-/// post-state here. A dry run never does, because it rolls every batch back.
+/// hangs off. A change made by THIS run's earlier batch (a shared edge) is
+/// expected, not a change: committed batches write their post-state here. A
+/// dry run never does, because it rolls every batch back.
 #[derive(Default, Debug)]
 pub struct Known {
     pub claims: BTreeMap<Uuid, (Uuid, String)>,
@@ -451,8 +450,6 @@ pub struct Spill {
     /// their writer's group in both modes, so they are not spill whoever
     /// wrote them.
     pub writer_owned: BTreeMap<String, usize>,
-    /// Fragments that are also the provenance of a claim not being moved.
-    pub shared_fragments: usize,
     /// Per eligible claim: edges whose OTHER endpoint is a claim that is not
     /// moving (held, or not listed). Reported for the operator; since
     /// migration 120 a public edge is not rewritten by the re-own.
@@ -468,9 +465,6 @@ async fn spill(
 ) -> anyhow::Result<Spill> {
     let mut s = Spill::default();
     for a in attached.values() {
-        if a.shared_outside {
-            s.shared_fragments += 1;
-        }
         if a.table == "edges"
             && a.claims
                 .iter()
@@ -537,8 +531,8 @@ pub fn records_for(claims: &[ClaimRow], attached: &Snapshot, specs: &[TableSpec]
 }
 
 /// Every claim a checked row hangs off that this batch did NOT move: the
-/// fragment's other provenance claims, the edge's other claim endpoint, and a
-/// claim of the batch itself that was held.
+/// edge's other claim endpoint, and a claim of the batch itself that was
+/// held.
 fn neighbours_of(s0: &Snapshot, moved: &BTreeSet<Uuid>) -> Vec<Uuid> {
     let mut out = BTreeSet::new();
     for a in s0.values() {
@@ -1174,14 +1168,6 @@ pub async fn run(
     }
     for (w, n) in &report.spill.by_writer {
         writeln!(out, "SPILL-WRITER\t{w}\t{n}")?;
-    }
-    if report.spill.shared_fragments > 0 {
-        writeln!(
-            out,
-            "SHARED-FRAGMENTS\t{}\t(also the provenance of a claim not being moved; they move \
-             with the eligible claim, and stay public)",
-            report.spill.shared_fragments
-        )?;
     }
     for (c, n) in &report.spill.neighbour_edges {
         writeln!(

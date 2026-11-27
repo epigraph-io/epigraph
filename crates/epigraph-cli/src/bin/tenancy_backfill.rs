@@ -26,9 +26,8 @@
 //! **Migration 070 is applied BEFORE this runs.** The consequence is the whole
 //! design: 070 arm (d) `claims_propagate_tenancy` is an `AFTER UPDATE ... FOR
 //! EACH STATEMENT` trigger on `claims`, and this binary's own
-//! `UPDATE claims SET owner_group_id = …` **is** that event. The 17 derived
-//! tables, `harvester_fragments` and `edges` are therefore stamped by the
-//! trigger, inside the same transaction, and this binary owes them no arm of
+//! `UPDATE claims SET owner_group_id = …` **is** that event. The 16 derived
+//! tables and `edges` are therefore stamped by the trigger, inside the same transaction, and this binary owes them no arm of
 //! its own — only a residual check that the trigger did its job.
 //!
 //! Had the backfill run first, it would have owed its own propagation walk, and
@@ -173,7 +172,7 @@
 //! Usage:
 //!     epigraph-tenancy-backfill run --legacy-owner operator|platform [--batch-size 5000]
 //!         [--dry-run]
-//!         [--entity claims|communities|perspectives|recall-events|harvester-fragments|registry-edges]
+//!         [--entity claims|communities|perspectives|recall-events|registry-edges]
 //!         [--max-runtime 2h]
 //!     epigraph-tenancy-backfill verify [--legacy-owner operator|platform]
 //!
@@ -198,10 +197,6 @@ const LEDGER_OWNED_DEFINERS: &[&str] = &["epigraph_mf_purge_granted"];
 
 /// The world group: a SHAPE CONSTANT, never an owner (plan §2.3).
 const WORLD: Uuid = Uuid::nil();
-
-/// Migration 074's seed group, the other sentinel owner (062's
-/// `NOT IN (world, seed)` check). One spelling, shared with the operator tool.
-const SEED: Uuid = epigraph_cli::operator::SEED;
 
 /// The instance-wide registries (migration 077 section 2b): their writers
 /// declare `('public', world)` on purpose, so this binary stamps none of them,
@@ -310,14 +305,14 @@ fn owner_sql(mode: LegacyOwner, agent_expr: &str) -> String {
     }
 }
 
-/// The 25 tier-A entities, exactly as `migrations/062_tenancy_columns.sql`
-/// seeds them into `tenancy_backfill_progress`.
+/// The 23 tier-A entities: the 25 `migrations/062_tenancy_columns.sql` seeds
+/// into `tenancy_backfill_progress`, less the two harvester tables migration
+/// 354 drops together with their progress rows.
 ///
-/// **25, not 24.** `docs/tenancy/HANDOFF.md` §4 M4 says "row counts across the
-/// 24 tier-A tables"; 062's array and the seeded table both say 25 (verified:
-/// `SELECT count(*) FROM tenancy_backfill_progress` = 25). An implementation
-/// built against 24 leaves one entity permanently `complete = false` and
-/// `verify` fails forever.
+/// **One per progress row.** `docs/tenancy/HANDOFF.md` §4 M4 counted 24 where
+/// 062's array said 25; an implementation built against a count that is not
+/// the table's leaves one entity permanently `complete = false` and `verify`
+/// fails forever.
 const TIER_A: &[&str] = &[
     "claims",
     "evidence",
@@ -329,7 +324,6 @@ const TIER_A: &[&str] = &[
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
     "claim_frames",
-    "harvester_claim_provenance",
     "challenges",
     "reasoning_traces",
     "experiment_triples",
@@ -338,7 +332,6 @@ const TIER_A: &[&str] = &[
     "claim_cluster_membership",
     "claim_neighborhood_membership",
     "claim_signature_revocations",
-    "harvester_fragments",
     "frames",
     "contexts",
     "perspectives",
@@ -346,8 +339,9 @@ const TIER_A: &[&str] = &[
     "recall_events",
 ];
 
-/// The 17 tables 070 arm (c)/(d) stamp from their parent claim. This binary
-/// never writes them directly; it only checks the residual.
+/// The 16 tables 070 arm (c)/(d) stamp from their parent claim (17 until
+/// migration 354 dropped `harvester` provenance). This binary never writes
+/// them directly; it only checks the residual.
 const CLAIM_DERIVED: &[&str] = &[
     "evidence",
     "triples",
@@ -357,7 +351,6 @@ const CLAIM_DERIVED: &[&str] = &[
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
     "claim_frames",
-    "harvester_claim_provenance",
     "challenges",
     "reasoning_traces",
     "experiment_triples",
@@ -418,7 +411,6 @@ enum Entity {
     Communities,
     Perspectives,
     RecallEvents,
-    HarvesterFragments,
     /// Re-meet every edge with a non-public frame, context, perspective or
     /// community endpoint (migration 258).
     RegistryEdges,
@@ -603,7 +595,6 @@ async fn run(
         for (e, table) in [
             (Entity::Claims, "claims"),
             (Entity::RecallEvents, "recall_events"),
-            (Entity::HarvesterFragments, "harvester_fragments"),
         ] {
             if wants(e) {
                 let n = residual_for(pool, table, Some(mode)).await?;
@@ -665,9 +656,6 @@ async fn run(
             return Ok(end);
         }
     }
-    if wants(Entity::HarvesterFragments) {
-        backfill_harvester_fragments(pool).await?;
-    }
     if wants(Entity::RegistryEdges) {
         remeet_registry_edges(pool, false, entity.is_some()).await?;
     }
@@ -678,7 +666,7 @@ async fn run(
         return Ok(RunEnd::Complete);
     }
 
-    // The remaining entities are either trigger-propagated (the 17 claim-derived
+    // The remaining entities are either trigger-propagated (the 16 claim-derived
     // tables and `edges`) or have nothing to derive from (`frames`, `contexts`).
     // Both are settled by measuring the residual, never by asserting.
     settle_remaining(pool, mode).await?;
@@ -696,7 +684,7 @@ async fn run(
 /// Refuse to run against a database that has not had migration 070 applied.
 ///
 /// Fail CLOSED. If arm (d) is absent, the backfill's `UPDATE claims` stamps the
-/// root and propagates to NOTHING — leaving 17 derived tables world-owned while
+/// root and propagates to NOTHING — leaving 16 derived tables world-owned while
 /// `tenancy_backfill_progress` cheerfully reports the claims entity complete.
 /// That is a silent half-backfill, and the only cheap moment to catch it is
 /// before the first batch.
@@ -714,7 +702,7 @@ async fn preflight(pool: &PgPool) -> anyhow::Result<()> {
         anyhow::bail!(
             "migration 070's claims_propagate_tenancy trigger is absent or disabled. \
              Apply 070 BEFORE running the backfill: this binary relies on it to \
-             propagate to the 17 claim-derived tables, harvester_fragments and edges. \
+             propagate to the 16 claim-derived tables and edges. \
              Running without it produces a silent half-backfill."
         );
     }
@@ -1118,80 +1106,6 @@ async fn backfill_agent_keyed(
         finish_entity(pool, table, total).await?;
         return Ok(Walk::Done);
     }
-}
-
-/// `harvester_fragments` → its claim's tenancy, via the provenance join.
-///
-/// This arm exists because arm (c) CANNOT cover this table (it has no
-/// `claim_id`) and arm (d) only fires on a claims *UPDATE*. A fragment inserted
-/// **before** its `harvester_claim_provenance` row was therefore stamped by no
-/// trigger at all — an insert-order hole the plan does not mention.
-///
-/// # Migration 089 closed the forward half; this pass is for the backlog
-///
-/// Since migration 089 a fragment written in that order IS stamped, at the
-/// moment the `harvester_claim_provenance` row linking it to its claim is
-/// inserted (`harvester_claim_provenance_fragment_inherit_tenancy`). So the
-/// residual this pass exists for is rows that were already on disk when 089
-/// applied, not new writes.
-///
-/// # The predicate is migration 089's, on purpose
-///
-/// TARGET: `f.owner_group_id IN (world, seed)`. 089 names the seed sentinel
-/// because migration 074 made this table a parentless root whose seed arm
-/// COALESCEs an undeclared insert to `('public', <seed group>)` on a session
-/// that is a member of `epigraph_seed`. A seed-owned fragment already on disk is
-/// reachable by no trigger (089 fires only on a new provenance insert), so this
-/// pass is its only repair. SOURCE: `c.owner_group_id <> world`, plus
-/// `(f.owner_group_id, f.visibility) IS DISTINCT FROM (c.owner_group_id,
-/// c.visibility)`, so a seed fragment on a seed claim is not rewritten in place
-/// (no inflated `rows_done`), a seed fragment on a WORLD claim is never stamped
-/// with the other sentinel, and a world fragment on a seed claim still moves as
-/// it always has. [`harvester_fragment_residual`] counts exactly the rows this
-/// statement can move (finding `F-089-D`): both read [`fragment_restampable`].
-///
-/// # Several citing claims: the most restrictive wins (migration 218)
-///
-/// A fragment cited by more than one claim takes [`FRAGMENT_WINNER`], the same
-/// order migration 218 gives the provenance trigger: group before public, a
-/// real owner before the seed sentinel, then the lowest `owner_group_id`. The
-/// former `UPDATE … FROM` over the provenance join applied whichever joined row
-/// the plan produced first (finding `F-089-A`).
-async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
-    let n = sqlx::query(&format!(
-        "UPDATE harvester_fragments t \
-            SET (owner_group_id, visibility) = (SELECT w.g, w.v FROM ({FRAGMENT_WINNER}) w) \
-          WHERE {}",
-        fragment_restampable()
-    ))
-    .bind(WORLD)
-    .bind(SEED)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    finish_entity(pool, "harvester_fragments", n as i64).await?;
-    Ok(())
-}
-
-/// The citing claim whose tenancy the fragment `t` inherits (binding `$1` =
-/// [`WORLD`], `$2` = [`SEED`]): the most restrictive of its non-world citing
-/// claims, by migration 218's order. No row when every citer is world-owned
-/// (089's source side: the world group has no tenancy to donate).
-const FRAGMENT_WINNER: &str = "SELECT c.owner_group_id AS g, c.visibility AS v \
-       FROM harvester_claim_provenance p JOIN claims c ON c.id = p.claim_id \
-      WHERE p.fragment_id = t.id AND c.owner_group_id <> $1 \
-      ORDER BY (c.visibility = 'group') DESC, (c.owner_group_id = $2) ASC, \
-               c.owner_group_id ASC \
-      LIMIT 1";
-
-/// The `harvester_fragments t` rows [`backfill_harvester_fragments`] moves:
-/// sentinel-owned (089's target side) and not already on their
-/// [`FRAGMENT_WINNER`]'s tuple.
-fn fragment_restampable() -> String {
-    format!(
-        "(t.owner_group_id IN ($1, $2) AND EXISTS (SELECT 1 FROM ({FRAGMENT_WINNER}) w \
-           WHERE (t.owner_group_id, t.visibility) IS DISTINCT FROM (w.g, w.v)))"
-    )
 }
 
 // `transcribe_legacy_ownership` lived here until PR-22.
@@ -1793,10 +1707,9 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 /// session functions, and widening either past its own scope would make its doc
 /// comment false.
 ///
-/// The first scope is "070's five plus migration 089's
-/// `epigraph_inherit_fragment_tenancy_stmt`" — it was 070's five alone until
-/// 089, and the sentence above is restated here rather than left as written
-/// because 089 moved it. `epigraph_claim_tenancy_by_ids` still does not belong
+/// The first scope was "070's five plus migration 089's fragment stamp" from
+/// 089 until migration 354 dropped that stamp with the harvester tables; it is
+/// 070's five again. `epigraph_claim_tenancy_by_ids` still does not belong
 /// there: it is a READ helper backing a suppression control, not a body any
 /// trigger fires, so it would widen that test from "trigger bodies" to
 /// "definer bodies" and leave it asserting a different claim than its name and
@@ -1872,29 +1785,8 @@ const DEFINER_FUNCTIONS: &[&str] = &[
 /// intended, and nothing in `_sqlx_migrations` records the difference. This gate
 /// is the only instrument that reports it.
 ///
-/// `epigraph_inherit_fragment_tenancy_stmt` (89) is deferred for the structural
-/// reason, not a judgement call: 089 is LATER than every migration week 11c
-/// applies, so at the moment this pre-flight runs the function legitimately does
-/// not exist. An entry in [`DEFINER_FUNCTIONS`] would therefore report `does not
-/// exist` and fail a correctly-sequenced deploy — turning the control that
-/// prevents an outage into the outage.
-///
-/// ## What this entry catches, scoped to what is reachable
-///
-/// 089's `ALTER FUNCTION ... OWNER TO` is inside a guarded `DO` block, so it can
-/// silently no-op. But the two failure states are reported by DIFFERENT branches
-/// of [`verify_definer_ownership`] and only one of them is this entry's:
-///
-/// * **Role absent** (the cluster the guard exists for — 060 could only
-///   `RAISE NOTICE`): reported by the role-existence branch, which returns before
-///   the per-function loop and says so. Not this entry.
-/// * **Owner present but not a MEMBER of `epigraph_maintenance`** — an operator
-///   re-own, a restore, a migration runner that is neither a superuser nor a
-///   member: this entry, via the `pg_has_role` predicate below.
-///
-/// A **superuser-owned** body passes, as 086's entry already records, and that is
-/// correct: it satisfies `epigraph_definer_bypass()` and bypasses row security
-/// outright, so nothing is degraded.
+/// Migration 089's fragment stamp was registered here at 89 until migration
+/// 354 dropped it with the harvester tables it wrote; its entry went with it.
 ///
 /// # ⚠ `epigraph_group_roster_admits_principal` (92) — THE FOURTH DIRECTION
 ///
@@ -1920,24 +1812,9 @@ const DEFINER_FUNCTIONS: &[&str] = &[
 /// which pins `proowner` by string equality; this half is what an operator gets
 /// on a cluster whose catalog CI never sees.
 ///
-/// ## And what a non-member owner actually costs, measured
-///
-/// Not "the stamp is filtered away silently" — that was an earlier draft's claim
-/// and it is wrong. Measured out of band on a scratch database at head, from a
-/// genuine non-bypassing application-role session (`#[sqlx::test]` cannot ask:
-/// `session_user` is the superuser — see finding
-/// `F-PR12-ci-runs-as-superuser-so-the-42501-arm-is-untestable`): a non-member
-/// owner still stamps a link whose claim the writing session can already see,
-/// because `harvester_fragments_tenancy`'s WITH CHECK is satisfied by that
-/// session's own writable groups. What it loses is the link whose claim the
-/// session CANNOT see — the body's own read of `public.claims` is RLS-filtered,
-/// so the join matches nothing and zero rows are stamped with no error. The
-/// ownership is load-bearing for COVERAGE, which is why a catalog gate rather
-/// than a runtime one is the right instrument.
 const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_claim_tenancy_by_ids", 86),
     ("epigraph_is_instance_admin", 83),
-    ("epigraph_inherit_fragment_tenancy_stmt", 89),
     ("epigraph_group_roster_admits_principal", 92),
     // 107, operator-scoped ownership. Deferred for the same structural reason
     // as 092. All fail CLOSED under a non-member owner: the two reads
@@ -2098,9 +1975,9 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // the claim goes public and the edge stays group-only.
     // 215 re-states it (and the share below) and adds, under the same owner:
     // the re-meet of edges on the moved claims' evidence (as above, LOUD or
-    // SILENT); a `harvester_sources` tenancy change, which the 115
-    // owner-immutable guard 173 attached refuses LOUD outside a privileged
-    // frame; and the deletes of the moved claims' `ds_combined_beliefs` and
+    // SILENT); a harvester-source tenancy change (until migration 354 dropped
+    // that table), which the 115 owner-immutable guard 173 attached refused
+    // LOUD outside a privileged frame; and the deletes of the moved claims' `ds_combined_beliefs` and
     // `ds_bayesian_divergence` rows, which row security filters SILENTLY to
     // the rows the owner can see, leaving stale scoped folds behind.
     ("epigraph_publicize_claims", 206),
@@ -2659,18 +2536,6 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_require_role_holder", 166),
     ("epigraph_agent_is_retired", 166),
     ("epigraph_role_agent_write_check", 166),
-    // 173 (ruling R-66), the audit report's tenancy stamp from its fragment.
-    // Under a non-member owner its read of the FORCEd `harvester_fragments` is
-    // filtered, so a report on a private fragment raises 23503 (loud).
-    ("epigraph_audit_report_inherit_tenancy", 173),
-    // 173, the reports-follow-their-fragment re-stamp. Only a privileged
-    // session changes a fragment's owner (115's owner guard; 115 limits 089's
-    // stamp to bypass sessions), and the reports' owner guard and row
-    // security admit that session itself, so a non-member owner does not
-    // stop a re-own. A visibility-only change from an application session
-    // (arm (d)) runs the report UPDATE under that session's row security;
-    // not measured under a non-member owner.
-    ("epigraph_fragment_audit_reports_follow", 173),
     // 180, legacy fleet parents. The rule reads `agents` (FORCEd, but its
     // SELECT policy admits every row), `operator_links` (FORCEd; read only
     // by a maintenance session or a maintenance-owned definer frame) and
@@ -4410,9 +4275,7 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
 /// names two sentinels and 074's seed arm produces the other one, so a
 /// seed-stamped row is not counted here. Left as-is deliberately for the generic
 /// tier-A census: seed-owned rows that no repair in this binary can move would
-/// turn the gate red with nothing to run. `harvester_fragments` is the exception,
-/// because [`backfill_harvester_fragments`] does repair its seed-owned rows; it
-/// is counted by [`harvester_fragment_residual`] instead (finding `F-089-D`).
+/// turn the gate red with nothing to run.
 async fn residual(pool: &PgPool, table: &str) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {table} WHERE owner_group_id = $1"
@@ -4427,7 +4290,7 @@ async fn residual(pool: &PgPool, table: &str) -> anyhow::Result<i64> {
 /// * `None` / `operator`: every world-owned row ([`residual`], the strict
 ///   check).
 /// * `platform`: a world-owned claim counts only if its author holds a LIVE
-///   link to a registered human; a world-owned derived row (or fragment) only
+///   link to a registered human; a world-owned derived row only
 ///   if its claim is no longer world-owned (it should have followed); an
 ///   agent-keyed row only if its agent is live-linked. The rest is the platform
 ///   corpus, by decision.
@@ -4436,9 +4299,6 @@ async fn residual_for(
     table: &str,
     mode: Option<LegacyOwner>,
 ) -> anyhow::Result<i64> {
-    if table == "harvester_fragments" {
-        return harvester_fragment_residual(pool, mode).await;
-    }
     if mode != Some(LegacyOwner::Platform) {
         return residual(pool, table).await;
     }
@@ -4457,45 +4317,6 @@ async fn residual_for(
     .bind(WORLD)
     .fetch_one(pool)
     .await?)
-}
-
-/// `harvester_fragments` rows that SHOULD have moved: the rows
-/// [`backfill_harvester_fragments`] can repair, which is migration 089's
-/// predicate over rows already on disk (a sentinel-owned fragment linked to a
-/// non-world claim) with migration 218's winner (the most restrictive such
-/// claim, whose tenancy differs from the fragment's): [`fragment_restampable`].
-///
-/// * `platform`: exactly those rows.
-/// * `None` / `operator` (strict): every world-owned fragment, as [`residual`]
-///   counts it, PLUS the repairable seed-owned ones. Seed-owned fragments the
-///   repair cannot move (no provenance, or only world or seed claims) are not
-///   counted, so a strict `verify` never fails on a row this binary has no way
-///   to fix.
-async fn harvester_fragment_residual(
-    pool: &PgPool,
-    mode: Option<LegacyOwner>,
-) -> anyhow::Result<i64> {
-    let filter = harvester_fragment_residual_filter(mode);
-    Ok(sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM harvester_fragments t WHERE {filter}"
-    ))
-    .bind(WORLD)
-    .bind(SEED)
-    .fetch_one(pool)
-    .await?)
-}
-
-/// The `WHERE` clause (over `harvester_fragments t`, binding `$1` = [`WORLD`],
-/// `$2` = [`SEED`]) shared by [`harvester_fragment_residual`]'s count and
-/// [`print_offenders`]' id listing, so the ids a strict `verify` prints are the
-/// rows it counted.
-fn harvester_fragment_residual_filter(mode: Option<LegacyOwner>) -> String {
-    let repairable = fragment_restampable();
-    if mode == Some(LegacyOwner::Platform) {
-        repairable
-    } else {
-        format!("t.owner_group_id = $1 OR {repairable}")
-    }
 }
 
 /// The deploy pre-flight. Returns the number of FAILING checks.
@@ -4931,14 +4752,7 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
         let n = residual_for(pool, t, mode).await?;
         if n > 0 {
             failures += 1;
-            if *t == "harvester_fragments" {
-                eprintln!(
-                    "FAIL: {n} row(s) in {t} still owned by a sentinel group (world, or seed \
-                     with a repairable claim); `run --entity harvester-fragments` moves them."
-                );
-            } else {
-                eprintln!("FAIL: {n} row(s) in {t} still owned by the world group.");
-            }
+            eprintln!("FAIL: {n} row(s) in {t} still owned by the world group.");
             if !platform {
                 print_offenders(pool, t).await?;
             }
@@ -5002,40 +4816,8 @@ async fn linked_author_personal_residue(
 /// Print up to 20 offending ids. Tables without an `id` column
 /// (`claim_frames`, `claim_cluster_membership`, `claim_neighborhood_membership`)
 /// are keyed on `claim_id` instead — a per-entity fact, not the uniform PK the
-/// acceptance line implies. `harvester_claim_provenance` has no `id` and no
-/// single-column key (its PK is `(claim_id, fragment_id)`), so its rows are
-/// listed by both key columns.
+/// acceptance line implies.
 async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
-    if table == "harvester_claim_provenance" {
-        let keys: Vec<(Uuid, Uuid)> = sqlx::query_as(
-            "SELECT claim_id, fragment_id FROM harvester_claim_provenance \
-              WHERE owner_group_id = $1 ORDER BY claim_id, fragment_id LIMIT 20",
-        )
-        .bind(WORLD)
-        .fetch_all(pool)
-        .await?;
-        for (claim_id, fragment_id) in keys {
-            eprintln!("    {table}.(claim_id, fragment_id) = ({claim_id}, {fragment_id})");
-        }
-        return Ok(());
-    }
-    if table == "harvester_fragments" {
-        // Strict mode only (the caller skips this under `platform`): list the
-        // rows `harvester_fragment_residual` counted, seed-owned repairable
-        // ones included, not just the world-owned ones.
-        let filter = harvester_fragment_residual_filter(None);
-        let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
-            "SELECT t.id FROM harvester_fragments t WHERE {filter} ORDER BY t.id LIMIT 20"
-        ))
-        .bind(WORLD)
-        .bind(SEED)
-        .fetch_all(pool)
-        .await?;
-        for id in ids {
-            eprintln!("    {table}.id = {id}");
-        }
-        return Ok(());
-    }
     let key = match table {
         "claim_frames" | "claim_cluster_membership" | "claim_neighborhood_membership" => "claim_id",
         _ => "id",
@@ -5200,6 +4982,11 @@ mod definer_register_tests {
     const DROPPED: &[(&str, i64)] = &[
         // 071's shim; 084 drops it with the table it wrote through.
         ("epigraph_ownership_transcribe", 84),
+        // 089's fragment stamp and 173's two audit-report triggers; 354 drops
+        // them with the harvester tables they fired on.
+        ("epigraph_inherit_fragment_tenancy_stmt", 354),
+        ("epigraph_audit_report_inherit_tenancy", 354),
+        ("epigraph_fragment_audit_reports_follow", 354),
     ];
 
     struct Migration {
@@ -6129,9 +5916,6 @@ mod definer_register_tests {
         "epigraph_role_agents_guard_update",
         "epigraph_role_agents_audit",
         "epigraph_role_agents_follow_lineage",
-        // 173: the audit-report tenancy inheritance and follow.
-        "epigraph_audit_report_inherit_tenancy",
-        "epigraph_fragment_audit_reports_follow",
         // 197: the atlas layout narrowing guard.
         "epigraph_atlas_layout_narrowed",
         // 200: the passkey act-confirmer guard and the anchored revoke.

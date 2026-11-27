@@ -681,10 +681,9 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
 /// the next reader from looking, which is the same failure this whole PR exists
 /// to reject — a control that reads like a control and checks nothing.
 ///
-/// The two lists are now equal by hand, and `claim_versions` /
-/// `harvester_fragments` are carried here even though
-/// `grep -rnE '(UPDATE|DELETE FROM) (public\.)?(claim_versions|harvester_fragments)'`
-/// over `src/routes/` currently returns nothing. They are a no-op today and
+/// The two lists are now equal by hand, and `claim_versions` is carried here
+/// even though `grep -rnE '(UPDATE|DELETE FROM) (public\.)?claim_versions'`
+/// over `src/routes/` currently returns nothing. It is a no-op today and
 /// correct the day a handler writes one. **Keep them equal by hand, and expect
 /// no test to tell you when you have not.**
 const WRITE_GATED_TABLES: &[&str] = &[
@@ -694,7 +693,6 @@ const WRITE_GATED_TABLES: &[&str] = &[
     "edges",
     "evidence",
     "frames",
-    "harvester_fragments",
     "mass_functions",
     "perspectives",
     "recall_events",

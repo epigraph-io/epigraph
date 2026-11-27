@@ -32,9 +32,9 @@
 //!   database's own narrowing path. The `workflows` rows are written directly
 //!   (migration 183: a maintenance session re-tenants them); the plan claims go
 //!   through one `UPDATE claims SET owner_group_id, visibility = 'group'`, so
-//!   `epigraph_propagate_tenancy` narrows their derived rows and fragments and
-//!   re-meets every edge with a claim endpoint, and migration 197's trigger
-//!   bumps the atlas epoch once in the batch's transaction. Every batch asserts
+//!   `epigraph_propagate_tenancy` narrows their derived rows and re-meets
+//!   every edge with a claim endpoint, and migration 197's trigger bumps the
+//!   atlas epoch once in the batch's transaction. Every batch asserts
 //!   the bump, and that an unstamped `epigraph_app` session lost EXACTLY the
 //!   rows that went public to group. Re-run `atlas_layout --apply` afterwards.
 //!   With the target equal to the source this is the in-place narrowing: no
@@ -183,11 +183,8 @@
 //!     [`StrayScope`]);
 //!   - `keep` only: carrying a row the cascade would move that is not
 //!     `('public', source)` (a third group's derived row, pinned evidence), or
-//!     an edge with a non-public endpoint, or sharing a cascaded row (a
-//!     harvester fragment) with a plan claim that stays (to a fixpoint);
-//!   - `group` only: sharing a harvester fragment with a claim that does not
-//!     end in the TO state (the cascade would narrow the fragment for both),
-//!     to a fixpoint, with its step lineage. It is reported as SHARED.
+//!     an edge with a non-public endpoint, or sharing a cascaded row with a
+//!     plan claim that stays (to a fixpoint).
 //!
 //!   A narrowing leaves a plan claim public for no other reason. It decides
 //!   every cascaded row and edge by the state the database leaves it in (the
@@ -210,7 +207,7 @@
 //!   named on a `SHARED-SPLIT` line: no run of either list narrows it alone,
 //!   so lineages that share a plan claim must be listed in ONE run.
 //! * The claims' DERIVED rows (`epigraph_propagate_tenancy`'s `derived[]`
-//!   tables and harvester fragments, read from the live trigger by
+//!   tables, read from the live trigger by
 //!   `tables::propagated_tables`): the cascade copies the claim's new tuple
 //!   onto every one that is not writer-owned. A WRITER-OWNED row (migration
 //!   114: another writer's evidence, BBA or trace) is left by the trigger while
@@ -1011,8 +1008,7 @@ pub struct Component {
     pub already_claims: Vec<Uuid>,
     /// The left and already claims' rows, as seen (the manifest's "seen" set).
     pub seen_claims: Vec<ClaimRow>,
-    /// Derived and fragment rows the cascade changes, and the state each ends
-    /// in.
+    /// Derived rows the cascade changes, and the state each ends in.
     pub rows: Snapshot,
     pub rows_post: BTreeMap<RowKey, RowState>,
     /// Rows attached to moving claims that stay as they are (writer-owned under
@@ -1264,7 +1260,7 @@ fn moved_tuple(act: &Act, t: &Tenancy) -> Tenancy {
 ///   them, a row of the same lineages already in the TO state, or (an
 ///   `AUTHORED` edge) the author agent the ingest records.
 ///
-/// Derived rows (evidence, BBAs, fragments, ...) are never own rows: a private
+/// Derived rows (evidence, BBAs, ...) are never own rows: a private
 /// one holds the lineage as in the main act.
 #[derive(Default)]
 struct StrayScope {
@@ -1317,18 +1313,12 @@ struct Narrowed {
 /// The narrowing's classification of the candidates' rows and the plans'
 /// edges. Decides each row's and edge's state AFTER the narrowing as the
 /// database computes it, and holds (by [`hand_off`]) only what would hand the
-/// target a row it must not get; everything else narrows. A candidate leaves
-/// only as SHARED: a harvester fragment it shares with a claim that does not
-/// end in the TO state (the cascade would narrow the fragment for both), to a
-/// fixpoint, with its step lineage.
+/// target a row it must not get; everything else narrows.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn classify_narrowing(
     conn: &mut PgConnection,
     act: &Act,
-    candidates: &mut BTreeSet<Uuid>,
-    left: &mut BTreeMap<Uuid, Left>,
-    step_of: &BTreeMap<Uuid, Uuid>,
-    step_members: &BTreeMap<Uuid, BTreeSet<Uuid>>,
+    candidates: &BTreeSet<Uuid>,
     attached: &Snapshot,
     edge_rows: &[EdgeRow],
     moving_wf: &BTreeSet<Uuid>,
@@ -1338,64 +1328,6 @@ async fn classify_narrowing(
     let to = act.to_state();
     let to_node: NodeState = (to.owner, to.visibility.clone());
     let mut out = Narrowed::default();
-
-    // ---- fragments shared with a claim that does not end in TO ----
-    let neighbours: Vec<Uuid> = attached
-        .values()
-        .filter(|a| a.table == "harvester_fragments")
-        .flat_map(|a| a.neighbours.iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let neighbours_in_to: BTreeSet<Uuid> = fetch_claims(conn, &neighbours, false)
-        .await?
-        .into_iter()
-        .filter(|c| claim_tenancy(c) == to)
-        .map(|c| c.id)
-        .collect();
-    loop {
-        let mut drop: Vec<(Uuid, String)> = Vec::new();
-        for a in attached
-            .values()
-            .filter(|a| a.table == "harvester_fragments")
-        {
-            let stays = a.claims.iter().any(|c| !candidates.contains(c))
-                || a.neighbours.iter().any(|n| !neighbours_in_to.contains(n));
-            if stays {
-                for c in a.claims.iter().filter(|c| candidates.contains(c)) {
-                    drop.push((
-                        *c,
-                        format!(
-                            "shares harvester fragment {} with a claim this run does not narrow \
-                             (the cascade would narrow it for both)",
-                            a.pk
-                        ),
-                    ));
-                }
-            }
-        }
-        if drop.is_empty() {
-            break;
-        }
-        for (c, why) in drop {
-            if !candidates.remove(&c) {
-                continue;
-            }
-            left.insert(c, Left::Shared(vec![why]));
-            if let Some(l) = step_of.get(&c) {
-                for m in step_members.get(l).into_iter().flatten() {
-                    if candidates.remove(m) {
-                        left.insert(
-                            *m,
-                            Left::Shared(vec![format!(
-                                "in step lineage {l}, a member of which stays shared"
-                            )]),
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     // ---- the candidates' cascaded rows, as the cascade leaves them ----
     let evidence: Vec<Uuid> = attached
@@ -2023,10 +1955,7 @@ pub async fn plan(
         let n = classify_narrowing(
             conn,
             act,
-            &mut candidates,
-            &mut left,
-            &step_of,
-            &step_members,
+            &candidates,
             &attached,
             &edge_rows,
             &moving_wf,
@@ -2068,21 +1997,13 @@ pub async fn plan(
         // ---- keep: cascaded rows ----
         for a in attached.values() {
             // Another writer's row (114) stays its writer's under `keep`.
-            let foreign = a.writer_owned != Some(true) && (a.tenancy != from || a.shared_outside);
+            let foreign = a.writer_owned != Some(true) && a.tenancy != from;
             if foreign {
                 for c in a.claims.intersection(&candidates) {
                     left.entry(*c).or_insert_with(|| Left::ForeignRow {
                         table: a.table.clone(),
                         id: a.pk.clone(),
-                        state: format!(
-                            "{}{}",
-                            tuple_text(&a.tenancy),
-                            if a.shared_outside {
-                                ", shared with a claim outside the plans"
-                            } else {
-                                ""
-                            }
-                        ),
+                        state: tuple_text(&a.tenancy),
                     });
                 }
             }
@@ -2098,9 +2019,8 @@ pub async fn plan(
             }
         }
         candidates.retain(|c| !left.contains_key(c));
-        // A cascaded row shared by a moving claim and one that stays (a
-        // harvester fragment) would move with the first: the first stays
-        // too, to a fixpoint.
+        // A cascaded row shared by a moving claim and one that stays would
+        // move with the first: the first stays too, to a fixpoint.
         loop {
             let mut more = Vec::new();
             for a in attached.values() {
@@ -3916,7 +3836,7 @@ pub async fn run(
                  each ends ('group', target), whole lineages only; a public generation or unshared \
                  public plan claim holds its lineage (public input is the public act's), and so does \
                  a public derived row; the claims move through the tenancy cascade (derived rows, \
-                 fragments, every edge with a claim endpoint); an edge with no moving claim endpoint \
+                 every edge with a claim endpoint); an edge with no moving claim endpoint \
                  (a workflow's, or one on a moving step's evidence) is written by this tool to the \
                  meet of its endpoints; an edge to a plan claim that stays (SHARED, or another \
                  group's) is co-owned by both groups (CO-OWNED-EDGE); a row the move would hand to \
@@ -3931,7 +3851,7 @@ pub async fn run(
                 out,
                 "RULE: only ('public', source) generations and plan claims change (with --catch-up \
                  also a stray generation's own private ones), and each ends ('group', target); the \
-                 claims narrow through the tenancy cascade (derived rows, fragments, every edge with \
+                 claims narrow through the tenancy cascade (derived rows, every edge with \
                  a claim endpoint; another writer's public row joins the claim's group and loses its \
                  writer_owned flag, which the manifest records; pinned evidence keeps its owner); \
                  an edge with no narrowing claim endpoint (a workflow's, or one on a narrowing \

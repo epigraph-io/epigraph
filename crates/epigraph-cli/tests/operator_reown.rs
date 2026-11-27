@@ -14,9 +14,8 @@
 //!   nothing of it written — the operator's 2026-09-23 directive);
 //! * derived rows written by the linked author AND by a non-linked agent, in
 //!   `evidence`, `mass_functions`, `claim_versions` and `challenges`, plus
-//!   writer-less rows (`reasoning_traces`, `claim_frames` — a composite key —
-//!   `harvester_claim_provenance`), a harvester fragment shared with a held
-//!   claim, and edges (one signed by the non-linked agent, one whose prior
+//!   writer-less rows (`reasoning_traces`, `claim_frames` — a composite key),
+//!   and edges (one signed by the non-linked agent, one whose prior
 //!   owner differs from both endpoints', and one the non-linked agent WROTE,
 //!   which migration 120 owns by its writer's group); since 120 a re-own
 //!   rewrites none of them;
@@ -135,7 +134,6 @@ struct Fx {
     mf_w_personal: Uuid,
     cv_w: Uuid,
     challenge_w: Uuid,
-    frag: Uuid,
     edge_plain: Uuid,
     edge_w: Uuid,
     edge_prior: Uuid,
@@ -316,35 +314,6 @@ async fn seed(pool: &PgPool) -> Fx {
         .await
         .expect("seed claim frame");
 
-    let source: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
-    )
-    .bind(h32(Uuid::new_v4()))
-    .fetch_one(pool)
-    .await
-    .expect("seed harvester source");
-    let frag: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
-                                          visibility) \
-         VALUES ($1, $2, 'fragment text', $3, 'public') RETURNING id",
-    )
-    .bind(source)
-    .bind(h32(Uuid::new_v4()))
-    .bind(WORLD)
-    .fetch_one(pool)
-    .await
-    .expect("seed fragment");
-    for c in [c_world, c_unlinked] {
-        sqlx::query(
-            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
-        )
-        .bind(c)
-        .bind(frag)
-        .execute(pool)
-        .await
-        .expect("seed provenance");
-    }
-
     let edge_plain = fixture::seed_edge(pool, c_world, c_personal).await;
     let edge_w = signed_edge(pool, c_world, c_actor, stranger).await;
     let edge_prior =
@@ -447,7 +416,6 @@ async fn seed(pool: &PgPool) -> Fx {
         mf_w_personal,
         cv_w,
         challenge_w,
-        frag,
         edge_plain,
         edge_w,
         edge_prior,
@@ -487,15 +455,12 @@ const SNAP_TABLES: &[&str] = &[
     "entity_mentions",
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
-    "harvester_claim_provenance",
     "experiment_triples",
     "experiment_entity_mentions",
     "claim_clusters",
     "claim_cluster_membership",
     "claim_neighborhood_membership",
     "claim_signature_revocations",
-    "harvester_fragments",
-    "harvester_sources",
     "edges",
     "factors",
     "recall_events",
@@ -650,7 +615,6 @@ async fn every_propagated_table_has_a_writer_rule(pool: PgPool) {
         .map(|(t, _)| (*t).to_string())
         .collect();
     assert_eq!(derived, ruled);
-    assert!(specs.iter().any(|s| s.name == "harvester_fragments"));
     assert!(specs.iter().any(|s| s.name == "edges"));
     let cf = specs.iter().find(|s| s.name == "claim_frames").unwrap();
     assert_eq!(
@@ -712,7 +676,6 @@ async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
         "{o}"
     );
     assert!(o.contains(&format!("SPILL-WRITER\t{}", fx.stranger)), "{o}");
-    assert!(o.contains("SHARED-FRAGMENTS\t1"), "{o}");
     // The review's finding: `edge_prior` (c_world -> held c_third) is
     // rewritten to the meet although c_third does not move. It must be
     // reported against c_world, and the edges between two MOVING claims
@@ -764,23 +727,8 @@ async fn apply_follow_claim_gives_exact_owners(pool: PgPool) {
         public(t)
     );
     assert_eq!(
-        tenancy(&pool, "harvester_fragments", fx.frag).await,
-        public(t)
-    );
-    assert_eq!(
         tenancy_where(&pool, "claim_frames", "claim_id = $1", fx.c_world).await,
         public(t)
-    );
-    // The held claim's provenance row of the SHARED fragment stays its own.
-    assert_eq!(
-        tenancy_where(
-            &pool,
-            "harvester_claim_provenance",
-            "claim_id = $1",
-            fx.c_unlinked
-        )
-        .await,
-        public(WORLD)
     );
     // Migration 120 (deliberately rewritten: this used to assert every edge
     // re-met to world): a public-to-public re-own never rewrites a public
@@ -1311,17 +1259,11 @@ async fn a_dry_run_holds_no_lock_past_its_batch(pool: PgPool) {
     assert!(!mf.exists(), "a dry run writes no manifest");
 }
 
-/// Two claims in two batches that SHARE rows: a fragment (provenance of both)
-/// and an edge between them, whose tenancy batch 1 changes. The shared rows
-/// are the review's P1 shape.
+/// Two claims in two batches that SHARE a row: an edge between them. The
+/// shared row is the review's P1 shape. (A harvester fragment cited by both
+/// was the second shared row until migration 354 dropped those tables.)
 async fn shared_rows_fixture(pool: &PgPool) -> (Fx, Uuid) {
     let fx = seed(pool).await;
-    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
-        .bind(fx.c_personal)
-        .bind(fx.frag)
-        .execute(pool)
-        .await
-        .expect("share the fragment with c_personal");
     let e =
         fixture::seed_edge_owned_by(pool, fx.c_world, fx.c_personal, "public", fx.retired_group)
             .await;
@@ -1465,11 +1407,12 @@ async fn a_row_changed_by_another_writer_since_the_plan_holds_its_claim(pool: Pg
 }
 
 /// The other direction: a shared row THIS run changed in an earlier batch is
-/// expected, not "changed since the plan". Batch 1 (`c_world`) moves the shared
-/// fragment; batch 2 (`c_personal`) must still move, and a reversal must
-/// restore every row byte-for-byte. Since migration 120 the shared EDGE is not
-/// rewritten by either batch (deliberately rewritten: this used to assert its
-/// meet changed), so the shared fragment is the row this arm exercises.
+/// expected, not "changed since the plan". Batch 2 (`c_personal`) must still
+/// move after batch 1 (`c_world`), and a reversal must restore every row
+/// byte-for-byte. Since migration 120 the shared EDGE is not rewritten by
+/// either batch (deliberately rewritten: this used to assert its meet
+/// changed), and since migration 354 there is no shared fragment for batch 1
+/// to move, so this pins the absence of a false hold over the shared edge.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_row_this_run_moved_in_an_earlier_batch_is_not_a_false_hold(pool: PgPool) {
     let (fx, e) = shared_rows_fixture(&pool).await;
@@ -1560,8 +1503,8 @@ async fn manifests_in_one_reverse_restore_byte_for_byte(pool: PgPool, oldest_fir
 /// Both manifests in ONE `reown-reverse`, given OLDEST first on the command
 /// line: the tool orders them newest-first by header `created_at`, so the
 /// shared rows come back byte-for-byte (review finding: in that order, as two
-/// invocations, the fragment ended on the target and the edge on world, where
-/// both had been on the retired author's group).
+/// invocations, the shared rows ended on the target and on world, where both
+/// had been on the retired author's group).
 #[sqlx::test(migrations = "../../migrations")]
 async fn two_manifests_in_one_reverse_restore_when_given_oldest_first(pool: PgPool) {
     manifests_in_one_reverse_restore_byte_for_byte(pool, true).await;

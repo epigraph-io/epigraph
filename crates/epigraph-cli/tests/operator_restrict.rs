@@ -6,8 +6,7 @@
 //!
 //! A world-owned public claim A (the one that moves) carrying: its own
 //! evidence, a reasoning trace, a claim version, a challenge, a frame
-//! assignment, a harvester fragment shared with a claim B that is not listed,
-//! and ANOTHER WRITER's attachments (writer-owned evidence and a writer-owned
+//! assignment, and ANOTHER WRITER's attachments (writer-owned evidence and a writer-owned
 //! BBA, migration 114). Edges from A: a public edge to B owned by its writer's
 //! group (D8), an edge to a group claim D in group K (meet `('group', K)`), and
 //! an edge to B DECLARED `('group', target)` (the F2 shape that must come back
@@ -108,7 +107,6 @@ struct Fx {
     mf_w: Uuid,
     cv: Uuid,
     challenge: Uuid,
-    frag: Uuid,
     e_ab_writer: Uuid,
     e_ad: Uuid,
     e_ab_declared: Uuid,
@@ -189,35 +187,6 @@ async fn seed(pool: &PgPool) -> Fx {
         .await
         .expect("seed claim frame");
 
-    let source: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
-    )
-    .bind(h32(Uuid::new_v4()))
-    .fetch_one(pool)
-    .await
-    .expect("seed harvester source");
-    let frag: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
-                                          visibility) \
-         VALUES ($1, $2, 'fragment text', $3, 'public') RETURNING id",
-    )
-    .bind(source)
-    .bind(h32(Uuid::new_v4()))
-    .bind(WORLD)
-    .fetch_one(pool)
-    .await
-    .expect("seed fragment");
-    for c in [a, b] {
-        sqlx::query(
-            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
-        )
-        .bind(c)
-        .bind(frag)
-        .execute(pool)
-        .await
-        .expect("seed provenance");
-    }
-
     let e_ab_writer = fixture::seed_edge_owned_by(pool, a, b, "public", stranger_group).await;
     let e_ad = fixture::seed_edge(pool, a, d).await;
     let e_ab_declared = fixture::seed_edge_owned_by(pool, a, b, "group", target).await;
@@ -256,7 +225,6 @@ async fn seed(pool: &PgPool) -> Fx {
         mf_w,
         cv,
         challenge,
-        frag,
         e_ab_writer,
         e_ad,
         e_ab_declared,
@@ -283,15 +251,12 @@ const SNAP_TABLES: &[&str] = &[
     "entity_mentions",
     "ds_combined_beliefs",
     "ds_bayesian_divergence",
-    "harvester_claim_provenance",
     "experiment_triples",
     "experiment_entity_mentions",
     "claim_clusters",
     "claim_cluster_membership",
     "claim_neighborhood_membership",
     "claim_signature_revocations",
-    "harvester_fragments",
-    "harvester_sources",
     "edges",
     "factors",
     "evidence_visibility_pins",
@@ -584,11 +549,6 @@ async fn apply_moves_the_claim_and_everything_that_follows(pool: PgPool) {
     ] {
         assert_eq!(row(&pool, t, id).await, grp(g), "{t} {id}");
     }
-    assert_eq!(
-        row(&pool, "harvester_fragments", fx.frag).await,
-        publ(WORLD),
-        "a fragment that is also B's provenance is a shared NODE: it does not narrow"
-    );
     assert!(!writer_owned(&pool, "evidence", fx.ev_w).await);
     assert!(!writer_owned(&pool, "mass_functions", fx.mf_w).await);
     let cf: (Uuid, String) = sqlx::query_as(
@@ -1682,9 +1642,8 @@ async fn a_claim_whose_evidence_edge_would_widen_is_held(pool: PgPool) {
 
 /// The classification of every table a restriction touches: DEPENDENT rows
 /// (the claim's own) and LINK rows (an association of the claim with another
-/// node) narrow; harvester fragments are NODES and narrow only when every
-/// claim they are the provenance of is restricted with them. A table the
-/// cascade gains without a decision here fails this test.
+/// node) narrow. A table the cascade gains without a decision here fails this
+/// test.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_touched_table_is_classified_node_link_or_dependent(pool: PgPool) {
     use epigraph_cli::operator::restrict::{role_of, Role};
@@ -1718,8 +1677,6 @@ async fn every_touched_table_is_classified_node_link_or_dependent(pool: PgPool) 
         ("evidence", Role::Dependent),
         ("experiment_entity_mentions", Role::Link),
         ("experiment_triples", Role::Dependent),
-        ("harvester_claim_provenance", Role::Link),
-        ("harvester_fragments", Role::SharedNode),
         ("mass_functions", Role::Dependent),
         ("reasoning_traces", Role::Dependent),
         ("triples", Role::Dependent),
@@ -1730,11 +1687,10 @@ async fn every_touched_table_is_classified_node_link_or_dependent(pool: PgPool) 
     assert_eq!(got, want);
 }
 
-/// A cluster, a frame, a shared fragment and the far-end claim and evidence
-/// of A's edges are NODES: after restricting A they are byte-identical, the
-/// other member's link rows are unchanged, and only A's own link rows (graph
-/// cluster membership, k-means assignment, frame assignment, provenance) and
-/// A's edges narrow. A fragment that is A's alone narrows with A. The reversal
+/// A cluster, a frame and the far-end claim and evidence of A's edges are
+/// NODES: after restricting A they are byte-identical, the other member's link
+/// rows are unchanged, and only A's own link rows (graph cluster membership,
+/// k-means assignment, frame assignment) and A's edges narrow. The reversal
 /// restores every row.
 #[sqlx::test(migrations = "../../migrations")]
 async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
@@ -1778,34 +1734,6 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
     .await;
     let ev_b = evidence(&pool, fx.b, "B's evidence").await;
     let x_ee = node_edge(&pool, (fx.ev_a, "evidence"), (ev_b, "evidence"), None).await;
-    let src: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
-    )
-    .bind(h32(Uuid::new_v4()))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let frag_a: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
-                                          visibility) \
-         VALUES ($1, $2, 'A only', $3, 'public') RETURNING id",
-    )
-    .bind(src)
-    .bind(h32(Uuid::new_v4()))
-    .bind(WORLD)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    exec(
-        &pool,
-        &format!(
-            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) \
-             VALUES ('{}', '{frag_a}')",
-            fx.a
-        ),
-    )
-    .await;
-
     let node_rows = |t: &'static str, cond: String| {
         let pool = pool.clone();
         async move {
@@ -1824,7 +1752,6 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
             "claim_cluster_membership",
             "claim_clusters",
             "claim_frames",
-            "harvester_claim_provenance",
             "evidence",
         ] {
             let rows: Vec<String> = sqlx::query_scalar(&format!(
@@ -1841,7 +1768,6 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
     let nodes_before = (
         node_rows("graph_clusters", format!("id = '{gc}'")).await,
         node_rows("frames", format!("id = '{}'", fx.frame)).await,
-        node_rows("harvester_fragments", format!("id = '{}'", fx.frag)).await,
         node_rows("claims", format!("id = '{}'", fx.b)).await,
     );
     let b_before = b_links(pool.clone(), fx.b).await;
@@ -1867,7 +1793,6 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
     let nodes_after = (
         node_rows("graph_clusters", format!("id = '{gc}'")).await,
         node_rows("frames", format!("id = '{}'", fx.frame)).await,
-        node_rows("harvester_fragments", format!("id = '{}'", fx.frag)).await,
         node_rows("claims", format!("id = '{}'", fx.b)).await,
     );
     assert_eq!(nodes_before, nodes_after, "a connected NODE changed");
@@ -1876,12 +1801,7 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
         b_links(pool.clone(), fx.b).await,
         "B's own rows changed"
     );
-    for t in [
-        "claim_cluster_membership",
-        "claim_clusters",
-        "claim_frames",
-        "harvester_claim_provenance",
-    ] {
+    for t in ["claim_cluster_membership", "claim_clusters", "claim_frames"] {
         let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
             "SELECT owner_group_id, visibility::text FROM {t} WHERE claim_id = $1"
         ))
@@ -1895,7 +1815,6 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
             "{t}: A's link rows {rows:?}"
         );
     }
-    assert_eq!(row(&pool, "harvester_fragments", frag_a).await, grp(g));
     assert_eq!(edge(&pool, x_ee).await, (g, "group".into(), None));
     assert_eq!(row(&pool, "evidence", ev_b).await, publ(WORLD));
 
@@ -1909,7 +1828,7 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-batch locks on edges and harvester_fragments (backlog 48f5cb6f)
+// Per-batch locks on edges (backlog 48f5cb6f)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Open (and leave uncommitted) an edge INSERT from `from` to `to` on its own
@@ -2069,18 +1988,11 @@ async fn a_concurrent_edge_insert_on_a_restricted_claim_is_waited_for_and_narrow
         .and_then(|rest| rest.split('\t').next())
         .map(|list| list.split(',').collect())
         .unwrap_or_default();
-    // Only the edge race is exercised above. `harvester_fragments` is pinned
-    // by the printed list alone: its lock is defence in depth, since a
-    // fragment's stamp comes through a `harvester_claim_provenance` insert
-    // whose foreign key to `claims` already waits on the batch's row lock
-    // (`tables::batch_lock_tables`).
-    for t in ["edges", "harvester_fragments"] {
-        assert!(
-            locked.contains(&t),
-            "every batch locks {t}; the plan's LOCKED-PER-BATCH list is {locked:?}\n{}",
-            run.show()
-        );
-    }
+    assert!(
+        locked.contains(&"edges"),
+        "every batch locks edges; the plan's LOCKED-PER-BATCH list is {locked:?}\n{}",
+        run.show()
+    );
 }
 
 /// The dry run runs the same batches (rolled back), so it holds the same

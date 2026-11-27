@@ -142,13 +142,14 @@ struct Fx {
     /// must be LEFT with it.
     s4: Uuid,
     s4b: Uuid,
-    /// S5 and S6 (alpha) are the provenance of one fragment; S6 has an edge to
-    /// the private note PN. Under `keep` that non-public endpoint leaves S6,
-    /// and S5 must stay with it (the cascaded-row fixpoint). A narrowing
-    /// decides by the edge's meet instead (see [`Neighbour`]).
+    /// S5 and S6 (alpha): S6 has an edge to the private note PN. Under `keep`
+    /// that non-public endpoint leaves S6, and S5, which shares no row with it,
+    /// moves. (S5 stayed with S6 through a shared harvester fragment until
+    /// migration 354 dropped those tables; no cascaded row is shared by two
+    /// claims since.) A narrowing decides by the edge's meet instead (see
+    /// [`Neighbour`]).
     s5: Uuid,
     s6: Uuid,
-    frag56: Uuid,
     /// author -> alpha generation 0 `AUTHORED`: structural, world-owned.
     e_authored: Uuid,
     /// alpha generation 0 `executes` S4, S5, S6 (three LEFT claims).
@@ -511,36 +512,6 @@ async fn seed_with(pool: &PgPool, neighbour: Neighbour) -> Fx {
         (pn, e)
     };
 
-    // One fragment, the provenance of S5 and S6, owned like the plan.
-    let hsource: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
-    )
-    .bind(h32(Uuid::new_v4()))
-    .fetch_one(pool)
-    .await
-    .expect("seed harvester source");
-    let frag56: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
-                                          visibility) \
-         VALUES ($1, $2, 'shared fragment', $3, 'public') RETURNING id",
-    )
-    .bind(hsource)
-    .bind(h32(Uuid::new_v4()))
-    .bind(src)
-    .fetch_one(pool)
-    .await
-    .expect("seed fragment");
-    for cl in [s5, s6] {
-        sqlx::query(
-            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
-        )
-        .bind(cl)
-        .bind(frag56)
-        .execute(pool)
-        .await
-        .expect("seed provenance");
-    }
-
     let ev_s1: Uuid = sqlx::query_scalar(
         "INSERT INTO evidence (claim_id, evidence_type, content_hash, raw_content) \
          VALUES ($1, 'document', $2, 'evidence of step one') RETURNING id",
@@ -615,7 +586,6 @@ async fn seed_with(pool: &PgPool, neighbour: Neighbour) -> Fx {
         s4b,
         s5,
         s6,
-        frag56,
         e_authored,
         e_exec_left,
         plan_edges,
@@ -640,8 +610,6 @@ const SNAPSHOT_TABLES: &[&str] = &[
     "groups",
     "group_memberships",
     "operator_links",
-    "harvester_fragments",
-    "harvester_claim_provenance",
     "atlas_layout_epoch",
 ];
 
@@ -899,10 +867,10 @@ async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
         r.show()
     );
     assert!(
-        r.stdout.lines().any(|l| l.starts_with("LEFT-CLAIM\t")
-            && l.contains(&fx.s5.to_string())
-            && l.contains("shared with a plan claim that stays")),
-        "a step sharing a cascaded row with a step that stays, stays (the fixpoint): {}",
+        !r.stdout
+            .lines()
+            .any(|l| l.starts_with("LEFT-CLAIM\t") && l.contains(&fx.s5.to_string())),
+        "a step that shares no row with a left step is not left: {}",
         r.show()
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -953,7 +921,7 @@ async fn apply_moves_only_the_source_groups_rows_and_keeps_visibility(pool: PgPo
         (fx.src, "public".into()),
         "a lineage partly the target's already is held whole"
     );
-    for c in [fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.tb] {
+    for c in [fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.tb, fx.s5] {
         assert_eq!(tenancy(&pool, "claims", c).await, moved, "claim {c}");
     }
     assert_eq!(
@@ -970,18 +938,13 @@ async fn apply_moves_only_the_source_groups_rows_and_keeps_visibility(pool: PgPo
         tenancy(&pool, "claims", fx.y).await,
         (fx.src, "public".into())
     );
-    for c in [fx.s4, fx.s4b, fx.s5, fx.s6] {
+    for c in [fx.s4, fx.s4b, fx.s6] {
         assert_eq!(
             tenancy(&pool, "claims", c).await,
             (fx.src, "public".into()),
             "a left step stays on the source: {c}"
         );
     }
-    assert_eq!(
-        tenancy(&pool, "harvester_fragments", fx.frag56).await,
-        (fx.src, "public".into()),
-        "a fragment shared with a step that stays does not move"
-    );
     assert_eq!(
         tenancy(&pool, "claims", fx.pc).await,
         (fx.src, "group".into())
@@ -1563,11 +1526,6 @@ async fn group_apply_narrows_every_moved_row_into_the_target_and_bumps_the_epoch
     assert_eq!(tenancy(&pool, "edges", fx.e_authored).await, narrowed);
     assert_eq!(tenancy(&pool, "edges", fx.e_s1_y).await, narrowed);
     assert_eq!(
-        tenancy(&pool, "harvester_fragments", fx.frag56).await,
-        narrowed,
-        "a fragment whose every claim narrows narrows with them"
-    );
-    assert_eq!(
         tenancy(&pool, "edges", fx.e_s6_pn).await,
         narrowed,
         "an edge to a row already private to the target stays as it is"
@@ -1807,8 +1765,7 @@ fn catch_up_after(after: &Path) -> Vec<&str> {
 /// In place, every unshared step of a plan narrows. S6's edge to a note that
 /// is already private to the SAME group meets into exactly the tuple it has,
 /// and S3's pinned evidence is already in the group's private state: neither
-/// hands anything to anyone, so neither may keep its step (or, through the
-/// fragment S5 shares with S6, its sibling) public. An edge on a step's
+/// hands anything to anyone, so neither may keep its step public. An edge on a step's
 /// evidence narrows with the step instead of keeping it public. A recorded run
 /// of the plan (`behavioral_executions`) follows its generation's tenancy
 /// (migration 240, backlog 88cf603b): it is counted, narrowed with the plan
@@ -1884,10 +1841,6 @@ async fn in_place_narrowing_leaves_no_unshared_plan_row_public(pool: PgPool) {
         app_reads_claims(&pool, &alpha).await,
         Vec::<String>::new(),
         "an unstamped session still reads a narrowed plan's steps"
-    );
-    assert_eq!(
-        tenancy(&pool, "harvester_fragments", fx.frag56).await,
-        in_place
     );
     assert_eq!(tenancy(&pool, "evidence", ev_pinned).await, in_place);
     assert_eq!(tenancy(&pool, "edges", fx.e_s6_pn).await, in_place);
@@ -2279,9 +2232,7 @@ async fn catch_up_narrows_a_public_generation_ingested_after_an_in_place_narrowi
 /// A step executed by a listed lineage AND by a source-owned public lineage
 /// left off the list is shared, so this run never narrows it. Narrowing the
 /// two lineages in separate runs would leave it public for good, so the dry
-/// run names the split for the operator to rule on. A step sharing a
-/// fragment with a shared step stays with it, reported SHARED (the cascade
-/// would narrow the fragment for both).
+/// run names the split for the operator to rule on.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_dry_run_names_a_step_split_with_an_unlisted_source_lineage(pool: PgPool) {
     let fx = seed(&pool).await;
@@ -2289,35 +2240,6 @@ async fn a_dry_run_names_a_step_split_with_an_unlisted_source_lineage(pool: PgPo
         let mut m = pool.acquire().await.expect("acquire");
         let w = workflow(&mut m, "epsilon", 0, None, fx.src, "public").await;
         edge(&mut m, (w, "workflow"), (fx.s2, "claim"), "executes").await;
-    }
-    let hsource: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
-    )
-    .bind(h32(Uuid::new_v4()))
-    .fetch_one(&pool)
-    .await
-    .expect("seed harvester source");
-    let frag: Uuid = sqlx::query_scalar(
-        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
-                                          visibility) \
-         VALUES ($1, $2, 'fragment of step three and the shared step', $3, 'public') \
-         RETURNING id",
-    )
-    .bind(hsource)
-    .bind(h32(Uuid::new_v4()))
-    .bind(fx.src)
-    .fetch_one(&pool)
-    .await
-    .expect("seed fragment");
-    for cl in [fx.s3, fx.x] {
-        sqlx::query(
-            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
-        )
-        .bind(cl)
-        .bind(frag)
-        .execute(&pool)
-        .await
-        .expect("seed provenance");
     }
     let dir = scratch_dir();
     let manifest = dir.join("m.jsonl");
@@ -2335,15 +2257,6 @@ async fn a_dry_run_names_a_step_split_with_an_unlisted_source_lineage(pool: PgPo
     assert!(
         !line_with(&r.stdout, "SHARED-SPLIT\t", &[&fx.x.to_string()]),
         "X is shared with another team's lineage, not split: {}",
-        r.show()
-    );
-    assert!(
-        line_with(
-            &r.stdout,
-            "LEFT-CLAIM\t",
-            &[&fx.s3.to_string(), "SHARED", &frag.to_string()]
-        ),
-        "a step sharing a fragment with a shared step stays with it: {}",
         r.show()
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -3290,10 +3203,6 @@ async fn a_private_move_carries_a_narrowed_plan_between_groups_and_reverses_exac
     }
     assert_eq!(tenancy(&pool, "evidence", fx.ev_s1).await, in_target);
     assert_eq!(tenancy(&pool, "mass_functions", fx.mf_s2).await, in_target);
-    assert_eq!(
-        tenancy(&pool, "harvester_fragments", fx.frag56).await,
-        in_target
-    );
     for e in &fx.plan_edges {
         assert_eq!(edge_tenancy(&pool, *e).await.0, fx.target, "plan edge {e}");
     }

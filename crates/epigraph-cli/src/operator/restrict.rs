@@ -20,8 +20,7 @@
 //! a re-run resumes where the last one stopped.
 //!
 //! A claim is also HELD when a row it would carry is NOT public and NOT already
-//! the target's: a derived row, a harvester fragment, or an edge touching it
-//! that is `('group', H)` for some other group H (or co-owned). The tenancy
+//! the target's: a derived row or an edge touching it that is `('group', H)` for some other group H (or co-owned). The tenancy
 //! trigger would move that row into the target, i.e. make H's row readable by
 //! the target's members. The one exception is PINNED evidence (migration 110):
 //! the trigger leaves its owner and its `group` visibility exactly as they are.
@@ -34,9 +33,8 @@
 //! other writers' rows included: a narrowing takes a writer-owned row into the
 //! claim's group and clears its `writer_owned` flag, migration 114, except an
 //! outsider's writer-owned challenge, which stays the challenger's, migration
-//! 168), onto the
-//! harvester fragments it is the provenance of, and re-meets every edge with
-//! the claim as an endpoint (migration 122's edges arm).
+//! 168), and re-meets every edge with the claim as an endpoint (migration
+//! 122's edges arm).
 //!
 //! # Nodes stay; dependent and link rows narrow
 //!
@@ -45,11 +43,8 @@
 //! DEPENDENT rows and every LINK row (an edge, a cluster, frame or
 //! neighbourhood assignment, an entity mention, a provenance link) narrow; the
 //! node at the other end (another claim, its evidence, a frame, a cluster, an
-//! entity) is never written. The one NODE the cascade itself reaches is a
-//! harvester fragment (through its provenance link): the trigger narrows it,
-//! and this tool puts it back in the same transaction unless every claim it is
-//! the provenance of ends in the target. The census then proves no other row
-//! of any table changed.
+//! entity) is never written. The census then proves no other row of any table
+//! changed.
 //!
 //! # Edges with an evidence endpoint
 //!
@@ -68,8 +63,8 @@
 //! # Locks held by every batch
 //!
 //! Apply, dry run and reverse alike: the batch's claims `FOR UPDATE`, then
-//! `SHARE ROW EXCLUSIVE` on `edges`, `harvester_fragments` and the derived
-//! tables with no key to claims (`tables::batch_lock_tables`, printed as
+//! `SHARE ROW EXCLUSIVE` on `edges` and the derived tables with no key to
+//! claims (`tables::batch_lock_tables`, printed as
 //! `LOCKED-PER-BATCH`), as `regroup-claims` does. Without the `edges` lock,
 //! an edge INSERT on a moving claim that its trigger stamped from the claim's
 //! PUBLIC tuple before the batch committed would land public on a claim the
@@ -77,11 +72,8 @@
 //! `claims`, so nothing else makes it wait). With it, such an insert either
 //! commits before the batch reads its rows (and is narrowed with them) or
 //! waits until the batch commits (and is stamped from the narrowed claim).
-//! The `harvester_fragments` lock is defence in depth: a fragment is stamped
-//! through a `harvester_claim_provenance` insert, whose foreign key to
-//! `claims` already serialises against the batch's `FOR UPDATE`
-//! (`tables::batch_lock_tables`). Cost: every edge and fragment write on the
-//! instance waits while a batch runs, dry runs included; keep batches short.
+//! Cost: every edge write on the instance waits while a batch runs, dry runs
+//! included; keep batches short.
 //!
 //! # The manifest records every row's full prior tenancy
 //!
@@ -101,7 +93,7 @@
 //!   immediately before that one statement and cleared immediately after it,
 //!   and the statement's payload is only the claims whose RECORDED prior
 //!   visibility is `public`.
-//! * Every recorded derived row and fragment is put back on its OWN recorded
+//! * Every recorded derived row is put back on its OWN recorded
 //!   tuple (writer-owned rows get their writer's group and their flag back).
 //! * Every recorded EDGE is put back on its own recorded tuple, never on a meet
 //!   recomputed from its endpoints (a declared `('group', H)` edge
@@ -174,17 +166,13 @@ pub enum Role {
     /// A row that belongs to the claim alone (keyed by its `claim_id`).
     Dependent,
     /// A row associating the claim with another node (an edge, a cluster or
-    /// frame or neighbourhood assignment, an entity mention, a provenance
-    /// link). The other node is not touched.
+    /// frame or neighbourhood assignment, an entity mention). The other node
+    /// is not touched.
     Link,
-    /// A node the cascade reaches through a link (a harvester fragment through
-    /// its provenance): it narrows only when EVERY claim it is the provenance
-    /// of is restricted into the target; otherwise it keeps its tuple.
-    SharedNode,
 }
 
-/// The [`Role`] of every table `epigraph_propagate_tenancy` (plus `claims`,
-/// fragments and edges) touches. A closed list: a table the cascade gains is
+/// The [`Role`] of every table `epigraph_propagate_tenancy` (plus `claims`
+/// and edges) touches. A closed list: a table the cascade gains is
 /// refused until it is classified here.
 pub const TABLE_ROLES: &[(&str, Role)] = &[
     ("claims", Role::Dependent),
@@ -204,9 +192,7 @@ pub const TABLE_ROLES: &[(&str, Role)] = &[
     ("claim_clusters", Role::Link),
     ("claim_cluster_membership", Role::Link),
     ("claim_neighborhood_membership", Role::Link),
-    ("harvester_claim_provenance", Role::Link),
     ("edges", Role::Link),
-    ("harvester_fragments", Role::SharedNode),
 ];
 
 /// The classification of `table`, if it has one.
@@ -748,7 +734,6 @@ pub async fn fetch_evidence_edges(
                 },
                 writer: r.get(8),
                 endpoints_public: None,
-                shared_outside: false,
                 neighbours,
                 writer_owned: None,
                 evidence_type: None,
@@ -1137,7 +1122,7 @@ async fn run_batch(
 
     // ---- rows the cascade would WIDEN, or that went stale ----
     // Each row's state after the move is predicted as the trigger computes it:
-    // a derived row or fragment takes ('group', target) unless it is pinned
+    // a derived row takes ('group', target) unless it is pinned
     // evidence (unchanged); an edge takes the meet of its endpoints with every
     // candidate claim (and its unpinned evidence) on ('group', target). A row
     // whose predicted reader set is not a SUBSET of its current one (another
@@ -1156,26 +1141,6 @@ async fn run_batch(
         }
     };
     let in_target = (ctx.target, "group".to_string());
-    // A fragment is a NODE (Role::SharedNode): it narrows only if every claim
-    // it is the provenance of ends in the target (a candidate, or a claim
-    // already there). Otherwise it keeps its tuple.
-    let frag_neighbours: Vec<Uuid> = attached
-        .values()
-        .filter(|a| a.table == "harvester_fragments")
-        .flat_map(|a| a.neighbours.iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let already_in_target: BTreeSet<Uuid> = fetch_claims(conn, &frag_neighbours, false)
-        .await?
-        .into_iter()
-        .filter(|c| c.owner == ctx.target && c.visibility == "group")
-        .map(|c| c.id)
-        .collect();
-    let fragment_narrows = |a: &Attached, moving: &BTreeSet<Uuid>| -> bool {
-        a.claims.iter().all(|c| moving.contains(c))
-            && a.neighbours.iter().all(|c| already_in_target.contains(c))
-    };
     let mut hold: BTreeMap<Uuid, Hold> = BTreeMap::new();
     for (k, a) in &attached {
         let predicted = match spec_of(ctx.specs, &k.0).kind {
@@ -1200,7 +1165,6 @@ async fn run_batch(
             // Migration 168 (R-CH1): an outsider's challenge is the
             // challenger's and the cascade never moves it.
             _ if is_outsider_challenge(&k.0, a.writer_owned) => Some(a.tenancy.clone()),
-            Kind::Fragments if !fragment_narrows(a, &cand_set) => Some(a.tenancy.clone()),
             _ => Some(Tenancy {
                 owner: ctx.target,
                 visibility: "group".into(),
@@ -1253,11 +1217,6 @@ async fn run_batch(
         .filter(|(_, a)| a.claims.iter().any(|c| moving.contains(c)))
         .collect();
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
-    let kept_nodes: BTreeSet<RowKey> = s0
-        .iter()
-        .filter(|(_, a)| a.table == "harvester_fragments" && !fragment_narrows(a, &moving))
-        .map(|(k, _)| k.clone())
-        .collect();
 
     // ---- manifest first: every prior, fsynced before the write ----
     let mut prior: Vec<Record> = eligible
@@ -1303,23 +1262,6 @@ async fn run_batch(
     .context("UPDATE claims")?
     .rows_affected();
 
-    // NODES the cascade reached and must not narrow: back on their tuple.
-    let mid = states_of(conn, ctx.specs, &claim_ids, &kept_nodes).await?;
-    let node_writes: Vec<(String, RowState)> = kept_nodes
-        .iter()
-        .filter_map(|k| {
-            let a = s0.get(k)?;
-            (mid.get(k) != Some(&RowState::of(a))).then(|| (k.1.clone(), RowState::of(a)))
-        })
-        .collect();
-    let nodes_restored = write_rows(
-        conn,
-        spec_of(ctx.specs, "harvester_fragments"),
-        &claim_ids,
-        &node_writes,
-    )
-    .await?;
-
     // The evidence-endpoint edges: the narrowest of their endpoints NOW.
     let ev_keys_moving: BTreeSet<RowKey> = keys.intersection(&ev_edge_keys).cloned().collect();
     let ends_ev = edge_ends(conn, &edge_ids(&ev_keys_moving)).await?;
@@ -1364,7 +1306,7 @@ async fn run_batch(
             ));
         }
     }
-    // (2) derived rows and fragments follow the claim, pinned evidence is
+    // (2) derived rows follow the claim, pinned evidence is
     // unchanged; (3) every edge is the meet of its endpoints now.
     let mut planned: BTreeMap<String, usize> = BTreeMap::new();
     let mut actual: BTreeMap<String, usize> = BTreeMap::new();
@@ -1408,7 +1350,6 @@ async fn run_batch(
             },
             _ if k.0 == "evidence" && pinned.contains(&k.1) => before.clone(),
             _ if is_outsider_challenge(&k.0, a.writer_owned) => before.clone(),
-            _ if kept_nodes.contains(k) => before.clone(),
             _ => RowState {
                 tenancy: Tenancy {
                     owner: ctx.target,
@@ -1471,13 +1412,6 @@ async fn run_batch(
         "claims".into(),
         (0, i64::try_from(claim_ids.len()).unwrap_or(i64::MAX), 0),
     );
-    if nodes_restored > 0 {
-        // The cascade narrowed them and this batch put them back: two updates.
-        expect_counts
-            .entry("harvester_fragments".into())
-            .or_default()
-            .1 += 2 * i64::try_from(nodes_restored).unwrap_or(i64::MAX);
-    }
     for (t, n) in &planned {
         expect_counts.entry(t.clone()).or_default().1 += i64::try_from(*n).unwrap_or(i64::MAX);
     }
@@ -1717,7 +1651,7 @@ pub async fn run(
     )?;
     writeln!(
         out,
-        "RULE: every derived row, fragment and edge of a moved claim follows it into the target \
+        "RULE: every derived row and edge of a moved claim follows it into the target \
          (other writers' rows included; a writer-owned row loses its flag, and the manifest \
          records it); pinned evidence and an outsider's writer-owned challenge are unchanged; a \
          claim carrying a non-public row that is not the target's is HELD"

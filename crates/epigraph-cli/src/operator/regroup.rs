@@ -24,7 +24,7 @@
 //! A claim is also HELD, WHOLE, when a row it carries would not follow it
 //! cleanly, so a claim is never moved partially:
 //!
-//! * `public-row`: a public derived row, fragment or edge. The cascade would
+//! * `public-row`: a public derived row or edge. The cascade would
 //!   narrow it into the target; this tool does not touch public rows.
 //! * `third-group`: a row owned by a group that is neither the source nor the
 //!   target (another writer's row: the cascade would carry it into the target).
@@ -52,16 +52,12 @@
 //!
 //! One `UPDATE claims SET owner_group_id = TARGET` (visibility stays `group`).
 //! `epigraph_propagate_tenancy` copies the new owner onto every derived row
-//! (writer-owned ones too, clearing their flag, migration 114), onto the
-//! harvester fragments the claim is the provenance of, and re-meets every edge
-//! with the claim as an endpoint (migration 122's edges arm):
+//! (writer-owned ones too, clearing their flag, migration 114), and re-meets
+//! every edge with the claim as an endpoint (migration 122's edges arm):
 //!
 //! * a derived row that is `('group', SOURCE)` becomes `('group', TARGET)`;
 //! * an OUTSIDER's challenge (migration 168) is the challenger's and stays as
 //!   it is (its readability follows the claim, migration 168);
-//! * a fragment the claim shares with a claim that does not end in the target
-//!   is a NODE: the cascade narrows it and this tool puts it back, in the same
-//!   transaction, as `restrict-claims` does;
 //! * an edge takes the EXACT MEET of its endpoints: the INSERT rule, applied
 //!   to what each endpoint is. An edge whose other end is a claim or evidence
 //!   that stays in the source becomes `('group', TARGET, co-owner SOURCE)` (or
@@ -128,18 +124,18 @@
 //!
 //! # Invariants checked in every batch, before its commit
 //!
-//! Each batch first holds `SHARE ROW EXCLUSIVE` on `edges`,
-//! `harvester_fragments` and the derived tables with no key to claims
-//! (`LOCKED-PER-BATCH`), so a concurrent INSERT on a moving claim either
-//! commits before the batch reads its rows or is stamped after the move: no
-//! edge or fragment lands on the pre-move tuple behind the batch. That blocks
+//! Each batch first holds `SHARE ROW EXCLUSIVE` on `edges` and the derived
+//! tables with no key to claims (`LOCKED-PER-BATCH`), so a concurrent INSERT
+//! on a moving claim either commits before the batch reads its rows or is
+//! stamped after the move: no edge lands on the pre-move tuple behind the
+//! batch. That blocks
 //! every write to those tables on the instance while a batch runs. Each
 //! `BATCH` line prints how long its transaction held those locks (`locks
 //! held <ms> ms`; for a batch whose every claim `--refuse-irreversible`
 //! held, the longest of its probes, which take the same locks) and the
 //! result prints the longest over every transaction, probes included
 //! (`longest lock hold`):
-//! about the stall a concurrent edge or fragment writer sees, per batch (it
+//! about the stall a concurrent edge writer sees, per batch (it
 //! is timed from the transaction's begin, so a wait to acquire the locks is
 //! included). A dry run takes the same locks for the same reads and writes,
 //! but an apply also fsyncs the manifest and commits while holding them, so
@@ -709,7 +705,6 @@ async fn fetch_node_edges(
                 },
                 writer,
                 endpoints_public: None,
-                shared_outside: false,
                 neighbours,
                 writer_owned: None,
                 evidence_type: None,
@@ -948,19 +943,7 @@ struct Ctx<'a> {
 struct Classified {
     attached: Snapshot,
     pinned: BTreeSet<String>,
-    already_in_target: BTreeSet<Uuid>,
     hold: BTreeMap<Uuid, Hold>,
-}
-
-impl Classified {
-    /// A fragment narrows (moves) only when every claim it is the provenance
-    /// of ends in the target: one of `moving`, or one already there.
-    fn fragment_moves(&self, a: &Attached, moving: &BTreeSet<Uuid>) -> bool {
-        a.claims.iter().all(|c| moving.contains(c))
-            && a.neighbours
-                .iter()
-                .all(|c| self.already_in_target.contains(c))
-    }
 }
 
 /// The evidence rows among `ids` that are sealed (an `evidence_encryption`
@@ -1092,23 +1075,9 @@ async fn classify_rows(
     }
     let sealed_edges = sealed_edges_of(conn, &edge_ids(&keys)).await?;
     let ends = ends_of(conn, ctx.nodes, &edge_ids(&keys)).await?;
-    let frag_neighbours: Vec<Uuid> = attached
-        .values()
-        .filter(|a| a.table == "harvester_fragments")
-        .flat_map(|a| a.neighbours.iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let already_in_target: BTreeSet<Uuid> = fetch_claims(conn, &frag_neighbours, false)
-        .await?
-        .into_iter()
-        .filter(|c| c.owner == ctx.target && c.visibility == GROUP)
-        .map(|c| c.id)
-        .collect();
     let mut cl = Classified {
         attached: Snapshot::new(),
         pinned,
-        already_in_target,
         hold: BTreeMap::new(),
     };
     let moves = |(id, ty): &(Uuid, String)| -> bool {
@@ -1185,7 +1154,6 @@ async fn classify_rows(
             // Migration 168: an outsider's challenge is the challenger's; the
             // cascade leaves it, and so does this act.
             _ if is_outsider_challenge(&k.0, a.writer_owned) => None,
-            Kind::Fragments if !cl.fragment_moves(a, cands) => None,
             _ if a.tenancy.visibility == PUBLIC => Some(Hold::PublicRow {
                 table: k.0.clone(),
                 id: k.1.clone(),
@@ -1230,7 +1198,6 @@ fn wanted(
     cl: &Classified,
     k: &RowKey,
     a: &Attached,
-    kept_nodes: &BTreeSet<RowKey>,
     ends: &BTreeMap<String, super::restrict::EdgeEnds>,
 ) -> Result<RowState, String> {
     let spec = spec_of(ctx.specs, &k.0);
@@ -1252,7 +1219,6 @@ fn wanted(
         },
         _ if k.0 == "evidence" && cl.pinned.contains(&k.1) => Ok(before),
         _ if is_outsider_challenge(&k.0, a.writer_owned) => Ok(before),
-        _ if kept_nodes.contains(k) => Ok(before),
         _ => Ok(RowState {
             tenancy: tenancy(ctx.target),
             writer_owned: spec.writer_owned.then_some(false),
@@ -1402,11 +1368,6 @@ async fn run_batch(
         .map(|(k, a)| (k.clone(), a.clone()))
         .collect();
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
-    let kept_nodes: BTreeSet<RowKey> = s0
-        .iter()
-        .filter(|(_, a)| a.table == "harvester_fragments" && !cl.fragment_moves(a, &moving))
-        .map(|(k, _)| k.clone())
-        .collect();
 
     // ---- manifest first: every prior, fsynced before the write ----
     let mut prior: Vec<Record> = eligible
@@ -1443,23 +1404,6 @@ async fn run_batch(
     .await
     .context("UPDATE claims")?
     .rows_affected();
-
-    // NODES the cascade reached and must not move: back on their tuple.
-    let mid = states_of(conn, ctx.specs, &claim_ids, &kept_nodes).await?;
-    let node_writes: Vec<(String, RowState)> = kept_nodes
-        .iter()
-        .filter_map(|k| {
-            let a = s0.get(k)?;
-            (mid.get(k) != Some(&RowState::of(a))).then(|| (k.1.clone(), RowState::of(a)))
-        })
-        .collect();
-    let nodes_restored = write_rows(
-        conn,
-        spec_of(ctx.specs, "harvester_fragments"),
-        &claim_ids,
-        &node_writes,
-    )
-    .await?;
 
     // Every edge: the EXACT meet of its endpoints now. The trigger re-met the
     // claim-endpoint edges, but with a node endpoint (a workflow, a frame...)
@@ -1526,7 +1470,7 @@ async fn run_batch(
     for (k, a) in &s0 {
         let before = RowState::of(a);
         rows_before.insert(k.clone(), (before.tenancy.clone(), a.claim));
-        let want = match wanted(ctx, &cl, k, a, &kept_nodes, &ends) {
+        let want = match wanted(ctx, &cl, k, a, &ends) {
             Ok(w) => w,
             Err(e) => {
                 v.push(e);
@@ -1570,12 +1514,6 @@ async fn run_batch(
         "claims".into(),
         (0, i64::try_from(claim_ids.len()).unwrap_or(i64::MAX), 0),
     );
-    if nodes_restored > 0 {
-        expect_counts
-            .entry("harvester_fragments".into())
-            .or_default()
-            .1 += 2 * i64::try_from(nodes_restored).unwrap_or(i64::MAX);
-    }
     for (t, n) in planned.iter().filter(|(t, _)| t.as_str() != "edges") {
         expect_counts.entry(t.clone()).or_default().1 += i64::try_from(*n).unwrap_or(i64::MAX);
     }
@@ -1885,7 +1823,7 @@ pub struct RunReport {
 /// The per-transaction lock-hold times of a run: every batch transaction
 /// (and every `--refuse-irreversible` probe) holds `SHARE ROW EXCLUSIVE` on
 /// the `LOCKED-PER-BATCH` tables from its first statement to its end, which
-/// is the longest any edge or fragment write on the instance waits on it.
+/// is the longest any edge write on the instance waits on it.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct LockHold {
     pub transactions: usize,
@@ -2124,8 +2062,8 @@ pub async fn run(
         "RULE: every row that follows a moved claim goes from ('group', source) to ('group', \
          target); an edge takes the exact meet of its endpoints (an end that stays in the source, \
          a claim or evidence (CO-OWNED-EDGE) or a group-private node such as a workflow or frame \
-         (SOURCE-NODE-EDGE), makes it co-owned); a shared fragment and an outsider's challenge \
-         stay as they are; a sealed claim (a claim_encryption or claim_version_encryption row) \
+         (SOURCE-NODE-EDGE), makes it co-owned); an outsider's challenge \
+         stays as it is; a sealed claim (a claim_encryption or claim_version_encryption row) \
          is HELD, and so, whole, is a claim with a public, pinned, sealed-evidence, sealed-edge \
          (an edge_encryption row the move would re-tuple) or third-group row; nothing becomes \
          public"
@@ -2390,8 +2328,8 @@ pub async fn run(
     writeln!(
         out,
         "  longest lock hold: {} ms over {} transaction(s) at --batch-size {} (each from the \
-         transaction's begin, lock waits included, to its commit or rollback: every edge and \
-         fragment write on the instance may wait about this long per batch; an apply also \
+         transaction's begin, lock waits included, to its commit or rollback: every edge \
+         write on the instance may wait about this long per batch; an apply also \
          fsyncs the manifest and commits while holding the locks, so a dry run's figure is a \
          lower bound)",
         report.lock_hold.max_ms, report.lock_hold.transactions, opts.batch_size

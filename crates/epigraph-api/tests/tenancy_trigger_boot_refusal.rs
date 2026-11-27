@@ -1,52 +1,34 @@
 #![cfg(feature = "db")]
-//! `AppState::assert_tenancy_triggers_armed` refuses a database whose migration
-//! 089 stamping trigger has been removed — finding `F-089-G`.
+//! `AppState::assert_tenancy_triggers_armed` refuses a database whose
+//! marker-gated stamping triggers have been removed, and boots one that is
+//! legitimately behind.
 //!
-//! Until now the boot assertion was asymmetric: a *disabled* 089 trigger was
-//! refused (the `disabled` half of the check is built from the LIKE-matched
-//! catalog rows, which its name matches), while a *dropped* one was not,
-//! because 089's trigger appeared in no required list. Absence therefore
-//! reverted to the pre-089 status quo with nothing said about it.
-//!
-//! # These three cases are one test each, and the third is the point
+//! # Each tier is three cases, and the third is the point
 //!
 //! A required-set entry is easy to get wrong in the direction of refusing a
 //! database that is legitimately behind — which is the outage the staged design
-//! exists to prevent, not a safe default. So:
+//! exists to prevent, not a safe default. So, per tier:
 //!
 //! 1. a database at head boots (over-refusal is silent and total);
-//! 2. trigger dropped, 089's function still present → refuses;
-//! 3. trigger AND function dropped → boots.
+//! 2. trigger dropped, the migration's marker function still present → refuses;
+//! 3. trigger AND marker functions dropped → boots.
 //!
 //! Case 3 is what discriminates a marker-gated tier from an unconditional
 //! entry. An unconditional entry in `TENANCY_TRIGGERS_070` passes cases 1 and 2
-//! and fails case 3 — and a database that never ran 089 is exactly the
-//! population that entry would have refused.
+//! and fails case 3 — and a database that never ran the migration is exactly
+//! the population that entry would have refused.
+//!
+//! The 089 and 173 tiers (the harvester tables' stamping triggers, finding
+//! `F-089-G`) and their cases left with those tables in migration 354. A
+//! database below 354 still carries them, and the binary boots there too
+//! ([`a_database_below_354_boots`]): the binary deploys before the migration.
 
 use epigraph_api::{ApiConfig, AppState};
+use sqlx::migrate::Migrator;
 use sqlx::PgPool;
+use std::borrow::Cow;
 
-/// 089's trigger, and the function it is gated on. Spelled here rather than
-/// imported: the constants under test are private to `state.rs`, and a test
-/// that shares its subject's spelling cannot detect a typo in it.
-const TRIGGER: &str = "harvester_claim_provenance_fragment_inherit_tenancy";
-const MARKER_FN: &str = "epigraph_inherit_fragment_tenancy_stmt";
-
-async fn drop_trigger(pool: &PgPool) {
-    sqlx::query(&format!(
-        "DROP TRIGGER {TRIGGER} ON public.harvester_claim_provenance"
-    ))
-    .execute(pool)
-    .await
-    .expect("drop 089 trigger");
-}
-
-async fn drop_marker_fn(pool: &PgPool) {
-    sqlx::query(&format!("DROP FUNCTION public.{MARKER_FN}()"))
-        .execute(pool)
-        .await
-        .expect("drop 089 marker function");
-}
+static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 /// Positive direction. A fix that refuses every database passes any negative
 /// test, so this one runs first.
@@ -59,118 +41,35 @@ async fn a_database_at_head_boots(pool: PgPool) {
     );
 }
 
-/// The finding. Assert the EFFECT — the refusal names the missing trigger —
-/// rather than merely that an error came back.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_dropped_089_trigger_is_refused(pool: PgPool) {
-    drop_trigger(&pool).await;
-
-    let state = AppState::with_db(pool, ApiConfig::default());
-    let err = state
-        .assert_tenancy_triggers_armed()
-        .await
-        .expect_err("a database at 089 with the stamping trigger removed must not serve");
-    let msg = err.to_string();
-    assert!(
-        msg.contains(TRIGGER),
-        "the refusal must name the trigger an operator has to restore; got: {msg}"
-    );
-}
-
-/// The discriminator. A database that never ran 089 — or one reverted by 089's
-/// own documented reversal, which drops the trigger and then the function — is
-/// behind, not broken, and must still boot.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_database_without_089_at_all_still_boots(pool: PgPool) {
-    drop_trigger(&pool).await;
-    drop_marker_fn(&pool).await;
-
-    let state = AppState::with_db(pool, ApiConfig::default());
-    assert!(
-        state.assert_tenancy_triggers_armed().await.is_ok(),
-        "089's trigger must be required only where 089's marker says 089 ran; requiring it \
-         unconditionally refuses every database that has not reached 089 yet, which is the \
-         staged-deploy outage the tier split exists to prevent"
-    );
-}
-
-// ===========================================================================
-// Migration 173's tier: the harvester neighbours' stamping triggers
-// ===========================================================================
-//
-// The same three cases for 173. Its triggers keep `harvester_sources` and
-// `harvester_audit_reports` no more readable than their fragments; losing the
-// follow trigger in particular re-opens the audit of a narrowed fragment
-// without any error. 173 installs two functions, and either one present means
-// 173 ran: a revert that drops one trigger with its own function still leaves
-// the other behind.
-
-/// 173's triggers as `(relation, trigger)`, spelled here for the same reason as
-/// [`TRIGGER`].
-const TRIGGERS_173: &[(&str, &str)] = &[
-    ("harvester_sources", "harvester_sources_require_tenancy"),
-    (
-        "harvester_audit_reports",
-        "harvester_audit_reports_inherit_tenancy",
-    ),
-    (
-        "harvester_fragments",
-        "harvester_fragments_audit_reports_inherit_tenancy",
-    ),
-];
-const STAMP_FN_173: &str = "epigraph_audit_report_inherit_tenancy";
-const FOLLOW_FN_173: &str = "epigraph_fragment_audit_reports_follow";
-
-async fn drop_173_triggers(pool: &PgPool) {
-    for (rel, tg) in TRIGGERS_173 {
-        sqlx::query(&format!("DROP TRIGGER {tg} ON public.{rel}"))
-            .execute(pool)
+/// Deploy order: this binary goes out BEFORE migration 354 drops the harvester
+/// tables, so it must boot on a database that still has them and their
+/// stamping triggers.
+#[sqlx::test(migrations = false)]
+async fn a_database_below_354_boots(pool: PgPool) {
+    let below = Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version < 354)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    below.run(&pool).await.expect("migrate below 354");
+    let still_there: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.harvester_fragments') IS NOT NULL")
+            .fetch_one(&pool)
             .await
-            .unwrap_or_else(|e| panic!("drop 173 trigger {tg}: {e}"));
-    }
-}
-
-async fn drop_173_fn(pool: &PgPool, name: &str) {
-    sqlx::query(&format!("DROP FUNCTION public.{name}()"))
-        .execute(pool)
-        .await
-        .unwrap_or_else(|e| panic!("drop 173 function {name}: {e}"));
-}
-
-/// The finding: dropped 173 triggers are refused, each one named. The follow
-/// function is dropped too, so the refusal also holds when only one of 173's
-/// two functions is left to say that 173 ran.
-#[sqlx::test(migrations = "../../migrations")]
-async fn dropped_173_triggers_are_refused(pool: PgPool) {
-    drop_173_triggers(&pool).await;
-    drop_173_fn(&pool, FOLLOW_FN_173).await;
-
-    let state = AppState::with_db(pool, ApiConfig::default());
-    let err = state
-        .assert_tenancy_triggers_armed()
-        .await
-        .expect_err("a database at 173 with its stamping triggers removed must not serve");
-    let msg = err.to_string();
-    for (rel, tg) in TRIGGERS_173 {
-        assert!(
-            msg.contains(&format!("{rel}.{tg}")),
-            "the refusal must name {rel}.{tg}; got: {msg}"
-        );
-    }
-}
-
-/// The discriminator: a database without 173 (both functions gone, as 173's
-/// documented undo leaves it) is behind, not broken, and boots.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_database_without_173_at_all_still_boots(pool: PgPool) {
-    drop_173_triggers(&pool).await;
-    drop_173_fn(&pool, FOLLOW_FN_173).await;
-    drop_173_fn(&pool, STAMP_FN_173).await;
-
+            .expect("probe");
+    assert!(still_there, "CALIBRATION: below 354 the tables exist");
     let state = AppState::with_db(pool, ApiConfig::default());
     assert!(
         state.assert_tenancy_triggers_armed().await.is_ok(),
-        "173's triggers must be required only where one of 173's functions says 173 ran"
+        "a database below 354 must boot: the binary deploys before the migration"
     );
 }
 
@@ -183,7 +82,9 @@ async fn a_database_without_173_at_all_still_boots(pool: PgPool) {
 // readable set, no epoch moves, and a stored map keeps reporting itself
 // current. 210 has three functions, and any one present means 210 ran.
 
-/// 210's staleness triggers, spelled here for the same reason as [`TRIGGER`].
+/// 210's staleness triggers. Spelled here rather than imported: the constants
+/// under test are private to `state.rs`, and a test that shares its subject's
+/// spelling cannot detect a typo in it.
 const STALE_TRIGGERS_210: &[(&str, &str)] = &[
     ("claims", "claims_atlas_map_stale"),
     ("edges", "edges_atlas_map_stale"),
@@ -265,7 +166,7 @@ async fn a_database_with_210_undone_still_boots(pool: PgPool) {
 // recorded runs stay readable to its old readers. 240 has three functions,
 // and any one present means 240 ran.
 
-/// 240's triggers, spelled here for the same reason as [`TRIGGER`].
+/// 240's triggers, spelled here for the same reason as [`STALE_TRIGGERS_210`].
 const TRIGGERS_240: &[(&str, &str)] = &[
     (
         "behavioral_executions",
