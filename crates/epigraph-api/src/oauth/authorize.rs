@@ -243,15 +243,12 @@ pub async fn callback_endpoint(
     let user = provision_external_user_client(&state, provider.as_ref(), &identity).await?;
 
     // 4. Compute requested ∩ grantable scopes (server-side only).
-    let requested: Vec<String> = session
-        .scope
-        .as_deref()
-        .unwrap_or("")
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
+    //    A retired scope (`epigraph_auth::RETIRED_SCOPES`) asked for is dropped,
+    //    and none is put to the person for consent (no grant mints one).
+    let requested: Vec<String> =
+        epigraph_auth::requested_scopes(session.scope.as_deref()).unwrap_or_default();
     let grantable: Vec<String> = if requested.is_empty() {
-        user.granted_scopes.clone()
+        epigraph_auth::without_retired_scopes(user.granted_scopes.clone())
     } else {
         requested
             .into_iter()

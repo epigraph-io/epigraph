@@ -4,6 +4,9 @@
 //!
 //! # What it decides
 //!
+//! * Every grant drops the retired scopes (`epigraph_auth::RETIRED_SCOPES`):
+//!   a client or chain that still holds one keeps working, and the token
+//!   simply does not carry it.
 //! * Every grant but the elevate grant drops `platform:admin` (only an
 //!   elevated token carries it; `epigraph_auth::JwtConfig::issue_access_token`
 //!   drops it too, the inner chokepoint).
@@ -107,6 +110,7 @@ pub async fn grantable(
 ) -> Vec<String> {
     use epigraph_db::{AdminScopeEnforcement, AdminScopeSwitch};
 
+    let scopes = epigraph_auth::without_retired_scopes(scopes);
     if grant == MintGrant::Elevate {
         return crate::oauth::token::elevated_scopes(&scopes);
     }
@@ -156,7 +160,8 @@ pub async fn grantable(
 /// The scopes a NEW refresh chain stores: the consented set a grant minted
 /// from (the code's consent, the request's intersection with the grant),
 /// BEFORE [`grantable`]'s switch-dependent strip, less `platform:admin` (no
-/// non-elevated mint ever carries it, so the chain has no use for it).
+/// non-elevated mint ever carries it, so the chain has no use for it) and
+/// less the retired scopes (no mint carries them).
 ///
 /// The chain's stored set is the ceiling of every later refresh (migration
 /// 140), and [`grantable`] runs on every mint, refresh included. Storing its
@@ -168,7 +173,7 @@ pub async fn grantable(
 /// the chokepoint.
 #[must_use]
 pub fn chain_scopes(consented: Vec<String>) -> Vec<String> {
-    epigraph_auth::without_elevated_only_scope(consented)
+    epigraph_auth::without_retired_scopes(epigraph_auth::without_elevated_only_scope(consented))
 }
 
 /// What a request path that HANDS OUT scopes may do with the admin-only ones

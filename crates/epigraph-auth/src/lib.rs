@@ -269,8 +269,9 @@ pub const ADMIN_ONLY_SCOPES: &[&str] = &[
 ];
 
 /// The ONLY scopes a DELEGATED run token (an access token carrying `dlg`) may
-/// hold: claim, evidence and edge reads and writes, challenges, and agent
-/// reads. Never group or agent management, webhooks, clients, or any
+/// hold: claim and edge reads and writes, evidence submission, and agent
+/// reads (a [`RETIRED_SCOPES`] entry a token still carries is ignored, see
+/// [`outside_delegated_ceiling`]). Never group or agent management, webhooks, clients, or any
 /// admin-only or elevated scope. The bearer layers refuse a delegated token
 /// that carries anything else ([`outside_delegated_ceiling`]), and
 /// [`AuthContext::has_scope`] never answers `true` outside it for a delegated
@@ -279,22 +280,69 @@ pub const ADMIN_ONLY_SCOPES: &[&str] = &[
 pub const DELEGATED_SCOPE_CEILING: &[&str] = &[
     "claims:read",
     "claims:write",
-    "claims:challenge",
-    "evidence:read",
     "evidence:submit",
     "edges:read",
     "edges:write",
     "agents:read",
 ];
 
-/// The scopes of `scopes` outside [`DELEGATED_SCOPE_CEILING`], in order.
+/// The scopes of `scopes` outside [`DELEGATED_SCOPE_CEILING`], in order. A
+/// [`RETIRED_SCOPES`] entry is never outside: a token minted before the scope
+/// was retired still carries it, and it authorizes nothing, so it is ignored
+/// rather than refused.
 #[must_use]
 pub fn outside_delegated_ceiling(scopes: &[String]) -> Vec<&str> {
     scopes
         .iter()
         .map(String::as_str)
-        .filter(|s| !DELEGATED_SCOPE_CEILING.contains(s))
+        .filter(|s| !DELEGATED_SCOPE_CEILING.contains(s) && !is_retired_scope(s))
         .collect()
+}
+
+/// Scopes RETIRED from issuance
+/// (`epigraph_core::canonical_scopes::RETIRED_SCOPES`, spelled here because
+/// this crate does not depend on `epigraph-core`; a test in `epigraph-api`
+/// pins the two equal). No route, middleware or MCP gate checks any of them,
+/// so a holder loses nothing when they go. Clients and tokens that already
+/// carry one keep working: a HELD retired scope is ignored (never minted again,
+/// never a refusal), and a REQUESTED one is dropped from the request (so a
+/// refresh, exchange or grant that names one narrows it away instead of
+/// failing `invalid_scope`).
+pub const RETIRED_SCOPES: &[&str] = &[
+    "claims:challenge",
+    "claims:delete",
+    "evidence:read",
+    "ingest:write",
+    "policy:challenge",
+];
+
+/// Whether `scope` is one of [`RETIRED_SCOPES`].
+#[must_use]
+pub fn is_retired_scope(scope: &str) -> bool {
+    RETIRED_SCOPES.contains(&scope)
+}
+
+/// `scopes` without any [`RETIRED_SCOPES`] entry, in order.
+#[must_use]
+pub fn without_retired_scopes(mut scopes: Vec<String>) -> Vec<String> {
+    scopes.retain(|s| !is_retired_scope(s));
+    scopes
+}
+
+/// A grant's whitespace-separated `scope` request with every
+/// [`RETIRED_SCOPES`] entry dropped. `None` when it names nothing else (absent,
+/// blank, or only retired scopes): the request then means "as granted", the
+/// meaning an absent `scope` already has on every grant, so naming a retired
+/// scope never turns a request into `invalid_scope`.
+#[must_use]
+pub fn requested_scopes(raw: Option<&str>) -> Option<Vec<String>> {
+    let named: Vec<String> = raw
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|s| !is_retired_scope(s))
+        .map(str::to_string)
+        .collect();
+    (!named.is_empty()).then_some(named)
 }
 
 /// Whether `scope` is one of [`ADMIN_ONLY_SCOPES`].
@@ -779,7 +827,11 @@ impl JwtConfig {
                 "a delegated or elevated token is not exchangeable".to_string(),
             ));
         }
-        let scopes = match requested_scopes.filter(|r| !r.is_empty()) {
+        // A retired scope in the request is dropped (it authorizes nothing),
+        // so naming one narrows it away instead of refusing the exchange.
+        let requested: Option<Vec<String>> =
+            requested_scopes.map(|r| r.iter().filter(|s| !is_retired_scope(s)).cloned().collect());
+        let scopes = match requested.as_deref().filter(|r| !r.is_empty()) {
             None => subject.scopes.clone(),
             Some(requested) => {
                 let mut out: Vec<String> = Vec::with_capacity(requested.len());
@@ -797,8 +849,9 @@ impl JwtConfig {
             }
         };
         // Belt and braces: the elevation scope never leaves an elevated token,
-        // and an elevated subject was refused above.
-        let scopes = without_elevated_only_scope(scopes);
+        // and an elevated subject was refused above. A retired scope the
+        // subject still carries is not minted again.
+        let scopes = without_retired_scopes(without_elevated_only_scope(scopes));
         let now = Utc::now().timestamp();
         let exp = (now + EXCHANGED_TOKEN_MAX_SECS).min(subject.exp);
         let claims = EpiGraphClaims {
@@ -1557,6 +1610,64 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.oauth_error(), "invalid_scope", "{wider:?}: {err:?}");
         }
+    }
+
+    /// A subject minted before a scope was retired still carries it: the
+    /// exchange does not mint it again, and REQUESTING it narrows it away
+    /// (alone, the request means the subject's own scopes) instead of
+    /// refusing `invalid_scope`.
+    #[test]
+    fn an_exchange_drops_a_retired_scope_and_ignores_a_request_for_one() {
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let raw = subject(
+            &cfg,
+            &["claims:read", "claims:delete", "episcience:tools"],
+            Duration::hours(1),
+            AccessTokenBinding::NONE,
+        );
+        let ex = cfg.exchange_token(&raw, EXT, &allowed(), None).unwrap();
+        assert_eq!(ex.claims.scopes, vec!["claims:read", "episcience:tools"]);
+
+        let asked = vec!["claims:read".to_string(), "claims:delete".to_string()];
+        let ex = cfg
+            .exchange_token(&raw, EXT, &allowed(), Some(&asked))
+            .unwrap();
+        assert_eq!(ex.claims.scopes, vec!["claims:read"]);
+
+        // Retired and NOT carried by the subject: still not a refusal.
+        let only_retired = vec!["ingest:write".to_string()];
+        let ex = cfg
+            .exchange_token(&raw, EXT, &allowed(), Some(&only_retired))
+            .unwrap();
+        assert_eq!(ex.claims.scopes, vec!["claims:read", "episcience:tools"]);
+    }
+
+    /// A delegated token carrying a retired scope is inside the ceiling: the
+    /// scope is ignored, not refused. A live non-ceiling scope still is.
+    #[test]
+    fn a_retired_scope_is_never_outside_the_delegated_ceiling() {
+        for retired in RETIRED_SCOPES {
+            let scopes = vec!["claims:read".to_string(), (*retired).to_string()];
+            assert!(
+                outside_delegated_ceiling(&scopes).is_empty(),
+                "{retired} refused a delegated token"
+            );
+        }
+        let scopes = vec!["claims:delete".to_string(), "groups:write".to_string()];
+        assert_eq!(outside_delegated_ceiling(&scopes), vec!["groups:write"]);
+    }
+
+    /// A request's retired scopes are dropped; one naming nothing else is
+    /// "as granted" (`None`), like an absent or blank one.
+    #[test]
+    fn a_request_naming_only_retired_scopes_means_as_granted() {
+        assert_eq!(requested_scopes(None), None);
+        assert_eq!(requested_scopes(Some("  ")), None);
+        assert_eq!(requested_scopes(Some("claims:delete evidence:read")), None);
+        assert_eq!(
+            requested_scopes(Some("claims:read claims:delete edges:read")),
+            Some(vec!["claims:read".to_string(), "edges:read".to_string()])
+        );
     }
 
     /// Audience: only a CONFIGURED extension. The kernel's own audience, an

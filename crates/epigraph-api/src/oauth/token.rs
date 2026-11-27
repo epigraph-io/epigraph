@@ -1063,16 +1063,15 @@ async fn handle_client_credentials(
     // Effective scopes = intersection of requested and granted, through the
     // mint chokepoint (never the elevation scope; the admin-only scopes per
     // migration 128's switch).
+    // A retired scope in the request is dropped (`epigraph_auth::requested_scopes`);
+    // a request naming nothing else means "as granted".
     let requested_scopes = {
         let granted = &client.granted_scopes;
-        match &req.scope {
-            Some(requested) => {
-                let requested: Vec<String> = requested.split(' ').map(|s| s.to_string()).collect();
-                requested
-                    .into_iter()
-                    .filter(|s| granted.contains(s))
-                    .collect::<Vec<_>>()
-            }
+        match epigraph_auth::requested_scopes(req.scope.as_deref()) {
+            Some(requested) => requested
+                .into_iter()
+                .filter(|s| granted.contains(s))
+                .collect::<Vec<_>>(),
             None => granted.clone(),
         }
     };
@@ -1338,7 +1337,13 @@ async fn handle_refresh_token(
     // again after the mint chokepoint below, which can strip what a request
     // named (an admin-only scope while migration 128's switch is armed, or
     // when the switch cannot be read).
-    let consented = refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref())
+    //
+    // A retired scope (`epigraph_auth::RETIRED_SCOPES`) in the request is
+    // dropped first, so naming one narrows it away (alone, the request means
+    // "as originally granted") instead of failing `invalid_scope`; one the
+    // chain still holds is dropped by the chokepoint.
+    let requested = epigraph_auth::requested_scopes(req.scope.as_deref()).map(|r| r.join(" "));
+    let consented = refresh_scopes(&stored.scopes, &client.granted_scopes, requested.as_deref())
         .ok_or_else(refresh_invalid_scope)?;
     // Then through the mint chokepoint (never the elevation scope; the
     // admin-only scopes per migration 128's switch), which only ever removes.
@@ -1349,7 +1354,7 @@ async fn handle_refresh_token(
         crate::oauth::scopes::MintGrant::RefreshToken,
     )
     .await;
-    if effective_scopes.is_empty() && names_a_scope(req.scope.as_deref()) {
+    if effective_scopes.is_empty() && names_a_scope(requested.as_deref()) {
         return Err(refresh_invalid_scope());
     }
 
@@ -2007,13 +2012,13 @@ mod elevate_scope_tests {
                 "groups:admin",
                 "claims:write",
                 "agents:write",
-                "evidence:read",
+                "edges:read",
                 "instance:admin",
                 "clients:admin",
                 "entity-types:write",
                 "not-a-known:scope",
             ])),
-            v(&["claims:read", "evidence:read", "platform:admin"])
+            v(&["claims:read", "edges:read", "platform:admin"])
         );
         assert_eq!(elevated_scopes(&[]), v(&["platform:admin"]));
     }
@@ -2449,7 +2454,7 @@ mod refresh_scope_tests {
     fn a_blank_scope_parameter_means_as_originally_granted() {
         // stored != granted, so "as originally granted" (stored ∩ granted) is
         // told apart from "the client's grant" and from "the stored set".
-        let stored = v(&["claims:read", "evidence:read"]);
+        let stored = v(&["claims:read", "edges:read"]);
         let granted = v(&["claims:read", "claims:write"]);
         for blank in [None, Some(""), Some("   ")] {
             assert_eq!(
@@ -2462,13 +2467,8 @@ mod refresh_scope_tests {
 
     #[test]
     fn a_requested_scope_outside_the_stored_set_is_never_added() {
-        let stored = v(&["claims:read", "evidence:read"]);
-        let granted = v(&[
-            "claims:read",
-            "claims:write",
-            "agents:write",
-            "evidence:read",
-        ]);
+        let stored = v(&["claims:read", "edges:read"]);
+        let granted = v(&["claims:read", "claims:write", "agents:write", "edges:read"]);
         assert_eq!(
             refresh_scopes(
                 &stored,
@@ -2497,7 +2497,7 @@ mod refresh_scope_tests {
 
     #[test]
     fn the_stored_order_is_kept_and_a_lost_grant_is_dropped() {
-        let stored = v(&["claims:write", "evidence:read", "claims:read"]);
+        let stored = v(&["claims:write", "edges:read", "claims:read"]);
         let granted = v(&["claims:read", "claims:write"]);
         assert_eq!(
             refresh_scopes(&stored, &granted, None),
