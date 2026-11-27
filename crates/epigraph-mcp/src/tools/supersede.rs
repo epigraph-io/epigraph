@@ -1098,172 +1098,6 @@ pub(crate) async fn unmark_duplicate_expecting(
     }))
 }
 
-/// The supersede refusal mappers, pinned byte for byte by refusal kind
-/// (`epigraph_auth::claim_act::ClaimActRefusal`): each row is a database
-/// error as the driver raises it and the exact `McpError` the caller gets.
-#[cfg(test)]
-mod refusal_table {
-    use super::{supersede_deferral_refusal, supersede_refusal};
-    use rmcp::model::ErrorCode;
-    use std::borrow::Cow;
-
-    #[derive(Debug)]
-    struct FakeDbError {
-        code: &'static str,
-        message: String,
-    }
-    impl std::fmt::Display for FakeDbError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(&self.message)
-        }
-    }
-    impl std::error::Error for FakeDbError {}
-    impl sqlx::error::DatabaseError for FakeDbError {
-        fn message(&self) -> &str {
-            &self.message
-        }
-        fn code(&self) -> Option<Cow<'_, str>> {
-            Some(Cow::Borrowed(self.code))
-        }
-        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-            self
-        }
-        fn kind(&self) -> sqlx::error::ErrorKind {
-            sqlx::error::ErrorKind::Other
-        }
-    }
-
-    fn db(code: &'static str, message: &str) -> epigraph_db::DbError {
-        epigraph_db::DbError::QueryFailed {
-            source: sqlx::Error::Database(Box::new(FakeDbError {
-                code,
-                message: message.to_string(),
-            })),
-        }
-    }
-
-    const RLS: &str = "new row violates row-level security policy for table \"claims\"";
-    const NO_EXECUTE: &str = "permission denied for function epigraph_record_cascade_deferral";
-    const GROUP_WRITE: &str =
-        "no write authority over the group that owns this claim; nothing was written";
-
-    fn not_recorded(claim: uuid::Uuid) -> String {
-        format!(
-            "CX03: the supersession of claim {claim} cannot be recorded: the session acting on \
-             it does not write the group that owns the claim; nothing was written"
-        )
-    }
-
-    /// The redacted `INTERNAL_ERROR` text a fault gets: whatever it is, it is
-    /// not the driver's message.
-    fn assert_redacted_fault(got: &crate::errors::McpError, secret: &str, row: &str) {
-        assert_eq!(got.code, ErrorCode::INTERNAL_ERROR, "{row}: {got:?}");
-        assert!(!got.message.contains(secret), "{row}: {got:?}");
-        assert!(!got.message.contains(GROUP_WRITE), "{row}: {got:?}");
-    }
-
-    /// The ACT: CX03, row security's uncoded 42501 (not writer), a coded
-    /// 42501 (unlisted, then a reviewed supersede code), CX03's text on
-    /// another SQLSTATE, an uncoded fault, and two repo refusals.
-    #[test]
-    fn every_act_refusal_kind_maps_to_its_exact_answer() {
-        let c = uuid::Uuid::new_v4();
-        let rows: [(&str, epigraph_db::DbError, ErrorCode, String); 7] = [
-            (
-                "cx03",
-                db("42501", "CX03: not recorded as one this session made"),
-                ErrorCode::INVALID_REQUEST,
-                not_recorded(c),
-            ),
-            (
-                "not writer: row security",
-                db("42501", RLS),
-                ErrorCode::INVALID_REQUEST,
-                GROUP_WRITE.to_string(),
-            ),
-            (
-                "not writer: uncoded engine 42501",
-                db("42501", "permission denied for table claims"),
-                ErrorCode::INVALID_REQUEST,
-                GROUP_WRITE.to_string(),
-            ),
-            (
-                "coded denial, unlisted: keeps its code as INTERNAL_ERROR",
-                db("42501", "ZZ99: a probe refusal"),
-                ErrorCode::INTERNAL_ERROR,
-                "ZZ99: a probe refusal".to_string(),
-            ),
-            (
-                "coded denial, a reviewed supersede code",
-                db("42501", "SR09: a reviewed refusal"),
-                ErrorCode::INVALID_REQUEST,
-                "SR09: a reviewed refusal".to_string(),
-            ),
-            (
-                "other: CX03's text on another SQLSTATE is not the CX03 denial",
-                db("P0001", "CX03: raised elsewhere"),
-                ErrorCode::INTERNAL_ERROR,
-                "CX03: raised elsewhere".to_string(),
-            ),
-            (
-                "other: a write row security hid",
-                epigraph_db::DbError::WriteRefused {
-                    entity: "claim".into(),
-                    id: c,
-                    action: "supersede".into(),
-                },
-                ErrorCode::INVALID_REQUEST,
-                format!(
-                    "supersede of claim {c} was refused: this session may read it but not \
-                     supersede it; nothing was changed"
-                ),
-            ),
-        ];
-        for (row, e, code, message) in rows {
-            let got = supersede_refusal(c, e);
-            assert_eq!(got.code, code, "{row}: {got:?}");
-            assert_eq!(got.message, message, "{row}");
-            assert_eq!(got.data, None, "{row}");
-        }
-
-        // An uncoded fault on another SQLSTATE stays a redacted fault.
-        let fault = supersede_refusal(c, db("XX000", "internal driver detail"));
-        assert_redacted_fault(&fault, "internal driver detail", "other: uncoded fault");
-    }
-
-    /// The DEFERRAL: CX03 is the act's own denial, byte for byte; any other
-    /// refusal (the missing EXECUTE grant's uncoded 42501 included) is a
-    /// fault, never the group-write denial.
-    #[test]
-    fn every_deferral_refusal_kind_maps_to_its_exact_answer() {
-        let c = uuid::Uuid::new_v4();
-        let cx03 = supersede_deferral_refusal(c, db("42501", "CX03: not recorded"));
-        assert_eq!(cx03.code, ErrorCode::INVALID_REQUEST, "{cx03:?}");
-        assert_eq!(cx03.message, not_recorded(c));
-        assert_eq!(
-            cx03.message,
-            supersede_refusal(c, db("42501", "CX03: from the act")).message,
-            "CX03 reads the same whichever statement raised it"
-        );
-
-        let grant = supersede_deferral_refusal(c, db("42501", NO_EXECUTE));
-        assert_redacted_fault(&grant, NO_EXECUTE, "deploy fault: missing EXECUTE");
-
-        let coded = supersede_deferral_refusal(c, db("42501", "ZZ99: a probe refusal"));
-        assert_eq!(coded.code, ErrorCode::INTERNAL_ERROR, "{coded:?}");
-        assert_eq!(coded.message, "ZZ99: a probe refusal");
-
-        let other = supersede_deferral_refusal(c, db("XX000", "internal driver detail"));
-        assert_redacted_fault(&other, "internal driver detail", "deploy fault: uncoded");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::unmark_refusal;
@@ -1297,5 +1131,170 @@ mod tests {
         ));
         assert_eq!(failed.code, ErrorCode::INTERNAL_ERROR, "{failed:?}");
         assert!(!failed.message.contains("lock timeout"), "{failed:?}");
+    }
+
+    /// The supersede refusal mappers, pinned byte for byte by refusal kind
+    /// (`epigraph_auth::claim_act::ClaimActRefusal`): each row is a database
+    /// error as the driver raises it and the exact `McpError` the caller gets.
+    mod refusal_table {
+        use super::super::{supersede_deferral_refusal, supersede_refusal};
+        use rmcp::model::ErrorCode;
+        use std::borrow::Cow;
+
+        #[derive(Debug)]
+        struct FakeDbError {
+            code: &'static str,
+            message: String,
+        }
+        impl std::fmt::Display for FakeDbError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.message)
+            }
+        }
+        impl std::error::Error for FakeDbError {}
+        impl sqlx::error::DatabaseError for FakeDbError {
+            fn message(&self) -> &str {
+                &self.message
+            }
+            fn code(&self) -> Option<Cow<'_, str>> {
+                Some(Cow::Borrowed(self.code))
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+
+        fn db(code: &'static str, message: &str) -> epigraph_db::DbError {
+            epigraph_db::DbError::QueryFailed {
+                source: sqlx::Error::Database(Box::new(FakeDbError {
+                    code,
+                    message: message.to_string(),
+                })),
+            }
+        }
+
+        const RLS: &str = "new row violates row-level security policy for table \"claims\"";
+        const NO_EXECUTE: &str = "permission denied for function epigraph_record_cascade_deferral";
+        const GROUP_WRITE: &str =
+            "no write authority over the group that owns this claim; nothing was written";
+
+        fn not_recorded(claim: uuid::Uuid) -> String {
+            format!(
+                "CX03: the supersession of claim {claim} cannot be recorded: the session acting on \
+                 it does not write the group that owns the claim; nothing was written"
+            )
+        }
+
+        /// The redacted `INTERNAL_ERROR` text a fault gets: whatever it is, it is
+        /// not the driver's message.
+        fn assert_redacted_fault(got: &crate::errors::McpError, secret: &str, row: &str) {
+            assert_eq!(got.code, ErrorCode::INTERNAL_ERROR, "{row}: {got:?}");
+            assert!(!got.message.contains(secret), "{row}: {got:?}");
+            assert!(!got.message.contains(GROUP_WRITE), "{row}: {got:?}");
+        }
+
+        /// The ACT: CX03, row security's uncoded 42501 (not writer), a coded
+        /// 42501 (unlisted, then a reviewed supersede code), CX03's text on
+        /// another SQLSTATE, an uncoded fault, and two repo refusals.
+        #[test]
+        fn every_act_refusal_kind_maps_to_its_exact_answer() {
+            let c = uuid::Uuid::new_v4();
+            let rows: [(&str, epigraph_db::DbError, ErrorCode, String); 7] = [
+                (
+                    "cx03",
+                    db("42501", "CX03: not recorded as one this session made"),
+                    ErrorCode::INVALID_REQUEST,
+                    not_recorded(c),
+                ),
+                (
+                    "not writer: row security",
+                    db("42501", RLS),
+                    ErrorCode::INVALID_REQUEST,
+                    GROUP_WRITE.to_string(),
+                ),
+                (
+                    "not writer: uncoded engine 42501",
+                    db("42501", "permission denied for table claims"),
+                    ErrorCode::INVALID_REQUEST,
+                    GROUP_WRITE.to_string(),
+                ),
+                (
+                    "coded denial, unlisted: keeps its code as INTERNAL_ERROR",
+                    db("42501", "ZZ99: a probe refusal"),
+                    ErrorCode::INTERNAL_ERROR,
+                    "ZZ99: a probe refusal".to_string(),
+                ),
+                (
+                    "coded denial, a reviewed supersede code",
+                    db("42501", "SR09: a reviewed refusal"),
+                    ErrorCode::INVALID_REQUEST,
+                    "SR09: a reviewed refusal".to_string(),
+                ),
+                (
+                    "other: CX03's text on another SQLSTATE is not the CX03 denial",
+                    db("P0001", "CX03: raised elsewhere"),
+                    ErrorCode::INTERNAL_ERROR,
+                    "CX03: raised elsewhere".to_string(),
+                ),
+                (
+                    "other: a write row security hid",
+                    epigraph_db::DbError::WriteRefused {
+                        entity: "claim".into(),
+                        id: c,
+                        action: "supersede".into(),
+                    },
+                    ErrorCode::INVALID_REQUEST,
+                    format!(
+                        "supersede of claim {c} was refused: this session may read it but not \
+                         supersede it; nothing was changed"
+                    ),
+                ),
+            ];
+            for (row, e, code, message) in rows {
+                let got = supersede_refusal(c, e);
+                assert_eq!(got.code, code, "{row}: {got:?}");
+                assert_eq!(got.message, message, "{row}");
+                assert_eq!(got.data, None, "{row}");
+            }
+
+            // An uncoded fault on another SQLSTATE stays a redacted fault.
+            let fault = supersede_refusal(c, db("XX000", "internal driver detail"));
+            assert_redacted_fault(&fault, "internal driver detail", "other: uncoded fault");
+        }
+
+        /// The DEFERRAL: CX03 is the act's own denial, byte for byte; any other
+        /// refusal (the missing EXECUTE grant's uncoded 42501 included) is a
+        /// fault, never the group-write denial.
+        #[test]
+        fn every_deferral_refusal_kind_maps_to_its_exact_answer() {
+            let c = uuid::Uuid::new_v4();
+            let cx03 = supersede_deferral_refusal(c, db("42501", "CX03: not recorded"));
+            assert_eq!(cx03.code, ErrorCode::INVALID_REQUEST, "{cx03:?}");
+            assert_eq!(cx03.message, not_recorded(c));
+            assert_eq!(
+                cx03.message,
+                supersede_refusal(c, db("42501", "CX03: from the act")).message,
+                "CX03 reads the same whichever statement raised it"
+            );
+
+            let grant = supersede_deferral_refusal(c, db("42501", NO_EXECUTE));
+            assert_redacted_fault(&grant, NO_EXECUTE, "deploy fault: missing EXECUTE");
+
+            let coded = supersede_deferral_refusal(c, db("42501", "ZZ99: a probe refusal"));
+            assert_eq!(coded.code, ErrorCode::INTERNAL_ERROR, "{coded:?}");
+            assert_eq!(coded.message, "ZZ99: a probe refusal");
+
+            let other = supersede_deferral_refusal(c, db("XX000", "internal driver detail"));
+            assert_redacted_fault(&other, "internal driver detail", "deploy fault: uncoded");
+        }
     }
 }
