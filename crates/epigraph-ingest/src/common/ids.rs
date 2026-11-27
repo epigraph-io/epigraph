@@ -84,3 +84,67 @@ pub fn workflow_root_id(canonical_name: &str, generation: u32) -> Uuid {
     let hash = blake3::hash(material.as_bytes());
     Uuid::new_v5(&WORKFLOW_NAMESPACE, hash.as_bytes())
 }
+
+/// `properties` key a scope-derived claim carries (see the module doc,
+/// "Scope-derived ids"), with value [`ID_SCOPE_OWNER_GROUP`]. It says the row's
+/// id and stored hash fold in its owning group, so neither is recomputable
+/// from the text alone.
+pub const ID_SCOPE_KEY: &str = "id_scope";
+
+/// The [`ID_SCOPE_KEY`] value: the scope is the ingest's `owner_group_id`.
+pub const ID_SCOPE_OWNER_GROUP: &str = "owner_group";
+
+/// [`atom_id`] for an ingest whose rows are owned by `scope`: `None` (a public
+/// ingest) is exactly [`atom_id`]; `Some(group)` is
+/// `uuid_v5(ATOM_NAMESPACE, content_hash || group.as_bytes())`, so the same
+/// text in two groups' non-public ingests gives two ids. The 48-byte name can
+/// never equal a 32-byte global name, so a scoped id never collides with a
+/// global one.
+#[must_use]
+pub fn scoped_atom_id(content_hash: &[u8; 32], scope: Option<Uuid>) -> Uuid {
+    match scope {
+        None => atom_id(content_hash),
+        Some(group) => {
+            let mut material = Vec::with_capacity(32 + 16);
+            material.extend_from_slice(content_hash);
+            material.extend_from_slice(group.as_bytes());
+            Uuid::new_v5(&ATOM_NAMESPACE, &material)
+        }
+    }
+}
+
+/// The stored `claims.content_hash` of an atom written under `scope`: `None`
+/// is the plain `content_hash` (global convergence, unchanged); `Some(group)`
+/// is `blake3(content_hash || group.as_bytes())`, the same material as
+/// [`scoped_atom_id`]. Scoped for the reason [`compound_content_hash`] is: a
+/// writer that converges by stored hash (`ClaimRepository::create_conn`'s
+/// content-hash lookup, by any agent, in any scope) must never find a group's
+/// non-public atom from another tenant's ingest of the same text.
+#[must_use]
+pub fn scoped_atom_content_hash(content_hash: &[u8; 32], scope: Option<Uuid>) -> [u8; 32] {
+    match scope {
+        None => *content_hash,
+        Some(group) => {
+            let mut material = Vec::with_capacity(32 + 16);
+            material.extend_from_slice(content_hash);
+            material.extend_from_slice(group.as_bytes());
+            *blake3::hash(&material).as_bytes()
+        }
+    }
+}
+
+/// A compound node's artifact seed for an ingest whose rows are owned by
+/// `scope`: `None` is `seed` unchanged; `Some(group)` appends `':'` and the
+/// group id's lowercase hyphenated text. Feed the result to
+/// [`compound_claim_id`] and [`compound_content_hash`].
+///
+/// A document seed is `"{title}\u{1f}{path}"` and its `path` is
+/// builder-made (`thesis`, `sections[i]`, `sections[i].paragraphs[j]`), so it
+/// never ends in `":" + uuid`: no scoped seed equals any public seed.
+#[must_use]
+pub fn scoped_seed(seed: &str, scope: Option<Uuid>) -> String {
+    match scope {
+        None => seed.to_string(),
+        Some(group) => format!("{seed}:{group}"),
+    }
+}

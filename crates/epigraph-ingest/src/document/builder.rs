@@ -1,12 +1,15 @@
 //! Document hierarchy walker. Reads a `DocumentExtraction` and produces an
 //! `IngestPlan` of claims + edges + path index.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
 use crate::common::edges::{decomposes_edge, thesis_derivation_str};
-use crate::common::ids::{atom_id, compound_claim_id, compound_content_hash, content_hash};
+use crate::common::ids::{
+    compound_claim_id, compound_content_hash, content_hash, scoped_atom_content_hash,
+    scoped_atom_id, scoped_seed, ID_SCOPE_KEY, ID_SCOPE_OWNER_GROUP,
+};
 use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
 use crate::document::schema::{ByteSpan, DocumentExtraction, Paragraph, SourceType};
@@ -117,6 +120,15 @@ const WORKFLOW_SOURCE_TYPE: &str = "workflow";
 ///
 /// Do not read a `true` here as an attestation of anything. It classifies, it
 /// does not verify.
+///
+/// # Scope-derived document atoms
+///
+/// A level-3 document row is in the class too when it carries the
+/// [`ID_SCOPE_KEY`]` = `[`ID_SCOPE_OWNER_GROUP`] marker: a non-public ingest
+/// stores `blake3(blake3(text) || owner_group)` on its atoms
+/// ([`crate::common::ids::scoped_atom_content_hash`]). An UNMARKED atom keeps
+/// the plain digest, so for it a body/digest disagreement is still a
+/// mismatch.
 #[must_use]
 pub fn stored_content_hash_is_seed_scoped(properties: &serde_json::Value) -> bool {
     let is_document = properties
@@ -125,7 +137,21 @@ pub fn stored_content_hash_is_seed_scoped(properties: &serde_json::Value) -> boo
         .is_some_and(|st| DOCUMENT_SOURCE_TYPES.contains(&st));
     // The workflow arm is keyed on the marker, not the stamp alone: see the doc
     // comment above.
-    is_compound_level(properties) && (is_document || is_scoped_workflow(properties))
+    (is_compound_level(properties) && (is_document || is_scoped_workflow(properties)))
+        || (is_document && is_scoped_atom(properties))
+}
+
+/// A level-3 row carrying the scope-derived id marker.
+fn is_scoped_atom(properties: &serde_json::Value) -> bool {
+    let level = properties.get("level").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    });
+    level == Some(3)
+        && properties
+            .get(ID_SCOPE_KEY)
+            .and_then(serde_json::Value::as_str)
+            == Some(ID_SCOPE_OWNER_GROUP)
 }
 
 /// The workflow subset of [`stored_content_hash_is_seed_scoped`]: a level-0..2
@@ -242,10 +268,42 @@ fn spine_text_kind(extraction: &DocumentExtraction) -> &'static str {
     }
 }
 
-/// Walk a `DocumentExtraction` tree and produce a flat list of operations.
+/// Walk a `DocumentExtraction` tree and produce a flat list of operations,
+/// with the GLOBAL ids of a public ingest: [`build_ingest_plan_scoped`] with
+/// no scope. Every id and stored hash is exactly what it was before ids could
+/// be scope-derived.
+#[must_use]
+pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
+    build_ingest_plan_scoped(extraction, None)
+}
+
+/// Mark a scope-derived claim's `properties` (see
+/// [`crate::common::ids::ID_SCOPE_KEY`]); a global claim's are left alone.
+fn mark_scope(mut properties: serde_json::Value, scope: Option<Uuid>) -> serde_json::Value {
+    if scope.is_some() {
+        properties[ID_SCOPE_KEY] = serde_json::json!(ID_SCOPE_OWNER_GROUP);
+    }
+    properties
+}
+
+/// Walk a `DocumentExtraction` tree and produce a flat list of operations,
+/// deriving ids for an ingest whose rows `scope` owns.
+///
+/// `scope` is `None` for a PUBLIC ingest (global ids, cross-source
+/// convergence) and `Some(owner_group_id)` for a `private` or `team` one: then
+/// every atom id and stored hash folds in the group
+/// ([`scoped_atom_id`], [`scoped_atom_content_hash`]), every compound seed gets
+/// `":" + group` ([`scoped_seed`]), each claim carries `id_scope` and the
+/// [`ID_SCOPE_KEY`] property marker. See [`crate::common::ids`],
+/// "Scope-derived ids". The plan's SHAPE (claims, their order, edges, paths)
+/// does not depend on `scope`, only its ids and hashes do, so two plans of one
+/// extraction twin claim by claim ([`adopt_recorded_ids`] relies on it).
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
+pub fn build_ingest_plan_scoped(
+    extraction: &DocumentExtraction,
+    scope: Option<Uuid>,
+) -> IngestPlan {
     let mut claims = Vec::new();
     let mut edges = Vec::new();
     let mut path_index = HashMap::new();
@@ -257,7 +315,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
     #[allow(clippy::option_if_let_else)]
     let thesis_id = if let Some(ref thesis_text) = extraction.thesis {
         let hash = content_hash(thesis_text);
-        let seed = format!("{doc_title}\u{1f}thesis");
+        let seed = scoped_seed(&format!("{doc_title}\u{1f}thesis"), scope);
         let id = compound_claim_id(&hash, &seed);
         // Stored hash is scoped too, so the (content_hash, agent_id) dedup
         // (`uq_claims_content_hash_agent` through migration 149, the app-layer
@@ -270,11 +328,14 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             id,
             content: thesis_text.clone(),
             level: 0,
-            properties: serde_json::json!({
-                "level": 0,
-                "source_type": source_type,
-                "thesis_derivation": thesis_derivation_str(&extraction.thesis_derivation),
-            }),
+            properties: mark_scope(
+                serde_json::json!({
+                    "level": 0,
+                    "source_type": source_type,
+                    "thesis_derivation": thesis_derivation_str(&extraction.thesis_derivation),
+                }),
+                scope,
+            ),
             content_hash: stored_hash,
             confidence: 1.0,
             methodology: None,
@@ -287,6 +348,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 locate_passage(extraction, thesis_text, None).as_ref(),
             )),
             enrichment: serde_json::json!({}),
+            id_scope: scope,
         });
         Some(id)
     } else {
@@ -298,7 +360,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
     for (si, section) in extraction.sections.iter().enumerate() {
         let section_path = format!("sections[{si}]");
         let section_hash = content_hash(&section.title);
-        let section_seed = format!("{doc_title}\u{1f}{section_path}");
+        let section_seed = scoped_seed(&format!("{doc_title}\u{1f}{section_path}"), scope);
         let section_id = compound_claim_id(&section_hash, &section_seed);
         let section_stored_hash = compound_content_hash(&section_hash, &section_seed);
         section_ids.push(section_id);
@@ -308,12 +370,15 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             id: section_id,
             content: section.title.clone(),
             level: 1,
-            properties: serde_json::json!({
-                "level": 1,
-                "source_type": source_type,
-                "section": section.title,
-                "spine_text_kind": spine_text_kind(extraction),
-            }),
+            properties: mark_scope(
+                serde_json::json!({
+                    "level": 1,
+                    "source_type": source_type,
+                    "section": section.title,
+                    "spine_text_kind": spine_text_kind(extraction),
+                }),
+                scope,
+            ),
             content_hash: section_stored_hash,
             confidence: 1.0,
             methodology: None,
@@ -331,6 +396,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 locate_passage(extraction, &section.title, section.heading_span.as_ref()).as_ref(),
             )),
             enrichment: serde_json::json!({}),
+            id_scope: scope,
         });
 
         if let Some(tid) = thesis_id {
@@ -347,7 +413,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 locate_passage(extraction, &paragraph.text, paragraph.span.as_ref()).as_ref(),
             );
             let para_hash = content_hash(&paragraph.text);
-            let para_seed = format!("{doc_title}\u{1f}{para_path}");
+            let para_seed = scoped_seed(&format!("{doc_title}\u{1f}{para_path}"), scope);
             let para_id = compound_claim_id(&para_hash, &para_seed);
             let para_stored_hash = compound_content_hash(&para_hash, &para_seed);
             para_ids.push(para_id);
@@ -385,12 +451,15 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 id: para_id,
                 content: paragraph.text.clone(),
                 level: 2,
-                properties: serde_json::json!({
-                    "level": 2,
-                    "source_type": source_type,
-                    "section": section.title,
-                    "spine_text_kind": spine_text_kind(extraction),
-                }),
+                properties: mark_scope(
+                    serde_json::json!({
+                        "level": 2,
+                        "source_type": source_type,
+                        "section": section.title,
+                        "spine_text_kind": spine_text_kind(extraction),
+                    }),
+                    scope,
+                ),
                 content_hash: para_stored_hash,
                 confidence: paragraph.confidence,
                 methodology: paragraph.methodology.clone(),
@@ -399,13 +468,14 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 supporting_text: Some(paragraph.text.clone()),
                 supporting_locator: Some(para_locator.clone()),
                 enrichment: enrichment.clone(),
+                id_scope: scope,
             });
 
             edges.push(decomposes_edge(section_id, para_id));
 
             for (ai, atom_text) in paragraph.atoms.iter().enumerate() {
                 let atom_hash = content_hash(atom_text);
-                let aid = atom_id(&atom_hash);
+                let aid = scoped_atom_id(&atom_hash, scope);
                 let atom_path = format!("{para_path}.atoms[{ai}]");
                 path_index.insert(atom_path, aid);
 
@@ -419,13 +489,17 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 if let Some(g) = generality {
                     props["generality"] = serde_json::json!(g);
                 }
+                let props = mark_scope(props, scope);
 
                 claims.push(PlannedClaim {
                     id: aid,
                     content: atom_text.clone(),
                     level: 3,
                     properties: props,
-                    content_hash: atom_hash,
+                    // Plain for a public ingest (global convergence); folded
+                    // with the owning group otherwise, so no content-hash
+                    // lookup in another scope can find this row.
+                    content_hash: scoped_atom_content_hash(&atom_hash, scope),
                     confidence: paragraph.confidence,
                     methodology: paragraph.methodology.clone(),
                     evidence_type: para_evidence_type.clone(),
@@ -435,6 +509,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                     supporting_text: Some(paragraph.text.clone()),
                     supporting_locator: Some(para_locator.clone()),
                     enrichment: enrichment.clone(),
+                    id_scope: scope,
                 });
 
                 edges.push(decomposes_edge(para_id, aid));
@@ -524,6 +599,81 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
         edges,
         path_index,
     }
+}
+
+/// Re-use, claim by claim, the ids an earlier ingest of the same document in
+/// the same scope recorded, so a group re-ingesting a document it ingested
+/// before ids became scope-derived converges on its own rows instead of
+/// writing scoped duplicates.
+///
+/// `scoped` and `global` are [`build_ingest_plan_scoped`] of ONE extraction
+/// with `Some(owner_group)` and `None`; they twin by index. `recorded` is what
+/// the ingest's in-scope `papers` row already asserts: each claim's id and,
+/// when the caller can read the row, its stored `content_hash` (the caller
+/// reads it from that paper's ingest-written `asserts` edges). A claim is
+/// adopted when its global twin's id is recorded, or when its global twin's
+/// stored hash is a recorded claim's hash (an atom the earlier ingest
+/// converged onto an existing row with that text, whose id is not the
+/// content address). An adopted claim is its global twin under the recorded
+/// id, and every edge and path of the plan is re-pointed with it; every other
+/// claim keeps its scoped id.
+///
+/// Returns the plan and the set of adopted ids. A write path MUST write an
+/// adopted claim BY ID, like a scoped one, even though it is a global atom
+/// (`id_is_document_scoped()` is `false` for it): only the row the document
+/// recorded may be resolved to, never another row found by its text in
+/// another scope. Only recorded claims are adopted, so a claim new in the
+/// re-ingest (an added paragraph) still gets a scoped id.
+///
+/// Plans that do not twin (not one extraction) are returned unchanged.
+#[must_use]
+pub fn adopt_recorded_ids(
+    mut scoped: IngestPlan,
+    global: &IngestPlan,
+    recorded: &[(Uuid, Option<[u8; 32]>)],
+) -> (IngestPlan, HashSet<Uuid>) {
+    let mut adopted = HashSet::new();
+    let twins = scoped.claims.len() == global.claims.len()
+        && scoped
+            .claims
+            .iter()
+            .zip(&global.claims)
+            .all(|(s, g)| s.level == g.level && s.content == g.content);
+    if recorded.is_empty() || !twins {
+        return (scoped, adopted);
+    }
+    let ids: HashSet<Uuid> = recorded.iter().map(|(id, _)| *id).collect();
+    let by_hash: HashMap<[u8; 32], Uuid> = recorded
+        .iter()
+        .filter_map(|(id, hash)| hash.map(|h| (h, *id)))
+        .collect();
+    let mut remap: HashMap<Uuid, Uuid> = HashMap::new();
+    for (claim, twin) in scoped.claims.iter_mut().zip(&global.claims) {
+        let Some(id) = ids
+            .get(&twin.id)
+            .copied()
+            .or_else(|| by_hash.get(&twin.content_hash).copied())
+        else {
+            continue;
+        };
+        remap.insert(claim.id, id);
+        adopted.insert(id);
+        *claim = twin.clone();
+        claim.id = id;
+    }
+    let re = |id: &mut Uuid| {
+        if let Some(to) = remap.get(id) {
+            *id = *to;
+        }
+    };
+    for edge in &mut scoped.edges {
+        re(&mut edge.source_id);
+        re(&mut edge.target_id);
+    }
+    for id in scoped.path_index.values_mut() {
+        re(id);
+    }
+    (scoped, adopted)
 }
 
 impl crate::common::walker::Walker for DocumentExtraction {

@@ -445,14 +445,44 @@ mod tests {
         }"#;
         let wf: crate::workflow::WorkflowExtraction = serde_json::from_str(wf_json).unwrap();
         let wf_plan = crate::workflow::build_ingest_plan(&wf);
+        // A non-public ingest's plan (backlog 8f56a641): every id, the atoms'
+        // included, folds in the owning group, so every claim must be
+        // declared NOT content-addressed — a write path sending a scoped atom
+        // down the content-hash branch would look its text up in every scope.
+        let scope = uuid::Uuid::from_u128(0x5c0b_e1d2);
+        let scoped_plan = crate::document::build_ingest_plan_scoped(&doc, Some(scope));
 
-        for (label, plan) in [("document", &doc_plan), ("workflow", &wf_plan)] {
+        for (label, plan) in [
+            ("document", &doc_plan),
+            ("workflow", &wf_plan),
+            ("scoped document", &scoped_plan),
+        ] {
             assert!(
                 plan.claims.iter().any(|c| c.level == 3),
                 "{label} plan must contain at least one atom for this guard to mean anything"
             );
             for c in &plan.claims {
                 let global_id = atom_id(&content_hash(&c.content));
+                if let Some(group) = c.id_scope {
+                    assert!(
+                        c.id_is_document_scoped(),
+                        "{label} level-{} claim {:?} has a scope-derived id but is declared \
+                         content-addressed",
+                        c.level,
+                        c.content
+                    );
+                    if c.level == 3 {
+                        assert_eq!(
+                            c.id,
+                            crate::common::ids::scoped_atom_id(
+                                &content_hash(&c.content),
+                                Some(group)
+                            ),
+                            "{label} atom {:?} is not uuid_v5(ATOM, blake3(text) || group)",
+                            c.content
+                        );
+                    }
+                }
                 if c.id_is_document_scoped() {
                     assert_ne!(
                         c.id, global_id,
@@ -473,11 +503,34 @@ mod tests {
             }
         }
 
+        assert!(
+            scoped_plan.claims.iter().all(|c| c.id_scope == Some(scope)),
+            "every claim of a scoped plan carries its scope"
+        );
+        assert!(
+            doc_plan
+                .claims
+                .iter()
+                .chain(&wf_plan.claims)
+                .all(|c| c.id_scope.is_none()),
+            "a public or workflow plan carries no scope"
+        );
+
         // Document builder only: compound rows carry a SEED-SCOPED storage hash
         // so the (content_hash, agent_id) dedup key (013's
         // `uq_claims_content_hash_agent`, dropped from 150; the identity tests
         // re-add it) cannot collapse two documents' structural rows; atoms keep
-        // the plain content hash.
+        // the plain content hash, unless the plan is scoped (then every stored
+        // hash folds in the group, so no content-hash lookup finds the row).
+        for c in &scoped_plan.claims {
+            assert_ne!(
+                c.content_hash,
+                content_hash(&c.content),
+                "scoped level-{} claim {:?} must store a scope-derived content_hash",
+                c.level,
+                c.content
+            );
+        }
         for c in &doc_plan.claims {
             let plain = content_hash(&c.content);
             if c.id_is_document_scoped() {
@@ -550,7 +603,15 @@ mod tests {
         // stamp different `source_type`s, so each stamp must be in the class.
         let mut seed_scoped_seen: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
-        for (label, plan) in [("document", &doc_plan), ("workflow", &wf_plan)] {
+        let scoped_plan = crate::document::build_ingest_plan_scoped(
+            &doc,
+            Some(uuid::Uuid::from_u128(0x5c0b_e1d2)),
+        );
+        for (label, plan) in [
+            ("document", &doc_plan),
+            ("workflow", &wf_plan),
+            ("scoped document", &scoped_plan),
+        ] {
             for c in &plan.claims {
                 let plain = content_hash(&c.content);
                 let digest_is_derivable = c.content_hash == plain;
@@ -582,6 +643,15 @@ mod tests {
             3,
             "guard is vacuous unless the document plan contributes its thesis, section and \
              paragraph rows; saw {seed_scoped_seen:?}"
+        );
+        assert_eq!(
+            seed_scoped_seen
+                .get("scoped document")
+                .copied()
+                .unwrap_or(0),
+            4,
+            "a scoped document plan's atom stores a scope-derived digest too, so all four rows \
+             are in the class; saw {seed_scoped_seen:?}"
         );
         assert_eq!(
             seed_scoped_seen.get("workflow").copied().unwrap_or(0),
