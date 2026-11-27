@@ -1837,7 +1837,7 @@ pub async fn submit_packet(
     // name list here embedded every event a host added later, which the
     // backfill then treated as outside the population anyway.
     #[cfg(feature = "db")]
-    let is_host_telemetry =
+    let is_telemetry =
         epigraph_db::is_telemetry_shaped(&packet.claim.labels, packet.claim.properties.as_ref());
 
     // Skip re-embedding on a duplicate submit (§5): the canonical claim already
@@ -1846,10 +1846,10 @@ pub async fn submit_packet(
     #[cfg(feature = "db")]
     if !was_duplicate {
         if let Some(embedding_service) = state.storing_embedding_service() {
-            if is_host_telemetry {
+            if is_telemetry {
                 tracing::debug!(
                     claim_id = %claim_id,
-                    "Skipping embedding for host-provenance telemetry claim"
+                    "Skipping embedding for telemetry-shaped claim"
                 );
             } else {
                 match embedding_service.generate(&packet.claim.content).await {
