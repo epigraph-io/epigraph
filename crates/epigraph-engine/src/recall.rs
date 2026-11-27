@@ -247,8 +247,32 @@ pub fn rrf_merge(
     merged
 }
 
+/// What one run of the theme-traversal leg read: the themes it drew from and
+/// their members, best first.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ThemeLeg {
+    /// The query's nearest themes by centroid, nearest first, as
+    /// `(theme_id, label)`. At most [`THEME_LEG_THEMES`]. Theme rows carry no
+    /// tenancy, so this shortlist is not viewer-scoped; its members are.
+    pub themes: Vec<(uuid::Uuid, String)>,
+    /// Those themes' current members visible to the viewer, as
+    /// `(claim_id, cosine similarity to the query)`, best first: the ranked
+    /// list [`rrf_merge`] takes as its theme leg.
+    pub members: Vec<(uuid::Uuid, f64)>,
+}
+
 /// The theme-traversal leg: the query's nearest themes, then their current
 /// members visible to `viewer`, best first, on the recall's own connection.
+///
+/// The ONE implementation of the leg (backlog a47df8ed): [`recall_routed`] and
+/// the MCP `recall` tool's `route` parameter both run it, so the shortlist
+/// size, the viewer-scoped member query
+/// ([`ClaimThemeRepository::claims_in_themes_at_dim_since`]) and the savepoint
+/// below are the same on both surfaces.
+///
+/// `dim` is the query vector's dimension (1536 or 3072; any other is refused
+/// by the theme read). `since`, when set, keeps members created at or after
+/// it, so a windowed caller's theme leg holds the same window as its ANN leg.
 ///
 /// Runs in a nested transaction (a savepoint when `conn` is already in one,
 /// as a `SessionGucMode::Transaction` read is), the way
@@ -256,19 +280,24 @@ pub fn rrf_merge(
 /// failed theme read is rolled back rather than aborting the caller's
 /// transaction, whose next statement is the ANN page's materialisation or the
 /// text fallback.
-async fn theme_leg(
+///
+/// # Errors
+/// [`epigraph_db::DbError`] when the savepoint or either theme read fails,
+/// including an unsupported `dim`.
+pub async fn theme_leg_on(
     conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     pgvec: &str,
     dim: usize,
     limit: usize,
-) -> Result<Vec<(uuid::Uuid, f64)>, epigraph_db::DbError> {
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<ThemeLeg, epigraph_db::DbError> {
     let mut bracket = sqlx::Connection::begin(&mut *conn).await?;
-    let got = theme_leg_reads(&mut bracket, viewer, pgvec, dim, limit).await;
+    let got = theme_leg_reads(&mut bracket, viewer, pgvec, dim, limit, since).await;
     match got {
-        Ok(members) => {
+        Ok(leg) => {
             bracket.commit().await?;
-            Ok(members)
+            Ok(leg)
         }
         Err(e) => {
             // The theme read's error is the one worth reporting; a failed
@@ -285,21 +314,28 @@ async fn theme_leg_reads(
     pgvec: &str,
     dim: usize,
     limit: usize,
-) -> Result<Vec<(uuid::Uuid, f64)>, epigraph_db::DbError> {
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<ThemeLeg, epigraph_db::DbError> {
     let dim = u32::try_from(dim).unwrap_or(0);
     let themes =
         ClaimThemeRepository::find_similar_themes_at_dim(&mut *conn, pgvec, THEME_LEG_THEMES, dim)
             .await?;
     if themes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ThemeLeg::default());
     }
     let theme_ids: Vec<uuid::Uuid> = themes.iter().map(|t| t.0).collect();
     let page = i32::try_from(limit).unwrap_or(i32::MAX);
     let members = ClaimThemeRepository::claims_in_themes_at_dim_since(
-        conn, viewer, &theme_ids, pgvec, page, dim, false, None,
+        conn, viewer, &theme_ids, pgvec, page, dim, false, since,
     )
     .await?;
-    Ok(members.into_iter().map(|(id, _, sim)| (id, sim)).collect())
+    Ok(ThemeLeg {
+        themes: themes
+            .into_iter()
+            .map(|(id, label, _)| (id, label))
+            .collect(),
+        members: members.into_iter().map(|(id, _, sim)| (id, sim)).collect(),
+    })
 }
 
 /// Semantic recall: embed the query, find similar claims, filter by truth.
@@ -491,8 +527,10 @@ async fn recall_on(
                     Some(rrf_merge(&ann, &[], limit))
                 } else {
                     theme_leg_ran = true;
-                    match theme_leg(&mut *conn, viewer, &pgvec, embedding.len(), limit).await {
-                        Ok(theme) => Some(rrf_merge(&ann, &theme, limit)),
+                    match theme_leg_on(&mut *conn, viewer, &pgvec, embedding.len(), limit, None)
+                        .await
+                    {
+                        Ok(leg) => Some(rrf_merge(&ann, &leg.members, limit)),
                         // Auto still holds a valid ANN page: serve it.
                         Err(e) if route == RecallRoute::Auto => {
                             tracing::warn!(
