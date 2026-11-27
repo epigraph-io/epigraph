@@ -584,8 +584,9 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          a signature verifier (any kind but `ed25519`), before anything is minted: the same \
          pre-authentication reason. The twenty-second is `record_v1_assertion` (backlog \
          bada894d): after a VERSION-1 agent assertion verified and its nonce was spent, one \
-         `security_events` row (`oauth.agent_assertion_v1_accepted`, `agent_id` NULL, which \
-         migration 077's append policy admits from any session) counting it, before anything \
+         `security_events` row (`oauth_agent_assertion_v1_accepted`, `agent_id` NULL, which \
+         migration 077's append policy admits from any session, and not under 118's reserved \
+         `oauth.` prefix) counting it, before anything \
          is minted; it reads nothing: the same pre-authentication reason.",
     ),
     (

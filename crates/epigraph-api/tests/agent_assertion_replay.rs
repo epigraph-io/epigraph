@@ -649,3 +649,56 @@ async fn a_v1_assertion_is_refused_under_refuse(pool: PgPool) {
         "the refused v1 refresh left the chain usable for v2: {body}"
     );
 }
+
+/// A pool on the same database whose every connection runs as the deployed
+/// application role, `epigraph_app`.
+async fn app_role_pool(pool: &PgPool) -> PgPool {
+    use sqlx::Executor;
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("current_database()");
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let prefix = base
+        .split_once('?')
+        .map_or(base.as_str(), |(a, _)| a)
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .expect("DATABASE_URL must carry a database path")
+        .0
+        .to_string();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&format!("{prefix}/{db}"))
+        .await
+        .expect("application-role pool")
+}
+
+/// Catches: the version-1 count row failing to write on the DEPLOYED role.
+/// The write is fail-open (a failure only warns), so a grant or row-security
+/// refusal would leave the operator's measurement silently at zero and the
+/// rollout would flip `refuse` on clients that still sign version 1. Served
+/// by a router whose pool is `epigraph_app`, an accepted version-1 assertion
+/// still leaves exactly one row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_v1_count_row_is_written_as_the_application_role(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(app_role_pool(&pool).await, config()));
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(status, StatusCode::OK, "v1 mints as epigraph_app: {body}");
+    assert_eq!(
+        v1_accepted_rows(&pool, &client_id).await,
+        1,
+        "the count row is written on the application role"
+    );
+}

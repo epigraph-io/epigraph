@@ -26,7 +26,12 @@ pub const ASSERTION_V1_ENV: &str = "EPIGRAPH_ASSERTION_V1";
 /// (written after its nonce was spent, so a replay never adds a row). Count
 /// these per `details->>'client_id'` to see who still signs version 1 before
 /// setting [`ASSERTION_V1_ENV`] to `refuse`.
-pub const V1_ACCEPTED_EVENT: &str = "oauth.agent_assertion_v1_accepted";
+///
+/// `oauth_`, not `oauth.`: migration 118 reserves the `oauth.` prefix for its
+/// definers (a restrictive insert policy), and this row is written by the
+/// application role itself; under that prefix it would be refused, and the
+/// fail-open write would leave the count silently at zero.
+pub const V1_ACCEPTED_EVENT: &str = "oauth_agent_assertion_v1_accepted";
 
 /// Which message an accepted agent assertion was signed over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

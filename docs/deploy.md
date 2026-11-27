@@ -609,7 +609,7 @@ For the others, anything else is off.
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. `POST /oauth/introspect` applies the same check: a delegated run token reads `active: false` while the switch is off, once its delegation has ended (operator link retired, delegator's allowance, client or writer membership revoked), or when it carries a scope outside the delegated ceiling, and the endpoint answers 503 when the check cannot be made. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for, matched against the agent's attested registration (migration 161), never its display properties. Empty refuses every mint. |
 | `EPIGRAPH_OAUTH_REDIRECT_ORIGINS` | empty | Extra HTTPS origins on which `/oauth/register` (dynamic client registration) accepts a `redirect_uri`, beside the built-in callbacks: `https://claude.ai/` and `https://claude.com/` (Claude), ChatGPT's exact `https://chatgpt.com/connector_platform_oauth_redirect` and `https://chatgpt.com/connector/oauth/<id>` (one `[A-Za-z0-9_-]` segment, nothing else under `chatgpt.com`), and loopback (`http://127.0.0.1`, `http://[::1]`, e.g. the Codex CLI). ChatGPT needs no entry here; listing `https://chatgpt.com` admits every path on it, and its two callbacks are still named ChatGPT on the consent page. Comma- or space-separated, each exactly `https://host[:port]`: no path, query, fragment, userinfo or `*`; anything else **refuses the boot**, naming the entry. A redirect must be on a listed origin exactly (same scheme, host and port; any path). The consent page names the origin, not the client's self-chosen name. Removing an origin later does not revoke clients already registered with it: `/oauth/authorize` matches the client's registered `redirect_uris`, so suspend or revoke those clients (`epigraph-operator suspend-client` / `revoke-client`). See `crates/epigraph-api/src/oauth/redirect.rs`. |
-| `EPIGRAPH_ASSERTION_V1` | `accept` | Whether an agent's VERSION-1 `client_assertion` (signed over the bare timestamp and nonce, bound to no server) still authenticates. `accept` logs and counts each one (`security_events` `oauth.agent_assertion_v1_accepted`); `refuse` answers `400 invalid_client`. Any other value **refuses the boot**. Version 2 (signed for this server's issuer) is always accepted. See "Agent `client_assertion`" in section 8. |
+| `EPIGRAPH_ASSERTION_V1` | `accept` | Whether an agent's VERSION-1 `client_assertion` (signed over the bare timestamp and nonce, bound to no server) still authenticates. `accept` logs and counts each one (`security_events` `oauth_agent_assertion_v1_accepted`); `refuse` answers `400 invalid_client`. Any other value **refuses the boot**. Version 2 (signed for this server's issuer) is always accepted. See "Agent `client_assertion`" in section 8. |
 | `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES` | empty | The federation extensions (by their `EPIGRAPH_MCP_EXTENSIONS` name) the RFC 8693 token-exchange grant at `/oauth/token` may mint for. Empty refuses every exchange, so a gateway with mounted extensions can call none of them. The kernel's own audience is never accepted here. See `crates/epigraph-api/src/oauth/token_exchange.rs`. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
 | `EPIGRAPH_BP_MAX_CONCURRENT` | `2` | How many `POST /api/v1/bp/propagate` runs may be in flight at once. A run beyond it is refused with 503 rather than queued; `0` refuses every run. A value that is not a non-negative integer, or is above the runtime semaphore's maximum (`usize::MAX >> 3`), is warned about and the default is used. Each request must also name its scope (`claim_ids` and `max_hops`, or `frame_id`). |
@@ -2297,7 +2297,7 @@ authenticates.
 
 - Under `accept`, each accepted version-1 assertion logs a warning naming
   the client and writes one `security_events` row
-  (`event_type = 'oauth.agent_assertion_v1_accepted'`, client in `details`),
+  (`event_type = 'oauth_agent_assertion_v1_accepted'`, client in `details`),
   only after its nonce is spent, so a replay never counts.
 - Under `refuse`, it is `400 invalid_client`, like every other failed client
   credential, and nothing is written.
@@ -2312,10 +2312,14 @@ Rollout:
    ```sql
    SELECT details->>'client_id' AS client_id, count(*), max(created_at) AS last_seen
      FROM security_events
-    WHERE event_type = 'oauth.agent_assertion_v1_accepted'
+    WHERE event_type = 'oauth_agent_assertion_v1_accepted'
     GROUP BY 1 ORDER BY last_seen DESC;
    ```
 
+   Cross-check the API log for `Agent assertion accepted as VERSION 1`
+   (a warning naming the client): the row is written fail-open, so a log
+   line with no matching row means the count is not being recorded and must
+   be fixed before step 3.
 3. Once no client has appeared there for longer than its token cadence (an
    agent access token lives 15 minutes), set `EPIGRAPH_ASSERTION_V1=refuse`
    and restart the API. Rollback: unset it (or `accept`) and restart.
