@@ -373,6 +373,15 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE policy default-denies every non-superuser role, and 263 grants DELETE to \
          nobody.",
     ),
+    (
+        "agent_scopes",
+        "DELETE",
+        "A declared agent scope (356) is ended by its revoke stamp, never deleted: the row is \
+         the record of what the agent was declared to do, where and from when to when. Under \
+         FORCE the absent DELETE policy default-denies every non-superuser role, 356 grants \
+         DELETE to nobody, and its guard refuses DELETE and TRUNCATE for every role, a \
+         superuser included, short of disabling triggers.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -457,6 +466,8 @@ const PROTECTED: &[&str] = &[
     "group_invitations",
     // Migration 347 (backlog f214b84e): 173's posture, FOR ALL policy.
     "harvester_enriched_concepts",
+    // Migration 356 (backlog d7ee64a6): 166's posture, privileged policies only.
+    "agent_scopes",
 ];
 
 // ===========================================================================
@@ -2124,6 +2135,12 @@ const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
 /// why)`. Exact in both directions: each must exist and grant `epigraph_app`
 /// no SELECT, table- or column-level.
 const NO_APP_SELECT: &[(&str, &str)] = &[
+    (
+        "agent_scopes",
+        "migration 356 (backlog d7ee64a6): each agent's declared write scopes; REVOKE ALL \
+         from epigraph_app, written through the maintenance verbs and read by maintenance \
+         and its definers only",
+    ),
     (
         "bug_report_intake_marks",
         "migration 272 (backlog e690866c): which agent filed which intake report; REVOKE ALL \

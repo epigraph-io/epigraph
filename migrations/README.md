@@ -5265,6 +5265,32 @@ restart.
   `docs/runbooks/353-undo.sql`. **Deploy order:** either; a binary without the change runs on 353
   unchanged, and the change's binary runs without 353 (only the concurrent-write backstop is
   missing).
+- **356**: `agent_scopes` (backlog d7ee64a6, the first step of the declared agent scope model
+  f8cde19f). Records, but does not yet enforce, a declared `(agent, group, action class)` write
+  scope per agent identity. Adds `agent_scopes` (`action_class` CHECK in `claim_write`,
+  `evidence_write`, `edge_write`, `label_write`, `share_publicize`, `group_admin`; a validity window
+  `valid_from` / `valid_to`; `granted_by` recorded as `session_user`; a non-blank `reason`; an
+  optional `role_attachment_id` referencing `role_agents`, which must be a live attachment of the
+  SAME agent; a revoke recorded in `revoked_at` / `revoked_by` / `revoke_reason`, final). Append-only
+  under the guard `epigraph_agent_scopes_guard` (`AGS02`, 55000: no supplied provenance, no
+  back-dating, no human or role node as the agent, no edit but the revoke, no DELETE or TRUNCATE
+  on any role); one un-revoked row per key (`agent_scopes_one_unrevoked`, 23505). Row security
+  ENABLE + FORCE admits only `epigraph_bypass()` / `epigraph_definer_bypass()` (no DELETE policy);
+  the application role holds no privilege on the table, not even SELECT. The maintenance verbs
+  `epigraph_agent_scope_grant(agent, group, class, reason, valid_from, valid_to, attachment) ->
+  uuid` and `epigraph_agent_scope_revoke(scope, reason) -> boolean` (SECURITY DEFINER, owned by
+  `epigraph_maintenance`, on `pg_catalog, pg_temp`, EXECUTE for the maintenance role only, and each
+  body refuses a non-maintenance session 42501 `AGS02`); the AFTER trigger
+  `epigraph_agent_scopes_audit` writes exactly one `security_events` row per grant
+  (`platform.agent_scope_granted`) and per revoke (`platform.agent_scope_revoked`), whatever path
+  wrote the row; a repeated revoke returns false and writes nothing. Adds `agent_scope_arming`
+  (one row, installed `armed = false`; the application and maintenance roles hold SELECT only, so
+  only a superuser moves it until the first enforcing door brings its audited verb). No write door
+  reads either table, so applying 356 changes no write and no read. Registered in
+  `tenancy_backfill` (deferred definers at 356, the grant register, the trigger exemption) and in
+  `elevation_arms_census.rs` (excluded). Pinned by `epigraph-db/tests/agent_scopes.rs`. Undo:
+  `docs/runbooks/356-undo.sql` (discards every declared row; the audit rows stay). **Deploy
+  order:** either; no binary reads it.
 
 ## `-- no-transaction` migrations
 

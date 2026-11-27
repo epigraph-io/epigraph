@@ -900,6 +900,10 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // columns and FORCEd by that migration, on the same precedent. Apply 347
     // before or with a binary carrying this name.
     "harvester_enriched_concepts",
+    // Declared agent scopes (356, backlog d7ee64a6), FORCEd by the migration
+    // that creates them, on the same precedent; privileged policies only. Inert
+    // on a database below 356 (the count is over relations that exist).
+    "agent_scopes",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

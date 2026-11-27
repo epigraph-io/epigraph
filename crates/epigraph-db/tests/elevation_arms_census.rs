@@ -146,6 +146,11 @@ const EXCLUDED: &[(&str, &str)] = &[
          definers; an attachment confers no read and widens nothing",
     ),
     (
+        "agent_scopes",
+        "declared agent write scopes (356): maintenance-written through audited definers, \
+         read only by maintenance and its definers; a scope only narrows a door, never widens it",
+    ),
+    (
         "group_invitations",
         "team-group invitations (263): written only by the person-facing team-group \
          definers and read only through epigraph_my_group_invitations; the application role \
