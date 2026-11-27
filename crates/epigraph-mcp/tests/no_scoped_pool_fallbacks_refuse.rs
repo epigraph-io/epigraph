@@ -1,6 +1,9 @@
 //! A server built WITHOUT a `ScopedPool` refuses `evolve_step`,
 //! `improve_workflow_hierarchy` and `report_workflow_outcome` before any
-//! statement runs on its raw pool (backlog 4cbd4192).
+//! claim, edge or workflow row is read or written (backlog 4cbd4192).
+//! (`evolve_step` still resolves the server's own signer agent first, which
+//! `agent_id` does on the raw pool for every server; that is a separate
+//! register class, not one of the fallback arms removed here.)
 //!
 //! Each of the three used to carry a fallback arm for that server: the evolve
 //! wrote its step on a `server.pool.begin()` transaction, the generation
@@ -20,7 +23,8 @@
 //! "no workflow with canonical_name", a non-workflows id with an
 //! idempotency key was `invalid_params`). That is what makes each arm fail on
 //! the old code: the refusal is an INTERNAL error naming the tool and
-//! `ScopedPool`, reached before the raw pool is asked anything.
+//! `ScopedPool`, reached before any claim, edge or workflow row is read or
+//! written.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
