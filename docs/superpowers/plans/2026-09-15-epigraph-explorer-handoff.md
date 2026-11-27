@@ -98,9 +98,10 @@ claims into Notion. Re-measure before quoting them as current.
   **D2** legacy rows backfill to explicit `public`; **D3** `public` means any
   authenticated agent, anonymous callers get nothing.
 - The enforcement boundary is **Rust, not Postgres** (§1 of that plan).
-- Relevant open findings: `D-PR16-recall-events-are-instance-wide` (every agent's
-  recall history is readable — gate any `get_recall_events` route behind
-  tenancy); `D-PR16-claim-authorship-is-not-a-credential` (nothing checks a
+- Relevant open findings: `D-PR16-recall-events-are-instance-wide` (since
+  corrected: `recall_events` row security is keyed on the querying agent, and
+  `get_recall_events` is routed for the caller's own rows only,
+  `GET /api/v1/recall-events`, decided under backlog ecf1b34f); `D-PR16-claim-authorship-is-not-a-credential` (nothing checks a
   caller may author as the `agent_id` in the body — matters before pointing an
   always-on Notion writer at prod); `D-PR19-webhook-secret-at-rest` (webhook
   secrets stored plaintext).
@@ -147,7 +148,9 @@ implementations per tool. Do not present the current audit as more than it is.
    (CLAUDE.md is explicit and there is a daily reconciler that catches the
    mistake).
 5. **Close the §8.2 gaps that Phase 2/3 need**: `get_provenance_chain` and
-   `check_already_ingested` first. `get_recall_events` is deliberately deferred.
+   `check_already_ingested` first. `get_recall_events` was deferred here; it is
+   now routed for the caller's own rows (`GET /api/v1/recall-events`, backlog
+   ecf1b34f).
 6. **Write the Notion auto-ingest spec separately.** It is sketched in the
    conversation but not specified: registry database, content-hash pipeline
    version, reconciler cron on the `git_ingest_reconciler.py` pattern, and the
@@ -189,7 +192,9 @@ implementations per tool. Do not present the current audit as more than it is.
    backfilled to `public` by D2.
 3. **BFF language** — Rust/axum matches the team; Node/TS gets a better graph-canvas
    ecosystem. `services/` precedent is Python (`nli`), so either is in keeping.
-4. **Does `get_recall_events` get an API route at all?** See §3, tenancy findings.
+4. **Does `get_recall_events` get an API route at all?** Decided (backlog
+   ecf1b34f): yes, the caller's own rows only (`GET /api/v1/recall-events`), with
+   an Explorer `/recalls` view. See §3, tenancy findings.
 5. **Who owns the parity backlog item** — it spans both surfaces and belongs to
    neither.
 

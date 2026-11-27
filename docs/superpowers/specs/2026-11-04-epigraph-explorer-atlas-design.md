@@ -66,7 +66,7 @@ Defaults taken on recommendation, recorded with A1-A6:
 - Deep links carry claim ids, resolved through `/claims/:id/placement`, never theme
   or neighbourhood ids alone.
 - Tours live in a Notion database, read with the viewer's own Notion connection.
-- `get_recall_events` gets no Explorer route until tenancy covers it.
+- `get_recall_events` is served to its own caller only: `GET /api/v1/recall-events` and the Explorer's `/recalls` page (decided under backlog ecf1b34f; `recall_events` row security is keyed on the querying agent).
 
 ---
 
