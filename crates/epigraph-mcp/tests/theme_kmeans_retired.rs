@@ -72,6 +72,27 @@ fn the_removed_tools_have_no_scope_mapping() {
     );
 }
 
+/// Whether `text` names `ident` as a whole identifier: an occurrence not
+/// flanked by another identifier character, so `theme_clustering` or
+/// `prestage_claims` do not count as naming `theme_cluster` / `stage_claims`.
+fn names_identifier(text: &str, ident: &str) -> bool {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(ident).any(|(i, m)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + m.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
+}
+
+#[test]
+fn names_identifier_matches_whole_identifiers_only() {
+    assert!(names_identifier("call theme_cluster now", "theme_cluster"));
+    assert!(names_identifier("\"theme_cluster\"", "theme_cluster"));
+    assert!(names_identifier("theme_cluster", "theme_cluster"));
+    assert!(!names_identifier("theme_clustering runs", "theme_cluster"));
+    assert!(!names_identifier("prestage_claims", "stage_claims"));
+}
+
 /// Nothing an agent reads may still point it at a removed tool.
 #[test]
 fn no_served_schema_names_a_removed_tool() {
@@ -80,7 +101,7 @@ fn no_served_schema_names_a_removed_tool() {
         let text = t.to_string();
         for removed in REMOVED {
             assert!(
-                !text.contains(removed),
+                !names_identifier(&text, removed),
                 "{name}'s served schema still names {removed}: {text}"
             );
         }

@@ -41,11 +41,16 @@ def table_rows(section: str) -> list[str]:
     return [line for line in section.splitlines() if line.startswith("| ") and "---" not in line]
 
 
-def test_the_removed_refusal_is_gone():
-    # The retired tool's refusal was the old source of THEME_JOBS. Pin that it
-    # is gone, so this list is the only place the jobs are enumerated.
-    themes_rs = (REPO / "crates" / "epigraph-mcp" / "src" / "tools" / "themes.rs").read_text()
-    assert "THEME_CLUSTER_RETIRED" not in themes_rs
+def test_every_theme_job_is_a_real_script():
+    # THEME_JOBS is the only place the jobs are enumerated, so tie it to the
+    # tree: each script exists, and a subcommand is one the script documents.
+    for script, sub in THEME_JOBS:
+        path = REPO / "scripts" / script
+        assert path.exists(), f"THEME_JOBS names a missing script: {path}"
+        if sub:
+            assert re.search(rf"^\s*{re.escape(sub)}\b", path.read_text(), re.M), (
+                f"{script} documents no {sub!r} subcommand"
+            )
 
 
 def test_step_10_schedules_every_theme_job():
