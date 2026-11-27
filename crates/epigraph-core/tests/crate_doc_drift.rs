@@ -10,13 +10,24 @@
 //!
 //! 1. every `pub mod` declared in `lib.rs` is named by an intra-doc link in
 //!    the crate doc, so a new module cannot ship undescribed;
-//! 2. every intra-doc link in the crate doc resolves to something `lib.rs`
-//!    declares: a lower-case first path segment must be a declared module,
-//!    and a bare upper-case name must be re-exported at the root by a
-//!    `pub use`. A type that is deleted cannot stay advertised.
+//! 2. every intra-doc link in the crate doc resolves, segment by segment, to
+//!    a public item of the crate: each leading segment must be a `pub mod`
+//!    declared in its parent (as a file or inline), and the last segment must
+//!    be a `pub` item or module declared in, or `pub use`d by, the module the
+//!    path ends in. A deleted type cannot stay advertised, whether the doc
+//!    names it bare (`Node`) or by module path (`edge::Edge`).
 //!
 //! `cargo check` and clippy do not run rustdoc, so a stale intra-doc link
 //! would otherwise go unnoticed.
+//!
+//! Rule 1 is a doc-coverage ratchet, not the proof that the graph types are
+//! gone: that proof is the workspace build after their deletion.
+//!
+//! Known limits of the text-level resolver (it reads the source, it does not
+//! parse it): a `pub` item inside a `#[cfg(...)]`-gated block or a
+//! macro-generated item still counts; a `pub use` counts if its text names
+//! the last segment anywhere; an inline module's body is cut by brace
+//! counting, which a brace inside a string literal or comment would skew.
 //!
 //! The last test pins the one path downstream crates import from the `edge`
 //! module, `epigraph_core::edge::relationships`. It is a guard, not a proof:
@@ -25,6 +36,7 @@
 //! The source is read as text, so this test adds no dependency.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 const LIB_RS: &str = include_str!("../src/lib.rs");
 
@@ -60,12 +72,12 @@ fn doc_links(doc: &str) -> Vec<String> {
     out
 }
 
-/// Everything the root `pub use` statements re-export, as raw text (the
-/// statements span several lines, so they are collected up to their `;`).
-fn root_reexport_text() -> String {
+/// The text of every `pub use` statement in `src`, joined (the statements
+/// span several lines, so each is collected up to its `;`).
+fn pub_use_text(src: &str) -> String {
     let mut text = String::new();
     let mut in_use = false;
-    for line in LIB_RS.lines() {
+    for line in src.lines() {
         let t = line.trim();
         if t.starts_with("pub use ") {
             in_use = true;
@@ -81,10 +93,108 @@ fn root_reexport_text() -> String {
     text
 }
 
-fn reexports(name: &str) -> bool {
-    root_reexport_text()
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .any(|tok| tok == name)
+fn idents(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+}
+
+/// Whether `src` declares a `pub` item (or module) named `name` on a line of
+/// its own, e.g. `pub fn name(`, `pub const fn name(`, `pub struct name<`,
+/// `pub mod name;` / `pub mod name {`. `pub(crate)` items do not count.
+fn declares_pub_item(src: &str, name: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "async", "const", "enum", "fn", "mod", "static", "struct", "trait", "type", "unsafe",
+    ];
+    src.lines()
+        .filter_map(|l| l.trim().strip_prefix("pub "))
+        .any(|rest| {
+            let mut toks = idents(rest);
+            let mut saw_keyword = false;
+            for tok in toks.by_ref() {
+                if KEYWORDS.contains(&tok) {
+                    saw_keyword = true;
+                } else {
+                    return saw_keyword && tok == name;
+                }
+            }
+            false
+        })
+}
+
+/// Whether `src` makes `name` public: declares it, or names it in a
+/// `pub use`.
+fn exposes(src: &str, name: &str) -> bool {
+    declares_pub_item(src, name) || idents(&pub_use_text(src)).any(|t| t == name)
+}
+
+/// The body of `pub mod <name> { ... }` inside `src`, cut by brace counting.
+fn inline_module_body(src: &str, name: &str) -> Option<String> {
+    let open = format!("pub mod {name} {{");
+    let at = src.find(&open)? + open.len();
+    let mut depth = 1usize;
+    for (i, c) in src[at..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(src[at..at + i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where a file-backed module's children live: `src/a.rs` keeps them in
+/// `src/a/`, `src/a/mod.rs` keeps them beside it.
+fn child_dir(file: &Path) -> PathBuf {
+    let parent = file.parent().expect("a module file has a parent dir");
+    match file.file_stem().and_then(|s| s.to_str()) {
+        Some("mod" | "lib") => parent.to_path_buf(),
+        Some(stem) => parent.join(stem),
+        None => parent.to_path_buf(),
+    }
+}
+
+/// Whether the intra-doc link `link` (a path relative to the crate root)
+/// names a public item of this crate. Each leading segment must be a
+/// `pub mod` of its parent; the last must be exposed by the module the path
+/// ends in.
+fn resolves(link: &str) -> bool {
+    let segs: Vec<&str> = link.split("::").collect();
+    let Some((last, modules)) = segs.split_last() else {
+        return false;
+    };
+    let lib = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    // The current module's source text and, if it is file-backed, its file.
+    let mut src = LIB_RS.to_string();
+    let mut file: Option<PathBuf> = Some(lib);
+    for m in modules {
+        if src.contains(&format!("pub mod {m};")) {
+            let Some(dir) = file.as_deref().map(child_dir) else {
+                return false;
+            };
+            let flat = dir.join(format!("{m}.rs"));
+            let nested = dir.join(m).join("mod.rs");
+            let path = if flat.is_file() { flat } else { nested };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return false;
+            };
+            src = text;
+            file = Some(path);
+        } else if let Some(body) = inline_module_body(&src, m) {
+            src = body;
+            // An inline module's file-backed children would sit in a dir
+            // named after it; none exist in this crate, so stop resolving
+            // files below an inline module.
+            file = None;
+        } else {
+            return false;
+        }
+    }
+    exposes(&src, last)
 }
 
 #[test]
@@ -106,23 +216,46 @@ fn crate_doc_names_every_declared_module() {
 
 #[test]
 fn crate_doc_links_only_what_lib_rs_declares() {
-    let modules = declared_modules();
-    let mut dangling = Vec::new();
-    for link in doc_links(&crate_doc()) {
-        let first = link.split("::").next().unwrap_or_default();
-        let ok = if first.starts_with(|c: char| c.is_ascii_lowercase()) {
-            modules.contains(first)
-        } else {
-            !link.contains("::") && reexports(first)
-        };
-        if !ok {
-            dangling.push(link);
-        }
-    }
+    let dangling: Vec<String> = doc_links(&crate_doc())
+        .into_iter()
+        .filter(|l| !resolves(l))
+        .collect();
     assert!(
         dangling.is_empty(),
-        "the crate doc links names lib.rs neither declares as a module nor re-exports: {dangling:?}"
+        "the crate doc links paths that do not resolve to a public item of the crate: {dangling:?}"
     );
+}
+
+/// The resolver itself: a deleted or unknown item behind a real module path
+/// must not resolve. Review of backlog 35be3cd3 found that a first-segment
+/// check alone let `edge::Edge` (the struct this change deleted) stay
+/// advertised.
+#[test]
+fn the_link_resolver_follows_the_whole_path() {
+    for good in [
+        "tenancy",
+        "AgentId",
+        "domain::ids",
+        "domain::ids::AgentId",
+        "domain::Claim",
+        "tenancy::consolidate_tenancy",
+        "edge::relationships",
+        "edge::relationships::SUPPORTS",
+        "edge::relationships::canonical_relationship",
+    ] {
+        assert!(resolves(good), "{good} should resolve");
+    }
+    for bad in [
+        "Node",
+        "graph::InMemoryGraph",
+        "edge::Edge",
+        "tenancy::NoSuchThing",
+        "domain::nope::Claim",
+        "edge::relationships::Edge",
+        "CoreError::NodeNotFound",
+    ] {
+        assert!(!resolves(bad), "{bad} should not resolve");
+    }
 }
 
 #[test]
