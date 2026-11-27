@@ -21,12 +21,20 @@ is gone, or sits on another claim, is reported as `unmatched` and left NULL.
 
 Pass 2 -- the single candidate
 ==============================
-For a BBA that is not an evidence-slot row, look at the evidence rows on its
+For an unslotted BBA (`slot_kind IS NULL`), look at the evidence rows on its
 claim. If there is exactly ONE, link to it. Claims with several evidence rows
 are `ambiguous` and claims with none are `no_candidate`; both stay NULL.
-Evidence-slot rows are excluded here: their slot already names their
-evidence row, so one that pass 1 could not match must not be linked to a
-different row merely because its claim has one.
+Slotted rows are excluded here and reported as `other_slot` when pass 1 does
+not apply to them:
+  * an evidence-slot row already names its evidence row, so one that pass 1
+    could not match must not be linked to a different row merely because its
+    claim has one;
+  * an edge-slot row (an edge factor) or an assessment-slot row is not
+    evidence-derived, and `evidence_id` is NULL for non-evidence BBAs by
+    contract. The engine keys a BBA's source item on `evidence_id`
+    (`atom_items.rs`: rows citing one evidence row are one source), so
+    linking such a row to its claim's evidence would merge two independent
+    sources into one.
 
 Why not value-match on `source_strength` x `evidence_type_weight`? That has a
 composition trap: `edge_factor.rs::wire_evidential_edge_factor` stores
@@ -40,7 +48,7 @@ Both passes skip retracted BBAs: migration 184's rewrite guard (re-created by
 in an UPDATE would abort the whole run. They are reported as `retracted`.
 
 The two passes match disjoint rows (pass 1 only evidence-slot rows, pass 2
-only the others), so the dry-run counts are exactly what `--execute` links,
+only unslotted rows), so the dry-run counts are exactly what `--execute` links,
 barring concurrent writes. The reported buckets partition the unlinked rows.
 
 Undo
@@ -108,10 +116,11 @@ UPDATE mass_functions mf
 RETURNING mf.id::text, mf.evidence_id::text
 """
 
-# Pass 2: every other row, on a claim with exactly one evidence row. Postgres
-# lacks `MIN(uuid)`; with HAVING COUNT(*) = 1, `(array_agg(id))[1]` is that
-# sole row.
-NOT_SLOT = "mf.slot_kind IS DISTINCT FROM 'evidence'"
+# Pass 2: an unslotted row, on a claim with exactly one evidence row. Edge and
+# assessment slots are not evidence-derived, and an evidence slot names its own
+# row (pass 1). Postgres lacks `MIN(uuid)`; with HAVING COUNT(*) = 1,
+# `(array_agg(id))[1]` is that sole row.
+UNSLOTTED = "mf.slot_kind IS NULL"
 LINK_SINGLE_SQL = f"""
 WITH single_evidence_claims AS (
     SELECT claim_id, (array_agg(id))[1] AS evidence_id
@@ -124,7 +133,7 @@ UPDATE mass_functions mf
   FROM single_evidence_claims sec
  WHERE mf.claim_id = sec.claim_id
    AND {ELIGIBLE}
-   AND {NOT_SLOT}
+   AND {UNSLOTTED}
 RETURNING mf.id::text, mf.evidence_id::text
 """
 
@@ -139,9 +148,10 @@ SELECT
   COUNT(*) FILTER (WHERE {ELIGIBLE} AND {SLOT_MATCH})                            AS slot_linkable,
   COUNT(*) FILTER (WHERE {ELIGIBLE} AND mf.slot_kind = 'evidence'
                      AND NOT ({SLOT_MATCH}))                                     AS slot_unmatched,
-  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {NOT_SLOT} AND COALESCE(ec.n, 0) = 1)    AS single_linkable,
-  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {NOT_SLOT} AND COALESCE(ec.n, 0) > 1)    AS ambiguous,
-  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {NOT_SLOT} AND COALESCE(ec.n, 0) = 0)    AS no_candidate,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND mf.slot_kind <> 'evidence')             AS other_slot,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {UNSLOTTED} AND COALESCE(ec.n, 0) = 1)   AS single_linkable,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {UNSLOTTED} AND COALESCE(ec.n, 0) > 1)   AS ambiguous,
+  COUNT(*) FILTER (WHERE {ELIGIBLE} AND {UNSLOTTED} AND COALESCE(ec.n, 0) = 0)   AS no_candidate,
   COUNT(*)                                                                        AS unlinked
   FROM mass_functions mf
   LEFT JOIN ec ON ec.claim_id = mf.claim_id
@@ -164,8 +174,8 @@ UNDO_COUNT_SQL = (
 )
 UNDO_SQL = "UPDATE mass_functions mf SET evidence_id = NULL" + UNDO_FROM + "RETURNING mf.id"
 
-BUCKET_KEYS = ("retracted", "slot_linkable", "slot_unmatched", "single_linkable",
-               "ambiguous", "no_candidate")
+BUCKET_KEYS = ("retracted", "slot_linkable", "slot_unmatched", "other_slot",
+               "single_linkable", "ambiguous", "no_candidate")
 
 
 def missing_columns(conn) -> list[str]:
@@ -229,7 +239,9 @@ def print_buckets(b: dict[str, int], slot: int, single: int, verb: str) -> None:
     print(f"    {verb:<12} = {slot:>10}")
     print(f"    unmatched    = {b['slot_unmatched']:>10} (slot's evidence row missing "
           f"or on another claim; left NULL)")
-    print("  pass 2 (single candidate, non-slot rows):")
+    print(f"  other_slot     = {b['other_slot']:>10} (edge or assessment slot; not "
+          f"evidence-derived, never linked)")
+    print("  pass 2 (single candidate, unslotted rows):")
     print(f"    {verb:<12} = {single:>10}")
     print(f"    ambiguous    = {b['ambiguous']:>10} (claim has >= 2 evidence rows; left NULL)")
     print(f"    no_candidate = {b['no_candidate']:>10} (claim has no evidence row; left NULL)")
@@ -245,6 +257,7 @@ def pass_counts(b: dict[str, int], slot: int, single: int) -> dict:
             "ambiguous": b["ambiguous"],
             "no_candidate": b["no_candidate"],
         },
+        "other_slot": b["other_slot"],
         "retracted": b["retracted"],
     }
 

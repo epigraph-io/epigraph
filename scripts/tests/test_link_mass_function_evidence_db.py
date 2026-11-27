@@ -10,6 +10,8 @@ Backlog d2c71a07:
     `slot_id` = its evidence row) to its slot, and only when that evidence row
     is on the BBA's own claim; a slot pointing at another claim's evidence is
     linked by neither pass, even when its claim has exactly one evidence row;
+  * an edge-slot or assessment-slot row (not evidence-derived) is never
+    linked, even on a claim with exactly one evidence row;
   * a dry run writes nothing (no row, no undo file) and counts exactly what
     `--execute` then links; a re-run links nothing; `--undo` restores NULLs,
     skipping a row whose link changed since;
@@ -157,7 +159,8 @@ class World:
         return {name: self.evidence_id(name) for name in BBAS}
 
 
-BBAS = ("single", "retracted", "slot", "cross_slot", "retracted_slot")
+BBAS = ("single", "retracted", "slot", "cross_slot", "retracted_slot", "edge_slot",
+        "assessment_slot")
 
 
 def summary(proc):
@@ -269,6 +272,13 @@ def world(tmp_path):
     _retract(cur, w.ids["retracted_slot"], agent, group)
     w.retracted.append(w.ids["retracted_slot"])
 
+    # EDGE_SLOT / ASSESSMENT_SLOT: an edge-factor and an assessment BBA on a
+    # claim with exactly one evidence row. Neither is evidence-derived.
+    c_other = claim()
+    _evidence(cur, c_other)
+    w.ids["edge_slot"] = _bba(cur, c_other, frame, agent, "edge", str(uuid.uuid4()))
+    w.ids["assessment_slot"] = _bba(cur, c_other, frame, agent, "assessment", str(uuid.uuid4()))
+
     assert w.fixture_state() == dict.fromkeys(BBAS), "fixture: every BBA starts unlinked"
 
     w.frame = frame
@@ -313,10 +323,13 @@ def test_a_slot_row_is_linked_exactly_and_a_cross_claim_slot_is_not(world):
     )
     assert state["single"] == world.ids["single_evidence"]
     assert state["retracted"] is None and state["retracted_slot"] is None
+    assert state["edge_slot"] is None, "an edge-factor BBA is not evidence-derived"
+    assert state["assessment_slot"] is None, "an assessment BBA is not evidence-derived"
 
     s = summary(proc)
     assert s["pass1_slot"]["linked"] >= 1 and s["pass1_slot"]["unmatched"] >= 1, s
     assert s["pass2_single"]["linked"] >= 1 and s["retracted"] >= 2, s
+    assert s["other_slot"] >= 2, s
     records = {r["mass_function_id"]: r for r in undo_records(undo)}
     assert records[world.ids["slot"]] == {
         "mass_function_id": world.ids["slot"],
@@ -324,7 +337,7 @@ def test_a_slot_row_is_linked_exactly_and_a_cross_claim_slot_is_not(world):
         "pass": "slot",
     }
     assert records[world.ids["single"]]["pass"] == "single"
-    for name in ("cross_slot", "retracted", "retracted_slot"):
+    for name in ("cross_slot", "retracted", "retracted_slot", "edge_slot", "assessment_slot"):
         assert world.ids[name] not in records, name
     assert len(records) == s["pass1_slot"]["linked"] + s["pass2_single"]["linked"]
 
