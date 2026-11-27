@@ -130,6 +130,56 @@ PINS: tuple[Pin, ...] = (
         needle='`CLAUDE.md`, "Belief values: f64, reproducible per platform only"',
         incident="de039f69",
     ),
+    # --- Backlog evidence tier (docs/conventions, pointed at from CLAUDE.md) -
+    Pin(
+        id="backlog-candidate-label-defined",
+        file="docs/conventions/backlog-retirement.md",
+        section_start="## Filing backlog items: evidence tier",
+        section_end="## Retiring a backlog item",
+        needle=(
+            "Label an item `backlog-candidate` (alongside `backlog`) when its only "
+            "support is static reading"
+        ),
+        incident="d543f045",
+    ),
+    Pin(
+        id="backlog-candidate-structural-vs-behavioural",
+        file="docs/conventions/backlog-retirement.md",
+        section_start="## Filing backlog items: evidence tier",
+        section_end="## Retiring a backlog item",
+        needle=(
+            "*Behavioural* claims (a wrong result, a race, a refusal) need an "
+            "executed test, a reproduced call, or a read"
+        ),
+        incident="d543f045",
+    ),
+    Pin(
+        id="backlog-candidate-removed-by-re-measurer",
+        file="docs/conventions/backlog-retirement.md",
+        section_start="## Filing backlog items: evidence tier",
+        section_end="## Retiring a backlog item",
+        needle="**The re-measurer removes `backlog-candidate`**, citing the evidence",
+        incident="d543f045",
+    ),
+    Pin(
+        id="backlog-candidate-never-closed-unmeasured",
+        file="docs/conventions/backlog-retirement.md",
+        section_start="## Filing backlog items: evidence tier",
+        section_end="## Retiring a backlog item",
+        needle="**A candidate is never closed for being unmeasured.**",
+        incident="d543f045",
+    ),
+    Pin(
+        id="claude-md-points-at-evidence-tier",
+        file="CLAUDE.md",
+        section_start="## Retiring backlog items",
+        section_end="## Schema, migrations, claim mechanics",
+        needle=(
+            "`docs/conventions/backlog-retirement.md`, \"Filing backlog items: "
+            "evidence tier\""
+        ),
+        incident="d543f045",
+    ),
     # --- CLAUDE.md, "Test database" ----------------------------------------
     Pin(
         id="test-db-fresh-and-migrated-from-empty",

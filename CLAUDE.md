@@ -66,6 +66,9 @@ Never register a first-party route under `/api/v1/ext`
 
 ## Retiring backlog items
 
+Filing an item backed only by static reading or testimony? Label it `backlog-candidate`; see
+`docs/conventions/backlog-retirement.md`, "Filing backlog items: evidence tier".
+
 When you complete or refute a claim labelled `backlog`, **always use
 `mcp__epigraph__resolve_backlog_item(original_id, resolution_content)`**.
 It creates a resolution claim (labelled `["resolved"]`, prose prefixed

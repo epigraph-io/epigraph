@@ -8,6 +8,37 @@ Use `submit_claim` (or `memorize`) with `labels=["backlog"]` and a self-containe
 description of the issue. Include enough context that a future agent or human can
 act on it without the original conversation.
 
+## Filing backlog items: evidence tier
+
+A backlog item says something is wrong. How that was established decides
+whether anyone should plan work on it yet.
+
+- **`backlog-candidate`.** Label an item `backlog-candidate` (alongside
+  `backlog`) when its only support is static reading (a code trace nobody
+  executed) or testimony (someone reported it). The item is open and visible
+  like any other; it is just not ready to plan until it is re-measured.
+- **Re-measured** means the defect was confirmed on the current ref, with the
+  evidence cited:
+  - *Structural* claims (dead code, doc drift, a duplicated constant):
+    `git grep` / `git show` on the current `main` is enough.
+  - *Behavioural* claims (a wrong result, a race, a refusal) need an executed
+    test, a reproduced call, or a read of the deployed system.
+- **The re-measurer removes `backlog-candidate`**, citing the evidence (what
+  was run, and on which ref) in the label patch. The ownership rules under
+  "Who may retire an item" apply to that patch as to any other, and it never
+  touches `resolved`.
+- **A candidate is never closed for being unmeasured.** An item nobody has
+  re-measured stays open as a candidate; it is not resolved, refuted or
+  dropped for that reason. `backlog-candidate` is never a substitute for
+  `resolved`: retiring a candidate still goes through `resolve_backlog_item`.
+- **Backlog items only.** The tier governs backlog promotion. General claims
+  are unaffected: their admission and belief do not change (ruling
+  `6e7a6c69`).
+
+To list only the items ready to plan, add `backlog-candidate` to
+`exclude_labels` in the open-backlog query below (`exclude_labels` drops a
+claim carrying any of the listed labels).
+
 ## Retiring a backlog item
 
 **ALWAYS use `mcp__epigraph__resolve_backlog_item`.** This single tool call both
