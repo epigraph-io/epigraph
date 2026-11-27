@@ -342,6 +342,63 @@ pub enum ApiError {
         message: String,
         data: serde_json::Value,
     },
+
+    /// A 4xx refusal whose body the route DESIGNS: `{"error": <error>,
+    /// "message": <message>, "details": <details>}`, with `message` verbatim
+    /// (no `"Bad request: "`-style prefix) and `details` omitted when `None`.
+    ///
+    /// This is the carrier for a route whose error keys and structured
+    /// details are a client contract older than the central variants
+    /// (`POST /api/v1/submit/packet`: `ValidationError` with
+    /// `details.field`, `SignatureError`, `DuplicateNotCurrent`, ...). The
+    /// route used to keep its own `(StatusCode, ErrorResponse)` envelope and
+    /// its own 500 redaction (backlog 23db186a); its 5xx now go through
+    /// [`ApiError::InternalError`] / [`ApiError::DatabaseError`] and its 4xx
+    /// through this variant, so the redaction lives here once.
+    ///
+    /// The status is a [`RefusalStatus`], so a 5xx cannot be carried: a
+    /// server fault's text is the server's (see [`ApiError::InternalError`]),
+    /// and this variant sends `message` to the caller as written.
+    ///
+    /// A `401` here carries NO `WWW-Authenticate` challenge. The packet
+    /// route's 401s refuse the Ed25519 signature over the PAYLOAD after the
+    /// bearer credential was accepted; a bearer challenge would tell the
+    /// client to re-mint a token that is not the problem (RFC 6750 §3 scopes
+    /// the challenge to bearer-token failures).
+    #[error("{message}")]
+    Refused {
+        status: RefusalStatus,
+        error: &'static str,
+        message: String,
+        details: Option<serde_json::Value>,
+    },
+}
+
+/// The statuses an [`ApiError::Refused`] may answer. 4xx only, so a server
+/// fault cannot reach the caller through the verbatim-message carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalStatus {
+    /// `400`
+    BadRequest,
+    /// `401`, without a `WWW-Authenticate` challenge (see [`ApiError::Refused`]).
+    Unauthorized,
+    /// `403`
+    Forbidden,
+    /// `409`
+    Conflict,
+}
+
+impl RefusalStatus {
+    /// The HTTP status this refusal answers.
+    #[must_use]
+    pub const fn status_code(self) -> StatusCode {
+        match self {
+            Self::BadRequest => StatusCode::BAD_REQUEST,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Conflict => StatusCode::CONFLICT,
+        }
+    }
 }
 
 impl ApiError {
@@ -382,6 +439,34 @@ impl ApiError {
             surface: surface.to_string(),
             runs_on_kind: "none",
             runs_on_name: PRIVATIZATION_LIFECYCLE_NOT_SERVED.to_string(),
+        }
+    }
+
+    /// A designed 4xx refusal with no `details` (see [`ApiError::Refused`]).
+    #[must_use]
+    pub fn refused(status: RefusalStatus, error: &'static str, message: impl Into<String>) -> Self {
+        Self::Refused {
+            status,
+            error,
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    /// A designed 4xx refusal carrying structured `details` (see
+    /// [`ApiError::Refused`]).
+    #[must_use]
+    pub fn refused_with(
+        status: RefusalStatus,
+        error: &'static str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self::Refused {
+            status,
+            error,
+            message: message.into(),
+            details: Some(details),
         }
     }
 }
@@ -659,6 +744,14 @@ impl IntoResponse for ApiError {
             ApiError::CompoundTarget { .. } => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "compound_target", None)
             }
+            // The route's designed body: its own key, its message verbatim
+            // (`caller_message` renders `Refused` as `message`), its details.
+            ApiError::Refused {
+                status,
+                error,
+                details,
+                ..
+            } => (status.status_code(), *error, details.clone()),
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a
@@ -1440,6 +1533,91 @@ mod tests {
             challenge.contains(r#"error="invalid_token""#),
             "got: {challenge}"
         );
+    }
+
+    /// `ApiError::Refused` renders the route's designed body exactly: its own
+    /// error key, its message VERBATIM (no `Display` prefix), its details
+    /// (omitted when `None`), and the status its `RefusalStatus` names. The
+    /// packet route's clients read these fields (`details.field`, the
+    /// `SignatureError` message, the `DuplicateNotCurrent` key), so the whole
+    /// body is pinned, not a substring of it (backlog 23db186a).
+    #[tokio::test]
+    async fn refused_renders_the_designed_body_verbatim() {
+        let (status, body) = rendered(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            "Claim content cannot be empty or whitespace",
+            serde_json::json!({ "field": "claim.content" }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "ValidationError",
+                "message": "Claim content cannot be empty or whitespace",
+                "details": { "field": "claim.content" },
+            })
+        );
+
+        let (status, body) = rendered(ApiError::refused(
+            RefusalStatus::Conflict,
+            "DuplicateNotCurrent",
+            "the existing claim is not current",
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "DuplicateNotCurrent",
+                "message": "the existing claim is not current",
+            }),
+            "no details key when None"
+        );
+
+        for (s, want) in [
+            (RefusalStatus::BadRequest, StatusCode::BAD_REQUEST),
+            (RefusalStatus::Unauthorized, StatusCode::UNAUTHORIZED),
+            (RefusalStatus::Forbidden, StatusCode::FORBIDDEN),
+            (RefusalStatus::Conflict, StatusCode::CONFLICT),
+        ] {
+            assert_eq!(s.status_code(), want);
+            assert!(want.is_client_error(), "a Refused is never a server fault");
+        }
+    }
+
+    /// A `Refused` 401 is a PAYLOAD-signature refusal after the bearer
+    /// credential was accepted: no `WWW-Authenticate`, unlike every bearer
+    /// 401 (`Unauthorized`, `InvalidSignature`, `SignatureError`).
+    #[test]
+    fn a_refused_401_carries_no_bearer_challenge() {
+        let response = ApiError::refused_with(
+            RefusalStatus::Unauthorized,
+            "SignatureError",
+            "Signature verification failed",
+            serde_json::json!({ "field": "signature" }),
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response.headers().get(WWW_AUTHENTICATE).is_none(),
+            "a payload-signature 401 must not tell the client to re-mint its token"
+        );
+    }
+
+    /// `caller_message` (what batch routes copy into a 200 body) is the
+    /// rendered top-level `message`, verbatim, for a `Refused`.
+    #[test]
+    fn refused_caller_message_is_the_message_verbatim() {
+        let e = ApiError::refused(
+            RefusalStatus::Forbidden,
+            "Forbidden",
+            "OPL02: nothing was written.",
+        );
+        assert_eq!(e.caller_message(), "OPL02: nothing was written.");
     }
 
     #[test]

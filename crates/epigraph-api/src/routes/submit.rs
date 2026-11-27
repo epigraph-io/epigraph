@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use uuid::Uuid;
 
+use crate::errors::{ApiError, RefusalStatus};
 use crate::services::SubmissionService;
 use crate::state::{AppState, CachedSubmission};
 use epigraph_core::{AgentId, Claim, ClaimId, TraceId, TruthValue};
@@ -36,7 +37,7 @@ use epigraph_events::EpiGraphEvent;
 // Database-related imports (only when db feature is enabled)
 use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
-use epigraph_core::{EvidenceId, EvidenceType, Methodology, TraceInput};
+use epigraph_core::{EvidenceId, EvidenceType, TraceInput};
 #[cfg(feature = "db")]
 use epigraph_db::AgentRepository;
 
@@ -228,22 +229,32 @@ pub enum MethodologySubmission {
 }
 
 impl MethodologySubmission {
+    /// The domain methodology this wire value names: the one mapping, used
+    /// for the stored trace and for [`Self::weight_modifier`].
+    #[must_use]
+    pub const fn as_domain(self) -> epigraph_core::Methodology {
+        use epigraph_core::Methodology as M;
+        match self {
+            Self::Deductive => M::Deductive,
+            Self::Inductive => M::Inductive,
+            Self::Abductive => M::Abductive,
+            Self::Instrumental => M::Instrumental,
+            Self::Extraction => M::Extraction,
+            Self::BayesianInference => M::BayesianInference,
+            Self::VisualInspection => M::VisualInspection,
+            Self::FormalProof => M::FormalProof,
+            Self::Heuristic => M::Heuristic,
+        }
+    }
+
     /// Returns a weight modifier for truth calculation
     ///
-    /// Formal proofs get bonuses (> 1.0), heuristics get penalties (< 1.0)
+    /// Formal proofs get bonuses (> 1.0), heuristics get penalties (< 1.0).
+    /// Read from `epigraph_core::Methodology::weight_modifier`, the one
+    /// methodology weight table (backlog 19e46f05); this route keeps no copy.
     #[must_use]
     pub const fn weight_modifier(self) -> f64 {
-        match self {
-            Self::FormalProof => 1.2,
-            Self::Deductive => 1.1,
-            Self::BayesianInference => 1.0,
-            Self::Inductive => 0.9,
-            Self::Instrumental => 0.85,
-            Self::VisualInspection => 0.8,
-            Self::Extraction => 0.75,
-            Self::Abductive => 0.7,
-            Self::Heuristic => 0.5,
-        }
+        self.as_domain().weight_modifier()
     }
 }
 
@@ -373,63 +384,15 @@ pub struct SubmitPacketResponse {
     pub visibility_note: Option<String>,
 }
 
-/// Error response structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorResponse {
-    pub error: String,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<serde_json::Value>,
-}
-
-impl ErrorResponse {
-    pub fn new(error: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            error: error.into(),
-            message: message.into(),
-            details: None,
-        }
-    }
-
-    pub fn with_details(
-        error: impl Into<String>,
-        message: impl Into<String>,
-        details: serde_json::Value,
-    ) -> Self {
-        Self {
-            error: error.into(),
-            message: message.into(),
-            details: Some(details),
-        }
-    }
-}
-
-/// The response for a refused packet.
-///
-/// A 5xx body is REDACTED, as `ApiError`'s are (F-route-error-text-remainder):
-/// this handler builds its own `ErrorResponse`s, many with the driver's error
-/// interpolated into `message` or `details`, so the message and details are
-/// LOGGED (target `api.internal_error`) and the body keeps only the error key
-/// and a fixed literal. A 4xx body is the caller's to read and is sent as built.
-fn error_response(status: StatusCode, error: ErrorResponse) -> Response {
-    if !status.is_server_error() {
-        return (status, Json(error)).into_response();
-    }
-    tracing::error!(
-        target: "api.internal_error",
-        route = "submit/packet",
-        kind = %error.error,
-        detail = %error.message,
-        details = ?error.details,
-        "packet submission failed"
-    );
-    let message = if error.error == "DatabaseError" {
-        crate::errors::DATABASE_ERROR_BODY
-    } else {
-        crate::errors::INTERNAL_ERROR_BODY
-    };
-    (status, Json(ErrorResponse::new(error.error, message))).into_response()
-}
+// A refused packet is an `ApiError` (backlog 23db186a). Its 4xx are
+// `ApiError::Refused`, which renders this route's designed
+// `{error, message, details}` body verbatim (the error keys and details are
+// a client contract) and puts no bearer challenge on the payload-signature
+// 401s. Its 5xx are `ApiError::InternalError` / `ApiError::DatabaseError`,
+// whose detail is LOGGED (target `api.internal_error`, prefixed
+// `submit/packet:`) and kept out of the body, as on every other route. The
+// route used to keep its own `ErrorResponse` envelope and its own copy of
+// that redaction.
 
 /// The response for a refused evidence INSERT of packet item `index`.
 ///
@@ -440,7 +403,7 @@ fn error_response(status: StatusCode, error: ErrorResponse) -> Response {
 /// The body names the constraint only (a schema identifier, as
 /// `ApiError::from(DbError::CheckViolation)` does); anything else stays a 500.
 #[cfg(feature = "db")]
-fn evidence_insert_error(index: usize, e: &sqlx::Error) -> (StatusCode, ErrorResponse) {
+fn evidence_insert_error(index: usize, e: &sqlx::Error) -> ApiError {
     if let Some(db) = e.as_database_error() {
         if db.code().as_deref() == Some("23514") {
             let constraint = db.constraint().unwrap_or("<unnamed>").to_string();
@@ -460,20 +423,17 @@ fn evidence_insert_error(index: usize, e: &sqlx::Error) -> (StatusCode, ErrorRes
                     "evidence[{index}] violates a database constraint (constraint {constraint})"
                 )
             };
-            return (
-                StatusCode::BAD_REQUEST,
-                ErrorResponse::with_details(
-                    "ValidationError",
-                    message,
-                    serde_json::json!({ "field": format!("evidence[{index}]"), "constraint": constraint }),
-                ),
+            return ApiError::refused_with(
+                RefusalStatus::BadRequest,
+                "ValidationError",
+                message,
+                serde_json::json!({ "field": format!("evidence[{index}]"), "constraint": constraint }),
             );
         }
     }
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        ErrorResponse::new("DatabaseError", format!("Failed to insert evidence: {e}")),
-    )
+    ApiError::DatabaseError {
+        message: format!("submit/packet: Failed to insert evidence: {e}"),
+    }
 }
 
 // =============================================================================
@@ -481,39 +441,32 @@ fn evidence_insert_error(index: usize, e: &sqlx::Error) -> (StatusCode, ErrorRes
 // =============================================================================
 
 /// Validate the epistemic packet and return any errors
-async fn validate_packet(
-    packet: &EpistemicPacket,
-    state: &AppState,
-) -> Result<(), (StatusCode, ErrorResponse)> {
+async fn validate_packet(packet: &EpistemicPacket, state: &AppState) -> Result<(), ApiError> {
     // 1. Validate claim content is not empty
     if packet.claim.content.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                "Claim content cannot be empty or whitespace",
-                serde_json::json!({ "field": "claim.content" }),
-            ),
+        return Err(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            "Claim content cannot be empty or whitespace",
+            serde_json::json!({ "field": "claim.content" }),
         ));
     }
 
     // 1b. Validate claim content length (DoS prevention)
     if packet.claim.content.len() > MAX_CLAIM_CONTENT_LENGTH {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                format!(
-                    "Claim content too long: {} bytes, maximum is {} bytes",
-                    packet.claim.content.len(),
-                    MAX_CLAIM_CONTENT_LENGTH
-                ),
-                serde_json::json!({
-                    "field": "claim.content",
-                    "length": packet.claim.content.len(),
-                    "max_allowed": MAX_CLAIM_CONTENT_LENGTH
-                }),
+        return Err(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            format!(
+                "Claim content too long: {} bytes, maximum is {} bytes",
+                packet.claim.content.len(),
+                MAX_CLAIM_CONTENT_LENGTH
             ),
+            serde_json::json!({
+                "field": "claim.content",
+                "length": packet.claim.content.len(),
+                "max_allowed": MAX_CLAIM_CONTENT_LENGTH
+            }),
         ));
     }
 
@@ -536,13 +489,11 @@ async fn validate_packet(
                 epigraph_db::DbError::InvalidData { reason } => reason,
                 other => other.to_string(),
             };
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ErrorResponse::with_details(
-                    "ValidationError",
-                    reason,
-                    serde_json::json!({ "field": "claim.labels" }),
-                ),
+            return Err(ApiError::refused_with(
+                RefusalStatus::BadRequest,
+                "ValidationError",
+                reason,
+                serde_json::json!({ "field": "claim.labels" }),
             ));
         }
     }
@@ -550,108 +501,96 @@ async fn validate_packet(
     // 1c. Validate idempotency key length (DoS prevention)
     if let Some(ref key) = packet.claim.idempotency_key {
         if key.len() > MAX_IDEMPOTENCY_KEY_LENGTH {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ErrorResponse::with_details(
-                    "ValidationError",
-                    format!(
-                        "Idempotency key too long: {} bytes, maximum is {} bytes",
-                        key.len(),
-                        MAX_IDEMPOTENCY_KEY_LENGTH
-                    ),
-                    serde_json::json!({
-                        "field": "claim.idempotency_key",
-                        "length": key.len(),
-                        "max_allowed": MAX_IDEMPOTENCY_KEY_LENGTH
-                    }),
+            return Err(ApiError::refused_with(
+                RefusalStatus::BadRequest,
+                "ValidationError",
+                format!(
+                    "Idempotency key too long: {} bytes, maximum is {} bytes",
+                    key.len(),
+                    MAX_IDEMPOTENCY_KEY_LENGTH
                 ),
+                serde_json::json!({
+                    "field": "claim.idempotency_key",
+                    "length": key.len(),
+                    "max_allowed": MAX_IDEMPOTENCY_KEY_LENGTH
+                }),
             ));
         }
     }
 
     // 2. Validate evidence count is within bounds (DoS prevention)
     if packet.evidence.len() > MAX_EVIDENCE_PER_PACKET {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                format!(
-                    "Too many evidence items: {} provided, maximum is {}",
-                    packet.evidence.len(),
-                    MAX_EVIDENCE_PER_PACKET
-                ),
-                serde_json::json!({
-                    "field": "evidence",
-                    "count": packet.evidence.len(),
-                    "max_allowed": MAX_EVIDENCE_PER_PACKET
-                }),
+        return Err(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            format!(
+                "Too many evidence items: {} provided, maximum is {}",
+                packet.evidence.len(),
+                MAX_EVIDENCE_PER_PACKET
             ),
+            serde_json::json!({
+                "field": "evidence",
+                "count": packet.evidence.len(),
+                "max_allowed": MAX_EVIDENCE_PER_PACKET
+            }),
         ));
     }
 
     // 3. Validate initial_truth if provided
     if let Some(truth) = packet.claim.initial_truth.0 {
         if !truth.is_finite() || !(0.0..=1.0).contains(&truth) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ErrorResponse::with_details(
-                    "ValidationError",
-                    "Initial truth value must be between 0.0 and 1.0",
-                    serde_json::json!({ "field": "claim.initial_truth", "value": truth }),
-                ),
+            return Err(ApiError::refused_with(
+                RefusalStatus::BadRequest,
+                "ValidationError",
+                "Initial truth value must be between 0.0 and 1.0",
+                serde_json::json!({ "field": "claim.initial_truth", "value": truth }),
             ));
         }
     }
 
     // 4. Validate reasoning trace has explanation (no naked assertions)
     if packet.reasoning_trace.explanation.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                "Reasoning trace must have a non-empty explanation (no naked assertions)",
-                serde_json::json!({ "field": "reasoning_trace.explanation" }),
-            ),
+        return Err(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            "Reasoning trace must have a non-empty explanation (no naked assertions)",
+            serde_json::json!({ "field": "reasoning_trace.explanation" }),
         ));
     }
 
     // 4b. Validate explanation length (DoS prevention)
     if packet.reasoning_trace.explanation.len() > MAX_EXPLANATION_LENGTH {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                format!(
-                    "Reasoning explanation too long: {} bytes, maximum is {} bytes",
-                    packet.reasoning_trace.explanation.len(),
-                    MAX_EXPLANATION_LENGTH
-                ),
-                serde_json::json!({
-                    "field": "reasoning_trace.explanation",
-                    "length": packet.reasoning_trace.explanation.len(),
-                    "max_allowed": MAX_EXPLANATION_LENGTH
-                }),
+        return Err(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            format!(
+                "Reasoning explanation too long: {} bytes, maximum is {} bytes",
+                packet.reasoning_trace.explanation.len(),
+                MAX_EXPLANATION_LENGTH
             ),
+            serde_json::json!({
+                "field": "reasoning_trace.explanation",
+                "length": packet.reasoning_trace.explanation.len(),
+                "max_allowed": MAX_EXPLANATION_LENGTH
+            }),
         ));
     }
 
     // 4c. Validate trace inputs count (DoS prevention)
     if packet.reasoning_trace.inputs.len() > MAX_TRACE_INPUTS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                format!(
-                    "Too many trace inputs: {} provided, maximum is {}",
-                    packet.reasoning_trace.inputs.len(),
-                    MAX_TRACE_INPUTS
-                ),
-                serde_json::json!({
-                    "field": "reasoning_trace.inputs",
-                    "count": packet.reasoning_trace.inputs.len(),
-                    "max_allowed": MAX_TRACE_INPUTS
-                }),
+        return Err(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            format!(
+                "Too many trace inputs: {} provided, maximum is {}",
+                packet.reasoning_trace.inputs.len(),
+                MAX_TRACE_INPUTS
             ),
+            serde_json::json!({
+                "field": "reasoning_trace.inputs",
+                "count": packet.reasoning_trace.inputs.len(),
+                "max_allowed": MAX_TRACE_INPUTS
+            }),
         ));
     }
 
@@ -660,13 +599,11 @@ async fn validate_packet(
         || packet.reasoning_trace.confidence < 0.0
         || packet.reasoning_trace.confidence > 1.0
     {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                "Reasoning confidence must be between 0.0 and 1.0",
-                serde_json::json!({ "field": "reasoning_trace.confidence" }),
-            ),
+        return Err(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            "Reasoning confidence must be between 0.0 and 1.0",
+            serde_json::json!({ "field": "reasoning_trace.confidence" }),
         ));
     }
 
@@ -674,49 +611,43 @@ async fn validate_packet(
     for (i, evidence) in packet.evidence.iter().enumerate() {
         // Validate hex format (must be 64 characters for BLAKE3)
         if evidence.content_hash.len() != 64 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ErrorResponse::with_details(
-                    "ValidationError",
-                    format!(
-                        "Evidence content_hash must be 64 hex characters, got {}",
-                        evidence.content_hash.len()
-                    ),
-                    serde_json::json!({ "field": format!("evidence[{}].content_hash", i) }),
+            return Err(ApiError::refused_with(
+                RefusalStatus::BadRequest,
+                "ValidationError",
+                format!(
+                    "Evidence content_hash must be 64 hex characters, got {}",
+                    evidence.content_hash.len()
                 ),
+                serde_json::json!({ "field": format!("evidence[{}].content_hash", i) }),
             ));
         }
 
         // Verify hex is valid
         if ContentHasher::from_hex(&evidence.content_hash).is_err() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ErrorResponse::with_details(
-                    "ValidationError",
-                    "Evidence content_hash contains invalid hex characters",
-                    serde_json::json!({ "field": format!("evidence[{}].content_hash", i) }),
-                ),
+            return Err(ApiError::refused_with(
+                RefusalStatus::BadRequest,
+                "ValidationError",
+                "Evidence content_hash contains invalid hex characters",
+                serde_json::json!({ "field": format!("evidence[{}].content_hash", i) }),
             ));
         }
 
         // 5b. Validate raw_content length (DoS prevention)
         if let Some(ref raw_content) = evidence.raw_content {
             if raw_content.len() > MAX_RAW_CONTENT_LENGTH {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    ErrorResponse::with_details(
-                        "ValidationError",
-                        format!(
-                            "Evidence raw_content too long: {} bytes, maximum is {} bytes",
-                            raw_content.len(),
-                            MAX_RAW_CONTENT_LENGTH
-                        ),
-                        serde_json::json!({
-                            "field": format!("evidence[{}].raw_content", i),
-                            "length": raw_content.len(),
-                            "max_allowed": MAX_RAW_CONTENT_LENGTH
-                        }),
+                return Err(ApiError::refused_with(
+                    RefusalStatus::BadRequest,
+                    "ValidationError",
+                    format!(
+                        "Evidence raw_content too long: {} bytes, maximum is {} bytes",
+                        raw_content.len(),
+                        MAX_RAW_CONTENT_LENGTH
                     ),
+                    serde_json::json!({
+                        "field": format!("evidence[{}].raw_content", i),
+                        "length": raw_content.len(),
+                        "max_allowed": MAX_RAW_CONTENT_LENGTH
+                    }),
                 ));
             }
 
@@ -725,17 +656,15 @@ async fn validate_packet(
             let computed_hex = ContentHasher::to_hex(&computed_hash);
 
             if computed_hex != evidence.content_hash {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    ErrorResponse::with_details(
-                        "IntegrityError",
-                        "Evidence content hash does not match raw content",
-                        serde_json::json!({
-                            "field": format!("evidence[{}]", i),
-                            "expected_hash": evidence.content_hash,
-                            "computed_hash": computed_hex,
-                        }),
-                    ),
+                return Err(ApiError::refused_with(
+                    RefusalStatus::BadRequest,
+                    "IntegrityError",
+                    "Evidence content hash does not match raw content",
+                    serde_json::json!({
+                        "field": format!("evidence[{}]", i),
+                        "expected_hash": evidence.content_hash,
+                        "computed_hash": computed_hex,
+                    }),
                 ));
             }
         }
@@ -747,21 +676,19 @@ async fn validate_packet(
         } = &evidence.evidence_type
         {
             if url.len() > MAX_URL_LENGTH {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    ErrorResponse::with_details(
-                        "ValidationError",
-                        format!(
-                            "Source URL too long: {} bytes, maximum is {} bytes",
-                            url.len(),
-                            MAX_URL_LENGTH
-                        ),
-                        serde_json::json!({
-                            "field": format!("evidence[{}].source_url", i),
-                            "length": url.len(),
-                            "max_allowed": MAX_URL_LENGTH
-                        }),
+                return Err(ApiError::refused_with(
+                    RefusalStatus::BadRequest,
+                    "ValidationError",
+                    format!(
+                        "Source URL too long: {} bytes, maximum is {} bytes",
+                        url.len(),
+                        MAX_URL_LENGTH
                     ),
+                    serde_json::json!({
+                        "field": format!("evidence[{}].source_url", i),
+                        "length": url.len(),
+                        "max_allowed": MAX_URL_LENGTH
+                    }),
                 ));
             }
         }
@@ -772,17 +699,15 @@ async fn validate_packet(
         match input {
             TraceInputSubmission::Evidence { index } => {
                 if *index >= packet.evidence.len() {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        ErrorResponse::with_details(
-                            "ValidationError",
-                            format!(
-                                "Evidence index {} is out of bounds (only {} evidence items provided)",
-                                index,
-                                packet.evidence.len()
-                            ),
-                            serde_json::json!({ "field": "reasoning_trace.inputs" }),
+                    return Err(ApiError::refused_with(
+                        RefusalStatus::BadRequest,
+                        "ValidationError",
+                        format!(
+                            "Evidence index {} is out of bounds (only {} evidence items provided)",
+                            index,
+                            packet.evidence.len()
                         ),
+                        serde_json::json!({ "field": "reasoning_trace.inputs" }),
                     ));
                 }
             }
@@ -791,26 +716,17 @@ async fn validate_packet(
                 // being referenced, this is a self-reference (circular)
                 if let Some(ref key) = packet.claim.idempotency_key {
                     if key == &id.to_string() {
-                        return Err((
-                            StatusCode::BAD_REQUEST,
-                            ErrorResponse::with_details(
-                                "CircularReferenceError",
-                                "Reasoning trace cannot reference its own claim (circular reference detected)",
-                                serde_json::json!({ "referenced_claim_id": id }),
-                            ),
-                        ));
+                        return Err(ApiError::refused_with(RefusalStatus::BadRequest, "CircularReferenceError", "Reasoning trace cannot reference its own claim (circular reference detected)", serde_json::json!({ "referenced_claim_id": id })));
                     }
                 }
                 // In production, we would verify the claim exists in the database
                 // For testing without a database, we return 400 for any non-existent claim
                 // In a real implementation, this would be a database lookup
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    ErrorResponse::with_details(
-                        "ValidationError",
-                        format!("Referenced claim {} does not exist", id),
-                        serde_json::json!({ "field": "reasoning_trace.inputs", "claim_id": id }),
-                    ),
+                return Err(ApiError::refused_with(
+                    RefusalStatus::BadRequest,
+                    "ValidationError",
+                    format!("Referenced claim {} does not exist", id),
+                    serde_json::json!({ "field": "reasoning_trace.inputs", "claim_id": id }),
                 ));
             }
         }
@@ -818,9 +734,10 @@ async fn validate_packet(
 
     // 7. Validate signature (if required)
     //
-    // DELIBERATE: the six 401s in this block are raw
-    // `(StatusCode::UNAUTHORIZED, Json(ErrorResponse))` tuples and carry NO
-    // `WWW-Authenticate` challenge, unlike every 401 `ApiError` produces.
+    // DELIBERATE: the six 401s in this block are `ApiError::Refused` with
+    // `RefusalStatus::Unauthorized` and carry NO `WWW-Authenticate`
+    // challenge, unlike the bearer 401s (`Unauthorized`, `InvalidSignature`,
+    // `SignatureError`), which do.
     //
     // PR-03's acceptance asked for "the challenge header on every 401 shape",
     // and this is the exception, recorded rather than left implicit. An RFC
@@ -837,28 +754,24 @@ async fn validate_packet(
     if state.config.require_packet_signatures {
         // Validate signature format (128 hex chars for Ed25519)
         if packet.signature.len() != 128 {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                ErrorResponse::with_details(
-                    "SignatureError",
-                    format!(
-                        "Signature must be 128 hex characters (64 bytes), got {}",
-                        packet.signature.len()
-                    ),
-                    serde_json::json!({ "field": "signature" }),
+            return Err(ApiError::refused_with(
+                RefusalStatus::Unauthorized,
+                "SignatureError",
+                format!(
+                    "Signature must be 128 hex characters (64 bytes), got {}",
+                    packet.signature.len()
                 ),
+                serde_json::json!({ "field": "signature" }),
             ));
         }
 
         // Validate hex format
         if packet.signature.chars().any(|c| !c.is_ascii_hexdigit()) {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                ErrorResponse::with_details(
-                    "SignatureError",
-                    "Signature contains invalid hex characters",
-                    serde_json::json!({ "field": "signature" }),
-                ),
+            return Err(ApiError::refused_with(
+                RefusalStatus::Unauthorized,
+                "SignatureError",
+                "Signature contains invalid hex characters",
+                serde_json::json!({ "field": "signature" }),
             ));
         }
 
@@ -878,93 +791,67 @@ async fn validate_packet(
             // keys to any reader that does not filter — and the SQL belongs in
             // the repo layer regardless (CLAUDE.md).
             let agent_id: Uuid = packet.claim.agent_id;
-            let mut conn = state.db_pool.acquire().await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::with_details(
-                        "InternalError",
-                        "Failed to acquire a database connection",
-                        serde_json::json!({ "error": e.to_string() }),
-                    ),
-                )
-            })?;
+            let mut conn = state
+                .db_pool
+                .acquire()
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("submit/packet: Failed to acquire a database connection: {e}"),
+                })?;
             let pub_key_row = epigraph_db::repos::agent::AgentRepository::public_key_if_signer(
                 &mut conn, agent_id,
             )
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::with_details(
-                        "InternalError",
-                        "Failed to look up agent public key",
-                        serde_json::json!({ "error": e.to_string() }),
-                    ),
-                )
+            .map_err(|e| ApiError::InternalError {
+                message: format!("submit/packet: Failed to look up agent public key: {e}"),
             })?;
 
             let pub_key_bytes: [u8; 32] = pub_key_row
                 .ok_or_else(|| {
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        ErrorResponse::with_details(
-                            "SignatureError",
-                            "Agent not registered, or is not an Ed25519 signer",
-                            serde_json::json!({ "field": "claim.agent_id" }),
-                        ),
+                    ApiError::refused_with(
+                        RefusalStatus::Unauthorized,
+                        "SignatureError",
+                        "Agent not registered, or is not an Ed25519 signer",
+                        serde_json::json!({ "field": "claim.agent_id" }),
                     )
                 })?
                 .try_into()
-                .map_err(|_| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ErrorResponse::with_details(
-                            "InternalError",
-                            "Stored public key has wrong length",
-                            serde_json::json!({}),
-                        ),
-                    )
+                .map_err(|_| ApiError::InternalError {
+                    message: "submit/packet: Stored public key has wrong length".to_string(),
                 })?;
 
             // 2. Decode the hex signature.
             let mut sig_bytes = [0u8; 64];
             hex::decode_to_slice(&packet.signature, &mut sig_bytes).map_err(|_| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    ErrorResponse::with_details(
-                        "SignatureError",
-                        "Signature contains invalid hex characters",
-                        serde_json::json!({ "field": "signature" }),
-                    ),
+                ApiError::refused_with(
+                    RefusalStatus::Unauthorized,
+                    "SignatureError",
+                    "Signature contains invalid hex characters",
+                    serde_json::json!({ "field": "signature" }),
                 )
             })?;
 
             // 3. Recompute the canonical bytes the client should have signed.
             // The canonical scheme: serialized (claim, evidence, reasoning_trace)
             // tuple, signature field excluded. See EpistemicPacket::signable_bytes.
-            let canonical = packet.signable_bytes().map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::with_details(
-                        "InternalError",
-                        "Failed to canonicalize packet for verification",
-                        serde_json::json!({ "error": e.to_string() }),
+            let canonical = packet
+                .signable_bytes()
+                .map_err(|e| ApiError::InternalError {
+                    message: format!(
+                        "submit/packet: Failed to canonicalize packet for verification: {e}"
                     ),
-                )
-            })?;
+                })?;
 
             // 4. Verify.
             match epigraph_crypto::SignatureVerifier::verify(&pub_key_bytes, &canonical, &sig_bytes)
             {
                 Ok(true) => { /* fall through */ }
                 Ok(false) => {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        ErrorResponse::with_details(
-                            "SignatureError",
-                            "Signature verification failed",
-                            serde_json::json!({ "field": "signature" }),
-                        ),
+                    return Err(ApiError::refused_with(
+                        RefusalStatus::Unauthorized,
+                        "SignatureError",
+                        "Signature verification failed",
+                        serde_json::json!({ "field": "signature" }),
                     ));
                 }
                 Err(e) => {
@@ -973,14 +860,9 @@ async fn validate_packet(
                         error = %e,
                         "Stored public key rejected by Ed25519 verifier — possibly corrupted in agents table"
                     );
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ErrorResponse::with_details(
-                            "InternalError",
-                            "Public key verification error",
-                            serde_json::json!({}),
-                        ),
-                    ));
+                    return Err(ApiError::InternalError {
+                        message: format!("submit/packet: Public key verification error: {e}"),
+                    });
                 }
             }
         }
@@ -988,14 +870,7 @@ async fn validate_packet(
         // Without the `db` feature there is no public-key store; fail closed.
         #[cfg(not(feature = "db"))]
         {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                ErrorResponse::with_details(
-                    "SignatureError",
-                    "Signature verification requires the `db` feature; submissions require a verified identity",
-                    serde_json::json!({ "field": "signature" }),
-                ),
-            ));
+            return Err(ApiError::refused_with(RefusalStatus::Unauthorized, "SignatureError", "Signature verification requires the `db` feature; submissions require a verified identity", serde_json::json!({ "field": "signature" })));
         }
     }
 
@@ -1030,22 +905,6 @@ fn calculate_truth_from_evidence(
 // =============================================================================
 // TYPE CONVERSIONS (Database Feature)
 // =============================================================================
-
-/// Convert submission methodology to domain methodology
-#[cfg(feature = "db")]
-fn convert_methodology(submission: MethodologySubmission) -> Methodology {
-    match submission {
-        MethodologySubmission::Deductive => Methodology::Deductive,
-        MethodologySubmission::Inductive => Methodology::Inductive,
-        MethodologySubmission::Abductive => Methodology::Abductive,
-        MethodologySubmission::Instrumental => Methodology::Instrumental,
-        MethodologySubmission::Extraction => Methodology::Extraction,
-        MethodologySubmission::BayesianInference => Methodology::BayesianInference,
-        MethodologySubmission::VisualInspection => Methodology::VisualInspection,
-        MethodologySubmission::FormalProof => Methodology::FormalProof,
-        MethodologySubmission::Heuristic => Methodology::Heuristic,
-    }
-}
 
 /// Convert evidence type submission to domain evidence type
 #[cfg(feature = "db")]
@@ -1171,20 +1030,16 @@ struct PersistOutcome {
 /// caller: a malformed request 400, a team the caller may not write 403, and
 /// the author refusals as [`author_tenancy_error`] maps them.
 #[cfg(feature = "db")]
-fn visibility_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
+fn visibility_error(e: epigraph_db::DbError) -> ApiError {
     use epigraph_db::errors::RefusalKind;
     match e {
         epigraph_db::DbError::Refused {
             kind: RefusalKind::Input,
             message,
-        } => (
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::new("ValidationError", message),
-        ),
-        epigraph_db::DbError::Refused { message, .. } => (
-            StatusCode::FORBIDDEN,
-            ErrorResponse::new("Forbidden", message),
-        ),
+        } => ApiError::refused(RefusalStatus::BadRequest, "ValidationError", message),
+        epigraph_db::DbError::Refused { message, .. } => {
+            ApiError::refused(RefusalStatus::Forbidden, "Forbidden", message)
+        }
         other => author_tenancy_error(other),
     }
 }
@@ -1196,11 +1051,11 @@ fn visibility_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
 /// DENIAL, not a server fault: 403, as on every other surface that reaches the
 /// definer (`errors.rs`'s `From<DbError>`). The function's text names the agent
 /// and the group, so it is LOGGED and kept out of the body, as the
-/// `From<DbError>` arm does too. This route builds its own `(StatusCode,
-/// ErrorResponse)` pairs, so it needs its own arm; before it, a revoked author
-/// got a 500 whose body carried both ids.
+/// `From<DbError>` arm does too. This route answers its own designed 403
+/// (`ApiError::Refused`) rather than `From<DbError>`'s, so it needs its own
+/// arm; before it, a revoked author got a 500 whose body carried both ids.
 #[cfg(feature = "db")]
-fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
+fn author_tenancy_error(e: epigraph_db::DbError) -> ApiError {
     // Migration 122 (OPL01): the author, or the authenticated caller writing
     // it, is not bound to a human operator.
     if let epigraph_db::DbError::OperatorLinkRequired { message } = &e {
@@ -1208,15 +1063,13 @@ fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) 
             detail = %message,
             "submit_packet refused: the author or the caller is not bound to a human operator"
         );
-        return (
-            StatusCode::FORBIDDEN,
-            ErrorResponse::new(
-                "Forbidden",
-                format!(
-                    "OPL01: the author agent, or the authenticated caller writing it, is not \
+        return ApiError::refused(
+            RefusalStatus::Forbidden,
+            "Forbidden",
+            format!(
+                "OPL01: the author agent, or the authenticated caller writing it, is not \
                      bound to a human operator; nothing was written. Fix: {}",
-                    epigraph_db::OPERATOR_LINK_FIX
-                ),
+                epigraph_db::OPERATOR_LINK_FIX
             ),
         );
     }
@@ -1225,14 +1078,12 @@ fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) 
             detail = %message,
             "submit_packet refused: outside the operator's groups, or attributed across humans"
         );
-        return (
-            StatusCode::FORBIDDEN,
-            ErrorResponse::new(
-                "Forbidden",
-                "OPL02: the write is outside the groups its human operator writes, or names an \
+        return ApiError::refused(
+            RefusalStatus::Forbidden,
+            "Forbidden",
+            "OPL02: the write is outside the groups its human operator writes, or names an \
                  author that belongs to another human than the authenticated caller's; nothing \
                  was written.",
-            ),
         );
     }
     if e.is_personal_group_refusal() {
@@ -1240,22 +1091,16 @@ fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) 
             detail = %e,
             "submit_packet refused: the author's personal group cannot own the claim"
         );
-        return (
-            StatusCode::FORBIDDEN,
-            ErrorResponse::new(
-                "Forbidden",
-                "the author's personal-group membership is revoked, or its personal group is not \
+        return ApiError::refused(
+            RefusalStatus::Forbidden,
+            "Forbidden",
+            "the author's personal-group membership is revoked, or its personal group is not \
                  usable; restoring it is an operator action. Nothing was written.",
-            ),
         );
     }
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        ErrorResponse::new(
-            "DatabaseError",
-            format!("Failed to resolve the author's tenancy: {e}"),
-        ),
-    )
+    ApiError::DatabaseError {
+        message: format!("submit/packet: Failed to resolve the author's tenancy: {e}"),
+    }
 }
 
 #[cfg(feature = "db")]
@@ -1267,28 +1112,23 @@ async fn persist_packet(
     trace_id: TraceId,
     evidence_ids: &[EvidenceId],
     truth_value: f64,
-) -> Result<PersistOutcome, (StatusCode, ErrorResponse)> {
+) -> Result<PersistOutcome, ApiError> {
     let agent_id = AgentId::from_uuid(packet.claim.agent_id);
     let pool = &state.db_pool;
 
     // 1. Verify agent exists (FK constraint check)
     let agent_exists = AgentRepository::get_by_id(pool, agent_id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to verify agent: {}", e)),
-            )
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("submit/packet: Failed to verify agent: {}", e),
         })?;
 
     if agent_exists.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                format!("Agent {} does not exist", packet.claim.agent_id),
-                serde_json::json!({ "field": "claim.agent_id", "agent_id": packet.claim.agent_id }),
-            ),
+        return Err(ApiError::refused_with(
+            RefusalStatus::BadRequest,
+            "ValidationError",
+            format!("Agent {} does not exist", packet.claim.agent_id),
+            serde_json::json!({ "field": "claim.agent_id", "agent_id": packet.claim.agent_id }),
         ));
     }
 
@@ -1299,11 +1139,8 @@ async fn persist_packet(
     // answers and refusals would tell any caller which teams another human's
     // agent writes, and how many (backlog 1c5edc26).
     if viewer.principal() != Some(agent_id.into()) {
-        let mut conn = pool.acquire().await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to acquire: {e}")),
-            )
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("submit/packet: Failed to acquire: {e}"),
         })?;
         match AgentRepository::author_naming(&mut conn, viewer.principal(), agent_id.into())
             .await
@@ -1345,21 +1182,16 @@ async fn persist_packet(
     let choice =
         epigraph_core::VisibilityChoice::parse(packet.visibility.as_deref(), packet.group_id)
             .map_err(|m| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    ErrorResponse::with_details(
-                        "ValidationError",
-                        m,
-                        serde_json::json!({ "field": "visibility" }),
-                    ),
+                ApiError::refused_with(
+                    RefusalStatus::BadRequest,
+                    "ValidationError",
+                    m,
+                    serde_json::json!({ "field": "visibility" }),
                 )
             })?;
     let resolved = {
-        let mut conn = pool.acquire().await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to acquire: {e}")),
-            )
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("submit/packet: Failed to acquire: {e}"),
         })?;
         epigraph_db::ClaimRepository::resolve_write_decl(&mut conn, agent_id.into(), choice)
             .await
@@ -1394,14 +1226,12 @@ async fn persist_packet(
     if resolved.resolved == "team" {
         let team = resolved.decl.owner_group_bind().unwrap_or_default();
         if !viewer.writable_groups().contains(&team) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                ErrorResponse::new(
-                    "Forbidden",
-                    format!(
-                        "the authenticated caller does not write team {team}, so it cannot write \
+            return Err(ApiError::refused(
+                RefusalStatus::Forbidden,
+                "Forbidden",
+                format!(
+                    "the authenticated caller does not write team {team}, so it cannot write \
                          this claim there; nothing was written"
-                    ),
                 ),
             ));
         }
@@ -1415,14 +1245,8 @@ async fn persist_packet(
     let mut tx = state
         .begin_claim_write(viewer, "submit_packet")
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "DatabaseError",
-                    format!("Failed to begin transaction: {e:?}"),
-                ),
-            )
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("submit/packet: Failed to begin transaction: {e:?}"),
         })?;
 
     // 3. Find-or-create the claim keyed on (content_hash, agent_id).
@@ -1432,11 +1256,8 @@ async fn persist_packet(
     // does not exist yet, so we keep the NULL-then-UPDATE dance below. The
     // canonical content_hash is computed inside `create_strict`; the hash and
     // public_key we pass to `with_id` only satisfy the constructor.
-    let truth = TruthValue::new(truth_value).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("InternalError", format!("Invalid truth value: {}", e)),
-        )
+    let truth = TruthValue::new(truth_value).map_err(|e| ApiError::InternalError {
+        message: format!("submit/packet: Invalid truth value: {}", e),
     })?;
 
     let agent_uuid: Uuid = agent_id.into();
@@ -1474,10 +1295,9 @@ async fn persist_packet(
                 if e.is_write_authority_refusal() {
                     return author_tenancy_error(e);
                 }
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
-                )
+                ApiError::DatabaseError {
+                    message: format!("submit/packet: Failed to insert claim: {}", e),
+                }
             })?;
     let canonical_id = persisted.id;
     // All dependent rows hang off the canonical claim id, not the
@@ -1490,14 +1310,8 @@ async fn persist_packet(
         was_created,
     )
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new(
-                "DatabaseError",
-                format!("Failed to read the claim's tenancy: {e}"),
-            ),
-        )
+    .map_err(|e| ApiError::DatabaseError {
+        message: format!("submit/packet: Failed to read the claim's tenancy: {e}"),
     })?;
 
     // Port the `properties` write to the create path (B1): `create_strict`
@@ -1509,14 +1323,8 @@ async fn persist_packet(
             .bind(claim_uuid)
             .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        "DatabaseError",
-                        format!("Failed to set claim properties: {}", e),
-                    ),
-                )
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("submit/packet: Failed to set claim properties: {}", e),
             })?;
     }
 
@@ -1530,14 +1338,8 @@ async fn persist_packet(
             .bind(claim_uuid)
             .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        "DatabaseError",
-                        format!("Failed to set claim labels: {}", e),
-                    ),
-                )
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("submit/packet: Failed to set claim labels: {}", e),
             })?;
     }
 
@@ -1552,7 +1354,7 @@ async fn persist_packet(
     if was_created {
         // 4. Insert reasoning trace (with claim_id)
         let trace_uuid: Uuid = trace_id.into();
-        let methodology = convert_methodology(packet.reasoning_trace.methodology);
+        let methodology = packet.reasoning_trace.methodology.as_domain();
         // The one enum -> reasoning_type mapping, shared with the repo layer
         // rather than copied here. The packet's `MethodologySubmission` has no
         // observation variant, so this transport cannot say "observational".
@@ -1583,10 +1385,7 @@ async fn persist_packet(
     .execute(&mut *tx)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to insert trace: {}", e)),
-        )
+        ApiError::DatabaseError { message: format!("submit/packet: Failed to insert trace: {}", e) }
     })?;
 
         // 5. Update claim with trace_id
@@ -1600,14 +1399,8 @@ async fn persist_packet(
         )
         .execute(&mut *tx)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "DatabaseError",
-                    format!("Failed to update claim with trace_id: {}", e),
-                ),
-            )
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("submit/packet: Failed to update claim with trace_id: {}", e),
         })?;
 
         // 5b. Materialize structural edges: agent --AUTHORED--> claim, claim --HAS_TRACE--> trace
@@ -1624,14 +1417,8 @@ async fn persist_packet(
             None,
         )
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "DatabaseError",
-                    format!("Failed to create AUTHORED edge: {}", e),
-                ),
-            )
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("submit/packet: Failed to create AUTHORED edge: {}", e),
         })?;
 
         epigraph_db::EdgeRepository::create_signed_conn(
@@ -1647,14 +1434,8 @@ async fn persist_packet(
             None,
         )
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "DatabaseError",
-                    format!("Failed to create HAS_TRACE edge: {}", e),
-                ),
-            )
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("submit/packet: Failed to create HAS_TRACE edge: {}", e),
         })?;
 
         epigraph_db::EdgeRepository::create_signed_conn(
@@ -1670,14 +1451,8 @@ async fn persist_packet(
             None,
         )
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "DatabaseError",
-                    format!("Failed to create TRACES edge: {}", e),
-                ),
-            )
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("submit/packet: Failed to create TRACES edge: {}", e),
         })?;
 
         // 6. Insert evidence records
@@ -1687,11 +1462,8 @@ async fn persist_packet(
 
             // Parse content hash from hex
             let content_hash_bytes = ContentHasher::from_hex(&evidence_submission.content_hash)
-                .map_err(|_| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ErrorResponse::new("InternalError", "Invalid content hash format"),
-                    )
+                .map_err(|_| ApiError::InternalError {
+                    message: "submit/packet: Invalid content hash format".to_string(),
                 })?;
 
             // Determine evidence type string
@@ -1706,13 +1478,9 @@ async fn persist_packet(
             // Convert evidence type to JSONB
             let evidence_type_domain = convert_evidence_type(&evidence_submission.evidence_type);
             let evidence_type_json = serde_json::to_value(&evidence_type_domain).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        "InternalError",
-                        format!("Failed to serialize evidence type: {}", e),
-                    ),
-                )
+                ApiError::InternalError {
+                    message: format!("submit/packet: Failed to serialize evidence type: {}", e),
+                }
             })?;
 
             // Parse signature if provided
@@ -1763,14 +1531,11 @@ async fn persist_packet(
                 epigraph_db::EvidenceDirection::Supports,
             )
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        "DatabaseError",
-                        format!("Failed to create the evidence's supports edge: {}", e),
-                    ),
-                )
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!(
+                    "submit/packet: Failed to create the evidence's supports edge: {}",
+                    e
+                ),
             })?;
 
             // Materialize graph edges: trace --USES_EVIDENCE--> evidence
@@ -1787,14 +1552,8 @@ async fn persist_packet(
                 None,
             )
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        "DatabaseError",
-                        format!("Failed to create USES_EVIDENCE edge: {}", e),
-                    ),
-                )
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("submit/packet: Failed to create USES_EVIDENCE edge: {}", e),
             })?;
         }
     } // end `if was_created`
@@ -1819,45 +1578,25 @@ async fn persist_packet(
         let existing = epigraph_db::ClaimRepository::get_by_id_conn(&mut tx, viewer, canonical_id)
             .await
             .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        "DatabaseError",
-                        format!("Failed to load existing claim: {}", e),
-                    ),
-                )
+                ApiError::DatabaseError { message: format!("submit/packet: Failed to load existing claim: {}", e) }
             })?
             .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorResponse::new(
-                        "DatabaseError",
-                        "claim for (content_hash, agent_id) vanished after find-or-create",
-                    ),
-                )
+                ApiError::DatabaseError { message: "submit/packet: claim for (content_hash, agent_id) vanished after find-or-create".to_string() }
             })?;
         if !existing.is_current {
-            return Err((
-                StatusCode::CONFLICT,
-                ErrorResponse::new(
-                    "DuplicateNotCurrent",
-                    "claim for (content_hash, agent_id) exists but is not current \
+            return Err(ApiError::refused(
+                RefusalStatus::Conflict,
+                "DuplicateNotCurrent",
+                "claim for (content_hash, agent_id) exists but is not current \
                      (superseded/duplicate); refusing to attach to a tombstone",
-                ),
             ));
         }
         existing.trace_id
     };
 
     // 7. Commit transaction
-    tx.commit().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new(
-                "DatabaseError",
-                format!("Failed to commit transaction: {}", e),
-            ),
-        )
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("submit/packet: Failed to commit transaction: {}", e),
     })?;
 
     // Carry the canonical ids for the response (B2). On the create path the
@@ -1923,21 +1662,19 @@ pub async fn submit_packet(
         Ok(json) => json,
         Err(rejection) => {
             let message = rejection.body_text();
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::with_details(
-                    "ParseError",
-                    format!("Invalid JSON payload: {}", message),
-                    serde_json::json!({ "details": message }),
-                )),
+            return ApiError::refused_with(
+                RefusalStatus::BadRequest,
+                "ParseError",
+                format!("Invalid JSON payload: {}", message),
+                serde_json::json!({ "details": message }),
             )
-                .into_response();
+            .into_response();
         }
     };
 
     // 1. Validate the packet
-    if let Err((status, error)) = validate_packet(&packet, &state).await {
-        return error_response(status, error);
+    if let Err(e) = validate_packet(&packet, &state).await {
+        return e.into_response();
     }
 
     // 2. Check for idempotent duplicate, AFTER validation and only among this
@@ -2049,7 +1786,7 @@ pub async fn submit_packet(
                     response_evidence_ids,
                 )
             }
-            Err((status, error)) => return error_response(status, error),
+            Err(e) => return e.into_response(),
         }
     };
     // Without the db feature there is no persistence step; the response simply
@@ -2876,6 +2613,169 @@ mod signature_verification_tests {
             rows, 0,
             "the packet was persisted despite the 400 — validate_packet runs before \
              the write, so a non-zero count means the check is in the wrong place"
+        );
+    }
+
+    // ── The error contract (backlog 23db186a) ──
+    //
+    // The route's refusals are `ApiError`s now. Its 4xx bodies are a client
+    // contract (error key, verbatim message, structured details), and its
+    // payload-signature 401s carry no bearer challenge; its 5xx are the
+    // central redacted bodies. These pin the WHOLE body, not a substring.
+
+    /// Status, `WWW-Authenticate` presence, and the JSON body of `response`.
+    async fn status_challenge_body(
+        response: axum::response::Response,
+    ) -> (StatusCode, bool, serde_json::Value) {
+        use http_body_util::BodyExt;
+        let status = response.status();
+        let challenged = response
+            .headers()
+            .contains_key(axum::http::header::WWW_AUTHENTICATE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, challenged, body)
+    }
+
+    /// A 400 and a payload-signature 401 answer the route's designed body
+    /// byte-for-byte, and the 401 carries no `WWW-Authenticate` challenge.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn refusals_answer_the_designed_body_and_the_401_carries_no_challenge(pool: PgPool) {
+        let state = test_state_with_required_signatures(pool.clone());
+        let agent_id = Uuid::new_v4();
+
+        // 400: empty content (the first validation step).
+        let packet = EpistemicPacket {
+            claim: build_test_claim_submission(agent_id, "   "),
+            evidence: vec![],
+            reasoning_trace: build_test_trace(),
+            signature: "0".repeat(128),
+            visibility: None,
+            group_id: None,
+        };
+        let (status, challenged, body) =
+            status_challenge_body(submit_packet_endpoint(state.clone(), packet).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(!challenged, "a 400 carries no challenge");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "ValidationError",
+                "message": "Claim content cannot be empty or whitespace",
+                "details": { "field": "claim.content" },
+            })
+        );
+
+        // 401: a wrong-length payload signature, refused before any lookup.
+        let packet = EpistemicPacket {
+            claim: build_test_claim_submission(agent_id, "a claim with a short signature"),
+            evidence: vec![],
+            reasoning_trace: build_test_trace(),
+            signature: "abc".to_string(),
+            visibility: None,
+            group_id: None,
+        };
+        let (status, challenged, body) =
+            status_challenge_body(submit_packet_endpoint(state.clone(), packet).await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(
+            !challenged,
+            "a payload-signature 401 must not carry a bearer challenge: the bearer \
+             credential was accepted, and re-minting it cannot fix the signature"
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "SignatureError",
+                "message": "Signature must be 128 hex characters (64 bytes), got 3",
+                "details": { "field": "signature" },
+            })
+        );
+
+        // 400: a body that is not JSON keeps its `ParseError` key and details.
+        let router = Router::new()
+            .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
+            .with_state(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/submit/packet")
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let (status, _, body) = status_challenge_body(router.oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "ParseError", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("Invalid JSON payload: ")),
+            "{body}"
+        );
+        assert!(body["details"]["details"].is_string(), "{body}");
+    }
+
+    /// A server fault this route builds itself is the central redacted 500:
+    /// `author_tenancy_error`'s fallback and `visibility_error`'s pass-through
+    /// arm, given a query failure carrying the driver's text, answer the
+    /// `DatabaseError` body, and the text stays in the server log.
+    #[tokio::test]
+    async fn a_route_built_server_fault_is_the_central_redacted_500() {
+        use http_body_util::BodyExt;
+        let driver = "relation \"tenancy_secret_shadow\" does not exist";
+        let query_failed = || epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Protocol(driver.to_string()),
+        };
+        for (site, err) in [
+            ("author_tenancy_error", author_tenancy_error(query_failed())),
+            ("visibility_error", visibility_error(query_failed())),
+        ] {
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{site}"
+            );
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(axum::http::header::WWW_AUTHENTICATE),
+                "{site}"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "DatabaseError",
+                    "message": format!("Database error: {}", crate::errors::DATABASE_ERROR_BODY),
+                    "details": { "message": crate::errors::DATABASE_ERROR_BODY },
+                }),
+                "{site}"
+            );
+            let text = body.to_string();
+            assert!(
+                !text.contains("tenancy_secret_shadow") && !text.contains("submit/packet"),
+                "{site}: the driver's text must stay server-side: {text}"
+            );
+        }
+    }
+
+    /// `evidence_insert_error` on anything but a CHECK refusal is the central
+    /// redacted `DatabaseError` 500, whatever the driver said.
+    #[tokio::test]
+    async fn a_non_check_evidence_insert_error_is_a_redacted_database_500() {
+        use http_body_util::BodyExt;
+        let driver = "relation \"evidence_secret_shadow\" does not exist";
+        let response =
+            evidence_insert_error(0, &sqlx::Error::Protocol(driver.to_string())).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "DatabaseError", "{body}");
+        assert!(
+            !body.to_string().contains("evidence_secret_shadow"),
+            "the driver's text must stay server-side: {body}"
         );
     }
 }
