@@ -1,18 +1,11 @@
 //! Regression tests for the write-side semantic novelty gate (backlog
 //! `1bcaed94`, Task 6.4) as wired into `submit_claim` / `memorize`.
 //!
-//! Test-strategy note (documented per the task brief's explicit fallback):
-//! every MCP integration test server in this crate is built with
-//! `McpEmbedder::new(pool, None)` — mock mode, no OpenAI API key (see
-//! `tool_resubmit_tests.rs`, `memorize_persists_labels.rs`,
-//! `submit_claim_labels_test.rs`). `McpEmbedder::generate` unconditionally
-//! errors in that mode, so `novelty_gate::decide` always answers
-//! `Err(GateSkip::EmbedderUnavailable)` and the gate never actually fires through `submit_claim`/`memorize` in this
-//! test process — there is no way to exercise a REAL embedding end-to-end
-//! without either a live OpenAI key or refactoring `EpiGraphMcpFull` to take
-//! a trait-object embedder (out of scope for this task; `EpiGraphMcpFull`
-//! is concretely typed over `McpEmbedder`, which hardcodes the OpenAI
-//! endpoint).
+//! Test-strategy note: this file's server is built with
+//! `McpEmbedder::new(pool, None)` and no generator, a keyless embedder whose
+//! `generate` always errors, so `novelty_gate::decide` always answers
+//! `Err(GateSkip::EmbedderUnavailable)` here and the gate never fires through
+//! `submit_claim`/`memorize` in this file.
 //!
 //! So this file proves the two things that ARE testable end-to-end at the
 //! MCP layer without a live embedder:
@@ -49,14 +42,13 @@
 //!     using `epigraph_embeddings::MockProvider` (a real deterministic
 //!     hash-derived embedder, not a stub of the decision logic).
 //!
-//! What is NOT covered anywhere: `submit_claim`/`memorize`'s glue code that
-//! ACTS on a fired decision — the `ReturnExisting` early-return response
-//! shape, the `near-duplicate` label append, and the pending-vector reuse
-//! into `store_embedding` — because exercising that requires a decision to
-//! actually fire through the concrete `EpiGraphMcpFull` server, which only
-//! ever holds a real `McpEmbedder` (hardcoded OpenAI endpoint). That code
-//! is verified by inspection only. See the task report for the full
-//! coverage boundary.
+//! The glue that ACTS on a fired decision IS covered elsewhere, by firing the
+//! gate through `McpEmbedder::with_generator` (a deterministic in-process
+//! provider): the `ReturnExisting` corroboration, its refusals and the
+//! `near-duplicate` insert in `novelty_gate_corroboration_app_role.rs`
+//! (backlogs 4f4c6175, 5578f693), and the status-label bypass with its
+//! controls in `status_claim_novelty_bypass.rs`. This file keeps the
+//! keyless-embedder (gate skipped) paths.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;

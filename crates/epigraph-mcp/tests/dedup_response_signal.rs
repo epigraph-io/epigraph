@@ -7,10 +7,11 @@
 //! `inputs_applied` claim it asserts against the stored graph, so the lists are
 //! pinned to what the write path actually does rather than to the wording.
 //!
-//! The novelty-gate arm cannot be fired through `EpiGraphMcpFull` in a test
-//! process — its `McpEmbedder` hard-codes the OpenAI endpoint (see the header of
-//! `novelty_gate_test.rs`). Its `deduplicated` block is pinned by the unit tests
-//! beside `tools::claims::dedup_block` and `tools::memory::memorize_dedup_block`.
+//! The novelty-gate arm (a corroboration, backlog 4f4c6175) is measured
+//! end-to-end in `novelty_gate_corroboration_app_role.rs`, which fires the gate
+//! through `McpEmbedder::with_generator`; its lists are also pinned by the unit
+//! tests beside `tools::claims::dedup_block` and
+//! `tools::memory::memorize_dedup_block`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
