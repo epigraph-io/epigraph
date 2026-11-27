@@ -152,8 +152,9 @@ CLEAN_TEXT = "An unremarkable public claim about soil carbon."
 
 def test_the_run_is_read_only_and_prints_ids_and_reasons_only():
     rows = [
-        ("00000000-0000-0000-0000-00000000000a", SECRET_TEXT, ["topic:x"]),
-        ("00000000-0000-0000-0000-00000000000b", CLEAN_TEXT, None),
+        ("00000000-0000-0000-0000-00000000000a", SECRET_TEXT, ["topic:x"], True),
+        ("00000000-0000-0000-0000-00000000000b", CLEAN_TEXT, None, True),
+        ("00000000-0000-0000-0000-00000000000c", "Old version: call (555) 123-4567.", None, False),
     ]
     conn = FakeConn(rows)
     out, err, ids = io.StringIO(), io.StringIO(), io.StringIO()
@@ -162,12 +163,20 @@ def test_the_run_is_read_only_and_prints_ids_and_reasons_only():
     assert conn.session.get("readonly") is True, "the session is read-only"
     assert any(isinstance(e, tuple) and e[1] for e in conn.log), "a server-side cursor"
     sql = next(e for e in conn.log if isinstance(e, str))
-    assert "visibility = 'public'" in sql and "is_current" in sql
+    where = sql.split("WHERE", 1)[1]
+    assert "visibility = 'public'" in where
+    # The guest card reads a claim by id whatever its is_current, so a
+    # superseded public claim is screened too.
+    assert "is_current" not in where, where
 
     lines = [json.loads(ln) for ln in out.getvalue().splitlines()]
-    assert lines == [{"claim_id": rows[0][0], "reasons": ["email_address", "street_address"]}]
-    assert ids.getvalue().splitlines()[-1] == rows[0][0]
-    assert counts["scanned"] == 2 and counts["flagged"] == 1
+    assert lines == [
+        {"claim_id": rows[0][0], "is_current": True,
+         "reasons": ["email_address", "street_address"]},
+        {"claim_id": rows[2][0], "is_current": False, "reasons": ["phone_number"]},
+    ]
+    assert ids.getvalue().splitlines()[1:] == [rows[0][0], rows[2][0]]
+    assert counts["scanned"] == 3 and counts["flagged"] == 2
     assert counts["by_reason"]["email_address"] == 1
     assert counts["by_reason"]["long_content"] == 0
     everything = out.getvalue() + ids.getvalue() + err.getvalue()

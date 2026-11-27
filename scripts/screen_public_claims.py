@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Screen public claims for text that should not be readable without a login.
 
-Read-only. Selects every public, current claim (`visibility = 'public' AND
-is_current`) and flags the ones a reviewer should look at before guest reads
+Read-only. Selects every public claim (`visibility = 'public'`), current or
+superseded, and flags the ones a reviewer should look at before guest reads
 are turned on, so they can be made private first (`epigraph-operator
-restrict-claims --claims-file <ids file>`). It never writes: the session is
-set read-only before the first query.
+restrict-claims --claims-file <ids file>`). Superseded claims are screened
+too: the guest claim card reads a claim by id with no `is_current` filter, so
+a superseded public claim is as readable as a current one. It never writes:
+the session is set read-only before the first query.
 
 Reasons (a claim gets every one that applies):
 
@@ -36,7 +38,7 @@ case-insensitive on whole words.
 
 Output:
   --out FILE (default stdout)  one JSON line per flagged claim,
-                               {"claim_id": ..., "reasons": [...]};
+                               {"claim_id": ..., "is_current": ..., "reasons": [...]};
   --claims-file-out FILE       the flagged ids, one per line, in the format
                                restrict-claims --claims-file reads;
   stderr                       `summary: {"scanned", "flagged", "by_reason"}`.
@@ -181,16 +183,15 @@ def screen(content, labels, private_groups, private_markers):
 
 
 SELECT_SQL = """
-SELECT id::text, content, labels
+SELECT id::text, content, labels, is_current IS TRUE
   FROM claims
  WHERE visibility = 'public'
-   AND is_current IS TRUE
  ORDER BY id
 """
 
 
 def run(conn, private_groups, private_markers, out, ids_out, err):
-    """Screen every public, current claim on `conn`; return the counts."""
+    """Screen every public claim on `conn`, current or not; return the counts."""
     conn.set_session(readonly=True)
     counts = {"scanned": 0, "flagged": 0, "by_reason": dict.fromkeys(REASONS, 0)}
     if ids_out is not None:
@@ -199,7 +200,7 @@ def run(conn, private_groups, private_markers, out, ids_out, err):
     cur.itersize = 2000
     try:
         cur.execute(SELECT_SQL)
-        for claim_id, content, labels in cur:
+        for claim_id, content, labels, is_current in cur:
             counts["scanned"] += 1
             reasons = screen(content, labels, private_groups, private_markers)
             if not reasons:
@@ -207,7 +208,9 @@ def run(conn, private_groups, private_markers, out, ids_out, err):
             counts["flagged"] += 1
             for r in reasons:
                 counts["by_reason"][r] += 1
-            out.write(json.dumps({"claim_id": claim_id, "reasons": reasons}) + "\n")
+            out.write(json.dumps(
+                {"claim_id": claim_id, "is_current": is_current, "reasons": reasons}
+            ) + "\n")
             if ids_out is not None:
                 ids_out.write(claim_id + "\n")
     finally:

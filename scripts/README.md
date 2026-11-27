@@ -45,14 +45,15 @@ jobs" (the theme pipeline is there too).
 
 ## screen_public_claims.py
 
-Screens every public, current claim for text that should not be readable
+Screens every public claim, current or superseded (the guest claim card reads
+a claim by id whatever its `is_current`), for text that should not be readable
 without a login, before guest reads are turned on: long verbatim text (content
 over 300 characters, or a quoted span of more than 40 words), internal
 identifiers (full UUIDs, internal host names and private addresses,
 home-directory and `*-private/` paths, operator-listed markers and private
 group names) and personal data (e-mail addresses, phone numbers, street
 addresses). It writes one JSON line per flagged claim (`{"claim_id",
-"reasons"}`), optionally the flagged ids in the format `epigraph-operator
+"is_current", "reasons"}`), optionally the flagged ids in the format `epigraph-operator
 restrict-claims --claims-file` reads, and per-reason counts on stderr. It never
 prints a claim's text, a matched term or the DSN.
 

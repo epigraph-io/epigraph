@@ -4,10 +4,12 @@ Seeds claims on the superuser connection, runs the script as an operator
 would (a subprocess with --database-url, on the test maintenance login of
 tests/db_roles.py), and reads its JSONL and ids file back:
 
-  * each public, current fixture claim gets exactly its expected reasons, and
-    a clean one is absent;
-  * a group-visibility hit and a superseded (not current) public hit are
-    absent: only what guests could read is screened;
+  * each public fixture claim gets exactly its expected reasons and its
+    `is_current`, and a clean one is absent;
+  * a superseded (not current) public hit IS reported (the guest claim card
+    reads a claim by id whatever its is_current), and a group-visibility hit
+    is absent: what guests could read is screened, and nothing else;
+  * an operator-listed private marker is flagged;
   * no fixture claim's text appears anywhere the script writes;
   * the ids file is the restrict-claims format (one UUID per line, `#`
     comments).
@@ -65,7 +67,8 @@ FIXTURES = {
     "street": ("S5 moved to 221 Baker Street", [], "public", True, ["street_address"]),
     "clean": ("S6 soil carbon rose between 1990-2000", ["topic:soil"], "public", True, None),
     "private_hit": ("S7 call (555) 123-4567", [], "group", True, None),
-    "superseded_hit": ("S8 call (555) 765-4321", [], "public", False, None),
+    "superseded_hit": ("S8 call (555) 765-4321", [], "public", False, ["phone_number"]),
+    "marker": ("S9 drafted in the heronry notes", [], "public", True, ["private_path"]),
 }
 
 
@@ -104,7 +107,9 @@ def world(tmp_path):
         ids[name] = cid
     groups = tmp_path / "groups.txt"
     groups.write_text("# invented\nNightjar Working Party\n")
-    yield {"ids": ids, "groups": groups, "tmp": tmp_path, "token": token}
+    markers = tmp_path / "markers.txt"
+    markers.write_text("# invented\nheronry notes\n")
+    yield {"ids": ids, "groups": groups, "markers": markers, "tmp": tmp_path, "token": token}
     cur.execute("DELETE FROM claims WHERE id = ANY(%s::uuid[])", (list(ids.values()),))
     conn.close()
 
@@ -114,7 +119,8 @@ def test_the_screen_emits_the_expected_jsonl_for_the_fixture(world):
     ids_file = world["tmp"] / "candidates.txt"
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "--database-url", db_roles.script_dsn(TEST_DSN),
-         "--private-groups", str(world["groups"]), "--out", str(out),
+         "--private-groups", str(world["groups"]),
+         "--private-markers", str(world["markers"]), "--out", str(out),
          "--claims-file-out", str(ids_file)],
         capture_output=True, text=True, timeout=300, cwd=str(REPO),
     )
@@ -123,17 +129,17 @@ def test_the_screen_emits_the_expected_jsonl_for_the_fixture(world):
     by_id = {}
     for line in out.read_text().splitlines():
         row = json.loads(line)
-        assert set(row) == {"claim_id", "reasons"}, row
-        by_id[row["claim_id"]] = row["reasons"]
+        assert set(row) == {"claim_id", "is_current", "reasons"}, row
+        by_id[row["claim_id"]] = (row["is_current"], row["reasons"])
     mine = {cid: by_id[cid] for cid in world["ids"].values() if cid in by_id}
-    expected = {world["ids"][n]: f[4] for n, f in FIXTURES.items() if f[4] is not None}
+    expected = {world["ids"][n]: (f[3], f[4]) for n, f in FIXTURES.items() if f[4] is not None}
     assert mine == expected, (mine, expected)
 
     listed = [ln for ln in ids_file.read_text().splitlines() if ln and not ln.startswith("#")]
     for ln in listed:
         uuid.UUID(ln)
     assert set(expected) <= set(listed)
-    for name in ("clean", "private_hit", "superseded_hit"):
+    for name in ("clean", "private_hit"):
         assert world["ids"][name] not in listed, name
 
     summary = [ln for ln in proc.stderr.splitlines() if ln.startswith("summary: ")]
