@@ -904,7 +904,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// claim, labels, evidence, trace and structural edges on ONE caller-stamped
 /// `AppState::write_as` transaction, authored by the caller and owned by its
 /// home group (`routes/conventions.rs` 3 -> 2). No file reached zero.
-const HIGH_WATER: usize = 125;
+/// 125 -> 121 (backlog bd13e0e0): the political-monitoring module was deleted
+/// from the kernel; `routes/political.rs` 4 -> 0, key DELETED
+/// (`HIGH_WATER_FILES` falls by one with it).
+/// 121 -> 117 (backlog ec968070): the admin policy writes `record_outcome`,
+/// `resolve_challenge` and `decay_sweep` were deleted (`routes/policies.rs`
+/// 8 -> 4). No file reached zero.
+const HIGH_WATER: usize = 117;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -982,7 +988,8 @@ const HIGH_WATER: usize = 125;
 /// 32 -> 31 when `routes/clusters.rs` reached zero (backlog 67c905a3).
 /// 31 -> 30 when `routes/experiment_loop.rs` reached zero (backlog 30c84267).
 /// 30 -> 29 when `routes/experiments.rs` reached zero (backlog 30c84267).
-const HIGH_WATER_FILES: usize = 29;
+/// 29 -> 28 when `routes/political.rs` was deleted (backlog bd13e0e0).
+const HIGH_WATER_FILES: usize = 28;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1258,19 +1265,15 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `context.rs`'s residue.
     ("routes/perspective.rs", 1),
     // 9 before the operator-binding delta review, which moved
-    // `create_challenge`'s transaction onto `AppState::begin_claim_write`.
-    ("routes/policies.rs", 8),
-    // 12 before conversion shard 5, which moved all seven read-only
-    // viewer-holding handlers onto `AppState::read_as`: `epistemic_profile`,
-    // `compare_agents`, `position_timeline`, `claim_genealogy`,
-    // `originated_claims`, `inflation_index` and `claim_techniques`. The five
-    // that remain hold NO `Viewer` at all -- `inflation_leaderboard`
-    // (which is also the site
-    // `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` records as
-    // `("political.rs", 1)`, so it must not be relocated to lower that
-    // register), `list_techniques`, `list_coalitions`, and the two `create_*`
-    // handlers, which write. This file's module doc carries the reasoning.
-    ("routes/political.rs", 4),
+    // `create_challenge`'s transaction onto `AppState::begin_claim_write`, and
+    // 8 before backlog ec968070 deleted the admin `record_outcome` (1),
+    // `resolve_challenge` (2) and `decay_sweep` (1) writes.
+    ("routes/policies.rs", 4),
+    // `routes/political.rs` was 4 and is GONE, not zeroed: backlog bd13e0e0
+    // deleted the political-monitoring module from the kernel (its last four
+    // sites were `list_techniques`, `list_coalitions` and the two `create_*`
+    // writers). `epistemic_profile` moved to `routes/agents.rs` (a1dd9225) on
+    // its `read_as` connection and adds no site there.
     // `routes/rag.rs` was 2 and is GONE, not zeroed: backlog 9bef22f3 deleted
     // its two writers, `generate_claim_embedding` and
     // `generate_evidence_embedding` (the `PUT …/embedding` routes).

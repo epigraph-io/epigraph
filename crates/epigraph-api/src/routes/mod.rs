@@ -126,7 +126,6 @@ pub mod perspective;
 pub mod placement;
 #[cfg(feature = "db")]
 pub mod policies;
-pub mod political;
 pub mod privatization;
 /// Deterministic 2-D PCA used by `/themes/:id/embeddings` so that endpoint can
 /// serve theme-splitting clients without disclosing raw embedding vectors.
@@ -723,12 +722,6 @@ pub fn create_router_with_extensions(
             delete(conventions::forget_convention),
         )
         .route("/api/v1/skills/share", post(conventions::share_skill))
-        // Political network monitoring (Items 3–12) — write endpoints
-        .route(
-            "/api/v1/propaganda-techniques",
-            post(political::create_technique),
-        )
-        .route("/api/v1/coalitions", post(political::create_coalition))
         .route("/api/v1/hypothesis", post(hypothesis::create_hypothesis))
         .route(
             "/api/v1/hypothesis/:id/status",
@@ -897,19 +890,11 @@ pub fn create_router_with_extensions(
             "/api/v1/graph/neighborhoods/:id/expand",
             get(graph_neighborhood::expand),
         )
-        // Policies write endpoints — require auth + scope
-        .route(
-            "/api/v1/policies/:claim_id/outcome",
-            post(policies::record_outcome),
-        )
-        .route("/api/v1/policies/decay-sweep", post(policies::decay_sweep))
+        // Policy challenges — create requires auth + `claims:write`. The admin
+        // outcome, decay-sweep and resolve writes were deleted (backlog ec968070).
         .route(
             "/api/v1/policy-challenges",
             post(policies::create_challenge),
-        )
-        .route(
-            "/api/v1/policy-challenges/:id/resolve",
-            post(policies::resolve_challenge),
         )
         // Cross-source match candidates — write/list endpoints, require auth + scope
         .route(
@@ -1218,48 +1203,12 @@ pub fn create_router_with_extensions(
             get(experiment_loop::list_experiments),
         )
         .route("/api/v1/methods/:id", get(methods::get_method))
-        // Political network monitoring (Items 3–12) — read endpoints
+        // The agent epistemic profile (the Explorer's agent page). The
+        // political-monitoring routes that were mounted around it were deleted
+        // from the kernel (backlog bd13e0e0).
         .route(
             "/api/v1/agents/:id/epistemic-profile",
-            get(political::epistemic_profile),
-        )
-        .route("/api/v1/agents/compare", get(political::compare_agents))
-        .route(
-            "/api/v1/agents/:id/position-timeline",
-            get(political::position_timeline),
-        )
-        .route(
-            "/api/v1/claims/:id/genealogy",
-            get(political::claim_genealogy),
-        )
-        .route(
-            "/api/v1/agents/:id/originated-claims",
-            get(political::originated_claims),
-        )
-        .route(
-            "/api/v1/agents/:id/inflation-index",
-            get(political::inflation_index),
-        )
-        .route(
-            "/api/v1/inflation-index/leaderboard",
-            get(political::inflation_leaderboard),
-        )
-        .route(
-            "/api/v1/claims/:id/techniques",
-            get(political::claim_techniques),
-        )
-        .route(
-            "/api/v1/propaganda-techniques",
-            get(political::list_techniques),
-        )
-        .route("/api/v1/coalitions", get(political::list_coalitions))
-        .route(
-            "/api/v1/counter-narrative-gaps",
-            get(political::counter_narrative_gaps),
-        )
-        .route(
-            "/api/v1/mirror-narratives",
-            get(political::mirror_narratives),
+            get(agents::epistemic_profile),
         )
         // Task management — read endpoints
         .route("/api/v1/tasks", get(tasks::list_tasks))
@@ -1698,13 +1647,7 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/contexts", post(context::create_context))
         .route("/api/v1/frames/:id/refine", post(belief::refine_frame))
-        .route("/api/v1/claims/:id/relate", post(edges::relate_claims))
-        // Political network monitoring — write endpoints (non-db stubs)
-        .route(
-            "/api/v1/propaganda-techniques",
-            post(political::create_technique),
-        )
-        .route("/api/v1/coalitions", post(political::create_coalition));
+        .route("/api/v1/claims/:id/relate", post(edges::relate_claims));
 
     // ------------------------------------------------------------------
     // PR-03: THE INVERSION.
@@ -1840,49 +1783,6 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/structural-features/:owner_id",
             get(structural::get_structural_features),
-        )
-        // Political network monitoring (Items 3–12) — read endpoints (non-db stubs)
-        .route(
-            "/api/v1/agents/:id/epistemic-profile",
-            get(political::epistemic_profile),
-        )
-        .route("/api/v1/agents/compare", get(political::compare_agents))
-        .route(
-            "/api/v1/agents/:id/position-timeline",
-            get(political::position_timeline),
-        )
-        .route(
-            "/api/v1/claims/:id/genealogy",
-            get(political::claim_genealogy),
-        )
-        .route(
-            "/api/v1/agents/:id/originated-claims",
-            get(political::originated_claims),
-        )
-        .route(
-            "/api/v1/agents/:id/inflation-index",
-            get(political::inflation_index),
-        )
-        .route(
-            "/api/v1/inflation-index/leaderboard",
-            get(political::inflation_leaderboard),
-        )
-        .route(
-            "/api/v1/claims/:id/techniques",
-            get(political::claim_techniques),
-        )
-        .route(
-            "/api/v1/propaganda-techniques",
-            get(political::list_techniques),
-        )
-        .route("/api/v1/coalitions", get(political::list_coalitions))
-        .route(
-            "/api/v1/counter-narrative-gaps",
-            get(political::counter_narrative_gaps),
-        )
-        .route(
-            "/api/v1/mirror-narratives",
-            get(political::mirror_narratives),
         )
         // D4 admin privatization. Registered in BOTH `create_router` variants so
         // the two chains do not diverge on an admin surface; the handlers here

@@ -27,10 +27,11 @@
 //!
 //! Scope note: this asserts the contract for the eight tables 060 creates. It is
 //! deliberately *not* a "every table any repo references exists" test —
-//! `propaganda_techniques`, `coalitions` and `syntheses` are referenced by
-//! `repos/political.rs` and the `entity_types` registry and are created by no
-//! migration. Those are pre-existing gaps, tracked separately; widening this
-//! test to cover them would land it red for reasons PR-01 does not own.
+//! `propaganda_techniques`, `coalitions` and `syntheses` are named by the
+//! `entity_types` registry and are created by no migration. No repo reads or
+//! writes the first two any more (backlog bd13e0e0 deleted
+//! `repos/political.rs`); the registry rows stay until the operator migration
+//! that also drops the prod-only tables.
 
 use sqlx::{PgPool, Row};
 

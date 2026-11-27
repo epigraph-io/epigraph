@@ -107,7 +107,6 @@ const REGISTER: &[(&str, usize)] = &[
     ("graph_neighborhood.rs", 1),
     ("hypothesis.rs", 10),
     ("papers.rs", 4),
-    ("policies.rs", 4),
     ("revoke_signature.rs", 6),
     ("search.rs", 3),
     ("submit.rs", 5),
@@ -164,7 +163,10 @@ const REGISTER: &[(&str, usize)] = &[
 /// Lowered to 71 by backlog 1c822492: `learn_convention`'s label write became
 /// `ClaimRepository::update_labels_conn` on the caller's stamped transaction
 /// (`conventions.rs` 3 -> 2).
-const HIGH_WATER: usize = 71;
+/// Lowered to 67 by backlog ec968070: the admin `record_outcome`,
+/// `resolve_challenge` and `decay_sweep` handlers and their four inline
+/// `UPDATE claims` were deleted (`policies.rs` 4 -> 0, row removed).
+const HIGH_WATER: usize = 67;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

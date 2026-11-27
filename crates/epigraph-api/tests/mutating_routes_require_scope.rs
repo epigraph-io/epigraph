@@ -4,8 +4,8 @@
 //!
 //! These handlers took `State` and a body and nothing else, or a
 //! `ViewerExtractor` and no scope. Bearer authentication alone admitted them,
-//! so a `claims:read` token could create frames, spans, propaganda
-//! techniques, coalitions, counterfactuals, events, activities, contexts and
+//! so a `claims:read` token could create frames, spans, counterfactuals,
+//! events, activities, contexts and
 //! perspectives, fold evidence into a frame, assess a claim, store a gap
 //! analysis, open challenges from gaps, create or promote a hypothesis, share a
 //! workflow, or submit a whole epistemic packet. Each route's MCP twin, where
@@ -148,8 +148,6 @@ fn claims_write_routes() -> Vec<(Method, String)> {
         (Method::POST, format!("/api/v1/frames/{a}/refine")),
         (Method::POST, "/api/v1/spans".into()),
         (Method::PUT, format!("/api/v1/spans/{a}/close")),
-        (Method::POST, "/api/v1/propaganda-techniques".into()),
-        (Method::POST, "/api/v1/coalitions".into()),
         (
             Method::POST,
             format!("/api/v1/conflicts/{a}/{b}/counterfactuals"),
@@ -300,10 +298,6 @@ async fn a_refused_span_event_or_activity_writes_nothing(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_refused_counterfactual_writes_nothing(pool: PgPool) {
-    // `POST /api/v1/propaganda-techniques` and `POST /api/v1/coalitions` are
-    // gated in the walk above but have no effect arm: their tables
-    // (`propaganda_techniques`, `coalitions`) are created by no migration, so
-    // the handlers answer 500 whatever the scope and there is no row to count.
     let w = world(pool, "scope-counterfactual").await;
     // `counterfactual_scenarios` references both claims.
     let a = viewer_fixture::seed_public_claim(&w.pool, w.agent, "scope counterfactual a").await;

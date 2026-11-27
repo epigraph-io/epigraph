@@ -319,10 +319,10 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // had proving tests for.
     // `political.rs` was 1 and is now 0, so it is gone from the register
     // (backlog 67c905a3). The site was `inflation_leaderboard`'s
-    // `claims ⨝ agents` aggregate; it is now
-    // `PoliticalRepository::get_inflation_leaderboard(.., &viewer)`, marking
-    // `c` in the `WHERE` so the mean and the `HAVING` threshold both see only
-    // visible claims, on the caller's `read_as` connection.
+    // `claims ⨝ agents` aggregate; it moved into
+    // `PoliticalRepository::get_inflation_leaderboard(.., &viewer)`, and the
+    // whole political module was later deleted from the kernel (backlog
+    // bd13e0e0).
     // `search.rs` was 1 and is now 0, so it is gone from the register (backlog
     // 67c905a3). The site was the `format!`-built `full_sql` in
     // `semantic_search`'s diverse arm. That statement was safe only by a
@@ -641,7 +641,9 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // on the caller's stamped transaction. `share_skill`'s remains.
     ("conventions.rs", 1),
     ("hypothesis.rs", 2),
-    ("policies.rs", 4),
+    // 4 -> 0, key removed (backlog ec968070): the admin `record_outcome`,
+    // `resolve_challenge` (two) and `decay_sweep` `UPDATE claims` were deleted
+    // with their handlers.
     // 2 -> 0, key removed (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding`
     // and `PUT /api/v1/evidence/:id/embedding` (`generate_claim_embedding`,
     // `generate_evidence_embedding`) were deleted.
