@@ -4,7 +4,36 @@ Database access layer for EpiGraph using PostgreSQL and sqlx.
 
 ## Setup
 
-This crate uses sqlx's compile-time query verification via the `query!` macro. To build this crate, you need to either:
+Most of this crate's SQL is NOT compile-time checked. Only a minority of its
+statements (under one in ten, measured in November 2026 as about 90 `query!` /
+`query_scalar!` macro calls against about 1,200 runtime `sqlx::query` /
+`query_as` / `query_scalar` calls under `src/`) use the sqlx macros that sqlx
+verifies against a database schema at build time. The rest are runtime
+statements, checked only when they run (by the DB-backed tests), for these
+reasons:
+
+- **Visibility and write splicing.** A tenancy-scoped read or write marks its
+  SQL with `/* {VISIBILITY:<alias>} */` or `/* {WRITABLE:<alias>} */` and
+  passes it through `Viewer::splice` / `splice_write`, which return a runtime
+  `String`. The macros need a compile-time literal of fixed arity, so a spliced
+  statement cannot be a macro. The few macro reads that filter by viewer spell
+  the static three-bind predicate instead
+  (`$N::bool OR visibility = 'public' OR owner_group_id = ANY($M::uuid[])`).
+  A write inside a macro can never take the write marker, which is why
+  `tests/write_gate_lint.rs` registers every one in `MACRO_WRITE_SITES`.
+- **Dynamic SQL.** Many statements are built with `format!` at run time
+  (optional filters, per-call column or table choices), which no macro can
+  check.
+- **Build cost.** Every macro call needs a matching `.sqlx/` entry, or a live
+  `DATABASE_URL`, to compile.
+
+Use a macro for a static statement that no viewer or writable marker will ever
+need to reach; otherwise use the runtime form, decoded through `query_as` into
+a `#[derive(sqlx::FromRow)]` struct rather than `Row::get`, which panics on a
+missing column or a type mismatch.
+
+Because the macros that remain are checked at build time, building this crate
+needs either:
 
 ### Option 1: Prepare queries with a database (recommended)
 
@@ -45,7 +74,9 @@ cargo build -p epigraph-db
 
 ## Features
 
-- **Type-safe queries**: Compile-time verification of SQL queries
+- **Typed rows**: `FromRow` decoding for runtime queries; compile-time SQL
+  verification only for the minority of statements that use the `query!`
+  family (see Setup for which, and why)
 - **Repository pattern**: Clean separation of data access logic
 - **Async/await**: Full async support with tokio
 - **Connection pooling**: Efficient connection management with sqlx
