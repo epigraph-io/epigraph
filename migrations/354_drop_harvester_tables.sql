@@ -36,9 +36,12 @@
 --    maintenance role, the policies' bypass arm; 42501 otherwise: the tables
 --    are FORCEd, so any other session, the owner included, would count only
 --    public rows and its own groups' rows), and every one of the five must be
---    EMPTY (55000 naming the table otherwise). This migration never drops a
---    row: a database whose harvester tables hold data stops here, and the
---    operator decides what happens to that data first.
+--    EMPTY (55000 naming the table otherwise). Each table is locked ACCESS
+--    EXCLUSIVE before it is read (within the 3 s lock timeout, 55P03
+--    otherwise), and the lock is held to the DROP, so a row committed after
+--    the check cannot be dropped unseen. This migration never drops a row: a
+--    database whose harvester tables hold data stops here, and the operator
+--    decides what happens to that data first.
 -- 3. The four shared bodies are re-stated with every harvester arm removed
 --    and no other byte changed except the audit rows' `'migration'` stamp
 --    (284 -> 354, as 284 bumped 242's):
@@ -128,6 +131,10 @@ BEGIN
                              'harvester_fragments', 'harvester_sources',
                              'harvester_enriched_concepts'] LOOP
         IF pg_catalog.to_regclass('public.' || t) IS NOT NULL THEN
+            -- Locked before it is read, and held to the DROP: a row a
+            -- concurrent writer commits after this check cannot be dropped
+            -- unseen.
+            EXECUTE pg_catalog.format('LOCK TABLE public.%I IN ACCESS EXCLUSIVE MODE', t);
             EXECUTE pg_catalog.format('SELECT EXISTS (SELECT 1 FROM public.%I)', t) INTO v_any;
             IF v_any THEN
                 RAISE EXCEPTION '354: public.% has rows; this migration drops only empty '
