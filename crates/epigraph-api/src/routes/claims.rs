@@ -1046,12 +1046,19 @@ pub(crate) async fn create_claim_core(
             truth_value,
         )
     };
+    // BLAKE3 of the STORED content (`content_for_db`, so the "[private]"
+    // placeholder for the fully_private tier), computed ONCE and reused by the
+    // attestation below, the (content_hash, agent_id) duplicate check and the
+    // `content_hash` override check (backlog 90e994f0). It is NOT written to
+    // `claim.content_hash` here: `Claim::new` leaves that [0u8; 32] and only
+    // the attest path fills it, so the override must be compared against this
+    // digest, never against `claim.content_hash` (which would accept 64 zeros).
+    let content_digest = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
     let attest_signer_id = attest.map(|k| {
-        let digest = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
-        claim.content_hash = digest;
+        claim.content_hash = content_digest;
         claim.signature = Some(
             k.signer
-                .sign_entity(epigraph_crypto::SignedEntity::Claim, &digest),
+                .sign_entity(epigraph_crypto::SignedEntity::Claim, &content_digest),
         );
         k.signer_id
     });
@@ -1216,7 +1223,6 @@ pub(crate) async fn create_claim_core(
         // duplicates. The contract is re-asserted here at the app layer:
         // lock_content_hash_agent, then a find, refusing a duplicate up front
         // with the same 409 the constraint would have produced.
-        let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
         let agent_uuid: Uuid = claim.agent_id.into();
         let dup_conflict = || {
             ApiError::Conflict {
@@ -1238,12 +1244,16 @@ pub(crate) async fn create_claim_core(
         // write one. The digest of a placeholder says nothing about whether the
         // ciphertexts are duplicates, and the server cannot compare those.
         if privacy_tier != "fully_private" {
-            ClaimRepository::lock_content_hash_agent(&mut tx, content_hash.as_slice(), agent_uuid)
-                .await?;
+            ClaimRepository::lock_content_hash_agent(
+                &mut tx,
+                content_digest.as_slice(),
+                agent_uuid,
+            )
+            .await?;
             if ClaimRepository::find_by_content_hash_and_agent(
                 &mut tx,
                 viewer,
-                content_hash.as_slice(),
+                content_digest.as_slice(),
                 agent_uuid,
             )
             .await?
@@ -1280,8 +1290,8 @@ pub(crate) async fn create_claim_core(
                 field: "content_hash".to_string(),
                 reason: "content_hash must be valid hex (64 chars for BLAKE3)".to_string(),
             })?;
-            let expected_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
-            if decoded.as_slice() != expected_hash.as_slice() {
+            // `content_digest`: BLAKE3(content_for_db), computed once above.
+            if decoded.as_slice() != content_digest.as_slice() {
                 return Err(ApiError::ValidationError {
                     field: "content_hash".to_string(),
                     reason: "content_hash override does not match BLAKE3(content); for non-compound claims the override must equal the server-computed hash of the claim content".to_string(),
@@ -3369,6 +3379,30 @@ pub async fn list_by_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog 90e994f0: `create_claim_core` hashes the claim content ONCE.
+    /// It hashed it up to three times (attestation, the (content_hash,
+    /// agent_id) duplicate check, the `content_hash` override check). A static
+    /// read of this file, since a digest count has no observable output; the
+    /// override's behaviour (mismatch and all-zero -> 400, correct -> created)
+    /// is `tests/content_hash_override_verification_test.rs`.
+    #[test]
+    fn create_claim_core_hashes_the_content_once() {
+        let src = include_str!("claims.rs");
+        let start = src
+            .find("pub(crate) async fn create_claim_core(")
+            .expect("create_claim_core is defined in this file");
+        let len = src[start..]
+            .find("\n}\n")
+            .expect("create_claim_core ends with a column-0 brace");
+        let body = &src[start..start + len];
+        let needle = concat!("ContentHasher", "::hash(");
+        assert_eq!(
+            body.matches(needle).count(),
+            1,
+            "create_claim_core must compute BLAKE3(content_for_db) once and reuse it"
+        );
+    }
 
     #[test]
     fn test_claim_response_from_claim() {
