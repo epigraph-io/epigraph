@@ -278,7 +278,7 @@ Return 3-8 claims."#,
             };
             let claim_id = {
                 let mut conn = pool.acquire().await?;
-                insert_unless_hash_exists(&mut conn, args.agent_id, decl, &new_claim)
+                insert_unless_hash_exists(&mut conn, viewer, args.agent_id, decl, &new_claim)
                     .await
                     .map_err(|e| e as Box<dyn std::error::Error>)?
             };
@@ -367,6 +367,12 @@ where
 /// `content_hash` already exists. Returns the new row's id, or `None` when the
 /// content was already present.
 ///
+/// **Writer:** the row is created through `ClaimRepository` (backlog
+/// 832e89a8), with its labels, then its properties, then its vector through
+/// the sealed-safe `store_embedding_if_unsealed`, all in the scope below, so
+/// the claim never commits without its embedding. `viewer` is the binary's
+/// maintenance (bypass) viewer that write is spent under.
+///
 /// **Concurrency:** the find and the INSERT run in one scope (a real `BEGIN`
 /// on a bare connection, a SAVEPOINT in a caller's transaction) under
 /// `ClaimRepository::lock_content_hash_agent` for the pair the INSERT writes,
@@ -377,6 +383,7 @@ where
 /// stays content-hash-only (any author), as before.
 async fn insert_unless_hash_exists(
     conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     agent_id: Uuid,
     decl: epigraph_core::TenancyDecl,
     claim: &WebSearchClaim<'_>,
@@ -403,26 +410,50 @@ async fn insert_unless_hash_exists(
         return Ok(None);
     }
 
-    let (id,): (Uuid,) = sqlx::query_as(
-        r#"
-        INSERT INTO claims (content, content_hash, truth_value, agent_id, labels, properties, embedding, visibility, owner_group_id)
-        VALUES ($1, $2, $3, $4, ARRAY['experimental', 'web_search'], $5, $6::vector, $7, $8)
-        RETURNING id
-        "#,
+    // A fresh id: the find above under the dedup lock is this binary's dedup,
+    // so the create itself must never collapse onto another row.
+    let id = Uuid::new_v4();
+    let created = epigraph_db::ClaimRepository::create_with_id_if_absent_conn(
+        &mut scope,
+        id,
+        claim.content,
+        &content_hash,
+        agent_id,
+        epigraph_core::TruthValue::new(claim.truth_value)?,
+        &["experimental".to_string(), "web_search".to_string()],
+        decl,
     )
-    .bind(claim.content)
-    .bind(content_hash.as_slice())
-    .bind(claim.truth_value)
-    .bind(agent_id)
-    .bind(&claim.properties)
-    .bind(claim.embedding)
-    .bind(decl.visibility_bind())
-    .bind(decl.owner_group_bind())
-    .fetch_one(&mut *scope)
     .await?;
+    if !created {
+        return Err(format!("web-search claim {id} was not created").into());
+    }
+    epigraph_db::ClaimRepository::set_properties_conn(
+        &mut scope,
+        id.into(),
+        claim.properties.clone(),
+    )
+    .await?;
+    let embedded = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+        &mut scope,
+        viewer,
+        id,
+        claim.embedding,
+    )
+    .await?;
+    if !embedded {
+        return Err(format!("the embedding of web-search claim {id} was not stored").into());
+    }
     scope.commit().await?;
     Ok(Some(id))
 }
+
+// The one canonical viewer fixture, for the tests below: a bypass viewer, as
+// the binary's maintenance session hands its claim writer. Declared at the
+// crate root because a `#[path]` inside an inline module resolves under a
+// directory named after that module, which does not exist.
+#[cfg(test)]
+#[path = "../../../epigraph-db/tests/viewer_fixture.rs"]
+mod viewer_fixture;
 
 /// Concurrency cover for [`insert_unless_hash_exists`] (backlog 00f1a517):
 /// two writers of one `(content_hash, agent_id)` must yield one row.
@@ -437,6 +468,7 @@ async fn insert_unless_hash_exists(
 #[cfg(test)]
 mod dedup_race_tests {
     use super::{content_hash_exists, insert_unless_hash_exists, WebSearchClaim};
+    use crate::viewer_fixture;
     use epigraph_core::{AgentId, Claim, TenancyDecl, TruthValue};
     use epigraph_crypto::ContentHasher;
     use epigraph_db::ClaimRepository;
@@ -522,7 +554,8 @@ mod dedup_race_tests {
                     properties: serde_json::json!({ "source": "web_search" }),
                     embedding: &embedding,
                 };
-                insert_unless_hash_exists(&mut tx_1, agent_id, decl, &claim)
+                let (_scoped, viewer) = viewer_fixture::bypass(pool).await;
+                insert_unless_hash_exists(&mut tx_1, &viewer, agent_id, decl, &claim)
                     .await
                     .expect("caller 1 insert")
                     .expect("caller 1 is the first write of the pair")
@@ -547,6 +580,7 @@ mod dedup_race_tests {
             let content = content.clone();
             let embedding = embedding.clone();
             tokio::spawn(async move {
+                let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
                 let mut conn = pool.acquire().await.expect("acquire caller 2's connection");
                 let claim = WebSearchClaim {
                     content: &content,
@@ -554,7 +588,7 @@ mod dedup_race_tests {
                     properties: serde_json::json!({ "source": "web_search" }),
                     embedding: &embedding,
                 };
-                insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+                insert_unless_hash_exists(&mut conn, &viewer, agent_id, decl, &claim)
                     .await
                     .expect("caller 2 insert")
             })
@@ -613,18 +647,47 @@ mod dedup_race_tests {
                 .expect("the run loop's pre-check over new content"),
             "new content is not reported as known"
         );
+        let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
         let mut conn = pool.acquire().await.expect("acquire");
-        let first = insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+        let first = insert_unless_hash_exists(&mut conn, &viewer, agent_id, decl, &claim)
             .await
             .expect("first run");
-        assert!(first.is_some(), "the first run inserts the new content");
+        let first_id = first.expect("the first run inserts the new content");
+        // Backlog 832e89a8: the row is the repository's (one `claim.created`
+        // event, which the binary's former raw INSERT never recorded) and still
+        // carries everything that INSERT wrote.
+        let (labels, source, has_embedding, owner, created_events): (
+            Vec<String>,
+            Option<String>,
+            bool,
+            Option<Uuid>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT c.labels, c.properties->>'source', c.embedding IS NOT NULL, c.owner_group_id, \
+                    (SELECT count(*) FROM events e WHERE e.event_type = 'claim.created' \
+                        AND e.payload->>'claim_id' = c.id::text) \
+               FROM claims c WHERE c.id = $1",
+        )
+        .bind(first_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the written claim");
+        assert_eq!(labels, ["experimental", "web_search"]);
+        assert_eq!(source.as_deref(), Some("web_search"));
+        assert!(has_embedding, "the claim commits with its embedding");
+        assert_eq!(
+            owner,
+            decl.owner_group_bind(),
+            "the declared tenancy is stored"
+        );
+        assert_eq!(created_events, 1, "created by a ClaimRepository writer");
         assert!(
             content_hash_exists(&pool, hash.as_slice())
                 .await
                 .expect("the run loop's pre-check over known content must not error"),
             "the run loop's pre-check reports the committed content as known"
         );
-        let second = insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+        let second = insert_unless_hash_exists(&mut conn, &viewer, agent_id, decl, &claim)
             .await
             .expect("a second run over known content must not error");
         assert_eq!(second, None, "the second run skips the known content");
@@ -652,7 +715,9 @@ mod dedup_race_tests {
         let content = format!("method_search bare race {}", Uuid::new_v4());
         let embedding = embedding_literal();
 
-        // Fires only for caller 1's row, which carries the marker property.
+        // Fires only for caller 1's row, which carries the marker truth value.
+        // Not a property: the claim's properties are written by an UPDATE
+        // after the repository's INSERT, so the INSERT row carries none.
         sqlx::query(
             &"CREATE OR REPLACE FUNCTION zz_ms_race_barrier() RETURNS trigger
               LANGUAGE plpgsql AS $$
@@ -668,7 +733,7 @@ mod dedup_race_tests {
         .expect("create the barrier function");
         sqlx::query(
             "CREATE TRIGGER zz_ms_race_barrier BEFORE INSERT ON claims FOR EACH ROW \
-             WHEN (NEW.properties->>'race_barrier' = 'hold') \
+             WHEN (NEW.truth_value = 0.81::float8) \
              EXECUTE FUNCTION zz_ms_race_barrier()",
         )
         .execute(&pool)
@@ -682,25 +747,26 @@ mod dedup_race_tests {
             .await
             .expect("take the barrier");
 
-        let spawn_run = |marker: &'static str| {
+        let spawn_run = |hold: bool| {
             let pool = pool.clone();
             let content = content.clone();
             let embedding = embedding.clone();
             tokio::spawn(async move {
+                let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
                 let mut conn = pool.acquire().await.expect("acquire a racer connection");
                 let claim = WebSearchClaim {
                     content: &content,
-                    truth_value: 0.8,
-                    properties: serde_json::json!({ "race_barrier": marker }),
+                    truth_value: if hold { 0.81 } else { 0.8 },
+                    properties: serde_json::json!({ "source": "web_search" }),
                     embedding: &embedding,
                 };
-                insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+                insert_unless_hash_exists(&mut conn, &viewer, agent_id, decl, &claim)
                     .await
                     .expect("racer insert")
             })
         };
 
-        let caller_1 = spawn_run("hold");
+        let caller_1 = spawn_run(true);
         // Caller 1 is parked inside its INSERT.
         let mut parked = false;
         for _ in 0..600 {
@@ -724,7 +790,7 @@ mod dedup_race_tests {
             "caller 1 never reached the barrier trigger, so this arm would prove nothing"
         );
 
-        let caller_2 = spawn_run("go");
+        let caller_2 = spawn_run(false);
         let blocked = settle_on_the_dedup_lock(&pool, &caller_2).await;
 
         sqlx::query("SELECT pg_advisory_unlock($1)")
