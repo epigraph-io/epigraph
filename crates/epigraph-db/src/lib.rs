@@ -129,28 +129,28 @@ pub use repos::{
     EntityTypeRepository, EpistemicEdgePairRow, EventCursor, EventRepository, EventRow,
     EvidenceAtTimeRow, EvidenceClaimLink, EvidenceDetailRow, EvidenceDirection, EvidenceEdge,
     EvidenceEdgeRow, EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceListFilter,
-    EvidenceListRow, EvidenceRepository, EvidenceSearchResult, EvolveStepResult,
+    EvidenceListRow, EvidenceRepository, EvidenceSearchResult, EvidenceTenancy, EvolveStepResult,
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
     FactorRepository, FlatPage, FlatRanking, FlatWorkflowClaim, FrameClaimBeliefHit,
     FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord, GapRepository,
     GraphExpansionHit, GraphViewRepository, GroundedNeighbor, GroupKeyEpochRepository,
     GroupMembershipRepository, GroupRepository, GroupRow, HierarchicalOutcomeCounters,
     HierarchicalOutcomeRecord, HierarchicalOutcomeResult, HierarchicalWorkflowRow,
-    HybridCandidates, HybridHit, HybridPage, IndexCounts, InstanceAdminRepository,
-    InstanceAdminRow, KeyEpochRow, LabelFamilyRow, LabelQuery, LearningEventRepository,
-    LearningEventRow, LevelAndSourceType, LineageHead, LineageRepository, MarkedDuplicateRow,
-    MarkedDuplicates, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow,
-    MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
-    MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
-    MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage, NewHierarchicalOutcomeReport,
-    NewRecallEvent, NonceConsumption, OAuthClientRepository, OAuthClientRow, OperatorLink,
-    OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
-    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProfileVisibility,
-    ProfileVisibilitySet, PromotionStanding, ProvenanceChain, ProvenanceChainRepository,
-    ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
-    ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshCheck,
-    RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository, RefreshTokenRow,
-    ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
+    HybridCandidates, HybridHit, HybridPage, IncidentEdgeTenancy, IndexCounts,
+    InstanceAdminRepository, InstanceAdminRow, KeyEpochRow, LabelFamilyRow, LabelQuery,
+    LearningEventRepository, LearningEventRow, LevelAndSourceType, LineageHead, LineageRepository,
+    MarkedDuplicateRow, MarkedDuplicates, MassFunctionRepository, MatchCandidateRepo,
+    MatchCandidateRow, MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength,
+    MethodFailureModes, MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult,
+    MethodSourcePaper, MethodUsageExample, MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage,
+    NewHierarchicalOutcomeReport, NewRecallEvent, NonceConsumption, OAuthClientRepository,
+    OAuthClientRow, OperatorLink, OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff,
+    PatchClaimInput, PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository,
+    ProfileVisibility, ProfileVisibilitySet, PromotionStanding, ProvenanceChain,
+    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
+    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
+    RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
+    RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
     RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
     SecurityEventRepository, SecurityEventRow, SemanticFlatPage, SemanticSelectedClaim,
     SheafRepository, SortDirection, StructuralRepository, SupersedeActor, SupersedeEdgeMigration,
@@ -174,6 +174,10 @@ pub use repos::{
     INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
 };
 pub use repos::{
+    preview_refusal, ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant,
+    VisibilityActOutcome, WriteTenancyReport,
+};
+pub use repos::{
     record_standing_refusal, AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony,
     EndReason, LiveElevation, Redemption, StandingCeremony, TicketMode, TicketPasskey,
 };
@@ -185,10 +189,6 @@ pub use repos::{
 pub use repos::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
 pub use repos::{AuthorNaming, AuthorNamingFacts};
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
-pub use repos::{
-    ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome,
-    WriteTenancyReport,
-};
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{CountersignDecision, CountersignRepository, CountersignedRow};
 pub use repos::{

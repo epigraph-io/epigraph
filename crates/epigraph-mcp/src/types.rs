@@ -3777,12 +3777,25 @@ pub struct PublishEventParams {
 
 // ── Claim visibility (docs/tenancy/claim-visibility-controls.md) ──
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct PublicizeClaimsParams {
     #[schemars(
-        description = "UUIDs of team or private claims to make PUBLIC (1 to 500). All or nothing: if any claim is not found, not readable, sealed, or owned by a group you are not a live ADMIN of, nothing changes and the error lists each refused claim. Already-public claims are reported as already_public. The owner group is unchanged. Unpinned evidence and traces follow the claim, and edges between claims that are now public become public."
+        description = "UUIDs of team or private claims to make PUBLIC (1 to 500). All or nothing: if any claim is not found, not readable, sealed, or owned by a group you are not a live ADMIN of, nothing changes and the error lists each refused claim. Already-public claims are reported as already_public. The owner group is unchanged. Unpinned evidence and traces follow the claim, and edges between claims that are now public become public. Give claim_ids or selection, not both."
     )]
+    #[serde(default)]
     pub claim_ids: Vec<String>,
+
+    #[schemars(
+        description = "Instead of claim_ids: a root claim and the closure to walk from it (by default what it decomposes_to and supports, outgoing, 3 edges deep). Every claim reached that you may publish is published with the root; a claim you may not (another group's, sealed, not yours to publish, superseded) is a boundary: listed with its reason, left untouched, and not walked through. A claim you cannot read is never followed or named. All or nothing, at most 500 claims."
+    )]
+    #[serde(default)]
+    pub selection: Option<SelectionParams>,
+
+    #[schemars(
+        description = "true: change nothing and return the plan ({claims, boundaries, capped}) the call would carry out and, when it would run, its effects (edges_widened, edges_kept, evidence_moved, evidence_kept), measured by running it and rolling it back. Run it first on a selection."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 
     #[schemars(
         description = "Why these claims are being published. Required, and recorded in the claim.publicized audit event."
@@ -3790,12 +3803,25 @@ pub struct PublicizeClaimsParams {
     pub reason: String,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ShareClaimsWithTeamParams {
     #[schemars(
-        description = "UUIDs of PRIVATE claims (owned by your home group) to move into a team (1 to 500). You must have written each claim, or be an admin of your home group. All or nothing. Visibility stays group-only: the team's members can read them afterwards. Public and team claims are refused; publicize_claims publishes."
+        description = "UUIDs of PRIVATE claims (owned by your home group) to move into a team (1 to 500). You must have written each claim, or be an admin of your home group. All or nothing. Visibility stays group-only: the team's members can read them afterwards. Public and team claims are refused; publicize_claims publishes. Give claim_ids or selection, not both."
     )]
+    #[serde(default)]
     pub claim_ids: Vec<String>,
+
+    #[schemars(
+        description = "Instead of claim_ids: a root claim and the closure to walk from it (by default what it decomposes_to and supports, outgoing, 3 edges deep). Every claim reached that you may share moves with the root; a claim you may not (public, already a team's, written by someone else, sealed, superseded) is a boundary: listed with its reason, left untouched, and not walked through. A claim you cannot read is never followed or named. All or nothing, at most 500 claims."
+    )]
+    #[serde(default)]
+    pub selection: Option<SelectionParams>,
+
+    #[schemars(
+        description = "true: change nothing and return the plan ({claims, boundaries, capped}) the call would carry out and, when it would run, its effects (edges_widened, edges_kept, evidence_moved, evidence_kept), measured by running it and rolling it back. Run it first on a selection."
+    )]
+    #[serde(default)]
+    pub dry_run: Option<bool>,
 
     #[schemars(
         description = "UUID of the team to move the claims into. You need your own live writer or admin membership of it."
@@ -3806,6 +3832,32 @@ pub struct ShareClaimsWithTeamParams {
         description = "Why. Required, and recorded in the claim.shared_with_team audit event."
     )]
     pub reason: String,
+}
+
+/// A subgraph for `publicize_claims` / `share_claims_with_team` (backlog
+/// 02d9e9a1).
+#[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
+pub struct SelectionParams {
+    #[schemars(description = "UUID of the claim to start from.")]
+    pub root: String,
+
+    #[schemars(
+        description = "Edge types to follow (default [\"decomposes_to\", \"supports\"]). Any of decomposes_to, supports, corroborates, elaborates, specializes, generalizes, refines, section_follows, continues_argument."
+    )]
+    #[serde(default)]
+    pub edge_types: Option<Vec<String>>,
+
+    #[schemars(
+        description = "'outgoing' (default: from the root to what it decomposes_to or supports), 'incoming' (to what decomposes into or supports it), or 'both'."
+    )]
+    #[serde(default)]
+    pub direction: Option<String>,
+
+    #[schemars(
+        description = "Edges to walk from the root, 0 to 10 (default 3; 0: the root alone)."
+    )]
+    #[serde(default)]
+    pub max_depth: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3837,7 +3889,15 @@ pub struct SetProfileVisibilityParams {
 
 #[derive(Debug, Serialize)]
 pub struct VisibilityActResponse {
-    /// Per-claim outcome: `publicized` / `already_public`, or `shared`.
+    /// Present for a selection or a dry run: whether this was a dry run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    /// Present for a selection or a dry run: the plan
+    /// (`epigraph_engine::visibility_act::VisibilityPlan`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<serde_json::Value>,
+    /// Per-claim outcome: `publicized` / `already_public`, or `shared`. Empty
+    /// on a dry run.
     pub results: Vec<VisibilityActItem>,
 }
 

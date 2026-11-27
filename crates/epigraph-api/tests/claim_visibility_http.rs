@@ -574,3 +574,137 @@ async fn publicize_over_http_refolds_the_belief_for_the_public(pool: PgPool) {
          team's ({stale:?}); control {expected:?}"
     );
 }
+
+/// A private claim of `agent` in its home group `home`, seeded.
+async fn private_claim(pool: &PgPool, agent: Uuid, home: Uuid, content: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                             is_current, visibility, owner_group_id) \
+         VALUES ($1, $2, sha256(convert_to($2, 'UTF8')), 0.7, $3, true, 'group', $4)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(agent)
+    .bind(home)
+    .execute(pool)
+    .await
+    .expect("seed claim");
+    id
+}
+
+/// `POST /api/v1/claims/share-with-team` by SELECTION (backlog 02d9e9a1): the
+/// dry run returns the plan (R and its child A; the public claim P under A is
+/// a boundary) and changes nothing; the act then moves exactly R and A, one
+/// audit row names them, and P and the claim Q beyond it are untouched. A
+/// stranger's selection on R is a 404 like a missing root; ids together with
+/// a selection are a 400.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_a_selection_over_http_with_a_dry_run(pool: PgPool) {
+    let (addr, _stop) = spawn_app(&pool).await;
+    let t = team(&pool, "http-team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "http-alice").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "http-carol").await;
+    add_member(&pool, t, alice, "writer").await;
+    let r = private_claim(&pool, alice, home, "http root").await;
+    let a = private_claim(&pool, alice, home, "http child").await;
+    let q = private_claim(&pool, alice, home, "http beyond").await;
+    let p = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                             is_current, visibility, owner_group_id) \
+         VALUES ($1, 'http public step', sha256('http public step'::bytea), 0.7, $2, true, \
+                 'public', $3)",
+    )
+    .bind(p)
+    .bind(alice)
+    .bind(home)
+    .execute(&pool)
+    .await
+    .expect("public claim");
+    for (s, o) in [(r, a), (a, p), (p, q)] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'claim', $2, 'claim', 'decomposes_to')",
+        )
+        .bind(s)
+        .bind(o)
+        .execute(&pool)
+        .await
+        .expect("edge");
+    }
+    let path = "/api/v1/claims/share-with-team";
+    let req = |dry_run: bool| json!({"selection": {"root": r}, "dry_run": dry_run, "group_id": t, "reason": "share"});
+    let ids_of = |v: &Value| -> Vec<String> {
+        let mut out: Vec<String> = v
+            .as_array()
+            .expect("list")
+            .iter()
+            .map(|c| c["claim_id"].as_str().unwrap().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+    let mut ra = vec![r.to_string(), a.to_string()];
+    ra.sort();
+
+    let (status, body) = send(addr, reqwest::Method::POST, path, alice, req(true)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["dry_run"], true, "{body}");
+    assert_eq!(ids_of(&body["plan"]["claims"]), ra, "{body}");
+    assert_eq!(ids_of(&body["plan"]["boundaries"]), vec![p.to_string()]);
+    assert_eq!(
+        body["plan"]["boundaries"][0]["reason"], "refused_not_private",
+        "{body}"
+    );
+    for c in [r, a, q] {
+        assert_eq!(tenancy(&pool, c).await, ("group".to_string(), home));
+    }
+    let audited = || async {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT details FROM security_events WHERE event_type = 'claim.shared_with_team'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("audit")
+    };
+    assert!(audited().await.is_empty(), "a dry run audits nothing");
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::POST,
+        path,
+        carol,
+        json!({"selection": {"root": r}, "group_id": t, "reason": "steal"}),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = send(
+        addr,
+        reqwest::Method::POST,
+        path,
+        alice,
+        json!({"claim_ids": [r], "selection": {"root": r}, "group_id": t, "reason": "both"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = send(addr, reqwest::Method::POST, path, alice, req(false)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(ids_of(&body["results"]), ra, "{body}");
+    for c in [r, a] {
+        assert_eq!(tenancy(&pool, c).await, ("group".to_string(), t));
+    }
+    assert_eq!(tenancy(&pool, q).await, ("group".to_string(), home));
+    assert_eq!(tenancy(&pool, p).await, ("public".to_string(), home));
+    let rows = audited().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let mut named: Vec<String> = rows[0]["claim_ids"]
+        .as_array()
+        .expect("claim_ids")
+        .iter()
+        .map(|i| i.as_str().unwrap().to_string())
+        .collect();
+    named.sort();
+    assert_eq!(named, ra);
+}
