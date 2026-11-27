@@ -107,8 +107,8 @@ pub const SIGNER_DISPLAY_NAME: &str = "epigraph-api-signer";
 
 /// The boot line when no key is configured.
 pub const UNSIGNED_AT_BOOT: &str = "EPIGRAPH_API_SIGNING_KEY_FILE is not set: HTTP edge \
-     writers insert their edges UNSIGNED. Provision the API's own signing key to attest them \
-     (ruling R-50).";
+     writers insert their edges UNSIGNED, and POST /api/v1/claims its claims. Provision the \
+     API's own signing key to attest them (ruling R-50).";
 
 /// The API's edge signing key: its signer and the agent recorded as
 /// `edges.signer_id`.
