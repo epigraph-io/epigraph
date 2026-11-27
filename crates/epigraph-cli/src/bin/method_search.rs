@@ -255,8 +255,9 @@ Return 3-8 claims."#,
             let journal = claim.get("journal").and_then(|v| v.as_str());
             let year = claim.get("year").and_then(|v| v.as_i64());
 
-            // Embed inline (matches hypothesis.rs pattern; embedding policy requires
-            // is_current=true claims to have an embedding).
+            // Embed before the write: `insert_unless_hash_exists` stores this vector
+            // with the claim in one transaction (as `hypothesis create` does), since
+            // the embedding policy requires is_current=true claims to have one.
             let embedding = embedder
                 .generate(content)
                 .await
