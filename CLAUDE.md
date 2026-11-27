@@ -537,8 +537,13 @@ only the non-merge commits a change adds. It refuses:
   committed, because a public deny-list would publish the names it protects.
 
 It only warns about a subject outside `<type>(<scope>): <text>` (W2) and a
-message with none of the three sections (W3). Output is redacted, never the
+message with none of the three sections (W3). A `style` commit (formatting
+only: rustfmt, whitespace) is a valid type whose one-line body is not warned
+about (no W3); E1-E6 still apply to it. Output is redacted, never the
 offending value.
+
+The job is in the `needs` of the required `test` check, so an E-class finding
+(E1-E6) turns `test` red and blocks the merge; warnings (W2-W4) do not.
 
 **Citing commits.** Cite a commit by sha only once it is on `main`, or when it
 is an earlier commit of the same change. Cite anything else (a commit on

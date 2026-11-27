@@ -50,8 +50,9 @@ jobs:
   # in `workspace-rest`, which is selected by exclusion.
   #
   # `test` (below) is the single required check. It fails unless every shard
-  # and every feature-gated check the plan asked for succeeded, so branch
-  # protection keeps one stable name however the shards are re-cut.
+  # and every feature-gated check the plan asked for succeeded, and the commit
+  # message lint passed, so branch protection keeps one stable name however
+  # the shards are re-cut.
   #
   # ON A PULL REQUEST ONLY THE AFFECTED SHARDS RUN. The org's GitHub-hosted
   # runners are capped at 20 concurrent jobs for every PR together, and the
