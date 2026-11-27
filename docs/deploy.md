@@ -609,6 +609,7 @@ For the others, anything else is off.
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. `POST /oauth/introspect` applies the same check: a delegated run token reads `active: false` while the switch is off, once its delegation has ended (operator link retired, delegator's allowance, client or writer membership revoked), or when it carries a scope outside the delegated ceiling, and the endpoint answers 503 when the check cannot be made. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for, matched against the agent's attested registration (migration 161), never its display properties. Empty refuses every mint. |
 | `EPIGRAPH_OAUTH_REDIRECT_ORIGINS` | empty | Extra HTTPS origins on which `/oauth/register` (dynamic client registration) accepts a `redirect_uri`, beside the built-in callbacks: `https://claude.ai/` and `https://claude.com/` (Claude), ChatGPT's exact `https://chatgpt.com/connector_platform_oauth_redirect` and `https://chatgpt.com/connector/oauth/<id>` (one `[A-Za-z0-9_-]` segment, nothing else under `chatgpt.com`), and loopback (`http://127.0.0.1`, `http://[::1]`, e.g. the Codex CLI). ChatGPT needs no entry here; listing `https://chatgpt.com` admits every path on it, and its two callbacks are still named ChatGPT on the consent page. Comma- or space-separated, each exactly `https://host[:port]`: no path, query, fragment, userinfo or `*`; anything else **refuses the boot**, naming the entry. A redirect must be on a listed origin exactly (same scheme, host and port; any path). The consent page names the origin, not the client's self-chosen name. Removing an origin later does not revoke clients already registered with it: `/oauth/authorize` matches the client's registered `redirect_uris`, so suspend or revoke those clients (`epigraph-operator suspend-client` / `revoke-client`). See `crates/epigraph-api/src/oauth/redirect.rs`. |
+| `EPIGRAPH_ASSERTION_V1` | `accept` | Whether an agent's VERSION-1 `client_assertion` (signed over the bare timestamp and nonce, bound to no server) still authenticates. `accept` logs and counts each one (`security_events` `oauth.agent_assertion_v1_accepted`); `refuse` answers `400 invalid_client`. Any other value **refuses the boot**. Version 2 (signed for this server's issuer) is always accepted. See "Agent `client_assertion`" in section 8. |
 | `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES` | empty | The federation extensions (by their `EPIGRAPH_MCP_EXTENSIONS` name) the RFC 8693 token-exchange grant at `/oauth/token` may mint for. Empty refuses every exchange, so a gateway with mounted extensions can call none of them. The kernel's own audience is never accepted here. See `crates/epigraph-api/src/oauth/token_exchange.rs`. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
 | `EPIGRAPH_BP_MAX_CONCURRENT` | `2` | How many `POST /api/v1/bp/propagate` runs may be in flight at once. A run beyond it is refused with 503 rather than queued; `0` refuses every run. A value that is not a non-negative integer, or is above the runtime semaphore's maximum (`usize::MAX >> 3`), is warned about and the default is used. Each request must also name its scope (`claim_ids` and `max_hops`, or `frame_id`). |
@@ -2221,6 +2222,88 @@ scopes, narrowed to the client's current `granted_scopes` (RFC 6749 section
    `epigraph_refresh_token_revoke_client_app`, drop the partial index, and
    drop the column. The rotate definer is untouched by 174, so nothing is
    re-run for it.
+
+### Agent `client_assertion`: version 2 is signed for this server's issuer
+
+An agent authenticates on `client_credentials` (and on the refresh grant of
+its chain) with `client_assertion_type=urn:epigraph:ed25519` and a
+`client_assertion` that is standard base64 of exactly 88 bytes:
+
+```text
+client_assertion = timestamp(8 bytes, u64 big-endian, Unix seconds)
+                || nonce(16 random bytes)
+                || Ed25519 signature(64 bytes)
+```
+
+The wire format is the same in both versions. What the signature covers is
+not:
+
+- **Version 2 (use this).** The signature covers
+
+  ```text
+  b"epigraph-sig-v1:oauth-assertion:" || issuer || b":" || timestamp(8, big-endian) || nonce(16)
+  ```
+
+  where `issuer` is the `issuer` member of this server's
+  `GET /.well-known/oauth-authorization-server` document, byte for byte (UTF-8,
+  no trailing slash; it is `EPIGRAPH_PUBLIC_BASE_URL` without one). Read it
+  from that document: it is **not** the URL the client connects to (not the
+  `/mcp` resource, not the token endpoint, not a load-balancer or internal
+  address), and a client that signs for anything else is refused. The
+  timestamp and nonce in the signed message are the same bytes as the first
+  24 bytes of the assertion. Built by
+  `epigraph_crypto::oauth_assertion_message`.
+
+  Worked example (pinned by the golden-bytes test in
+  `crates/epigraph-crypto/src/domain.rs`): issuer `https://epigraph.example`,
+  timestamp `1700000000` (`0x6553F100`), nonce `00 01 02 … 0f`. The signed
+  message is these 81 bytes, in hex:
+
+  ```text
+  65706967726170682d7369672d76313a6f617574682d617373657274696f6e3a   "epigraph-sig-v1:oauth-assertion:"
+  68747470733a2f2f65706967726170682e6578616d706c653a                 "https://epigraph.example:"
+  000000006553f100                                                   timestamp, big-endian
+  000102030405060708090a0b0c0d0e0f                                   nonce
+  ```
+
+  and the assertion sent is `000000006553f100 || 000102…0f || signature`.
+- **Version 1 (deprecated).** The signature covers the bare 24 bytes
+  `timestamp || nonce`. It names no server, so an assertion is good at every
+  server that knows the agent's key. Still accepted by default; see below.
+
+For both versions the timestamp must be at most 300 seconds old and at most
+30 seconds in the future, and the nonce is single use per key (migration
+213): a replayed assertion is `400 invalid_client`. The server tries
+version 2 first, then version 1.
+
+**`EPIGRAPH_ASSERTION_V1`** (`accept` by default, or `refuse`; any other
+value refuses the boot) decides whether a version-1 assertion still
+authenticates.
+
+- Under `accept`, each accepted version-1 assertion logs a warning naming
+  the client and writes one `security_events` row
+  (`event_type = 'oauth.agent_assertion_v1_accepted'`, client in `details`),
+  only after its nonce is spent, so a replay never counts.
+- Under `refuse`, it is `400 invalid_client`, like every other failed client
+  credential, and nothing is written.
+
+Rollout:
+
+1. Deploy the API. Nothing changes for clients: version 1 is still
+   accepted.
+2. Move every agent client to version 2. Find the clients that still sign
+   version 1:
+
+   ```sql
+   SELECT details->>'client_id' AS client_id, count(*), max(created_at) AS last_seen
+     FROM security_events
+    WHERE event_type = 'oauth.agent_assertion_v1_accepted'
+    GROUP BY 1 ORDER BY last_seen DESC;
+   ```
+
+3. Once no client has appeared there for longer than its token cadence (an
+   agent access token lives 15 minutes), set `EPIGRAPH_ASSERTION_V1=refuse`
+   and restart the API. Rollback: unset it (or `accept`) and restart.
 
 ### Token-endpoint and revocation error bodies (RFC 6749 section 5.2, RFC 7009)
 
