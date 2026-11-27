@@ -2244,16 +2244,7 @@ impl AppState {
     /// non-production name the dev fallback is refused; see
     /// [`jwt_config_from_env_values`].
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
-        let signing_key = std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR).ok();
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET").ok();
-        let env = std::env::var("EPIGRAPH_ENV").ok();
-        let allow_insecure = std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET").ok();
-        jwt_config_from_env_values(
-            signing_key.as_deref(),
-            secret.as_deref(),
-            env.as_deref(),
-            allow_insecure_secret(allow_insecure.as_deref()),
-        )
+        jwt_config_from_lookup(|name| std::env::var(name).ok())
     }
 
     /// The admin-scope switch for one request (elevation plan EL-10): read on
@@ -3471,6 +3462,24 @@ fn jwt_env_is_production(env: Option<&str>) -> bool {
         .is_some_and(crate::oauth::providers::env_is_production)
 }
 
+/// [`AppState`]'s JWT config from a variable lookup: the four variables
+/// `AppState::default_jwt_config` reads, by name, passed to
+/// [`jwt_config_from_env_values`]. `default_jwt_config` passes
+/// `std::env::var`; a test passes a closure, so the variable NAMES are
+/// covered without mutating the process environment.
+fn jwt_config_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Arc<crate::oauth::JwtConfig> {
+    let signing_key = lookup(epigraph_auth::JWT_SIGNING_KEY_VAR);
+    let secret = lookup("EPIGRAPH_JWT_SECRET");
+    let env = lookup("EPIGRAPH_ENV");
+    let allow_insecure = lookup("EPIGRAPH_ALLOW_INSECURE_SECRET");
+    jwt_config_from_env_values(
+        signing_key.as_deref(),
+        secret.as_deref(),
+        env.as_deref(),
+        allow_insecure_secret(allow_insecure.as_deref()),
+    )
+}
+
 /// [`AppState`]'s JWT config from the raw environment values. Pure, so every
 /// arm is testable without mutating the process environment.
 ///
@@ -3635,9 +3644,10 @@ impl std::ops::DerefMut for ClaimWriteTx<'_> {
 #[cfg(test)]
 mod default_jwt_config_tests {
     //! [`super::jwt_config_from_env_values`], the pure core of
-    //! `AppState::default_jwt_config`. No test here touches the process
+    //! `AppState::default_jwt_config`, and [`super::jwt_config_from_lookup`],
+    //! which reads the variables by name. No test here touches the process
     //! environment.
-    use super::{allow_insecure_secret, jwt_config_from_env_values};
+    use super::{allow_insecure_secret, jwt_config_from_env_values, jwt_config_from_lookup};
     use jsonwebtoken::Algorithm;
 
     /// A valid Ed25519 seed (64 hex characters).
@@ -3732,6 +3742,46 @@ mod default_jwt_config_tests {
                 "EPIGRAPH_ENV={env:?} refused with the wrong text: {text:?}"
             );
         }
+    }
+
+    /// The wiring: `EPIGRAPH_ENV` is read by that name and reaches the
+    /// production check. A lookup that answers only `EPIGRAPH_ENV` (no key, no
+    /// opt-out) must refuse; one that also answers the opt-out by its name
+    /// must not.
+    #[test]
+    fn the_lookup_reads_epigraph_env_by_name() {
+        let refused = std::panic::catch_unwind(|| {
+            jwt_config_from_lookup(|name| (name == "EPIGRAPH_ENV").then(|| "production".into()))
+        });
+        assert!(
+            refused.is_err(),
+            "EPIGRAPH_ENV=production with no key must refuse the dev fallback"
+        );
+
+        let opted_out = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_ALLOW_INSECURE_SECRET" => Some("1".into()),
+            _ => None,
+        });
+        assert_eq!(opted_out.signing_algorithm(), Some(Algorithm::HS256));
+    }
+
+    /// The wiring: the signing key and the secret are read by their names.
+    #[test]
+    fn the_lookup_reads_the_keys_by_name() {
+        let eddsa = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_JWT_SIGNING_KEY" => Some(SEED.into()),
+            _ => None,
+        });
+        assert_eq!(eddsa.signing_algorithm(), Some(Algorithm::EdDSA));
+
+        let hs256 = jwt_config_from_lookup(|name| match name {
+            "EPIGRAPH_ENV" => Some("production".into()),
+            "EPIGRAPH_JWT_SECRET" => Some(REAL_SECRET.into()),
+            _ => None,
+        });
+        assert_eq!(hs256.signing_algorithm(), Some(Algorithm::HS256));
     }
 
     /// A malformed signing key never falls back, in any environment.
