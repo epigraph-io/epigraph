@@ -20,7 +20,6 @@ members = [
     "crates/epigraph-cli",
     "crates/epigraph-jobs",
     "crates/epigraph-events",
-    "crates/epigraph-tools",
     "crates/epigraph-mcp",
     "crates/epigraph-ingest",
     "crates/epigraph-ingest-executor",
@@ -107,7 +106,6 @@ epigraph-embeddings = { path = "crates/epigraph-embeddings", features = ["openai
 epigraph-jobs = { path = "crates/epigraph-jobs" }
 epigraph-events = { path = "crates/epigraph-events" }
 epigraph-ds = { path = "crates/epigraph-ds" }
-epigraph-tools = { path = "crates/epigraph-tools" }
 epigraph-mcp = { path = "crates/epigraph-mcp" }
 epigraph-ingest = { path = "crates/epigraph-ingest" }
 epigraph-ingest-executor = { path = "crates/epigraph-ingest-executor" }

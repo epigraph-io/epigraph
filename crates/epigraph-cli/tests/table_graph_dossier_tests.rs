@@ -30,7 +30,7 @@ use dossier::collect_git_context;
 use dossier::extract_fk_targets;
 
 /// Workspace root, computed at compile time.
-/// `CARGO_MANIFEST_DIR` is `crates/epigraph-tools/`; root is two levels up.
+/// `CARGO_MANIFEST_DIR` is `crates/epigraph-cli/`; root is two levels up.
 const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 const REPO_MIGRATIONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
 

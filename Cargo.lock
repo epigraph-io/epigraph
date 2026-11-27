@@ -1550,6 +1550,7 @@ dependencies = [
  "ndarray",
  "openssl",
  "rand 0.8.6",
+ "regex",
  "reqwest 0.12.28",
  "rustix",
  "serde",
@@ -1558,11 +1559,13 @@ dependencies = [
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
+ "walkdir",
  "wiremock",
 ]
 
@@ -1849,26 +1852,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
-]
-
-[[package]]
-name = "epigraph-tools"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "clap",
- "epigraph-core",
- "hex",
- "regex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "uuid",
- "walkdir",
 ]
 
 [[package]]

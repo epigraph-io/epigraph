@@ -1,17 +1,20 @@
 //! Discover tables (from migration SQL files) and crates (from Cargo workspaces).
 
+use crate::cli::Roots;
 use crate::types::{CrateRef, TableRef};
 use anyhow::{Context, Result};
 use regex::Regex;
+use std::path::Path;
 use walkdir::WalkDir;
 
-/// Scan migration directories. `repo_dirs` is `[(repo_name, abs_dir, skip_subdirs)]`.
-pub fn scan_migrations(repo_dirs: &[(&str, &str, &[&str])]) -> Result<Vec<TableRef>> {
+/// Scan migration directories. `repo_dirs` is `[(repo_name, dir, skip_subdirs)]`.
+pub fn scan_migrations<D: AsRef<Path>>(repo_dirs: &[(&str, D, &[&str])]) -> Result<Vec<TableRef>> {
     let create_re =
         Regex::new(r"(?im)^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?(?:public\.)?(\w+)\s*\(")
             .expect("regex");
     let mut out = Vec::new();
     for (repo, dir, skips) in repo_dirs {
+        let dir = dir.as_ref();
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
@@ -45,10 +48,13 @@ pub fn scan_migrations(repo_dirs: &[(&str, &str, &[&str])]) -> Result<Vec<TableR
     Ok(out)
 }
 
-pub fn scan_crates(repo_dirs: &[(&str, &str)]) -> Result<Vec<CrateRef>> {
+pub fn scan_crates<D: AsRef<Path>>(repo_dirs: &[(&str, D)]) -> Result<Vec<CrateRef>> {
     let mut out = Vec::new();
     for (repo, dir) in repo_dirs {
-        for entry in std::fs::read_dir(dir)? {
+        let dir = dir.as_ref();
+        let entries =
+            std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?;
+        for entry in entries {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -66,19 +72,16 @@ pub fn scan_crates(repo_dirs: &[(&str, &str)]) -> Result<Vec<CrateRef>> {
     Ok(out)
 }
 
-pub fn run() -> Result<()> {
-    let tables = scan_migrations(&[
-        ("epigraph", "/home/jeremy/epigraph/migrations", &[]),
-        (
-            "episcience",
-            "/home/jeremy/episcience/migrations",
-            &["upstream"],
-        ),
-    ])?;
-    let crates = scan_crates(&[
-        ("epigraph", "/home/jeremy/epigraph/crates"),
-        ("episcience", "/home/jeremy/episcience/crates"),
-    ])?;
+/// Every table under the two checkouts' `migrations/` and every crate under
+/// their `crates/`, read from the roots given on the command line only.
+pub fn collect(roots: &Roots) -> Result<(Vec<TableRef>, Vec<CrateRef>)> {
+    let tables = scan_migrations(&roots.migration_dirs())?;
+    let crates = scan_crates(&roots.crate_dirs())?;
+    Ok((tables, crates))
+}
+
+pub fn run(roots: &Roots) -> Result<()> {
+    let (tables, crates) = collect(roots)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
