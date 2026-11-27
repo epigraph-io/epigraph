@@ -934,6 +934,50 @@ pub(crate) fn test_auth_with_scopes(scopes: &[&str]) -> AuthContext {
 }
 
 #[cfg(test)]
+mod delegated_ceiling_tests {
+    use super::*;
+
+    fn delegated(scopes: &[&str]) -> AuthContext {
+        AuthContext {
+            delegated_by: Some(uuid::Uuid::new_v4()),
+            ..test_auth_with_scopes(scopes)
+        }
+    }
+
+    /// A delegated run token minted before a scope was retired still carries
+    /// it; the ceiling check ignores it (it authorizes nothing) instead of
+    /// refusing the token. Every retired scope, including the three that were
+    /// never inside the ceiling.
+    #[test]
+    fn a_delegated_token_carrying_a_retired_scope_passes_the_ceiling() {
+        for retired in epigraph_auth::RETIRED_SCOPES {
+            let auth = delegated(&["claims:read", "claims:write", retired]);
+            let delegator = auth.delegated_by.expect("delegated");
+            assert!(
+                refuse_outside_ceiling(&auth, delegator, "/api/v1/claims").is_ok(),
+                "a delegated token carrying {retired} was refused"
+            );
+        }
+    }
+
+    /// Calibration: the ceiling still refuses a live scope outside it.
+    #[test]
+    fn a_delegated_token_carrying_a_live_scope_outside_the_ceiling_is_refused() {
+        let auth = delegated(&["claims:read", "claims:delete", "groups:write"]);
+        let delegator = auth.delegated_by.expect("delegated");
+        match refuse_outside_ceiling(&auth, delegator, "/api/v1/claims") {
+            Err(ApiError::Forbidden { reason }) => {
+                assert!(
+                    reason.ends_with("also carries groups:write"),
+                    "only the live scope is named, not the retired one: {reason}"
+                );
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod require_scope_tests {
     use super::*;
     use axum::extract::FromRequestParts;

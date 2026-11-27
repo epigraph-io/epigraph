@@ -39,9 +39,9 @@
 //! # What is accepted rather than gated
 //!
 //! FK `ON DELETE CASCADE` is a referential action and consults no policy. Five
-//! (parent, child) pairs reach a tier-A child from a parent the application may
-//! delete without an owner rule (`harvester_sources`, `experiment_entities`
-//! twice, `graph_clusters`, `graph_neighborhoods`; the last is reached from
+//! (parent, child) pairs reached a tier-A child from a parent the application
+//! may delete without an owner rule (a harvester table, dropped by migration
+//! 354, `experiment_entities` twice, `graph_clusters`, `graph_neighborhoods`; the last is reached from
 //! `claim_themes`' rebuild and the cluster-run deletes). All are
 //! materializations. `every_unscoped_fk_cascade_into_tier_a_is_listed` is the
 //! exact register. Node tables outside tier A keep 001's invoker edge cascade,
@@ -1522,141 +1522,9 @@ async fn a_non_privileged_session_cannot_reown_a_row_and_then_delete_it(pool: Pg
     assert_eq!(n, 1, "a privileged session re-owns as before");
 }
 
-async fn insert_harvester_source(pool: &PgPool) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO harvester_sources (id, content_hash, modality) VALUES ($1, $2, 'text')",
-    )
-    .bind(id)
-    .bind(id.as_bytes().to_vec())
-    .execute(pool)
-    .await
-    .expect("seed harvester source");
-    id
-}
-
-/// A fragment declared `('public', owner)`, written on the superuser pool (the
-/// only kind of session that may name a sentinel owner).
-async fn insert_public_fragment(pool: &PgPool, source: Uuid, owner: Uuid, text: &str) -> Uuid {
-    let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO harvester_fragments \
-             (id, source_id, content_hash, content_text, visibility, owner_group_id) \
-         VALUES ($1, $2, $3, $4, 'public', $5)",
-    )
-    .bind(id)
-    .bind(source)
-    .bind(id.as_bytes().to_vec())
-    .bind(text)
-    .bind(owner)
-    .execute(pool)
-    .await
-    .expect("seed a sentinel-owned fragment");
-    id
-}
-
-async fn fragment_tenancy(pool: &PgPool, id: Uuid) -> (Uuid, String) {
-    sqlx::query_as("SELECT owner_group_id, visibility::text FROM harvester_fragments WHERE id = $1")
-        .bind(id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or_else(|e| panic!("read fragment {id}: {e}"))
-}
-
-/// Section 9: an INSERT cannot do what section 7 forbids an UPDATE to do.
-///
-/// 089's fragment stamp is a maintenance-owned definer, so section 7's guard
-/// admits the re-own it performs. Before section 9 a bystander T, writable only
-/// on its own group, cited three sentinel-owned fragments from its own claims
-/// (one already cited by another author's world claim, one uncited, one on the
-/// seed sentinel cited from T's PRIVATE claim), came to own all three, deleted
-/// them, and the FK cascade removed the other author's provenance row. Now each
-/// provenance INSERT succeeds (calibration: the write itself is not refused),
-/// every fragment keeps its sentinel tenancy, T's DELETE removes nothing, and the
-/// other author's provenance survives. The same INSERT on the superuser pool
-/// still stamps, so the gate is scoped to the session and 089 is not off.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_provenance_insert_does_not_hand_a_session_a_world_fragment(pool: PgPool) {
-    const SEED: Uuid = Uuid::from_u128(0xdead);
-    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
-    let (t, t_group) = fixture::seed_agent_with_group(&pool, "bystander-t").await;
-    let world_claim = fixture::seed_public_claim(&pool, author, "another author's claim").await;
-    let t_public = seed_public_claim_owned_by(&pool, t, t_group, "t's public claim").await;
-    let t_private = fixture::seed_group_claim(&pool, t, t_group, "t's private claim").await;
-    let source = insert_harvester_source(&pool).await;
-    let cited = insert_public_fragment(&pool, source, WORLD, "cited by another author").await;
-    let uncited = insert_public_fragment(&pool, source, WORLD, "cited by nobody").await;
-    let seeded = insert_public_fragment(&pool, source, SEED, "seed-sentinel fragment").await;
-    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
-        .bind(world_claim)
-        .bind(cited)
-        .execute(&pool)
-        .await
-        .expect("the other author's provenance row");
-    assert_app_role_does_not_bypass(&pool).await;
-    let frags = [cited, uncited, seeded];
-
-    let p = pool.clone();
-    let (linked, deleted) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, &p, t).await;
-        let mut linked = 0;
-        for (claim, frag) in [(t_public, cited), (t_public, uncited), (t_private, seeded)] {
-            linked += sqlx::query(
-                "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
-            )
-            .bind(claim)
-            .bind(frag)
-            .execute(&mut *conn)
-            .await
-            .expect("T links a fragment to its own claim")
-            .rows_affected();
-        }
-        let deleted = sqlx::query("DELETE FROM harvester_fragments WHERE id = ANY($1)")
-            .bind(&frags[..])
-            .execute(&mut *conn)
-            .await
-            .expect("T's DELETE")
-            .rows_affected();
-        (conn, (linked, deleted))
-    })
-    .await;
-
-    assert_eq!(linked, 3, "calibration: each provenance INSERT landed");
-    for (frag, owner) in [(cited, WORLD), (uncited, WORLD), (seeded, SEED)] {
-        assert_eq!(
-            fragment_tenancy(&pool, frag).await,
-            (owner, "public".to_string()),
-            "fragment {frag}: a non-privileged provenance INSERT leaves its tenancy alone"
-        );
-    }
-    assert_eq!(deleted, 0, "T owns none of the fragments, so deletes none");
-    let others: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM harvester_claim_provenance WHERE claim_id = $1 AND fragment_id = $2",
-    )
-    .bind(world_claim)
-    .bind(cited)
-    .fetch_one(&pool)
-    .await
-    .expect("read provenance");
-    assert_eq!(others, 1, "the other author's provenance row survived");
-
-    // Privileged: the identical INSERT still stamps (089's own case).
-    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
-        .bind(t_private)
-        .bind(uncited)
-        .execute(&pool)
-        .await
-        .expect("superuser link");
-    assert_eq!(
-        fragment_tenancy(&pool, uncited).await,
-        (t_group, "group".to_string()),
-        "a privileged session's provenance INSERT still stamps the fragment"
-    );
-}
-
-// ===========================================================================
-// 3c. The privileged writers, on a NON-superuser maintenance member.
-// ===========================================================================
+// Section 9's test (`a_provenance_insert_does_not_hand_a_session_a_world_fragment`)
+// pinned 089's fragment stamp until migration 354 dropped it with the
+// harvester tables.
 
 /// Every row the round trip below can touch, keyed `(table, primary key)`,
 /// as `to_jsonb(row)`. `claims.updated_at` is the one column removed: 001's
@@ -1667,7 +1535,6 @@ async fn round_trip_snapshot(
     pool: &PgPool,
     claims: &[Uuid],
     edges: &[Uuid],
-    frags: &[Uuid],
 ) -> Vec<(String, String, serde_json::Value)> {
     sqlx::query_as(
         "SELECT 'claims', id::text, to_jsonb(t) - 'updated_at' FROM claims t \
@@ -1678,17 +1545,11 @@ async fn round_trip_snapshot(
            FROM claim_versions t WHERE claim_id = ANY($1) \
          UNION ALL SELECT 'mass_functions', id::text, to_jsonb(t) \
            FROM mass_functions t WHERE claim_id = ANY($1) \
-         UNION ALL SELECT 'harvester_claim_provenance', concat_ws(',', claim_id, fragment_id), \
-                          to_jsonb(t) \
-           FROM harvester_claim_provenance t WHERE claim_id = ANY($1) \
-         UNION ALL SELECT 'harvester_fragments', id::text, to_jsonb(t) \
-           FROM harvester_fragments t WHERE id = ANY($3) \
          UNION ALL SELECT 'edges', id::text, to_jsonb(t) FROM edges t WHERE id = ANY($2) \
          ORDER BY 1, 2",
     )
     .bind(claims)
     .bind(edges)
-    .bind(frags)
     .fetch_all(pool)
     .await
     .expect("round-trip snapshot")
@@ -1745,8 +1606,8 @@ async fn write_tenancy_shape(
 /// shapes and the privatization job's:
 ///
 /// * `reown-claims`: its `UPDATE claims SET owner_group_id` (the trigger
-///   carries it into `claim_frames`, `claim_versions`, `mass_functions`,
-///   `harvester_claim_provenance` and the fragment), then its keep-writer
+///   carries it into `claim_frames`, `claim_versions` and `mass_functions`),
+///   then its keep-writer
 ///   `write_tenancy` on `claim_versions`, and a `write_tenancy` that moves an
 ///   edge's owner AND co-owner;
 /// * `reown-reverse`: its `UPDATE claims ... FROM jsonb_to_recordset`, and the
@@ -1808,14 +1669,6 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
         let mut conn = pool.acquire().await.expect("acquire");
         store_bba(&mut conn, c1, bt, writer, None).await;
     }
-    let source = insert_harvester_source(&pool).await;
-    let frag = insert_public_fragment(&pool, source, WORLD, "a fragment of the claim").await;
-    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
-        .bind(c1)
-        .bind(frag)
-        .execute(&pool)
-        .await
-        .expect("provenance");
     let e_private = fixture::seed_edge(&pool, c1, c2).await;
     let e_public = fixture::seed_edge(&pool, c1, c3).await;
     let (e_owner, e_co): (Uuid, Option<Uuid>) =
@@ -1866,9 +1719,8 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
 
     let claims = [c1, c2, c3];
     let edges = [e_private, e_public];
-    let frags = [frag];
-    let before = round_trip_snapshot(&pool, &claims, &edges, &frags).await;
-    assert_eq!(before.len(), 10, "fixture rows: {before:#?}");
+    let before = round_trip_snapshot(&pool, &claims, &edges).await;
+    assert_eq!(before.len(), 8, "fixture rows: {before:#?}");
 
     let role = format!("w9_maint_member_{}", Uuid::new_v4().simple());
     for stmt in [
@@ -2029,7 +1881,7 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
         ],
         "every shape landed; the counts are what each is expected to move"
     );
-    let after = round_trip_snapshot(&pool, &claims, &edges, &frags).await;
+    let after = round_trip_snapshot(&pool, &claims, &edges).await;
     assert_eq!(
         after, before,
         "every touched row is back to its pre-image (bar claims.updated_at)"
@@ -2079,12 +1931,13 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     // `behavioral_executions_delete_owner` and `behavioral_executions_owner_immutable`.
     // 31 -> 32 (backlog 34864fb5): migration 246's `papers`, with
     // `papers_delete_owner` and `papers_owner_immutable`.
-    // 32 -> 33 (backlog f214b84e): migration 347's `harvester_enriched_concepts`,
-    // with `harvester_enriched_concepts_delete_owner` and
-    // `harvester_enriched_concepts_owner_immutable`.
+    // 32 -> 33 (backlog f214b84e): migration 347's harvester concepts table,
+    // with its delete policy and
+    // its owner guard.
+    // 33 -> 28 (backlog a6e3dba2): migration 354 drops the five harvester tables.
     assert_eq!(
         rows.len(),
-        33,
+        28,
         "the tier-A set changed size; decide its DELETE rule: {rows:?}"
     );
     let missing: Vec<&String> = rows
@@ -2125,8 +1978,9 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     // 30 -> 31 (backlog 88cf603b): migration 240's `behavioral_executions_delete_owner`.
     // 31 -> 32 (backlog 34864fb5): migration 246's `papers_delete_owner`.
     // 32 -> 33 (backlog f214b84e): migration 347's
-    // `harvester_enriched_concepts_delete_owner`.
-    assert_eq!(quals.len(), 33, "{quals:?}");
+    // its delete policy.
+    // 33 -> 28 (backlog a6e3dba2): migration 354 drops the five harvester tables.
+    assert_eq!(quals.len(), 28, "{quals:?}");
     for (table, qual) in &quals {
         assert!(
             qual.contains("owner_group_id = ANY") && qual.contains("epigraph_writable_groups()"),
@@ -2270,13 +2124,13 @@ async fn a_reader_cannot_delete_its_groups_sealed_rows(pool: PgPool) {
 async fn every_unscoped_fk_cascade_into_tier_a_is_listed(pool: PgPool) {
     // Migration 118 section 6 closed four former entries by revoking the
     // application role's DELETE on the parent (graph_neighborhoods) or every
-    // write on it (experiment_entities, harvester_sources):
+    // write on it (experiment_entities, the harvester sources table):
     // experiment_entities -> experiment_entity_mentions / experiment_triples,
     // graph_neighborhoods -> claim_neighborhood_membership, and
-    // harvester_sources -> harvester_fragments. Only the cluster
+    // the harvester sources-to-fragments cascade. Only the cluster
     // materialization remains reachable. (Since migration 173
-    // `harvester_sources` also carries 115's restrictive DELETE policy, and
-    // `harvester_fragments -> harvester_audit_reports` is a cascade between
+    // the harvester sources table also carries 115's restrictive DELETE policy, and
+    // the fragments-to-audit-reports cascade ran between
     // two tables that both do, so neither pair can appear here.)
     //
     // Migration 210 (Atlas W2) adds `claim_themes -> atlas_map_levels`: a level
@@ -2428,8 +2282,8 @@ async fn the_115_functions_are_maintenance_owned_definers(pool: PgPool) {
         // the administrative repair now.
         ("epigraph_dedup_move_bbas(uuid, uuid, uuid[])", false),
         ("epigraph_cascade_delete_node_edges()", false),
-        // Redefined by 115 (section 9); CREATE OR REPLACE kept 089's owner and ACL.
-        ("epigraph_inherit_fragment_tenancy_stmt()", false),
+        // 115 also redefined 089's fragment stamp (section 9); migration 354
+        // dropped it with the harvester tables.
     ] {
         let (secdef, owner, public_exec, app): (bool, String, bool, bool) = sqlx::query_as(
             "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, \

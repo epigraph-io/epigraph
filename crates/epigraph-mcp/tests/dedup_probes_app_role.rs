@@ -198,7 +198,7 @@ async fn the_novelty_gate_sees_the_members_own_private_neighbour(pool: PgPool) {
     let server = app_server(&pool).await;
 
     let member_viewer = viewer_of(&pool, member).await;
-    let (mine, _) = novelty_gate::decide(
+    let mine = novelty_gate::decide(
         &server,
         &member_viewer,
         &embedder,
@@ -207,7 +207,8 @@ async fn the_novelty_gate_sees_the_members_own_private_neighbour(pool: PgPool) {
         &[],
     )
     .await
-    .expect("the mock embedder works");
+    .expect("the mock embedder works")
+    .decision;
     assert_eq!(
         mine,
         GateDecision::ReturnExisting(neighbour),
@@ -219,7 +220,7 @@ async fn the_novelty_gate_sees_the_members_own_private_neighbour(pool: PgPool) {
         .expect("the member reads its own neighbour back");
     assert_eq!(read_back.id.as_uuid(), neighbour);
 
-    let (theirs, _) = novelty_gate::decide(
+    let theirs = novelty_gate::decide(
         &server,
         &viewer_of(&pool, stranger).await,
         &embedder,
@@ -228,7 +229,8 @@ async fn the_novelty_gate_sees_the_members_own_private_neighbour(pool: PgPool) {
         &[],
     )
     .await
-    .expect("the mock embedder works");
+    .expect("the mock embedder works")
+    .decision;
     assert_eq!(
         theirs,
         GateDecision::Insert,

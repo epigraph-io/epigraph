@@ -130,6 +130,14 @@ const DYNAMIC_READERS: &[DynamicReader] = &[
               pool's); their calls pass the file's `*_ENV` constants",
     },
     DynamicReader {
+        file: "crates/epigraph-api/src/state.rs",
+        lookups: &["lookup"],
+        computed: 1,
+        why: "`AppState::default_jwt_config`'s `std::env::var` closure passed to \
+              `jwt_config_from_lookup`, whose `lookup` calls pass literals and \
+              `epigraph_auth::JWT_SIGNING_KEY_VAR`",
+    },
+    DynamicReader {
         file: "crates/epigraph-cli/src/atlas_nightly/offbox.rs",
         lookups: &[],
         computed: 1,

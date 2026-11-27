@@ -8,7 +8,7 @@
 //!   under another key), although the binary now resolves it once per distinct
 //!   author of a batch. The batch size is 3 so the walk spans many batches and
 //!   authors straddle batch boundaries.
-//! * the 17 claim-derived tables (a row seeded in EVERY one, each asserted
+//! * the 16 claim-derived tables (17 before migration 354; a row seeded in EVERY one, each asserted
 //!   present before the comparison): every row takes its claim's tenancy, except a
 //!   WRITER-OWNED row (kept, the claim being public) and a PINNED evidence row
 //!   (owner kept, visibility `group`): 110/114's rules, unchanged.
@@ -192,7 +192,7 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
     .expect("pin");
     fixture::seed_reasoning_trace(&pool, claims[3], "deductive").await;
     // Two more derived tables with rows (review C8: the comparison below spans
-    // all 17, and a table with no rows proves nothing about its arm).
+    // all 16, and a table with no rows proves nothing about its arm).
     exec(
         &pool,
         &format!(
@@ -211,7 +211,7 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
         ),
     )
     .await;
-    // Delta review DIS-D9: a row in EVERY one of the 17 derived tables, so each
+    // Delta review DIS-D9: a row in EVERY one of the 16 derived tables, so each
     // arm of 122 section 8's `derived` array is compared on at least one row
     // (a fresh database had no frame, so the mass_functions seed below used to
     // insert nothing, and 13 of the 17 tables were compared empty). Owner and
@@ -283,17 +283,6 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("neighborhood");
-    let fragment: Uuid = sqlx::query_scalar(
-        "WITH s AS (INSERT INTO harvester_sources (content_hash, modality) \
-                    VALUES ('\\x01'::bytea, 'text') RETURNING id) \
-         INSERT INTO harvester_fragments (source_id, content_hash, content_text, \
-                                          owner_group_id, visibility) \
-         SELECT s.id, '\\x02'::bytea, 'equivalence fragment', $1, 'public' FROM s RETURNING id",
-    )
-    .bind(WORLD)
-    .fetch_one(&pool)
-    .await
-    .expect("fragment");
     for (i, sql) in [
         "INSERT INTO triples (claim_id, subject_id, predicate, confidence, extractor, \
                               object_literal) VALUES ($1, $2, 'relates', 0.5, 'equiv', 'x')",
@@ -306,7 +295,6 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
                                              bayesian_posterior, kl_divergence) \
          VALUES ($1, $3, 0.5, 0.5, 0.0)",
         "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $3)",
-        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $4)",
         "INSERT INTO experiment_triples (claim_id, subject_entity_id, predicate, \
                                          object_entity_id) VALUES ($1, $5, 'relates', $6)",
         "INSERT INTO experiment_entity_mentions (claim_id, entity_id, surface_form) \
@@ -329,7 +317,9 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
             .bind(claims[10 + i])
             .bind(entity)
             .bind(frame)
-            .bind(fragment)
+            // $4 was the provenance table's fragment, dropped by migration 354;
+            // kept so the later placeholders keep their numbers.
+            .bind(Uuid::nil())
             .bind(xs)
             .bind(xo)
             .bind(run)
@@ -486,7 +476,7 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
     assert_eq!(owner_of(live).await, human_group);
     assert_eq!(owner_of(retired).await, human_group);
 
-    // ---- derived rows: the trigger's rules, over ALL 17 claim-derived tables
+    // ---- derived rows: the trigger's rules, over ALL 16 claim-derived tables
     // (review C8: this compared three while the doc said seventeen). A
     // writer-owned row (114) and a pinned evidence row (110) are the stated
     // exceptions, checked by name below.
@@ -504,7 +494,6 @@ async fn the_set_based_backfill_matches_the_per_row_definitions(pool: PgPool) {
         ("ds_combined_beliefs", "TRUE"),
         ("ds_bayesian_divergence", "TRUE"),
         ("claim_frames", "TRUE"),
-        ("harvester_claim_provenance", "TRUE"),
         ("challenges", "TRUE"),
         ("experiment_triples", "TRUE"),
         ("experiment_entity_mentions", "TRUE"),

@@ -9517,6 +9517,99 @@ impl ClaimRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// [`store_embedding_if_unsealed`](Self::store_embedding_if_unsealed) that
+    /// also refuses a claim which **already carries** a vector: it fills a
+    /// missing `claims.embedding` and never overwrites one.
+    ///
+    /// For the `embedding_generation` job (backlog 1b83b2a1). The job reads the
+    /// claim, calls the provider, then stores; an inline write (the submission
+    /// path's own post-commit embed, or a re-embed) can land inside that round
+    /// trip, and the job's vector must not replace it. The sibling stays as it
+    /// is because its other callers re-embed on purpose.
+    ///
+    /// Same lock-then-guarded-`UPDATE` shape as the sibling, for the reason its
+    /// doc gives: the `FOR UPDATE` in its own statement makes the `UPDATE`'s
+    /// snapshot include a seal, or an inline vector, committed while this call
+    /// waited on the row. The `c.embedding IS NULL` guard is read under that
+    /// lock, so a vector committed before the lock is granted is seen.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the vector was written. `false` covers the sibling's four
+    /// cases plus "the claim already has a vector"; a caller that must tell
+    /// that case apart reads [`claim_has_embedding`](Self::claim_has_embedding)
+    /// afterwards.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, embedding_pgvector))]
+    pub async fn store_embedding_if_unsealed_and_missing(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+        embedding_pgvector: &str,
+    ) -> Result<bool, DbError> {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+
+        // The lock, as its own statement (see `store_embedding_if_unsealed`).
+        sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        let sql = viewer.splice_write(
+            "UPDATE claims AS c SET embedding = $2::vector \
+              WHERE c.id = $1 \
+                AND c.embedding IS NULL \
+                AND COALESCE(c.is_current, true) = true \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = c.id \
+                ) \
+                /* {WRITABLE:c} */",
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(embedding_pgvector);
+        // Conditional: a `Bypass` viewer renders `" "` and has no `$3`.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let result = q.execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Whether the claim `viewer` reads as `id` carries a `claims.embedding`
+    /// vector. `false` for no such claim, a claim the viewer cannot read, and a
+    /// claim whose vector is `NULL` (a sealed claim's always is).
+    ///
+    /// The `embedding_generation` job asks this before calling the provider,
+    /// so a claim that already has a vector costs no provider call (backlog
+    /// 1b83b2a1), and again after
+    /// [`store_embedding_if_unsealed_and_missing`](Self::store_embedding_if_unsealed_and_missing)
+    /// wrote nothing, to tell a vector that landed during the provider call
+    /// from a seal or a supersede.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn claim_has_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS (SELECT 1 FROM claims \
+                             WHERE id = $1 AND embedding IS NOT NULL \
+                               /* {VISIBILITY:claims} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
     /// Why [`store_embedding_if_unsealed`](Self::store_embedding_if_unsealed)
     /// wrote nothing, for a caller that must answer with a status rather than
     /// skip the claim: `(is_current, sealed)` of the row as `viewer` reads it,

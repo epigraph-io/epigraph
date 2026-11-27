@@ -10,8 +10,13 @@
 //! the backlog plan's literal `<->`), and the closest neighbor's distance
 //! decides:
 //!
-//! - `dist < novelty_threshold` (default `0.05`) — semantic duplicate.
-//!   Suppress the insert; return the existing claim's id.
+//! - `dist < novelty_threshold` (default `0.05`) — semantic duplicate. No new
+//!   claim row: the submission's evidence CORROBORATES the existing claim
+//!   ([`corroborate`], backlog 4f4c6175) and its id is returned. When the
+//!   caller may not attach to that claim, or it sits in a different audience
+//!   than the caller asked to write to, the caller's own claim is inserted
+//!   instead (backlogs 5578f693, fef24216), flagged `near-duplicate` like the
+//!   next band when its readers may read the match ([`neighbour_covers_write`]).
 //! - `dist < 0.15` — near-duplicate. Insert normally, but flag it with a
 //!   `near-duplicate` label so it is discoverable/reviewable. The 0.15 band
 //!   is fixed, NOT the tunable `novelty_threshold`.
@@ -36,15 +41,17 @@
 //!    it did not hold: it has to be re-asserted at every call site.
 //!
 //!    A labelled status claim gets the SAME semantics as
-//!    `novelty_threshold = 0.0`: suppression off, 0.15 soft-flag still on.
-//!    Suppression is what loses data; the flag is only discoverability.
+//!    `novelty_threshold = 0.0`: deduplication off, 0.15 soft-flag still on.
+//!    Deduplication is what loses the series (a run that only corroborates
+//!    the prior run's claim is not a claim of its own); the flag is only
+//!    discoverability.
 //!
 //! The bypass sits in [`decide`], the one function every gated write path
 //! (`submit_claim`, `batch_submit_claims` through it, `memorize`) calls, and
 //! `labels` is a required argument there. No HTTP claim-write route runs this
 //! gate, so there is nothing to bypass on that transport.
 
-use epigraph_db::{ClaimRepository, NearestClaimHit};
+use epigraph_db::{ClaimRepository, EvidenceRepository, NearestClaimHit};
 use uuid::Uuid;
 
 use crate::errors::{internal_error, McpError};
@@ -134,8 +141,9 @@ pub fn effective_threshold(novelty_threshold: f64, labels: &[String]) -> f64 {
 /// Outcome of the gate decision, independent of I/O — see [`classify`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
-    /// `dist < novelty_threshold`: suppress the insert, return the existing
-    /// claim's id unchanged.
+    /// `dist < novelty_threshold`: no new claim; the submission corroborates
+    /// the existing claim ([`corroborate`]), or is inserted flagged when it may
+    /// not.
     ReturnExisting(Uuid),
     /// `novelty_threshold <= dist < NEAR_DUPLICATE_BAND`: insert normally,
     /// but append the `near-duplicate` label.
@@ -160,14 +168,47 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
     }
 }
 
-/// I/O wrapper: embed `content`, look up its nearest `is_current` claims,
-/// and classify. Returns `None` (never gates) if embedding generation
-/// fails — the gate is best-effort and must never block a write the way
-/// post-insert embedding is best-effort today (see CLAUDE.md embedding
-/// policy). Callers that get `None` should fall back to the pre-gate
-/// embed-after-insert behavior (there is no vector to reuse).
+/// Why [`decide`] could not run the gate (backlog 8482b8fc).
 ///
-/// On `Some`, the returned `String` is the ALREADY-GENERATED embedding,
+/// The gate fails OPEN: the caller inserts exactly as if the gate did not
+/// exist, so an embedder or database outage never blocks a write. It used to
+/// fail open SILENTLY, so a caller could not tell a novel claim from one that
+/// was never checked. Every caller now reports this cause on its response as
+/// `gate_skipped: {reason}` ([`crate::types::GateSkipped`]), and [`decide`]
+/// logs it with the stable `novelty gate skipped` prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateSkip {
+    /// The embedder could not produce a vector for the content (no provider
+    /// configured, or the provider failed).
+    EmbedderUnavailable,
+    /// The caller's stamped read for the neighbour lookup could not be opened.
+    ReadUnavailable,
+    /// The nearest-neighbour query failed.
+    NearestQueryFailed,
+}
+
+/// What [`decide`] answers when the gate ran.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateVerdict {
+    /// The decision.
+    pub decision: GateDecision,
+    /// The ALREADY-GENERATED embedding, pgvector-formatted (see [`decide`]).
+    pub embedding: String,
+    /// The cosine distance to the nearest readable neighbour, `None` when there
+    /// is none.
+    pub nearest_distance: Option<f64>,
+}
+
+/// I/O wrapper: embed `content`, look up its nearest `is_current` claims,
+/// and classify. Returns `Err(GateSkip)` (never gates) if embedding
+/// generation or the neighbour read fails — the gate is best-effort and must
+/// never block a write the way post-insert embedding is best-effort today
+/// (see CLAUDE.md embedding policy). Callers that get `Err` fall back to the
+/// pre-gate embed-after-insert behavior (there is no vector to reuse) and
+/// report the [`GateSkip`] on their response.
+///
+/// On `Ok`, [`GateVerdict::embedding`] is the ALREADY-GENERATED embedding,
 /// pgvector-formatted, so the caller can hand it straight to
 /// `claim_helper::embed_claim_author_stamped`'s `pending_embedding` parameter
 /// instead of paying for a second embedding call. (Storing it "directly" through
@@ -203,9 +244,12 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// the caller's groups; the session's policy dropped them.
 ///
 /// A server with no `ScopedPool` has its read refused, and the gate then
-/// answers `None` (no gate), as on any other read failure. A deployed server
-/// always has one, and `exact_resubmit_probe`, which runs first, refuses loudly
-/// on a server without it.
+/// answers [`GateSkip::ReadUnavailable`] (no gate), as on any other read
+/// failure. A deployed server always has one, and `exact_resubmit_probe`,
+/// which runs first, refuses loudly on a server without it.
+///
+/// # Errors
+/// The [`GateSkip`] naming why the gate did not run.
 pub async fn decide(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -213,29 +257,49 @@ pub async fn decide(
     content: &str,
     novelty_threshold: f64,
     labels: &[String],
-) -> Option<(GateDecision, String)> {
-    let vector = embedder.generate(content).await.ok()?;
+) -> Result<GateVerdict, GateSkip> {
+    let vector = match embedder.generate(content).await {
+        Ok(vector) => vector,
+        Err(e) => {
+            tracing::warn!(
+                reason = "embedder_unavailable",
+                "novelty gate skipped: the embedder produced no vector; inserting unchecked: {e}"
+            );
+            return Err(GateSkip::EmbedderUnavailable);
+        }
+    };
     let pgvec = epigraph_db::pgvector_literal(&vector);
     let mut read = match server.read_as(viewer, "novelty_gate").await {
         Ok(read) => read,
         Err(e) => {
-            tracing::warn!("novelty gate: could not open the caller's read: {e:?}");
-            return None;
+            tracing::warn!(
+                reason = "read_unavailable",
+                "novelty gate skipped: could not open the caller's read; inserting unchecked: \
+                 {e:?}"
+            );
+            return Err(GateSkip::ReadUnavailable);
         }
     };
     let nearest =
         match ClaimRepository::nearest_by_embedding(&mut read, viewer, &pgvec, NEAREST_K).await {
             Ok(hits) => hits,
             Err(e) => {
-                tracing::warn!("novelty gate: nearest_by_embedding failed: {e}");
-                return None;
+                tracing::warn!(
+                    reason = "nearest_query_failed",
+                    "novelty gate skipped: nearest_by_embedding failed; inserting unchecked: {e}"
+                );
+                return Err(GateSkip::NearestQueryFailed);
             }
         };
     if let Err(e) = read.commit().await {
         tracing::warn!("novelty gate: closing the caller's read failed: {e}");
     }
     let threshold = effective_threshold(novelty_threshold, labels);
-    Some((classify(&nearest, threshold), pgvec))
+    Ok(GateVerdict {
+        decision: classify(&nearest, threshold),
+        embedding: pgvec,
+        nearest_distance: nearest.first().map(|hit| hit.distance),
+    })
 }
 
 /// `true` when `agent_id` already authored a claim with `content_hash` that
@@ -296,6 +360,348 @@ pub async fn read_back_existing(
     })?;
     read.commit().await.map_err(internal_error)?;
     Ok(existing)
+}
+
+/// [`crate::types::Corroboration::Refused`]'s reason when the caller cannot
+/// write the matched claim's group and the claim is not one it may attach to
+/// as a non-owner (a public claim, migration 114).
+pub const REFUSED_NOT_WRITABLE: &str = "claim not writable by caller";
+
+/// [`crate::types::Corroboration::Refused`]'s reason when the matched claim's
+/// audience is not the one this write asked for (backlog fef24216).
+pub const REFUSED_OTHER_SCOPE: &str = "claim visibility differs from this write's";
+
+/// [`crate::types::Corroboration::Refused`]'s reason when the matched claim is
+/// a promoted hypothesis whose evidence frame (`research_validity`) is missing
+/// or not binary, so no evidence can be filed on it
+/// (`epigraph_engine::promotion::promoted_hypothesis_filing_frame`).
+pub const REFUSED_NO_FILING_FRAME: &str =
+    "claim cannot take this evidence: its evidence frame is missing or not binary";
+
+/// The note on a corroboration whose evidence body this caller's group had
+/// already attached to the claim.
+pub const ALREADY_ATTACHED_NOTE: &str =
+    "this evidence was already attached to the claim by your group; nothing new was written";
+
+/// One submission's evidence, built for the existing claim
+/// [`GateDecision::ReturnExisting`] named.
+pub struct CorroboratingEvidence<'a> {
+    /// The signed evidence row, its `claim_id` the existing claim.
+    pub evidence: &'a epigraph_core::Evidence,
+    /// The source identity stored in `evidence.source_url`.
+    pub source_url: Option<&'a str>,
+    /// The submission's confidence (the BBA's strength).
+    pub strength: f64,
+    /// The calibration key of the evidence type (`empirical`, `testimony`, ..).
+    pub evidence_type: &'a str,
+    /// Where the submission asked to be written.
+    pub tenancy: &'a epigraph_db::ResolvedWriteDecl,
+    /// The cosine distance the gate measured, recorded on the AUTHORED edge.
+    pub distance: Option<f64>,
+    /// The tool, for the AUTHORED edge and the logs.
+    pub tool: &'static str,
+}
+
+/// What [`corroborate`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorroborationOutcome {
+    /// The evidence row `evidence_id` was attached, its BBA combined, and the
+    /// AUTHORED edge written. `None`: the caller's group had already attached
+    /// the same evidence body to this claim, and nothing was written.
+    Attached { evidence_id: Option<Uuid> },
+    /// Nothing was written; the caller inserts its own claim. `reason` is
+    /// [`REFUSED_NOT_WRITABLE`], [`REFUSED_OTHER_SCOPE`] or
+    /// [`REFUSED_NO_FILING_FRAME`].
+    /// `flag_near_duplicate` is whether that claim
+    /// may carry the `near-duplicate` label ([`neighbour_covers_write`]).
+    Refused {
+        reason: &'static str,
+        flag_near_duplicate: bool,
+    },
+}
+
+impl CorroborationOutcome {
+    /// The response block for this outcome on `existing_id`.
+    #[must_use]
+    pub fn report(self, existing_id: Uuid) -> crate::types::Corroboration {
+        match self {
+            Self::Attached { evidence_id } => crate::types::Corroboration::Attached {
+                claim_id: existing_id.to_string(),
+                evidence_id: evidence_id.map(|e| e.to_string()),
+                note: evidence_id.is_none().then_some(ALREADY_ATTACHED_NOTE),
+            },
+            Self::Refused { reason, .. } => crate::types::Corroboration::Refused {
+                refused: reason,
+                nearest_claim_id: existing_id.to_string(),
+            },
+        }
+    }
+
+    /// Whether the caller's own claim, inserted after a refusal, is labelled
+    /// `near-duplicate`. Always false for an attachment (nothing is inserted).
+    #[must_use]
+    pub fn flags_near_duplicate(self) -> bool {
+        matches!(
+            self,
+            Self::Refused {
+                flag_near_duplicate: true,
+                ..
+            }
+        )
+    }
+}
+
+/// Whether every reader of the claim this write inserts can also read the
+/// matched claim, so that a `near-duplicate` label on the inserted claim tells
+/// its readers nothing they could not see for themselves.
+///
+/// The label is persisted on the caller's claim, so it is read by that claim's
+/// whole audience. When the write is wider than the claim the gate matched (a
+/// PUBLIC write next to a team or private claim, or a team write next to
+/// another group's claim), the label would tell that audience that some claim
+/// they may not read lies within the novelty threshold of this one, which the
+/// gate used to keep to itself (it suppressed the write). A PRIVATE write is
+/// read only within the author's home group and stays labelled, as backlog
+/// 5578f693 requires of a reader's own claim. `claim` is the matched claim's
+/// `(visibility, owner_group_id)` as the caller reads it, `None` when it could
+/// not be read.
+#[must_use]
+pub fn neighbour_covers_write(
+    tenancy: &epigraph_db::ResolvedWriteDecl,
+    claim: Option<(&str, Uuid)>,
+) -> bool {
+    if tenancy.resolved == "private" {
+        return true;
+    }
+    match claim {
+        Some(("public", _)) => true,
+        Some((_, owner)) => {
+            tenancy.resolved != "public" && tenancy.decl.owner_group_bind() == Some(owner)
+        }
+        None => false,
+    }
+}
+
+/// Attach a duplicate submission's evidence to the existing claim the gate
+/// matched, instead of dropping it (backlog 4f4c6175).
+///
+/// A second agent asserting what a first already asserted is independent
+/// corroboration, the signal a Dempster-Shafer belief is built to count. The
+/// gate used to suppress the submission entirely: the caller got the existing
+/// id and nothing of its own was recorded. Now, on ONE transaction stamped
+/// from `author`:
+///
+/// 1. the caller's evidence row is written on the existing claim (as the
+///    caller's group's row when the claim is a public claim it does not own,
+///    migration 114);
+/// 2. its BBA is combined into the claim's cached belief exactly as
+///    `update_with_evidence` combines one
+///    (`tools::claims::wire_attached_evidence_in_tx`), WITHOUT seeding the
+///    claim's authored `truth_value` as a BBA: the caller is not its author;
+/// 3. an `AUTHORED` edge from the caller to the claim records the event
+///    (`was_created: false`, `corroboration: true`, the measured `distance`).
+///
+/// The claim ROW (`truth_value`, `labels`, `content`) is never written.
+///
+/// # When nothing is written ([`CorroborationOutcome::Refused`])
+///
+/// * The caller can READ the claim but may not attach to it: its group is not
+///   one the caller writes, and it is not public (backlog 5578f693). Decided
+///   before any write; a row-security refusal of the evidence INSERT (a public
+///   claim, but no writable home group to own the attachment) is caught as
+///   the same refusal. The caller then inserts its own claim.
+/// * The claim's audience differs from the one the caller asked to write to
+///   (backlog fef24216). An attachment takes the CLAIM's audience: a non-owner's
+///   evidence on a public claim is public (migration 114), and a BBA on a public
+///   claim folds into the public cache when its evidence is public
+///   (`epigraph_engine::derivation_scope`). A private or team submission
+///   attached to a public claim would therefore publish its evidence body and
+///   move the public belief from a source its writer had kept narrow; a public
+///   one attached to a team claim would vanish from everyone outside the team.
+///   So a corroboration is written only into the audience the caller asked for
+///   (both public, or the same owning group); otherwise the caller's own claim
+///   is inserted where it asked. This is a rule about where a write lands, not
+///   a second belief filter: what the cache folds stays the derivation-scope
+///   filter's decision.
+/// * The claim is a promoted hypothesis whose evidence frame is missing or not
+///   binary, so it can take no evidence from anyone. Checked before any write.
+///
+/// The caller's own claim is labelled `near-duplicate` only when its readers
+/// can read the matched claim too ([`neighbour_covers_write`]); otherwise the
+/// label would disclose a claim they may not see.
+///
+/// # Errors
+/// An internal error for a failed read or write other than those refusals, or
+/// the designed DS-wiring failure text; the transaction is dropped, so nothing
+/// is written.
+pub async fn corroborate(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    author: crate::write_identity::WriteIdentity,
+    existing_id: Uuid,
+    ev: CorroboratingEvidence<'_>,
+) -> Result<CorroborationOutcome, McpError> {
+    let mut tx = crate::claim_helper::begin_author_stamped_tx_for(
+        server,
+        author,
+        ev.tool,
+        ev.tenancy.operator_grant.as_ref(),
+    )
+    .await?;
+    let granted =
+        crate::claim_helper::write_viewer(server, viewer, author.agent_id(), ev.tenancy).await?;
+    let viewer = granted.as_ref().unwrap_or(viewer);
+
+    // The claim's audience, as the caller reads it on THIS stamped transaction.
+    let Some((_, claim_visibility, claim_owner)) =
+        ClaimRepository::tenancy_of_conn(&mut tx, viewer, &[existing_id])
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .next()
+    else {
+        // Vanished (or narrowed) since the gate read it: there is nothing the
+        // caller may attach to.
+        return Ok(CorroborationOutcome::Refused {
+            reason: REFUSED_NOT_WRITABLE,
+            flag_near_duplicate: neighbour_covers_write(ev.tenancy, None),
+        });
+    };
+    // Should the caller's own claim, if it is inserted instead, carry the
+    // `near-duplicate` label? Only when its readers can read this claim too.
+    let flag_near_duplicate =
+        neighbour_covers_write(ev.tenancy, Some((claim_visibility.as_str(), claim_owner)));
+
+    // May the caller attach at all? A writer of the claim's group, or a
+    // non-owner of a PUBLIC claim (migration 114). Asked of the session itself.
+    let writes_claim_group =
+        epigraph_db::ClaimRepository::claims_not_writable_on_session(&mut tx, &[existing_id])
+            .await
+            .map_err(internal_error)?
+            .is_empty();
+    let foreign_public =
+        epigraph_db::repos::foreign_attach::is_foreign_public_claim(&mut tx, existing_id)
+            .await
+            .map_err(internal_error)?;
+    if !writes_claim_group && !foreign_public {
+        return Ok(CorroborationOutcome::Refused {
+            reason: REFUSED_NOT_WRITABLE,
+            flag_near_duplicate,
+        });
+    }
+
+    // Into the audience the caller asked for, and no other.
+    let same_scope = match ev.tenancy.decl.visibility_bind() {
+        Some("public") => claim_visibility == "public",
+        Some(_) => {
+            claim_visibility != "public" && ev.tenancy.decl.owner_group_bind() == Some(claim_owner)
+        }
+        None => false,
+    };
+    if !same_scope {
+        return Ok(CorroborationOutcome::Refused {
+            reason: REFUSED_OTHER_SCOPE,
+            flag_near_duplicate,
+        });
+    }
+
+    // Can the matched claim take evidence at all? A promoted hypothesis files
+    // it on `research_validity`, and a missing or non-binary frame refuses
+    // every attachment (`tools::claims::wire_attached_evidence_in_tx`). That
+    // refusal is a fact about the MATCHED claim, which the caller never named:
+    // failing the caller's submission on it would lose a write that was a
+    // successful dedup before corroboration existed. So it is decided here,
+    // before any write, and the caller's own claim is inserted instead. Any
+    // other failure (a read or write error) still propagates: a retry may
+    // corroborate, and a transient error must not leave a duplicate behind.
+    match epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut tx, viewer, existing_id)
+        .await
+    {
+        Ok(_) => {}
+        Err(
+            e @ (epigraph_db::DbError::NotFound { .. } | epigraph_db::DbError::InvalidData { .. }),
+        ) => {
+            tracing::warn!(
+                claim_id = %existing_id,
+                tool = ev.tool,
+                "novelty gate corroboration refused: the matched claim cannot take this \
+                 evidence; inserting the caller's own claim instead: {e}"
+            );
+            return Ok(CorroborationOutcome::Refused {
+                reason: REFUSED_NO_FILING_FRAME,
+                flag_near_duplicate,
+            });
+        }
+        Err(e) => return Err(internal_error(e)),
+    }
+
+    let edge_key = server.edge_signing_key().await?;
+    match EvidenceRepository::create_with_source_url(
+        &mut *tx,
+        ev.evidence,
+        ev.source_url,
+        epigraph_db::EvidenceEdge::supports(Some(edge_key)),
+    )
+    .await
+    {
+        Ok(_) => {}
+        // A public claim, but no writable home group to own the attachment.
+        Err(e) if crate::tools::claims::refused_by_row_security_on(&e, "evidence") => {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                claim_id = %existing_id,
+                tool = ev.tool,
+                "novelty gate corroboration refused by row security; inserting the caller's \
+                 own claim instead: {e}"
+            );
+            return Ok(CorroborationOutcome::Refused {
+                reason: REFUSED_NOT_WRITABLE,
+                flag_near_duplicate,
+            });
+        }
+        // The caller's group already attached this body to this claim (the
+        // per-owner evidence de-duplication, migration 171). Nothing is new:
+        // no BBA, no edge.
+        Err(epigraph_db::DbError::DuplicateKey { .. }) => {
+            return Ok(CorroborationOutcome::Attached { evidence_id: None });
+        }
+        Err(e) => return Err(internal_error(e)),
+    }
+    let evidence_id = ev.evidence.id.as_uuid();
+    crate::tools::claims::wire_attached_evidence_in_tx(
+        &mut tx,
+        viewer,
+        existing_id,
+        author.agent_id(),
+        evidence_id,
+        ev.strength,
+        true,
+        ev.evidence_type,
+        /* seed_truth */ false,
+        ev.tool,
+    )
+    .await?;
+    crate::claim_helper::emit_verb_edge_best_effort(
+        &mut tx,
+        author.agent_id(),
+        "agent",
+        existing_id,
+        "claim",
+        "AUTHORED",
+        Some(serde_json::json!({
+            "tool": ev.tool,
+            "was_created": false,
+            "corroboration": true,
+            "distance": ev.distance,
+        })),
+        ev.tool,
+        Some(edge_key),
+    )
+    .await?;
+    tx.commit().await.map_err(internal_error)?;
+    Ok(CorroborationOutcome::Attached {
+        evidence_id: Some(evidence_id),
+    })
 }
 
 #[cfg(test)]
@@ -474,7 +880,7 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(
+        let decision = decide(
             &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
@@ -485,7 +891,8 @@ mod tests {
             &[],
         )
         .await
-        .expect("decide must succeed with a working mock embedder");
+        .expect("decide must succeed with a working mock embedder")
+        .decision;
 
         assert_eq!(
             decision,
@@ -525,7 +932,7 @@ mod tests {
         .await
         .expect("seed neighbor claim");
 
-        let (decision, _pgvec) = decide(
+        let decision = decide(
             &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
@@ -536,7 +943,8 @@ mod tests {
             &[],
         )
         .await
-        .expect("decide must succeed with a working mock embedder");
+        .expect("decide must succeed with a working mock embedder")
+        .decision;
 
         assert_eq!(
             decision,
@@ -553,7 +961,7 @@ mod tests {
     async fn decide_inserts_unflagged_when_no_neighbors_exist(pool: sqlx::PgPool) {
         let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
 
-        let (decision, _pgvec) = decide(
+        let decision = decide(
             &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
@@ -564,9 +972,28 @@ mod tests {
             &[],
         )
         .await
-        .expect("decide must succeed with a working mock embedder");
+        .expect("decide must succeed with a working mock embedder")
+        .decision;
 
         assert_eq!(decision, GateDecision::Insert);
+    }
+
+    /// Each [`GateSkip`] serializes to the stable snake_case `reason` the
+    /// responses carry (backlog 8482b8fc): callers match on these strings.
+    #[test]
+    fn every_gate_skip_serializes_to_its_stable_reason() {
+        for (skip, reason) in [
+            (GateSkip::EmbedderUnavailable, "embedder_unavailable"),
+            (GateSkip::ReadUnavailable, "read_unavailable"),
+            (GateSkip::NearestQueryFailed, "nearest_query_failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(crate::types::GateSkipped { reason: skip })
+                    .expect("serializes"),
+                serde_json::json!({ "reason": reason }),
+                "{skip:?}"
+            );
+        }
     }
 
     // ── status-claim bypass (ruling R-35) ────────────────────────────────

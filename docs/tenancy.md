@@ -93,6 +93,20 @@ back. Migration 062 forbids that pairing outright with
 | An edge | the **meet** of its two endpoints, 070 arm (b); since **120** (operator decision D8) an edge between two public claims (or evidence, or from a `synthesis` source) is owned by its **writer's group** and stays public, and every other public-meet edge (an agent, paper, workflow, trace ... endpoint) stays `('public', world)`. See "Edges between public claims are their writer's (120)" below. |
 | A row with no derivable owner (`frames`, `contexts`, `perspectives`, `communities`, `recall_events`) | **must be declared by the writer.** Before 074 these landed on `('public', world)`; after 074 there is no default to land on. See the next section. `harvester_fragments` is in this set too, with one qualification — see below. |
 
+> **The harvester tables are dropped since migration 354** (backlog c7752f07,
+> a6e3dba2). The in-repo harvester crate and proto were already gone, and the
+> operator decided on 2026-11-27 to drop `harvester_sources`,
+> `harvester_fragments`, `harvester_audit_reports`,
+> `harvester_claim_provenance` and `harvester_enriched_concepts` with their
+> grants. Measured first, read-only, on the deployed database the same day:
+> all five had no live row and no insert, update or delete since their
+> statistics were reset, so nothing external was writing them, and there was
+> nothing to archive. 354 refuses to run while any of them holds a row, and
+> `docs/runbooks/354-undo.sql` recreates them empty. The two rows above that
+> name the harvester tables, and the notes on fragments below (089, 115, 218,
+> `F-089-*`, `F-218-A`), describe the schema before 354; on a database at
+> head there is no fragment to stamp, hold or blank.
+
 **`harvester_fragments` is the one table in two rows of that table, and the
 order of the two writes decides which.** It has no `claim_id`, so it is a
 parentless root and its writer must declare tenancy (074) — but it does reach a
@@ -174,15 +188,17 @@ sentinel-owned (hence public) fragment to public or group, never to something
 more readable. A harvester deployment must therefore be operated as a trusted
 writer: its DSN is a maintenance credential, not an application one.
 
-**What the trust model does not yet cover (finding `F-218-A`).** `epigraph_app`
+**What the trust model did not cover (finding `F-218-A`; closed, moot since
+migration 354 dropped the table).** `epigraph_app`
 still holds INSERT on `harvester_claim_provenance`: 115 skips the stamp for an
 application session's link but keeps the row. Arm (d) re-stamps a fragment from
 whichever of its linked claims a later tenancy change names, without asking who
 wrote the link, so a link written on an application connection can still
 influence a fragment's tenancy through arm (d). This predates 218 (168 behaves
 the same) and 218 does not widen it. The candidate repair, revoking that INSERT
-from the application role, waits on the operator confirming which role the
-external harvester connects as.
+from the application role, waited on the operator confirming which role the
+external harvester connected as. The measurement that answered it found no
+external writer at all, and the table was dropped (354) instead.
 
 **`epigraph_app` holds no UPDATE on `harvester_claim_provenance` (migration
 218).** The stamp is AFTER INSERT only, so an UPDATE that re-pointed a row's
@@ -334,7 +350,7 @@ have moved and REPORTS the platform corpus.
 It is resumable across a `kill -9`: the `tenancy_backfill_progress` cursor is
 committed in the same transaction as its batch.
 
-**Bounded runs.** `--entity claims|communities|perspectives|recall-events|harvester-fragments`
+**Bounded runs.** `--entity claims|communities|perspectives|recall-events|registry-edges`
 runs one arm alone (no settle, no final verify). `--max-runtime 2h` (or `90m`,
 `3600s`) stops cleanly between batches and exits **3**: partial, re-run the same
 command to resume. A walk that begins from a cursor an earlier run left (an
@@ -383,7 +399,8 @@ locked are stepped over. Run one.
 2. **Phase 0** — mints a personal group, plus a live membership in it, for every
    claim author that lacks one (migration 057 documents ~1,198 orphan agents
    that have never authenticated).
-3. The entity arms: `claims`, `recall_events`, `harvester_fragments`.
+3. The entity arms: `claims`, `recall_events` (and `harvester_fragments` until
+   migration 354 dropped it).
    (`--entity perspectives` and `--entity communities` are accepted and do
    nothing; see below.)
 4. `settle_remaining`, then `verify`.
@@ -902,6 +919,96 @@ human (`OPL02`).
   override. The census reads authors, not writing principals: it sees writer
   scope only where the author was also the writer.
 
+### Non-interactive service filer
+
+A filing service (for example a daemon beside an experiment orchestrator or an
+instrument driver) writes claims, evidence and edges as ITS OWN agent, shown
+as operated by a named human. It uses arm (c) above. It is never an operator
+link, because a link makes the agent stdio-only and ends its HTTP access
+(migration 107; `operated_agent_token.rs`). The end-to-end test is
+`crates/epigraph-api/tests/service_filer_identity.rs`, which runs armed, on
+the application role, with the token the client really mints.
+
+**Setting one up (operator, in order).**
+
+1. Register a `client_type = 'service'` OAuth client (legal-entity fields,
+   approved to `active`), with `granted_scopes` limited to `claims:read
+   claims:write evidence:write edges:write`. Give it no admin scope. Keep its
+   secret in a file that only the filer process reads.
+2. Mint one `client_credentials` token for it. The first mint creates the
+   client's agent and pins it to the client; an allowance needs that agent.
+3. On the maintenance DSN, run `epigraph-operator allow-author-binding-client
+   --client <oauth client id> --operator <human operator agent id> --reason
+   <text> --apply`. This calls migration 149's
+   `epigraph_allow_author_binding_client`, and the binding it prints must be
+   `client_allowlist`.
+4. Give the agent a `writer` membership of the ONE team it files into:
+   `epigraph-operator group-member add --group <team> --agent <filer agent>
+   --role writer --reason <text> --apply`. The command refuses with `GRP04`
+   before step 3 (the agent belongs to no human yet) and with `GRP03` for a
+   team the operator does not write; the test asserts both.
+
+**Writing.** Call the kernel REST API (for example `POST
+/api/v1/submit/packet`, a claim with its evidence) with the client's bearer
+token, and name the team: `group_id = <team>`.
+* Without `group_id` the route picks a default
+  (`docs/tenancy/claim-visibility-controls.md`). That default can be the
+  agent's own personal group, which is refused `OPL02` once armed
+  ("Authoring as itself" above).
+* The operator's personal group is refused 403, because a personal group is
+  never a team.
+* `GET /api/v1/claims/:id` shows the filer's agent as `authored_by.agent` and
+  the operator as `authored_by.human`.
+
+**What the one membership does and does not confine.** The `OPL01` and
+`OPL02` refusals here hold only once the binding is ARMED ("Arming, and the
+valve" above). Before that, only row security and the route's team-write
+check apply.
+* Armed, a team the operator does not write is refused `OPL02` for claims,
+  even if the agent holds a writer row there. Unarmed, that writer row admits
+  the claim.
+* The filer's CLAIMS can go into EVERY team its operator writes, not only the
+  team of step 4. Migration 206's `epigraph_writable_teams` gives an agent
+  each team its live human writes (owner decision D-V3), and 149 makes the
+  operator that human, so the packet route admits a claim into such a team
+  with no membership of the filer's own. The test pins this as observed.
+* Migration 149 leaves evidence, edge and belief writes outside a packet to
+  the membership, not to the binding (the door gap above). For those writes,
+  the membership is the limit. The test shows it: `POST /api/v1/evidence` on
+  the filer's claim in its own team is written, and on its claim in another
+  team of the operator it is refused 403.
+* So a claim the filer files into another of the operator's teams (for
+  example by omitting or mistyping `group_id`) is stranded: the filer cannot
+  later attach evidence or edges to it outside a packet.
+* To keep a filer's claims out of the operator's other teams, choose an
+  operator who writes only the target team. Whether D-V3 should exclude
+  allowlisted agents is an open question.
+
+**Extensions.** The token exchange (`grant_type` token-exchange at
+`/oauth/token`, audiences in `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES`) works for the
+filer's token. It returns a token for the same agent with the same scopes, for
+at most five minutes, and the kernel refuses that token.
+
+**Not the MCP HTTP listener.** The listener refuses to start, and refuses every
+call, while its SIGNER agent is allowlisted (149). So never run a listener as
+the filer's agent; the filer writes over kernel REST.
+
+**Incident response.** Revoke the allowance AND the client (above). Once the
+binding is armed, the filer's next claim write after the revoke is refused
+`OPL01`. That happens at once, with the same token and its membership still in
+place.
+* Its other writes to the team fail because the membership no longer counts:
+  a membership of a keyless team made by the team verb (step 4, a
+  `did:epigraph:group:` key) counts only while the agent has a live human
+  (migration 236's `epigraph_live_memberships_unbound`), so once the
+  allowance is revoked the team's claims read as missing to the filer (404),
+  armed or not. The test shows this, armed, for an evidence write.
+* A membership of a group with its own key (not made by the team verb) does
+  not lapse that way. Unarmed, revoking the allowance does not stop the
+  writes such a membership admits, so revoke that membership as well,
+  through the group's own membership path (the team verb's `group-member
+  remove` acts only on verb-made teams).
+
 ### Delegated run tokens (dormant until armed)
 
 An operated agent is stdio-only, with ONE carve-out: a delegated run token.
@@ -918,9 +1025,10 @@ reads nothing extra. A delegated token is refused unless:
 
 * it carries no scope outside the delegated ceiling,
   `epigraph_auth::DELEGATED_SCOPE_CEILING` (`claims:read claims:write
-  claims:challenge evidence:read evidence:submit edges:read edges:write
-  agents:read`): no group or agent management, no webhooks, no client or
-  admin-only scope. `AuthContext::has_scope` also never answers `true` outside
+  evidence:submit edges:read edges:write agents:read`): no group or agent
+  management, no webhooks, no client or admin-only scope. A retired scope
+  (`epigraph_auth::RETIRED_SCOPES`) a token still carries is ignored, not
+  refused. `AuthContext::has_scope` also never answers `true` outside
   the ceiling for a delegated context, so no `claims:admin` arm runs for one;
 * the process read `EPIGRAPH_RUN_TOKENS=on` at boot (both `epigraph-api` and
   the MCP HTTP listener; unset or any other value, every `dlg` token is
@@ -2329,7 +2437,7 @@ a future change to any of these tables can be checked against it.
 | `evidence.embedding`, `evidence.embedding_3072` | → `NULL` | **not restored** — see the gap below |
 | `evidence.properties` | → `'{}'`; ciphertext to `evidence_encryption.encrypted_properties` | yes |
 | `triples`, `entity_mentions`, `experiment_entity_mentions`, `reasoning_traces`, `challenges`, `experiment_triples` | rows **DELETED** | **no** — re-extraction is a separate, explicit operation |
-| `harvester_fragments.content_text`, `.context_window` | blanked, including a fragment cited by claims outside the plan | **no, and not recoverable** — the fragment text *is* the source |
+| `harvester_fragments.content_text`, `.context_window` (before migration 354 only) | blanked, including a fragment cited by claims outside the plan | **no, and not recoverable** — the fragment text *is* the source. Since 354 the table is dropped and the seal has no such step. |
 
 Deleting the derived extractions rather than encrypting them is deliberate: they
 are re-derivable from the plaintext, and encrypting each one would multiply the
@@ -2344,12 +2452,13 @@ plaintext is one `pg_dump` away.
 
 - **No semantic recall inside the group.** The vector is gone and the server
   cannot recompute it. This is a real product cost, taken deliberately.
-- **The extractions are gone**, and `harvester_fragments` source text is gone
-  for good. A fragment is one row and can be cited by several claims, so a
+- **The extractions are gone**, and (before migration 354, which dropped the
+  table) `harvester_fragments` source text was gone for good. A fragment is one row and can be cited by several claims, so a
   fragment shared with a claim OUTSIDE the plan is blanked for that claim too.
   The alternative — skipping shared fragments — would leave the sealed claim's
   own source text readable, which is the direction a seal exists to prevent. The
-  preview's `unrecoverable` line states the over-reach before the admin clicks.
+  preview's `unrecoverable` line stated the over-reach before the admin clicked;
+  since 354 the preview carries neither that line nor its shared-fragment count.
 - **It is not server-reversible.** Only a key holder can unseal, and a `seal`
   plan cannot be reverted to `public` until every one of its items has been
   unsealed. A sealed claim can never be declassified: the database refuses it
