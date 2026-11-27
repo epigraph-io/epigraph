@@ -128,13 +128,19 @@ def test_an_explicit_flag_beats_calibration_path(module, monkeypatch, fixture_ca
 @pytest.mark.parametrize("module", [strength, intra], ids=["source_strength", "intra_source"])
 def test_an_unreadable_calibration_path_is_refused_not_ignored(module, monkeypatch, tmp_path):
     # These scripts write mass_functions: silently falling back to the repo file
-    # would backfill with weights the engine is not serving.
+    # would hide that the override the operator set was never read. (The engine
+    # itself logs and serves its embedded copy here, so the message must not
+    # send the operator looking for a different file; it says to fix or unset
+    # the variable.)
     missing = tmp_path / "absent.toml"
     monkeypatch.setenv("CALIBRATION_PATH", str(missing))
     monkeypatch.setattr(sys, "argv", [module.__file__, "--database-url", "postgres://unused/x"])
     with pytest.raises(SystemExit) as exc:
         module.main()
-    assert str(missing) in str(exc.value.code)
+    message = str(exc.value.code)
+    assert str(missing) in message
+    assert "fix or unset CALIBRATION_PATH" in message
+    assert "engine would serve" not in message
 
 
 # (script, Rust file, Rust function) each Python belief backfill mirrors.
