@@ -23,8 +23,10 @@ No `CLAUDE.md` section states this rule. The code states it:
 
 - `crates/epigraph-engine/src/edge_factor.rs`:
   `effective_source_strength` / `effective_source_strength_profiled`;
-- the comments in `crates/epigraph-mcp/src/tools/ds_auto.rs`, which call that
-  helper "the SAME discount authority" for every writer and recompute path;
+- the comments in `crates/epigraph-mcp/src/tools/ds_auto.rs` on the
+  initial-cache writers: "Unify onto the SAME discount authority
+  (`effective_source_strength`)", "the same discount authority every other
+  writer uses" and "The shared invariant is the discount AUTHORITY";
 - the module comment in `ds_auto.rs`: "Each BBA is Shafer-discounted by its
   `source_strength` before combination to prevent runaway confirmation (C2)
   and dilution attacks (C3)."
