@@ -263,7 +263,19 @@ pub(crate) async fn submit_claim_response(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<SubmitClaimResponse, McpError> {
     let sub = match prepare_submission(server, viewer, params, auth).await? {
-        PreparedSubmission::Existing(response) => return Ok(*response),
+        PreparedSubmission::NearDuplicate {
+            existing_id,
+            distance,
+            mut sub,
+        } => {
+            match corroborate_submission(server, viewer, existing_id, distance, &mut sub).await? {
+                Some(response) => return Ok(response),
+                // Refused: `sub` now carries the refusal (and, when its
+                // readers may read the match, the `near-duplicate` label), and
+                // is inserted as the caller's own claim.
+                None => *sub,
+            }
+        }
         PreparedSubmission::Fresh(sub) => *sub,
     };
     let mut tx = crate::claim_helper::begin_author_stamped_tx_for(
@@ -286,13 +298,128 @@ pub(crate) async fn submit_claim_response(
     finish_submission(server, viewer, sub, written, "submit_claim").await
 }
 
+/// The novelty gate matched `existing_id`: attach this submission's evidence
+/// to it as corroboration (`novelty_gate::corroborate`, backlog 4f4c6175) and
+/// answer with the existing claim, or, when the caller may not attach there
+/// (backlogs 5578f693, fef24216), record the refusal on `sub` (and flag it
+/// `near-duplicate` when its readers may read the match), and answer `None` so
+/// the caller inserts it as its own claim.
+/// `sub.pending_embedding` already holds the gate's vector, so that insert
+/// pays for no second embedding.
+async fn corroborate_submission(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    existing_id: Uuid,
+    distance: Option<f64>,
+    sub: &mut Submission,
+) -> Result<Option<SubmitClaimResponse>, McpError> {
+    let evidence = submission_evidence(server, sub, ClaimId::from_uuid(existing_id));
+    let outcome = crate::tools::novelty_gate::corroborate(
+        server,
+        viewer,
+        sub.author,
+        existing_id,
+        crate::tools::novelty_gate::CorroboratingEvidence {
+            evidence: &evidence,
+            source_url: sub
+                .params
+                .source_url
+                .as_deref()
+                .or_else(|| EvidenceRepository::source_url_of(&evidence.evidence_type)),
+            strength: sub.confidence,
+            evidence_type: &sub.params.evidence_type,
+            tenancy: &sub.tenancy,
+            distance,
+            tool: "submit_claim",
+        },
+    )
+    .await?;
+    let crate::tools::novelty_gate::CorroborationOutcome::Attached { evidence_id } = outcome else {
+        // Labelled only when the claim's readers may read the match too
+        // (`novelty_gate::neighbour_covers_write`).
+        if outcome.flags_near_duplicate()
+            && !sub.params.labels.iter().any(|l| l == "near-duplicate")
+        {
+            sub.params.labels.push("near-duplicate".to_string());
+        }
+        sub.corroboration = Some(outcome.report(existing_id));
+        return Ok(None);
+    };
+    let existing =
+        crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id).await?;
+    Ok(Some(SubmitClaimResponse {
+        claim_id: existing_id.to_string(),
+        // The existing claim's own truth_value: a corroboration never writes it.
+        truth_value: existing.truth_value.value(),
+        content_hash: ContentHasher::to_hex(&existing.content_hash),
+        embedded: false,
+        belief: None,
+        plausibility: None,
+        pignistic_prob: None,
+        frame_id: None,
+        // The caller is TOLD this is not an insert, and what became of each
+        // input it sent (backlog a3e63a12).
+        deduplicated: Some(dedup_block(
+            DedupBy::NoveltyGate,
+            existing_id,
+            &sub.params,
+            evidence_id.is_some(),
+        )),
+        visibility: None,
+        owner_group_id: None,
+        visibility_note: None,
+        // About the SUBMITTED text, on every path.
+        atomicity: crate::types::AtomicityWarning::for_content(&sub.params.content),
+        gate_skipped: None,
+        corroboration: Some(outcome.report(existing_id)),
+    }))
+}
+
+/// This submission's evidence row for `claim_id`, signed by this server: the
+/// submission's own claim, or the existing claim it corroborates.
+fn submission_evidence(server: &EpiGraphMcpFull, sub: &Submission, claim_id: ClaimId) -> Evidence {
+    let evidence_hash = ContentHasher::hash(sub.params.evidence_data.as_bytes());
+    // `Evidence::agent_id` IS `evidence.signer_id` (the table has no author
+    // column), and the digest is signed with THIS SERVER's key below. So it names
+    // the signer, not the author: naming the author recorded a caller's agent as
+    // the signer of a signature it never made, which `SignatureVerifier` then
+    // checks against the wrong public key.
+    let mut e = Evidence::new(
+        AgentId::from_uuid(sub.signer_agent_id),
+        sub.pub_key,
+        evidence_hash,
+        sub.evidence_type.clone(),
+        Some(sub.params.evidence_data.clone()),
+        claim_id,
+    );
+    e.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+    );
+    // The row signature above covers `content_hash` (BLAKE3 of
+    // evidence_data) only. A dataset's structured fields (root, manifest
+    // digest, counts) get a signature of their own, bound to this row's
+    // evidence and claim ids, under the separate `Dataset` signing domain,
+    // so the bytes every existing evidence signature covers are unchanged
+    // (backlog c8beb101). A no-op for any other evidence type.
+    e.evidence_type
+        .attest_dataset(e.id, e.claim_id, &server.signer);
+    e
+}
+
 /// The `deduplicated` block for a `submit_claim` answered with an existing
 /// claim (backlog a3e63a12). Each list is what the path in question ACTUALLY
 /// does with the input, read off the code below, not what one might expect:
 ///
-/// * [`DedupBy::NoveltyGate`] — `prepare_submission` returns before any
-///   transaction opens. Nothing of this call is written: not its wording, not
-///   its labels, not an evidence row, not a trace.
+/// * [`DedupBy::NoveltyGate`] — the submission CORROBORATES the existing claim
+///   (`corroborate_submission`, backlog 4f4c6175): an Evidence row
+///   (evidence_data, evidence_type, a dataset, and source_url in
+///   `evidence.source_url`) and its BBA (confidence) are written on it. Its
+///   wording, methodology, reasoning and labels are written nowhere: no claim
+///   row and no reasoning trace. When `evidence_written` is false (the caller's
+///   group had attached the same evidence body already) nothing is written and
+///   every input is discarded.
 /// * [`DedupBy::ContentHash`] — `write_submission` still runs in full on the
 ///   existing claim: `update_labels_conn` UNIONS the labels in; a new Evidence
 ///   row (evidence_data, evidence_type, and source_url in `evidence.source_url`)
@@ -310,24 +437,34 @@ pub(crate) async fn submit_claim_response(
 /// Only supplied inputs are listed; see `types::Deduplicated`. On a
 /// novelty-gate hit `novelty_threshold` is the input that DECIDED the hit, so
 /// it is listed in neither.
-fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams) -> Deduplicated {
+fn dedup_block(
+    by: DedupBy,
+    existing_claim_id: Uuid,
+    params: &SubmitClaimParams,
+    evidence_written: bool,
+) -> Deduplicated {
     let mut applied: Vec<&'static str> = Vec::new();
     let mut discarded: Vec<&'static str> = Vec::new();
     match by {
         DedupBy::NoveltyGate => {
-            discarded.extend(["content", "methodology", "evidence_data", "evidence_type"]);
-            discarded.push("confidence");
+            discarded.extend(["content", "methodology"]);
+            let evidence_inputs = if evidence_written {
+                &mut applied
+            } else {
+                &mut discarded
+            };
+            evidence_inputs.extend(["evidence_data", "evidence_type", "confidence"]);
             if params.source_url.is_some() {
-                discarded.push("source_url");
+                evidence_inputs.push("source_url");
+            }
+            if params.dataset.is_some() {
+                evidence_inputs.push("dataset");
             }
             if params.reasoning.is_some() {
                 discarded.push("reasoning");
             }
             if !params.labels.is_empty() {
                 discarded.push("labels");
-            }
-            if params.dataset.is_some() {
-                discarded.push("dataset");
             }
         }
         DedupBy::ContentHash => {
@@ -364,9 +501,14 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
 
 /// What [`prepare_submission`] decided.
 enum PreparedSubmission {
-    /// The novelty gate matched an existing claim: this is the response, and
-    /// nothing is to be written.
-    Existing(Box<SubmitClaimResponse>),
+    /// The novelty gate matched `existing_id` at `distance`: the submission
+    /// corroborates it, or, when it may not, is written as its own flagged
+    /// claim (`corroborate_submission`). Nothing is written yet.
+    NearDuplicate {
+        existing_id: Uuid,
+        distance: Option<f64>,
+        sub: Box<Submission>,
+    },
     /// A submission to write.
     Fresh(Box<Submission>),
 }
@@ -390,6 +532,12 @@ struct Submission {
     pending_embedding: Option<String>,
     /// The resolved `visibility` / `group_id` (docs/tenancy/claim-visibility-controls.md).
     tenancy: epigraph_db::ResolvedWriteDecl,
+    /// Why the novelty gate could not run, when it should have (backlog
+    /// 8482b8fc). Reported on the response.
+    gate_skipped: Option<crate::tools::novelty_gate::GateSkip>,
+    /// Why a near-duplicate was inserted instead of corroborating the claim the
+    /// gate matched (backlogs 5578f693, fef24216). Reported on the response.
+    corroboration: Option<crate::types::Corroboration>,
 }
 
 /// What [`write_submission`] wrote.
@@ -496,11 +644,13 @@ async fn prepare_submission(
         crate::tools::novelty_gate::exact_resubmit_probe(server, viewer, &content_hash, agent_id)
             .await?;
     let mut pending_embedding: Option<String> = None;
+    let mut gate_skipped: Option<crate::tools::novelty_gate::GateSkip> = None;
+    let mut near_duplicate: Option<(Uuid, Option<f64>)> = None;
     if !is_exact_resubmit {
         let novelty_threshold = params
             .novelty_threshold
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
-        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+        match crate::tools::novelty_gate::decide(
             server,
             viewer,
             server.embedder.as_ref(),
@@ -510,79 +660,44 @@ async fn prepare_submission(
         )
         .await
         {
-            if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
-            {
-                // Semantic duplicate: suppress the insert entirely and
-                // report the existing claim, mirroring the shape of a
-                // content-hash dedup hit (no new Evidence/Trace/edges/DS).
-                //
-                // Two deliberate differences from the content-hash dedup
-                // this composes with, both intended per the backlog spec
-                // (nearest_by_embedding scans ALL is_current claims, not
-                // scoped to this agent):
-                //   1. `existing_id` can belong to ANOTHER agent's claim —
-                //      unlike find_by_content_hash_and_agent's same-agent
-                //      dedup, semantic novelty is corpus-wide. CONCRETE
-                //      CONSEQUENCE: if agent B asserts a near-paraphrase of
-                //      a fact agent A already asserted, B's submission is
-                //      suppressed at the default threshold and B receives
-                //      A's claim id — with NO independent AUTHORED edge,
-                //      Evidence, or ReasoningTrace recorded for B. In a
-                //      Dempster-Shafer system where independent
-                //      corroboration from a second source is itself
-                //      evidentiary signal (BBA combination), that is a real
-                //      loss of corroboration data, not just a dedup nicety.
-                //      This is what the backlog spec asks for (no agent
-                //      filter on the ANN query) — flagging it here for a
-                //      future owner to reconsider, not changing it
-                //      unilaterally.
-                //   2. `params.labels` (the CALLER's requested labels on
-                //      THIS submission) are silently dropped here, since
-                //      nothing is inserted. `resolve_backlog_item` is
-                //      unaffected (it hardcodes novelty_threshold=0.0 so
-                //      this branch never fires for it).
-                let existing =
-                    crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id)
-                        .await?;
-                return Ok(PreparedSubmission::Existing(Box::new(
-                    SubmitClaimResponse {
-                        claim_id: existing_id.to_string(),
-                        truth_value: existing.truth_value.value(),
-                        content_hash: ContentHasher::to_hex(&existing.content_hash),
-                        embedded: false,
-                        belief: None,
-                        plausibility: None,
-                        pignistic_prob: None,
-                        frame_id: None,
-                        // The caller is TOLD this is not an insert, and that
-                        // every input it sent was dropped (backlog a3e63a12).
-                        deduplicated: Some(dedup_block(DedupBy::NoveltyGate, existing_id, &params)),
-                        visibility: None,
-                        owner_group_id: None,
-                        visibility_note: None,
-                        // About the SUBMITTED text, on every path.
-                        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
-                    },
-                )));
-            }
-            // Insert / InsertFlagged: stash the already-generated,
-            // pgvector-formatted embedding so the was_created branch below
-            // can store it directly instead of paying for a second
-            // embedding call via embed_and_store.
-            pending_embedding = Some(pgvec);
-            if matches!(
+            // The gate could not run: fall through exactly as before this
+            // feature existed (insert, then embed best-effort post-insert),
+            // and say so on the response (backlog 8482b8fc).
+            Err(skip) => gate_skipped = Some(skip),
+            Ok(crate::tools::novelty_gate::GateVerdict {
                 decision,
-                crate::tools::novelty_gate::GateDecision::InsertFlagged
-            ) && !params.labels.iter().any(|l| l == "near-duplicate")
-            {
-                params.labels.push("near-duplicate".to_string());
+                embedding: pgvec,
+                nearest_distance,
+            }) => {
+                // Every decision keeps the already-generated, pgvector-formatted
+                // embedding, so an insert below (a fresh claim, a flagged one,
+                // or a near-duplicate that may not corroborate) stores it
+                // directly instead of paying for a second embedding call.
+                pending_embedding = Some(pgvec);
+                if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) =
+                    decision
+                {
+                    // Semantic duplicate. Phase 1 writes nothing (see this
+                    // function's doc): the caller corroborates `existing_id`
+                    // with this submission's evidence, or inserts it flagged
+                    // when it may not (`corroborate_submission`). The match is
+                    // corpus-wide, so `existing_id` may be another agent's
+                    // claim; `resolve_backlog_item` never gets here (it passes
+                    // novelty_threshold = 0.0).
+                    near_duplicate = Some((existing_id, nearest_distance));
+                }
+                if matches!(
+                    decision,
+                    crate::tools::novelty_gate::GateDecision::InsertFlagged
+                ) && !params.labels.iter().any(|l| l == "near-duplicate")
+                {
+                    params.labels.push("near-duplicate".to_string());
+                }
             }
         }
-        // embedder failure (None): fall through exactly as before this
-        // feature existed — insert, then embed best-effort post-insert.
     }
 
-    Ok(PreparedSubmission::Fresh(Box::new(Submission {
+    let sub = Box::new(Submission {
         params,
         author,
         agent_id,
@@ -598,7 +713,17 @@ async fn prepare_submission(
         evidence_type,
         pending_embedding,
         tenancy,
-    })))
+        gate_skipped,
+        corroboration: None,
+    });
+    Ok(match near_duplicate {
+        Some((existing_id, distance)) => PreparedSubmission::NearDuplicate {
+            existing_id,
+            distance,
+            sub,
+        },
+        None => PreparedSubmission::Fresh(sub),
+    })
 }
 
 /// Phase 2 of a submission: every write, on the caller's author-stamped
@@ -621,7 +746,6 @@ async fn write_submission(
         weight,
         claim,
         methodology,
-        evidence_type,
         ..
     } = sub;
     let (agent_id, agent_id_typed, signer_agent_id, pub_key, confidence, weight) = (
@@ -691,37 +815,7 @@ async fn write_submission(
 
     // Build Evidence + Trace from this submission. Both are noun-claims with
     // their own UUIDs and signatures regardless of was_created.
-    let evidence_hash = ContentHasher::hash(params.evidence_data.as_bytes());
-    // `Evidence::agent_id` IS `evidence.signer_id` (the table has no author
-    // column), and the digest is signed with THIS SERVER's key below. So it names
-    // the signer, not the author: naming the author recorded a caller's agent as
-    // the signer of a signature it never made, which `SignatureVerifier` then
-    // checks against the wrong public key.
-    let evidence = Evidence::new(
-        AgentId::from_uuid(signer_agent_id),
-        pub_key,
-        evidence_hash,
-        evidence_type.clone(),
-        Some(params.evidence_data.clone()),
-        claim.id,
-    );
-    let evidence_with_sig = {
-        let mut e = evidence;
-        e.signature = Some(
-            server
-                .signer
-                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
-        );
-        // The row signature above covers `content_hash` (BLAKE3 of
-        // evidence_data) only. A dataset's structured fields (root, manifest
-        // digest, counts) get a signature of their own, bound to this row's
-        // evidence and claim ids, under the separate `Dataset` signing domain,
-        // so the bytes every existing evidence signature covers are unchanged
-        // (backlog c8beb101). A no-op for any other evidence type.
-        e.evidence_type
-            .attest_dataset(e.id, e.claim_id, &server.signer);
-        e
-    };
+    let evidence_with_sig = submission_evidence(server, sub, claim.id);
 
     let explanation = params.reasoning.clone().unwrap_or_else(|| {
         format!(
@@ -902,6 +996,8 @@ async fn finish_submission(
         raw_truth,
         content_hash,
         mut pending_embedding,
+        gate_skipped,
+        corroboration,
         ..
     } = sub;
     let WrittenSubmission {
@@ -1001,12 +1097,14 @@ async fn finish_submission(
         // pre-check: it is what decided whether DS ran, and it also covers a
         // concurrent writer landing the same content between the two.
         deduplicated: (!was_created)
-            .then(|| dedup_block(DedupBy::ContentHash, claim_uuid, &params)),
+            .then(|| dedup_block(DedupBy::ContentHash, claim_uuid, &params, true)),
         visibility: Some(tenancy.visibility.to_string()),
         owner_group_id: Some(tenancy.owner_group_id.to_string()),
         visibility_note: tenancy.note,
         // Warn-only (backlog 72850d43): the claim above is already committed.
         atomicity: crate::types::AtomicityWarning::for_content(&params.content),
+        gate_skipped: gate_skipped.map(|reason| crate::types::GateSkipped { reason }),
+        corroboration,
     })
 }
 
@@ -1506,6 +1604,163 @@ fn ds_wire_failure_message(e: &str) -> String {
     }
 }
 
+/// The Dempster-Shafer half of attaching one evidence row to a claim, on the
+/// caller's author-stamped transaction, AFTER the evidence row was written on
+/// it: the frame the evidence is filed on, its BBA combined into the claim's
+/// cached belief (`ds_auto::auto_wire_ds_update_filed_on`), and the claim's
+/// Beta-Bernoulli track and divergence row. Returns the combination.
+///
+/// Shared by `update_with_evidence` and the novelty gate's corroboration
+/// (`novelty_gate::corroborate`, backlog 4f4c6175), so a corroborating
+/// submission's evidence is combined exactly as evidence attached by hand is.
+/// It never writes the claim ROW (`truth_value`, `labels`, `content`): that is
+/// the caller's decision. `seed_truth` is `ds_auto`'s `seed_truth_prior`: true
+/// only when the caller may file the authored `truth_value` as the author's
+/// BBA (a writer of the claim's group adding evidence by hand).
+///
+/// # Errors
+/// A caller error for a promoted hypothesis whose filing frame is missing or
+/// malformed; the designed `ds_wire_failure_message` text for a failed wire
+/// (the cause is logged); an internal error otherwise. The caller drops its
+/// transaction, so nothing is written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn wire_attached_evidence_in_tx(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    agent_id: Uuid,
+    evidence_id: Uuid,
+    strength: f64,
+    supports: bool,
+    evidence_type: &str,
+    seed_truth: bool,
+    tool: &'static str,
+) -> Result<ds_auto::DsAutoResult, McpError> {
+    // Type weight from the served calibration (`CALIBRATION_PATH`, else the
+    // compiled-in copy), never a cwd file with a 0.7 fallback (backlog d83b998a).
+    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+        .get_evidence_type_weight(evidence_type);
+
+    // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
+    //
+    // #497 ("update_with_evidence best-effort") made this failure non-fatal and
+    // disclosed it as `belief_wired: false`. That was right FOR ITS TREE: there
+    // the evidence INSERT had already self-committed on the unstamped pool, the
+    // wiring ran on a sibling pool connection and was refused in production
+    // (`new row violates row-level security policy for table "claim_frames"`),
+    // so a fatal error reported total failure for a call whose evidence row the
+    // database had kept.
+    //
+    // Neither premise survives D2. The wiring runs on THIS stamped transaction,
+    // so the production refusal it was working around is the thing D2 removes,
+    // and the evidence row is uncommitted until everything below succeeds. A
+    // failure here therefore leaves NOTHING behind — no evidence, no BBA, no
+    // truth write, no labels — and an error is now the complete and truthful
+    // answer. Swallowing it instead would commit exactly the BBA-less evidence
+    // row the note above explains is worse than nothing (it blocks the identical
+    // re-submit via the same-owner evidence de-duplication). The error text keeps
+    // the failing step as its prefix (`assign_claim:`, `store BBA:`,
+    // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
+    // which is the part of #497's disclosure that still has a referent.
+    //
+    // `submit_claim` still treats its own DS wiring as best-effort, and that is
+    // not a discrepancy: there the CLAIM is the primary write and it has already
+    // committed in its own transaction before the wire runs, so the claim
+    // exists either way. Here the evidence row IS the submission, and it is in
+    // the same unit as its BBA.
+    //
+    // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
+    // A promoted hypothesis's readers read `research_validity`, never
+    // `binary_truth`, so its evidence is filed there (operator rulings R-8 and
+    // R-17), instead of on `binary_truth`, never on both: the fold reads every
+    // two-hypothesis frame and would count it twice. A missing or non-binary
+    // `research_validity` is the caller's refusal, with nothing written.
+    let file_on =
+        epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_db::DbError::InvalidData { .. }
+                | epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
+                other => internal_error(other),
+            })?
+            .map(|frame| frame.id);
+    let ds = ds_auto::auto_wire_ds_update_filed_on(
+        &mut *conn,
+        viewer,
+        claim_id,
+        agent_id,
+        strength,
+        weight, // from calibration.toml (C1 fix: single weight source)
+        supports,
+        Some(evidence_type),
+        Some(evidence_id), // C-1: evidence UUID prevents BBA upsert overwrite
+        seed_truth,
+        file_on,
+    )
+    .await
+    .map_err(|e| {
+        // Logged as well as returned. The reply is designed text
+        // (`internal_error_text`, which does not log), so without this a
+        // dropped wire here would never reach the server log, and its cause
+        // reaches only the log. #497 added this warn so that one log query
+        // ("ds auto-wire failed") finds every dropped wire, whichever tool
+        // dropped it; `submit_claim`'s path emits the same prefix with the same
+        // `claim_id`/`tool` fields. The wording differs because the outcome
+        // does: here the whole submission is rolled back.
+        tracing::warn!(
+            claim_id = %claim_id,
+            tool,
+            "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
+        );
+        crate::errors::internal_error_text(ds_wire_failure_message(&e))
+    })?;
+
+    // The claim's Beta-Bernoulli track and its DS-vs-Bayesian divergence row
+    // (backlog f50344c0), kept as `POST /frames/:id/evidence` keeps them, by
+    // the same functions: the evidence BBA's mass on TRUE (index 0 of the
+    // binary frame) goes to alpha, the rest of its non-conflict mass to beta,
+    // and the row records this call's BetP against that posterior on the
+    // cache's frame, for `get_divergence`. Every call here stores a new BBA
+    // (an identical `evidence_data` is refused at the insert), so it is always
+    // counted. Both are best-effort, each under its own savepoint: the row is
+    // claim-derived, and a non-owner of a public claim is refused it (and the
+    // Beta write) without losing the evidence. A cold start (the claim's track
+    // still at the Beta(1, 1) prior before this call) records no row: see
+    // `epigraph_engine::ds_divergence`.
+    let beta_update = epigraph_engine::ds_divergence::apply_beta_update(
+        &mut *conn,
+        viewer,
+        claim_id,
+        Some(epigraph_engine::ds_divergence::beta_increments(
+            &ds.evidence_bba,
+            Some(0),
+        )),
+        // Never a replacement: each call files its BBA under its own
+        // evidence's perspective.
+        None,
+        tool,
+    )
+    .await
+    .map_err(internal_error)?;
+    let frame_version =
+        epigraph_engine::ds_divergence::frame_version(&mut *conn, viewer, ds.frame_id, tool)
+            .await
+            .map_err(internal_error)?;
+    epigraph_engine::ds_divergence::record_divergence(
+        &mut *conn,
+        claim_id,
+        ds.frame_id,
+        ds.pignistic_prob,
+        beta_update,
+        frame_version,
+        tool,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    Ok(ds)
+}
+
 pub async fn update_with_evidence(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1746,84 +2001,20 @@ pub async fn update_with_evidence(
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
 
-    // Type weight from the served calibration (`CALIBRATION_PATH`, else the
-    // compiled-in copy), never a cwd file with a 0.7 fallback (backlog d83b998a).
-    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
-        .get_evidence_type_weight(&params.evidence_type);
-
-    // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
-    //
-    // #497 ("update_with_evidence best-effort") made this failure non-fatal and
-    // disclosed it as `belief_wired: false`. That was right FOR ITS TREE: there
-    // the evidence INSERT had already self-committed on the unstamped pool, the
-    // wiring ran on a sibling pool connection and was refused in production
-    // (`new row violates row-level security policy for table "claim_frames"`),
-    // so a fatal error reported total failure for a call whose evidence row the
-    // database had kept.
-    //
-    // Neither premise survives D2. The wiring runs on THIS stamped transaction,
-    // so the production refusal it was working around is the thing D2 removes,
-    // and the evidence row is uncommitted until everything below succeeds. A
-    // failure here therefore leaves NOTHING behind — no evidence, no BBA, no
-    // truth write, no labels — and an error is now the complete and truthful
-    // answer. Swallowing it instead would commit exactly the BBA-less evidence
-    // row the note above explains is worse than nothing (it blocks the identical
-    // re-submit via the same-owner evidence de-duplication). The error text keeps
-    // the failing step as its prefix (`assign_claim:`, `store BBA:`,
-    // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
-    // which is the part of #497's disclosure that still has a referent.
-    //
-    // `submit_claim` still treats its own DS wiring as best-effort, and that is
-    // not a discrepancy: there the CLAIM is the primary write and it has already
-    // committed in its own transaction before the wire runs, so the claim
-    // exists either way. Here the evidence row IS the submission, and it is in
-    // the same unit as its BBA.
-    //
-    // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
-    // A promoted hypothesis's readers read `research_validity`, never
-    // `binary_truth`, so its evidence is filed there (operator rulings R-8 and
-    // R-17), instead of on `binary_truth`, never on both: the fold reads every
-    // two-hypothesis frame and would count it twice. A missing or non-binary
-    // `research_validity` is the caller's refusal, with nothing written.
-    let file_on =
-        epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut tx, viewer, claim_id)
-            .await
-            .map_err(|e| match e {
-                epigraph_db::DbError::InvalidData { .. }
-                | epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
-                other => internal_error(other),
-            })?
-            .map(|frame| frame.id);
-    let ds = ds_auto::auto_wire_ds_update_filed_on(
+    let ds = wire_attached_evidence_in_tx(
         &mut tx,
         viewer,
         claim_id,
         agent_id,
+        evidence.id.as_uuid(),
         strength,
-        weight, // from calibration.toml (C1 fix: single weight source)
         params.supports,
-        Some(&params.evidence_type),
-        Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
-        !foreign_claim, // seed the authored truth_value only on a claim this caller writes
-        file_on,
+        &params.evidence_type,
+        // Seed the authored truth_value only on a claim this caller writes.
+        !foreign_claim,
+        "update_with_evidence",
     )
-    .await
-    .map_err(|e| {
-        // Logged as well as returned. The reply is designed text
-        // (`internal_error_text`, which does not log), so without this a
-        // dropped wire here would never reach the server log, and its cause
-        // reaches only the log. #497 added this warn so that one log query
-        // ("ds auto-wire failed") finds every dropped wire, whichever tool
-        // dropped it; `submit_claim`'s path emits the same prefix with the same
-        // `claim_id`/`tool` fields. The wording differs because the outcome
-        // does: here the whole submission is rolled back.
-        tracing::warn!(
-            claim_id = %claim_id,
-            tool = "update_with_evidence",
-            "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
-        );
-        crate::errors::internal_error_text(ds_wire_failure_message(&e))
-    })?;
+    .await?;
 
     // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
     //
@@ -1856,53 +2047,6 @@ pub async fn update_with_evidence(
     // MIGRATION 114: on a public claim the caller does not own, neither update
     // runs (labels were refused above) and `truth_after` reports the unchanged
     // value. The recombined DS belief is still returned below.
-    // The claim's Beta-Bernoulli track and its DS-vs-Bayesian divergence row
-    // (backlog f50344c0), kept as `POST /frames/:id/evidence` keeps them, by
-    // the same functions: the evidence BBA's mass on TRUE (index 0 of the
-    // binary frame) goes to alpha, the rest of its non-conflict mass to beta,
-    // and the row records this call's BetP against that posterior on the
-    // cache's frame, for `get_divergence`. Every call here stores a new BBA
-    // (an identical `evidence_data` is refused above), so it is always
-    // counted. Both are best-effort, each under its own savepoint: the row is
-    // claim-derived, and a non-owner of a public claim is refused it (and the
-    // Beta write) without losing the evidence. A cold start (the claim's track
-    // still at the Beta(1, 1) prior before this call) records no row: see
-    // `epigraph_engine::ds_divergence`.
-    let beta_update = epigraph_engine::ds_divergence::apply_beta_update(
-        &mut tx,
-        viewer,
-        claim_id,
-        Some(epigraph_engine::ds_divergence::beta_increments(
-            &ds.evidence_bba,
-            Some(0),
-        )),
-        // Never a replacement: each call files its BBA under its own
-        // evidence's perspective.
-        None,
-        "update_with_evidence",
-    )
-    .await
-    .map_err(internal_error)?;
-    let frame_version = epigraph_engine::ds_divergence::frame_version(
-        &mut tx,
-        viewer,
-        ds.frame_id,
-        "update_with_evidence",
-    )
-    .await
-    .map_err(internal_error)?;
-    epigraph_engine::ds_divergence::record_divergence(
-        &mut tx,
-        claim_id,
-        ds.frame_id,
-        ds.pignistic_prob,
-        beta_update,
-        frame_version,
-        "update_with_evidence",
-    )
-    .await
-    .map_err(internal_error)?;
-
     let after_truth = if foreign_claim {
         claim.truth_value
     } else {
@@ -2540,7 +2684,7 @@ pub async fn resolve_backlog_item(
         // so the gate never returns an existing claim for a resolution. Refused
         // rather than trusted, because following it would retire the item
         // against a claim this call did not write.
-        PreparedSubmission::Existing(_) => {
+        PreparedSubmission::NearDuplicate { .. } => {
             return Err(crate::errors::internal_error_text(
                 "resolve_backlog_item: the novelty gate returned an existing claim for a \
                  resolution at threshold 0.0; refusing to retire the item against a claim this \
@@ -2881,7 +3025,7 @@ async fn gate_retirement_label(
 /// \"<table>\""): a tenancy `WITH CHECK` refused the stamp. A CODED `42501` a
 /// trigger raises (a designed refusal with its own text), or a row-security
 /// refusal on any OTHER table, is not this.
-fn refused_by_row_security_on(e: &epigraph_db::DbError, table: &str) -> bool {
+pub(crate) fn refused_by_row_security_on(e: &epigraph_db::DbError, table: &str) -> bool {
     matches!(
         e,
         epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
@@ -3405,11 +3549,9 @@ mod tests {
     // Nested in `tests` because `tests/no_inline_sql_in_tools.rs` requires the first
     // `#[cfg(test)]` in a tools file to introduce `mod tests` and be the last item.
     mod dedup_block_tests {
-        //! The novelty-gate arm of `dedup_block` cannot be reached through
-        //! `EpiGraphMcpFull` in a test process (its embedder hard-codes OpenAI; see
-        //! `tests/novelty_gate_test.rs`), so its list is pinned here. The
-        //! content-hash arm is additionally measured end-to-end in
-        //! `tests/dedup_response_signal.rs`.
+        //! The lists `dedup_block` reports per path. Both arms are also measured
+        //! end-to-end: the content-hash arm in `tests/dedup_response_signal.rs`,
+        //! the novelty-gate arm in `tests/novelty_gate_corroboration_app_role.rs`.
         use super::super::dedup_block;
         use crate::types::{DedupBy, SubmitClaimParams};
 
@@ -3438,9 +3580,37 @@ mod tests {
             }
         }
 
+        /// A corroboration (backlog 4f4c6175) records the evidence inputs on
+        /// the existing claim and drops the claim-level ones.
         #[test]
-        fn a_novelty_gate_hit_discards_every_supplied_input() {
-            let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params());
+        fn a_novelty_gate_corroboration_applies_the_evidence_inputs_only() {
+            let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params(), true);
+            for want in [
+                "evidence_data",
+                "evidence_type",
+                "confidence",
+                "source_url",
+                "dataset",
+            ] {
+                assert!(d.inputs_applied.contains(&want), "{want}: {d:?}");
+                assert!(!d.inputs_discarded.contains(&want), "{want}: {d:?}");
+            }
+            for want in ["content", "methodology", "reasoning", "labels"] {
+                assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
+                assert!(!d.inputs_applied.contains(&want), "{want}: {d:?}");
+            }
+            assert!(
+                !d.inputs_discarded.contains(&"novelty_threshold")
+                    && !d.inputs_applied.contains(&"novelty_threshold"),
+                "the threshold decided the hit; it was not discarded: {d:?}"
+            );
+        }
+
+        /// A repeat of evidence the caller's group had already attached writes
+        /// nothing, so nothing is applied.
+        #[test]
+        fn a_repeated_corroboration_discards_every_supplied_input() {
+            let d = dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &params(), false);
             assert!(d.inputs_applied.is_empty(), "{d:?}");
             for want in [
                 "content",
@@ -3455,10 +3625,6 @@ mod tests {
             ] {
                 assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
             }
-            assert!(
-                !d.inputs_discarded.contains(&"novelty_threshold"),
-                "the threshold decided the hit; it was not discarded: {d:?}"
-            );
         }
 
         #[test]
@@ -3470,7 +3636,7 @@ mod tests {
             p.novelty_threshold = None;
             p.dataset = None;
             for by in [DedupBy::NoveltyGate, DedupBy::ContentHash] {
-                let d = dedup_block(by, uuid::Uuid::nil(), &p);
+                let d = dedup_block(by, uuid::Uuid::nil(), &p, true);
                 for absent in [
                     "source_url",
                     "reasoning",

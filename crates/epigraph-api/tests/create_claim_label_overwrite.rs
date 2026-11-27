@@ -7,11 +7,11 @@
 //! `!request.labels.is_empty()`. So a dedup hit — which is explicitly not a
 //! creation — still rewrote the stored label array.
 //!
-//! This is not cosmetic. `crates/epigraph-api/src/routes/policies.rs` uses
-//! `'policy:active' = ANY(labels)` and `'policy:challenge' = ANY(labels)` as
-//! UPDATE predicates, so stripping a policy claim's labels permanently detaches
-//! it from its outcome and challenge endpoints. Any `claims:write` holder who
-//! can guess the content could do it.
+//! This is not cosmetic. `crates/epigraph-api/src/routes/policies.rs` (through
+//! `PolicyRepository`) keys on `'policy:active' = ANY(labels)` and
+//! `'policy:challenge' = ANY(labels)`, so stripping a policy claim's labels
+//! permanently detaches it from the policy list and the challenge read. Any
+//! `claims:write` holder who can guess the content could do it.
 //!
 //! `crates/epigraph-api/src/routes/submit.rs` already had the correct shape
 //! (`if was_created && !packet.claim.labels.is_empty()`); this brings
@@ -100,7 +100,7 @@ async fn dedup_hit_must_not_overwrite_existing_labels() {
     assert!(
         labels.iter().any(|l| l == "policy:active"),
         "policy:active was stripped by a non-creating request — the claim is now \
-         invisible to every policies.rs UPDATE keyed on it. labels={labels:?}"
+         invisible to every policies.rs read keyed on it. labels={labels:?}"
     );
     assert!(
         labels.iter().any(|l| l == "keep-me"),

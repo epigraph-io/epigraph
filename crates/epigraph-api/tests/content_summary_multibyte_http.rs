@@ -1,11 +1,11 @@
 #![cfg(feature = "db")]
 //! Content summaries must be cut on a CHARACTER boundary.
 //!
-//! Three handlers shortened claim content with a byte slice:
-//!
-//! * `political.rs::position_timeline` — `&c.content[..120]`
-//! * `political.rs::inflation_index` — `&content[..120]`
-//! * `edges.rs::claim_provenance` — `&claim_row.content[..57]`
+//! `edges.rs::claim_provenance` shortened claim content with a byte slice,
+//! `&claim_row.content[..57]`. (Two more call sites, `political.rs`'s
+//! `position_timeline` and `inflation_index`, had the same defect and their
+//! arms lived here; both handlers were deleted with the political module,
+//! backlog bd13e0e0.)
 //!
 //! `&s[..n]` panics when byte `n` falls inside a multibyte UTF-8 character, so
 //! any claim whose content puts a non-ASCII character across that byte took
@@ -40,17 +40,6 @@ mod fixture;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
-
-/// 1 ASCII byte then 200 two-byte `é`: every `é` starts on an ODD byte, so the
-/// even byte 120 is the second byte of a character.
-fn content_cut_at_120_mid_char() -> String {
-    let s = format!("a{}", "é".repeat(200));
-    assert!(
-        !s.is_char_boundary(120),
-        "fixture must put byte 120 inside a character, or it tests nothing"
-    );
-    s
-}
 
 /// 100 two-byte `é`: characters start on EVEN bytes, so the odd byte 57 is
 /// the second byte of a character.
@@ -102,92 +91,6 @@ async fn get_ok(addr: std::net::SocketAddr, path: &str) -> Value {
         "GET {path} must answer 200; got {status}: {body}"
     );
     serde_json::from_str(&body).unwrap_or_else(|e| panic!("GET {path}: {e}: {body}"))
-}
-
-/// The one `content_summary` an agent-scoped endpoint returned under `key`.
-fn only_summary(body: &Value, key: &str) -> String {
-    let rows = body[key]
-        .as_array()
-        .unwrap_or_else(|| panic!("`{key}` is not an array: {body}"));
-    assert_eq!(rows.len(), 1, "one seeded claim, one `{key}` entry: {body}");
-    rows[0]["content_summary"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no string content_summary: {body}"))
-        .to_string()
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn position_timeline_summarises_multibyte_content_without_panicking() {
-    let (pool, addr, _shutdown) = pool_and_app().await;
-
-    // Control: ASCII over 120 characters is truncated to 120 + "...".
-    let (ascii_agent, _) = fixture::seed_agent_with_group(&pool, "timeline-ascii").await;
-    fixture::seed_public_claim(&pool, ascii_agent, &"x".repeat(130)).await;
-    let body = get_ok(
-        addr,
-        &format!("/api/v1/agents/{ascii_agent}/position-timeline"),
-    )
-    .await;
-    assert_eq!(
-        only_summary(&body, "timeline"),
-        format!("{}...", "x".repeat(120)),
-        "ASCII truncation must be unchanged"
-    );
-
-    // Defect arm.
-    let content = content_cut_at_120_mid_char();
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "timeline-multibyte").await;
-    fixture::seed_public_claim(&pool, agent, &content).await;
-    let body = get_ok(addr, &format!("/api/v1/agents/{agent}/position-timeline")).await;
-    let summary = only_summary(&body, "timeline");
-    let expected: String = content.chars().take(120).collect::<String>() + "...";
-    assert_eq!(
-        summary, expected,
-        "a 201-character summary is cut to 120 characters plus an ellipsis"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn inflation_index_summarises_multibyte_content_without_panicking() {
-    let (pool, addr, _shutdown) = pool_and_app().await;
-
-    async fn seed_inflation_claim(pool: &sqlx::PgPool, label: &str, content: &str) -> Uuid {
-        let (agent, _) = fixture::seed_agent_with_group(pool, label).await;
-        let claim = fixture::seed_public_claim(pool, agent, content).await;
-        // `get_agent_inflation_claims` selects only claims carrying an
-        // `inflation_factor`; without it the list is empty and the summary
-        // code never runs.
-        sqlx::query(
-            "UPDATE claims SET properties = \
-             COALESCE(properties, '{}'::jsonb) || '{\"inflation_factor\": 2.0}'::jsonb \
-             WHERE id = $1",
-        )
-        .bind(claim)
-        .execute(pool)
-        .await
-        .expect("mark the claim as an inflation claim");
-        agent
-    }
-
-    // Control.
-    let ascii_agent = seed_inflation_claim(&pool, "inflation-ascii", &"y".repeat(130)).await;
-    let body = get_ok(
-        addr,
-        &format!("/api/v1/agents/{ascii_agent}/inflation-index"),
-    )
-    .await;
-    assert_eq!(
-        only_summary(&body, "sample_claims"),
-        format!("{}...", "y".repeat(120)),
-        "ASCII truncation must be unchanged"
-    );
-
-    // Defect arm.
-    let content = content_cut_at_120_mid_char();
-    let agent = seed_inflation_claim(&pool, "inflation-multibyte", &content).await;
-    let body = get_ok(addr, &format!("/api/v1/agents/{agent}/inflation-index")).await;
-    let expected: String = content.chars().take(120).collect::<String>() + "...";
-    assert_eq!(only_summary(&body, "sample_claims"), expected);
 }
 
 /// The provenance label for `claim`, read from the one chain a claim with a

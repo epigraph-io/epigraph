@@ -236,14 +236,14 @@ async fn seed_client_and_code(
     let unique = Uuid::new_v4().simple().to_string();
     let client_id = format!("epigraph_test_{unique}");
     // Seed the client's granted_scopes as a STRICT SUPERSET of the code's scopes
-    // (extra: evidence:read). handle_authorization_code mints the token from
+    // (extra: tasks:read). handle_authorization_code mints the token from
     // row.scopes (the CODE), NOT the client's granted_scopes — unlike
     // client_credentials, which intersects. The happy-path assertion (token
     // scopes == code scopes) therefore isolates that property: a regression that
     // switched to client-granted scopes would surface the extra scope and fail.
     let mut client_scopes: Vec<String> = scopes.to_vec();
-    if !client_scopes.iter().any(|s| s == "evidence:read") {
-        client_scopes.push("evidence:read".to_string());
+    if !client_scopes.iter().any(|s| s == "tasks:read") {
+        client_scopes.push("tasks:read".to_string());
     }
     let oauth_client_uuid = OAuthClientRepository::create(
         pool,

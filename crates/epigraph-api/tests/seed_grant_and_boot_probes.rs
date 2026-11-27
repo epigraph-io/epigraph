@@ -6,7 +6,8 @@
 //! `AppState::probe_rls_posture` and `AppState::warn_on_privileged_connection`
 //! are composed at runtime around
 //! `epigraph_db::repos::seed_posture::SESSION_IS_SEED_SQL`, and the only
-//! caller of either is `bin/server.rs` at boot.
+//! caller of either at boot is `boot::check_db_posture` (through their
+//! `*_on(pool)` forms), which `bin/server.rs` calls.
 //! `seed_escape_explicit_membership.rs::the_boot_probe_asks_the_seed_question_the_triggers_ask`
 //! tests the EXPRESSION; this runs the two statements that embed it (column
 //! order, tuple decode, the `$1` bind). That matters in one direction:

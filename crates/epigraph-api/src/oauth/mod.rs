@@ -1,5 +1,6 @@
 //! OAuth2 authorization server module.
 
+pub mod assertion;
 pub mod authorize;
 pub mod device;
 pub mod introspect;
