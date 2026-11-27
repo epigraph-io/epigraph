@@ -1,6 +1,10 @@
-//! `epigraph-tenancy-backfill` — the one-shot, batched, resumable backfill that
-//! gives every pre-existing row an explicit tenancy declaration, plus the
-//! `verify` subcommand whose exit code is the deploy pre-flight.
+//! `epigraph-tenancy-backfill` — the batched, resumable backfill that gives
+//! every pre-existing row an explicit tenancy declaration, plus the `verify`
+//! subcommand whose exit code is the deploy pre-flight.
+//!
+//! Status: `run` is one-shot; see the crates/epigraph-cli README
+//! classification. `verify` is the standing deploy pre-flight, which is why
+//! the README classifies the binary `admin`.
 //!
 //! # What it stamps, and why not `world` or `seed`
 //!

@@ -149,3 +149,86 @@ fn every_bin_has_exactly_one_readme_row_with_a_defined_class() {
         "README.md rows naming no [[bin]] in Cargo.toml: {stale:?}. Remove or rename them."
     );
 }
+
+/// `(name, path)` of every `[[bin]]` target; `path` defaults to
+/// `src/bin/<name>.rs`, as Cargo's does.
+fn manifest_bin_paths(manifest: &str) -> Vec<(String, String)> {
+    let manifest: toml::Table = toml::from_str(manifest).expect("Cargo.toml parses as TOML");
+    let Some(bins) = manifest.get("bin") else {
+        return Vec::new();
+    };
+    bins.as_array()
+        .expect("`bin` is an array of tables")
+        .iter()
+        .map(|bin| {
+            let name = bin
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .expect("a [[bin]] has a string `name`")
+                .to_string();
+            let path = bin
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .map_or_else(|| format!("src/bin/{name}.rs"), str::to_string);
+            (name, path)
+        })
+        .collect()
+}
+
+/// The first `//!` line of a binary's source: the summary its header gives.
+fn summary_line(source: &str) -> Option<&str> {
+    source
+        .lines()
+        .find(|l| l.trim_start().starts_with("//!"))
+        .map(str::trim)
+}
+
+/// A standing or admin binary must not introduce itself as one-time (backlog
+/// 748966d0, split from 02de2b85): `epigraph-operator` called itself "the
+/// one-time operator ownership backfill" while it carries the standing operator
+/// verbs, which is the kind of header that gets a reusable tool retired.
+#[test]
+fn standing_and_admin_bins_do_not_introduce_themselves_as_one_time() {
+    let classes: BTreeMap<&str, &str> = table_rows(README, "Binaries").into_iter().collect();
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0;
+    let mut offenders = Vec::new();
+    for (name, path) in manifest_bin_paths(MANIFEST) {
+        let Some(class) = classes.get(name.as_str()) else {
+            continue; // the completeness test reports a missing row
+        };
+        if !matches!(*class, "standing" | "admin") {
+            continue;
+        }
+        let source = std::fs::read_to_string(crate_dir.join(&path))
+            .unwrap_or_else(|e| panic!("read {path} for [[bin]] {name}: {e}"));
+        let summary = summary_line(&source)
+            .unwrap_or_else(|| panic!("{path} ([[bin]] {name}) has no `//!` header"));
+        checked += 1;
+        let lower = summary.to_lowercase();
+        if ["one-time", "one-shot", "one time", "one shot"]
+            .iter()
+            .any(|w| lower.contains(w))
+        {
+            offenders.push(format!("{name} ({class}): {summary}"));
+        }
+    }
+    // Non-vacuity: both classes are populated well beyond a handful of bins.
+    assert!(checked >= 20, "only {checked} standing/admin bins checked");
+    assert!(
+        offenders.is_empty(),
+        "these binaries are classified standing or admin in README.md, yet their \
+         header's summary line calls them one-time/one-shot; rewrite the summary \
+         (keep any one-shot history further down the header):\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn summary_line_is_the_first_inner_doc_line() {
+    assert_eq!(
+        summary_line("// licence\n//! `x` — the tool.\n//! more\n"),
+        Some("//! `x` — the tool.")
+    );
+    assert_eq!(summary_line("fn main() {}\n"), None);
+}

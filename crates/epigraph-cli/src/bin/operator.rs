@@ -1,4 +1,36 @@
-//! `epigraph-operator` — the one-time operator ownership backfill.
+//! `epigraph-operator` — the audited operator verbs, run by hand on the
+//! maintenance connection.
+//!
+//! Its standing subcommands, by kind (flags under "Usage" below and `--help`):
+//!
+//! * roles and elevation: `grant-role`, `end-role-assignment`,
+//!   `list-role-assignments`, `restore-role-successor`, `end-elevation`,
+//!   `list-elevations`, `verify-confirmations`, `arm-admin-scopes`,
+//!   `disarm-admin-scopes`;
+//! * passkeys: `passkey-enroll`, `list-passkeys`, `revoke-passkey`;
+//! * groups and roles: `create-group`, `define-group-role`, `bind-group-role`,
+//!   `end-group-role-binding`, `role-attach`, `role-detach`, `group-roster`,
+//!   `group-member`, `set-default-group`;
+//! * operators, identity links and clients: `register-human-operator`,
+//!   `revoke-human-operator`, `register-system-agent`, `link`, `retire-link`,
+//!   `arm-operator-binding`, `approve-client`, `suspend-client`,
+//!   `revoke-client`, `allow-author-binding-client`,
+//!   `revoke-author-binding-client`, `grant-client-scope`,
+//!   `revoke-client-scope`, `list-dcr-clients`, `sweep-dcr-clients`;
+//! * custody, ownership and restriction: `custodial-supersede`,
+//!   `reown-claims`, `reown-linked`, `restrict-claims`, `regroup-claims`,
+//!   `reown-workflows`, `hide-evidence`, `set-workflow-submitter`,
+//!   `delete-frames`, `privatization`, and `reown-reverse`, which reverses
+//!   their manifests;
+//! * repairs with a reverse verb or an audited record:
+//!   `backfill-ingest-markers` / `reverse-ingest-markers`,
+//!   `backfill-evidence-edges` / `reverse-evidence-edges`,
+//!   `link-legacy-authors`, `link-retired`.
+//!
+//! History: the binary began as the operator ownership backfill that
+//! migration 107 left out of scope (`link-retired`, `reown-claims` and
+//! `reown-reverse`). Those verbs stay for later re-owns; the crate README
+//! classifies the binary `admin`.
 //!
 //! See `epigraph_cli::operator` for what each subcommand does and why. This
 //! file is argument parsing and exit codes only.
