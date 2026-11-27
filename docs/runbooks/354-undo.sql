@@ -32,7 +32,14 @@
 --   * no rows: 354 refused to run while any table held one, so there is
 --     nothing to restore;
 --   * the tables owned by the login that runs this file (001 created them as
---     the migrating login);
+--     the migrating login), with the grants a fresh migrate gives them. The
+--     exact-match test (harvester_tables_dropped.rs) proves the shape on a
+--     fresh database only; a deployed database whose tables had another owner
+--     or extra grants comes back without them, and nothing reports it. So
+--     BEFORE applying 354, record each table's owner and ACL (`\dp
+--     public.harvester_*`, or `SELECT relname, pg_get_userbyid(relowner),
+--     relacl FROM pg_class WHERE relname LIKE 'harvester\_%'`), and after
+--     this file compare against that record and re-apply any difference;
 --   * 354's `_sqlx_migrations` row. Dropping the tables again is a NEW
 --     migration, never a re-run of 354.
 --
