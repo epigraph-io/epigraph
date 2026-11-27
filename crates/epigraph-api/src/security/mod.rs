@@ -18,8 +18,7 @@ pub mod rate_limit;
 
 pub use audit::{SecurityAuditLog, SecurityEvent, SecurityEventFilter};
 pub use keys::{
-    AgentKey, KeyError, KeyManager, KeyRepository, KeyRevocationRequest, KeyRotationRequest,
-    KeyStatus, KeyType, Signature,
+    AgentKey, KeyError, KeyRevocationRequest, KeyRotationRequest, KeyStatus, KeyType, Signature,
 };
 pub use rate_limit::{
     AgentRateLimiter, Quota, RateLimitConfig, RateLimitError, RateLimitSettings, TrustedProxies,

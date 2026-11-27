@@ -11,7 +11,6 @@ use uuid::Uuid;
 #[cfg(feature = "db")]
 use epigraph_db::PgPool;
 
-use crate::middleware::SignatureVerificationState;
 use crate::oauth::providers::ProviderRegistry;
 use crate::routes::harvest::HarvesterClient;
 use crate::security::audit::InMemorySecurityAuditLog;
@@ -374,25 +373,6 @@ pub struct AppState {
     pub config: ApiConfig,
     /// Idempotency store for duplicate request detection
     pub idempotency_store: IdempotencyStore,
-    /// Signature verification state for the Ed25519 request-signing middleware.
-    ///
-    /// **Test-only as of PR-03, and left in place deliberately.** Its sole
-    /// production consumer was `middleware::require_signature`, which was
-    /// unreachable through either `create_router` and has been deleted; the
-    /// remaining constructors (`with_signature_state`,
-    /// `with_db_and_signature_state`) and every reader of this field now live
-    /// under `tests/`. `SecurityEvent::signature_verification` and
-    /// `::auth_attempt` are consequently never written any more — `deploy.md`
-    /// §5 tells operators their dashboards for those two event types will read
-    /// empty.
-    ///
-    /// Not deleted in PR-03 because removing it means touching `AppState`'s
-    /// two non-db constructors, and the `not(feature = "db")` configuration
-    /// did not compile then, so the change could not be verified. That reason
-    /// has lapsed: CI now runs
-    /// `cargo check -p epigraph-api --no-default-features --locked`. The field
-    /// is still dead weight, not a hazard: nothing reads it on a request path.
-    pub signature_state: SignatureVerificationState,
     /// Thread-safe propagation orchestrator for truth propagation
     ///
     /// The orchestrator maintains the in-memory representation of the
@@ -1414,12 +1394,9 @@ impl AppState {
     /// Create new application state with the given configuration (no database)
     #[cfg(not(feature = "db"))]
     pub fn new(config: ApiConfig) -> Self {
-        let signature_state =
-            SignatureVerificationState::new().with_max_request_size(config.max_request_size);
         Self {
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
-            signature_state,
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
@@ -1459,8 +1436,6 @@ impl AppState {
     /// Create new application state with database pool and configuration
     #[cfg(feature = "db")]
     pub fn with_db(db_pool: PgPool, config: ApiConfig) -> Self {
-        let signature_state =
-            SignatureVerificationState::new().with_max_request_size(config.max_request_size);
         Self {
             db_pool,
             scoped: None,
@@ -1480,7 +1455,6 @@ impl AppState {
             guest_rate_limiter: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
-            signature_state,
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
@@ -1503,37 +1477,6 @@ impl AppState {
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
             edge_signer: None,
-        }
-    }
-
-    /// Create new application state with custom signature verification state
-    #[cfg(not(feature = "db"))]
-    pub fn with_signature_state(
-        config: ApiConfig,
-        signature_state: SignatureVerificationState,
-    ) -> Self {
-        Self {
-            config,
-            idempotency_store: Arc::new(RwLock::new(HashMap::new())),
-            signature_state,
-            propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
-            propagator: DatabasePropagator::with_defaults(),
-            rate_limiter: None,
-            address_rate_limiter: None,
-            audit_log: Arc::new(InMemorySecurityAuditLog::new()),
-            embedding_service: None,
-            embedding_provider: None,
-            challenge_service: Arc::new(ChallengeService::new()),
-            claim_store: Arc::new(RwLock::new(HashMap::new())),
-            event_bus: Arc::new(EventBus::new(1000)),
-            started_at: Instant::now(),
-            webhook_store: Arc::new(RwLock::new(HashMap::new())),
-            webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
-            jwt_config: Self::default_jwt_config(),
-            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
-            providers: Arc::new(ProviderRegistry::empty()),
-            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
         }
     }
 
@@ -2074,70 +2017,15 @@ impl AppState {
         Ok(stored)
     }
 
-    /// Create new application state with database pool and custom signature verification state
-    #[cfg(feature = "db")]
-    pub fn with_db_and_signature_state(
-        db_pool: PgPool,
-        config: ApiConfig,
-        signature_state: SignatureVerificationState,
-    ) -> Self {
-        Self {
-            db_pool,
-            scoped: None,
-            #[cfg(feature = "db")]
-            admin_cascade: false,
-            #[cfg(feature = "db")]
-            run_tokens: epigraph_db::RunTokens::Off,
-            #[cfg(feature = "db")]
-            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
-            #[cfg(feature = "db")]
-            token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
-            ),
-            bp_apply: BpApply::Off,
-            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
-            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard(),
-            guest_reads: GuestReads::Off,
-            guest_rate_limiter: None,
-            config,
-            idempotency_store: Arc::new(RwLock::new(HashMap::new())),
-            signature_state,
-            propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
-            propagator: DatabasePropagator::with_defaults(),
-            rate_limiter: None,
-            address_rate_limiter: None,
-            audit_log: Arc::new(InMemorySecurityAuditLog::new()),
-            embedding_service: None,
-            embedding_provider: None,
-            challenge_service: Arc::new(ChallengeService::new()),
-            claim_store: Arc::new(RwLock::new(HashMap::new())),
-            event_bus: Arc::new(EventBus::new(1000)),
-            started_at: Instant::now(),
-            webhook_store: Arc::new(RwLock::new(HashMap::new())),
-            webhook_egress: epigraph_jobs::egress::EgressGuard::system(),
-            harvester_client: None,
-            jwt_config: Self::default_jwt_config(),
-            policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
-            providers: Arc::new(ProviderRegistry::empty()),
-            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
-            entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
-            passkeys: None,
-            edge_signer: None,
-        }
-    }
-
     /// Create new application state with custom propagation configuration
     #[cfg(not(feature = "db"))]
     pub fn with_propagation_config(
         config: ApiConfig,
         propagation_config: PropagationConfig,
     ) -> Self {
-        let signature_state =
-            SignatureVerificationState::new().with_max_request_size(config.max_request_size);
         Self {
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
-            signature_state,
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::new(propagation_config),
             rate_limiter: None,
@@ -2166,8 +2054,6 @@ impl AppState {
         config: ApiConfig,
         propagation_config: PropagationConfig,
     ) -> Self {
-        let signature_state =
-            SignatureVerificationState::new().with_max_request_size(config.max_request_size);
         Self {
             db_pool,
             scoped: None,
@@ -2187,7 +2073,6 @@ impl AppState {
             guest_rate_limiter: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
-            signature_state,
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::new(propagation_config),
             rate_limiter: None,
@@ -3000,10 +2885,10 @@ impl Default for ApiConfig {
 ///
 /// Every `AppState` constructor needs a live `PgPool` (or, in the no-db arm,
 /// the whole set of embedding/event/challenge services). What is under test is
-/// the *default the constructors install*, and all six install the identical
+/// the *default the constructors install*, and all four install the identical
 /// expression `Arc::new(epigraph_authz::GroupPolicyGate::new())`. Asserting
 /// against that value directly keeps this a unit test;
-/// [`the_default_gate_is_installed_at_every_constructor`] pins that the six
+/// [`the_default_gate_is_installed_at_every_constructor`] pins that the four
 /// sites and the value here have not drifted apart, by reading this file.
 #[cfg(test)]
 mod extension_wiring_tests {
@@ -3058,15 +2943,17 @@ mod extension_wiring_tests {
         assert!(decision.is_allowed(), "got {decision:?}");
     }
 
-    /// Six assignment sites cover eight public entry points: `AppState::new`
+    /// Four assignment sites cover six public entry points: `AppState::new`
     /// (db) and `with_scoped_pool` delegate to `with_db` rather than assigning
     /// their own. Counting the literal is how the three tests above stay
-    /// connected to the constructors they claim to describe — a seventh
-    /// constructor that installed something else would show up here.
+    /// connected to the constructors they claim to describe — a fifth
+    /// constructor that installed something else would show up here. (The
+    /// two request-signing-middleware constructors were deleted with that
+    /// middleware, backlog 67f71b76.)
     #[test]
     fn the_default_gate_is_installed_at_every_constructor() {
         let src = include_str!("state.rs");
-        // Split so the needle itself is not a seventh occurrence of the thing
+        // Split so the needle itself is not a fifth occurrence of the thing
         // being counted.
         let needle = concat!(
             "policy_gate: Arc::new(epigraph_authz::",
@@ -3074,10 +2961,9 @@ mod extension_wiring_tests {
         );
         let installs = src.matches(needle).count();
         assert_eq!(
-            installs, 6,
-            "expected the fail-closed default at all six `policy_gate:` \
+            installs, 4,
+            "expected the fail-closed default at all four `policy_gate:` \
              assignment sites (AppState::new(no-db), with_db, \
-             with_signature_state, with_db_and_signature_state, \
              with_propagation_config, with_db_and_propagation_config), found \
              {installs}"
         );

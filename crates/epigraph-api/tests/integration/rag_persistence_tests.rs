@@ -22,7 +22,6 @@ use axum::{
     http::{Method, Request, StatusCode},
     Router,
 };
-use epigraph_api::middleware::SignatureVerificationState;
 use epigraph_api::{create_router, ApiConfig, AppState};
 use epigraph_core::Agent;
 use epigraph_db::{AgentRepository, PgPool};
@@ -149,15 +148,13 @@ fn rag_bearer_token() -> String {
 /// Conversion shard 6 moved `rag_context` onto `AppState::read_as`, which
 /// HARD-REFUSES a state whose `scoped` is `None` — that refusal is the
 /// fail-closed behaviour of the conversion, not an inconvenience to route
-/// around. `AppState::with_db_and_signature_state` leaves `scoped: None`, so
+/// around. `AppState::with_db` leaves `scoped: None`, so
 /// every one of the five arms in this file would have started asserting
 /// `StatusCode::OK` against a 500.
 ///
 /// The repair is plumbing, not a weakened assertion: `with_scoped_pool` sets
 /// `db_pool = scoped.inner().clone()`, so these tests keep exactly the
-/// connection posture and the row visibility they had. `signature_state` is a
-/// public field and is assigned after construction because no constructor takes
-/// both a `ScopedPool` and a signature state.
+/// connection posture and the row visibility they had.
 ///
 /// These tests are about RAG query SEMANTICS — similarity ordering, `min_truth`,
 /// `limit`, the domain filter — not about tenancy, and they are not being asked
@@ -171,13 +168,11 @@ async fn create_test_router(pool: PgPool) -> Router {
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
     };
-    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
     let url = viewer_fixture::database_url_for(&pool).await;
     let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
         .await
         .expect("connect a scoped pool");
-    let mut state = AppState::with_scoped_pool(scoped, config);
-    state.signature_state = signature_state;
+    let state = AppState::with_scoped_pool(scoped, config);
     create_router(state)
 }
 

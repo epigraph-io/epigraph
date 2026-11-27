@@ -2,7 +2,6 @@
 pub mod edge_signer;
 pub mod embedding_restore;
 pub mod errors;
-pub mod extractors;
 #[cfg(feature = "db")]
 pub mod jobs_drain;
 pub mod metrics;

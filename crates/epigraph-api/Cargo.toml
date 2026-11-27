@@ -175,20 +175,12 @@ name = "db_integration_tests"
 path = "tests/integration/db_integration_tests.rs"
 
 [[test]]
-name = "signature_middleware_tests"
-path = "tests/middleware/signature_tests.rs"
-
-[[test]]
 name = "semantic_search_tests"
 path = "tests/routes/semantic_search_tests.rs"
 
 [[test]]
 name = "submit_packet_tests"
 path = "tests/routes/submit_packet_tests.rs"
-
-[[test]]
-name = "middleware_integration_tests"
-path = "tests/integration/middleware_integration_tests.rs"
 
 [[test]]
 name = "submit_persistence_tests"
@@ -213,14 +205,6 @@ path = "tests/integration/test_claim_cleanup.rs"
 [[test]]
 name = "security_tests"
 path = "tests/security_tests.rs"
-
-[[test]]
-name = "signed_extractor_tests"
-path = "tests/extractors/signed_extractor_tests.rs"
-
-[[test]]
-name = "key_management_tests"
-path = "tests/key_management_tests.rs"
 
 [[test]]
 name = "audit_integration_tests"

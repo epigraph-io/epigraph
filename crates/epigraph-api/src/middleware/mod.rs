@@ -1,4 +1,3 @@
-pub mod auth;
 pub mod bearer;
 #[cfg(feature = "db")]
 pub mod elevated_access;
@@ -10,12 +9,6 @@ pub mod instance_authz;
 pub mod provenance;
 pub mod rate_limit;
 pub mod scopes;
-
-// Re-export common types for convenience
-pub use auth::{
-    signature_verification_middleware, SignatureError, SignatureVerificationState, VerifiedAgent,
-    PUBLIC_KEY_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER,
-};
 
 // Re-export rate limiting middleware
 #[cfg(feature = "db")]
@@ -33,35 +26,24 @@ pub use instance_authz::require_instance_admin_for_group;
 pub use provenance::record_provenance;
 pub use scopes::check_scopes;
 
-// Legacy export (deprecated)
-#[allow(deprecated)]
-pub use auth::signature_verification_layer;
-
 // ---------------------------------------------------------------------------
-// `require_signature` was DELETED in PR-03.
+// Ed25519 *request* signing (X-Signature / X-Public-Key / X-Timestamp headers
+// over the raw body) is gone.
 //
-// It layered Ed25519 *request* signing (X-Signature / X-Public-Key /
-// X-Timestamp headers over the raw body) on the `protected` router whenever
-// `ApiConfig::require_signatures` was set. It had been unreachable through
-// either `create_router` variant: the branch that installed it also short-
-// circuited on any request carrying an `AuthContext`, and bearer auth ran
-// first, so every authenticated request skipped it and every unauthenticated
-// one was rejected earlier.
+// PR-03 deleted `require_signature`, the only production installer of the
+// request-signing middleware: it had been unreachable through either
+// `create_router` variant (bearer auth ran first and short-circuited it). It
+// was also the only writer of `SecurityEvent::signature_verification` and
+// `SecurityEvent::auth_attempt` rows, so those event types have no producer
+// (see docs/deploy.md).
 //
-// Two knock-on effects, recorded here rather than left to be discovered:
+// Backlog 67f71b76 then deleted what PR-03 had left behind with no production
+// caller: the middleware itself (`middleware/auth.rs`, with its state type,
+// error type, verified-agent extension and header constants), its deprecated
+// layer shim, the signed-request body extractor, the in-memory key manager
+// and the `AppState` field and constructors that carried the middleware's
+// state. Their tests built their own routers around them and went with them.
 //
-//   * It was the only writer of `SecurityEvent::signature_verification` and
-//     `SecurityEvent::auth_attempt` rows into `security_events`. Those event
-//     types now have no producer. Nothing live is lost — the path was already
-//     unreachable — but a dashboard reading them will read empty forever.
-//   * It was the only production caller of `signature_verification_middleware`,
-//     which is what inserts `VerifiedAgent` into request extensions. The
-//     `VerifiedAgent` branch in `rate_limit.rs` is consequently dead; see the
-//     note there.
-//
-// `signature_verification_middleware`, `VerifiedAgent` and the header
-// constants remain exported above: the middleware tests build their own
-// routers around them, and PAYLOAD-level packet signatures
-// (`ApiConfig::require_packet_signatures` -> `routes/submit.rs`) are a
-// separate, live mechanism that this deletion does not touch.
+// PAYLOAD-level packet signatures (`ApiConfig::require_packet_signatures` ->
+// `routes/submit.rs`) are a separate, live mechanism and are untouched.
 // ---------------------------------------------------------------------------

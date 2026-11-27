@@ -1,10 +1,14 @@
-//! Agent key management for key rotation and revocation
+//! Agent key types for key rotation and revocation
 //!
-//! This module implements secure key lifecycle management:
+//! This module holds the key lifecycle types:
 //! - Key creation with validity periods
-//! - Key rotation with dual-signature verification
-//! - Key revocation with reason tracking
+//! - Key rotation requests with dual-signature verification
+//! - Key revocation requests with reason tracking
 //! - Status-based access control
+//!
+//! The rotation and revocation routes (`routes/agent_keys.rs`) persist keys
+//! through `epigraph_db::AgentKeyRepository`; there is no in-memory key
+//! manager.
 //!
 //! # Security Properties
 //!
@@ -456,186 +460,6 @@ impl KeyRevocationRequest {
             revoked_by,
             created_at: Utc::now(),
         }
-    }
-}
-
-/// Repository trait for key persistence
-///
-/// This trait abstracts the storage layer, enabling:
-/// - In-memory repositories for testing
-/// - Database repositories for production
-/// - Mock repositories for unit tests
-pub trait KeyRepository: Send + Sync {
-    /// Store a new key
-    fn store_key(&self, key: AgentKey);
-
-    /// Get a key by ID
-    fn get_key(&self, key_id: Uuid) -> Option<AgentKey>;
-
-    /// Get the active key for an agent
-    fn get_active_key(&self, agent_id: AgentId) -> Option<AgentKey>;
-
-    /// Update an existing key
-    fn update_key(&self, key: AgentKey);
-}
-
-/// Service for managing agent keys
-///
-/// This service handles:
-/// - Key creation and registration
-/// - Key rotation with verification
-/// - Key revocation
-/// - Key lookup and validation
-///
-/// # Type Parameters
-///
-/// * `R` - Repository implementation for key persistence
-pub struct KeyManager<R: KeyRepository> {
-    repo: R,
-}
-
-impl<R: KeyRepository> KeyManager<R> {
-    /// Create a new key manager with the given repository
-    #[must_use]
-    pub fn new(repo: R) -> Self {
-        Self { repo }
-    }
-
-    /// Get the currently active key for an agent
-    ///
-    /// # Errors
-    ///
-    /// Returns `KeyError::KeyNotFound` if no active key exists
-    pub fn get_active_key(&self, agent_id: AgentId) -> Result<AgentKey, KeyError> {
-        self.repo
-            .get_active_key(agent_id)
-            .ok_or(KeyError::KeyNotFound {
-                key_id: Uuid::nil(), // No specific key ID when searching by agent
-                agent_id,
-            })
-    }
-
-    /// Rotate an agent's key
-    ///
-    /// # Process
-    ///
-    /// 1. Get the current active key
-    /// 2. Verify the current key is active
-    /// 3. Verify the old key signature over the rotation message
-    /// 4. Verify the new key signature over the rotation message
-    /// 5. Mark the current key as Rotated
-    /// 6. Create and activate the new key
-    ///
-    /// # Security Notes
-    ///
-    /// Both signatures are verified using ed25519-dalek with constant-time
-    /// comparison. This prevents:
-    /// - Timing attacks on signature verification
-    /// - Key substitution attacks (message includes new public key)
-    ///
-    /// # Errors
-    ///
-    /// Returns `KeyError` if:
-    /// - No active key exists for the agent
-    /// - Current key is not active
-    /// - Old key signature is invalid
-    /// - New key signature is invalid
-    pub fn rotate_key(&self, request: KeyRotationRequest) -> Result<AgentKey, KeyError> {
-        // 1. Get current active key
-        let mut current_key = self.get_active_key(request.agent_id)?;
-
-        // 2. Verify current key is active
-        if current_key.status != KeyStatus::Active {
-            return Err(KeyError::InvalidKeyStatus {
-                key_id: current_key.id,
-                status: current_key.status,
-                operation: "key rotation".to_string(),
-            });
-        }
-
-        // 3. Verify old key signature
-        let message = request.message_to_sign();
-        let old_sig_valid = SignatureVerifier::verify(
-            &current_key.public_key,
-            &message,
-            request.old_key_signature.as_bytes(),
-        )
-        .unwrap_or(false);
-
-        if !old_sig_valid {
-            return Err(KeyError::InvalidOldKeySignature);
-        }
-
-        // 4. Verify new key signature
-        let new_sig_valid = SignatureVerifier::verify(
-            &request.new_public_key,
-            &message,
-            request.new_key_signature.as_bytes(),
-        )
-        .unwrap_or(false);
-
-        if !new_sig_valid {
-            return Err(KeyError::InvalidNewKeySignature);
-        }
-
-        // 5. Mark current key as rotated
-        current_key.mark_rotated();
-        self.repo.update_key(current_key);
-
-        // 6. Create and store new active key
-        let new_key = AgentKey::new(request.agent_id, request.new_public_key);
-        self.repo.store_key(new_key.clone());
-
-        Ok(new_key)
-    }
-
-    /// Revoke an agent's key
-    ///
-    /// # Process
-    ///
-    /// 1. Look up the key by ID
-    /// 2. Verify the key belongs to the requesting agent
-    /// 3. Check the key is not already revoked
-    /// 4. Mark the key as Revoked with reason and revoked_by
-    ///
-    /// # Errors
-    ///
-    /// Returns `KeyError` if:
-    /// - Key not found
-    /// - Key belongs to a different agent
-    /// - Key already revoked
-    pub fn revoke_key(&self, request: KeyRevocationRequest) -> Result<(), KeyError> {
-        // 1. Get the key to revoke
-        let mut key = self
-            .repo
-            .get_key(request.key_id)
-            .ok_or(KeyError::KeyNotFound {
-                key_id: request.key_id,
-                agent_id: request.agent_id,
-            })?;
-
-        // 2. Verify the key belongs to the agent
-        if key.agent_id != request.agent_id {
-            return Err(KeyError::KeyNotFound {
-                key_id: request.key_id,
-                agent_id: request.agent_id,
-            });
-        }
-
-        // 3. Check if already revoked
-        if key.status == KeyStatus::Revoked {
-            return Err(KeyError::InvalidKeyStatus {
-                key_id: key.id,
-                status: KeyStatus::Revoked,
-                operation: "revocation".to_string(),
-            });
-        }
-
-        // 4. Revoke the key
-        key.revoke(request.reason, request.revoked_by);
-        self.repo.update_key(key);
-
-        Ok(())
     }
 }
 
