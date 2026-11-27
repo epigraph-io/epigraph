@@ -67,8 +67,12 @@ exactly the coupling the wave removes, and the ratchet counts them.
 The one test-only exception is composition in tests. A front end's
 `tests/` may build another front end beside its own (the API's tests start an
 MCP server beside the router, and the CLI's tests drive the real API
-handlers). These edges are dev-dependencies, and the ratchet does not count
-files under `tests/`.
+handlers), and the ratchet does not count files under `tests/`. Only the
+CLI's edge is a dev-dependency today: the API's tests reach `epigraph-mcp`
+through the API's optional normal dependency (the `db` feature), the same
+edge section 2 lists. When the wave removes that edge, those tests need an
+`epigraph-mcp` dev-dependency in its place; this exception permits that, and
+the step that makes the swap lists the dev edge in the ratchet's allowed edges.
 
 ## 4. Where new shared logic goes
 
@@ -88,8 +92,12 @@ files under `tests/`.
 
 ## 5. How it is enforced
 
-`crates/epigraph-api/tests/crate_layering_ratchet.rs` (added with the service
-crate, backlog 6ffcb138) fails when:
+`crates/epigraph-api/tests/crate_layering_ratchet.rs` arrives in the same
+change as the service crate (the first step of the wave, backlog 6ffcb138).
+In a tree that has no `crates/epigraph-service` yet, that step has not landed:
+the rule still holds, and shared logic goes into a kernel crate or waits for
+the service crate, never into a front end. Once it has landed, the ratchet
+fails when:
 
 1. **A new dependency edge appears among the three front ends**, or from
    `epigraph-service` to any of them. Every dependency table is read (normal,
