@@ -27,7 +27,7 @@ mod types;
 use discover::scan_migrations;
 
 /// Path to this repo's `migrations/` directory.
-/// `CARGO_MANIFEST_DIR` resolves to `crates/epigraph-tools/` at compile time,
+/// `CARGO_MANIFEST_DIR` resolves to `crates/epigraph-cli/` at compile time,
 /// so the workspace root is two levels up.
 const EPIGRAPH_MIGRATIONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
 

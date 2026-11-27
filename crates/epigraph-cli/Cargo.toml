@@ -659,6 +659,19 @@ epigraph-db = { workspace = true, features = ["test-support"] }
 openssl = "0.10"
 ciborium = "0.2"
 url = "2"
+# The `table_graph` example (and its two `tests/table_graph_*` targets, which
+# `#[path]`-include its source): migration DDL scans and the dossier walk.
+# It moved here from the retired `epigraph-tools` crate; a dev-dependency, so
+# the library and its bins do not link either crate.
+regex = { workspace = true }
+walkdir = { workspace = true }
+
+# A cargo example, not a `[[bin]]`: a research/documentation pipeline that
+# narrates each migration table, built only by `cargo build --example
+# table_graph` and the `--all-targets` gates.
+[[example]]
+name = "table_graph"
+path = "examples/table_graph/main.rs"
 
 [lints]
 workspace = true

@@ -188,9 +188,9 @@ class AffectedSelection(unittest.TestCase):
             self.assertEqual(pr_plan(["docs/x.md", path])["mode"], "full", path)
 
     def test_a_crate_manifest_is_that_crate_not_the_full_set(self):
-        d = pr_plan(["crates/epigraph-tools/Cargo.toml"])
+        d = pr_plan(["crates/epigraph-cli/Cargo.toml"])
         self.assertEqual(d["mode"], "affected")
-        self.assertIn("epigraph-tools", d["whole"])
+        self.assertIn("epigraph-cli", d["whole"])
 
     def test_source_scans_shard_runs_per_package_at_its_thread_count(self):
         d = pr_plan(["crates/epigraph-api/src/lib.rs"])
