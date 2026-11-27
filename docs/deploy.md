@@ -1818,9 +1818,14 @@ are in no canonical role, registration set, delegated ceiling or
 changes. A client, refresh chain or token that already carries one keeps
 working: the held scope is ignored (a delegated run token carrying one is not
 refused by the delegated ceiling), and a request that names one (refresh,
-`client_credentials`, token exchange, run token, authorize) drops it, so a
-request naming only retired scopes means "as granted" instead of
-`invalid_scope`. Optional tidying, in any order after the deploy: re-run
+`client_credentials`, token exchange, run token, authorize) drops it. A
+request naming ONLY retired scopes means "as granted" where the answer is
+bounded by the requester's own grant (refresh, `client_credentials`, token
+exchange), instead of `invalid_scope`. Where the token or consent is for
+someone else it is never widened: a run token request naming only retired
+scopes is refused `invalid_scope` (`no_scope`), as one naming only ungranted
+scopes is, and an authorize request naming only retired scopes puts no scope
+to the person for consent. Optional tidying, in any order after the deploy: re-run
 `bootstrap_clients` (the canonical clients converge onto the new sets), and
 remove the five from `default_scopes` in `providers.toml` (they are not
 granted even if listed; provisioning logs a warning naming them).

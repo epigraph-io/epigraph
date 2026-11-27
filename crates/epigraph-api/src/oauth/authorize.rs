@@ -243,18 +243,7 @@ pub async fn callback_endpoint(
     let user = provision_external_user_client(&state, provider.as_ref(), &identity).await?;
 
     // 4. Compute requested ∩ grantable scopes (server-side only).
-    //    A retired scope (`epigraph_auth::RETIRED_SCOPES`) asked for is dropped,
-    //    and none is put to the person for consent (no grant mints one).
-    let requested: Vec<String> =
-        epigraph_auth::requested_scopes(session.scope.as_deref()).unwrap_or_default();
-    let grantable: Vec<String> = if requested.is_empty() {
-        epigraph_auth::without_retired_scopes(user.granted_scopes.clone())
-    } else {
-        requested
-            .into_iter()
-            .filter(|s| user.granted_scopes.contains(s))
-            .collect()
-    };
+    let grantable: Vec<String> = consent_scopes(session.scope.as_deref(), &user.granted_scopes);
 
     // 5. Atomically rotate state -> fresh consent nonce, recording user + scopes server-side.
     let consent_nonce = crate::oauth::device::generate_state_public();
@@ -282,6 +271,28 @@ pub async fn callback_endpoint(
         &state.oauth_redirect_origins,
     ))
     .into_response())
+}
+
+/// The scopes a consent puts to the person: those the client's `scope`
+/// request names that the person's client is granted, or, when the request
+/// names none, the whole grant. Never a retired scope
+/// (`epigraph_auth::RETIRED_SCOPES`): one in the grant is left out, and one in
+/// the request is dropped the way an ungranted one is, so a request naming
+/// ONLY retired scopes narrows to nothing. It is never read as a request for
+/// everything granted, which would put more to the person, on a third-party
+/// client's behalf, than that client asked for.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn consent_scopes(requested: Option<&str>, user_granted: &[String]) -> Vec<String> {
+    let named: Vec<&str> = requested.unwrap_or("").split_whitespace().collect();
+    if named.is_empty() {
+        return epigraph_auth::without_retired_scopes(user_granted.to_vec());
+    }
+    named
+        .into_iter()
+        .filter(|s| !epigraph_auth::is_retired_scope(s))
+        .filter(|s| user_granted.iter().any(|g| g == s))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Pure HTML render. `ticket` is the consent-session nonce the POST handler will consume.
@@ -472,4 +483,59 @@ pub async fn authorize_endpoint(
     Err(ApiError::ServiceUnavailable {
         service: "database required for OAuth2".to_string(),
     })
+}
+
+#[cfg(test)]
+mod consent_scope_tests {
+    use super::consent_scopes;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The person's client is still granted retired scopes (granted before
+    /// the retirement).
+    fn granted() -> Vec<String> {
+        v(&[
+            "claims:read",
+            "evidence:read",
+            "claims:write",
+            "claims:delete",
+        ])
+    }
+
+    /// Catches: a request naming only retired scopes being read as "no
+    /// request", which would put the whole grant to the person for consent on
+    /// a client's behalf that asked for one unchecked scope.
+    #[test]
+    fn a_request_naming_only_retired_scopes_narrows_to_nothing() {
+        assert_eq!(consent_scopes(Some("evidence:read"), &granted()), v(&[]));
+        assert_eq!(
+            consent_scopes(Some("claims:delete evidence:read ingest:write"), &granted()),
+            v(&[])
+        );
+    }
+
+    /// A retired scope beside a live one is dropped, and only granted live
+    /// scopes are put to the person.
+    #[test]
+    fn a_retired_scope_in_a_request_is_dropped_like_an_ungranted_one() {
+        assert_eq!(
+            consent_scopes(Some("claims:read evidence:read edges:write"), &granted()),
+            v(&["claims:read"])
+        );
+    }
+
+    /// No request (absent or blank) is the whole grant, as before the
+    /// retirement, less the retired scopes it still lists.
+    #[test]
+    fn no_request_is_the_live_grant() {
+        for asked in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                consent_scopes(asked, &granted()),
+                v(&["claims:read", "claims:write"]),
+                "{asked:?}"
+            );
+        }
+    }
 }

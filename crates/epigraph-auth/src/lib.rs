@@ -338,6 +338,12 @@ pub fn without_retired_scopes(mut scopes: Vec<String>) -> Vec<String> {
 ///   turns a request into `invalid_scope`.
 /// * `Some` of the rest otherwise. A blank request (`Some("")`) names nothing
 ///   and stays `Some(vec![])`, so each grant keeps its own meaning for it.
+///
+/// Only for grants whose answer is bounded by the REQUESTER's own grant
+/// (refresh, `client_credentials`), where "as granted" gives the requester
+/// nothing it did not already hold. A grant that mints for someone else (the
+/// run-token grant, the authorize consent) must not read an only-retired
+/// request as "as granted": it narrows to nothing instead.
 #[must_use]
 pub fn requested_scopes(raw: Option<&str>) -> Option<Vec<String>> {
     let raw = raw?;
