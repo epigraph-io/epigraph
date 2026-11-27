@@ -1,7 +1,8 @@
 # EpiGraph Explorer: Atlas (zoomable map, sources, timeline)
 
 **Date:** 2026-11-04
-**Status:** spec
+**Status:** in-progress (checked against origin/main ad30094c5, 2026-11-27). See the phasing table in §10; the neighbourhood level is replaced by `2026-11-12-atlas-nested-groups-and-subgraph-view-design.md`.
+**Original status:** spec
 **Repo:** `epigraph` (public)
 **Builds on:** `2026-09-15-epigraph-explorer-ui-design.md` (the Explorer: BFF, auth,
 claim pages, graph canvas) and `../plans/2026-09-15-epigraph-explorer-impl-plan.md`.

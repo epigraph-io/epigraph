@@ -1,6 +1,8 @@
 # Human identity visibility, and real names at provisioning
 
-Status: design for implementation on `feat/human-identity-visibility`, mapped against
+**Status:** implemented-with-deviations (checked against origin/main ad30094c5, 2026-11-27). Landed as #1088 through staging #1111 (migrations 309-344); §16a lists the part B deviations.
+
+Original status: design for implementation on `feat/human-identity-visibility`, mapped against
 `origin/main` at `ffeb7bb3a` (head migration 271). Every surface below was re-read on that
 head; the PR must re-verify each one again at commit time (§7 says how).
 

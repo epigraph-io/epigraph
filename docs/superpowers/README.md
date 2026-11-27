@@ -71,14 +71,14 @@ Checked against `origin/main` at `ad30094c5` on 2026-11-27, except the rows mark
 | `2026-06-03-link-epistemic-mcp-design.md` | unverified | | |
 | `2026-06-03-oauth-provision-email-allowlist-design.md` | unverified | | |
 | `2026-06-03-perspective-lens-reads-design.md` | unverified | | |
-| `2026-06-03-plan-2.5-server-side-ingestion-idempotency.md` | unverified | | |
-| `2026-06-03-plan-3-git-ingest-reconciler-design.md` | unverified | | |
-| `2026-06-15-rdf-triple-matching-experiment-design.md` | unverified | | |
-| `2026-06-18-deterministic-spine-ingest-design.md` | unverified | | |
-| `2026-07-11-review-divergence-expected-behavior.md` | unverified | | |
-| `2026-07-23-mcp-federation-gateway-design.md` | unverified | | |
-| `2026-09-15-epigraph-explorer-ui-design.md` | unverified | | |
-| `2026-09-26-episcience-operator-authority-design.md` | unverified | | |
-| `2026-11-04-epigraph-explorer-atlas-design.md` | unverified | | |
-| `2026-11-12-atlas-nested-groups-and-subgraph-view-design.md` | unverified | | |
-| `2026-11-24-human-identity-visibility-design.md` | unverified | | |
+| `2026-06-03-plan-2.5-server-side-ingestion-idempotency.md` | implemented | #261; `persist_packet` through `ClaimRepository::create_or_get` (`routes/submit.rs`), `AgentRepository::create_or_get_declaring` (`routes/agents.rs`) | |
+| `2026-06-03-plan-3-git-ingest-reconciler-design.md` | implemented | `scripts/git_ingest_reconciler.py` | Sections 3.5, 3.6, 4 and 5 revised 2026-11-26 (backlog 39dfef78). |
+| `2026-06-15-rdf-triple-matching-experiment-design.md` | implemented | #275; `experiments/rdf-triple-matching/` | The experiment ran and its result was negative (`CONCLUSION.md`); the triple layer stays a stub that reports whether it is populated (`0dcaa51aa`, `09bb5958f`). |
+| `2026-06-18-deterministic-spine-ingest-design.md` | implemented | `crates/epigraph-ingest/src/document/structure.rs`; `structure_source` (MCP and HTTP twin); `PIPELINE_VERSION_BASE = hierarchical_extraction_v2` | `structure_source` lives in `tools/ingestion.rs`, not a separate `tools/structure_source.rs`. |
+| `2026-07-11-review-divergence-expected-behavior.md` | implemented | The note itself | A policy note whose decision (document, do not backfill) needs no code. |
+| `2026-07-23-mcp-federation-gateway-design.md` | implemented-with-deviations | `crates/epigraph-mcp/src/federation/`, `EPIGRAPH_MCP_EXTENSIONS` | Shipped with a loopback TCP transport, not the Unix socket the text describes; the episcience socket transport and deployment (§B, §C) are follow-on work. |
+| `2026-09-15-epigraph-explorer-ui-design.md` | in-progress | `services/explorer/` (phases 1 and 2: `/search`, `/claim/{id}`, `/claim/{id}/graph`, `/theme/{id}`), the MCP twin routes | Phase 3 is superseded by `2026-11-04-epigraph-explorer-atlas-design.md`; phase 4 (writes from the UI) is not in the tree. |
+| `2026-09-26-episcience-operator-authority-design.md` | in-progress | Kernel: the RFC 8693 token-exchange grant (`72c8cc27f`, `oauth/token_exchange.rs`) | `Viewer::resolve_operated` is not in the tree, the gateway still forwards the caller's bearer (CLAUDE.md), and the episcience port is in that repository. |
+| `2026-11-04-epigraph-explorer-atlas-design.md` | in-progress | `services/explorer/` Atlas routes and `static/atlas.js` | Per its §10 phasing table: P3a in the tree, P3b and P3c partly, P3d not. Its neighbourhood level (§4.2, P3e) is replaced by `2026-11-12-atlas-nested-groups-and-subgraph-view-design.md`. |
+| `2026-11-12-atlas-nested-groups-and-subgraph-view-design.md` | implemented | Atlas waves W1-W12 (plans `2026-11-13-atlas-w*`); `atlas_meaning`, `atlas_links`, `atlas_naming`, `atlas_layout` binaries; `services/explorer/tests/atlas_nested.rs`, `atlas_latency.rs`; `crates/epigraph-api/tests/atlas_latency_gate.rs`; `4e494dfce` | |
+| `2026-11-24-human-identity-visibility-design.md` | implemented-with-deviations | #1088 through staging #1111 (`8dc5c6f43`); migrations 309-344 | §16a of the spec lists the part B deviations. |

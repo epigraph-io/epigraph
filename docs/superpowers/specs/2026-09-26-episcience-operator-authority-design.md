@@ -1,6 +1,8 @@
 # EpiScience: human OAuth -> operated agent -> DB authority (design, batch W-own Part B)
 
-Status: design only, no code. Operator decision 2026-09-26: *"Episcience should carry
+**Status:** in-progress (checked against origin/main ad30094c5, 2026-11-27). The kernel's RFC 8693 token-exchange grant is in the tree; `Viewer::resolve_operated`, the exchanged-token forwarding and the episcience port are not.
+
+Original status: design only, no code. Operator decision 2026-09-26: *"Episcience should carry
 the same 'human oauth to agent' pipeline. If the human has superuser access, so do
 their agents."* Companion to migration 114 (writer-owned derived rows, same batch).
 

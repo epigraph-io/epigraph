@@ -1,7 +1,7 @@
 # EpiGraph MCP Federation Gateway — Design
 
 **Date:** 2026-07-23
-**Status:** Implemented (gateway kernel, v1 — loopback TCP transport). Episcience socket
+**Status:** implemented-with-deviations (checked against origin/main ad30094c5, 2026-11-27): the gateway kernel, v1, shipped with a loopback TCP transport, not the Unix socket this text describes. Episcience socket
 transport + deployment (§B, §C) remain follow-on work.
 **Repos touched:** `epigraph-io/epigraph` (gateway — primary), `epigraph-io/episcience` (socket transport for its existing MCP server)
 

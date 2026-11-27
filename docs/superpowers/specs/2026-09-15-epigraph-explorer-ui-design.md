@@ -1,7 +1,8 @@
 # EpiGraph Explorer — Web UI, BFF, and MCP/API parity
 
 **Date:** 2026-09-15
-**Status:** spec
+**Status:** in-progress (checked against origin/main ad30094c5, 2026-11-27). Phases 1 and 2 are in `services/explorer/`; phase 3 is superseded by the Atlas spec; phase 4 (writes) is not in the tree.
+**Original status:** spec
 **Repo:** `epigraph` (public)
 **Related:** `2026-07-23-mcp-federation-gateway-design.md` (extension point),
 `2026-06-03-plan-3-git-ingest-reconciler-design.md` (the reconciler pattern the

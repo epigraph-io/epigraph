@@ -1,6 +1,6 @@
 # Plan 3: Server-side git-ingest reconciler (cross-repo, continuous)
 
-**Status:** implemented (`scripts/git_ingest_reconciler.py`); §3.5, §3.6, §4 and §5 revised 2026-11-26 (backlog 39dfef78)
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27): `scripts/git_ingest_reconciler.py`; §3.5, §3.6, §4 and §5 revised 2026-11-26 (backlog 39dfef78)
 **Repo:** `epigraph` (public) · **Branch base:** `docs/commit-ingestion-spec`
 **Depends on:** Plan #2 (`--pr-ingest`, merged to `main` #257) and **Plan 2.5** (server-side idempotency — merged to `dev` #261, **must reach `main`/prod before live enable**). Final subsystem of `docs/superpowers/specs/2026-06-02-commit-ingestion-automation-design.md`.
 
