@@ -547,3 +547,214 @@ async fn a_redecomposition_reports_the_parents_open_challenges_and_changes_none(
         before
     );
 }
+
+// ---- The binary's own wiring of the open-challenge report (backlog 122ac356).
+//
+// The test above drives the library helpers directly. These run the real
+// `decompose_claims` binary, so they prove its `--redecompose --plan` and
+// `--retarget` paths call those helpers and print the report.
+
+const BIN: &str = env!("CARGO_BIN_EXE_decompose_claims");
+
+/// The disputer's text: the `contradicts` source `seed` lands on the
+/// compound atom, and the key of the retarget fixture.
+const DISPUTER: &str = "The backup never took over.";
+
+struct BinRun {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl BinRun {
+    #[track_caller]
+    fn ok(self) -> Self {
+        assert_eq!(
+            self.code,
+            Some(0),
+            "decompose_claims failed\nstdout:\n{}\nstderr:\n{}",
+            self.stdout,
+            self.stderr
+        );
+        self
+    }
+
+    fn open_challenge_lines(&self) -> Vec<&str> {
+        self.stderr
+            .lines()
+            .filter(|l| l.starts_with("OPEN-CHALLENGE "))
+            .collect()
+    }
+}
+
+fn temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("redecompose-{stem}-{}.{ext}", Uuid::new_v4()))
+}
+
+/// Run the binary on the maintenance path with `fixture` as the LLM, in a
+/// clean environment. No mode these tests run writes through the API, so the
+/// token is never presented.
+async fn run_bin(pool: &PgPool, args: &[&str], fixture: serde_json::Value) -> BinRun {
+    let url = fixture::database_url_for(pool).await;
+    let fixture_path = temp_path("fixture", "json");
+    std::fs::write(&fixture_path, fixture.to_string()).unwrap();
+    let out = std::process::Command::new(BIN)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("DATABASE_URL", &url)
+        .env("MAINTENANCE_DATABASE_URL", &url)
+        .env("RUST_LOG", "warn")
+        .env("EPIGRAPH_TOKEN", "never-presented-by-a-read-only-mode")
+        .env("DECOMPOSE_FIXTURE_PATH", &fixture_path)
+        .args(["--provider", "fixture"])
+        .args(args)
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("run decompose_claims");
+    std::fs::remove_file(&fixture_path).ok();
+    BinRun {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// `decompose_claims --redecompose --plan`: the compound atom's plan line in
+/// the written file carries its pending challenge (not the rejected one) as
+/// `parent_open_challenges`, and stderr names it on an `OPEN-CHALLENGE` line
+/// and counts it. No challenge row changes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_redecompose_plan_binary_writes_and_prints_the_parents_open_challenges(pool: PgPool) {
+    let w = seed(&pool).await;
+    let pending = seed_challenge(&pool, w.compound_atom, w.agent, "pending").await;
+    let rejected = seed_challenge(&pool, w.compound_atom, w.agent, "rejected").await;
+    let before = (
+        challenge_row(&pool, pending).await,
+        challenge_row(&pool, rejected).await,
+    );
+    let ids = temp_path("ids", "txt");
+    std::fs::write(&ids, format!("{}\n", w.compound_atom)).unwrap();
+    let plan = temp_path("plan", "jsonl");
+
+    let r = run_bin(
+        &pool,
+        &[
+            "--redecompose",
+            "--ids-file",
+            ids.to_str().unwrap(),
+            "--plan",
+            plan.to_str().unwrap(),
+        ],
+        serde_json::json!({ COMPOUND_ATOM: {
+            "atoms": ["The pump failed.", "The backup took over."],
+            "generality": [0, 0],
+        }}),
+    )
+    .await
+    .ok();
+
+    let raw = std::fs::read_to_string(&plan)
+        .unwrap_or_else(|e| panic!("no plan file ({e})\nstderr:\n{}", r.stderr));
+    let lines: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "{raw}\nstderr:\n{}", r.stderr);
+    assert_eq!(lines[0]["claim_id"], serde_json::json!(w.compound_atom));
+    assert_eq!(
+        lines[0]["parent_open_challenges"],
+        serde_json::json!([{"id": pending, "state": "pending", "challenger_id": w.agent}]),
+        "{raw}"
+    );
+    assert_eq!(
+        r.open_challenge_lines(),
+        vec![format!(
+            "OPEN-CHALLENGE parent={} challenge={pending} state=pending challenger={}",
+            w.compound_atom, w.agent
+        )],
+        "stderr:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr
+            .lines()
+            .any(|l| l.starts_with("open challenges: 1 on 1 of 1 touched parents")),
+        "stderr:\n{}",
+        r.stderr
+    );
+    assert_eq!(
+        (
+            challenge_row(&pool, pending).await,
+            challenge_row(&pool, rejected).await,
+        ),
+        before
+    );
+    std::fs::remove_file(&ids).ok();
+    std::fs::remove_file(&plan).ok();
+}
+
+/// `decompose_claims --retarget` (dry run): once the compound atom has atoms,
+/// its conflict edge's manifest entry carries the parent's pending challenge
+/// (not the withdrawn one), and stderr names and counts it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_retarget_binary_writes_and_prints_the_parents_open_challenges(pool: PgPool) {
+    let w = seed(&pool).await;
+    let pump = claim_if_not_exists(&pool, w.agent, "The pump failed.").await;
+    let backup = claim_if_not_exists(&pool, w.agent, "The backup took over.").await;
+    edge(&pool, w.compound_atom, pump, "decomposes_to").await;
+    edge(&pool, w.compound_atom, backup, "decomposes_to").await;
+    let pending = seed_challenge(&pool, w.compound_atom, w.agent, "pending").await;
+    let withdrawn = seed_challenge(&pool, w.compound_atom, w.agent, "withdrawn").await;
+    let before = (
+        challenge_row(&pool, pending).await,
+        challenge_row(&pool, withdrawn).await,
+    );
+    let manifest = temp_path("manifest", "jsonl");
+
+    let r = run_bin(
+        &pool,
+        &["--retarget", "--manifest", manifest.to_str().unwrap()],
+        serde_json::json!({ DISPUTER: {"atoms": [1]} }),
+    )
+    .await
+    .ok();
+
+    let raw = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("no manifest ({e})\nstderr:\n{}", r.stderr));
+    let entries: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|e| e["parent_id"] == serde_json::json!(w.compound_atom))
+        .collect();
+    assert_eq!(entries.len(), 1, "{raw}\nstderr:\n{}", r.stderr);
+    assert_eq!(entries[0]["source_id"], serde_json::json!(w.disputer));
+    assert_eq!(
+        entries[0]["parent_open_challenges"],
+        serde_json::json!([{"id": pending, "state": "pending", "challenger_id": w.agent}]),
+        "{raw}"
+    );
+    assert_eq!(
+        r.open_challenge_lines(),
+        vec![format!(
+            "OPEN-CHALLENGE parent={} challenge={pending} state=pending challenger={}",
+            w.compound_atom, w.agent
+        )],
+        "stderr:\n{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr
+            .lines()
+            .any(|l| l.starts_with("open challenges: 1 on 1 of ")),
+        "stderr:\n{}",
+        r.stderr
+    );
+    assert_eq!(
+        (
+            challenge_row(&pool, pending).await,
+            challenge_row(&pool, withdrawn).await,
+        ),
+        before
+    );
+    std::fs::remove_file(&manifest).ok();
+}
