@@ -345,10 +345,14 @@ def world(tmp_path):
     yield w
 
     # Revert every run's links (other rows of the shared test database too),
-    # newest first, then remove the fixture.
+    # newest first, then remove the fixture. A failed revert would leave other
+    # suites' rows linked, so it fails the test once the cleanup is done.
+    failed = []
     for undo in reversed(w.undo_files):
         if undo.exists():
-            w.run("--undo", str(undo), "--execute", check=False)
+            proc = w.run("--undo", str(undo), "--execute", check=False)
+            if proc.returncode != 0:
+                failed.append(f"{undo.name}: rc={proc.returncode} {proc.stderr[-500:]}")
     cur.execute(
         "SELECT public.epigraph_purge_mass_functions(%s::uuid[], 'link-db teardown')",
         (w.retracted,),
@@ -356,6 +360,8 @@ def world(tmp_path):
     cur.execute("DELETE FROM claims WHERE id = ANY(%s::uuid[])", (w.claims,))
     cur.execute("DELETE FROM frames WHERE id = ANY(%s::uuid[])", ([frame, frame2],))
     conn.close()
+    if failed:
+        pytest.fail("teardown could not revert a run's links: " + "; ".join(failed))
 
 
 def test_a_retracted_row_is_skipped_and_does_not_abort_the_backfill(world):
