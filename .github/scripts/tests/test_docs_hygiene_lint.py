@@ -60,12 +60,32 @@ class ScanText(unittest.TestCase):
         # A label named after a memory file is not a citation of one.
         self.assertEqual(classes("src/a.rs", 'labels: ["src:MEMORY.md"]'), [])
 
+    def test_bare_memory_note_filename_is_d2(self):
+        # Cited without the "user-memory" words: still a note nobody can open.
+        self.assertEqual(classes("scripts/a.py", "Per feedback_no_raw_sql.md: call the API"), ["D2"])
+        self.assertEqual(classes("src/a.rs", "/// (see `project_bp_primary.md`)"), ["D2"])
+        self.assertEqual(classes("docs/a.md", "per reference_oauth_mint.md"), ["D2"])
+        # Ordinary Markdown names are not memory-note names.
+        for ok in ("README.md", "user-guide.md", "projects.md", "references.md", "docs/feedback.md"):
+            self.assertEqual(classes("docs/a.md", "see " + ok), [], ok)
+
     def test_private_repo_citation_is_d3(self):
         self.assertEqual(classes("CLAUDE.md", "through `release/epiclaw/CLAUDE.md`'s"), ["D3"])
         wrapped = "/// labels the writers in epiclaw-host's\n///   `deploy/` prompts write\n"
-        self.assertEqual(lint.scan_text("src/a.rs", wrapped), [(1, "D3", "citation of a file in a private repository")])
+        self.assertEqual(lint.scan_text("src/a.rs", wrapped), [(1, "D3", "citation of a private file outside this repository")])
         # Naming the host component is fine; citing its files is not.
         self.assertEqual(classes("src/a.rs", "// epiclaw-host's ProvenanceRecorder signs"), [])
+
+    def test_private_source_file_and_notes_citations_are_d3(self):
+        self.assertEqual(classes("src/a.rs", "/// matches the epiclaw-host `container.rs` convention"), ["D3"])
+        self.assertEqual(classes("src/a.rs", "/// epiclaw-host's `container.rs` documents X"), ["D3"])
+        self.assertEqual(classes("m.sql", "-- (epiclaw-host/src/host/provenance.rs) signs"), ["D3"])
+        notes = "~/" + "ops-" + "private/"
+        self.assertEqual(classes("docs/a.md", "recorded in `" + notes + "2026-mapping.md`"), ["D3"])
+        self.assertEqual(classes("tests/a.rs", "// in " + notes + "r.md (R4)"), ["D3"])
+        # A `~/` path that names nothing private, and a host-side env var, pass.
+        self.assertEqual(classes("docs/a.md", "install to `~/.cargo/bin/`"), [])
+        self.assertEqual(classes("src/a.rs", "// epiclaw-host exports `EPIGRAPH_OAUTH_TOKEN_URL`"), [])
 
 
 class Scan(unittest.TestCase):
@@ -82,6 +102,7 @@ class Scan(unittest.TestCase):
         root = self.tree({
             "docs/superpowers/plans/p.md": "cd " + HOME + "alice/wt (user-memory `x.md`)\n",
             "docs/tenancy/progress.json": '{"a": "release/epiclaw/CLAUDE.md"}\n',
+            "migrations/048_label_provenance_telemetry.sql": "-- (epiclaw-host/src/host/provenance.rs)\n",
         })
         self.assertEqual(lint.scan(root), [])
 

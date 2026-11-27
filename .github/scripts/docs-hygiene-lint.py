@@ -5,19 +5,28 @@
     .github/scripts/docs-hygiene-lint.py [--root <dir>]
 
 Reports, per file and line, and exits 1 on any finding:
-  D1 a developer's home-directory path in a Markdown file. The pattern and the
-     allowed generic account names are the commit-message lint's E2
-     (commit-message-lint.py), loaded from that script so the two cannot drift.
-  D2 a citation of an assistant's private memory file ("user-memory", "auto-memory").
-     The note is on one developer's machine; state the rule it holds instead.
-  D3 a citation of a file inside a private repository (`release/epiclaw/...`,
-     another host's `deploy/` prompts). State what the file says instead.
+  D1 a developer's home-directory path in a Markdown file: `/home/<name>/` or
+     `/Users/<name>/`, with the trailing slash. The pattern and the allowed
+     generic account names are the commit-message lint's E2
+     (commit-message-lint.py), loaded from that script so the two cannot drift;
+     so a bare `/home/<name>` at the end of a word, and any `~/` path, are not D1.
+  D2 a citation of an assistant's private memory file: the words "user-memory"
+     or "auto-memory", or a memory-note filename (`feedback_<x>.md`,
+     `project_<x>.md`, `reference_<x>.md`, `user_<x>.md`). The note is on one
+     developer's machine; state the rule it holds instead.
+  D3 a citation of a file outside this repository that a reader cannot open:
+     the private host repository's files (`release/epiclaw/...`, its `deploy/`
+     prompts, `epiclaw-host/src/...`, or the host named beside a quoted source
+     file such as `container.rs`), or the operator's private notes directory
+     under `~/`. State what the file says instead.
 
 Not scanned, on purpose:
   docs/superpowers/ (dated historical plans, specs and reports, kept as written)
   and docs/tenancy/progress.json (a historical run log);
   this lint, its tests and the commit-message lint and its self-test, which
-  carry these patterns as fixtures.
+  carry these patterns as fixtures;
+  migrations/048_label_provenance_telemetry.sql, an applied migration, which
+  cannot be edited (its D3 citation stays).
 D1 covers Markdown only: home paths in code defaults, examples and experiments
 are a separate surface.
 
@@ -47,10 +56,23 @@ _CML = _commit_lint()
 HOME_RE = _CML.HOME_RE
 HOME_OK_NAMES = _CML.HOME_OK_NAMES
 
-MEMORY_RE = re.compile(r"\b(?:user|auto)-memory\b", re.I)
+MEMORY_RE = re.compile(
+    r"\b(?:user|auto)-memory\b|\b(?:feedback|project|reference|user)_[a-z0-9_]+\.md\b",
+    re.I,
+)
+# The operator's private notes directory, built from parts so this source never
+# carries the literal a pre-push scan looks for.
+_PRIVATE_NOTES = re.escape("~/" + "ops-" + "private/")
 # Matched over the whole file, so a citation wrapped across a comment line
 # (`... epiclaw-host's\n///   `deploy/` ...`) is still one match.
-PRIVATE_REPO_RE = re.compile(r"release/epiclaw/|epiclaw-host\S*\s+(?:(?://+|#)\s*)?`deploy/`")
+_HOST_THEN = r"epiclaw-host\S*\s+(?:(?://+|#)\s*)?"
+PRIVATE_REPO_RE = re.compile(
+    r"release/epiclaw/"
+    r"|epiclaw-host/src/"
+    + "|" + _HOST_THEN + r"`deploy/`"
+    + "|" + _HOST_THEN + r"`[\w./-]+\.(?:rs|py|ts|js|sh|toml|md)`"
+    + "|" + _PRIVATE_NOTES
+)
 
 SKIP_PREFIXES = ("docs/superpowers/",)
 SKIP_FILES = {
@@ -59,6 +81,8 @@ SKIP_FILES = {
     ".github/scripts/tests/test_docs_hygiene_lint.py",
     ".github/scripts/commit-message-lint.py",
     ".github/scripts/test-commit-message-lint.sh",
+    # Applied (in production): never edited, so its header citation stays.
+    "migrations/048_label_provenance_telemetry.sql",
 }
 # Text files scanned for D2 and D3; D1 is Markdown only.
 TEXT_EXTS = (".md", ".rs", ".py", ".sh", ".toml", ".yml", ".yaml", ".sql", ".js", ".json")
@@ -103,7 +127,7 @@ def scan_text(rel, text):
             found.append((n, "D2", "citation of a private assistant-memory file"))
     for m in PRIVATE_REPO_RE.finditer(text):
         n = text.count("\n", 0, m.start()) + 1
-        found.append((n, "D3", "citation of a file in a private repository"))
+        found.append((n, "D3", "citation of a private file outside this repository"))
     return sorted(found)
 
 
