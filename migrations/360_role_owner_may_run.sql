@@ -76,10 +76,16 @@
 -- as an unavailable answer.
 --
 -- OWNER. `role_agents` and `role_assignments` are FORCE RLS and admit a
--- maintenance-owned definer frame. Under any other owner both reads see no
--- row, so every identity reads `not_attached`: fail CLOSED (the host skips),
--- but with a misleading reason. `tenancy_backfill verify` reports a wrong
--- owner (registered there at 360).
+-- maintenance-owned definer frame. Under any other owner both reads would
+-- see no row and every identity would read `not_attached`: closed, but with
+-- a reason that sends the operator to attach identities that are attached.
+-- So the body checks its owner first, inline as 166's gate does (the frame's
+-- `current_user` or the `session_user` must be a member of
+-- `epigraph_maintenance`; skipped on a database without that role), and
+-- under a wrong owner raises 166's `ROL01` naming the remedy instead of
+-- answering. The host refuses the run on any code but 42883, so this changes
+-- no outcome, only the reason. `tenancy_backfill verify` also reports a
+-- wrong owner (registered there at 360).
 --
 -- PATH. 172's form: `SET search_path = pg_catalog, pg_temp`, every name
 -- qualified (`definer_search_path_ratchet`).
@@ -102,6 +108,20 @@ DECLARE
     v_role text;
     v_at   timestamptz := pg_catalog.clock_timestamp();
 BEGIN
+    -- FAIL LOUD under a wrong owner (166's gate's check, verbatim in form):
+    -- such a frame reads no `role_agents` row, and would answer
+    -- `not_attached` for every identity.
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'epigraph_maintenance')
+       AND NOT pg_catalog.pg_has_role(current_user, 'epigraph_maintenance', 'MEMBER')
+       AND NOT pg_catalog.pg_has_role(session_user, 'epigraph_maintenance', 'MEMBER') THEN
+        RAISE EXCEPTION 'ROL01: epigraph_role_owner_may_run runs as %, which cannot read '
+                        'role_agents; refusing rather than reading every agent as not_attached',
+                        current_user
+            USING ERRCODE = 'ROL01',
+                  HINT = 'Nothing was answered. ALTER FUNCTION '
+                         'public.epigraph_role_owner_may_run(uuid, uuid) OWNER TO '
+                         'epigraph_maintenance (tenancy_backfill verify reports it).';
+    END IF;
     IF p_role_id IS NULL OR p_agent IS NULL THEN
         RAISE EXCEPTION 'epigraph_role_owner_may_run: the role node and the agent are required'
             USING ERRCODE = '22023';

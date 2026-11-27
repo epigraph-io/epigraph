@@ -4019,6 +4019,67 @@ async fn the_app_role_cannot_execute_owner_may_run(pool: PgPool) {
     );
 }
 
+/// Review round (360). `role_agents` and `role_assignments` admit only a
+/// maintenance-owned definer frame, so under any other owner the question
+/// would see no attachment and answer `not_attached` for an identity that IS
+/// attached, on a held role: the run is still refused, but the reason sends
+/// the operator to attach what is attached. It fails LOUD instead, with
+/// 166's `ROL01`, which is neither an answer nor the host's `42883`.
+/// CONTROL: restoring the owner restores the answer.
+///
+/// Verified to fail: without the inline owner check the attestor's call on
+/// the misowned function answers `not_attached`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_misowned_owner_may_run_refuses_rather_than_answer_not_attached(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    grant(&pool, ROLE, h, None).await;
+    assert_eq!(
+        owner_may_run(&pool, ROLE, attached).await,
+        "held",
+        "CALIBRATION: maintenance-owned, an attached identity on a held role"
+    );
+
+    sqlx::query(&format!(
+        "ALTER FUNCTION {OWNER_MAY_RUN} OWNER TO epigraph_app"
+    ))
+    .execute(&pool)
+    .await
+    .expect("misown the function");
+    let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+        .bind(ATTESTOR)
+        .bind(OWNER_MAY_RUN)
+        .fetch_one(&pool)
+        .await
+        .expect("privilege");
+    assert!(
+        can,
+        "CALIBRATION: the attestor keeps EXECUTE, so the refusal measured is the body's"
+    );
+    let node = role_node(&pool, ROLE).await;
+    let r = owner_may_run_on(&pool, ATTESTOR, None, Some(node), Some(attached)).await;
+    assert_rol01(&r, "the attestor asks a misowned owner-role question");
+    assert_ne!(
+        code_of(&r).as_deref(),
+        Some(UNDEFINED_FUNCTION),
+        "never the host's not-deployed code"
+    );
+
+    sqlx::query(&format!(
+        "ALTER FUNCTION {OWNER_MAY_RUN} OWNER TO epigraph_maintenance"
+    ))
+    .execute(&pool)
+    .await
+    .expect("restore the owner");
+    assert_eq!(
+        owner_may_run(&pool, ROLE, attached).await,
+        "held",
+        "CONTROL: with the owner restored the question answers again"
+    );
+}
+
 /// `docs/runbooks/360-undo.sql`, applied twice to a database migrated through
 /// 360, returns the catalog to exactly what it was below 360 (the function
 /// and its grants gone, nothing else touched), and the host's question then
