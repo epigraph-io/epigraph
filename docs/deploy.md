@@ -497,7 +497,7 @@ neither.
 |---|---|---|---|
 | Cascade replay | `replay_deferred_cascades --max-failures 20` | every 90 s (the binary's own documentation) | Exit 2 while a cascade is stuck: read the report and `--retire <event id> --reason <text>` it. `--report-only` is a read-only staleness check that takes no lock. |
 | Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 5 a privatization plan is stranded in `applying` or `reverting` with no job to finish it (the report's `stranded_privatization_plans` names each; reported on every run until it is recovered, see `docs/tenancy.md`, "A plan stranded in `applying` or `reverting`"), 4 pending jobs of a type this run has no handler for are waiting (the report's `pending_unregistered` names each type and its count; typically `embedding_generation` on an instance whose embedding provider may not write `claims.embedding`, which wait until a drain that registers the type runs), 3 out of time with work pending. Treat 4 and 5 as failures (do not add either to `SuccessExitStatus=`). On an instance that will never register the type, clear it once by hand with `drain_jobs --cancel-pending <TYPE>` (repeatable): that run sets the type's pending jobs `cancelled`, lists them in `cancelled_unregistered`, and refuses (exit 1, nothing written) a type it has a handler for. Cancelling an `embedding_generation` job leaves its claim's `claims.embedding` NULL; `embed_backfill` refills missing vectors, and needs an OpenAI key. `epigraph-cli reembed` does NOT restore them: it writes `embedding_3072`. |
-| Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or retired kind, a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
+| Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or removed kind, a retired kind with no handler (`TruthPropagation`, `ReputationUpdate`, `WebhookNotification`, `DataCleanup`), a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
 | Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY`. `--allow-mock` (deterministic mock vectors, for a smoke run) is refused, exit 1 with nothing read or written, unless the database's name ends in `_test` or `EPIGRAPH_ENV=test` is set: a mock vector in a real database is served by recall as a real one and never refilled. |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 | Theme maintenance | `assign_unthemed_themes --apply` (`epigraph-cli`), then `python3 scripts/maintain_themes.py` | nightly | Keeps the themes `recall(diverse=true)` samples from current between rebuilds: assigns unthemed claims, reassigns misplaced ones, splits at most three high-variance themes, recomputes the affected centroids. `maintain_themes.py` works over the HTTP API, not a DSN: it needs `EPIGRAPH_API_URL` and `EPIGRAPH_TOKEN`, a token with `claims:write` and `claims:admin` minted through the token endpoint (the script's docstring shows how), and refuses to start without the token. On a row-secured deployment its first phase can only assign claims the token may write, so run `assign_unthemed_themes --apply` first (maintenance DSN; a dry run without `--apply`). Small in memory: a split clusters at most 5,000 2-D projections. `--dry-run` reports without writing. |
@@ -1616,8 +1616,9 @@ request-signing middleware and no `X-Signature` / `X-Public-Key` /
 ### Webhook egress guard
 
 One shared module, `epigraph_jobs::egress`, decides whether a webhook
-destination may be dialled: for `POST /api/v1/webhooks`, for the API's
-delivery dispatcher, and for `epigraph-jobs`' `ConfigurableWebhookHandler`.
+destination may be dialled: for `POST /api/v1/webhooks` and for the API's
+delivery dispatcher. Webhooks are delivered only by that dispatcher; there is
+no webhook job.
 
 **Registration resolves the host, and refuses it if any answer is internal.**
 `POST /api/v1/webhooks` validates the URL (scheme `http`/`https`, a parseable
@@ -1697,15 +1698,11 @@ that routes outbound webhook traffic through a proxy must allow direct egress
 from the API process instead**, on the webhook ports its subscribers use.
 Other outbound HTTP from the process is unaffected.
 
-`epigraph-jobs` ships one sanctioned production `HttpClient`,
-`PinnedHttpClient`. It builds each request's client with
-`epigraph_jobs::egress::pinned_client`, the same function the API's dispatcher
-uses, so both paths dial only the vetted addresses, never resolve the name
-again (a fallback resolver refuses every other name), and follow no redirects
-or proxies. Nothing in this repository wires `ConfigurableWebhookHandler` into
-a runner. Anything that does should pass `PinnedHttpClient`. The `HttpClient`
-trait stays open for test mocks, so a second production implementation is a
-review red flag, not a compile error.
+The dispatcher builds each request's client with
+`epigraph_jobs::egress::pinned_client`, so it dials only the vetted addresses,
+never resolves the name again (a fallback resolver refuses every other name),
+and follows no redirects or proxies. Any future webhook sender must build its
+client there too.
 
 ### Tokens for the in-repo Python helpers
 

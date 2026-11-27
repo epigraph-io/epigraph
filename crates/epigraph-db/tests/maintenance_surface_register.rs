@@ -32,9 +32,6 @@
 //!   in the drain timer's own messages ([`VARIABLE_NAMED`]), which catches a
 //!   read that does not go through `std::env::var` (a clap `env = ...`
 //!   binding, a scan of `std::env::vars()` that compares names);
-//! * `DbReputationService` (epigraph-jobs), a maintenance-pool consumer with no
-//!   constructor anywhere, is not wired into either crate: if it is ever wired,
-//!   it belongs in the drain timer, not a request binary.
 //!
 //! The set is asserted in BOTH directions: a new site fails, and a site that
 //! is removed but left in [`ALLOWED`] fails too, so the table cannot turn into
@@ -373,17 +370,6 @@ fn only_the_two_boot_refusals_read_the_variable() {
     let mut want: Vec<String> = ENV_READERS.iter().map(ToString::to_string).collect();
     want.sort();
     assert_eq!(readers, want);
-}
-
-#[test]
-fn the_unwired_reputation_service_stays_out_of_the_request_crates() {
-    for (rel, code) in sources() {
-        assert!(
-            !code.contains("DbReputationService"),
-            "{rel} wires epigraph-jobs' DbReputationService, a maintenance-pool consumer; under \
-             D9 it belongs in the drain timer, never in a request-serving binary"
-        );
-    }
 }
 
 #[test]

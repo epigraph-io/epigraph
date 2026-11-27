@@ -173,20 +173,14 @@ const SCAN_ROOTS: &[&str] = &[
 
 /// The hybrids that exist today, as `(path suffix, function name)`.
 ///
-/// `db_reputation_service.rs::get_claim_outcomes` mints a bypass viewer from
-/// the privileged pool and then runs the read on an injected `PgPool`. It has
-/// no production constructor — `DbReputationService::new` and
-/// `::with_scoped_pool` have no caller outside their own file — which is the
-/// only reason it is a register entry rather than a live defect. Owner:
-/// `D-PR17-hybrid-shape-lint`, re-owned by PR-17 to the `acquire_as`
-/// conversion PR.
-///
-/// Fixing it means routing the read onto the maintenance connection, which is a
-/// signature change to a public struct and therefore not this batch's to make.
-const EXPECTED_HYBRIDS: &[(&str, &str)] = &[(
-    "epigraph-jobs/src/db_reputation_service.rs",
-    "get_claim_outcomes",
-)];
+/// EMPTY. Its last row, `epigraph-jobs/src/db_reputation_service.rs::get_claim_outcomes`
+/// (a bypass minted from the privileged pool and spent on an injected
+/// `PgPool`, with no production constructor), was deleted with the
+/// unregistered reputation job handler (backlog 47bb548f). The scanner's
+/// negative calibration, which that row used to provide, is now the synthetic
+/// fixture in `the_scanner_finds_a_hybrid` below, run through the same
+/// [`hybrids_in`] path [`scan`] uses.
+const EXPECTED_HYBRIDS: &[(&str, &str)] = &[];
 
 /// Remove comments, leaving code positions otherwise intact.
 ///
@@ -462,6 +456,23 @@ fn key_for(p: &Path) -> String {
     )
 }
 
+/// The names of the production regions of ONE source file that mint a bypass
+/// and name a foreign pool handle. [`scan`] runs every scanned file through
+/// this, and the calibration fixture runs through it too.
+fn hybrids_in(raw_source: &str) -> Vec<String> {
+    let src = strip_comments(raw_source);
+    // `#[cfg(test)]` bodies are excluded: a test that stands a pool in for a
+    // maintenance one is a fixture choice, not a production path, and the
+    // production half is what this lint is about.
+    let prod = strip_cfg_test_modules(&src);
+    regions(&prod)
+        .into_iter()
+        .filter(|r| MINTS.iter().any(|m| r.body.contains(m)))
+        .filter(|r| FOREIGN_POOLS.iter().any(|p| r.body.contains(p)))
+        .map(|r| r.name)
+        .collect()
+}
+
 /// Every production region that mints a bypass and names a foreign pool handle.
 fn scan() -> BTreeSet<(String, String)> {
     let mut found = BTreeSet::new();
@@ -469,19 +480,9 @@ fn scan() -> BTreeSet<(String, String)> {
         let mut files = Vec::new();
         rust_files(Path::new(root), &mut files);
         for f in files {
-            let src = strip_comments(&std::fs::read_to_string(&f).expect("read source"));
-            // `#[cfg(test)]` bodies are excluded: a test that stands a pool in
-            // for a maintenance one is a fixture choice, not a production path,
-            // and the production half is what this lint is about.
-            let prod = strip_cfg_test_modules(&src);
-            for r in regions(&prod) {
-                let mints = MINTS.iter().any(|m| r.body.contains(m));
-                if !mints {
-                    continue;
-                }
-                if FOREIGN_POOLS.iter().any(|p| r.body.contains(p)) {
-                    found.insert((key_for(&f), r.name));
-                }
+            let raw = std::fs::read_to_string(&f).expect("read source");
+            for name in hybrids_in(&raw) {
+                found.insert((key_for(&f), name));
             }
         }
     }
@@ -611,28 +612,50 @@ fn the_positive_control_is_still_clean() {
     );
 }
 
-/// THE NEGATIVE CONTROL the obligation names, asserted by NAME.
+/// THE NEGATIVE CONTROL, asserted by NAME on a synthetic hybrid.
 ///
-/// The register entry must correspond to a function the scanner actually finds.
-/// A register row pointing at nothing is how this lint would quietly stop
-/// having a calibration case at all.
+/// The tree's last real hybrid (`db_reputation_service.rs::get_claim_outcomes`)
+/// was deleted, so with [`EXPECTED_HYBRIDS`] empty a scanner that found nothing
+/// would pass the register test. This fixture has the exact shape that row had
+/// (a bypass minted from the privileged pool, the read run on `self.pool`), and
+/// it goes through [`hybrids_in`], the per-file path [`scan`] uses, so a broken
+/// stripper, region splitter or match list fails here. The same function with
+/// the read moved onto the maintenance session, and the same body inside a
+/// `#[cfg(test)]` module or a comment, must NOT be flagged.
 #[test]
-fn the_registered_hybrid_is_really_there() {
-    let src = strip_comments(include_str!(
-        "../../epigraph-jobs/src/db_reputation_service.rs"
-    ));
-    let region = regions(&src)
-        .into_iter()
-        .find(|r| r.name == "get_claim_outcomes")
-        .expect("db_reputation_service.rs must still define get_claim_outcomes");
-    assert!(
-        MINTS.iter().any(|m| region.body.contains(m)),
-        "CALIBRATION: the registered hybrid must still mint a bypass"
+fn the_scanner_finds_a_hybrid() {
+    let hybrid = r#"
+impl ReputationJobService for DbReputationService {
+    async fn get_claim_outcomes(&self, agent_id: Uuid) -> Result<Vec<Outcome>, E> {
+        let session = self.scoped.maintenance_session(SystemReason::ReputationRecompute).await?;
+        let rows = ClaimRepository::get_by_agent(&self.pool, session.viewer(), agent_id).await?;
+        Ok(rows)
+    }
+
+    async fn store(&self) -> Result<(), E> { Ok(()) }
+}
+"#;
+    assert_eq!(
+        hybrids_in(hybrid),
+        vec!["get_claim_outcomes".to_string()],
+        "CALIBRATION: the scanner must flag a function that mints a bypass and spends it on \
+         self.pool, and nothing else in the fixture"
     );
+
+    let fixed = hybrid.replace("&self.pool, session.viewer()", "session.split()");
     assert!(
-        FOREIGN_POOLS.iter().any(|p| region.body.contains(p)),
-        "CALIBRATION: the registered hybrid must still name a foreign pool \
-         handle. If it does not, the row belongs in a DELETE, not here."
+        hybrids_in(&fixed).is_empty(),
+        "the same function spending on the maintenance session is not a hybrid"
+    );
+    let in_tests = format!("#[cfg(test)]\nmod tests {{\n{hybrid}\n}}\n");
+    assert!(
+        hybrids_in(&in_tests).is_empty(),
+        "a hybrid inside a #[cfg(test)] module is a fixture, not production"
+    );
+    let commented: String = hybrid.lines().map(|l| format!("// {l}\n")).collect();
+    assert!(
+        hybrids_in(&commented).is_empty(),
+        "prose naming the hazard is not the hazard"
     );
 }
 

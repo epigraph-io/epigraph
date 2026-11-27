@@ -1,9 +1,8 @@
 //! Outbound-webhook egress guard (SSRF protection).
 //!
 //! Every outbound webhook path in the workspace — `epigraph-api`'s
-//! registration gate and delivery dispatcher, and this crate's
-//! [`crate::ConfigurableWebhookHandler`] — decides "may this address be dialled?"
-//! here, and only here. Two classifiers are two definitions of "internal" that
+//! registration gate and delivery dispatcher — decides "may this address be
+//! dialled?" here, and only here. Two classifiers are two definitions of "internal" that
 //! can drift, and the one that drifts open is the one nobody notices.
 //!
 //! # The address table
@@ -570,10 +569,10 @@ impl EgressGuard {
 // THE PINNED CLIENT — the one way a vetted target is dialled
 // =============================================================================
 //
-// Every webhook send in the workspace builds its HTTP client here: the API's
-// delivery dispatcher (`epigraph_api::routes::webhooks`) and this crate's
-// `PinnedHttpClient`. One construction site, so the properties below cannot be
-// held by one caller and forgotten by another.
+// Every webhook send in the workspace builds its HTTP client here (today the
+// API's delivery dispatcher, `epigraph_api::routes::webhooks`). One
+// construction site, so the properties below cannot be held by one caller and
+// forgotten by another.
 
 /// The base HTTP client configuration for webhook delivery.
 ///
