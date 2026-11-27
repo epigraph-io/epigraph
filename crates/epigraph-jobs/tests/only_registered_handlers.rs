@@ -28,22 +28,116 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The source with every `#[cfg(test)] mod … { … }` removed (brace-matched),
-/// so a test double implementing `JobHandler` is not counted.
+/// The source with comments removed and the contents of string and char
+/// literals blanked, every newline kept.
+///
+/// Both later passes count braces and match text, so neither may see a `{`
+/// inside `'{'` or `"{"` (it would unbalance the test-module strip and swallow
+/// the production code after it), nor an `impl JobHandler for X` written in a
+/// doc comment or a message string (it would count a handler that is not
+/// there). A `'` opens a char literal only when it is one: `'x'`, `'\…'`; a
+/// lifetime such as `'static` or `'_` is code.
+fn code_only(src: &str) -> String {
+    let c: Vec<char> = src.chars().collect();
+    let n = c.len();
+    let mut out = String::with_capacity(src.len());
+    let blank = |ch: char| if ch == '\n' { '\n' } else { ' ' };
+    // `r"…"`, `r#"…"#`, `br"…"`: the hash count, when a raw string opens at `i`.
+    let raw_at = |i: usize| -> Option<usize> {
+        let ident = |j: usize| c[j].is_alphanumeric() || c[j] == '_';
+        let prefix_ok = i == 0 || !ident(i - 1) || (c[i - 1] == 'b' && (i == 1 || !ident(i - 2)));
+        if c[i] != 'r' || !prefix_ok {
+            return None;
+        }
+        let hashes = c[i + 1..].iter().take_while(|&&x| x == '#').count();
+        (c.get(i + 1 + hashes) == Some(&'"')).then_some(hashes)
+    };
+    let mut i = 0;
+    while i < n {
+        if c[i] == '/' && c.get(i + 1) == Some(&'/') {
+            while i < n && c[i] != '\n' {
+                i += 1;
+            }
+        } else if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+            let mut depth = 0usize;
+            while i < n {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(c[i]));
+                    i += 1;
+                }
+            }
+        } else if let Some(hashes) = raw_at(i) {
+            // Ends at a quote followed by as many hashes as opened it.
+            out.push('"');
+            i += 2 + hashes;
+            while i < n {
+                let run = c[i + 1..].iter().take_while(|&&x| x == '#').count();
+                if c[i] == '"' && run >= hashes {
+                    i += 1 + hashes;
+                    break;
+                }
+                out.push(blank(c[i]));
+                i += 1;
+            }
+            out.push('"');
+        } else if c[i] == '"' {
+            out.push('"');
+            i += 1;
+            while i < n && c[i] != '"' {
+                if c[i] == '\\' {
+                    out.push(' ');
+                    i += 1;
+                }
+                if i < n {
+                    out.push(blank(c[i]));
+                    i += 1;
+                }
+            }
+            out.push('"');
+            i += 1;
+        } else if c[i] == '\'' && (c.get(i + 1) == Some(&'\\') || c.get(i + 2) == Some(&'\'')) {
+            // A char literal. In '\…' the escaped char (maybe a quote, as in
+            // '\'') is skipped before looking for the closing quote.
+            i += if c[i + 1] == '\\' { 3 } else { 2 };
+            while i < n && c[i] != '\'' {
+                i += 1;
+            }
+            out.push_str("' '");
+            i += 1;
+        } else {
+            out.push(c[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The (already [`code_only`]) source with every `#[cfg(test)] mod … { … }`
+/// removed, brace-matched, so a test double implementing `JobHandler` is not
+/// counted. A bodiless `#[cfg(test)] mod name;` declares a file module and
+/// strips nothing here (that file is scanned on its own).
 fn without_test_modules(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
     while let Some(at) = rest.find("#[cfg(test)]") {
         out.push_str(&rest[..at]);
         let after = &rest[at + "#[cfg(test)]".len()..];
-        if !after.trim_start().starts_with("mod ") {
+        let open = after.find('{');
+        let has_body = after.trim_start().starts_with("mod ")
+            && open.is_some_and(|o| after.find(';').is_none_or(|semi| o < semi));
+        let Some(open) = open.filter(|_| has_body) else {
             out.push_str("#[cfg(test)]");
             rest = after;
             continue;
-        }
-        let Some(open) = after.find('{') else {
-            rest = "";
-            break;
         };
         let mut depth = 0usize;
         let mut end = after.len();
@@ -72,26 +166,43 @@ fn ident_at(s: &str) -> String {
         .collect()
 }
 
+/// Every type one source file implements `JobHandler` for, outside tests.
+///
+/// Matched on the whitespace-flattened code, so a header rustfmt wrapped over
+/// several lines (`impl<…>\n    JobHandler for X<…>\nwhere …`) is still seen.
+/// A match counts only when the text since the previous `{`, `}` or `;` holds
+/// an `impl` keyword, i.e. when it is an impl header.
+fn handlers_in(raw: &str) -> BTreeSet<String> {
+    let flat = without_test_modules(&code_only(raw))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let needle = "JobHandler for ";
+    let mut found = BTreeSet::new();
+    for (at, _) in flat.match_indices(needle) {
+        let item_start = flat[..at].rfind(['{', '}', ';']).map_or(0, |p| p + 1);
+        let header = &flat[item_start..at];
+        let is_impl = header
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| word == "impl");
+        if !is_impl {
+            continue;
+        }
+        let name = ident_at(&flat[at + needle.len()..]);
+        assert!(!name.is_empty(), "unparsed impl header: {header}{needle}…");
+        found.insert(name);
+    }
+    found
+}
+
 /// Every type `epigraph-jobs/src` implements `JobHandler` for, outside tests.
 fn defined_handlers(src_dir: &Path) -> BTreeSet<String> {
     let mut files = Vec::new();
     rust_files(src_dir, &mut files);
-    let mut found = BTreeSet::new();
-    for file in files {
-        let src = without_test_modules(&std::fs::read_to_string(&file).expect("read source"));
-        for line in src.lines() {
-            let line = line.trim_start();
-            if line.starts_with("//") || !line.starts_with("impl") {
-                continue;
-            }
-            if let Some(at) = line.find("JobHandler for ") {
-                let name = ident_at(&line[at + "JobHandler for ".len()..]);
-                assert!(!name.is_empty(), "unparsed impl line: {line}");
-                found.insert(name);
-            }
-        }
-    }
-    found
+    files
+        .iter()
+        .flat_map(|f| handlers_in(&std::fs::read_to_string(f).expect("read source")))
+        .collect()
 }
 
 /// Every type `build_job_runner` registers.
@@ -146,7 +257,68 @@ fn the_test_module_strip_keeps_production_impls() {
     let src = "impl JobHandler for Before {}\n\
                #[cfg(test)]\nmod tests { struct Fake; impl JobHandler for Fake { fn f() { if x {} } } }\n\
                impl<S: X + 'static> JobHandler for After<S> {}\n";
-    let stripped = without_test_modules(src);
+    let stripped = without_test_modules(&code_only(src));
     assert!(stripped.contains("Before") && stripped.contains("After<S>"));
     assert!(!stripped.contains("Fake"));
+    assert_eq!(handlers_in(src), set(&["After", "Before"]));
+}
+
+fn set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// A bodiless `#[cfg(test)] mod name;` has no block to strip. Looking for the
+/// next `{` regardless would strip the next production item instead.
+#[test]
+fn a_bodiless_test_module_strips_nothing() {
+    let src = "#[cfg(test)]\nmod helpers;\n\nimpl JobHandler for AfterBodilessMod {}\n";
+    assert_eq!(handlers_in(src), set(&["AfterBodilessMod"]));
+}
+
+/// A brace inside a char or string literal, or a comment, in a test module
+/// must not unbalance the strip and swallow the production code after it.
+#[test]
+fn braces_in_literals_and_comments_do_not_unbalance_the_strip() {
+    let src = r##"
+#[cfg(test)]
+mod tests {
+    const OPEN: char = '{';
+    const ESCAPED: char = '\u{7b}';
+    const BYTE: u8 = b'{';
+    const QUOTE: char = '\'';
+    const S: &str = "{{ \" {";
+    const R: &str = r#"{"#;
+    const BR: &[u8] = br"{";
+    // an unbalanced { in a comment
+    /* and { another */
+    fn lifetimes<'a>(x: &'a str) -> &'static str { let _: &'_ str = x; "" }
+    struct Fake;
+    impl JobHandler for Fake {}
+}
+
+impl<S: Store + 'static> crate::JobHandler for AfterTestModule<S> {}
+"##;
+    assert_eq!(handlers_in(src), set(&["AfterTestModule"]));
+}
+
+/// rustfmt wraps a long impl header; the handler is still seen.
+#[test]
+fn a_wrapped_impl_header_is_seen() {
+    let src =
+        "impl<S>\n    JobHandler\n    for WrappedHeader<S>\nwhere\n    S: Send + 'static,\n{\n}\n";
+    assert_eq!(handlers_in(src), set(&["WrappedHeader"]));
+}
+
+/// Prose and strings naming a handler are not a handler.
+#[test]
+fn comments_and_strings_naming_a_handler_do_not_count() {
+    let src = r#"
+/// Docs mention `impl JobHandler for InADocComment`.
+// impl JobHandler for InALineComment {}
+/* impl JobHandler for InABlockComment {} */
+const MSG: &str = "impl JobHandler for InAString";
+fn f() { let _ = "JobHandler for NotAnImpl"; }
+impl JobHandler for Real {}
+"#;
+    assert_eq!(handlers_in(src), set(&["Real"]));
 }
