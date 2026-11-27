@@ -36,8 +36,13 @@ below uses the same word.
    `**Status:** <word> (checked against origin/main <sha>, <date>). <evidence>`,
    keeping the old line as `Original status:`, and update the row below.
 
-A pull request that implements, deviates from or abandons a spec updates both its
-`Status` line and its row here (CLAUDE.md, "Workflow").
+A pull request that adds a spec adds its row here in the same change, as
+`proposed` with `**Status:** proposed` as the spec's first `Status` line. A
+`proposed` line needs no `(checked against ...)` citation, since nothing is in
+the tree to check yet; every other status cites its check. A pull request that
+implements, deviates from or abandons a spec updates both its `Status` line and
+its row here (CLAUDE.md, "Workflow"). `.github/scripts/tests/test_spec_index.py`,
+run by CI's `plan` job, fails when a spec has no row.
 `.github/scripts/tests/test_spec_index.py` fails when a spec has no row, a row
 names a missing file, a status word is outside the vocabulary, or a checked spec's
 `Status` word disagrees with its row.

@@ -1,10 +1,10 @@
 """The design-spec status index, docs/superpowers/README.md, must match the specs.
 
 Fails when a spec has no row, a row names a missing file, a status word is
-outside the vocabulary, or a checked spec's first `Status` line disagrees with
-its row or cites no check. A row still marked `unverified` (transitional; it
-leaves VOCABULARY once every spec is checked) does not constrain its spec's
-line yet. Stdlib only, so the `plan` job runs it with no install:
+outside the vocabulary, or a spec's first `Status` line disagrees with its
+row or (unless it is `proposed`) cites no check. A row still marked
+`unverified` (transitional; it leaves VOCABULARY once every spec is checked)
+does not constrain its spec's line yet. Stdlib only, so the `plan` job runs it with no install:
 
     python3 -m unittest discover -s .github/scripts/tests -v
 
@@ -37,6 +37,10 @@ STATUS_LINE_RE = re.compile(r"^\W*status\W", re.I)
 STATUS_WORD_RE = re.compile(r"^\W*status\W+([A-Za-z-]+)", re.I)
 # The citation a checked spec carries on its status line.
 CHECKED_RE = re.compile(r"\(checked against origin/main [0-9a-f]{9,40}, \d{4}-\d{2}-\d{2}\)")
+# Statuses that make no claim about the tree, so their line needs no citation:
+# a new spec is written `proposed`, before anything exists to check it against.
+# `approved` still cites one: it says no implementation is in the tree yet.
+UNCHECKED_OK = {"proposed"}
 # A table row of the index: | `file.md` | status | ... |
 ROW_RE = re.compile(r"^\|\s*`([^`]+\.md)`\s*\|\s*([^|]*?)\s*\|")
 
@@ -82,7 +86,7 @@ def problems(readme_text, specs, vocabulary=VOCABULARY):
         word = m.group(1).lower() if m else None
         if word != status:
             out.append(f"{name}: Status line says {word!r}, row says {status!r}")
-        if not CHECKED_RE.search(line):
+        if status not in UNCHECKED_OK and not CHECKED_RE.search(line):
             out.append(f"{name}: Status line cites no '(checked against origin/main <sha>, <date>)'")
     return out
 
@@ -135,6 +139,15 @@ class Checks(unittest.TestCase):
         specs = dict(SPECS, **{"a.md": SPECS["a.md"].replace(CHECK, "")})
         self.assertEqual(len(problems(README, specs)), 1)
         self.assertIn("cites no", problems(README, specs)[0])
+
+    def test_a_new_proposed_spec_needs_a_row_but_no_citation(self):
+        readme = README + "| `c.md` | proposed | | |\n"
+        specs = dict(SPECS, **{"c.md": "# C\n\n**Status:** proposed\n"})
+        self.assertEqual(problems(readme, specs), [])
+        # The word must still match its row, and an approved spec still cites.
+        self.assertEqual(problems(readme.replace("| proposed |", "| approved |"),
+                                  dict(specs, **{"c.md": "**Status:** approved\n"})),
+                         ["c.md: Status line cites no '(checked against origin/main <sha>, <date>)'"])
 
     def test_the_first_status_line_is_the_one_read(self):
         text = f"# A\n\n**Status:** approved {CHECK}\n\n## Notes\n\nStatus: implemented {CHECK}\n"

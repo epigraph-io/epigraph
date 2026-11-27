@@ -249,10 +249,11 @@ migrate to head (it used to skip silently).
      the next batch.
 - `gh pr merge --merge --delete-branch` by default; never `--squash`
   unless explicitly told.
-- A PR that implements, deviates from or abandons a design spec
-  (`docs/superpowers/specs/`) updates its Status line and its
-  `docs/superpowers/README.md` row (vocabulary and procedure there;
-  `.github/scripts/tests/test_spec_index.py` checks they agree).
+- A PR that adds a design spec (`docs/superpowers/specs/`) adds its
+  `docs/superpowers/README.md` row as `proposed`; a PR that implements,
+  deviates from or abandons one updates its Status line and its row
+  (vocabulary and procedure there; `.github/scripts/tests/test_spec_index.py`,
+  in CI's `plan` job, fails when they disagree or a spec has no row).
 
 ## Embedding policy
 
