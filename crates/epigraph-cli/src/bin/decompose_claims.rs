@@ -60,9 +60,16 @@
 //! refused as a cycle. The ids come from the MCP `query_compound_claims` tool
 //! or the `compound-atom` label (`atomicity_sweep`). Afterwards the
 //! re-decomposed claim is a decomposed parent, so `--retarget` moves its
-//! contradicts/refutes edges onto the new atoms; challenges (their own
-//! table) are not moved. `--apply-plan` of a `--redecompose` plan needs
-//! `--redecompose` again; without it every line is refused.
+//! contradicts/refutes edges onto the new atoms; challenges stay on the
+//! parent by design (R-CH1/R-3): they are reported in the manifest and listed
+//! on atoms with list_challenges include_parents. Every `--redecompose` mode
+//! that calls the LLM or writes, and every `--retarget` mode, prints one
+//! `OPEN-CHALLENGE` line per open challenge (state not accepted, rejected or
+//! withdrawn) on a parent it touched and an `open challenges:` count; a
+//! `--redecompose --plan` line and a retarget manifest entry carry them as
+//! `parent_open_challenges` (`{id, state, challenger_id}`). No challenge row
+//! is changed (backlog 122ac356). `--apply-plan` of a `--redecompose` plan
+//! needs `--redecompose` again; without it every line is refused.
 //!
 //! Two filters default ON: skip `backlog`-labelled claims
 //! (`--include-backlog`) and skip claims that look atomic, one sentence and
@@ -203,10 +210,11 @@
 
 use clap::Parser;
 use epigraph_cli::decompose::{
-    atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
-    run_decomposition_batches, select_candidates, select_redecompose_candidates, verify_plan_for,
-    visible_claim_count, write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb,
-    EligibilityFilters, PlanGaps, Population, Priority, SingletonLedger,
+    atom_create_body, attach_open_challenges, open_challenges, persist_planned,
+    plan_decomposition_batches_with_gaps, read_plan_jsonl, run_decomposition_batches,
+    select_candidates, select_redecompose_candidates, verify_plan_for, visible_claim_count,
+    write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb, EligibilityFilters,
+    PlanGaps, Population, Priority, SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -1133,6 +1141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             print_retarget_plan(&run.plan);
+            report_open_challenges(
+                &run.plan
+                    .iter()
+                    .filter(|e| !e.parent_open_challenges.is_empty())
+                    .map(|e| (e.parent_id, e.parent_open_challenges.clone()))
+                    .collect(),
+                distinct_count(run.plan.iter().map(|e| e.parent_id)),
+            );
             eprintln!("manifest: {}", manifest.display());
             if !apply {
                 eprintln!(
@@ -1160,6 +1176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pool = maint_pool.ok_or("--retarget needs the maintenance path")?;
             let applied = apply_retarget(pool, viewer, &api, &plan, Some(&manifest)).await?;
             print_applied(&applied);
+            let parents: Vec<uuid::Uuid> = plan.iter().map(|e| e.parent_id).collect();
+            report_open_challenges(
+                &open_challenges(pool, viewer, &parents).await?,
+                distinct_count(parents.iter().copied()),
+            );
         }
         Mode::ApplyPlan(path) => {
             let planned = read_plan_jsonl(&path)?;
@@ -1180,6 +1201,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("FAILED {id}: {why}");
             }
             report_cycles(&totals.cycles);
+            if cli.redecompose {
+                let parents: Vec<uuid::Uuid> = ok.iter().map(|p| p.claim_id).collect();
+                report_open_challenges(
+                    &open_challenges(db, viewer, &parents).await?,
+                    distinct_count(parents.iter().copied()),
+                );
+            }
             eprintln!(
                 "apply-plan complete: {} applied, {} failed (still undecomposed; re-run this \
                  plan to retry them), {} refused, {} atoms, {} decomposes_to edges",
@@ -1315,11 +1343,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // write-path exercise.
             let llm = resolve_llm_client(&cli.provider, std::env::var(FIXTURE_PATH_ENV).ok())?;
             if let Mode::Plan(path) = &mode {
-                let (plans, gaps) =
+                let (mut plans, gaps) =
                     plan_decomposition_batches_with_gaps(&claims, llm.as_ref(), cli.batch_size)
                         .await;
+                if cli.redecompose {
+                    attach_open_challenges(db, viewer, &mut plans).await?;
+                }
                 write_plan_jsonl(path, &plans)?;
                 print_plan(&plans);
+                if cli.redecompose {
+                    report_open_challenges(
+                        &plans
+                            .iter()
+                            .filter(|p| !p.parent_open_challenges.is_empty())
+                            .map(|p| (p.claim_id, p.parent_open_challenges.clone()))
+                            .collect(),
+                        distinct_count(plans.iter().map(|p| p.claim_id)),
+                    );
+                }
                 let singletons: Vec<uuid::Uuid> = plans
                     .iter()
                     .filter(|p| p.atoms.len() <= 1)
@@ -1348,6 +1389,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             report_unplanned(&totals.gaps, &totals.singletons);
             report_cycles(&totals.cycles);
+            if cli.redecompose {
+                let parents: Vec<uuid::Uuid> = claims.iter().map(|c| c.claim_id).collect();
+                report_open_challenges(
+                    &open_challenges(db, viewer, &parents).await?,
+                    distinct_count(parents.iter().copied()),
+                );
+            }
             eprintln!(
                 "decompose complete: {} atoms, {} decomposes_to edges",
                 totals.atoms, totals.edges
@@ -1535,6 +1583,37 @@ async fn report_decomposed_conflict_parents(
         eprintln!("RETARGET-CANDIDATE {parent}\t{n} conflict edges");
     }
     Ok(())
+}
+
+/// Name every open challenge on a parent this run touched, one line each,
+/// then their count over the `touched` parents (backlog 122ac356). Nothing
+/// here changes a challenge: they stay on the parent by design (R-CH1/R-3).
+fn report_open_challenges(
+    open: &std::collections::BTreeMap<uuid::Uuid, Vec<epigraph_cli::decompose::OpenChallenge>>,
+    touched: usize,
+) {
+    for (parent, challenges) in open {
+        for c in challenges {
+            eprintln!(
+                "OPEN-CHALLENGE parent={parent} challenge={} state={} challenger={}",
+                c.id,
+                c.state,
+                c.challenger_id
+                    .map_or_else(|| "none".to_string(), |a| a.to_string())
+            );
+        }
+    }
+    let total: usize = open.values().map(Vec::len).sum();
+    eprintln!(
+        "open challenges: {total} on {} of {touched} touched parents (they stay on the parent; \
+         list_challenges include_parents lists them on its atoms)",
+        open.len()
+    );
+}
+
+/// How many distinct ids `ids` holds.
+fn distinct_count(ids: impl Iterator<Item = uuid::Uuid>) -> usize {
+    ids.collect::<std::collections::BTreeSet<_>>().len()
 }
 
 fn print_retarget_plan(plan: &[epigraph_cli::retarget::RetargetPlanEntry]) {

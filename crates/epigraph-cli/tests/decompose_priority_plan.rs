@@ -514,6 +514,7 @@ fn three_atom_plan(
         ],
         generality: vec![0, 0, 0],
         model: "fixture".into(),
+        parent_open_challenges: Vec::new(),
     }
 }
 
@@ -1026,6 +1027,7 @@ async fn an_empty_answer_is_not_recorded_as_judged_atomic(pool: PgPool) {
             generality: vec![0; atoms.len()],
             atoms,
             model: "hand-edited".to_string(),
+            parent_open_challenges: Vec::new(),
         }
     };
     let planned = vec![

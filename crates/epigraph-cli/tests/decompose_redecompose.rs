@@ -2,7 +2,9 @@
 //! target of a `decomposes_to` edge, can be selected, split and verified,
 //! which the undecomposed population can never do; a re-run writes nothing
 //! twice; an atom that would close a `decomposes_to` cycle is refused; and the
-//! re-decomposed atom becomes a `--retarget` input.
+//! re-decomposed atom becomes a `--retarget` input; and the parent's open
+//! challenges are reported on its plan line and retarget entry while no
+//! challenge row changes (backlog `122ac356`).
 //!
 //! The atom submit is a fake that dedups on (author, text), as the API's
 //! `if_not_exists` does, so atom ids are deterministic without an API server.
@@ -12,8 +14,9 @@
 mod fixture;
 
 use epigraph_cli::decompose::{
-    persist_decomposition, persist_planned, select_candidates, select_redecompose_candidates,
-    verify_plan, verify_plan_for, Decomposition, EligibilityFilters, Ineligible, PlanDrift,
+    attach_open_challenges, persist_decomposition, persist_planned, read_plan_jsonl,
+    select_candidates, select_redecompose_candidates, verify_plan, verify_plan_for,
+    write_plan_jsonl, Decomposition, EligibilityFilters, Ineligible, OpenChallenge, PlanDrift,
     PlannedDecomposition, Population, Priority,
 };
 use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
@@ -319,6 +322,7 @@ async fn an_atom_that_would_close_a_cycle_is_refused(pool: PgPool) {
         atoms,
         generality: vec![0, 0],
         model: "fixture".into(),
+        parent_open_challenges: Vec::new(),
     };
     let p = pool.clone();
     let agent = w.agent;
@@ -359,6 +363,7 @@ async fn a_redecompose_plan_line_verifies_only_under_redecompose(pool: PgPool) {
         atoms: split().atoms,
         generality: vec![0, 0],
         model: "fixture".into(),
+        parent_open_challenges: Vec::new(),
     };
     let (ok, drifted) = verify_plan(&pool, &viewer, vec![line()]).await.unwrap();
     assert!(ok.is_empty());
@@ -410,5 +415,135 @@ async fn a_redecomposed_atom_becomes_a_retarget_input(pool: PgPool) {
             .await
             .contains(&(w.disputer, w.compound_atom)),
         "after the split, --retarget sees the dispute and can move it onto the atom it targets"
+    );
+}
+
+async fn seed_challenge(pool: &PgPool, claim: Uuid, challenger: Uuid, state: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, state) \
+         VALUES ($1, $2, 'factual_error', 'the backup did not take over', $3) RETURNING id",
+    )
+    .bind(claim)
+    .bind(challenger)
+    .bind(state)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The whole challenge row, every column: `claim_id`, `owner_group_id`,
+/// `visibility`, `state` and the resolution columns among them.
+async fn challenge_row(pool: &PgPool, id: Uuid) -> serde_json::Value {
+    sqlx::query_scalar("SELECT to_jsonb(c) FROM challenges c WHERE c.id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Backlog 122ac356: a compound with one pending challenge (and one already
+/// rejected), re-decomposed, lists exactly the pending challenge on its plan
+/// line (the `--redecompose --plan` manifest entry, through the JSONL file)
+/// and on a `--retarget` manifest entry for its conflict edge, and applying
+/// the plan leaves every challenge row exactly as it was: challenges stay on
+/// the parent by design (R-CH1/R-3).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_redecomposition_reports_the_parents_open_challenges_and_changes_none(pool: PgPool) {
+    let w = seed(&pool).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let pending = seed_challenge(&pool, w.compound_atom, w.agent, "pending").await;
+    let rejected = seed_challenge(&pool, w.compound_atom, w.agent, "rejected").await;
+    let before = (
+        challenge_row(&pool, pending).await,
+        challenge_row(&pool, rejected).await,
+    );
+    let want = vec![OpenChallenge {
+        id: pending,
+        state: "pending".into(),
+        challenger_id: Some(w.agent),
+    }];
+
+    let mut plans = vec![PlannedDecomposition {
+        kind: PlannedDecomposition::KIND.into(),
+        claim_id: w.compound_atom,
+        agent_id: w.agent,
+        content: COMPOUND_ATOM.into(),
+        atoms: split().atoms,
+        generality: vec![0, 0],
+        model: "fixture".into(),
+        parent_open_challenges: Vec::new(),
+    }];
+    attach_open_challenges(&pool, &viewer, &mut plans)
+        .await
+        .unwrap();
+    assert_eq!(plans[0].parent_open_challenges, want);
+
+    // The plan file carries it, and reads back.
+    let path =
+        std::env::temp_dir().join(format!("redecompose-challenges-{}.jsonl", Uuid::new_v4()));
+    write_plan_jsonl(&path, &plans).unwrap();
+    let line: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+    assert_eq!(
+        line["parent_open_challenges"],
+        serde_json::json!([{"id": pending, "state": "pending", "challenger_id": w.agent}])
+    );
+    assert_eq!(read_plan_jsonl(&path).unwrap(), plans);
+    std::fs::remove_file(&path).ok();
+
+    // Apply the plan, as --apply-plan --redecompose does.
+    let redecompose = Population::Redecompose {
+        include_decomposed: false,
+    };
+    let (ok, drifted) = verify_plan_for(&pool, &viewer, plans, redecompose)
+        .await
+        .unwrap();
+    assert!(drifted.is_empty(), "{drifted:?}");
+    let p = pool.clone();
+    let agent = w.agent;
+    let submit = move |text: String, _g: i64, _parent: epigraph_cli::decompose::AtomParent| {
+        let p = p.clone();
+        async move { Ok::<_, Box<dyn std::error::Error>>(claim_if_not_exists(&p, agent, &text).await) }
+    };
+    let totals = persist_planned(&pool, &viewer, &ok, None, &submit)
+        .await
+        .unwrap();
+    assert_eq!(totals.edges, 2, "{:?}", totals.failed);
+
+    // The parent's conflict edge is now a retarget input; its manifest entry
+    // reports the same open challenge.
+    let mut entries: Vec<epigraph_cli::retarget::RetargetPlanEntry> =
+        R::list_parent_conflict_edges(&pool, &viewer, false, 100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.parent_id == w.compound_atom)
+            .map(|e| epigraph_cli::retarget::RetargetPlanEntry {
+                kind: epigraph_cli::retarget::RetargetPlanEntry::KIND.into(),
+                edge_id: e.edge_id,
+                relationship: "contradicts".into(),
+                source_id: e.source_id,
+                parent_id: e.parent_id,
+                atoms: vec![],
+                verdict: "unclear".into(),
+                reason: None,
+                chosen_atom_ids: vec![],
+                model: "fixture".into(),
+                parent_open_challenges: Vec::new(),
+            })
+            .collect();
+    assert_eq!(entries.len(), 1);
+    epigraph_cli::retarget::attach_parent_open_challenges(&pool, &viewer, &mut entries)
+        .await
+        .unwrap();
+    assert_eq!(entries[0].parent_open_challenges, want);
+
+    // No challenge row changed: same claim, owner, visibility, state.
+    assert_eq!(
+        (
+            challenge_row(&pool, pending).await,
+            challenge_row(&pool, rejected).await,
+        ),
+        before
     );
 }

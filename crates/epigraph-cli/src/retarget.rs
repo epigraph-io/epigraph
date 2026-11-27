@@ -339,6 +339,12 @@ pub struct RetargetPlanEntry {
     /// The atoms the edge would move to. Non-empty only for `atoms`.
     pub chosen_atom_ids: Vec<Uuid>,
     pub model: String,
+    /// The parent's challenges that were open when the entry was planned
+    /// (backlog 122ac356). A retarget moves conflict EDGES only; challenges
+    /// stay on the parent by design (R-CH1/R-3), and this reports them.
+    /// Absent (empty) when there are none, so older manifests still read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_open_challenges: Vec<crate::decompose::OpenChallenge>,
 }
 
 impl RetargetPlanEntry {
@@ -478,6 +484,7 @@ pub async fn plan_retarget(
                 reason,
                 chosen_atom_ids: chosen,
                 model: llm.model_name().to_string(),
+                parent_open_challenges: Vec::new(),
             });
         }
     }
@@ -542,8 +549,9 @@ pub fn read_retarget_manifest(
 
 #[cfg(feature = "db")]
 pub use db::{
-    apply_entry, apply_retarget, existing_atom_edges, load_retarget_items, plan_with_resume,
-    run_retarget, EdgeApiClient, RetargetOptions, RetargetRun,
+    apply_entry, apply_retarget, attach_parent_open_challenges, existing_atom_edges,
+    load_retarget_items, plan_with_resume, run_retarget, EdgeApiClient, RetargetOptions,
+    RetargetRun,
 };
 
 /// `model` of a plan entry resumed from existing atom edges (no LLM call).
@@ -1062,6 +1070,7 @@ mod db {
                     reason: Some(super::RESUMED_REASON.to_string()),
                     chosen_atom_ids: chosen,
                     model: super::RESUMED_MODEL.to_string(),
+                    parent_open_challenges: Vec::new(),
                 },
             );
         }
@@ -1082,6 +1091,24 @@ mod db {
                     .or_else(|| asked.remove(&i.edge_id))
             })
             .collect())
+    }
+
+    /// Set each entry's `parent_open_challenges` from
+    /// [`crate::decompose::open_challenges`], read as `viewer`. Reads only.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn attach_parent_open_challenges(
+        pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        plan: &mut [RetargetPlanEntry],
+    ) -> Result<(), epigraph_db::DbError> {
+        let parents: Vec<Uuid> = plan.iter().map(|e| e.parent_id).collect();
+        let open = crate::decompose::open_challenges(pool, viewer, &parents).await?;
+        for e in plan.iter_mut() {
+            e.parent_open_challenges = open.get(&e.parent_id).cloned().unwrap_or_default();
+        }
+        Ok(())
     }
 
     /// What one `--retarget` invocation does, besides the manifest path.
@@ -1105,7 +1132,8 @@ mod db {
 
     /// The whole `--retarget` / `--retarget --apply` flow, as the binary runs
     /// it: load candidates → (none: return, no LLM call) → plan through the
-    /// LLM → append plan lines to `manifest` → if and only if
+    /// LLM → record each parent's open challenges on its entries → append
+    /// plan lines to `manifest` → if and only if
     /// `opts.apply`, write through `api` and append the applied lines.
     ///
     /// # Errors
@@ -1122,7 +1150,8 @@ mod db {
         if items.is_empty() {
             return Ok(RetargetRun::default());
         }
-        let plan = plan_with_resume(pool, viewer, &items, llm, opts.batch_size).await?;
+        let mut plan = plan_with_resume(pool, viewer, &items, llm, opts.batch_size).await?;
+        attach_parent_open_challenges(pool, viewer, &mut plan).await?;
         super::append_jsonl(manifest, &plan)?;
         if !opts.apply {
             return Ok(RetargetRun {
@@ -1218,6 +1247,7 @@ mod tests {
             reason: None,
             chosen_atom_ids: chosen,
             model: "fixture".into(),
+            parent_open_challenges: Vec::new(),
         }
     }
 
@@ -1399,6 +1429,7 @@ mod tests {
             reason: None,
             chosen_atom_ids: vec![],
             model: "fixture".into(),
+            parent_open_challenges: Vec::new(),
         };
         append_jsonl(&path, std::slice::from_ref(&entry)).unwrap();
         append_jsonl(

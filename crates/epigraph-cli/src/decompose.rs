@@ -330,6 +330,34 @@ pub struct PlannedDecomposition {
     pub generality: Vec<i64>,
     /// `LlmProvider::model_name()` of the provider that produced the atoms.
     pub model: String,
+    /// A `--redecompose --plan` line: the parent's challenges that were open
+    /// when the plan was written (backlog 122ac356). Challenges stay on the
+    /// parent; this is a report, never moved. Absent (empty) on every other
+    /// line, so older plan files still read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_open_challenges: Vec<OpenChallenge>,
+}
+
+/// One open challenge on a parent a `--redecompose` or `--retarget` run
+/// touches, as its manifest entry records it (backlog 122ac356).
+///
+/// Challenges stay on the parent by design (R-CH1/R-3): a re-decomposition
+/// or a retarget never moves or edits one. The run reports them so the
+/// operator sees which disputes now sit on a decomposed parent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenChallenge {
+    pub id: uuid::Uuid,
+    pub state: String,
+    pub challenger_id: Option<uuid::Uuid>,
+}
+
+/// The challenge states that close a challenge. Every other state
+/// (`pending`, `under_review`) is open.
+pub const CLOSED_CHALLENGE_STATES: [&str; 3] = ["accepted", "rejected", "withdrawn"];
+
+/// Whether a challenge in `state` is still open.
+pub fn is_open_challenge_state(state: &str) -> bool {
+    !CLOSED_CHALLENGE_STATES.contains(&state)
 }
 
 impl PlannedDecomposition {
@@ -664,11 +692,11 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 
 #[cfg(feature = "db")]
 pub use db_writes::{
-    persist_decomposition, persist_planned, plan_decomposition_batches,
-    plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
-    select_redecompose_candidates, verify_plan, verify_plan_for, visible_claim_count, writer_group,
-    BatchClaim, BatchTotals, DecomposeDb, DecomposeRead, DecomposeTx, PersistOutcome, PlanDrift,
-    PlanGaps, Population, Priority, Selection,
+    attach_open_challenges, open_challenges, persist_decomposition, persist_planned,
+    plan_decomposition_batches, plan_decomposition_batches_with_gaps, run_decomposition_batches,
+    select_candidates, select_redecompose_candidates, verify_plan, verify_plan_for,
+    visible_claim_count, writer_group, BatchClaim, BatchTotals, DecomposeDb, DecomposeRead,
+    DecomposeTx, PersistOutcome, PlanDrift, PlanGaps, Population, Priority, Selection,
 };
 
 #[cfg(feature = "db")]
@@ -808,6 +836,65 @@ mod db_writes {
         viewer: &Viewer,
     ) -> Result<i64, DbError> {
         ClaimRepository::count_conn(&mut *db.read(viewer).await?, viewer, None).await
+    }
+
+    /// The open challenges (see [`super::is_open_challenge_state`]) on each
+    /// of `parents`, read as `viewer` on one `db` connection through
+    /// `ChallengeRepository::list_for_claim`, so a challenge or a parent the
+    /// viewer cannot read is not reported. Only parents with at least one
+    /// open challenge appear. Reads only: no challenge row is touched
+    /// (backlog 122ac356).
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn open_challenges(
+        db: &dyn DecomposeDb,
+        viewer: &Viewer,
+        parents: &[Uuid],
+    ) -> Result<std::collections::BTreeMap<Uuid, Vec<super::OpenChallenge>>, DbError> {
+        let mut out = std::collections::BTreeMap::new();
+        if parents.is_empty() {
+            return Ok(out);
+        }
+        let mut read = db.read(viewer).await?;
+        for &parent in parents {
+            if out.contains_key(&parent) {
+                continue;
+            }
+            let open: Vec<super::OpenChallenge> =
+                epigraph_db::ChallengeRepository::list_for_claim(&mut *read, viewer, parent)
+                    .await?
+                    .into_iter()
+                    .filter(|c| super::is_open_challenge_state(&c.state))
+                    .map(|c| super::OpenChallenge {
+                        id: c.id,
+                        state: c.state,
+                        challenger_id: c.challenger_id,
+                    })
+                    .collect();
+            if !open.is_empty() {
+                out.insert(parent, open);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Set each plan line's `parent_open_challenges` from [`open_challenges`]
+    /// (a `--redecompose --plan` run, before the plan file is written).
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn attach_open_challenges(
+        db: &dyn DecomposeDb,
+        viewer: &Viewer,
+        plans: &mut [super::PlannedDecomposition],
+    ) -> Result<(), DbError> {
+        let parents: Vec<Uuid> = plans.iter().map(|p| p.claim_id).collect();
+        let open = open_challenges(db, viewer, &parents).await?;
+        for p in plans.iter_mut() {
+            p.parent_open_challenges = open.get(&p.claim_id).cloned().unwrap_or_default();
+        }
+        Ok(())
     }
 
     /// The group a `decomposes_to` edge written as `viewer` on `db` records
@@ -1172,6 +1259,7 @@ mod db_writes {
                     atoms: decomp.atoms,
                     generality: decomp.generality,
                     model: llm.model_name().to_string(),
+                    parent_open_challenges: Vec::new(),
                 })
             })
             .collect();
@@ -1820,6 +1908,7 @@ mod tests {
             atoms: vec!["A".to_string(), "B".to_string()],
             generality: vec![0, -1],
             model: "fixture".to_string(),
+            parent_open_challenges: Vec::new(),
         }];
         write_plan_jsonl(&path, &plans).unwrap();
         assert_eq!(read_plan_jsonl(&path).unwrap(), plans);

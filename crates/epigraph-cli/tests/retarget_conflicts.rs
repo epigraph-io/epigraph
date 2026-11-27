@@ -742,6 +742,7 @@ fn entry_for(
         reason: None,
         chosen_atom_ids: atoms,
         model: "hand-edited".into(),
+        parent_open_challenges: Vec::new(),
     }
 }
 
