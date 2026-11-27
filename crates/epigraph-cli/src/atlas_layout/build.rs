@@ -335,9 +335,13 @@ mod tests {
         format!("{regions:?}{themes:?}")
     }
 
-    /// Backlog 6285e0cf: `cites` stays in the layout's links (a bundle
-    /// counts it, as `ATLAS_DEFAULT_RELATIONSHIPS` does) at weight 0: it
-    /// moves no region and no theme.
+    /// Backlog 6285e0cf: `cites` stays in the shared theme layout's links
+    /// (counted, as `ATLAS_DEFAULT_RELATIONSHIPS` does) at weight 0: it
+    /// moves no region and no theme. `build_layout` places regions and themes
+    /// before it reads the links, so no relationship moves a position here;
+    /// this pins that `cites` stays counted while moving nothing. The nested
+    /// maps' group and leaf force layouts do pull on `cites` (design spec
+    /// 2026-11-04, section 10, question 5).
     #[test]
     fn a_cites_link_is_kept_in_the_links_and_moves_no_position() {
         let without = build_layout(&inputs(), &BuildOptions::default()).unwrap();

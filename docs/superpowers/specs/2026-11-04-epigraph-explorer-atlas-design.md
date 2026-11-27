@@ -365,12 +365,20 @@ prototype first did, and switch once positions ship.
    caller can read, with no `x`/`y` (`placement: "viewer"`). A per-viewer position
    waits for the per-viewer view.
 4. *The `atlas_layout --min-public-members` default.* Stands at 1.
-5. *Whether `cites` counts in layout links.* It does, at weight 0: a bundle and
-   `/graph/links` count it (`ATLAS_DEFAULT_RELATIONSHIPS`), and it moves no
-   position in the shared theme layout (the `atlas_layout` build test
-   `a_cites_link_is_kept_in_the_links_and_moves_no_position`) and carries flow
-   weight 0 and sign 0 in a leaf (`epigraph-engine` `atlas_flow`). The leaf
-   force layout still pulls on every edge of a leaf, `cites` included.
+5. *Whether `cites` counts in layout links.* It does, at weight 0 in this
+   design's shared theme layout: `/graph/links` and the layout's links count it
+   (`ATLAS_DEFAULT_RELATIONSHIPS`), and it moves no region or theme, because
+   `atlas_layout`'s `build_layout` places regions and themes before it reads
+   any link (so no relationship moves a position there; the build test
+   `a_cites_link_is_kept_in_the_links_and_moves_no_position` pins that `cites`
+   stays counted and moves nothing). It also carries flow weight 0 and sign 0
+   in a leaf (`epigraph-engine` `atlas_flow`). Two layouts of the nested maps
+   (design 2026-11-12) still pull on `cites` at full weight, and whether they
+   should is open for the owner: group-child placement, where the sibling
+   bundles count `cites` (`atlas_links` `COUNTED_RELATIONSHIPS`) and
+   `atlas_layout`'s group force layout pulls linked children together by the
+   bundle count, and the leaf force layout, which pulls on every edge of a
+   leaf.
 6. *`POST /claims/batch-get` on the elevated read-only POST allowlist.* Stands.
 
 **Prerequisites.** This PR rebased on `main` and split into kernel and Explorer
