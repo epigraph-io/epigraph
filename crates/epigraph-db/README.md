@@ -74,9 +74,10 @@ cargo build -p epigraph-db
 
 ## Features
 
-- **Typed rows**: `FromRow` decoding for runtime queries; compile-time SQL
-  verification only for the minority of statements that use the `query!`
-  family (see Setup for which, and why)
+- **SQL checking**: compile-time verification only for the minority of
+  statements that use the `query!` family; the runtime majority is checked by
+  the DB-backed tests (see Setup for which, and why). New runtime queries
+  should decode through `FromRow`; some older sites still use `Row::get`
 - **Repository pattern**: Clean separation of data access logic
 - **Async/await**: Full async support with tokio
 - **Connection pooling**: Efficient connection management with sqlx
