@@ -5,10 +5,18 @@ tests run it as an operator would (a subprocess on the maintenance login,
 tests/db_roles.py) over fixture rows seeded on the superuser connection, and
 read the rows back.
 
-Retracted rows (backlog d2c71a07): migration 184's rewrite guard (re-created
-by 228) refuses any change to a retracted row's `evidence_id`, so a single
-retracted, unlinked row the UPDATE matched aborted the whole `--execute` and
-linked nothing. The backfill skips retracted rows and counts them.
+Backlog d2c71a07:
+  * pass 1 links an evidence-slot row (migration 267: `slot_kind = 'evidence'`,
+    `slot_id` = its evidence row) to its slot, and only when that evidence row
+    is on the BBA's own claim; a slot pointing at another claim's evidence is
+    linked by neither pass, even when its claim has exactly one evidence row;
+  * a dry run writes nothing (no row, no undo file) and counts exactly what
+    `--execute` then links; a re-run links nothing; `--undo` restores NULLs,
+    skipping a row whose link changed since;
+  * retracted rows: migration 184's rewrite guard (re-created by 228) refuses
+    any change to a retracted row's `evidence_id`, so a single retracted,
+    unlinked row the UPDATE matched aborted the whole `--execute` and linked
+    nothing. The backfill skips retracted rows and counts them.
 
 Uses the CI-provisioned `_test` database (.github/workflows/ci.yml, job
 `python`: DEDUP_TEST_DATABASE_URL, EPIGRAPH_PYTEST_REQUIRE_DB=1) and skips
@@ -141,7 +149,25 @@ class World:
         return proc
 
     def execute(self):
-        return self.run("--execute"), None
+        undo = self.tmp_path / f"undo-{len(self.undo_files)}.jsonl"
+        self.undo_files.append(undo)
+        return self.run("--execute", "--undo-file", str(undo)), undo
+
+    def fixture_state(self):
+        return {name: self.evidence_id(name) for name in BBAS}
+
+
+BBAS = ("single", "retracted", "slot", "cross_slot", "retracted_slot")
+
+
+def summary(proc):
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("summary: ")]
+    assert len(lines) == 1, proc.stdout
+    return json.loads(lines[0][len("summary: "):])
+
+
+def undo_records(path):
+    return [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
 
 
 @pytest.fixture
@@ -221,6 +247,30 @@ def world(tmp_path):
     _retract(cur, w.ids["retracted"], agent, group)
     w.retracted.append(w.ids["retracted"])
 
+    # SLOT: an evidence-slot row on a claim with TWO evidence rows, so the
+    # single-candidate pass cannot link it; only the slot rule can.
+    c_slot = claim()
+    w.ids["slot_evidence"] = _evidence(cur, c_slot)
+    w.ids["other_evidence"] = _evidence(cur, c_slot)
+    w.ids["slot"] = _bba(cur, c_slot, frame, agent, "evidence", w.ids["slot_evidence"])
+
+    # CROSS_SLOT: an evidence-slot row whose slot names the evidence row of
+    # ANOTHER claim (c_slot's), on a claim with exactly one evidence row of its
+    # own. Its slot proves it was not written for that one row, so neither
+    # pass may link it.
+    c_cross = claim()
+    w.ids["cross_own_evidence"] = _evidence(cur, c_cross)
+    w.ids["cross_slot"] = _bba(cur, c_cross, frame, agent, "evidence", w.ids["slot_evidence"])
+
+    # RETRACTED_SLOT: a retracted evidence-slot row whose slot matches.
+    c_rslot = claim()
+    rslot_evidence = _evidence(cur, c_rslot)
+    w.ids["retracted_slot"] = _bba(cur, c_rslot, frame, agent, "evidence", rslot_evidence)
+    _retract(cur, w.ids["retracted_slot"], agent, group)
+    w.retracted.append(w.ids["retracted_slot"])
+
+    assert w.fixture_state() == dict.fromkeys(BBAS), "fixture: every BBA starts unlinked"
+
     w.frame = frame
     w.agent = agent
     w.group = group
@@ -248,3 +298,97 @@ def test_a_retracted_row_is_skipped_and_does_not_abort_the_backfill(world):
     assert world.evidence_id("single") == world.ids["single_evidence"], (
         "the rest of the backfill committed:\n" + proc.stdout
     )
+
+
+def test_a_slot_row_is_linked_exactly_and_a_cross_claim_slot_is_not(world):
+    proc, undo = world.execute()
+    state = world.fixture_state()
+    assert state["slot"] == world.ids["slot_evidence"], (
+        "the evidence-slot row is linked to its slot's evidence row:\n" + proc.stdout
+    )
+    assert state["cross_slot"] is None, (
+        "a slot naming another claim's evidence is linked by neither pass "
+        f"(got {state['cross_slot']}; own evidence {world.ids['cross_own_evidence']}, "
+        f"slot {world.ids['slot_evidence']})"
+    )
+    assert state["single"] == world.ids["single_evidence"]
+    assert state["retracted"] is None and state["retracted_slot"] is None
+
+    s = summary(proc)
+    assert s["pass1_slot"]["linked"] >= 1 and s["pass1_slot"]["unmatched"] >= 1, s
+    assert s["pass2_single"]["linked"] >= 1 and s["retracted"] >= 2, s
+    records = {r["mass_function_id"]: r for r in undo_records(undo)}
+    assert records[world.ids["slot"]] == {
+        "mass_function_id": world.ids["slot"],
+        "evidence_id": world.ids["slot_evidence"],
+        "pass": "slot",
+    }
+    assert records[world.ids["single"]]["pass"] == "single"
+    for name in ("cross_slot", "retracted", "retracted_slot"):
+        assert world.ids[name] not in records, name
+    assert len(records) == s["pass1_slot"]["linked"] + s["pass2_single"]["linked"]
+
+
+def test_a_dry_run_writes_nothing_and_counts_what_execute_links(world):
+    before_total = world.linked_total()
+    named = world.tmp_path / "dry-run-undo.jsonl"
+    dry = world.run("--undo-file", str(named))
+    assert world.fixture_state() == dict.fromkeys(BBAS), "a dry run links nothing"
+    assert world.linked_total() == before_total, "a dry run writes no row"
+    assert not named.exists(), "a dry run writes no undo file"
+    d = summary(dry)
+    assert d["mode"] == "dry-run", d
+
+    proc, _ = world.execute()
+    e = summary(proc)
+    assert d["pass1_slot"]["linked"] == e["pass1_slot"]["linked"] >= 1, (d, e)
+    assert d["pass2_single"]["linked"] == e["pass2_single"]["linked"] >= 1, (d, e)
+    assert world.linked_total() == before_total + e["pass1_slot"]["linked"] + e[
+        "pass2_single"]["linked"]
+
+
+def test_a_re_run_is_a_no_op(world):
+    world.execute()
+    first = world.fixture_state()
+    total = world.linked_total()
+    proc, undo = world.execute()
+    s = summary(proc)
+    assert s["pass1_slot"]["linked"] == 0 and s["pass2_single"]["linked"] == 0, s
+    assert undo_records(undo) == []
+    assert world.fixture_state() == first
+    assert world.linked_total() == total
+
+
+def test_undo_restores_nulls_and_skips_a_row_changed_since(world):
+    _, undo = world.execute()
+    linked_total = world.linked_total()
+    # After the run, someone re-points the single-candidate row: the undo must
+    # not clobber a link it did not write.
+    world.cur.execute(
+        "UPDATE mass_functions SET evidence_id = %s WHERE id = %s",
+        (world.ids["cross_own_evidence"], world.ids["single"]),
+    )
+    n = len(undo_records(undo))
+
+    dry = summary(world.run("--undo", str(undo)))
+    assert dry == {"mode": "undo-dry-run", "records": n, "reverted": n - 1, "skipped": 1}, dry
+    assert world.evidence_id("slot") == world.ids["slot_evidence"], "an undo dry run writes nothing"
+    assert world.linked_total() == linked_total
+
+    done = summary(world.run("--undo", str(undo), "--execute"))
+    assert done == {"mode": "undo", "records": n, "reverted": n - 1, "skipped": 1}, done
+    assert world.evidence_id("slot") is None, "the slot link is undone"
+    assert world.evidence_id("single") == world.ids["cross_own_evidence"], (
+        "a row re-linked since the run is left alone"
+    )
+    assert world.linked_total() == linked_total - (n - 1)
+
+
+def test_execute_needs_a_new_undo_file(world):
+    refused = world.run("--execute", check=False)
+    assert refused.returncode == 2 and "--undo-file" in refused.stderr, refused.stderr
+    existing = world.tmp_path / "exists.jsonl"
+    existing.write_text("")
+    refused = world.run("--execute", "--undo-file", str(existing), check=False)
+    assert refused.returncode == 2 and "exists" in refused.stderr, refused.stderr
+    assert world.fixture_state() == dict.fromkeys(BBAS), "a refused run links nothing"
