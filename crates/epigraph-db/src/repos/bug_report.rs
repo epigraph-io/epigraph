@@ -24,7 +24,7 @@
 //! as [`DbError::Refused`] with the database's message, so every surface
 //! answers it as the caller's error rather than a server fault.
 
-use crate::errors::{DbError, RefusalKind};
+use crate::errors::DbError;
 use chrono::{DateTime, Utc};
 use epigraph_crypto::ContentHasher;
 use uuid::Uuid;
@@ -171,29 +171,12 @@ impl BugReportInput {
     }
 }
 
-/// Classify a definer refusal by its code, as the refusal-code registry
-/// does. `None` for anything that is not a registered `BUGnn: ` refusal.
-fn refusal_kind(message: &str) -> Option<RefusalKind> {
-    crate::refusal_codes::lookup_message(message)
-        .filter(|c| crate::refusal_codes::Family::Bug.holds(c.code))
-        .and_then(|c| match c.answer {
-            crate::refusal_codes::Answer::Refused(kind) => Some(kind),
-            _ => None,
-        })
-}
-
-/// A `BUGnn:` refusal as [`DbError::Refused`] carrying the database's message;
-/// every other error unchanged.
+/// A registered `BUGnn: ` refusal as [`DbError::Refused`] carrying the
+/// database's message, read by the refusal-code registry as every other
+/// family's repo reads its own (`DbError::from_definer`); every other error
+/// the ordinary conversion.
 fn map_refusal(e: sqlx::Error) -> DbError {
-    if let sqlx::Error::Database(db) = &e {
-        if let Some(kind) = refusal_kind(db.message()) {
-            return DbError::Refused {
-                kind,
-                message: db.message().to_string(),
-            };
-        }
-    }
-    DbError::from(e)
+    DbError::from_definer(e, crate::refusal_codes::Family::Bug)
 }
 
 /// The bug-report intake's two definers.
@@ -424,12 +407,38 @@ mod tests {
 
     #[test]
     fn only_bug_codes_are_refusals() {
-        assert_eq!(refusal_kind("BUG04: x"), Some(RefusalKind::Input));
-        assert_eq!(refusal_kind("BUG03: x"), Some(RefusalKind::State));
-        assert_eq!(refusal_kind("BUG08: x"), Some(RefusalKind::State));
-        assert_eq!(refusal_kind("BUG07: x"), Some(RefusalKind::Authority));
-        assert_eq!(refusal_kind("OPL01: x"), None);
-        assert_eq!(refusal_kind("BUG"), None);
-        assert_eq!(refusal_kind("BUGGY: x"), None);
+        use crate::errors::fake_db::{error, shape};
+        for (message, want) in [
+            ("BUG04: x", "Refused(Input): BUG04: x"),
+            ("BUG03: x", "Refused(State): BUG03: x"),
+            ("BUG08: x", "Refused(State): BUG08: x"),
+            ("BUG07: x", "Refused(Authority): BUG07: x"),
+            ("OPL01: x", "QueryFailed"),
+            ("BUG", "QueryFailed"),
+            ("BUGGY: x", "QueryFailed"),
+        ] {
+            assert_eq!(
+                shape(&map_refusal(error("P0001", message))),
+                want,
+                "{message}"
+            );
+        }
+    }
+
+    /// A custom SQLSTATE the registry answers wins over a `BUGnn: ` message,
+    /// as it does for every other family's repo: the claims trigger's ROL01
+    /// stays the typed denial whatever the text opens with.
+    #[test]
+    fn a_registered_sqlstate_wins_over_a_bug_message() {
+        use crate::errors::fake_db::{error, shape};
+        assert_eq!(
+            shape(&map_refusal(error("ROL01", "BUG01: x"))),
+            "RoleHolderRequired: BUG01: x"
+        );
+        assert_eq!(
+            shape(&map_refusal(error("TGP01", "BUG04: x"))),
+            "QueryFailed",
+            "another family's code is not this repo's to convert"
+        );
     }
 }
