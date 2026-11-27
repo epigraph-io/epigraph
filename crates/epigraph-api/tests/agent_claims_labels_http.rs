@@ -44,17 +44,18 @@ async fn app_role_state(pool: &PgPool) -> AppState {
     state
 }
 
-/// A public `claim -ATTRIBUTED_TO-> agent` edge, world-owned.
-async fn attribute(pool: &PgPool, claim: Uuid, agent: Uuid) {
+/// A public `claim -<relationship>-> agent` attribution edge, world-owned.
+async fn attribute(pool: &PgPool, claim: Uuid, agent: Uuid, relationship: &str) {
     let world = viewer_fixture::world_group(pool).await;
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-         VALUES ($1, $2, 'claim', $3, 'agent', 'ATTRIBUTED_TO')",
+         VALUES ($1, $2, 'claim', $3, 'agent', $4)",
     )
     .bind(id)
     .bind(claim)
     .bind(agent)
+    .bind(relationship)
     .execute(pool)
     .await
     .expect("seed the attribution edge");
@@ -80,7 +81,10 @@ async fn set_labels(pool: &PgPool, claim: Uuid, labels: &[&str]) {
 
 /// Two attributed claims with DIFFERENT labels and one with none: each item
 /// carries exactly its own stored labels, so a handler that dropped them, or
-/// assigned one claim's labels to another, fails.
+/// assigned one claim's labels to another, fails. The alpha claim has a
+/// SECOND attribution edge (the lowercase spelling the page query also
+/// matches), so it is listed twice; both copies must carry its labels, so a
+/// handler that consumed the label map on first use fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn agent_claims_returns_each_claims_stored_labels(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -93,8 +97,9 @@ async fn agent_claims_returns_each_claims_stored_labels(pool: PgPool) {
     set_labels(&pool, alpha, &["topic:alpha", "src:notes.md"]).await;
     set_labels(&pool, beta, &["topic:beta"]).await;
     for claim in [alpha, beta, bare] {
-        attribute(&pool, claim, author).await;
+        attribute(&pool, claim, author, "ATTRIBUTED_TO").await;
     }
+    attribute(&pool, alpha, author, "attributed_to").await;
 
     let token = common::mint_token_with_agent(&["claims:read"], reader);
     let req = Request::builder()
@@ -110,30 +115,37 @@ async fn agent_claims_returns_each_claims_stored_labels(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "attributed claims: {body}");
 
     let items = body["items"].as_array().expect("items");
-    assert_eq!(items.len(), 3, "all three attributions are listed: {body}");
-    let labels_of = |claim: Uuid| -> Vec<String> {
-        let item = items
+    assert_eq!(items.len(), 4, "all four attributions are listed: {body}");
+    // Every listed copy of `claim`, as its labels.
+    let labels_of = |claim: Uuid| -> Vec<Vec<String>> {
+        let copies: Vec<Vec<String>> = items
             .iter()
-            .find(|i| i["id"].as_str() == Some(claim.to_string().as_str()))
-            .unwrap_or_else(|| panic!("{claim} is listed: {body}"));
-        // `ClaimResponse` omits an empty `labels` from the JSON.
-        match &item["labels"] {
-            Value::Null => Vec::new(),
-            labels => serde_json::from_value(labels.clone()).expect("labels is a string array"),
-        }
+            .filter(|i| i["id"].as_str() == Some(claim.to_string().as_str()))
+            // `ClaimResponse` omits an empty `labels` from the JSON.
+            .map(|item| match &item["labels"] {
+                Value::Null => Vec::new(),
+                labels => serde_json::from_value(labels.clone()).expect("labels is a string array"),
+            })
+            .collect();
+        assert!(!copies.is_empty(), "{claim} is listed: {body}");
+        copies
     };
     assert_eq!(
         labels_of(alpha),
-        ["topic:alpha", "src:notes.md"],
-        "the alpha claim's stored labels: {body}"
+        [
+            ["topic:alpha", "src:notes.md"],
+            ["topic:alpha", "src:notes.md"]
+        ],
+        "both attributions of the alpha claim carry its stored labels: {body}"
     );
     assert_eq!(
         labels_of(beta),
-        ["topic:beta"],
+        [["topic:beta"]],
         "the beta claim's stored labels: {body}"
     );
-    assert!(
-        labels_of(bare).is_empty(),
+    assert_eq!(
+        labels_of(bare),
+        [Vec::<String>::new()],
         "an unlabelled claim lists no labels: {body}"
     );
 }
