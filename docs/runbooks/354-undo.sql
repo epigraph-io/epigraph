@@ -3,9 +3,10 @@
 -- backlog a6e3dba2, c7752f07) back out, in ONE transaction, as a superuser
 -- on the migration DSN.
 --
--- ROLL THE BINARY BACK FIRST if you want the pre-354 binary: it requires
--- the harvester tenancy triggers this file recreates. A 354 binary also runs
--- on the result (it no longer names the tables).
+-- ROLL THE BINARY BACK FIRST: a binary built with 354 no longer blanks
+-- harvester fragment text in a seal, so it must not serve a database where
+-- the harvester tables exist and hold rows. The pre-354 binary requires the
+-- harvester tenancy triggers this file recreates.
 --
 -- WHAT IT DOES:
 --   * REFUSES (55000, nothing changed) unless each of the four bodies 354

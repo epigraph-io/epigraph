@@ -79,16 +79,21 @@
 -- Measure first: `SELECT count(*) FROM <each table>` as a superuser (guard
 -- (c) refuses on any row).
 --
--- Binary: the API binary of this change names none of the tables (its FORCE
--- list, its trigger tiers and its seal), so it runs on either side of this
--- file. An OLDER binary still boots on a migrated database (its boot check
--- skips a trigger whose table is absent, with a warning, and the 089 and 173
--- tiers are gated on functions this file drops), but its seal statement
--- naming `harvester_fragments` fails with 42P01, so a privatization seal
--- fails until the new binary runs. Deploy the binary with this file, or
--- before it. The operator CLI of this change refuses a database below 354:
--- its cascade model finds `harvester_claim_provenance` in
--- `epigraph_propagate_tenancy`'s list and no longer attributes it.
+-- Binary: MIGRATE FIRST, then start the API binary of this change (the
+-- unit's ExecStartPre runs `epigraph-migrate` before the server). That binary
+-- names none of the tables: its seal no longer blanks harvester fragment text
+-- and its boot check no longer requires their FORCE or triggers. So it must
+-- not serve a database below 354 that holds harvester rows: a seal there would
+-- leave fragment text in plaintext. (On a database below 354 with EMPTY
+-- harvester tables, as measured on the deployed one, nothing is lost; guard
+-- (c) keeps 354 from running over rows.) An OLDER binary still boots on a
+-- migrated database (its boot check skips a trigger whose table is absent,
+-- with a warning, and the 089 and 173 tiers are gated on functions this file
+-- drops), but its seal statement naming `harvester_fragments` fails with
+-- 42P01, so a privatization seal fails until the new binary runs. The
+-- operator CLI of this change refuses a database below 354: its cascade model
+-- finds `harvester_claim_provenance` in `epigraph_propagate_tenancy`'s list
+-- and no longer attributes it.
 --
 -- Undo: `docs/runbooks/354-undo.sql` (roll the binary back first) recreates
 -- the five tables EMPTY in their 347 shape and re-states the four bodies

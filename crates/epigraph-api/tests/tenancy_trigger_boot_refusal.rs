@@ -37,10 +37,11 @@ async fn a_database_at_head_boots(pool: PgPool) {
     );
 }
 
-/// A database below 354 (its harvester tables, their triggers and the 089 and
-/// 173 stamping functions recreated by `docs/runbooks/354-undo.sql`) boots on
-/// this binary, which no longer requires those triggers: the binary may be
-/// deployed before the migration.
+/// A database put back below 354 by `docs/runbooks/354-undo.sql` (its
+/// harvester tables, their triggers and the 089 and 173 stamping functions
+/// recreated, EMPTY) still boots on this binary, which no longer requires those
+/// triggers. (The deploy order is migrate first: this binary must not serve a
+/// database below 354 that holds harvester rows, see 354's header.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_database_below_354_boots(pool: PgPool) {
     let undo = std::fs::read_to_string(

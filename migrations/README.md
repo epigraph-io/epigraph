@@ -5244,11 +5244,14 @@ restart.
   did; it refuses (55000) over a body a later migration re-stated. Run it BEFORE any older
   runbook that re-states one of the four bodies or names a harvester table (284's, 258's,
   242's, 126's, ...): those refuse over 354's bodies or fail on the absent tables. **Measure first** (guard (c)): `SELECT count(*)` of each table as a
-  superuser. **Deploy order:** the binary of this change with the migration, or before
-  it: it runs on either side of 354. An OLDER binary still boots on a migrated database (its
-  trigger check skips an absent table with a warning, and the 089/173 tiers are gated on functions
-  354 drops), but its seal fails (42P01 on `harvester_fragments`). The operator CLI of this change
-  refuses a database below 354 (its cascade model no longer attributes the provenance table).
+  superuser. **Deploy order:** MIGRATE FIRST, then the binary of this change
+  (`epigraph-migrate` as ExecStartPre). That binary no longer blanks harvester fragment text in a
+  seal nor checks the harvester tables at boot, so it must not serve a database below 354 that
+  holds harvester rows (with the tables empty, as measured, nothing is lost). An OLDER binary
+  still boots on a migrated database (its trigger check skips an absent table with a warning, and
+  the 089/173 tiers are gated on functions 354 drops), but its seal fails (42P01 on
+  `harvester_fragments`). The operator CLI of this change refuses a database below 354 (its
+  cascade model no longer attributes the provenance table).
   Apply as a superuser. **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
