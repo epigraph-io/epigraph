@@ -36,13 +36,24 @@
 //!    because test-only composition is the documented exception. A file with
 //!    no entry has a ceiling of zero.
 //!
+//! 3. **A front-end dependency is renamed, or a front end's crate is aliased
+//!    in source.** The count in 2 reads the crate's own name, so a
+//!    `mcp = { package = "epigraph-mcp", .. }` key (whose references read
+//!    `mcp::`) or a `use epigraph_mcp as m;` (whose calls read `m::`) would
+//!    take the count to zero or freeze it while the coupling grows. Both are
+//!    refused outright: a front end names another front end only by its own
+//!    crate name, so every reference is one the count sees. An item imported
+//!    by name (`use epigraph_mcp::{a, b};`) counts once per import, not per
+//!    use; the count is a proxy for the import surface, not a call graph.
+//!
 //! A count BELOW its ceiling, or a ceiling whose file is gone, does not fail.
 //! It prints "lower the ceiling" so the step that removed a reference
 //! lowers the number in the same change.
 //!
 //! The checks are pure functions over manifest text and file text, so
-//! [`an_extra_mcp_to_api_edge_fails`] and [`a_raised_reference_count_fails`]
-//! feed them synthetic input and prove that each kind of violation is caught.
+//! [`an_extra_mcp_to_api_edge_fails`], [`a_raised_reference_count_fails`] and
+//! [`a_renamed_or_aliased_front_end_fails`] feed them synthetic input and prove
+//! that each kind of violation is caught.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -245,6 +256,55 @@ fn edge_violations(
     violations
 }
 
+/// Every front-end dependency in `manifests` declared under a key that is not
+/// the package's own name (check 3), one line each. A `workspace = true` entry
+/// inherits its rename, so a renamed `[workspace.dependencies]` key counts too.
+fn rename_violations(manifests: &[(&str, String)], workspace_deps: &toml::Table) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (from, manifest) in manifests {
+        let parsed: Value =
+            toml::from_str(manifest).unwrap_or_else(|e| panic!("parse {from}'s Cargo.toml: {e}"));
+        for (table, deps) in dependency_tables(&parsed) {
+            for (key, spec) in deps {
+                let to = package_of(key, spec, workspace_deps);
+                if FRONT_ENDS.contains(&to.as_str()) && to != *from && key != &to {
+                    violations.push(format!(
+                        "{from} -> {to} [{table}] is declared under the key `{key}`: its \
+                         source would name the crate `{}::`, which the reference count does \
+                         not see. Declare it under its own name.",
+                        key.replace('-', "_")
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// The aliases `text`, a source file of `owner`, gives the OTHER front ends'
+/// crates (`use epigraph_mcp as m;`, `extern crate epigraph_mcp as m;`,
+/// `use epigraph_mcp::{self as m};`), one line each (check 3).
+fn alias_violations(owner: &str, text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for c in FRONT_ENDS.iter().filter(|c| **c != owner) {
+        let name = c.replace('-', "_");
+        for pattern in [
+            format!("{name} as "),
+            format!("{name}::{{self as "),
+            format!("{name}::self as "),
+        ] {
+            if text.contains(&pattern) {
+                found.push(format!(
+                    "`{}`: an alias for another front end's crate, whose uses the \
+                     reference count does not see. Name the crate by its own name.",
+                    pattern.trim_end()
+                ));
+            }
+        }
+    }
+    found
+}
+
 /// The references `text`, a source file of `owner`, makes to the OTHER front
 /// ends' crates.
 fn foreign_references(owner: &str, text: &str) -> usize {
@@ -267,6 +327,9 @@ fn reference_findings(
     let mut lower = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for (path, owner, text) in files {
+        for alias in alias_violations(owner, text) {
+            violations.push(format!("{path}: {alias}"));
+        }
         let count = foreign_references(owner, text);
         let max = ceiling.get(path.as_str()).copied().unwrap_or(0);
         seen.insert(path.as_str());
@@ -341,6 +404,18 @@ fn no_new_dependency_edge_among_the_front_ends() {
             );
         }
     }
+}
+
+#[test]
+fn no_front_end_dependency_is_renamed() {
+    let root = workspace_root();
+    let workspace_deps = workspace_dependencies(&read(&root.join("Cargo.toml")));
+    let violations = rename_violations(&real_manifests(), &workspace_deps);
+    assert!(
+        violations.is_empty(),
+        "crate layering (backlog 6ffcb138):\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]
@@ -483,5 +558,74 @@ fn a_raised_reference_count_fails() {
         lower.len(),
         1,
         "the ceiling whose file is absent is reported: {lower:?}"
+    );
+}
+
+/// Check 3 catches the two ways to hide references from the count: the
+/// allowed API -> MCP edge declared under a renamed key (directly or through a
+/// renamed workspace entry), and an alias for the MCP crate in API source. A
+/// plain declaration and a plain reference are not flagged.
+#[test]
+fn a_renamed_or_aliased_front_end_fails() {
+    let workspace_deps = workspace_dependencies(
+        r#"
+        [workspace.dependencies]
+        epigraph-mcp = { path = "crates/epigraph-mcp" }
+        mcp-front = { path = "crates/epigraph-mcp", package = "epigraph-mcp" }
+        "#,
+    );
+    for manifest in [
+        "[dependencies]\nmcp = { path = \"../epigraph-mcp\", package = \"epigraph-mcp\", optional = true }\n",
+        "[dependencies]\nmcp-front = { workspace = true, optional = true }\n",
+    ] {
+        let manifests = [("epigraph-api", manifest.to_string())];
+        assert!(
+            edge_violations(&manifests, &workspace_deps, ALLOWED_EDGES).is_empty(),
+            "the edge itself is the allowed one: {manifest}"
+        );
+        assert_eq!(
+            rename_violations(&manifests, &workspace_deps).len(),
+            1,
+            "{manifest}"
+        );
+    }
+    assert!(rename_violations(
+        &[(
+            "epigraph-api",
+            "[dependencies]\nepigraph-mcp = { workspace = true, optional = true }\n\
+             db = { package = \"epigraph-db\", path = \"../epigraph-db\" }\n"
+                .to_string()
+        )],
+        &workspace_deps
+    )
+    .is_empty());
+
+    let ceilings = &[("crates/epigraph-api/src/a.rs", 5)];
+    for text in [
+        "use epigraph_mcp as m;\nm::a(); m::b(); m::c(); m::d(); m::e(); m::f();\n",
+        "extern crate epigraph_mcp as m;\n",
+        "use epigraph_mcp::{self as m, errors};\n",
+    ] {
+        let (v, _) = reference_findings(
+            &[(
+                "crates/epigraph-api/src/a.rs".to_string(),
+                "epigraph-api",
+                text.to_string(),
+            )],
+            ceilings,
+        );
+        assert_eq!(v.len(), 1, "{text}\n{v:?}");
+    }
+    let (v, _) = reference_findings(
+        &[(
+            "crates/epigraph-cli/src/bin/x.rs".to_string(),
+            "epigraph-cli",
+            "use epigraph_cli as cli;\n".to_string(),
+        )],
+        ceilings,
+    );
+    assert!(
+        v.is_empty(),
+        "a crate aliasing itself is not coupling: {v:?}"
     );
 }
