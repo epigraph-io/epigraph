@@ -492,15 +492,18 @@ impl MethodRepository {
     /// Get source papers for a method: the papers that `asserts` one of the
     /// method's source claims, through edges `viewer` may read.
     ///
-    /// `pub_year` and `source_type` are always `None`. `papers` has no
-    /// `properties` column and never had one (`id, doi, title, journal,
-    /// created_at`, plus `licence` and the tenancy columns), so this statement
-    /// used to read `p.properties->>'year'` and failed with `42703` whenever a
-    /// method matched; the method gap analysis, its only caller, answered 500
-    /// for every capability some method covers. That was invisible while the
-    /// route could not take a capability at all (backlog 97381982). The fields
-    /// stay, as `None`, so the response shape does not change; a stale flag
-    /// can only come from a year the schema does not store.
+    /// `pub_year` and `source_type` are always `None`. This statement used to
+    /// read `p.properties->>'year'` when no migration declared
+    /// `papers.properties`, so on a database migrated from empty it failed
+    /// with `42703` whenever a method matched; the method gap analysis, its
+    /// only caller, answered 500 for every capability some method covers. That
+    /// was invisible while the route could not take a capability at all
+    /// (backlog 97381982). Migration 355 now declares `properties` (`jsonb NOT
+    /// NULL DEFAULT '{}'`, with `abstract_text`, as a deployed database carries
+    /// them; backlog 158b7ce4), but no writer fills a year into it and this
+    /// read still does not use it. The fields stay, as `None`, so the response
+    /// shape does not change; a stale flag can only come from a year the
+    /// schema does not store.
     pub async fn get_source_papers<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
