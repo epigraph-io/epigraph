@@ -94,7 +94,9 @@ pub struct CacheWriteNotes {
     /// was written and the rule does NOT elect the frame this call wrote:
     /// `Some(None)` when the claim has no owner (a compound, or template-only
     /// input). The next owner recompute refolds the cache there (or, with no
-    /// owner, never from these BBAs), so the written value will not stand.
+    /// owner, never from these BBAs), and its values may differ from the ones
+    /// written here (the clamp, and per-frame overrides keyed on the frame
+    /// folded). `None` too when the owner read failed (the note is omitted).
     pub owner_elsewhere: Option<Option<Uuid>>,
 }
 
@@ -504,6 +506,38 @@ async fn frame_visible_to(
                 .await
                 .map_err(|e| format!("{what}: could not roll back to the savepoint: {e}"))?;
             Ok(false)
+        }
+    }
+}
+
+/// The cache-owner frame `viewer` resolves for `claim_id`, read under a
+/// savepoint: `Some(owner)` (itself `None` for a claim with no owner), or
+/// `None` when the read failed. It only feeds a diagnostic note (backlog
+/// 8ff648c9), so a failure omits that note and never aborts the caller's
+/// transaction.
+async fn cache_owner_frame_optional(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<Option<Option<Uuid>>, String> {
+    let what = "cache_owner_frame_for_claim";
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("{what}: could not open a savepoint: {e}"))?;
+    match MassFunctionRepository::cache_owner_frame_for_claim(&mut *sp, viewer, claim_id).await {
+        Ok(owner) => {
+            sp.commit()
+                .await
+                .map_err(|e| format!("{what}: could not release the savepoint: {e}"))?;
+            Ok(Some(owner))
+        }
+        Err(e) => {
+            tracing::warn!(read = what, error = %e, "optional read failed; treated as absent");
+            sp.rollback()
+                .await
+                .map_err(|e| format!("{what}: could not roll back to the savepoint: {e}"))?;
+            Ok(None)
         }
     }
 }
@@ -1048,6 +1082,9 @@ pub async fn auto_wire_ds_update_filed_on(
     // Backlog 8ff648c9: when this write took the cache, say where it departs
     // from the owner recompute's frame. Read AFTER the write, so the owner is
     // the one every later recompute elects (this call's BBA included).
+    // Both reads below only feed these notes, so each is OPTIONAL: run under
+    // a savepoint, and a failure omits its note instead of rolling back the
+    // submission.
     if cache_written {
         let recorded_before = claim_prior.and_then(|(_, _, _, recorded)| recorded);
         if let Some(from) = recorded_before.filter(|recorded| *recorded != frame_id) {
@@ -1061,12 +1098,10 @@ pub async fn auto_wire_ds_update_filed_on(
                 RepointedFrom::Hidden
             });
         }
-        let owner =
-            MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, claim_id)
-                .await
-                .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?;
-        if owner != Some(frame_id) {
-            notes.owner_elsewhere = Some(owner);
+        if let Some(owner) = cache_owner_frame_optional(&mut *conn, viewer, claim_id).await? {
+            if owner != Some(frame_id) {
+                notes.owner_elsewhere = Some(owner);
+            }
         }
     }
 

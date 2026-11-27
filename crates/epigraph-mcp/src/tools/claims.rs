@@ -1993,7 +1993,8 @@ pub async fn update_with_evidence(
         warnings.push(match owner {
             Some(owner) => format!(
                 "The cache-owner rule elects frame {owner} for claim {claim_id}, not {} where \
-                 this call wrote its cache: the next recompute refolds the cache on {owner}.",
+                 this call wrote its cache: the next recompute refolds the cache on {owner}, \
+                 and its values may differ from these (the clamp, per-frame overrides).",
                 ds.frame_id
             ),
             None => format!(

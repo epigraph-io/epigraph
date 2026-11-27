@@ -2050,8 +2050,10 @@ pub struct UpdateResponse {
     /// Present only when this call wrote the claim's cache and the cache-owner
     /// rule elects ANOTHER frame for it (the frame's id, or `"none"` for a
     /// claim with no owner: a compound, or template-only input). The next
-    /// recompute refolds the cache there, so the values above will not stand
-    /// (backlog 8ff648c9). `warning` says so.
+    /// recompute refolds the cache there, and its values may differ from the
+    /// ones above (the clamp, and per-frame overrides keyed on the frame
+    /// folded); with no owner, no recompute keeps them (backlog 8ff648c9).
+    /// `warning` says so. Absent too when the owner could not be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_owner_frame_id: Option<String>,
     /// Populated when supporting evidence *lowered* the pignistic probability
