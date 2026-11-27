@@ -6,7 +6,8 @@
 //!   table, and no `crates/*/src` file does either (the Rust half of the same
 //!   change: a binary that still named one would fail on a 354 database);
 //! * 354 refuses (55000, nothing changed) while any of the five tables has a
-//!   row, naming it, and over a shared body it does not re-state;
+//!   row, naming it, and over a shared body it does not re-state; it refuses
+//!   (42501, nothing changed) a session that could not read every row;
 //! * `docs/runbooks/354-undo.sql` puts the catalog back exactly as it was
 //!   below 354, twice over, refuses over a foreign body, and 354 then applies
 //!   again (apply, undo, apply).
@@ -240,6 +241,54 @@ async fn migration_354_refuses_while_a_harvester_table_has_a_row(pool: PgPool) {
         .await
         .expect("POSITIVE CONTROL: over empty tables, 354 applies");
     assert_eq!(live_references(&pool).await, Vec::<String>::new());
+}
+
+/// The tables are FORCEd, so a session that is neither a superuser, a
+/// BYPASSRLS login nor a maintenance member would count only the rows its
+/// policies show it and could drop a row it never saw: 354 refuses it
+/// (42501) with its own message, before it locks or reads any table, and
+/// changes nothing. `SET LOCAL SESSION AUTHORIZATION` (not `SET ROLE`),
+/// because the guard's `epigraph_bypass()` reads `session_user`. The message
+/// is asserted, not only the code: without the guard this session fails
+/// later with a different 42501 (no privilege to LOCK a table).
+#[sqlx::test(migrations = false)]
+async fn migration_354_refuses_a_session_that_cannot_read_every_row(pool: PgPool) {
+    migrate(&pool, &below(354))
+        .await
+        .expect("migrate below 354");
+    let sql = migration_354();
+    let before = live_references(&pool).await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::raw_sql("SET LOCAL SESSION AUTHORIZATION epigraph_app")
+        .execute(&mut *tx)
+        .await
+        .expect("become the application role");
+    let shape: (bool, bool) = sqlx::query_as(
+        "SELECT public.epigraph_bypass(), \
+                (SELECT r.rolsuper OR r.rolbypassrls FROM pg_roles r \
+                  WHERE r.rolname = current_user)",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("probe the session");
+    assert_eq!(
+        shape,
+        (false, false),
+        "CALIBRATION: the session is neither bypass nor superuser/BYPASSRLS"
+    );
+    let r = sqlx::raw_sql(&sql).execute(&mut *tx).await;
+    assert_eq!(sqlstate(&r).as_deref(), Some("42501"), "{r:?}");
+    let msg = r.unwrap_err().to_string();
+    assert!(
+        msg.contains("could not see every row it would drop"),
+        "the refusal is 354's own guard: {msg}"
+    );
+    drop(tx);
+    assert_eq!(
+        live_references(&pool).await,
+        before,
+        "a refused 354 changes nothing"
+    );
 }
 
 /// The body of `epigraph_record_elevated_access` with `suffix` appended, as a
