@@ -137,7 +137,15 @@ Full spec: `docs/conventions/backlog-retirement.md`.
 - After adding or modifying a `sqlx::query!` / `sqlx::query_as!` macro
   call, run `DATABASE_URL=... cargo sqlx prepare --workspace -- --tests`
   and commit `.sqlx/` so `SQLX_OFFLINE=true cargo check --workspace`
-  passes in CI.
+  passes in CI. Removing a macro call leaves its `.sqlx/` entry orphaned;
+  delete it.
+- Most repo SQL is runtime, not macro-checked (under one in ten statements
+  use the macros; `crates/epigraph-db/README.md`, "Setup"). Prefer the macro
+  only for a static statement that no `Viewer::splice` / `splice_write`
+  marker will ever need to reach, since a macro cannot take a spliced
+  literal. Otherwise decode a runtime query through `query_as` into a
+  `FromRow` struct, never `Row::get`, which panics on a missing column or a
+  type mismatch.
 - `claim_from_row` has ~20 callers in `crates/epigraph-db/src/repos/claim.rs`.
   Do not widen its signature — extend the relevant `SELECT` in the caller
   and post-fix the returned `Claim` (see `list_by_labels` and `get_by_id`

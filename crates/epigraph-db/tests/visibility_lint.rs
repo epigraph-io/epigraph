@@ -1277,14 +1277,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "claim.rs",
         "update_trace_id_conn",
-        "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
-         authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
+        "WRITE, by delegation only: a one-line wrapper over the generic-executor \
+         update_trace_id (EXECUTOR_WITHOUT_VIEWER), kept so callers can pass `&mut tx` by \
+         deref coercion. Same argument as update_labels_conn: an UPDATE on an already-fetched \
+         claim, authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
     ),
     (
         "claim.rs",
         "update_truth_value_conn",
-        "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
-         authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
+        "WRITE, by delegation only: a one-line wrapper over the generic-executor \
+         update_truth_value (EXECUTOR_WITHOUT_VIEWER), kept so callers can pass `&mut tx` by \
+         deref coercion. Same argument as update_labels_conn: an UPDATE on an already-fetched \
+         claim, authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
     ),
     (
         "claim_encryption.rs",
@@ -4307,6 +4311,40 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          connection's GUCs. There is nothing to filter: the caller (hypothesis promotion) read \
          the source row through `get_for_claim_frame` with its own viewer. Generic executor so \
          the promotion's transaction can hold the copy and its `claim_frames` insert together.",
+    ),
+    // Backlog 2dbf45f2: each was a `&PgPool` fn (`sqlx::query!`) beside a
+    // `_conn` twin repeating its UPDATE with runtime `Row::get`; the pair is
+    // now this one generic fn, and the `_conn` form (CONN_WITHOUT_VIEWER) wraps it.
+    (
+        "claim.rs",
+        "update_trace_id",
+        "UPDATE `claims` SET `trace_id` by primary key, RETURNING the row. A write; the \
+         control depends on the connection. The update_trace_id_conn wrapper's non-test \
+         callers pass the stamped transaction that created or fetched the claim, so there it \
+         is claims_tenancy's WITH CHECK against that connection's GUCs, as for \
+         update_labels_conn. The one non-test raw-pool caller, \
+         routes/conventions.rs::learn_convention, is NOT under a stamped WITH CHECK: it \
+         attaches the trace to the convention claim the same request has just created as the \
+         SYSTEM agent on the raw pool (viewer_spend_lint's learn_convention row), so its \
+         control is that the id is a row the handler itself wrote. A new \
+         raw-pool caller needs its own gate. A `&Viewer` would be spendable only through \
+         splice_write, which is not this change's. SCOPE: executor only; the SQL is \
+         unchanged.",
+    ),
+    (
+        "claim.rs",
+        "update_truth_value",
+        "UPDATE `claims` SET `truth_value` by primary key, RETURNING the row. A write; the \
+         control depends on the connection. The update_truth_value_conn wrapper's non-test \
+         callers pass their stamped transaction, so there it is claims_tenancy's WITH CHECK \
+         against that connection's GUCs, as for update_labels_conn. The one non-test raw-pool \
+         caller, routes/conventions.rs::forget_convention, is NOT under a stamped WITH CHECK: \
+         its gate is the handler's earlier ClaimRepository::get_by_id(pool, &viewer, ..), \
+         which refuses a claim the caller cannot see before this write runs \
+         (viewer_spend_lint's forget_convention row). A new \
+         raw-pool caller needs its own gate. A `&Viewer` would be spendable only through \
+         splice_write, which is not this change's. SCOPE: executor only; the SQL is \
+         unchanged.",
     ),
     (
         "claim.rs",
