@@ -219,6 +219,14 @@ PINS: tuple[Pin, ...] = (
         incident="d543f045",
     ),
     Pin(
+        id="backlog-candidate-evidence-goes-in-patch-claim",
+        file="docs/conventions/backlog-retirement.md",
+        section_start="## Filing backlog items: evidence tier",
+        section_end=None,
+        needle="use one `patch_claim` call that both removes the label",
+        incident="d543f045",
+    ),
+    Pin(
         id="backlog-candidate-never-closed-unmeasured",
         file="docs/conventions/backlog-retirement.md",
         section_start="## Filing backlog items: evidence tier",

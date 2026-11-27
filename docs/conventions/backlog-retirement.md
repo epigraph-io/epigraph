@@ -24,16 +24,20 @@ whether anyone should plan work on it yet.
   - *Behavioural* claims (a wrong result, a race, a refusal) need an executed
     test, a reproduced call, or a read of the deployed system.
 - **The re-measurer removes `backlog-candidate`**, citing the evidence (what
-  was run, and on which ref) in the label patch. The ownership rules under
-  "Who may retire an item" apply to that patch as to any other, and it never
-  touches `resolved`.
+  was run, and on which ref) on the item itself. `update_labels` carries no
+  text, so use one `patch_claim` call that both removes the label
+  (`remove_labels: ["backlog-candidate"]`) and merges the evidence into the
+  item's `properties`, e.g.
+  `{"remeasured": {"ref": "<commit>", "evidence": "<what was run>"}}`. The
+  ownership rules under "Who may retire an item" apply to that patch as to
+  any other, and it never touches `resolved`.
 - **A candidate is never closed for being unmeasured.** An item nobody has
   re-measured stays open as a candidate; it is not resolved, refuted or
   dropped for that reason. `backlog-candidate` is never a substitute for
   `resolved`: retiring a candidate still goes through `resolve_backlog_item`.
 - **Backlog items only.** The tier governs backlog promotion. General claims
-  are unaffected: their admission and belief do not change (ruling
-  `6e7a6c69`).
+  are unaffected: their admission and belief do not change
+  (`6e7a6c69`).
 
 To list only the items ready to plan, add `backlog-candidate` to
 `exclude_labels` in the open-backlog query below (`exclude_labels` drops a
