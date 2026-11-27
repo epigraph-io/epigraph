@@ -49,6 +49,8 @@ HITS = [
     # fixture: an EC2 private host name of an invented address.
     ("internal_hostname", "The node " + "ip-" + "-".join(["10", "1", "2", "3"]) + " went down.", ()),
     ("private_path", "Notes live in /home/alice/project/notes.md now.", ()),
+    ("private_path", "Open file:///home/alice/project/notes.md in a browser.", ()),
+    ("private_path", "Open file:///Users/bob/notes.md in a browser.", ()),
     ("private_path", "Copied from C:\\Users\\bob\\Desktop.", ()),
     ("private_path", "Read ~/drafts/plan.txt first.", ()),
     ("private_path", "Kept in team-private/runbooks for now.", ()),
@@ -83,6 +85,7 @@ CLEAN = [
     "Working parties and orchids are discussed in general terms.",
     "The @mention syntax and the user@ prefix are not addresses.",
     "Hash 3f2b8c1e is a short prefix, not a full identifier.",
+    "The cluster mounts /srv/home/shared and /data/root/cache for every job.",
 ]
 
 
@@ -100,6 +103,24 @@ def test_reasons_are_ordered_and_unique():
 
 def test_every_reason_has_a_fixture():
     assert {h[0] for h in HITS} == set(spc.REASONS)
+
+
+def test_both_term_files_are_required(tmp_path, monkeypatch, capsys):
+    """A run without --private-markers would screen no private directory name
+    beyond the built-in `*-private/` shape, so the flag is required like
+    --private-groups (an empty file is allowed)."""
+    groups = tmp_path / "groups.txt"
+    groups.write_text("")
+    base = ["screen_public_claims.py", "--database-url", "postgres://reader@127.0.0.1:1/x_test"]
+    for missing, argv in (
+        ("--private-markers", base + ["--private-groups", str(groups)]),
+        ("--private-groups", base + ["--private-markers", str(groups)]),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc:
+            spc.main()
+        assert exc.value.code == 2
+        assert missing in capsys.readouterr().err
 
 
 def test_terms_are_read_from_a_file_and_never_built_in(tmp_path):
@@ -195,7 +216,8 @@ def test_a_connection_failure_never_prints_the_dsn(monkeypatch, capsys, tmp_path
 
     monkeypatch.setattr(spc.psycopg2, "connect", _refuse)
     monkeypatch.setattr(sys, "argv", ["screen_public_claims.py", "--database-url", dsn,
-                                      "--private-groups", str(groups)])
+                                      "--private-groups", str(groups),
+                                      "--private-markers", str(groups)])
     assert spc.main() == 2
     captured = capsys.readouterr()
     assert sentinel not in captured.out + captured.err

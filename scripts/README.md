@@ -59,6 +59,12 @@ prints a claim's text, a matched term or the DSN.
 
 The private group names and markers come from files the operator supplies (one
 per line, `#` comments); none is built in, because that list is itself private.
+Both flags are required (an empty file is allowed): list every private
+directory and project name in the markers file, since the built-in path rule
+only knows home directories and a `*-private/` directory.
+
+Not screened: credentials or connection strings, IPv6 addresses, UUIDs written
+without dashes, and the guest card's `sources` (document key and title).
 
 ```bash
 python3 scripts/screen_public_claims.py --database-url "$READONLY_DSN" \

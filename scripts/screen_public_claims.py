@@ -23,8 +23,9 @@ Reasons (a claim gets every one that applies):
                         .intranet/.localdomain/.home.arpa, or an EC2 private
                         host name (scripts/check_sensitive.py's pattern);
     private_path        a home-directory path (/home/<u>/, /Users/<u>/,
-                        /root/, ~/, C:\\Users\\), a directory named
-                        `*-private/`, or a term from --private-markers;
+                        /root/, ~/, C:\\Users\\, and their file:// URLs),
+                        a directory named `*-private/`, or a term from
+                        --private-markers;
     private_group_name  a name from --private-groups.
   personal data (content and labels)
     email_address, phone_number (North American or +country forms),
@@ -32,9 +33,10 @@ Reasons (a claim gets every one that applies):
     P.O. box).
 
 The private names and markers are read from files the operator supplies and
-are never built in: the list of names to protect is itself private. One term
-per line; blank lines and `#` comments are ignored; matching is
-case-insensitive on whole words.
+are never built in: the list of names to protect is itself private. Both
+files are required (either may be empty), so a run cannot silently skip the
+operator's private directory names. One term per line; blank lines and `#`
+comments are ignored; matching is case-insensitive on whole words.
 
 Output:
   --out FILE (default stdout)  one JSON line per flagged claim,
@@ -54,7 +56,7 @@ job and is usually privileged. Give it a read-only login.
 
 Usage:
     python3 scripts/screen_public_claims.py --database-url <read-only DSN> \\
-        --private-groups groups.txt [--private-markers markers.txt] \\
+        --private-groups groups.txt --private-markers markers.txt \\
         --out hits.jsonl --claims-file-out restrict-candidates.txt
 """
 from __future__ import annotations
@@ -104,7 +106,7 @@ INTERNAL_HOST = re.compile(
     re.I,
 )
 PRIVATE_PATH = re.compile(
-    r"(?:(?<![\w.~/])(?:/home/|/Users/|/root/)[\w.-]"
+    r"(?:(?:(?<![\w.~/])|(?<=file://))(?:/home/|/Users/|/root/)[\w.-]"
     r"|(?<![\w/])~/[\w.-]"
     r"|\b[A-Za-z]:\\Users\\"
     r"|(?<![\w-])[\w.]+(?:-[\w.]+)*-private/)",
@@ -234,8 +236,9 @@ def main():
     )
     parser.add_argument(
         "--private-markers",
-        default=None,
-        help="File of further private markers (directory names, project names), one per line.",
+        required=True,
+        help="File of private markers (private directory names, project names), one per "
+             "line (may be empty).",
     )
     parser.add_argument("--out", default=None, help="JSONL of flagged claims (default stdout).")
     parser.add_argument(
@@ -246,7 +249,7 @@ def main():
     args = parser.parse_args()
 
     groups = read_terms(args.private_groups)
-    markers = read_terms(args.private_markers) if args.private_markers else []
+    markers = read_terms(args.private_markers)
 
     try:
         # MAINTENANCE-DSN-EXEMPT: read-only by design (the session is set

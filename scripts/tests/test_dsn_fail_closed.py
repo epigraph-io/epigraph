@@ -217,7 +217,8 @@ _SCRIPTS = [
     ("lib/tiered_enrichment.py",
      ["--tier", "1", "--claim-id", "00000000-0000-0000-0000-000000000001"], "--database-url"),
     # Read-only privacy screen: --database-url only, never the environment.
-    ("screen_public_claims.py", ["--private-groups", "/dev/null"], "--database-url"),
+    ("screen_public_claims.py", ["--private-groups", "/dev/null", "--private-markers", "/dev/null"],
+     "--database-url"),
     # Refuses at import: both halves of its read/write split are required.
     ("run_assessment_worker.py", [], "DATABASE_URL"),
 ]
