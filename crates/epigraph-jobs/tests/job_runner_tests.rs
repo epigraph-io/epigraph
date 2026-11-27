@@ -11,12 +11,10 @@
 //! 3. `JobHandler` trait tests - interface compliance
 //! 4. `JobRunner` tests - worker pool, shutdown, retry logic
 //! 5. `JobQueue` tests - FIFO ordering
-//! 6. Built-in handler tests - EpiGraph-specific job types
 
 use epigraph_jobs::{
-    async_trait, DataCleanupHandler, EmbeddingGenerationHandler, EpiGraphJob, InMemoryJobQueue,
-    Job, JobError, JobHandler, JobId, JobQueue, JobResult, JobResultMetadata, JobRunner, JobState,
-    ReputationUpdateHandler, TruthPropagationHandler, WebhookNotificationHandler,
+    async_trait, EpiGraphJob, InMemoryJobQueue, Job, JobError, JobHandler, JobId, JobQueue,
+    JobResult, JobResultMetadata, JobRunner, JobState,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -279,11 +277,28 @@ fn test_job_handler_trait_implementation() {
     assert_eq!(handler.job_type(), "test_handler");
 }
 
+/// A handler that overrides nothing but the two required methods, so it
+/// exercises the `JobHandler` trait's default `max_retries` and `backoff`.
+struct DefaultsHandler;
+
+#[async_trait]
+impl JobHandler for DefaultsHandler {
+    async fn handle(&self, _job: &Job) -> Result<JobResult, JobError> {
+        Err(JobError::ProcessingFailed {
+            message: "unused".into(),
+        })
+    }
+
+    fn job_type(&self) -> &'static str {
+        "defaults_handler"
+    }
+}
+
 /// Handler should have configurable `max_retries` with sensible default
 #[test]
 fn test_job_handler_max_retries_default() {
-    // Built-in handlers should default to 3 retries
-    let handler = TruthPropagationHandler;
+    // The trait default is 3 retries
+    let handler = DefaultsHandler;
     assert_eq!(handler.max_retries(), 3, "Default max_retries should be 3");
 }
 
@@ -490,45 +505,6 @@ async fn test_job_queue_only_dequeues_pending() {
     let pending = queue.pending_jobs().await;
     assert_eq!(pending.len(), 1, "Should only have 1 pending job");
     assert_eq!(pending[0].id, job1.id);
-}
-
-// ============================================================================
-// Built-in Job Handler Tests
-// ============================================================================
-
-/// `TruthPropagation` handler should have correct job type
-#[test]
-fn test_propagation_job_handler() {
-    let handler = TruthPropagationHandler;
-    assert_eq!(handler.job_type(), "truth_propagation");
-}
-
-/// `EmbeddingGeneration` handler should have correct job type
-#[test]
-fn test_embedding_generation_job_handler() {
-    let handler = EmbeddingGenerationHandler;
-    assert_eq!(handler.job_type(), "embedding_generation");
-}
-
-/// `ReputationUpdate` handler should have correct job type
-#[test]
-fn test_reputation_update_job_handler() {
-    let handler = ReputationUpdateHandler;
-    assert_eq!(handler.job_type(), "reputation_update");
-}
-
-/// `WebhookNotification` handler should have correct job type
-#[test]
-fn test_webhook_notification_job_handler() {
-    let handler = WebhookNotificationHandler;
-    assert_eq!(handler.job_type(), "webhook_notification");
-}
-
-/// `DataCleanup` handler should have correct job type
-#[test]
-fn test_cleanup_job_handler() {
-    let handler = DataCleanupHandler;
-    assert_eq!(handler.job_type(), "data_cleanup");
 }
 
 // ============================================================================
@@ -960,7 +936,7 @@ fn test_backoff_formula_correctness() {
 /// Default backoff should cap at reasonable maximum to prevent overflow
 #[test]
 fn test_backoff_does_not_overflow() {
-    let handler = TruthPropagationHandler;
+    let handler = DefaultsHandler;
 
     // Even with high attempt count, should not panic or overflow
     let backoff_large = handler.backoff(30);

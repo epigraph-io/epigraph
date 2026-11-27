@@ -6,8 +6,13 @@
 //! `{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}`. [`parse_job`]
 //! accepts it only when:
 //!
-//! * it deserializes into an [`EpiGraphJob`], so an unknown or retired kind
+//! * it deserializes into an [`EpiGraphJob`], so an unknown or removed kind
 //!   (the k-means `ThemeClusterRebuild`, a misspelling) is refused;
+//! * it is not a RETIRED kind ([`EpiGraphJob::is_retired`]: `TruthPropagation`,
+//!   `ReputationUpdate`, `WebhookNotification`, `DataCleanup`). Those still
+//!   deserialize, so a stored row of one stays readable, but no handler exists
+//!   for them: an enqueued one would only sit pending and make every drain
+//!   exit 4 until it was cancelled;
 //! * every key of the kind's body is one the kind has, so a stray or
 //!   misspelled extra key is refused rather than silently dropped;
 //! * its values are ones the drain can run safely: a `ClusterGraph` needs a
@@ -54,6 +59,12 @@ pub enum JobRefusal {
         /// What the field must be.
         reason: &'static str,
     },
+    /// A retired kind: it deserializes, but no handler exists for it.
+    #[error(
+        "{0} is a retired job kind: no handler exists for it, so drain_jobs would never run it; \
+         enqueue_job refuses it"
+    )]
+    Retired(&'static str),
     /// A privatization kind.
     #[error(
         "{0} jobs are enqueued only by their HTTP dispatch, which writes the plan's state and \
@@ -107,6 +118,7 @@ pub fn parse_job(text: &str) -> Result<EpiGraphJob, JobRefusal> {
         EpiGraphJob::PrivatizationApply { .. }
         | EpiGraphJob::PrivatizationRevert { .. }
         | EpiGraphJob::PrivatizationReseal { .. } => Err(JobRefusal::Privatization(job.job_type())),
+        _ if job.is_retired() => Err(JobRefusal::Retired(job.job_type())),
         _ => Ok(job),
     }
 }
@@ -153,6 +165,46 @@ mod tests {
             );
         }
         assert!(matches!(parse_job("{"), Err(JobRefusal::NotJson(_))));
+    }
+
+    /// The four retired kinds still parse as `EpiGraphJob`s (a stored row of
+    /// one must stay readable), so the deserialization check alone would let
+    /// an operator enqueue one that no drain can run. They are refused by
+    /// name, and nothing else is caught by that arm.
+    #[test]
+    fn a_retired_kind_is_refused_by_name() {
+        let id = "00000000-0000-0000-0000-000000000001";
+        for (text, tag) in [
+            (
+                format!(r#"{{"TruthPropagation":{{"source_claim_id":"{id}"}}}}"#),
+                "truth_propagation",
+            ),
+            (
+                format!(r#"{{"ReputationUpdate":{{"agent_id":"{id}"}}}}"#),
+                "reputation_update",
+            ),
+            (
+                format!(r#"{{"WebhookNotification":{{"webhook_id":"{id}","payload":{{"a":1}}}}}}"#),
+                "webhook_notification",
+            ),
+            (
+                r#"{"DataCleanup":{"retention_days":30}}"#.to_string(),
+                "data_cleanup",
+            ),
+        ] {
+            let got = parse_job(&text);
+            assert!(
+                got.is_err(),
+                "{text} names a retired kind and must be refused, got {got:?}"
+            );
+            assert_eq!(got.err(), Some(JobRefusal::Retired(tag)), "{text}");
+        }
+        // The kinds the drain does run are not caught by the retired arm.
+        assert!(parse_job(r#"{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}"#).is_ok());
+        assert!(parse_job(&format!(
+            r#"{{"EmbeddingGeneration":{{"claim_id":"{id}"}}}}"#
+        ))
+        .is_ok());
     }
 
     #[test]

@@ -1,6 +1,7 @@
-//! TDD Tests for `EmbeddingGenerationHandler`
+//! TDD Tests for embedding generation job handling
 //!
-//! These tests define the expected behavior of the embedding generation job handler.
+//! These tests define the expected behavior of an embedding generation job handler
+//! (the local `TestableEmbeddingHandler`; production uses `ConfigurableEmbeddingHandler`).
 //! They are written in TDD style to describe the desired behavior.
 //!
 //! # Test Coverage
@@ -31,8 +32,8 @@
 //! - Job handler must integrate with embedding service correctly
 
 use epigraph_jobs::{
-    async_trait, EmbeddingGenerationHandler, EpiGraphJob, InMemoryJobQueue, Job, JobError,
-    JobHandler, JobQueue, JobResult, JobResultMetadata, JobRunner,
+    async_trait, EpiGraphJob, InMemoryJobQueue, Job, JobError, JobHandler, JobQueue, JobResult,
+    JobResultMetadata, JobRunner,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -1835,42 +1836,4 @@ fn test_handler_backoff_strategy() {
         max_backoff <= Duration::from_secs(3600),
         "Backoff should be capped at 1 hour"
     );
-}
-
-// ============================================================================
-// Built-in Handler Verification (Stub)
-// ============================================================================
-
-/// Verify the built-in `EmbeddingGenerationHandler` exists and has correct job type
-#[test]
-fn test_builtin_handler_exists() {
-    let handler = EmbeddingGenerationHandler;
-    assert_eq!(
-        handler.job_type(),
-        "embedding_generation",
-        "Built-in handler should have correct job type"
-    );
-}
-
-/// Verify the built-in handler currently returns "not implemented"
-#[tokio::test]
-async fn test_builtin_handler_stub_behavior() {
-    let handler = EmbeddingGenerationHandler;
-    let job = create_embedding_job(Uuid::new_v4());
-
-    let result = handler.handle(&job).await;
-
-    // Currently a stub, should return ProcessingFailed
-    match result {
-        Err(JobError::ProcessingFailed { message }) => {
-            assert!(
-                message.contains("not implemented"),
-                "Stub should indicate not implemented. Got: {message}"
-            );
-        }
-        Ok(_) => {
-            // If implemented, that's also fine - the test just verifies current state
-        }
-        Err(e) => panic!("Unexpected error type: {e:?}"),
-    }
 }
