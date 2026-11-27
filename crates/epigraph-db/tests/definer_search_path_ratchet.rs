@@ -186,7 +186,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_human_operators_guard_update()",
     "public.epigraph_human_operators_mirror_instance_admins()",
     "public.epigraph_human_operators_refuse_system_agent()",
-    "public.epigraph_inherit_fragment_tenancy_stmt()",
     "public.epigraph_inherit_tenancy_stmt()",
     "public.epigraph_instance_admins_frozen()",
     "public.epigraph_is_elevated()",
@@ -298,7 +297,9 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 // 189 -> 188: 311 re-states `epigraph_provision_oauth_agent` on 172's form.
 // 188 -> 187: 346's successor on this tree re-states `epigraph_is_group_admin(uuid)` on
 // 172's form (staging 2026-11-26: each branch lowered it by one on its own).
-const HIGH_WATER: usize = 187;
+// 187 -> 186: 354 drops `epigraph_inherit_fragment_tenancy_stmt` with the
+// harvester tables.
+const HIGH_WATER: usize = 186;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.
