@@ -95,6 +95,8 @@
 //!   function as `epigraph_app`
 //!   (`epigraph-db/tests/personal_group_no_revival.rs`) and the e2e harness.
 
+mod source_files;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -622,13 +624,30 @@ fn rel(p: &Path) -> String {
 }
 
 fn measured_calls() -> BTreeMap<(String, String), usize> {
+    measured_calls_in(&src_texts())
+}
+
+/// `(path under crates/, text)` for every [`src_files`] entry.
+fn src_texts() -> Vec<(String, String)> {
+    src_files()
+        .iter()
+        .map(|p| (rel(p), std::fs::read_to_string(p).expect("read source")))
+        .collect()
+}
+
+/// [`measured_calls`] over given sources. A file inside a split module's
+/// directory keys as the module's registered file
+/// (`source_files::module_key`), and counts for one key are SUMMED across
+/// files, so a move never overwrites a site.
+fn measured_calls_in(files: &[(String, String)]) -> BTreeMap<(String, String), usize> {
     let mut out = BTreeMap::new();
-    for p in src_files() {
-        let text = strip_comments(&std::fs::read_to_string(&p).expect("read source"));
+    for (path, text) in files {
+        let text = strip_comments(text);
         for name in WATCHED {
             let n = count_calls(&text, name);
             if n > 0 {
-                out.insert((rel(&p), (*name).to_string()), n);
+                *out.entry((source_files::module_key(path), (*name).to_string()))
+                    .or_default() += n;
             }
         }
     }
@@ -989,4 +1008,18 @@ fn the_revival_matcher_sees_every_spelling() {
     assert!(n.contains("create or replace function epigraph_ensure_personal_group("));
     let q = normalise("CREATE FUNCTION \"public\" . \"epigraph_community_add_member\"(a uuid)");
     assert!(q.contains("create function public.epigraph_community_add_member("));
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: the calls in the moved code key under the
+/// registered path and are summed, never overwritten. Fails on a measurement
+/// keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let files = src_texts();
+    let split = source_files::split_module(&files, "epigraph-db/src/repos/claim.rs");
+    assert!(split
+        .iter()
+        .any(|(p, _)| p == "epigraph-db/src/repos/claim/moved.rs"));
+    assert_eq!(measured_calls_in(&split), measured_calls_in(&files));
 }

@@ -62,6 +62,8 @@
 //! at the next one. The calibration test pins that the four writers on this
 //! tree are all found, so a scanner that went blind fails rather than passes.
 
+mod source_files;
+
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -349,7 +351,7 @@ fn scan_tree() -> Vec<Writer> {
         rust_files(&krate.path().join("src"), &mut files);
     }
     files.sort();
-    let mut out = Vec::new();
+    let mut texts = Vec::new();
     for file in files {
         let text = std::fs::read_to_string(&file).expect("read source");
         let label = file
@@ -357,9 +359,19 @@ fn scan_tree() -> Vec<Writer> {
             .unwrap_or(&file)
             .display()
             .to_string();
-        out.extend(scan_source(&label, &text));
+        texts.push((label, text));
     }
-    out
+    scan_files(&texts)
+}
+
+/// [`scan_tree`] over given `(path under crates/, text)` sources. A file
+/// inside a split module's directory is labelled as the module's registered
+/// file (`source_files::module_key`), so a moved writer keeps its site.
+fn scan_files(files: &[(String, String)]) -> Vec<Writer> {
+    files
+        .iter()
+        .flat_map(|(label, text)| scan_source(&source_files::module_key(label), text))
+        .collect()
 }
 
 #[test]
@@ -546,4 +558,34 @@ async fn not_writers(pool: &PgPool) {
         !found.iter().any(|w| w.site == "x.rs::entity_upsert"),
         "entities are not sealed and not guarded by 212"
     );
+}
+
+/// A writer moved into `repos/claim/` (backlog 39955709) keeps its site name,
+/// so the calibration above still finds it. Fails when the label is the raw
+/// file path.
+#[test]
+fn a_writer_moved_into_the_claim_module_keeps_its_site() {
+    let path = "epigraph-db/src/repos/claim.rs";
+    let text =
+        std::fs::read_to_string(workspace_root().join("crates").join(path)).expect("read claim.rs");
+    let files = vec![(path.to_string(), text)];
+    let split = source_files::split_module(&files, path);
+    assert_eq!(split.len(), 2);
+    let sites: Vec<String> = scan_files(&split).into_iter().map(|w| w.site).collect();
+    assert_eq!(
+        sites,
+        scan_files(&files)
+            .into_iter()
+            .map(|w| w.site)
+            .collect::<Vec<_>>()
+    );
+    for known in [
+        "epigraph-db/src/repos/claim.rs::store_embedding",
+        "epigraph-db/src/repos/claim.rs::store_embedding_if_unsealed",
+    ] {
+        assert!(
+            sites.iter().any(|s| s == known),
+            "{known} not found in {sites:#?}"
+        );
+    }
 }

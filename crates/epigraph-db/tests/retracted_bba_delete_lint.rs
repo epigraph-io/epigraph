@@ -40,6 +40,7 @@
 //!   and `ON DELETE CASCADE` from `claims` / `frames` are not scanned.
 
 mod belief_lint;
+mod source_files;
 
 use belief_lint::{
     find_words, is_sql, rust_sources, rust_view, sql_without_comments, with_scratch, RustUnits,
@@ -188,7 +189,7 @@ fn measure(
             if d == 0 {
                 continue;
             }
-            let key = (s.path.clone(), units.unit_at(lit.start).0);
+            let key = (s.key(), units.unit_at(lit.start).0);
             *all.entry(key.clone()).or_default() += d;
             let n = unguarded(&sql);
             if n > 0 {
@@ -439,5 +440,25 @@ fn the_named_deletes_are_scanned() {
             .iter()
             .all(|(_, _, n, why)| *n > 0 && why.len() > 20),
         "every entry needs a count and a reason"
+    );
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: every site in the moved code keys under the
+/// registered path (`Source::key`), so no entry goes stale and no moved site
+/// reads as unregistered. Fails on a ratchet keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let rust = rust_sources();
+    let split = belief_lint::with_claim_split(&rust);
+    assert!(split
+        .iter()
+        .any(|s| s.path.ends_with("/repos/claim/moved.rs")));
+    let measured = measure(&split);
+    assert_eq!(measured, measure(&rust));
+    assert!(
+        findings(&measured.1).is_empty(),
+        "{:#?}",
+        findings(&measured.1)
     );
 }

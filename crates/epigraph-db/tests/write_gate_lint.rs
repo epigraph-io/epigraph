@@ -100,10 +100,11 @@
 //! it here in the same PR.
 
 mod lint_text;
+mod source_files;
 
 use lint_text::spend_views;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Tenancy-scoped tables whose `UPDATE`/`DELETE` statements this lint watches.
 ///
@@ -321,30 +322,18 @@ const MACRO_WRITE_SITES: &[(&str, &str)] = &[
     ("recall_event.rs::prune_older_than", "sqlx::query!"),
 ];
 
-fn repos_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/repos")
-}
-
 /// Every `.rs` under `src/repos/`, with `#[cfg(test)]` modules truncated away.
 ///
 /// Test modules are excluded because a fixture's `DELETE FROM claims` is
 /// cleanup, not a production write path, and charging it would put rows in a
 /// security register that no conversion shard can ever remove.
 fn repo_files() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(repos_dir()).expect("read repos dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf-8 file name")
-            .to_string();
-        let body = std::fs::read_to_string(&path).expect("read repo file");
-        out.push((name, strip_test_modules(&body)));
-    }
+    // Recursive, keyed by `source_files::module_key`: a split module's files
+    // (`claim/*.rs`) are scanned under its registered name (`claim.rs`).
+    let mut out: Vec<(String, String)> = source_files::repo_sources()
+        .into_iter()
+        .map(|(name, body)| (name, strip_test_modules(&body)))
+        .collect();
     out.sort();
     assert!(
         out.len() > 30,
