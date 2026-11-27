@@ -388,10 +388,15 @@ it:
   projection necessarily reads as one service identity and then re-exports under
   a different permission system (§7).
 - `get_recall_events` reads `recall_events`, which this design first treated as
-  instance-wide (`D-PR16-recall-events-are-instance-wide`). That finding was
-  corrected: an agent-less row is refused rather than published, and the
-  table's row security is keyed on the querying agent, so a row holds only its
-  querier's own query and returned ids. *Decided (2026-11-27, backlog
+  instance-wide (`D-PR16-recall-events-are-instance-wide`). That finding is
+  corrected for NEW rows only: the table's row security is keyed on the
+  querying agent, and on the application role an agent-less row is refused
+  rather than published. Two gaps remain. Rows written before the change were
+  backfilled as `public` and still need a one-off data pass, so a privileged
+  read (the MCP tool on a bypass connection) still sees them instance-wide.
+  And a privileged write with no owner group is still declared instance-wide
+  (`recall_event.rs::log`). The route below serves neither: it filters on the
+  caller's own agent id, whatever a row's stamp. *Decided (2026-11-27, backlog
   ecf1b34f):* the route ships for the caller's own rows only
   (`GET /api/v1/recall-events`, no agent parameter, with an app-role leak test),
   and the Explorer shows it as the signed-in viewer's own history (`/recalls`).

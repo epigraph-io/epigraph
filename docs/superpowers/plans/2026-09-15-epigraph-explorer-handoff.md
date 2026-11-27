@@ -98,10 +98,11 @@ claims into Notion. Re-measure before quoting them as current.
   **D2** legacy rows backfill to explicit `public`; **D3** `public` means any
   authenticated agent, anonymous callers get nothing.
 - The enforcement boundary is **Rust, not Postgres** (§1 of that plan).
-- Relevant open findings: `D-PR16-recall-events-are-instance-wide` (since
-  corrected: `recall_events` row security is keyed on the querying agent, and
-  `get_recall_events` is routed for the caller's own rows only,
-  `GET /api/v1/recall-events`, decided under backlog ecf1b34f); `D-PR16-claim-authorship-is-not-a-credential` (nothing checks a
+- Relevant open findings: `D-PR16-recall-events-are-instance-wide` (corrected
+  for new rows: `recall_events` row security is keyed on the querying agent;
+  rows backfilled as `public` before that still need a one-off data pass. The
+  REST route `GET /api/v1/recall-events` serves the caller's own rows only,
+  decided under backlog ecf1b34f); `D-PR16-claim-authorship-is-not-a-credential` (nothing checks a
   caller may author as the `agent_id` in the body — matters before pointing an
   always-on Notion writer at prod); `D-PR19-webhook-secret-at-rest` (webhook
   secrets stored plaintext).
