@@ -222,6 +222,17 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 /// event type filters, and a secret of at least 32 characters for
 /// HMAC-SHA256 payload signing.
 ///
+/// # What a subscription receives
+///
+/// Only what the API's in-memory event bus carries, which today is three
+/// publishers: `submit::submit_packet` and `versioning::supersede_claim`
+/// (`ClaimSubmitted`) and `challenge::submit_challenge` (`ClaimChallenged`).
+/// `POST /api/v1/claims`, `POST /api/v1/claims/batch`, every other route and
+/// every MCP tool publish nothing, so a subscriber never hears of those
+/// writes. Delivery is in-process and best-effort: lost on restart, publish
+/// errors discarded, no durable retry. `docs/deploy.md` ("What webhooks see",
+/// backlog 5902eed5) has the full list.
+///
 /// # Delivery-target policy
 ///
 /// The URL is checked twice. First against [`validate_webhook_url`] (shape,

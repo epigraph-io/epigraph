@@ -1651,6 +1651,62 @@ request-signing middleware and no `X-Signature` / `X-Public-Key` /
 `SecurityEvent::signature_verification` and `auth_attempt` rows into
 `security_events`, so dashboards that read those two event types read empty.
 
+### What webhooks see
+
+This records the current coverage (backlog 5902eed5). It describes the code
+as it stands; it is not a decision that it should stay this way.
+
+Webhooks are fed by the API process's in-memory event bus
+(`epigraph_events::EventBus`, `AppState::event_bus`), and
+`start_webhook_dispatcher` is its only wired consumer. Three handlers publish
+to it, and they are the whole list (`git grep -n '.publish(EpiGraphEvent'
+crates/` finds no other production site):
+
+| Handler | Route | Event |
+|---|---|---|
+| `routes/submit.rs::submit_packet` | `POST /api/v1/submit/packet` | `ClaimSubmitted` |
+| `routes/versioning.rs::supersede_claim` | `POST /api/v1/claims/:id/supersede` | `ClaimSubmitted` (for the replacement claim) |
+| `routes/challenge.rs::submit_challenge` | `POST /api/v1/claims/:id/challenge` | `ClaimChallenged` |
+
+**Everything else publishes nothing**, so a subscriber does not hear about it:
+
+* `POST /api/v1/claims` (with or without `if_not_exists`) and
+  `POST /api/v1/claims/batch`;
+* every other HTTP write, for example edges, evidence, challenge resolution,
+  duplicate marking, staging promotion, ingestion, and `POST /api/v1/events`
+  (which writes the durable `events` table, not the bus);
+* **every MCP tool**. `epigraph-mcp` has no event bus (only `epigraph-api`
+  depends on `epigraph-events`), so a claim created, challenged or superseded
+  through MCP never reaches a webhook;
+* every CLI binary and background job.
+
+The other `EpiGraphEvent` variants (`TruthUpdated`, `ClaimVerified`,
+`BeliefUpdated`, `AgentCreated` and the rest) are not published in
+production, so a subscription filtered to one of them receives nothing.
+
+**Delivery is in-process and best-effort:**
+
+* The publishing handlers discard the publish result (`let _ = ...publish`).
+  A failed publish is not logged and does not fail the request.
+* Each event is handed to `tokio::spawn` for delivery, and the request does
+  not wait for it. Each subscription gets up to
+  `WebhookDeliveryConfig::max_retries` retries (default 3) with exponential
+  backoff, then a WARN `Webhook delivery failed`. Nothing records an
+  undelivered event for a later attempt.
+* Nothing is durable. An event published just before the API process stops
+  or restarts, including one still in its retry loop, is lost. The bus keeps
+  the last 1000 events in memory (`EventBus::new(1000)`), but nothing replays
+  them to webhooks, and they do not survive a restart either.
+* Fan-out is filtered per subscriber: an event whose payload names a claim the
+  subscription's owner cannot read is not delivered
+  (`routes/webhooks.rs::retain_visible_subscriptions`).
+
+`GET /api/v1/events` (and the MCP `list_events` tool) reads the durable
+`events` table through `epigraph_db::EventRepository`, not the bus. It is a
+separate feed, and an event in one is not implied to be in the other. A
+subscriber that must not miss claims should reconcile against the API
+rather than rely on webhooks alone.
+
 ### Webhook egress guard
 
 One shared module, `epigraph_jobs::egress`, decides whether a webhook
