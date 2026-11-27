@@ -11,10 +11,15 @@
 //!
 //! 1. The read runs on the caller's viewer-stamped connection
 //!    ([`AppState::read_as`]), where `recall_events_tenancy` (migration 077)
-//!    admits only rows whose `agent_id` is the session principal.
+//!    admits only rows whose `agent_id` is the session principal. The viewer
+//!    is always the plain scoped one ([`UnelevatedViewer`]): elevation could
+//!    only add 126's read arm, which admits OTHER agents' rows this route
+//!    never serves, so an elevated token gains nothing here and its read is
+//!    not an elevated access.
 //! 2. [`RecallEventRepository::list_own`] filters `agent_id = <the viewer's
-//!    principal>` itself, so an elevated session (126's read arm) or a
-//!    legacy `'public'`-stamped row does not widen the answer.
+//!    principal>` itself, so a connection on which the row policy admits more
+//!    (a bypass connection, or a legacy `'public'`-stamped row read there)
+//!    does not widen the answer.
 //! 3. An `agent_id` query parameter naming anyone but the caller is refused
 //!    (400), rather than ignored, so a client that expects the MCP tool's
 //!    `agent_id` filter learns that this route does not take one instead of
@@ -43,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::errors::ApiError;
-use crate::middleware::bearer::{AuthContext, ViewerExtractor};
+use crate::middleware::bearer::{AuthContext, UnelevatedViewer};
 use crate::routes::pagination::Page;
 use crate::state::AppState;
 
@@ -149,7 +154,7 @@ fn parse_uuid(raw: Option<&str>, field: &str) -> Result<Option<Uuid>, ApiError> 
 pub async fn list_own_recall_events(
     State(state): State<AppState>,
     auth_ctx: Option<Extension<AuthContext>>,
-    ViewerExtractor(viewer): ViewerExtractor,
+    UnelevatedViewer(viewer): UnelevatedViewer,
     Query(q): Query<RecallEventsQuery>,
 ) -> Result<Json<Page<RecallEventView>>, ApiError> {
     let Some(Extension(auth)) = auth_ctx else {
