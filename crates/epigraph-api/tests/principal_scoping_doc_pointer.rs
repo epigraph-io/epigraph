@@ -3,17 +3,23 @@
 //!
 //! `GET /api/v1/claims/by-labels` and `POST /api/v1/edges` run on a
 //! connection stamped with the caller's viewer, so a client-credentials
-//! service token sees fewer claims than a person's own MCP session: a claim
-//! in a group the token does not read is absent from by-labels, and an edge
-//! to it is answered 404. That was reported as a filter bug; it is the
+//! service token can see fewer claims than a person's own MCP session: a
+//! claim in a group the token does not read (a person's personal group, unless
+//! the operator gave the token a writer row there under migration 235's
+//! personal-group arm) is absent from by-labels, and an edge to it is
+//! answered 404. That was reported as a filter bug; it is the
 //! existence-hiding rule. `docs/tenancy.md`, "Same query, different
 //! principal", states it, and each handler's doc comment names that section,
 //! so a reader of either handler finds the explanation.
 //!
 //! What is pinned: the doc comment of each handler names the section, and the
-//! section exists under that exact heading and names both endpoints. A
-//! renamed heading, a dropped pointer or a section that stops covering one of
-//! the endpoints fails here. Source text only: no feature and no database.
+//! section exists under that exact heading, names both endpoints and names
+//! migration 235's personal-group arm (the one way a service token does read a
+//! person's personal group, so the section cannot state the rule as
+//! unconditional). A renamed heading, a dropped pointer, a section that stops
+//! covering one of the endpoints, or one that drops that qualifier fails here.
+//! The behaviour itself is tested elsewhere (`shard7_routes_scoped_read.rs`
+//! for by-labels); this file pins only that the explanation stays reachable. Source text only: no feature and no database.
 
 use std::path::{Path, PathBuf};
 
@@ -102,4 +108,19 @@ fn the_principal_section_exists_and_covers_both_endpoints() {
             "the `{SECTION}` section must name `{endpoint}`"
         );
     }
+}
+
+/// A service token is not shut out of every personal group: migration 235's
+/// personal-group arm gives an allowlisted service client a writer row in its
+/// owner's personal group, and a writer row reads. The section must say so,
+/// or it reads as a guarantee that a service token never sees a person's
+/// personal-group claims.
+#[test]
+fn the_principal_section_names_the_235_exception() {
+    let body = section(&read("docs/tenancy.md"), SECTION);
+    assert!(
+        body.contains("migration 235"),
+        "the `{SECTION}` section must name migration 235's personal-group arm, \
+         the way a service token is given a row in a person's personal group"
+    );
 }

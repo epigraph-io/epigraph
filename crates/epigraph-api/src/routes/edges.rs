@@ -730,8 +730,8 @@ pub struct NeighborhoodResponse {
 /// Protected route — requires Ed25519 signature verification.
 ///
 /// Acts as the token's principal: an endpoint that principal cannot read is
-/// answered 404, as if it did not exist, so a service token gets 404 on a
-/// claim another caller sees (backlog f0a817fb). See `docs/tenancy.md`,
+/// answered 404, as if it did not exist, so a service token can get 404 on
+/// a claim another caller sees (backlog f0a817fb). See `docs/tenancy.md`,
 /// "Same query, different principal".
 ///
 /// Validation:

@@ -2078,21 +2078,28 @@ transaction stamped the same way
 
 So one query can return different rows to two callers, and the difference is
 the principal, not the endpoint. A client-credentials service token is a
-principal of its own, and it is not a member of a person's personal group: a
-claim private to that group is absent from the token's by-labels result, and
-an edge from or to that claim is answered 404, while the person's own MCP
-session sees the claim. That is the existence-hiding rule, not a filter bug.
-No "rows hidden by scope" indicator is returned instead, because telling a
-caller that a claim it cannot read exists would disclose that claim across
-groups, which row security is there to prevent.
+principal of its own. It reads a person's personal group only if the operator
+gave it a `writer` row there (migration 235's personal-group arm, under "Keyless
+team groups (migration 164)" above; a writer row also reads), and it is not a
+member otherwise: then a claim private to that group is absent from the
+token's by-labels result, and an edge from or to that claim is answered 404,
+while the person's own MCP session sees the claim. That is the
+existence-hiding rule, not a filter bug. No "rows hidden by scope" indicator
+is returned instead, because telling a caller that a claim it cannot read
+exists would disclose that claim across groups, which row security is there
+to prevent.
 
 It follows that a check and the write it guards must run as the same
 principal. A dedup gate (look a claim up by label, file only when nothing
 matches) that reads over REST with a service token, for a write made under
 another principal, misses every claim the token cannot read and files
 duplicates of them. Run the lookup and the write under one principal that
-reads the same groups as the caller whose claims it guards (that caller's own
-MCP session, for example). Backlog `f0a817fb`.
+reads the same groups as the caller whose claims it guards: that caller's own
+MCP session, for example, or, for a host service client that writes into its
+operator's personal group, the same token once the operator has given it the
+235 writer row there (`epigraph-operator group-member add --group <owner's
+personal group> --agent <allowlisted agent> --role writer`). Backlog
+`f0a817fb`.
 
 ### DELETE and UPDATE of a row you do not own (115, 117)
 
