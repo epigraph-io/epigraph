@@ -226,3 +226,59 @@ async fn one_statement_for_every_seed_matches_the_per_seed_path(pool: PgPool) {
         "no seeds, no pairs"
     );
 }
+
+async fn insert_claim_with_id(pool: &PgPool, agent: Uuid, id: Uuid) {
+    let content = format!("claim {}", id);
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id)
+         VALUES ($1, $2, sha256($2::bytea), 0.5, $3)",
+    )
+    .bind(id)
+    .bind(&content)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("claim");
+}
+
+/// A seed's own claim must not take one of its `per_triple_cap` slots.
+///
+/// Every seed here has exactly `cap` (= 1) neighbour, so the correct answer
+/// is one pair per seed with no arbitrary choice inside the `LIMIT`. Without
+/// the `t2.claim_id <> t1.claim_id` self-exclusion each seed's subquery has
+/// two candidates (itself and its neighbour) for one slot; the seed's id is
+/// minted below its neighbour's so a sort-based `DISTINCT` picks the seed
+/// itself, and over 16 seeds a hash-based one does too with overwhelming
+/// probability. The self pair is then dropped by `canonical`, and the seed
+/// comes back with no pair at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_never_spends_its_cap_on_its_own_claim(pool: PgPool) {
+    let cap = 1usize;
+    let agent = insert_agent(&pool).await;
+    let mut seeds = Vec::new();
+    let mut expected = Vec::new();
+    for _ in 0..16 {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (seed, neighbour) = if a < b { (a, b) } else { (b, a) };
+        insert_claim_with_id(&pool, agent, seed).await;
+        insert_claim_with_id(&pool, agent, neighbour).await;
+        let subject = insert_entity(&pool).await;
+        insert_triple(&pool, seed, subject, "part_of").await;
+        insert_triple(&pool, neighbour, subject, "part_of").await;
+        seeds.push(seed);
+        expected.push((seed, neighbour));
+    }
+    expected.sort_unstable();
+
+    let b = SharedTripleBlocker::new(cap);
+    let batched = b.candidates(&pool, &seeds).await.expect("batched");
+    assert_eq!(
+        batched, expected,
+        "every seed must yield its one neighbour, not spend the cap on itself"
+    );
+    assert_eq!(
+        per_seed_reference(&pool, &seeds, cap).await,
+        expected,
+        "CALIBRATION: the per-seed path agrees"
+    );
+}
