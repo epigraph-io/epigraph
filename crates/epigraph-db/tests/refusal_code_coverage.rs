@@ -275,6 +275,14 @@ const REDACTED: &[(&[&str], &str)] = &[
         &["WFO01", "WFO02", "WFO03", "WFO04"],
         "the workflow outcome record, workflow lock and admin deprecate",
     ),
+    // Migration 356: the declared agent scopes record. The guard
+    // (`epigraph_agent_scopes_guard`, 55000) and the two maintenance verbs
+    // (`epigraph_agent_scope_grant`, `epigraph_agent_scope_revoke`, 42501 for
+    // a non-maintenance session) are reached only by a maintenance or
+    // superuser SESSION over SQL: no crate calls them (the application role
+    // holds no privilege on the table or the verbs), so no Rust arm answers
+    // the code and no caller sees it (backlog d7ee64a6).
+    (&["AGS02"], "migration 356's agent-scope guard and maintenance verbs; no Rust caller"),
 ];
 
 /// The registry: the reviewed message-code lists and the custom SQLSTATEs
