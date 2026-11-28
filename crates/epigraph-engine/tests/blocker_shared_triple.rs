@@ -92,3 +92,137 @@ async fn returns_shared_triple_candidates(pool: PgPool) {
         assert_ne!(a, b, "self-pair found");
     }
 }
+
+/// The per-seed statement `SharedTripleBlocker` ran once per seed before
+/// backlog d69a4d24, kept here as the reference the batched statement must
+/// agree with.
+async fn per_seed_reference(pool: &PgPool, seeds: &[Uuid], cap: usize) -> Vec<(Uuid, Uuid)> {
+    let mut out = Vec::new();
+    for &seed in seeds {
+        let nbrs: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT DISTINCT t2.claim_id
+             FROM triples t1
+             JOIN triples t2
+                  ON t2.subject_id = t1.subject_id
+                 AND t2.predicate  = t1.predicate
+                 AND t2.claim_id  <> t1.claim_id
+             WHERE t1.claim_id = $1
+             LIMIT $2",
+        )
+        .bind(seed)
+        .bind(cap as i64)
+        .fetch_all(pool)
+        .await
+        .expect("reference");
+        for (n,) in nbrs {
+            if let Some(p) = epigraph_engine::matching::blocker::canonical(seed, n) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Pairs of `pairs` that touch `claim`.
+fn touching(pairs: &[(Uuid, Uuid)], claim: Uuid) -> Vec<(Uuid, Uuid)> {
+    pairs
+        .iter()
+        .copied()
+        .filter(|&(a, b)| a == claim || b == claim)
+        .collect()
+}
+
+/// Backlog d69a4d24: the blocker answers every seed in ONE statement, and the
+/// answer is the one the per-seed loop gave.
+///
+/// The seed set covers the shapes a batched rewrite can get wrong:
+/// * three seeds under the cap, two of which are each other's neighbours
+///   (one shared `(subject, predicate)`), and one with a neighbour of its own;
+/// * a seed with no triples at all;
+/// * a duplicated seed;
+/// * a seed with MORE neighbours than the cap, on a triple no other seed
+///   shares, which must yield exactly `cap` pairs. A per-seed `LIMIT` turned
+///   into one global `LIMIT` over the whole seed set fails this arm or the
+///   equivalence arm.
+///
+/// Every seed but the over-cap one stays under the cap, because
+/// `DISTINCT ... LIMIT` without an `ORDER BY` picks an arbitrary subset above
+/// it, so only the over-cap seed's COUNT is comparable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn one_statement_for_every_seed_matches_the_per_seed_path(pool: PgPool) {
+    let cap = 3usize;
+    let agent = insert_agent(&pool).await;
+    let s1 = insert_claim(&pool, agent).await;
+    let s2 = insert_claim(&pool, agent).await;
+    let s3 = insert_claim(&pool, agent).await;
+    let empty = insert_claim(&pool, agent).await;
+    let hub = insert_claim(&pool, agent).await;
+    let n3 = insert_claim(&pool, agent).await;
+    let n1 = insert_claim(&pool, agent).await;
+
+    let shared = insert_entity(&pool).await;
+    let other = insert_entity(&pool).await;
+    let hub_subject = insert_entity(&pool).await;
+
+    // s1 <-> s2 <-> n1 on (shared, has_property).
+    insert_triple(&pool, s1, shared, "has_property").await;
+    insert_triple(&pool, s2, shared, "has_property").await;
+    insert_triple(&pool, n1, shared, "has_property").await;
+    // Same subject, different predicate: NOT a neighbour of s1/s2.
+    insert_triple(&pool, s3, shared, "made_of").await;
+    // s3 <-> n3 on (other, made_of).
+    insert_triple(&pool, s3, other, "made_of").await;
+    insert_triple(&pool, n3, other, "made_of").await;
+    // hub shares (hub_subject, part_of) with cap + 2 claims nobody else touches.
+    insert_triple(&pool, hub, hub_subject, "part_of").await;
+    for _ in 0..cap + 2 {
+        let c = insert_claim(&pool, agent).await;
+        insert_triple(&pool, c, hub_subject, "part_of").await;
+    }
+
+    let b = SharedTripleBlocker::new(cap);
+    let under_cap = [s1, s2, s3, empty, s1];
+    let batched = b.candidates(&pool, &under_cap).await.expect("batched");
+    let reference = per_seed_reference(&pool, &under_cap, cap).await;
+    assert_eq!(batched, reference, "batched answer differs from per-seed");
+    let mut expected = vec![
+        epigraph_engine::matching::blocker::canonical(s1, s2).unwrap(),
+        epigraph_engine::matching::blocker::canonical(s1, n1).unwrap(),
+        epigraph_engine::matching::blocker::canonical(s2, n1).unwrap(),
+        epigraph_engine::matching::blocker::canonical(s3, n3).unwrap(),
+    ];
+    expected.sort_unstable();
+    assert_eq!(batched, expected, "CALIBRATION: the seeded neighbourhoods");
+
+    // The over-cap seed alongside the others: its own pairs are capped at
+    // `cap`, and every other seed's pairs are unchanged.
+    let with_hub = [s1, hub, s2, s3, empty, s1];
+    let batched = b.candidates(&pool, &with_hub).await.expect("batched");
+    assert_eq!(
+        touching(&batched, hub).len(),
+        cap,
+        "the over-cap seed must yield exactly `cap` pairs: {batched:?}"
+    );
+    let without_hub: Vec<_> = batched
+        .iter()
+        .copied()
+        .filter(|&(a, b)| a != hub && b != hub)
+        .collect();
+    assert_eq!(
+        without_hub, expected,
+        "a capped seed must not eat another seed's share"
+    );
+    let reference = per_seed_reference(&pool, &with_hub, cap).await;
+    assert_eq!(
+        touching(&reference, hub).len(),
+        cap,
+        "CALIBRATION: the per-seed path caps the hub too"
+    );
+
+    assert!(
+        b.candidates(&pool, &[]).await.expect("no seeds").is_empty(),
+        "no seeds, no pairs"
+    );
+}
