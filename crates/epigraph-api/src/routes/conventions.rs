@@ -440,9 +440,13 @@ pub async fn forget_convention(
     pub_key[..16].copy_from_slice(principal_bytes);
     pub_key[16..].copy_from_slice(principal_bytes);
 
-    // Get-or-create an agent row for this principal.
+    // Get-or-create an agent row for this principal, on the transaction the
+    // read and the check opened (agents are untenanted): a second pool
+    // checkout while that transaction is held would let a burst of concurrent
+    // forgets starve the pool, and a forget refused or failed later now
+    // leaves no principal agent row behind.
     let principal_agent = if let Some(a) =
-        epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
+        epigraph_db::AgentRepository::get_by_public_key(&mut *tx, &pub_key)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: e.to_string(),
@@ -450,7 +454,7 @@ pub async fn forget_convention(
         a
     } else {
         let agent = epigraph_core::Agent::new(pub_key, Some(format!("principal:{principal_id}")));
-        epigraph_db::AgentRepository::create(pool, &agent)
+        epigraph_db::AgentRepository::create_conn(&mut tx, &agent)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: e.to_string(),
@@ -477,8 +481,8 @@ pub async fn forget_convention(
     // owns it, as the separate best-effort edge write this replaces did. The
     // evidence row is the caller's write too (migration 114's attach rule on a
     // public claim it does not own). The transaction was opened above for the
-    // read and the writer check; the principal agent get-or-create since then
-    // autocommits on the raw pool.
+    // read and the writer check, and carries the principal agent
+    // get-or-create since then.
     epigraph_db::EvidenceRepository::create(
         &mut *tx,
         &evidence,
