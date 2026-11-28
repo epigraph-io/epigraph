@@ -60,13 +60,15 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("scripts/backfill_locality_tag.py", "<module>", 2, "rewrites the locality_tag metadata column only; masses untouched"),
     ("scripts/backfill_source_strength.py", "execute_backfill", 2, "SPEC §4.1 W13 script: rewrites source_strength (alpha); write path frozen (af23a73d changed only its calibration-file choice and docstring)"),
     ("scripts/e2e/probe-batch-h.sh", "<file>", 1, "end-to-end probe seeding one BBA in its own throwaway database"),
-    ("scripts/link_mass_function_evidence.py", "<module>", 1, "SPEC §4.1 W13 script: rewrites evidence_id, so item keys; frozen, not edited"),
+    ("scripts/link_mass_function_evidence.py", "<module>", 3, "SPEC §4.1 W13 script: rewrites evidence_id only (masses untouched): the exact evidence-slot link, the single-candidate link, and the undo's revert to NULL of the links one run recorded"),
     ("scripts/migrate_provenance_bba.py", "migrate", 1, "SPEC §4.1 W13 script: inserts truth_value seed BBAs; write path frozen (af23a73d changed only its docstring)"),
     ("scripts/migrate_provenance_bba.py", "rollback", 1, "SPEC §4.1 W13 script: deletes the seed BBAs it inserted"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "<module>", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "main", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
     ("scripts/tests/test_migrate_provenance_bba.py", "execute", 2, "two test doubles (seed and rollback) that match the statement text of migrate_provenance_bba.py; write nothing"),
     ("scripts/tests/test_migrate_provenance_bba.py", "test_the_delete_skips_retracted_rows_and_reports_them", 1, "selects the rollback's recorded DELETE text from a test double to assert its retracted_at predicate; writes nothing"),
+    ("scripts/tests/test_link_mass_function_evidence_db.py", "_bba", 1, "the evidence-link DB arm's fixture: one unlinked BBA (optionally on an evidence slot), in the CI-provisioned _test database only"),
+    ("scripts/tests/test_link_mass_function_evidence_db.py", "test_undo_restores_nulls_and_skips_a_row_changed_since", 1, "the evidence-link DB arm re-points one fixture BBA's evidence_id after a run, so the undo must skip it; _test database only"),
     ("scripts/tests/test_migrate_provenance_bba_db.py", "_seed_bba", 1, "the K4b DB arm's fixture: one seed BBA exactly as migrate() writes it, in the CI-provisioned _test database only"),
 ];
 

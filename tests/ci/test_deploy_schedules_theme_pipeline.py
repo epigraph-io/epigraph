@@ -10,7 +10,7 @@ jobs" step listed neither, so a deployment following the guide never ran them.
 This ties the guide to the pointer in code: every script the refusal names
 must have a row in Step 10's table, with the subcommand the refusal names.
 It also checks that scripts/README.md says where the pinned Python
-dependencies live (there is no scripts/requirements.txt).
+dependencies live (scripts/requirements.txt, backlog 8afe831f).
 """
 from __future__ import annotations
 
@@ -88,8 +88,8 @@ def test_the_theme_rows_state_role_cadence_and_memory():
 
 def test_scripts_readme_names_the_pinned_dependency_file():
     readme = SCRIPTS_README.read_text()
-    assert "tests/requirements-ci.txt" in readme
-    assert (REPO / "tests" / "requirements-ci.txt").exists()
+    assert "-r scripts/requirements.txt" in readme
+    assert (REPO / "scripts" / "requirements.txt").exists()
 
 
 def test_the_rebuild_is_operator_run_with_the_flag_and_the_rebuild_steps():
