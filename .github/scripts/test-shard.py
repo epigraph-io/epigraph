@@ -154,6 +154,7 @@ LIGHT_TARGETS = {
         "maintenance_surface_register",
         "no_unscoped_pool",
         "personal_group_mint_ratchet",
+        "refusal_code_coverage",
         "tenancy_coverage",
         "viewer_ratchet",
         "visibility_act_callers_ratchet",
