@@ -2812,6 +2812,17 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // roster write refused: loud, fail-closed). Registered so the pre-flight
     // sees an owner the guarded `OWNER TO` failed to set.
     ("epigraph_is_group_admin", 346),
+    // 356 (backlog d7ee64a6), the declared agent scopes record: the audit
+    // trigger and the two maintenance verbs. All three write through row
+    // security and 123's reserved-prefix policy, whose arms a maintenance or
+    // superuser SESSION satisfies whoever owns the body (`epigraph_bypass()`
+    // reads session_user), so a non-member owner does not widen who writes.
+    // What it costs is the owner's privileges: an owner without INSERT /
+    // UPDATE on `agent_scopes` or INSERT on `security_events` refuses every
+    // grant and revoke (loud, fail-closed).
+    ("epigraph_agent_scopes_audit", 356),
+    ("epigraph_agent_scope_grant", 356),
+    ("epigraph_agent_scope_revoke", 356),
     // 360 (backlog 6e633456), the host's owner-role question for a role's
     // schedule. Reads the FORCEd `role_agents` and `role_assignments` through
     // `epigraph_definer_bypass()` (the owner). Under a non-member owner both
@@ -4175,6 +4186,20 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "epigraph_edge_bbas_keyed",
         "public.epigraph_edge_bbas_keyed(uuid)",
         true,
+    ),
+    // 356: the declared agent scope verbs are maintenance-only. An app grant
+    // would let the request DSN declare or end an agent's write scopes (the
+    // record the enforcing doors will read), and the body's own session
+    // check is defence in depth, not the boundary.
+    (
+        "epigraph_agent_scope_grant",
+        "public.epigraph_agent_scope_grant(uuid, uuid, text, text, timestamptz, timestamptz, uuid)",
+        false,
+    ),
+    (
+        "epigraph_agent_scope_revoke",
+        "public.epigraph_agent_scope_revoke(uuid, text)",
+        false,
     ),
     // 360: the host asks it on the attestor's login; the application role
     // never does (an app grant would let a request DSN rebuild the role
@@ -5966,6 +5991,8 @@ mod definer_register_tests {
         "epigraph_person_authenticators_anchor",
         // 315: the binding trigger that re-owns a role's projection edges.
         "epigraph_group_role_bindings_reown_role_edges",
+        // 356: the declared agent scopes audit.
+        "epigraph_agent_scopes_audit",
     ];
 
     /// The function names [`OPERATOR_FUNCTION_GRANTS`] checks, read from each

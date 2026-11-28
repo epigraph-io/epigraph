@@ -2396,6 +2396,10 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     // migration that creates them; no tenancy columns, so reached through
     // GROUP_INVITATION_TABLES below.
     "group_invitations",
+    // Declared agent scopes (356, backlog d7ee64a6): FORCEd by the migration
+    // that creates them; no tenancy columns, so reached through
+    // AGENT_SCOPE_TABLES below.
+    "agent_scopes",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2510,6 +2514,11 @@ const WORKFLOW_REPORT_TABLES: &[&str] = &["workflow_outcome_reports"];
 /// `owner_group_id` columns, so it does not join `tier_a`.
 const GROUP_INVITATION_TABLES: &[&str] = &["group_invitations"];
 
+/// The declared agent scopes (356), FORCEd by the migration that creates them,
+/// none of the earlier kinds, and carrying no `visibility` / `owner_group_id`
+/// columns, so they do not join `tier_a`.
+const AGENT_SCOPE_TABLES: &[&str] = &["agent_scopes"];
+
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
 /// reports.
@@ -2586,6 +2595,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(ROLE_AGENT_TABLES.iter().map(|s| (*s).to_string()))
         .chain(WORKFLOW_REPORT_TABLES.iter().map(|s| (*s).to_string()))
         .chain(GROUP_INVITATION_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(AGENT_SCOPE_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()
