@@ -52,13 +52,11 @@
 //! (85c03e90).
 
 pub mod admin_cascade;
-pub mod agent_assessment;
 pub mod atlas_flow;
 pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
 pub mod bba_retract;
-pub mod belief_gate;
 pub mod belief_modes;
 pub mod belief_profile;
 pub mod belief_query;
@@ -77,7 +75,6 @@ pub mod dag;
 pub mod derivation_scope;
 pub mod diverse_retrieval;
 pub mod diverse_select;
-pub mod domain_decay;
 pub mod ds_divergence;
 pub mod edge_factor;
 pub mod epistemic_interval;
@@ -99,7 +96,6 @@ pub mod rerank;
 pub mod retention;
 pub mod retraction_cascade;
 pub mod scoped_belief;
-pub mod service;
 pub mod sheaf;
 pub mod silence_alarm;
 pub mod source_dependence;
@@ -107,7 +103,6 @@ pub mod supersede_delta;
 pub mod theme_cluster;
 pub mod triple_extractor;
 pub mod uncertainty;
-pub mod unified_bp;
 pub mod visibility_act;
 pub mod voi;
 pub mod workflow_promotion;
@@ -141,8 +136,8 @@ pub use interval_bp::{
 };
 pub use promotion::{evaluate_promotion, PromotionFailure, PromotionInput, PromotionResult};
 pub use propagation::{
-    ClaimDependency, ConcurrentOrchestrator, DatabasePropagator, PropagationAuditRecord,
-    PropagationConfig, PropagationOrchestrator, PropagationResult,
+    ClaimDependency, DatabasePropagator, PropagationAuditRecord, PropagationConfig,
+    PropagationOrchestrator, PropagationResult,
 };
 pub use reasoning::{
     Contradiction, IndirectChallenge, ReasoningClaim, ReasoningEdge, ReasoningEngine,
@@ -159,10 +154,6 @@ pub use rerank::{
     merge_rerank_scores, parse_groundedness_response, parse_rerank_response, Groundedness,
     GroundednessGate, HttpRerankClient, MockRerankClient, RerankCandidate, RerankClient,
     RerankError, RerankProviderConfig, RerankScore, RerankedHit,
-};
-pub use service::{
-    ClaimProcessingResult, EpistemicService, EpistemicServiceBuilder, EpistemicServiceConfig,
-    ReputationResult, ValidationResult,
 };
 pub use sheaf::{
     compute_cohomology, compute_edge_inconsistency, compute_expected_betp, compute_section,

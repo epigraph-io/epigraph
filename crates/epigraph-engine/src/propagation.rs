@@ -37,7 +37,6 @@
 use crate::{DagValidator, EngineError, EvidenceType, EvidenceWeighter};
 use epigraph_core::{AgentId, Claim, ClaimId, TruthValue};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock};
 
 /// Maximum number of audit entries to retain in the audit trail.
 /// Implements circular buffer behavior: oldest entries are evicted when limit is exceeded.
@@ -420,53 +419,6 @@ impl PropagationOrchestrator {
 }
 
 impl Default for PropagationOrchestrator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Thread-safe wrapper for concurrent propagation operations
-///
-/// Wraps `PropagationOrchestrator` in `Arc<RwLock<>>` for safe
-/// concurrent access from multiple threads.
-///
-/// # Usage
-///
-/// ```text
-/// let orchestrator = ConcurrentOrchestrator::new();
-///
-/// // Clone for use in another thread
-/// let orch_clone = orchestrator.clone_arc();
-///
-/// thread::spawn(move || {
-///     let mut orch = orch_clone.inner.write().unwrap();
-///     // ... perform operations
-/// });
-/// ```
-pub struct ConcurrentOrchestrator {
-    /// The inner orchestrator wrapped in thread-safe containers
-    pub inner: Arc<RwLock<PropagationOrchestrator>>,
-}
-
-impl ConcurrentOrchestrator {
-    /// Create a new concurrent orchestrator
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(PropagationOrchestrator::new())),
-        }
-    }
-
-    /// Clone the Arc for sharing with another thread
-    #[must_use]
-    pub fn clone_arc(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-impl Default for ConcurrentOrchestrator {
     fn default() -> Self {
         Self::new()
     }
