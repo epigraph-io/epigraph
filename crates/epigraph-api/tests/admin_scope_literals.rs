@@ -44,7 +44,7 @@ const ADMIN_ONLY: &[&str] = &[
 /// 68 -> 66: `resolve_challenge`'s and `decay_sweep`'s
 /// `check_scopes(&auth, &["claims:admin"])` went with the deleted admin
 /// policy write handlers (backlog ec968070).
-const HIGH_WATER: usize = 66;
+const HIGH_WATER: usize = 65;
 
 /// The gate module: the chokepoint itself spells the scopes.
 const GATE: &str = "epigraph-auth/src/lib.rs";
