@@ -776,9 +776,15 @@ Past the window, or after an R8 refusal, an undo is maintenance-only (section 5.
     `epigraph_live_memberships`.
   * The Explorer's `services/explorer/src/ttl.rs::ResponseCache` is keyed per session, with
     `OVERVIEW_TTL` and `LANDING_CACHE_TTL` of 60 s and `ATLAS_LAYOUT_TTL` of 30 s. After an
-    **undo**, which narrows, a session can keep seeing withdrawn theme counts for up to 60 s.
-    The undo surface states this bound in its response, and P2 decides between accepting it
-    and adding a process-wide generation counter that the cache keys on.
+    **undo**, which narrows, a session can keep seeing the cached aggregates as they stood
+    before it for up to 60 s: theme and community counts and labels, the landing statistics
+    and the Atlas layout's regions. A claim's own page is not cached, so the withdrawn claims'
+    content is not served from cache. The undo surface states this bound in its response. The
+    bound is accepted (backlog `fb349198`): no process-wide generation counter keys the cache,
+    so the staleness lasts up to 60 s for the overviews
+    (`services/explorer/src/bff/graph.rs::OVERVIEW_TTL`,
+    `services/explorer/src/pages/core.rs::LANDING_CACHE_TTL`) and up to 30 s for the Atlas
+    layout (`services/explorer/src/bff/atlas.rs::ATLAS_LAYOUT_TTL`).
 * **Clusters and themes.**
   * `graph_clusters`, `cluster_edges`, `graph_neighborhoods`, `neighborhood_edges`,
     `cluster_labels` and `claim_themes` (centroid, label, `claim_count`) are corpus-wide

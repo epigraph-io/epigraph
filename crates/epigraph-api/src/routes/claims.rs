@@ -3271,6 +3271,13 @@ pub struct ClaimByLabelsResponse {
 /// so the rows returned are the caller's own visible set rather than "public
 /// claim metadata". The scripts named above authenticate.
 ///
+/// So the same labels can return fewer rows here than the MCP tool returns
+/// to another caller: a service token reads a person's personal group only
+/// if the operator gave it a writer row there (migration 235's personal-group
+/// arm), and without one a claim there is absent rather than flagged as
+/// hidden (backlog f0a817fb). See `docs/tenancy.md`, "Same query, different
+/// principal".
+///
 /// # Paging
 /// A full page (as many rows as the clamped `limit`) carries the
 /// [`NEXT_CURSOR_HEADER`] response header; pass it back as `after` for the next

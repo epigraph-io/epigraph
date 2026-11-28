@@ -2881,7 +2881,8 @@ has a live attachment is refused `ROL01` unless, for every live attachment,
 the role has a live human holder and the agent's live-linked human is that
 holder. That also refuses an agent still linked to the previous holder after
 a handover: grant the role back to its human, or detach the agent and attach
-an identity linked to the new holder. `epigraph-mcp-full` asks the same question
+an identity linked to the new holder (not for a curator; see "A curator is
+re-linked, never replaced" below). `epigraph-mcp-full` asks the same question
 at boot, on every transport, and refuses to start on `may_run = false`.
 Attachments are written by a maintenance session
 (`epigraph-operator role-attach` / `role-detach`, dry run by default, over
@@ -2902,6 +2903,26 @@ enforces the rule against a writer that does not choose its own principal
 (the API, which stamps the authenticated viewer). A container that holds the
 application DSN directly can stamp another identity of the same human; the
 migration's header states that limit in full.
+
+**A curator is re-linked, never replaced** (backlog `ee290133`). For an
+attached agent that submitted workflow lineages (a curator), detaching it and
+attaching an identity linked to the new holder is the wrong remedy: keep the
+same agent across holders and re-link it to the new holder. A new generation
+of a lineage inherits the lineage's recorded submitter, and only that
+submitter, its operator, a delegate (an agent live-linked to either), a live
+writer of the lineage's owner group, or the audited admin path over HTTP may
+add one (`crates/epigraph-mcp/src/tools/workflow_authority.rs`). A replacement
+identity linked to the new holder is none of the first three, so it can extend
+only the lineages owned by a group it writes; a lineage the curator published
+into any other group (its first holder's personal group, for example) stops at
+its last generation. No verb performs that re-link yet: an agent is linked to
+one operator, ever (`epigraph_link_operator` refuses a second with `55000`),
+and `crates/epigraph-api/tests/role_handover_curator.rs` (backlog `6a1825ef`)
+pins that a handover today cuts the curator off. Until a re-link path lands,
+the only remedy that keeps a curator's lineages extensible by the curator is
+granting the role back to its human. The `ROL01` hint the database returns
+(migration 166) still names only the two generic remedies; for a curator,
+this paragraph overrides it. The handover plan is backlog `cdfc586a`.
 
 **Group bindings that admit only attached agents (migration 179).**
 `define-group-role` and `bind-group-role` take
