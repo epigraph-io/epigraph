@@ -246,6 +246,45 @@ pub async fn create_entity(
     }))
 }
 
+/// The most items one `entity-mentions/batch` or `triples/batch` request may
+/// carry (backlog 591b2f6f). A larger batch is `400`; split it.
+pub const MAX_BATCH_ITEMS: usize = 1000;
+
+/// Refuse (`400`) a batch over [`MAX_BATCH_ITEMS`] or any item whose
+/// confidence is not a finite number in `[0.0, 1.0]` (backlog 591b2f6f).
+///
+/// Neither `triples` nor `entity_mentions` has a CHECK on `confidence`, so
+/// this is the only bound: without it `1.5`, `-0.1` and NaN were stored as
+/// given. Runs before the handler opens its transaction, so a refused batch
+/// costs no connection and writes nothing. The first bad item decides the
+/// message, by its index in the request.
+#[cfg(feature = "db")]
+fn validate_batch(
+    kind: &'static str,
+    confidences: impl ExactSizeIterator<Item = f64>,
+) -> Result<(), ApiError> {
+    let len = confidences.len();
+    if len > MAX_BATCH_ITEMS {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "a batch carries at most {MAX_BATCH_ITEMS} {kind}; this one carries {len}. \
+                 Split it; nothing was written"
+            ),
+        });
+    }
+    for (index, confidence) in confidences.enumerate() {
+        if !(confidence.is_finite() && (0.0..=1.0).contains(&confidence)) {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "{kind}[{index}].confidence must be a finite number in [0.0, 1.0], \
+                     got {confidence}; nothing was written"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Refuse the batch unless the caller may write EVERY claim it attaches to.
 ///
 /// Runs on the batch's own stamped transaction, before its first insert. Each
@@ -297,8 +336,10 @@ pub async fn create_entity(
 
 /// POST /api/v1/entity-mentions/batch — batch insert entity mentions
 ///
-/// All or nothing: every mention's claim must be one the caller can write
-/// (module doc), and the rows are inserted on one stamped transaction.
+/// All or nothing: at most [`MAX_BATCH_ITEMS`] mentions, each with a
+/// confidence in `[0.0, 1.0]` (else `400`), every mention's claim one the
+/// caller can write (module doc), and the rows inserted on one stamped
+/// transaction.
 #[cfg(feature = "db")]
 pub async fn batch_create_mentions(
     State(state): State<AppState>,
@@ -306,6 +347,7 @@ pub async fn batch_create_mentions(
     ViewerExtractor(viewer): ViewerExtractor,
     Json(req): Json<BatchMentionsRequest>,
 ) -> Result<Json<BatchIdsResponse>, ApiError> {
+    validate_batch("mentions", req.mentions.iter().map(|m| m.confidence))?;
     let mut tx = state.write_as(&viewer, "batch_create_mentions").await?;
     require_writable_targets(
         &mut tx,
@@ -350,8 +392,10 @@ pub async fn batch_create_mentions(
 
 /// POST /api/v1/triples/batch — batch insert RDF-style triples
 ///
-/// All or nothing: every triple's claim must be one the caller can write
-/// (module doc), and the rows are inserted on one stamped transaction.
+/// All or nothing: at most [`MAX_BATCH_ITEMS`] triples, each with a
+/// confidence in `[0.0, 1.0]` (else `400`), every triple's claim one the
+/// caller can write (module doc), and the rows inserted on one stamped
+/// transaction.
 #[cfg(feature = "db")]
 pub async fn batch_create_triples(
     State(state): State<AppState>,
@@ -359,6 +403,7 @@ pub async fn batch_create_triples(
     ViewerExtractor(viewer): ViewerExtractor,
     Json(req): Json<BatchTriplesRequest>,
 ) -> Result<Json<BatchIdsResponse>, ApiError> {
+    validate_batch("triples", req.triples.iter().map(|t| t.confidence))?;
     let mut tx = state.write_as(&viewer, "batch_create_triples").await?;
     require_writable_targets(
         &mut tx,
