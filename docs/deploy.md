@@ -2139,6 +2139,33 @@ dynamically registered (RFC 7591) client with its authorization-code count.
 those that never completed an authorization and are older than the floor,
 with one audit row per client.
 
+**Write-scope re-provision (migration 362): a GATE for the MCP scope remap.**
+The remap that moves the MCP edge writers to `edges:write` and the evidence
+writers to `evidence:write` (backlog c2dbcf27) must not deploy until this verb
+has run on the target database. Before it, those writers need only
+`claims:write`, and many writing clients and their live refresh chains hold
+neither new scope. A grant on the client alone would not reach a connected
+agent, because the refresh grant issues the chain's stored scopes narrowed to
+the client's grant. In order:
+
+1. Migrate to 362 and install the `epigraph-operator` that has the verb.
+2. `epigraph-operator reprovision-write-scopes --reason <text>` (dry run):
+   one `CLIENT` line per active `claims:write` client it would change, one
+   `CHAIN` line per live refresh family, and the totals. Compare them with a
+   census of the same predicate.
+3. `... --reason <text> --apply --confirm-count <N from step 2>
+   --manifest-out <new file>`. A different count rolls back everything. Keep
+   the manifest: it is the undo.
+4. Run the dry run again; it must report `0 client(s)`. A rotation in flight
+   during step 3 can mint a successor the run did not see. Re-run step 3 for
+   any that remain.
+5. Only then deploy the remap.
+
+The undo is `reprovision-write-scopes --reverse --manifest <file> --reason
+<text> --apply`. It restores each client's exact prior arrays and its chains
+(by family), and leaves alone (HELD, exit 3) any client whose arrays changed
+since. Undo the remap first.
+
 **Access-token revocation (migration 141).** `POST /oauth/revoke` with an
 access token records its `jti` in a durable denylist, which the API and the
 MCP bearer middleware read. A binary built with it on a database without 141
