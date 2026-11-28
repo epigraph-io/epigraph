@@ -895,6 +895,40 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          nothing else.",
     ),
     (
+        "paper.rs",
+        "asserted_claims_conn",
+        "READ of the ids (and, where the session reads the claim row, the stored \
+         content_hash) of the claims one `papers` row asserts through ingest-written \
+         `asserts` edges, on the document ingest's own author-stamped transaction, for the \
+         paper row that transaction just got or created in its declared scope (backlog \
+         8f56a641). Row security on that transaction filters both `edges` and `claims`; every \
+         id it can return is one an earlier ingest of that scope's own paper reported to that \
+         scope, and it is used only to re-use those ids, never returned to a caller.",
+    ),
+    (
+        "paper.rs",
+        "own_group_legacy_claims_conn",
+        "READ of the ids and stored content_hash of the claims ONE group owns, non-public, \
+         that hold one of the document ingest's global plan ids or stored hashes, on that \
+         ingest's own author-stamped transaction, for the group the ingest writes into \
+         (backlog 8f56a641: a pre-246 ingest of the same document by that group). The scope is \
+         in the SQL (`owner_group_id = $1 AND visibility <> 'public'`), not only row security, \
+         so the operator CLI's RLS-bypassing pool reads no other group's row either; used only \
+         to re-use the group's own ids, never returned to a caller.",
+    ),
+    (
+        "paper.rs",
+        "public_twin_recorded_claims_conn",
+        "READ of what the PUBLIC `papers` row of the same document key as the ingest's own \
+         in-scope row asserts through in-force ingest-written `asserts` edges, on the document \
+         ingest's own author-stamped transaction (backlog 8f56a641: a pre-246 non-public \
+         ingest recorded its claims on the one row 246 made public). In the SQL: only when \
+         that row asserts one of the ingest group's own non-public rows, and only that group's \
+         rows and public rows are returned, never another group's non-public row, so the \
+         operator CLI's RLS-bypassing pool reads no other group's row either; used only to \
+         re-use those ids, never returned to a caller.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \

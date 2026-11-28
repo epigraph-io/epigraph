@@ -124,6 +124,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
             supporting_text: None,
             supporting_locator: None,
             enrichment: serde_json::json!({}),
+            id_scope: None,
         });
         Some(id)
     } else {
@@ -187,6 +188,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
             supporting_text: None,
             supporting_locator: None,
             enrichment: serde_json::json!({}),
+            id_scope: None,
         });
 
         if let Some(tid) = thesis_id {
@@ -235,6 +237,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 supporting_text: Some(step.rationale.clone()),
                 supporting_locator: None,
                 enrichment: serde_json::json!({}),
+                id_scope: None,
             });
 
             edges.push(decomposes_edge(phase_id, step_id));
@@ -273,6 +276,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                     supporting_text: Some(step.rationale.clone()),
                     supporting_locator: None,
                     enrichment: serde_json::json!({}),
+                    id_scope: None,
                 });
 
                 edges.push(decomposes_edge(step_id, oid));

@@ -1236,7 +1236,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // migration 246 `PaperRepository::get_or_create_stored` writes `papers` in the ingest's declared
     // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`; since
     // backlog b995f117 it is the only write of that row on the detached path too. The body of
-    // `do_ingest_document_reporting` (a thin wrapper now, with no SQL of its own).
+    // `do_ingest_document_reporting` (a thin wrapper now, with no SQL of its own). stamped:
+    // `ingest_plan_for_scope` (backlog 8f56a641) reads `PaperRepository::asserted_claims_conn`
+    // on the same stamped transaction, for the paper row the walk got or created in its own
+    // declared scope: the ids that scope's earlier ingest of the document recorded; then
+    // `PaperRepository::own_group_legacy_claims_conn`, the owning group's own non-public rows
+    // under the global plan's ids or hashes (scoped in its SQL), for a pre-246 ingest; then
+    // `PaperRepository::public_twin_recorded_claims_conn`, what the document key's public row
+    // recorded, gated and filtered to the group's own and public rows in its SQL.
     (
         "ingestion.rs",
         "ingest_document_walk_reporting",
@@ -1259,6 +1266,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "ingest_plan_for_scope",
             "label_resolved_claim",
             "persist_planned_claim",
             "resolve_ingest_visibility",
@@ -1277,7 +1285,8 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `resolve_ingest_visibility`; stamped: `PaperRepository::licence`, read by the id the
     // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
     // migration 246 `PaperRepository::get_or_create_stored` writes `papers` in the ingest's declared
-    // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`.
+    // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`. stamped:
+    // `ingest_plan_for_scope`, as in `ingest_document_walk_reporting` above.
     (
         "ingestion.rs",
         "do_ingest_document_spine",
@@ -1298,6 +1307,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "ingest_plan_for_scope",
             "label_resolved_claim",
             "persist_planned_claim",
             "resolve_ingest_visibility",

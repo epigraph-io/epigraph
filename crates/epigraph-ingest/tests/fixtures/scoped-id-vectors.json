@@ -1,0 +1,167 @@
+{
+ "schema": "scoped-ids-v1",
+ "about": "Independent (Python) derivation of document ingest ids; see gen_scoped_id_vectors.py.",
+ "group": "5c0be1d2-7a41-4f6e-9b3a-2d8e6f1a0c47",
+ "extraction": {
+  "source": {
+   "title": "Scoped Id Golden Paper — résumé",
+   "source_type": "Paper",
+   "authors": []
+  },
+  "thesis": "Golden thesis: ids stay put",
+  "thesis_derivation": "TopDown",
+  "sections": [
+   {
+    "title": "Introduction",
+    "paragraphs": [
+     {
+      "text": "First paragraph text.",
+      "atoms": [
+       "Atom one is plain.",
+       "Atom zwölf has umlauts."
+      ],
+      "generality": [
+       1,
+       2
+      ],
+      "confidence": 0.8
+     }
+    ]
+   },
+   {
+    "title": "Results",
+    "paragraphs": [
+     {
+      "text": "Second paragraph text.",
+      "atoms": [
+       "Atom one is plain."
+      ],
+      "generality": [
+       1
+      ],
+      "confidence": 0.7
+     },
+     {
+      "text": "Third paragraph text.",
+      "atoms": [],
+      "generality": [],
+      "confidence": 0.6
+     }
+    ]
+   }
+  ],
+  "relationships": []
+ },
+ "public": [
+  {
+   "level": 0,
+   "content": "Golden thesis: ids stay put",
+   "claim_id": "949fd0d2-e0ee-53e6-ab5e-731c9c15e789",
+   "content_hash": "ee49a2fb9e900600160206d48a835fecc9c65397ac9d6441fa1974519e68a1e7"
+  },
+  {
+   "level": 1,
+   "content": "Introduction",
+   "claim_id": "4dddf7eb-1c48-55af-a836-484eb359f346",
+   "content_hash": "87da93359949d3592a75c4e6b459450e031519eb4c37367d85d929937b793098"
+  },
+  {
+   "level": 2,
+   "content": "First paragraph text.",
+   "claim_id": "ab0a19ed-d693-57da-abaf-54cbbe89c145",
+   "content_hash": "8d8dc43033a339ead934f273d65657ee90e2bbef0cd8d4de61ec86af348bd3bd"
+  },
+  {
+   "level": 3,
+   "content": "Atom one is plain.",
+   "claim_id": "105aad83-1e74-5d61-bbc0-fc0af41296b4",
+   "content_hash": "9292d481fabae1e47fd9012aa588193906ef3b7ab6b11c4c6e756b34de6e483b"
+  },
+  {
+   "level": 3,
+   "content": "Atom zwölf has umlauts.",
+   "claim_id": "090b59a0-d36b-51ba-9330-809e6bcb8a49",
+   "content_hash": "6ae1aefc2a508c52e35d54ee7153f67d0c1893d0c60ebabc5a82df8502704838"
+  },
+  {
+   "level": 1,
+   "content": "Results",
+   "claim_id": "d33fbb77-6421-5177-a0c5-06c82f3aa5fd",
+   "content_hash": "e9db3892b3563b2643b0b1bfe03ed3bfadac724fc3d3f8e0a2650d50c433da7c"
+  },
+  {
+   "level": 2,
+   "content": "Second paragraph text.",
+   "claim_id": "6abe9cba-08f9-54ff-8755-a880fbaa8fcd",
+   "content_hash": "9b3c67c304acc45391bd1227913c52d4ed20c60d476fe574a93550ce05de63c7"
+  },
+  {
+   "level": 3,
+   "content": "Atom one is plain.",
+   "claim_id": "105aad83-1e74-5d61-bbc0-fc0af41296b4",
+   "content_hash": "9292d481fabae1e47fd9012aa588193906ef3b7ab6b11c4c6e756b34de6e483b"
+  },
+  {
+   "level": 2,
+   "content": "Third paragraph text.",
+   "claim_id": "bbb600c2-aef9-59c9-afa7-2b62a783df09",
+   "content_hash": "f3ad5f824b59acd0d69d3b9c1c450af26d4a36155884e7f2de4fc08d494598b4"
+  }
+ ],
+ "scoped": [
+  {
+   "level": 0,
+   "content": "Golden thesis: ids stay put",
+   "claim_id": "01470dd2-266b-548f-873f-da07ee90a523",
+   "content_hash": "985d36729352615a38d53f086b24753cd7bad53643a4243d0a8128da5ff0820e"
+  },
+  {
+   "level": 1,
+   "content": "Introduction",
+   "claim_id": "af7dafdd-0f09-5dd3-9e83-5d64865eb409",
+   "content_hash": "7e9f3a108f641da288433e6288c064ad6907e6ab683f71fddbbfa2cc49940e8e"
+  },
+  {
+   "level": 2,
+   "content": "First paragraph text.",
+   "claim_id": "a1961131-2f90-533e-87de-e489872d4fe1",
+   "content_hash": "1cadce58ba6cf46fcc6efed2716b4f4b96a9fe9838e3c361c583f194f38e3ba8"
+  },
+  {
+   "level": 3,
+   "content": "Atom one is plain.",
+   "claim_id": "c27b302c-25e2-541f-ba38-c2c7c51cebb1",
+   "content_hash": "b782f74294e125f76d852629c21de0c62ec18a42bbfa75d04dd63efbf026eeff"
+  },
+  {
+   "level": 3,
+   "content": "Atom zwölf has umlauts.",
+   "claim_id": "18c619a3-f4cb-56da-a507-1e23776a4230",
+   "content_hash": "7fc315341bc4bd2b89ccd2479b6c0b5845393b6fc45fcd68e1d83b2aae3c77cd"
+  },
+  {
+   "level": 1,
+   "content": "Results",
+   "claim_id": "c6eb0109-4c3b-5178-ab91-569c74340405",
+   "content_hash": "bb3238f862d4e422d02e096ca89283c80b8e360461e62309a276bc7b5098f6a6"
+  },
+  {
+   "level": 2,
+   "content": "Second paragraph text.",
+   "claim_id": "289f10ee-1b6a-598b-beeb-56885bc06973",
+   "content_hash": "16117fb973df50b7b046dea5c4837c195034cd895f1c77211e6f12ebfea08220"
+  },
+  {
+   "level": 3,
+   "content": "Atom one is plain.",
+   "claim_id": "c27b302c-25e2-541f-ba38-c2c7c51cebb1",
+   "content_hash": "b782f74294e125f76d852629c21de0c62ec18a42bbfa75d04dd63efbf026eeff"
+  },
+  {
+   "level": 2,
+   "content": "Third paragraph text.",
+   "claim_id": "f01b59ed-6e4b-52a1-8ac3-82d747113b06",
+   "content_hash": "24c662d240a5a159d081b5b6cdf841de509cfb35fea944490e5fff8016a60259"
+  }
+ ]
+}

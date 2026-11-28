@@ -1495,7 +1495,28 @@ pub async fn verify_claim_report(
                 None => HashCheck::NotApplicable,
             }
         } else if epigraph_ingest::document::stored_content_hash_is_seed_scoped(&properties) {
-            HashCheck::NotApplicable
+            // A non-public document atom stores
+            // `blake3(blake3(body) || owner_group)` (backlog 8f56a641):
+            // re-derive it from the row's current owner, read through the
+            // caller's viewer, so an honest row still reports `match`. A
+            // disagreement stays `not_applicable`, never `mismatch`: sharing
+            // a claim with a team moves its owner but not its digest.
+            let owner = ClaimRepository::tenancy_of_conn(&mut *conn, viewer, &[id])
+                .await
+                .map_err(internal_error)?
+                .first()
+                .map(|(_, _, group)| *group);
+            match owner.and_then(|group| {
+                epigraph_ingest::document::scoped_atom_hash_matches(
+                    &properties,
+                    &claim.content,
+                    &claim.content_hash,
+                    group,
+                )
+            }) {
+                Some(true) => HashCheck::Match,
+                _ => HashCheck::NotApplicable,
+            }
         } else {
             HashCheck::Mismatch
         }
