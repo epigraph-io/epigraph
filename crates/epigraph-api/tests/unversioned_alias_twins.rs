@@ -33,13 +33,24 @@ struct Answer {
 }
 
 async fn get(app: &axum::Router, uri: &str, token: Option<&str>) -> Answer {
-    let mut req = Request::builder().method(Method::GET).uri(uri);
+    call(app, Method::GET, uri, token).await
+}
+
+/// A GET with no body, or a POST with the JSON body `{}`.
+async fn call(app: &axum::Router, method: Method, uri: &str, token: Option<&str>) -> Answer {
+    let mut req = Request::builder().method(method.clone()).uri(uri);
     if let Some(t) = token {
         req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
     }
+    let body = if method == Method::POST {
+        req = req.header(header::CONTENT_TYPE, "application/json");
+        Body::from("{}")
+    } else {
+        Body::empty()
+    };
     let resp = app
         .clone()
-        .oneshot(req.body(Body::empty()).expect("request"))
+        .oneshot(req.body(body).expect("request"))
         .await
         .expect("response");
     let status = resp.status();
@@ -251,4 +262,36 @@ async fn the_other_unversioned_aliases_are_marked_deprecated_and_get_claims_keep
         v1.body
     );
     assert_eq!(v1.deprecation, None);
+}
+
+/// The POST aliases (`/claims`, `/agents`) carry the headers too. The request
+/// is refused (a `claims:read` token, an empty body), and the refusal comes
+/// from the handler's own extractors, inside the alias's layer, so it still
+/// says where the successor is. CALIBRATION: the route matched (not 404) and
+/// the token authenticated (not 401); the `/api/v1` twin carries no header.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_post_aliases_are_marked_deprecated() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    common::assert_test_db_at_head(&url).await;
+    let app = epigraph_api::build_app_for_tests(&url)
+        .await
+        .expect("app builds");
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+
+    for alias in ["/claims", "/agents"] {
+        let a = call(&app, Method::POST, alias, Some(&token)).await;
+        assert!(
+            a.status != StatusCode::NOT_FOUND && a.status != StatusCode::UNAUTHORIZED,
+            "POST {alias}: {} {}",
+            a.status,
+            a.body
+        );
+        assert_alias_headers(&a, alias);
+        let t = call(&app, Method::POST, &format!("/api/v1{alias}"), Some(&token)).await;
+        assert_eq!(t.status, a.status, "POST /api/v1{alias}: same handler");
+        assert_eq!(
+            t.deprecation, None,
+            "POST /api/v1{alias} is the current route"
+        );
+    }
 }
