@@ -215,9 +215,17 @@ pub async fn find_workflow_hierarchical(
 
 // ── list_workflows ─────────────────────────────────────────────────────────
 
-/// The truth below which a hierarchical generation counts as deprecated:
-/// `find_workflow_hierarchical`'s default `min_truth` (`deprecate_workflow`
-/// writes 0.05).
+/// The truth below which `list_workflows` counts a hierarchical generation as
+/// not live (its `head_deprecated`, and the live-generation lookup). It is
+/// `find_workflow_hierarchical`'s default `min_truth`.
+///
+/// This is NOT the rule `find_workflow_hierarchical` uses for its
+/// `lineage_head_deprecated` flag and its sort: that one is the deprecation
+/// sentinel, `WorkflowRepository::is_deprecated_truth` (the 0.05 that
+/// `deprecate_workflow` writes). The two agree for every truth value the
+/// server writes today (1.0 and 0.05) and differ for a generation whose
+/// truth lies in (0.05, 0.3), which this listing calls deprecated and
+/// `find_workflow_hierarchical` does not.
 const LIVE_MIN_TRUTH: f64 = 0.3;
 
 /// Where a `list_workflows` page starts. The enumeration walks the
