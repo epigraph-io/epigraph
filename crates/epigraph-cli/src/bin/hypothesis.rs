@@ -129,6 +129,7 @@ async fn run(
                 .ok_or("OPENAI_API_KEY not set — embeddings required for hypothesis creation")?;
             create(
                 &pool,
+                viewer,
                 embedder.as_ref(),
                 &statement,
                 tenancy,
@@ -143,8 +144,13 @@ async fn run(
     }
 }
 
+// Eight parameters, one over clippy's default: the eighth is the maintenance
+// viewer the embedding write is spent under (backlog 832e89a8). Each is a
+// distinct CLI input or handle; a parameter struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 async fn create(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn epigraph_embeddings::EmbeddingService,
     statement: &str,
     tenancy: TenancyChoice,
@@ -181,26 +187,48 @@ async fn create(
         }
     };
 
-    let claim_id: (Uuid,) = sqlx::query_as(
-        r#"
-        INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, embedding, visibility, owner_group_id)
-        VALUES ($1, $2, $3, 0.5, ARRAY['hypothesis'], $4, $5::vector, $6, $7)
-        RETURNING id
-        "#,
+    // The claim goes through `ClaimRepository` (backlog 832e89a8): CLI claim
+    // writers do not carry their own claim INSERT. A fresh id, so the create
+    // never collapses onto an existing row: the legacy content-hash dedup of
+    // `create_conn` would hand back ANOTHER claim with the same text (any
+    // author's), and the frame row, prior and VOI below would land on it.
+    let claim_id = (Uuid::new_v4(),);
+    let created = epigraph_db::ClaimRepository::create_with_id_if_absent_conn(
+        &mut tx,
+        claim_id.0,
+        statement,
+        &content_hash,
+        agent_id,
+        epigraph_core::TruthValue::new(0.5)?,
+        &["hypothesis".to_string()],
+        decl,
     )
-    .bind(statement)
-    .bind(content_hash.as_slice())
-    .bind(agent_id)
-    .bind(serde_json::json!({
-        "hypothesis_status": "active",
-        "research_question": research_question,
-        "search_radius": search_radius,
-    }))
-    .bind(&embedding_str)
-    .bind(decl.visibility_bind())
-    .bind(decl.owner_group_bind())
-    .fetch_one(&mut *tx)
     .await?;
+    if !created {
+        return Err(format!("hypothesis claim {} was not created", claim_id.0).into());
+    }
+    epigraph_db::ClaimRepository::set_properties_conn(
+        &mut tx,
+        claim_id.0.into(),
+        serde_json::json!({
+            "hypothesis_status": "active",
+            "research_question": research_question,
+            "search_radius": search_radius,
+        }),
+    )
+    .await?;
+    // The vector rides the same transaction, so the claim never commits
+    // without it, as when it was part of the row's own INSERT.
+    let embedded = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+        &mut tx,
+        viewer,
+        claim_id.0,
+        &embedding_str,
+    )
+    .await?;
+    if !embedded {
+        return Err(format!("the embedding of hypothesis {} was not stored", claim_id.0).into());
+    }
 
     // 3. Add to hypothesis_assessment frame
     let frame_id: (Uuid,) =
@@ -566,6 +594,14 @@ async fn promote(
     Ok(())
 }
 
+// The one canonical viewer fixture, for the tests below: a bypass viewer, as
+// the binary's maintenance session hands its claim writer. Declared at the
+// crate root because a `#[path]` inside an inline module resolves under a
+// directory named after that module, which does not exist.
+#[cfg(test)]
+#[path = "../../../epigraph-db/tests/viewer_fixture.rs"]
+mod viewer_fixture;
+
 #[cfg(test)]
 mod tests {
     //! `hypothesis create` is one transaction (backlog 2e64b8a2): the claim,
@@ -576,7 +612,8 @@ mod tests {
     //! discarded (`.ok()`), so the command reported success without it.
 
     use super::*;
-    use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+    use crate::viewer_fixture;
+    use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
     use sqlx::PgPool;
 
     fn embedder() -> MockProvider {
@@ -623,17 +660,103 @@ mod tests {
     }
 
     async fn run_create(pool: &PgPool, agent: Uuid, statement: &str) -> Result<(), String> {
+        run_create_as(pool, agent, statement, TenancyChoice::Public).await
+    }
+
+    async fn run_create_as(
+        pool: &PgPool,
+        agent: Uuid,
+        statement: &str,
+        tenancy: TenancyChoice,
+    ) -> Result<(), String> {
+        let (_scoped, viewer) = viewer_fixture::bypass(pool).await;
         create(
             pool,
+            &viewer,
             &embedder(),
             statement,
-            TenancyChoice::Public,
+            tenancy,
             0.3,
             agent,
             None,
         )
         .await
         .map_err(|e| e.to_string())
+    }
+
+    /// Backlog 832e89a8: the hypothesis claim is created through
+    /// `ClaimRepository`, not the binary's own claim INSERT, and keeps
+    /// everything that INSERT wrote: the declared tenancy, the `hypothesis`
+    /// label, the lifecycle properties and the statement's embedding, all in
+    /// the create's one transaction. The repository writer also records the
+    /// `claim.created` event every repository create emits, which the raw
+    /// INSERT never did; that event is what tells the two paths apart here.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_writes_the_claim_through_the_repository_with_its_tenancy_and_embedding(
+        pool: PgPool,
+    ) {
+        let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "832e89a8").await;
+        hypothesis_frame(&pool).await;
+        let statement = "832e89a8 hypothesis written through the repository";
+        run_create_as(&pool, agent, statement, TenancyChoice::Group(group))
+            .await
+            .expect("create succeeds");
+
+        let (id, visibility, owner, labels, status, has_embedding): (
+            Uuid,
+            String,
+            Option<Uuid>,
+            Vec<String>,
+            Option<String>,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT id, visibility::text, owner_group_id, labels, \
+                    properties->>'hypothesis_status', embedding IS NOT NULL \
+               FROM claims WHERE content = $1",
+        )
+        .bind(statement)
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one hypothesis claim");
+        assert_eq!(
+            (visibility.as_str(), owner),
+            ("group", Some(group)),
+            "--group declares a group-visible claim owned by that group"
+        );
+        assert_eq!(labels, vec!["hypothesis".to_string()]);
+        assert_eq!(status.as_deref(), Some("active"));
+        assert!(has_embedding, "the claim commits with its embedding");
+
+        let expected = epigraph_db::pgvector_literal(
+            &embedder()
+                .generate(statement)
+                .await
+                .expect("embed the statement"),
+        );
+        let stored_matches: bool =
+            sqlx::query_scalar("SELECT $2::vector = c.embedding FROM claims c WHERE c.id = $1")
+                .bind(id)
+                .bind(&expected)
+                .fetch_one(&pool)
+                .await
+                .expect("compare the stored vector");
+        assert!(
+            stored_matches,
+            "the stored vector is the statement's embedding"
+        );
+
+        let created_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+              WHERE event_type = 'claim.created' AND payload->>'claim_id' = $1::text",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("count claim.created events");
+        assert_eq!(
+            created_events, 1,
+            "the claim was created by a ClaimRepository writer (one claim.created event)"
+        );
     }
 
     /// Calibration: with the frame present every part is written, the VOI
