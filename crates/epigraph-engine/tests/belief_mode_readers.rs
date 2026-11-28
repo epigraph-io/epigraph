@@ -161,6 +161,8 @@ const ACTED_ON_BY: &[(&str, &[&str])] = &[
     (
         "contradict_compound_guard",
         &[
+            // Each AppState constructor, for `POST /api/v1/edges`.
+            "crates/epigraph-api/src/state.rs",
             // Each server constructor, for MCP `link_epistemic`.
             "crates/epigraph-mcp/src/server.rs",
         ],

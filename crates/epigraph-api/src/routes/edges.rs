@@ -672,6 +672,13 @@ pub struct CreateEdgeResponse {
     #[serde(flatten)]
     pub edge: EdgeResponse,
     pub owned_by_caller: bool,
+    /// Present only under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=warn` (the
+    /// default) for a `contradicts` / `refutes` edge onto a claim whose text
+    /// screens compound and that has no decomposition (backlog 73317662):
+    /// `{conjuncts, hint}`. The edge was written exactly as without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_contradiction_risk:
+        Option<epigraph_engine::contradiction_guard::PartialContradictionRisk>,
 }
 
 /// Request body for `PATCH /api/v1/edges/:id`.
@@ -901,6 +908,56 @@ pub async fn create_edge(
         }
     }
 
+    // EPIGRAPH_CONTRADICT_COMPOUND_GUARD (backlog 73317662, the MCP twin's
+    // b4c2fc2f): a `contradicts` / `refutes` edge onto a claim whose text
+    // asserts several things and that nobody has decomposed would dispute all
+    // of them at once. Decided after the existence checks above, on the
+    // target text the caller can read on this transaction (no existence
+    // oracle), and before any write. `refuse` answers 422 with nothing
+    // written; `warn` writes, reports the risk and, once the edge commits,
+    // logs the caller.
+    let partial_contradiction_risk = if request.target_type == "claim"
+        && epigraph_engine::contradiction_guard::is_contradiction(&request.relationship)
+    {
+        let target = epigraph_db::ClaimRepository::get_by_id(
+            &mut *tx,
+            &viewer,
+            epigraph_core::ClaimId::from_uuid(request.target_id),
+        )
+        .await?;
+        match target {
+            // Defensive: `entity_exists` just read it on this transaction.
+            None => None,
+            Some(target) => {
+                use epigraph_engine::contradiction_guard::{decide, ContradictionDecision};
+                match decide(
+                    &mut tx,
+                    &request.relationship,
+                    request.target_id,
+                    &target.content,
+                    state.contradict_compound_guard,
+                    "create_edge",
+                    auth.agent_id,
+                )
+                .await?
+                {
+                    ContradictionDecision::Unaffected => None,
+                    ContradictionDecision::Warn(risk) => Some(risk),
+                    ContradictionDecision::Refuse(risk) => {
+                        return Err(ApiError::refused_with(
+                            crate::errors::RefusalStatus::UnprocessableEntity,
+                            epigraph_engine::contradiction_guard::REFUSAL_CODE,
+                            risk.refusal(request.target_id),
+                            risk.refusal_data(request.target_id),
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // Branch on if_not_exists: drainer / outbox callers opt in to
     // (source_id, target_id, relationship) idempotency; the default path
     // preserves the post-migration-018 multi-emit semantics. Exception:
@@ -1036,6 +1093,10 @@ pub async fn create_edge(
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the edge: {e}"),
     })?;
+    // The edge has landed: only now does it count in the guard's journal.
+    if let Some(risk) = &partial_contradiction_risk {
+        risk.log_accepted("create_edge", auth.agent_id);
+    }
 
     // UNSCOPED, deliberately and counted (`no_unscoped_pool.rs`): the
     // provenance row below runs after the commit on the raw pool, as it did
@@ -1156,6 +1217,7 @@ pub async fn create_edge(
         Json(CreateEdgeResponse {
             edge: response,
             owned_by_caller,
+            partial_contradiction_risk,
         }),
     ))
 }
