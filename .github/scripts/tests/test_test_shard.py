@@ -148,7 +148,7 @@ class AffectedSelection(unittest.TestCase):
         self.assertNotIn("epigraph-core", kept["partial"])
 
     def test_python_outside_scripts_runs_no_shard(self):
-        d = pr_plan(["services/kanban/board.py", "tests/dedup/test_x.py", "tests/theme/conftest.py"])
+        d = pr_plan(["tools/kanban/board.py", "tests/dedup/test_x.py", "tests/theme/conftest.py"])
         self.assertEqual(d["ids"], [])
 
     def test_a_runbook_read_by_db_tests_runs_only_those_targets(self):
@@ -687,6 +687,16 @@ class Gate(unittest.TestCase):
         needs = self.needs(self.RUN_NONE, test_shard="skipped", something_new="skipped")
         self.assertTrue(ts.gate(needs))
 
+    def test_the_commit_message_lint_must_succeed(self):
+        # Outside the plan's run flags: a failed lint fails the gate, a
+        # successful one passes it, whatever the plan ran.
+        for run in (self.RUN_NONE, self.RUN_ALL):
+            ran = "success" if run is self.RUN_ALL else "skipped"
+            for lint, ok in (("success", True), ("failure", False), ("cancelled", False), ("skipped", False)):
+                needs = self.needs(run, test_shard=ran, test_extra=ran, lint_features=ran)
+                needs["commit-message-lint"] = {"result": lint, "outputs": {}}
+                self.assertEqual(ts.gate(needs) == [], ok, (run, lint))
+
 
 class Workflow(unittest.TestCase):
     """The job graph in ci.yml that the planner's outputs drive."""
@@ -753,7 +763,13 @@ class Workflow(unittest.TestCase):
     def test_the_gate_needs_plan_and_every_blocking_test_job(self):
         gate = self.jobs["test"]
         self.assertEqual(gate["if"], "${{ !cancelled() }}")
-        self.assertEqual(set(gate["needs"]), {"plan", "test-shard", "test-extra", "lint-features"})
+        # commit-message-lint is in it so that the required `test` check
+        # blocks a merge on an error-class message finding (backlog ad3001f9).
+        self.assertEqual(set(gate["needs"]),
+                         {"plan", "test-shard", "test-extra", "lint-features", "commit-message-lint"})
+        # It runs on every event (no `if:`), so the gate's "a job the plan
+        # does not gate must succeed" rule applies to it.
+        self.assertNotIn("if", self.jobs["commit-message-lint"])
         run = " ".join(s.get("run", "") for s in gate["steps"])
         self.assertIn("test-shard.py gate", run)
         env = [s for s in gate["steps"] if "run" in s][0]["env"]

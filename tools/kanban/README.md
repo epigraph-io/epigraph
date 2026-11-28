@@ -1,5 +1,7 @@
 # EpiGraph Kanban
 
+Developer tool for the backlog; not part of the shipped product. It lives under `tools/`, not `services/`: nothing deploys or packages it, and CI's `kanban` job only keeps its tests running.
+
 A local kanban board over the EpiGraph backlog. The cards are claims labelled `backlog` that are not labelled `resolved` and are current. You pick cards to develop, and the board starts a headless Claude Code **ultracode** agent for each one in its own git worktree. The agent opens a PR into a staging **integration branch** and flags blockers as it works. You review and accept. When the integration branch is ready, you ship it to `main` with one more PR, and the board retires the shipped backlog claims in EpiGraph.
 
 - `server.py`: backend. Uses only the Python 3.9 standard library and binds to `127.0.0.1` only.
@@ -10,8 +12,8 @@ A local kanban board over the EpiGraph backlog. The cards are claims labelled `b
 ## Run
 
 ```bash
-python3 services/kanban/server.py                 # port 8097, repo = git toplevel of cwd
-python3 services/kanban/server.py --port 8097 --repo ~/Projects/epigraph --no-refresh
+python3 tools/kanban/server.py                 # port 8097, repo = git toplevel of cwd
+python3 tools/kanban/server.py --port 8097 --repo ~/Projects/epigraph --no-refresh
 ```
 
 At startup the server prints a **single-use pairing link**, `http://127.0.0.1:8097/#pair=<code>`. Open it in the browser you will use. The page trades the code for a per-session secret, keeps that secret in the tab's `sessionStorage`, and clears the link from the address bar.
@@ -174,7 +176,7 @@ Every `/api/*` call needs the session secret in the `X-Kanban-Token` header. It 
 ## Tests
 
 ```bash
-cd services/kanban && python3 -m unittest discover -s tests -v
+cd tools/kanban && python3 -m unittest discover -s tests -v
 ```
 
 The tests create a temporary bare `origin` repo and a clone, plus stub `claude`/`gh` scripts. They then drive the full flow: import → develop → review (live blocker plus report blockers) → resolve blocker → accept → open integration PR → merge → shipped → backlog resolution. They also cover feedback/resume, reject, auth/Host/Origin rejection, 404, and 409. Security guards are tested separately:

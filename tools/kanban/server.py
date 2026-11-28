@@ -11,7 +11,7 @@ integration branch to main via one more PR -- a tree of PRs:
 
 Python 3.9 standard library only. Binds 127.0.0.1 only.
 
-    python3 services/kanban/server.py [--port 8097] [--repo PATH]
+    python3 tools/kanban/server.py [--port 8097] [--repo PATH]
 """
 
 import argparse

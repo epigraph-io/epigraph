@@ -347,6 +347,8 @@ enum CommitType {
     Perf,
     Docs,
     Chore,
+    /// Formatting only (rustfmt, whitespace): a one-line body, no sections.
+    Style,
     Unknown,
 }
 
@@ -361,6 +363,7 @@ impl CommitType {
             "perf" => Self::Perf,
             "docs" => Self::Docs,
             "chore" => Self::Chore,
+            "style" => Self::Style,
             _ => Self::Unknown,
         }
     }
@@ -371,7 +374,7 @@ impl CommitType {
             Self::Feat => "extraction",
             Self::Fix | Self::Refactor | Self::Security => "deductive",
             Self::Test | Self::Perf => "instrumental",
-            Self::Docs | Self::Chore | Self::Unknown => "heuristic",
+            Self::Docs | Self::Style | Self::Chore | Self::Unknown => "heuristic",
         }
     }
 
@@ -388,7 +391,7 @@ impl CommitType {
             Self::Fix | Self::Security => 0.7,
             Self::Test => 0.8,
             Self::Refactor => 0.5,
-            Self::Docs => 0.4,
+            Self::Docs | Self::Style => 0.4,
             Self::Chore => 0.3,
             Self::Perf => {
                 if has_verification {
@@ -413,6 +416,7 @@ impl std::fmt::Display for CommitType {
             Self::Perf => "perf",
             Self::Docs => "docs",
             Self::Chore => "chore",
+            Self::Style => "style",
             Self::Unknown => "unknown",
         };
         write!(f, "{s}")
@@ -3570,6 +3574,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_header_style_type() {
+        // `style` (formatting-only commits) is a protocol type of its own, with
+        // and without a scope, and maps the way `docs` does. Asserted through
+        // Display so the test also compiles where Style does not exist.
+        let (ct, scope, claim) = parse_header("style(api): rustfmt");
+        assert_eq!(ct.to_string(), "style");
+        assert_eq!(scope, "api");
+        assert_eq!(claim, "rustfmt");
+        let (ct, scope, claim) = parse_header("style: fmt");
+        assert_eq!(ct.to_string(), "style");
+        assert_eq!(scope, "");
+        assert_eq!(claim, "fmt");
+        assert_eq!(ct.methodology(), CommitType::Docs.methodology());
+        let docs_truth = CommitType::Docs.initial_truth(false);
+        assert!((ct.initial_truth(false) - docs_truth).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_parse_header_type_colon_unknown_type() {
         // An unknown type with colon format should still be Unknown
         let (ct, scope, claim) = parse_header("misc: random stuff");
@@ -3690,6 +3712,7 @@ fix(db): prevent SQL injection in claim search
         assert_eq!(CommitType::from_str("perf"), CommitType::Perf);
         assert_eq!(CommitType::from_str("docs"), CommitType::Docs);
         assert_eq!(CommitType::from_str("chore"), CommitType::Chore);
+        assert_eq!(CommitType::from_str("style"), CommitType::Style);
         assert_eq!(CommitType::from_str("anything_else"), CommitType::Unknown);
     }
 

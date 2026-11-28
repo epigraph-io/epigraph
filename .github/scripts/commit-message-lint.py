@@ -23,7 +23,8 @@ or all zeros) and reports per commit. ERRORS fail the run (exit 1):
      deny-list of customer names would publish them.
 WARNINGS never change the exit status: W2 a subject outside
 `<type>(<scope>)?: <text>`, W3 none of the Evidence/Reasoning/Verification
-sections. Offending values are NEVER printed (public CI logs): each finding is
+sections (not reported for a `style` commit: formatting only, whose body is
+one line; E4 and E5 still apply to it). Offending values are NEVER printed (public CI logs): each finding is
 redacted, and a subject that itself holds an error is withheld. Run from the
 repository root.
 
@@ -77,9 +78,13 @@ IPV4_RE = re.compile(r"(?<![0-9.])([0-9]{1,3}(?:\.[0-9]{1,3}){3})(?![0-9]|\.[0-9
 # RFC 5737 documentation blocks, allowed in messages.
 DOC_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
 # Subject shape of the Epistemic Commit Protocol.
-SUBJECT_RE = re.compile(r"^(feat|fix|refactor|perf|test|docs|chore|security)(\([^)\s][^)]*\))?: \S")
+SUBJECT_RE = re.compile(r"^(feat|fix|refactor|perf|test|docs|chore|security|style)(\([^)\s][^)]*\))?: \S")
 # Subjects exempt from W2.
-SUBJECT_EXEMPT = ("Merge ", "Revert ", "merge(", "style(")
+SUBJECT_EXEMPT = ("Merge ", "Revert ", "merge(")
+# Types whose body is one line and carries none of the three sections (no W3):
+# `style` is a formatting-only change (rustfmt, whitespace) with no claim to
+# give evidence for.
+NO_SECTION_TYPES = {"style"}
 # The three protocol sections, as they appear in a message body.
 SECTIONS = ("**Evidence:**", "**Reasoning:**", "**Verification:**")
 # Phrases that say a verification was not actually performed.
@@ -246,9 +251,11 @@ def lint(subject, message):
     warnings = []
     if verification_not_run(message) and not UNVERIFIED_RE.search(message):
         errors.append(("E4", "Verification records something not run and the message has no Unverified: line"))
-    if not subject.startswith(SUBJECT_EXEMPT) and not SUBJECT_RE.match(subject):
+    subject_m = SUBJECT_RE.match(subject)
+    if not subject.startswith(SUBJECT_EXEMPT) and not subject_m:
         warnings.append(("W2", "subject does not match <type>(<scope>)?: <text>"))
-    if not any(s in message for s in SECTIONS):
+    sectionless = subject_m is not None and subject_m.group(1) in NO_SECTION_TYPES
+    if not sectionless and not any(s in message for s in SECTIONS):
         warnings.append(("W3", "none of the Evidence/Reasoning/Verification sections"))
     return errors, warnings
 
