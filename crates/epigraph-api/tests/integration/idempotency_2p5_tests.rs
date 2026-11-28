@@ -23,7 +23,6 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use epigraph_api::middleware::SignatureVerificationState;
 use epigraph_api::{create_router, ApiConfig, AppState};
 use epigraph_core::{Agent, ClaimId, TruthValue};
 use epigraph_db::{AgentRepository, ClaimRepository, PgPool};
@@ -84,8 +83,7 @@ fn create_test_router(pool: PgPool) -> Router {
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
     };
-    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-    let state = AppState::with_db_and_signature_state(pool, config, signature_state);
+    let state = AppState::with_db(pool, config);
     create_router(state)
 }
 
@@ -160,9 +158,7 @@ async fn create_agent_is_idempotent_on_public_key(pool: PgPool) {
             public_base_url: "http://localhost:8080".to_string(),
             ..ApiConfig::default()
         };
-        let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-        let mut state =
-            AppState::with_db_and_signature_state(pool.clone(), config, signature_state);
+        let mut state = AppState::with_db(pool.clone(), config);
         state.scoped = Some(
             epigraph_db::ScopedPool::connect(
                 &fixture::database_url_for(&pool).await,
@@ -716,11 +712,9 @@ fn create_test_router_with_embedder(pool: PgPool) -> Router {
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
     };
-    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
     let service: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::local(1536)));
-    let state = AppState::with_db_and_signature_state(pool, config, signature_state)
-        .with_embedding_service(service);
+    let state = AppState::with_db(pool, config).with_embedding_service(service);
     create_router(state)
 }
 

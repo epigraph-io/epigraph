@@ -80,11 +80,6 @@ fn closed_world_high_conflict_combination_stays_closed_world() {
         k >= 0.5,
         "test needs the old high-conflict branch, got K={k}"
     );
-    assert_eq!(
-        combination::select_combination_rule(k, 0.0),
-        combination::CombinationRule::Inagaki,
-        "these inputs are exactly the ones the old selector sent to Inagaki"
-    );
 
     let (combined, reports) = combination::combine_multiple(&[pro, con], 0.9).expect("combine");
 

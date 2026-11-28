@@ -3,7 +3,6 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::Router;
-use epigraph_api::middleware::SignatureVerificationState;
 use epigraph_api::{create_router, ApiConfig, AppState};
 use http_body_util::BodyExt;
 use serde::Deserialize;
@@ -28,8 +27,7 @@ async fn create_test_router(pool: PgPool) -> Router {
     )
     .await
     .expect("ScopedPool over the test database");
-    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-    let mut state = AppState::with_db_and_signature_state(pool, config, signature_state);
+    let mut state = AppState::with_db(pool, config);
     state.scoped = Some(scoped);
     create_router(state)
 }

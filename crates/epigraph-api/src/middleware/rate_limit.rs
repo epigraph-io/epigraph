@@ -185,20 +185,12 @@ fn client_ip(request: &Request<Body>, trusted: &TrustedProxies) -> Option<IpAddr
 ///    middleware INSIDE `bearer_auth_middleware` (protected router) and
 ///    `optional_bearer_auth_middleware` (anonymous allowlist), so a token
 ///    presented there is already verified when this runs.
-/// 2. A `VerifiedAgent` (Ed25519-signed request), where a router installs
-///    `signature_verification_middleware`; no production router does.
-/// 3. The client address ([`client_ip`]).
+/// 2. The client address ([`client_ip`]).
 ///
 /// `None` when none of these is available.
 fn rate_limit_key(request: &Request<Body>, trusted: &TrustedProxies) -> Option<AgentId> {
     if let Some(auth) = request.extensions().get::<AuthContext>() {
         return Some(AgentId::from_uuid(auth.agent_id.unwrap_or(auth.client_id)));
-    }
-    if let Some(agent) = request
-        .extensions()
-        .get::<crate::middleware::VerifiedAgent>()
-    {
-        return Some(agent.agent_id);
     }
     client_ip(request, trusted).map(ip_to_agent_id)
 }
