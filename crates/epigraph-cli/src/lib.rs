@@ -27,6 +27,8 @@ pub mod bridge;
 #[cfg(feature = "db")]
 pub mod cache_owner_audit;
 pub mod contamination_split;
+#[cfg(feature = "db")]
+pub mod cross_source_recent;
 pub mod decompose;
 #[cfg(feature = "db")]
 pub mod decomposes_to_factor_sweep;

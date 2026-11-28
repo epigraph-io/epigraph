@@ -30,7 +30,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-cli/src/backfill_factors.rs", "rewire_one", 1, "SPEC §4.1 W8: rewire restamps an edge BBA's tenancy columns; masses untouched"),
     ("crates/epigraph-cli/src/edge_rewire.rs", "restore_edge_rows_batched", 1, "R-176(2) class E rollback: compare-and-swap of a targeted rewire's rows back to their recorded pre-image (masses, typing, created_at), only where the row is live and still holds what the rewire wrote; the rewire wrote no compound-ended edge, so neither does this"),
     ("crates/epigraph-cli/src/k10_retro.rs", "const RESTORE_ROW_SQL", 1, "K10(3) retro sweep undo (OD-10; R-178(2), R-179): re-inserts a row the sweep deleted from its stored to_jsonb image, only where its id and its upsert key are free; the sweep deleted only live rows off retired sources, so the undo writes back exactly those"),
-    ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", 1, "SPEC §4.1 W13: raw INSERT of bootstrap BBAs; PR-W4"),
     ("crates/epigraph-cli/src/bin/experiment.rs", "analyze", 1, "SPEC §4.1 W13: CLI experiment outcome BBA; PR-W4"),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", 1, "SPEC §4.1 W13: CLI hypothesis prior BBA; PR-W4"),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "promote", 1, "SPEC §4.1 W13: CLI copy_to_frame on promotion; PR-W4"),
@@ -306,8 +305,8 @@ def rescale(cur, factor):
     );
 }
 
-/// A raw `INSERT INTO mass_functions` in Rust source fails, as `bin/dekg.rs`
-/// would if it were new.
+/// A raw `INSERT INTO mass_functions` in Rust source fails, as the removed
+/// `dekg migrate` bootstrap verb's insert would if it were added back.
 #[test]
 fn a_raw_mass_functions_insert_in_rust_src_fails() {
     let path = "crates/epigraph-cli/src/bin/scratch_bba_import.rs";
@@ -351,7 +350,10 @@ fn the_spec_named_writers_are_measured() {
         "crates/epigraph-api/src/routes/assess.rs",
         "crates/epigraph-cli/src/bin/hypothesis.rs",
         "crates/epigraph-cli/src/bin/experiment.rs",
-        "crates/epigraph-cli/src/bin/dekg.rs",
+        // SPEC §4.1 W13 also names `crates/epigraph-cli/src/bin/dekg.rs`.
+        // Its only BBA write was the `dekg migrate` bootstrap verb's raw
+        // INSERT, which named columns `mass_functions` does not have; the
+        // verb was removed (backlog e750f605), so the file writes nothing now.
         "crates/epigraph-engine/src/edge_factor.rs",
         "crates/epigraph-mcp/src/tools/ds.rs",
         "crates/epigraph-mcp/src/tools/ds_auto.rs",

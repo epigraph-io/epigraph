@@ -5,12 +5,21 @@
 //! promotions, and stamps `claims.last_match_scan_at` so the next sweep
 //! advances. Output is a single JSON line on stdout, easy to feed into
 //! scheduled-job logs.
+//!
+//! `--recent` (backlog efc1d318) switches the seed selection to the post-write
+//! drain: current, never-scanned, embedded, non-status claims created within
+//! `--window` (default one day) that pass the matcher's eligibility gate,
+//! oldest first, capped by `--limit` (alias `--cap`). The
+//! matcher run and the stamp are the default sweep's own, see
+//! `epigraph_cli::cross_source_recent`.
 
 use async_trait::async_trait;
 use clap::Parser;
+use epigraph_cli::cross_source_recent::{
+    parse_window, select_recent_seeds, sweep_seeds, SweepInputs, DEFAULT_WINDOW,
+};
 use epigraph_cli::matching_client::RerankBridgesClient;
 use epigraph_engine::matching::calibration::MatcherConfig;
-use epigraph_engine::matching::pipeline::{run_pipeline, RunInputs};
 use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
 use uuid::Uuid;
 
@@ -53,9 +62,24 @@ impl VerifierClient for CountOnlyVerifier {
     about = "Sweep claims for cross-source matches and (optionally) promote them"
 )]
 struct Args {
-    /// Maximum number of seed claims to scan in this sweep.
-    #[arg(long, default_value_t = 200)]
+    /// Maximum number of seed claims to scan in this sweep (also the
+    /// `--recent` cap).
+    #[arg(long, alias = "cap", default_value_t = 200)]
     limit: i64,
+
+    /// Post-write drain mode: scan only current claims that have never been
+    /// scanned (`last_match_scan_at IS NULL`), were created within `--window`,
+    /// have an embedding, carry no status label (`status`, `telemetry` and the
+    /// novelty gate's status-claim labels) and pass the matcher's eligibility
+    /// gate (`[matcher.eligibility]`), oldest first. Same matcher, verifier, policy and
+    /// stamping as the default sweep.
+    #[arg(long)]
+    recent: bool,
+
+    /// How far back `--recent` looks: `<N>d`, `<N>h` or `<N>m`. Ignored
+    /// without `--recent`.
+    #[arg(long, default_value = DEFAULT_WINDOW, value_parser = parse_window)]
+    window: std::time::Duration,
 
     /// Run the pipeline without writing CORROBORATES edges. Match-candidate
     /// rows are still written so admins can review.
@@ -139,20 +163,29 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Pick seeds: claims never scanned, or scanned more than 7 days ago.
-    // Bias toward recent claims so newly-ingested material gets attention
-    // first — the older-and-unscanned tail can wait for a backfill pass.
-    let seeds: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM claims
+    let seeds: Vec<Uuid> = if args.recent {
+        // The post-write drain (efc1d318): never-scanned, embedded claims
+        // from the window, status claims and claims the matcher's
+        // eligibility gate would drop excluded. A claim that ages out of the
+        // window unscanned keeps its NULL stamp, so the default sweep below
+        // still reaches it.
+        select_recent_seeds(&pool, args.window, args.limit, &cfg.eligibility).await?
+    } else {
+        // Pick seeds: claims never scanned, or scanned more than 7 days ago.
+        // Bias toward recent claims so newly-ingested material gets attention
+        // first — the older-and-unscanned tail can wait for a backfill pass.
+        sqlx::query_scalar(
+            "SELECT id FROM claims
          WHERE COALESCE(is_current, true) = true
            AND (last_match_scan_at IS NULL
                 OR last_match_scan_at < now() - INTERVAL '7 days')
          ORDER BY created_at DESC
          LIMIT $1",
-    )
-    .bind(args.limit)
-    .fetch_all(&pool)
-    .await?;
+        )
+        .bind(args.limit)
+        .fetch_all(&pool)
+        .await?
+    };
 
     let seed_count = seeds.len();
     let verifier: Box<dyn VerifierClient> = if args.count_only {
@@ -176,30 +209,24 @@ async fn main() -> anyhow::Result<()> {
             (None, false) => "off (OPENAI_API_KEY unset)",
         }
     );
-    let report = run_pipeline(
-        &pool,
-        RunInputs {
-            seeds: seeds.clone(),
-            cfg,
-            verifier,
-            auto_promote,
-            probe_embedder,
-        },
-    )
-    .await?;
-
     // Stamp the seed window so the next sweep moves forward, regardless of
     // whether we applied. Skipping this on --dry-run would put the sweep in
     // a loop re-scanning the same seeds.
     // EXCEPT for --count-only: that's an analysis run, not a real sweep, and
     // stamping would skip the picked claims from the next legitimate sweep
     // for 7 days.
-    if !seeds.is_empty() && !args.count_only {
-        sqlx::query("UPDATE claims SET last_match_scan_at = now() WHERE id = ANY($1)")
-            .bind(&seeds)
-            .execute(&pool)
-            .await?;
-    }
+    let report = sweep_seeds(
+        &pool,
+        &seeds,
+        SweepInputs {
+            cfg,
+            verifier,
+            auto_promote,
+            probe_embedder,
+            stamp: !args.count_only,
+        },
+    )
+    .await?;
 
     println!(
         "{}",
@@ -246,6 +273,8 @@ async fn main() -> anyhow::Result<()> {
             "skipped_no_verdict": report.skipped_no_verdict,
             "apply":         auto_promote,
             "count_only":    args.count_only,
+            "recent":        args.recent,
+            "window_secs":   args.recent.then_some(args.window.as_secs()),
         })
     );
     Ok(())

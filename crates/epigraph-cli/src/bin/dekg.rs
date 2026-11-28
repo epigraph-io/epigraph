@@ -287,15 +287,6 @@ enum MigrateCmd {
         #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
         db_url: String,
     },
-    /// Re-create mass functions from truth_value for claims without BBAs
-    BootstrapMasses {
-        /// Database URL (overrides DATABASE_URL env var)
-        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
-        db_url: String,
-        /// Confidence scaling factor for mass assignment
-        #[arg(long, default_value = "0.7")]
-        confidence_scale: f64,
-    },
     /// Report agent statistics
     ExtractAgents {
         /// Database URL (overrides DATABASE_URL env var)
@@ -937,16 +928,16 @@ async fn handle_community(client: &Client, base: &str, action: CommunityCmd) -> 
 // MIGRATE HANDLERS (direct DB connection)
 // =============================================================================
 
-/// The one pool constructor the five `dekg migrate` subcommands share.
+/// The one pool constructor the four `dekg migrate` subcommands share.
 ///
-/// Every one of them is a corpus-wide integrity check or a bulk write
-/// (`bootstrap-masses`, `materialize-edges`, `auto-frames`), so all five are
-/// maintenance work in the sense `epigraph_cli::MaintenancePool` documents.
-/// Before PR-15 each spelled its own `sqlx::PgPool::connect(&db_url)`, which
-/// made this file the workspace's worst instance of the "second, unconverted
-/// pool construction" failure — converting four of five would have read green.
-/// One function, five call sites, and
-/// `crates/epigraph-db/tests/no_unmaintained_dsn.rs` fails if a sixth
+/// Every one of them is a corpus-wide integrity check or report (`validate`,
+/// `extract-agents`) or a bulk write (`materialize-edges`, `create-frames`), so
+/// all four are maintenance work in the sense `epigraph_cli::MaintenancePool`
+/// documents. Before PR-15 each spelled its own
+/// `sqlx::PgPool::connect(&db_url)`, which made this file the workspace's worst
+/// instance of the "second, unconverted pool construction" failure — converting
+/// all but one would have read green. One function, four call sites, and
+/// `crates/epigraph-db/tests/no_unmaintained_dsn.rs` fails if a second
 /// construction reappears.
 ///
 /// `MaintenancePool` is not held past this call: the `db_url` argument is the
@@ -1053,89 +1044,6 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
             if !all_ok {
                 std::process::exit(1);
             }
-        }
-
-        MigrateCmd::BootstrapMasses {
-            db_url,
-            confidence_scale,
-        } => {
-            let pool = migrate_pool(&db_url).await?;
-
-            println!("Bootstrapping mass functions (confidence_scale={confidence_scale})...\n");
-
-            // Find claims that have a frame assignment but no mass function
-            let claims_needing_bba: Vec<(Uuid, Uuid, f64)> = sqlx::query_as(
-                r#"
-                SELECT cf.claim_id, cf.frame_id, c.truth_value
-                FROM claim_frames cf
-                JOIN claims c ON c.id = cf.claim_id
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM mass_functions mf
-                    WHERE mf.claim_id = cf.claim_id AND mf.frame_id = cf.frame_id
-                )
-                "#,
-            )
-            .fetch_all(&pool)
-            .await
-            .context("Failed to query claims needing BBAs")?;
-
-            if claims_needing_bba.is_empty() {
-                println!("  No claims need bootstrapping. All have mass functions.");
-                return Ok(());
-            }
-
-            println!(
-                "  Found {} claim-frame pairs needing bootstrap",
-                claims_needing_bba.len()
-            );
-
-            let mut created = 0u64;
-            for (claim_id, frame_id, truth_value) in &claims_needing_bba {
-                let mass_h = truth_value * confidence_scale;
-                let mass_theta = 1.0 - mass_h;
-
-                // Get hypothesis count to build proper Θ key. `frames.hypotheses`
-                // is `text[]`, so the arity is `array_length`; the earlier
-                // `jsonb_array_length` was refused by Postgres on every call and
-                // an `unwrap_or((2,))` turned that into a binary Θ for every
-                // frame. A lookup that fails now stops the run: a Θ key built
-                // for the wrong arity is a wrong mass function.
-                let hyp_count: (i32,) =
-                    sqlx::query_as("SELECT array_length(hypotheses, 1) FROM frames WHERE id = $1")
-                        .bind(frame_id)
-                        .fetch_one(&pool)
-                        .await
-                        .with_context(|| format!("Failed to read arity of frame {frame_id}"))?;
-
-                let theta_key: String = (0..hyp_count.0)
-                    .map(|i| i.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let masses = serde_json::json!({
-                    "0": mass_h,
-                    theta_key: mass_theta,
-                });
-
-                let inserted = sqlx::query(
-                    r#"
-                    INSERT INTO mass_functions (claim_id, frame_id, masses, source_type, source_label)
-                    VALUES ($1, $2, $3, 'bootstrap', 'dekg migrate bootstrap-masses')
-                    ON CONFLICT DO NOTHING
-                    "#
-                )
-                .bind(claim_id)
-                .bind(frame_id)
-                .bind(&masses)
-                .execute(&pool)
-                .await
-                .context("Failed to insert mass function")?;
-
-                // Rows written, not rows attempted: a conflicting row is skipped
-                // by ON CONFLICT DO NOTHING and must not be reported as created.
-                created += inserted.rows_affected();
-            }
-            println!("  Created {} mass functions", created);
         }
 
         MigrateCmd::ExtractAgents { db_url } => {
@@ -1651,28 +1559,47 @@ mod tests {
         ));
     }
 
+    /// Backlog e750f605: the mass-bootstrap migrate verb is removed. Its handler
+    /// inserted into `mass_functions` with `source_type` and `source_label`
+    /// columns that table has never had, so it failed at its first insert on
+    /// every database. Removed rather than repaired, it must neither parse nor
+    /// be listed by `dekg migrate --help`.
+    ///
+    /// The verb is spelled in pieces so a `git grep` for it finds no live
+    /// reference anywhere in the tree.
     #[test]
-    fn cli_parses_migrate_bootstrap_masses() {
-        let cli = Cli::try_parse_from([
+    fn cli_rejects_removed_migrate_bootstrap_verb() {
+        const REMOVED_VERB: &str = concat!("bootstrap", "-", "masses");
+
+        let parsed = Cli::try_parse_from([
             "dekg",
             "migrate",
-            "bootstrap-masses",
+            REMOVED_VERB,
             "--db-url",
             "postgres://localhost/test",
-            "--confidence-scale",
-            "0.8",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Migrate {
-                action:
-                    MigrateCmd::BootstrapMasses {
-                        confidence_scale, ..
-                    },
-            } => {
-                assert!((confidence_scale - 0.8).abs() < f64::EPSILON);
-            }
-            _ => panic!("Expected BootstrapMasses"),
+        ]);
+        assert!(
+            parsed.is_err(),
+            "`dekg migrate {REMOVED_VERB}` must no longer parse"
+        );
+
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let migrate = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "migrate")
+            .expect("`dekg migrate` exists");
+        let verbs: Vec<&str> = migrate.get_subcommands().map(|c| c.get_name()).collect();
+        assert!(
+            !verbs.contains(&REMOVED_VERB),
+            "`dekg migrate --help` must not list {REMOVED_VERB}: {verbs:?}"
+        );
+        for kept in [
+            "validate",
+            "extract-agents",
+            "materialize-edges",
+            "create-frames",
+        ] {
+            assert!(verbs.contains(&kept), "{kept} is still listed: {verbs:?}");
         }
     }
 
