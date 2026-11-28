@@ -2114,6 +2114,47 @@ pub async fn update_with_evidence(
                 .to_string(),
         );
     }
+    // The refuting counterpart (backlog b191f198). A refute is not clamped
+    // (that would write a value no fold of the BBAs gives), so its result can
+    // land ABOVE the prior: the fold re-reads every stored two-hypothesis BBA,
+    // and a prior below their fold (a stale cache, or one carried from a
+    // frame this fold does not read) is replaced by it. Without this note a
+    // refute read as raising belief, with no word on why.
+    if !params.supports && ds.pignistic_prob > pre_belief {
+        // With no cache the prior was `truth_value`, seeded as a BBA bounded
+        // to the profile's seed range, so the cause named differs.
+        let cause = if pre_pignistic.is_some() {
+            "the pre-call cached value was below the fold of the BBAs already stored (a \
+             stale cache, or one carried from another frame)"
+        } else {
+            "the claim had no cached belief, so the prior was its truth_value, which the \
+             fold reads as a seed BBA bounded to the belief profile's truth_seed_min / \
+             truth_seed_max, together with any BBAs already stored: the bound or those \
+             BBAs put the fold above it"
+        };
+        warnings.push(format!(
+            "Refuting evidence left belief above the claim's pre-call belief: pignistic_prob \
+             is {} after this call, above {pre_belief} before it (pignistic_before, or \
+             truth_before when the claim had no cached belief). This call re-folded every \
+             stored two-hypothesis BBA of the claim, and {cause}. The refute's own BBA is \
+             mass_function_id.",
+            ds.pignistic_prob
+        ));
+    }
+    // The same symptom on the claim ROW (backlog b191f198 review): a claim's
+    // `truth_value` can lag its cache (a non-owner attach refolds the cache and
+    // never writes `truth_value`, migration 114). An owner's refute that lowers
+    // BetP below the cache still writes `truth_value` UP to that BetP, which
+    // the check above cannot see. With no cache the prior IS `truth_value`, so
+    // the check above already covers it; a non-owner never writes it.
+    if !params.supports && pre_pignistic.is_some() && after_truth.value() > before {
+        warnings.push(format!(
+            "Refuting evidence raised truth_value from {before} to {}: the claim's \
+             truth_value lagged its cached belief (pignistic_before), and an update writes \
+             truth_value from the refolded pignistic_prob, not from truth_before.",
+            after_truth.value()
+        ));
+    }
     // Migration 114: a non-owner refreshes a claim's cached belief only on the
     // frame the cache already carries, and seeds one only on `binary_truth`
     // when the claim has no cache at all. When that refused the write, the
@@ -2181,6 +2222,7 @@ pub async fn update_with_evidence(
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
+        pignistic_before: pre_pignistic,
         truth_after: after_truth.value(),
         truth_written: !foreign_claim,
         evidence_owner: if foreign_claim {
@@ -2189,6 +2231,7 @@ pub async fn update_with_evidence(
             "claim_owner"
         },
         evidence_id: evidence.id.as_uuid().to_string(),
+        mass_function_id: ds.mass_function_id.to_string(),
         belief_wired: true,
         bba_stored: true,
         cache_written: ds.cache_written,

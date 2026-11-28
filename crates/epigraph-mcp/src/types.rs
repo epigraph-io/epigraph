@@ -2073,7 +2073,17 @@ pub struct VerifyResponse {
 #[derive(Debug, Serialize)]
 pub struct UpdateResponse {
     pub claim_id: String,
+    /// The claim's `truth_value` before this call. It can differ from the
+    /// cached belief the update folds against; see [`Self::pignistic_before`].
     pub truth_before: f64,
+    /// The claim's cached `pignistic_prob` before this call, `null` when it
+    /// had none (backlog b191f198). This, not `truth_before`, is the prior the
+    /// monotonicity clamp and the direction warnings compare `pignistic_prob`
+    /// against (with `truth_before` standing in when it is `null`), so
+    /// `pignistic_before -> pignistic_prob` is the movement this call made to
+    /// the cached belief. `truth_before -> truth_after` can show a different
+    /// movement when the `truth_value` and the cache had diverged.
+    pub pignistic_before: Option<f64>,
     /// The claim's `truth_value` after this call. Equal to `truth_before` when
     /// [`Self::truth_written`] is `false`.
     pub truth_after: f64,
@@ -2090,6 +2100,17 @@ pub struct UpdateResponse {
     /// caller's own group (migration 114).
     pub evidence_owner: &'static str,
     pub evidence_id: String,
+    /// The `mass_functions` row id of the BBA this call stored for its
+    /// evidence (backlog b191f198): the id `retract_bba` takes, which
+    /// `evidence_id` is not. Retracting it marks this call's BBA retracted
+    /// and offers the claim's cache a refold from the BBAs left; it does not
+    /// restore `truth_before`. The cache takes that refold only under
+    /// migration 114's non-owner rule, as it took this call's write, so after
+    /// a retract on a claim you do not write the cached belief can still
+    /// include this BBA's effect until a recompute. On a claim's first update
+    /// the call may also store a `truth_value_seed` BBA (whose pignistic
+    /// probability is the claim's `truth_value`); that row is not this id.
+    pub mass_function_id: String,
     /// Whether the Dempster-Shafer wiring for this submission landed. Always
     /// `true` in a response.
     ///
@@ -2171,7 +2192,13 @@ pub struct UpdateResponse {
     /// (the claim's prior sits above the plausibility its stored BBAs allow, so
     /// the monotonicity clamp yields to that bound; this is mathematically
     /// correct Dempster-Shafer combination, and the warning exists so callers
-    /// don't mistake it for a bug), when [`Self::cache_written`] is `false`,
+    /// don't mistake it for a bug), when refuting evidence left it ABOVE the
+    /// pre-call prior ([`Self::pignistic_before`], else `truth_before`: the
+    /// prior was below the fold of the claim's stored BBAs, which this call
+    /// re-folded; backlog b191f198), when refuting evidence wrote
+    /// `truth_value` UP (it lagged the cached belief, so `truth_after` can be
+    /// above `truth_before` even when `pignistic_prob` went down), when
+    /// [`Self::cache_written`] is `false`,
     /// and for each of [`Self::fold_pignistic_prob`],
     /// [`Self::cache_repointed_from`] and [`Self::cache_owner_frame_id`] that
     /// is present. Several notes are joined by a space.
