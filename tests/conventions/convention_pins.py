@@ -372,4 +372,24 @@ PINS: tuple[Pin, ...] = (
         ),
         incident="40cdb432",
     ),
+    # --- PR body freshness and first-parent bisect -------------------------
+    Pin(
+        id="pr-template-body-matches-final-commits",
+        file=".github/pull_request_template.md",
+        section_start="## Checklist",
+        section_end=None,
+        needle=(
+            "After each review round, the PR body was updated to match the "
+            "final commits (no stale claims)"
+        ),
+        incident="e0a1cce5",
+    ),
+    Pin(
+        id="bisect-main-with-first-parent",
+        file="docs/conventions/git-history.md",
+        section_start="## Bisecting main",
+        section_end=None,
+        needle="bisect `main` with `git bisect start --first-parent`",
+        incident="e0a1cce5",
+    ),
 )
