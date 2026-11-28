@@ -363,3 +363,126 @@ async fn a_non_finite_confidence_is_refused_and_writes_nothing(pool: PgPool) {
         );
     }
 }
+
+/// The batch returns one id per item IN REQUEST ORDER, and each id is the row
+/// built from that item (backlog 591b2f6f: the rows are now written by one
+/// statement instead of one round trip each). Items alternate between two
+/// claims and every field that varies is checked against the row its id names,
+/// so a statement that returns ids in table, claim or id order is caught.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_batch_returns_its_ids_in_request_order(pool: PgPool) {
+    let (caller, cg) = seed_agent_with_group(&pool, "591-caller").await;
+    let c1 = claim_of(&pool, caller, cg).await;
+    let c2 = claim_of(&pool, caller, cg).await;
+    let e = entity(&pool).await;
+    let object = entity(&pool).await;
+    let app = app(&pool).await;
+
+    let mut items = Vec::new();
+    for i in 0..6usize {
+        let claim = if i % 2 == 0 { c2 } else { c1 };
+        let mut t = triple_json(claim, e, 0.1 * (6 - i) as f64, &format!("t{i}"));
+        if i == 3 {
+            t["object_literal"] = serde_json::Value::Null;
+            t["object_id"] = serde_json::json!(object);
+            t["properties"] = serde_json::json!({ "n": i });
+        }
+        items.push(t);
+    }
+    let (status, body) = post_triples(&app, caller, items.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    let ids: Vec<Uuid> = serde_json::from_value(body["ids"].clone()).expect("ids");
+    assert_eq!(ids.len(), items.len(), "{body}");
+    for (i, (id, item)) in ids.iter().zip(&items).enumerate() {
+        let (claim, literal, object_id, confidence, properties): (
+            Uuid,
+            Option<String>,
+            Option<Uuid>,
+            f64,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT claim_id, object_literal, object_id, confidence, properties \
+             FROM triples WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("triple {i} ({id}) not found: {e}"));
+        assert_eq!(
+            claim.to_string(),
+            item["claim_id"].as_str().unwrap(),
+            "item {i}"
+        );
+        assert_eq!(
+            literal.as_deref(),
+            item["object_literal"].as_str(),
+            "item {i}"
+        );
+        assert_eq!(
+            object_id.map(|o| o.to_string()).as_deref(),
+            item["object_id"].as_str(),
+            "item {i}"
+        );
+        assert_eq!(confidence, item["confidence"].as_f64().unwrap(), "item {i}");
+        let want_props = item
+            .get("properties")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        assert_eq!(properties, want_props, "item {i}");
+    }
+
+    let mut items = Vec::new();
+    for i in 0..6usize {
+        let claim = if i % 2 == 0 { c1 } else { c2 };
+        let mut m = mention_json(claim, e, 0.1 * i as f64, &format!("m{i}"));
+        if i % 3 == 1 {
+            m["span_start"] = serde_json::json!(i as i32);
+            m["span_end"] = serde_json::json!(i as i32 + 10);
+            m["mention_role"] = serde_json::json!("object");
+        }
+        items.push(m);
+    }
+    let (status, body) = post_mentions(&app, caller, items.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    let ids: Vec<Uuid> = serde_json::from_value(body["ids"].clone()).expect("ids");
+    assert_eq!(ids.len(), items.len(), "{body}");
+    for (i, (id, item)) in ids.iter().zip(&items).enumerate() {
+        let (claim, surface, role, confidence, span_start, span_end): (
+            Uuid,
+            String,
+            String,
+            f64,
+            Option<i32>,
+            Option<i32>,
+        ) = sqlx::query_as(
+            "SELECT claim_id, surface_form, mention_role::text, confidence, span_start, span_end \
+             FROM entity_mentions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("mention {i} ({id}) not found: {e}"));
+        assert_eq!(
+            claim.to_string(),
+            item["claim_id"].as_str().unwrap(),
+            "item {i}"
+        );
+        assert_eq!(surface, item["surface_form"].as_str().unwrap(), "item {i}");
+        assert_eq!(role, item["mention_role"].as_str().unwrap(), "item {i}");
+        assert_eq!(confidence, item["confidence"].as_f64().unwrap(), "item {i}");
+        assert_eq!(
+            span_start,
+            item.get("span_start")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32),
+            "item {i}"
+        );
+        assert_eq!(
+            span_end,
+            item.get("span_end")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32),
+            "item {i}"
+        );
+    }
+}
