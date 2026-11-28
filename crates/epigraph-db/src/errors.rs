@@ -341,9 +341,36 @@ impl From<sqlx::Error> for DbError {
             },
             // 23503. Kept alongside the unique-violation arm so every repo gets
             // the classification for free; without it a bad FK is a 500.
+            //
+            // A DESIGNED 23503 refusal whose message opens with a listed
+            // caller-refusal code (migration 359's TEN04: a derived row whose
+            // claim_id names no claim) is the caller's input refusal (HTTP
+            // 400, the MCP tool error) carrying its reviewed message; the
+            // SQLSTATE stays in the foreign-key class. An uncoded 23503 (a
+            // real FK constraint, or an arm left uncoded because its text
+            // would tell a missing row from a hidden one) stays
+            // `ForeignKeyViolation`, which routes match on.
             sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
-                Self::ForeignKeyViolation {
-                    constraint: db_err.constraint().unwrap_or("<unnamed>").to_string(),
+                if crate::refusal_codes::caller_refusal_code(db_err.message()).is_some() {
+                    // DETAIL is what the reply withholds (TEN04 moved the
+                    // claim id there), and `Refused` carries only the
+                    // message, so the server log keeps it here.
+                    let db_detail = db_err
+                        .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                        .and_then(sqlx::postgres::PgDatabaseError::detail);
+                    tracing::warn!(
+                        detail = %db_err.message(),
+                        db_detail = ?db_detail,
+                        "the database refused the request (a coded 23503)"
+                    );
+                    Self::Refused {
+                        kind: RefusalKind::Input,
+                        message: db_err.message().to_string(),
+                    }
+                } else {
+                    Self::ForeignKeyViolation {
+                        constraint: db_err.constraint().unwrap_or("<unnamed>").to_string(),
+                    }
                 }
             }
             // 23514. `sqlx` has no `is_check_violation()` helper, so the code

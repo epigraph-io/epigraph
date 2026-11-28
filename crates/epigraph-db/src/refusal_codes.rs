@@ -35,8 +35,10 @@
 //! discloses (`From<DbError> for ApiError`): an older coded refusal whose text
 //! nobody reviewed for the HTTP body stays the redacted 500.
 //!
-//! `tests/caller_refusal_codes_restatement.rs` pins that this list is exactly
-//! the set of codes 176 introduces.
+//! Migration 359 gives the same treatment to the three `*_require_tenancy`
+//! trigger bodies 176 left out, and its codes (`TEN03`..`TEN06`) join the
+//! list. `tests/caller_refusal_codes_restatement.rs` pins that this list is
+//! exactly the set of codes 176 and 359 introduce.
 //!
 //! The supersede architecture's refusal codes (`SR01`..`SR13`, SPEC section
 //! 7.2) follow 176's pattern but are not 176's, so they live in a second
@@ -397,7 +399,8 @@ pub fn route_code(e: &DbError) -> Option<&'static str> {
         .map(|c| c.code)
 }
 
-/// Every refusal code migration 176 introduced.
+/// Every refusal code migration 176 introduced, and the ones migration 359
+/// added when it restated the `*_require_tenancy` bodies.
 #[rustfmt::skip]
 pub const CALLER_REFUSAL_CODES: &[&str] = &[
     // epigraph_admin_act_args (130): an admin act's kind and arguments.
@@ -413,6 +416,16 @@ pub const CALLER_REFUSAL_CODES: &[&str] = &[
     "PRV01",
     // epigraph_agents_refuse_registered_system_key (148).
     "AGK01",
+    // Migration 359, the *_require_tenancy trigger bodies (216's text). Each
+    // message names a table and the fix; row ids are in DETAIL.
+    // epigraph_claims_require_tenancy: an undeclared INSERT INTO claims (23502).
+    "TEN03",
+    // epigraph_derived_require_tenancy: a claim_id that names no claim (23503,
+    // answered as the caller's input refusal), and an undeclared row with
+    // claim_id NULL (23502).
+    "TEN04", "TEN05",
+    // epigraph_root_require_tenancy: an undeclared INSERT into a root (23502).
+    "TEN06",
 ];
 
 /// The supersede architecture's caller-reachable refusal codes (SPEC section
