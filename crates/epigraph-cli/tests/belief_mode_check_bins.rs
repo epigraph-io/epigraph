@@ -44,6 +44,7 @@ fn legacy_modes() -> serde_json::Value {
         "atom_fold": "legacy",
         "compound_belief": "legacy",
         "compound_write_guard": "warn",
+        "contradict_compound_guard": "warn",
         "compound_source_edges": "frozen",
         "atom_cache_mode": "display",
         "inference": "off",

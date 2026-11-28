@@ -2938,6 +2938,13 @@ pub struct LinkEpistemicResponse {
     pub belief_target_claim_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_belief: Option<LinkEpistemicBelief>,
+    /// Present only under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=warn` (the
+    /// default) for a `contradicts` / `refutes` edge whose target text screens
+    /// compound and that has no decomposition (backlog b4c2fc2f): `{conjuncts,
+    /// hint}`. The edge was written exactly as without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_contradiction_risk:
+        Option<epigraph_engine::contradiction_guard::PartialContradictionRisk>,
 }
 
 #[derive(Debug, Serialize)]

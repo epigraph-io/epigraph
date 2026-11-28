@@ -1,7 +1,7 @@
 //! The belief-mode switches this process runs under, read once at startup
 //! (SPEC §10.2).
 //!
-//! Atom-level belief is rolled out behind seven environment flags. Because a
+//! Atom-level belief is rolled out behind eight environment flags. Because a
 //! process reads them **once, at startup**, a flag flip is a restart window
 //! over N processes, not an atomic switch, and a process that was never
 //! restarted keeps running the old mode.
@@ -45,6 +45,7 @@
 //! | `EPIGRAPH_ATOM_FOLD` | `legacy`, `aef_standalone`, `aef` | `legacy` | yes: the single atom-cache writer (`edge_factor::recompute_atom_cache`) folds with the AEF the atoms the mode covers; the CLI wave bins whose writers fold only legacy refuse a writing run under any other fold |
 //! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` | `shadow` only: MCP `get_belief` adds the atom-level `shadow` view beside the served values. `progressive` and `strict` are not wired and serve `legacy` (logged once; `/health` and `system_stats` report the configured mode under `belief_modes` and the served one under `belief_modes_served`) |
 //! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | yes, on the textless BBA writers MCP `submit_ds_evidence`, REST `POST /api/v1/frames/:id/evidence` and REST `POST /api/v1/claims/:id/assess` (`compound_write_guard::decide`, role by migration 193's definer, a claim the caller cannot read left to the writer's not-found): on a compound, `warn` stores the BBA inert (a compound has no cache-owner frame, so no cache fold reads it; the per-frame side rows each writer keeps, such as its Beta track, are still written), returns `deprecated_compound_target` with the caller's visible atoms and logs the caller; `refuse` refuses it (MCP `invalid_params`, REST 422, `error: compound_target`) before anything is written. `update_with_evidence` carries evidence text and is not guarded |
+//! | `EPIGRAPH_CONTRADICT_COMPOUND_GUARD` | `warn`, `refuse` | `warn` | yes, on the edge writers MCP `link_epistemic` and REST `POST /api/v1/edges` (`contradiction_guard::decide`): a `contradicts` or `refutes` edge (any case) onto a target whose text screens compound (`epigraph_core::atomicity::conjunct_screen`) and that has no in-force `decomposes_to` children (migration 193's definer); `warn` writes the edge, returns `partial_contradiction_risk {conjuncts, hint}` and logs the caller; `refuse` refuses it (MCP `invalid_params`, REST 422, `error: compound_contradiction_target`) before anything is written. An atomic or a decomposed target is unaffected |
 //! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` | yes: the atom display fold (`atom_items`), the atom-cache writer, BBA retraction's cache vacate and the shadow report keep or drop edge-factor rows whose source is a compound |
 //! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` | no |
 //! | `EPIGRAPH_INFERENCE` | `off`, `shadow`, `on` | `off` | no |
@@ -165,6 +166,18 @@ belief_mode! {
 }
 
 belief_mode! {
+    /// What a `contradicts` / `refutes` edge onto an undecomposed target
+    /// whose text screens compound does ([`crate::contradiction_guard`]; the
+    /// module doc's table names the writers that act on it).
+    ContradictCompoundGuard, env = "EPIGRAPH_CONTRADICT_COMPOUND_GUARD", default = Warn, {
+        /// Written, the caller warned and logged.
+        Warn => "warn",
+        /// Refused.
+        Refuse => "refuse",
+    }
+}
+
+belief_mode! {
     /// How an atom's display fold reads edge-factor BBAs whose source is a
     /// compound.
     CompoundSourceEdges, env = "EPIGRAPH_COMPOUND_SOURCE_EDGES", default = Frozen, {
@@ -209,7 +222,7 @@ belief_mode! {
     }
 }
 
-/// The seven belief modes of one process, as `/health` and `system_stats`
+/// The eight belief modes of one process, as `/health` and `system_stats`
 /// report them.
 ///
 /// Deserialising refuses an unknown field as well as a missing one: a report
@@ -220,7 +233,7 @@ belief_mode! {
 #[serde(deny_unknown_fields)]
 ///
 /// The fields are private to this module (backlog 9a8f3bff): outside it, the
-/// one way to act on a flag is its accessor ([`Self::atom_fold`] and the six
+/// one way to act on a flag is its accessor ([`Self::atom_fold`] and the seven
 /// beside it), so the `belief_mode_readers` ratchet can list every file that
 /// acts on each flag by its accessor calls, however the struct reached that
 /// file. A value with chosen modes is built by [`Self::from_lookup`].
@@ -228,6 +241,7 @@ pub struct BeliefModes {
     atom_fold: AtomFold,
     compound_belief: CompoundBelief,
     compound_write_guard: CompoundWriteGuard,
+    contradict_compound_guard: ContradictCompoundGuard,
     compound_source_edges: CompoundSourceEdges,
     atom_cache_mode: AtomCacheMode,
     inference: Inference,
@@ -342,6 +356,13 @@ impl BeliefModes {
                 CompoundWriteGuard::as_str,
                 &mut unrecognised,
             ),
+            contradict_compound_guard: read_flag(
+                &lookup,
+                ContradictCompoundGuard::ENV,
+                ContradictCompoundGuard::parse_value,
+                ContradictCompoundGuard::as_str,
+                &mut unrecognised,
+            ),
             compound_source_edges: read_flag(
                 &lookup,
                 CompoundSourceEdges::ENV,
@@ -398,6 +419,13 @@ impl BeliefModes {
         self.compound_write_guard
     }
 
+    /// `EPIGRAPH_CONTRADICT_COMPOUND_GUARD`: what a `contradicts` /
+    /// `refutes` edge onto an undecomposed compound-looking target does.
+    #[must_use]
+    pub const fn contradict_compound_guard(&self) -> ContradictCompoundGuard {
+        self.contradict_compound_guard
+    }
+
     /// `EPIGRAPH_COMPOUND_SOURCE_EDGES`: whether edge-factor rows whose source
     /// is a compound are kept or dropped.
     #[must_use]
@@ -432,7 +460,7 @@ impl BeliefModes {
 
     /// Every flag, in report order.
     #[must_use]
-    pub const fn fields(&self) -> [ModeField; 7] {
+    pub const fn fields(&self) -> [ModeField; 8] {
         [
             ModeField {
                 key: "atom_fold",
@@ -448,6 +476,11 @@ impl BeliefModes {
                 key: "compound_write_guard",
                 env: CompoundWriteGuard::ENV,
                 value: self.compound_write_guard.as_str(),
+            },
+            ModeField {
+                key: "contradict_compound_guard",
+                env: ContradictCompoundGuard::ENV,
+                value: self.contradict_compound_guard.as_str(),
             },
             ModeField {
                 key: "compound_source_edges",
@@ -566,6 +599,11 @@ mod tests {
                 .map(|m| (CompoundWriteGuard::ENV, m.as_str())),
         );
         out.extend(
+            ContradictCompoundGuard::ALL
+                .iter()
+                .map(|m| (ContradictCompoundGuard::ENV, m.as_str())),
+        );
+        out.extend(
             CompoundSourceEdges::ALL
                 .iter()
                 .map(|m| (CompoundSourceEdges::ENV, m.as_str())),
@@ -602,6 +640,7 @@ mod tests {
                 "atom_fold": "legacy",
                 "compound_belief": "legacy",
                 "compound_write_guard": "warn",
+                "contradict_compound_guard": "warn",
                 "compound_source_edges": "frozen",
                 "atom_cache_mode": "display",
                 "inference": "off",
@@ -631,6 +670,11 @@ mod tests {
             (
                 "EPIGRAPH_COMPOUND_WRITE_GUARD",
                 "compound_write_guard",
+                &["warn", "refuse"],
+            ),
+            (
+                "EPIGRAPH_CONTRADICT_COMPOUND_GUARD",
+                "contradict_compound_guard",
                 &["warn", "refuse"],
             ),
             (
@@ -737,11 +781,15 @@ mod tests {
             1 => m.compound_belief = next(CompoundBelief::ALL, m.compound_belief),
             2 => m.compound_write_guard = next(CompoundWriteGuard::ALL, m.compound_write_guard),
             3 => {
+                m.contradict_compound_guard =
+                    next(ContradictCompoundGuard::ALL, m.contradict_compound_guard);
+            }
+            4 => {
                 m.compound_source_edges = next(CompoundSourceEdges::ALL, m.compound_source_edges);
             }
-            4 => m.atom_cache_mode = next(AtomCacheMode::ALL, m.atom_cache_mode),
-            5 => m.inference = next(Inference::ALL, m.inference),
-            6 => m.bp_apply = next(BpApply::ALL, m.bp_apply),
+            5 => m.atom_cache_mode = next(AtomCacheMode::ALL, m.atom_cache_mode),
+            6 => m.inference = next(Inference::ALL, m.inference),
+            7 => m.bp_apply = next(BpApply::ALL, m.bp_apply),
             _ => unreachable!(),
         }
         m
@@ -768,7 +816,7 @@ mod tests {
                 (ours[0].theirs, ours[0].ours)
             );
         }
-        // And all seven at once are all reported, in report order.
+        // And all eight at once are all reported, in report order.
         let mut all = base;
         for i in 0..keys.len() {
             all = with_field_moved(all, i);
@@ -783,7 +831,7 @@ mod tests {
     #[test]
     fn a_report_parses_only_when_it_carries_exactly_the_known_modes() {
         let mut modes = BeliefModes::default();
-        for i in 0..7 {
+        for i in 0..BeliefModes::default().fields().len() {
             modes = with_field_moved(modes, i);
         }
         let wire = serde_json::to_value(modes).unwrap();
