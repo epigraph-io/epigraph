@@ -1,12 +1,18 @@
-//! POST /api/v1/submit/packet must NOT embed claims whose
-//! `properties.event` marks them as host-provenance telemetry from
-//! `epiclaw-host`. Embedding sentence-shaped operational events like
-//! "Container X exited code 0 after Yms" has no semantic value and costs an
-//! OpenAI call per event; the host signs them only for tamper-evidence on
-//! container lifecycle.
+//! POST /api/v1/submit/packet must NOT embed telemetry-shaped claims: a
+//! claim labelled `telemetry`, or one whose `properties.event` is any non-null
+//! value. Embedding sentence-shaped operational events like "Container X
+//! exited code 0 after Yms" has no semantic value and costs an embedding call
+//! per event; the host signs them only for tamper-evidence on container
+//! lifecycle.
+//!
+//! The rule is `epigraph_db::is_telemetry_shaped`, the Rust twin of the
+//! `EMBEDDABLE_POPULATION` SQL predicate the maintenance enumerator uses, so
+//! the write path never embeds a claim the backfill would leave alone. It is
+//! deliberately NOT a list of known event names: an event a host starts
+//! emitting tomorrow is telemetry by shape (backlog d323bc31).
 //!
 //! Regression guard: removing the skip-check in `submit.rs` would resume
-//! ~thousands of wasted embedding calls per day from the epiclaw orchestrator.
+//! ~thousands of wasted embedding calls per day from the host orchestrator.
 
 use std::sync::Arc;
 
@@ -50,6 +56,16 @@ async fn submit_packet_with_properties(
     content: &str,
     properties: Option<serde_json::Value>,
 ) -> Uuid {
+    submit_packet_with(pool, content, properties, &[]).await
+}
+
+/// [`submit_packet_with_properties`] that also sets `claim.labels`.
+async fn submit_packet_with(
+    pool: PgPool,
+    content: &str,
+    properties: Option<serde_json::Value>,
+    labels: &[&str],
+) -> Uuid {
     let provider = MockProvider::new(EmbeddingConfig::local(1536));
     let service: Arc<dyn EmbeddingService> = Arc::new(provider);
     let state = AppState::with_db(pool.clone(), ApiConfig::default())
@@ -86,6 +102,9 @@ async fn submit_packet_with_properties(
     });
     if let Some(p) = properties {
         claim["properties"] = p;
+    }
+    if !labels.is_empty() {
+        claim["labels"] = json!(labels);
     }
 
     let body = json!({
@@ -196,47 +215,80 @@ async fn submit_packet_skips_embedding_for_all_known_telemetry_events(pool: PgPo
     }
 }
 
+async fn has_embedding(pool: &PgPool, claim_id: Uuid) -> bool {
+    sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_packet_still_embeds_non_telemetry_claims(pool: PgPool) {
-    // No properties.event → embed as normal. This guards against an overly
-    // broad skip rule that would silently drop embeddings for ordinary claims.
-    let claim_id = submit_packet_with_properties(
+    // No properties.event and no `telemetry` label → embed as normal. This
+    // guards against an overly broad skip rule that would silently drop
+    // embeddings for ordinary claims.
+    let claim_id = submit_packet_with(
         pool.clone(),
         "An ordinary knowledge claim that should be embedded",
-        None,
+        Some(json!({"kind": "note"})),
+        &["hypothesis", "telemetry-adjacent"],
     )
     .await;
-
-    let has_embedding: bool =
-        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
     assert!(
-        has_embedding,
-        "ordinary claim {claim_id} (no properties.event) should be embedded"
+        has_embedding(&pool, claim_id).await,
+        "ordinary claim {claim_id} (no properties.event, no `telemetry` label) \
+         should be embedded"
     );
 
-    // Unknown event values should NOT trigger the skip — keeps the filter
-    // tight to the known epiclaw-host emitters.
-    let claim_id_unknown = submit_packet_with_properties(
+    // An explicit JSON null under `event` is no event: the SQL predicate's
+    // `(properties->>'event') IS NULL` holds for it, so the write path must
+    // embed it too or the two halves of the rule disagree.
+    let claim_id_null_event = submit_packet_with(
         pool.clone(),
-        "Claim with unknown event marker",
-        Some(json!({"event": "something_else_entirely"})),
+        "A claim whose event key is explicitly null",
+        Some(json!({"event": null})),
+        &[],
     )
     .await;
-
-    let has_embedding_unknown: bool =
-        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
-            .bind(claim_id_unknown)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
     assert!(
-        has_embedding_unknown,
-        "claim with unknown properties.event value should still be embedded"
+        has_embedding(&pool, claim_id_null_event).await,
+        "claim {claim_id_null_event} with properties.event = null should be embedded"
+    );
+}
+
+/// Backlog d323bc31: the skip is the population rule, not a list of known
+/// event names. An event value no host emits today is still telemetry-shaped.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_skips_embedding_for_an_unlisted_event(pool: PgPool) {
+    let claim_id = submit_packet_with(
+        pool.clone(),
+        "telemetry: some future host event",
+        Some(json!({"event": "some_future_event"})),
+        &[],
+    )
+    .await;
+    assert!(
+        !has_embedding(&pool, claim_id).await,
+        "claim {claim_id} carries properties.event = \"some_future_event\"; it is \
+         outside the embedded population and must not be embedded"
+    );
+}
+
+/// Backlog d323bc31: the `telemetry` label alone puts a claim outside the
+/// embedded population, with no `properties.event` at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_skips_embedding_for_a_telemetry_label_without_event(pool: PgPool) {
+    let claim_id = submit_packet_with(
+        pool.clone(),
+        "A labelled telemetry claim that carries no event property",
+        None,
+        &["telemetry", "src:host"],
+    )
+    .await;
+    assert!(
+        !has_embedding(&pool, claim_id).await,
+        "claim {claim_id} is labelled `telemetry`; it is outside the embedded \
+         population and must not be embedded"
     );
 }

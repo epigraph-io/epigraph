@@ -80,7 +80,9 @@ pub use errors::{
     DbError, RefusalKind, OPERATOR_LINK_FIX, OPERATOR_LINK_REQUIRED, OPERATOR_SCOPE_REFUSED,
     PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED, ROLE_HOLDER_REQUIRED,
 };
-pub use label_validation::reject_unexpanded_labels;
+pub use label_validation::{
+    check_label_bounds, reject_unexpanded_labels, MAX_LABELS_PER_CLAIM, MAX_LABEL_CHARS,
+};
 pub use pool::{
     apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,
     create_pool_with_options, maintenance_database_url, maintenance_verdict,
@@ -118,9 +120,9 @@ pub use repos::{
     PaperIngest, PaperRef, PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use repos::{
-    carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
-    AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository, AgentKeyRow,
-    AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
+    carries_dedup_identity_key, is_telemetry_shaped, reserved_edge_property_refusal,
+    ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository,
+    AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
     AnalysisRecord, AnalysisRepository, AssertionNonceRepository, AttestedKeyRow, AuthorOperator,
     BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, BetaTrackInput, ChallengeRepository, ChallengeRow,

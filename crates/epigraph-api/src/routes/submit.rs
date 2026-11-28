@@ -482,9 +482,15 @@ async fn validate_packet(packet: &EpistemicPacket, state: &AppState) -> Result<(
     // write this guard protects — `submit_packet`'s raw `UPDATE claims SET
     // labels` — is itself `#[cfg(feature = "db")]`, so without `db` there is no
     // persistence path for an unexpanded label to reach.
+    //
+    // The same block bounds the label set (backlog 854165dd): at most
+    // `MAX_LABELS_PER_CLAIM` labels, none empty or longer than
+    // `MAX_LABEL_CHARS` characters.
     #[cfg(feature = "db")]
     {
-        if let Err(e) = epigraph_db::reject_unexpanded_labels(&packet.claim.labels) {
+        let checked = epigraph_db::reject_unexpanded_labels(&packet.claim.labels)
+            .and_then(|()| epigraph_db::check_label_bounds(&packet.claim.labels));
+        if let Err(e) = checked {
             let reason = match e {
                 epigraph_db::DbError::InvalidData { reason } => reason,
                 other => other.to_string(),
@@ -493,7 +499,11 @@ async fn validate_packet(packet: &EpistemicPacket, state: &AppState) -> Result<(
                 RefusalStatus::BadRequest,
                 "ValidationError",
                 reason,
-                serde_json::json!({ "field": "claim.labels" }),
+                serde_json::json!({
+                    "field": "claim.labels",
+                    "max_labels": epigraph_db::MAX_LABELS_PER_CLAIM,
+                    "max_label_chars": epigraph_db::MAX_LABEL_CHARS
+                }),
             ));
         }
     }
@@ -1331,7 +1341,8 @@ async fn persist_packet(
     // Set labels at creation (parity with `claims.rs::create_claim`), so a
     // multi-principal writer labels the claim it just created as the creator —
     // no separate ownership-gated label PATCH (which would need `claims:admin`).
-    // Guarded on creation: a duplicate submit must not relabel another run's claim.
+    // Guarded on creation: a duplicate submit must not relabel another run's claim
+    // (pinned by `submit_packet_dedup_leaves_the_first_submits_labels`).
     if was_created && !packet.claim.labels.is_empty() {
         sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
             .bind(&packet.claim.labels)
@@ -1816,29 +1827,18 @@ pub async fn submit_packet(
     // Embedding generation is non-blocking: if the service is unavailable
     // or fails, the claim submission still succeeds.
     //
-    // Skip host-provenance telemetry (epiclaw-host signs every observable
-    // event as a signed claim for tamper-evidence; embedding sentence-shaped
-    // operational events like "Container X exited code 0 after Yms" has no
-    // semantic value and costs an OpenAI call per event).
+    // Skip telemetry-shaped claims (backlog d323bc31): a `telemetry` label or
+    // any non-null `properties.event`. Hosts sign every observable event as a
+    // claim for tamper-evidence; embedding sentence-shaped operational events
+    // like "Container X exited code 0 after Yms" has no semantic value and
+    // costs an embedding call per event. The rule is
+    // `epigraph_db::is_telemetry_shaped`, the Rust twin of the SQL predicate
+    // the embedding backfill enumerates, NOT a list of known event names: a
+    // name list here embedded every event a host added later, which the
+    // backfill then treated as outside the population anyway.
     #[cfg(feature = "db")]
-    let is_host_telemetry = packet
-        .claim
-        .properties
-        .as_ref()
-        .and_then(|p| p.get("event"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|e| {
-            matches!(
-                e,
-                "container_spawned"
-                    | "container_exited"
-                    | "agent_output"
-                    | "task_scheduled"
-                    | "task_executed"
-                    | "message_received"
-                    | "message_sent"
-            )
-        });
+    let is_telemetry =
+        epigraph_db::is_telemetry_shaped(&packet.claim.labels, packet.claim.properties.as_ref());
 
     // Skip re-embedding on a duplicate submit (§5): the canonical claim already
     // carries its embedding from the create path; re-running the (paid) embed
@@ -1846,10 +1846,10 @@ pub async fn submit_packet(
     #[cfg(feature = "db")]
     if !was_duplicate {
         if let Some(embedding_service) = state.storing_embedding_service() {
-            if is_host_telemetry {
+            if is_telemetry {
                 tracing::debug!(
                     claim_id = %claim_id,
-                    "Skipping embedding for host-provenance telemetry claim"
+                    "Skipping embedding for telemetry-shaped claim"
                 );
             } else {
                 match embedding_service.generate(&packet.claim.content).await {
