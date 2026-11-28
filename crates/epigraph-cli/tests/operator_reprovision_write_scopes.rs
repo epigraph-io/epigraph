@@ -13,6 +13,8 @@
 //! * the dry run and a wrong `--confirm-count` change nothing; one
 //!   `oauth.write_scopes_reprovisioned` row per changed client; a re-run finds
 //!   nothing to do;
+//! * a client whose arrays already hold both scopes has only its stale
+//!   `claims:write` chain widened, and the reverse restores that chain alone;
 //! * `--reverse --manifest` restores the exact prior arrays (order and a
 //!   pre-existing `evidence:write` in `allowed_scopes` kept), restores a chain
 //!   by family (the successor a rotation minted since), and HOLDS a client
@@ -272,9 +274,10 @@ fn client_count(stdout: &str) -> usize {
 /// 'active'` removed -> the dry run lists the suspended, revoked and pending
 /// clients; the reverse setting each array to `after` minus the two scopes
 /// instead of the recorded `before` -> client A's restored `allowed_scopes`
-/// loses its pre-existing `evidence:write`. On the tree before this change
-/// the verb does not exist (clap: unrecognized subcommand) and the dry-run
-/// assertion fails.
+/// loses its pre-existing `evidence:write`; the reverse restoring chains only
+/// for a `restored` client (not an `already` one) -> client B's stale chain
+/// keeps both appended scopes. On the tree before this change the verb does
+/// not exist (clap: unrecognized subcommand) and the dry-run assertion fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn reprovision_widens_live_chains_of_active_writers_and_reverses_exactly(pool: PgPool) {
     // A: active writer, `evidence:write` already in allowed (not granted),
@@ -290,6 +293,12 @@ async fn reprovision_widens_live_chains_of_active_writers_and_reverses_exactly(p
         &["claims:admin", "claims:write"],
     )
     .await;
+    // B: active writer whose arrays ALREADY hold both scopes, with a stale
+    // claims:write chain minted before its grant: only the chain is widened,
+    // and the reverse takes the `already` arm and restores the chain alone.
+    let b_scopes = ["claims:write", "edges:write", "evidence:write"];
+    let (b, _, _) = service_client(&pool, "active", &b_scopes, &b_scopes).await;
+    let b_token = live_token(&pool, b, &["claims:write"]).await;
     // Not candidates.
     let w = ["claims:read", "claims:write"];
     let (s, _, _) = service_client(&pool, "suspended", &w, &w).await;
@@ -324,7 +333,7 @@ async fn reprovision_widens_live_chains_of_active_writers_and_reverses_exactly(p
         "PREMISE: the chain mints neither scope before the run: {pre_scopes:?}"
     );
 
-    let watched = [a, h, s, r, p, ro];
+    let watched = [a, h, b, s, r, p, ro];
     let before = snapshot(&pool, &watched).await;
     let (role, dsn) = login_in(&pool, "epigraph_maintenance").await;
     let manifest = std::env::temp_dir().join(format!("rws-{}.jsonl", Uuid::new_v4().simple()));
@@ -336,7 +345,7 @@ async fn reprovision_widens_live_chains_of_active_writers_and_reverses_exactly(p
     assert_eq!(dry.code, 0, "{}", dry.show());
     assert!(dry.stdout.starts_with("DRY RUN: "), "{}", dry.show());
     let n = client_count(&dry.stdout);
-    for c in [a, h] {
+    for c in [a, h, b] {
         assert!(
             dry.stdout.contains(&format!("CLIENT\t{c}")),
             "{c} listed: {}",
@@ -437,6 +446,21 @@ async fn reprovision_widens_live_chains_of_active_writers_and_reverses_exactly(p
             "evidence:write"
         ])
     );
+    // B: arrays untouched (nothing to add), its stale chain widened.
+    assert_eq!(after[&b].1, before[&b].1, "B's allowed_scopes unchanged");
+    assert_eq!(after[&b].2, before[&b].2, "B's granted_scopes unchanged");
+    assert_eq!(
+        after[&b].3[&b_token].0,
+        v(&b_scopes),
+        "a stale chain of an already-granted client is widened"
+    );
+    let b_rows = audit_rows(&pool, "oauth.write_scopes_reprovisioned", b).await;
+    assert_eq!(
+        b_rows.len(),
+        1,
+        "B's chain-only change is audited: {b_rows:?}"
+    );
+    assert_eq!(b_rows[0]["refresh_tokens_widened"], 1);
     // Untouched: not active, or not a writer.
     for c in [s, r, p, ro] {
         assert_eq!(after[&c], before[&c], "client {c} is untouched");
@@ -537,6 +561,16 @@ async fn reprovision_widens_live_chains_of_active_writers_and_reverses_exactly(p
         rev.show()
     );
     assert!(rev.stdout.contains(&format!("HELD\t{h}")), "{}", rev.show());
+    assert!(
+        rev.stdout
+            .contains(&format!("ALREADY\t{b}\ttokens_restored=1\ttokens_held=0")),
+        "B's arrays need nothing, its chain is restored: {}",
+        rev.show()
+    );
+    assert_eq!(
+        restored[&b], before[&b],
+        "B is back exactly: arrays and chain"
+    );
     assert_eq!(restored[&a].1, v(&a_allowed), "A's allowed_scopes exactly");
     assert_eq!(restored[&a].2, v(&a_granted), "A's granted_scopes exactly");
     // The successor minted by the post-run refresh is restored by family.
