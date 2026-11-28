@@ -10,11 +10,12 @@
 //!
 //! # The discriminating pair
 //!
-//! One principal, one token, one route, two private conventions. The
-//! principal holds `reader` in group A and `admin` in its own group B; the only
-//! variable is the role it holds in the owning group. B's forget lands (200, an
-//! evidence row), A's is refused (403) and writes nothing. A negative alone
-//! would pass over a route that refuses everything.
+//! One principal, one token, one route, two private conventions, each authored
+//! by another agent in that agent's own group. The principal holds `reader` in
+//! group A and `writer` in group B; the only variable is the role it holds in
+//! the owning group. B's forget lands (200, an evidence row), A's is refused
+//! (403) and writes nothing. A negative alone would pass over a route that
+//! refuses everything.
 //!
 //! The check is about PRIVATE conventions; the public path is unchanged.
 //!
@@ -127,40 +128,45 @@ struct World {
     client: Uuid,
     /// Owned by a group the principal holds `reader` in.
     readable: Uuid,
-    /// Owned by a group the principal holds `admin` in.
+    /// Owned by a group the principal holds `writer` in.
     writable: Uuid,
 }
 
 async fn world(pool: &PgPool) -> World {
-    let (principal, own_group) = fixture::seed_agent_with_group(pool, "forget-principal").await;
-    let (author, other_group) = fixture::seed_agent_with_group(pool, "forget-author").await;
-    // The read-only half of the pair: a second membership, role `reader`.
-    sqlx::query(
-        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
-         VALUES ($1, $2, ''::bytea, 0, 'reader')",
-    )
-    .bind(other_group)
-    .bind(principal)
-    .execute(pool)
-    .await
-    .expect("reader membership");
+    let (principal, _) = fixture::seed_agent_with_group(pool, "forget-principal").await;
+    let (author, read_group) = fixture::seed_agent_with_group(pool, "forget-author").await;
+    let (author_w, write_group) =
+        fixture::seed_agent_with_group(pool, "forget-author-writable").await;
+    // One shape on both sides: each convention is authored by ANOTHER agent
+    // in that agent's own group, and the principal holds a second membership
+    // there. The only variable is that membership's role.
+    for (group, role) in [(read_group, "reader"), (write_group, "writer")] {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, $3)",
+        )
+        .bind(group)
+        .bind(principal)
+        .bind(role)
+        .execute(pool)
+        .await
+        .expect("second membership");
+    }
 
-    let readable = private_convention(pool, author, other_group, "read-only").await;
-    let writable = private_convention(pool, principal, own_group, "writable").await;
+    let readable = private_convention(pool, author, read_group, "read-only").await;
+    let writable = private_convention(pool, author_w, write_group, "writable").await;
 
     let viewer = epigraph_db::Viewer::resolve(pool, principal)
         .await
         .expect("resolve");
     assert!(
-        viewer
-            .group_bind()
-            .is_some_and(|g| g.contains(&other_group))
-            && !viewer.writable_groups().contains(&other_group),
+        viewer.group_bind().is_some_and(|g| g.contains(&read_group))
+            && !viewer.writable_groups().contains(&read_group),
         "PREMISE: the principal reads the read-only group and does not write it"
     );
     assert!(
-        viewer.writable_groups().contains(&own_group),
-        "PREMISE: the principal writes its own group"
+        viewer.writable_groups().contains(&write_group),
+        "PREMISE: the principal writes the other group"
     );
 
     let state = AppState::with_scoped_pool(app_scoped(pool).await, ApiConfig::default());
@@ -215,8 +221,8 @@ async fn a_reader_who_cannot_write_a_private_convention_is_refused_and_nothing_i
 }
 
 /// POSITIVE CONTROL, the other half of the pair: the SAME principal and token
-/// forget a private convention of a group it writes: 200, one evidence row
-/// and one `refutes` edge, and the truth falls.
+/// forget a private convention another agent authored in a group the principal
+/// writes: 200, one evidence row and one `refutes` edge, and the truth falls.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_writer_forgets_a_private_convention(pool: PgPool) {
     let w = world(&pool).await;
