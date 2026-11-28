@@ -392,6 +392,17 @@ PINS: tuple[Pin, ...] = (
         needle="bisect `main` with `git bisect start --first-parent`",
         incident="e0a1cce5",
     ),
+    Pin(
+        id="bisect-skips-a-merge-finished-by-a-staging-fixup",
+        file="docs/conventions/git-history.md",
+        section_start="## Bisecting main",
+        section_end=None,
+        needle=(
+            "merge that is broken only because its resolution was completed in "
+            "the next commit is not the PR's fault, so `git bisect skip` it"
+        ),
+        incident="e0a1cce5",
+    ),
     # --- The MCP screen tool's description names the gated refusal ---------
     Pin(
         id="screen-claim-atomicity-description-names-the-gated-refusal",
