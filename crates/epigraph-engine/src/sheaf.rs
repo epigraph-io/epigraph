@@ -324,47 +324,50 @@ pub fn compute_edge_inconsistency(
     }
 }
 
-/// Compute H¹ from a list of obstructions.
-///
-/// Sorts obstructions by inconsistency DESC and separates h0 (consistent)
-/// from h1 (total inconsistency).
-pub fn compute_cohomology(
-    obstructions: &mut Vec<SheafObstruction>,
-    threshold: f64,
-) -> SheafCohomology {
-    obstructions.sort_by(|a, b| {
-        b.edge_inconsistency
-            .partial_cmp(&a.edge_inconsistency)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let edge_count = obstructions.len();
-    let h1: f64 = obstructions.iter().map(|o| o.edge_inconsistency).sum();
-    let h0 = obstructions
-        .iter()
-        .filter(|o| o.edge_inconsistency <= threshold)
-        .count();
-    let h1_normalized = if edge_count > 0 {
-        h1 / edge_count as f64
-    } else {
-        0.0
-    };
-
-    // Only keep obstructions above threshold
-    obstructions.retain(|o| o.edge_inconsistency > threshold);
-
-    SheafCohomology {
-        h0,
-        h1,
-        h1_normalized,
-        edge_count,
-        obstructions: obstructions.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compute H¹ from a list of obstructions.
+    ///
+    /// Test-only (backlog f0d266af): no production path calls the scalar H¹;
+    /// the served cohomology is `cdst_sheaf::compute_cdst_cohomology`.
+    ///
+    /// Sorts obstructions by inconsistency DESC and separates h0 (consistent)
+    /// from h1 (total inconsistency).
+    fn compute_cohomology(
+        obstructions: &mut Vec<SheafObstruction>,
+        threshold: f64,
+    ) -> SheafCohomology {
+        obstructions.sort_by(|a, b| {
+            b.edge_inconsistency
+                .partial_cmp(&a.edge_inconsistency)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let edge_count = obstructions.len();
+        let h1: f64 = obstructions.iter().map(|o| o.edge_inconsistency).sum();
+        let h0 = obstructions
+            .iter()
+            .filter(|o| o.edge_inconsistency <= threshold)
+            .count();
+        let h1_normalized = if edge_count > 0 {
+            h1 / edge_count as f64
+        } else {
+            0.0
+        };
+
+        // Only keep obstructions above threshold
+        obstructions.retain(|o| o.edge_inconsistency > threshold);
+
+        SheafCohomology {
+            h0,
+            h1,
+            h1_normalized,
+            edge_count,
+            obstructions: obstructions.clone(),
+        }
+    }
 
     #[test]
     fn test_restriction_kind_classification() {

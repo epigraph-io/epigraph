@@ -145,10 +145,7 @@ pub use reasoning::{
     ReasoningResult, ReasoningStats, SupportCluster, TransitiveSupport,
 };
 pub use recall::{recall, recall_routed, RecallError, RecallResult, RecallRoute};
-pub use reconciliation::{
-    cluster_obstructions, extract_cospan, reconcile, ClusterSummary, ReconciliationConfig,
-    ReconciliationResult,
-};
+pub use reconciliation::{reconcile, ClusterSummary, ReconciliationConfig, ReconciliationResult};
 pub use reputation::ReputationCalculator;
 pub use rerank::{
     apply_groundedness, build_groundedness_prompt, build_rerank_client_from_env,
@@ -157,7 +154,7 @@ pub use rerank::{
     RerankError, RerankProviderConfig, RerankScore, RerankedHit,
 };
 pub use sheaf::{
-    compute_cohomology, compute_edge_inconsistency, compute_expected_betp, compute_section,
-    restriction_kind, RestrictionKind, SheafCohomology, SheafObstruction, SheafSection,
+    compute_edge_inconsistency, compute_expected_betp, compute_section, restriction_kind,
+    RestrictionKind, SheafCohomology, SheafObstruction, SheafSection,
 };
 pub use voi::{compute_voi, Neighbor, VoiResult};
