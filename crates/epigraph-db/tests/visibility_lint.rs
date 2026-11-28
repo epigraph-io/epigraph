@@ -4800,7 +4800,12 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          the claim is visible to the caller (`visible_claim_ids`, viewer-spliced) and answers an \
          unreadable claim as not-a-compound, and `contradiction_guard::decide` (backlog \
          b4c2fc2f) runs only after its writer read the target's content on the caller's \
-         viewer-spliced transaction.",
+         viewer-spliced transaction. The second caller uses the bit the other way round: a \
+         decomposition the caller cannot see turns its warning OFF (the target's cache is \
+         derived from its parts whoever can see them). So a reader of a compound-text claim \
+         learns whether it has a decomposition it cannot see, the same bit \
+         `compound_write_guard` already discloses for a readable claim and migration 193 \
+         accepts.",
     ),
     // Backlog 30c84267: the experiment-loop and method-catalog handlers run
     // every statement on the caller's stamped transaction or read, so the repo
