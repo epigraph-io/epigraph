@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block title %}My recall history · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("entities.css") }}">
+{%- endblock %}
+
+{% block content %}
+<header class="entity-head">
+  <p class="entity-kind">Recall history</p>
+  <h1>My recalls</h1>
+</header>
+
+<section class="section" aria-labelledby="recalls-title">
+  <h2 id="recalls-title" class="section__title">Newest first</h2>
+  <p class="small muted">Every recall you ran, with the claims it returned.
+  Only your own recalls are listed; nobody else can read them here.</p>
+  {%- match history %}
+  {%- when Degraded::Available { data } %}
+  {%- if data.rows.is_empty() %}
+  {%- if data.paged %}
+  <p class="muted">No older recalls.</p>
+  {%- else %}
+  <p class="muted">You have not run a recall yet.</p>
+  {%- endif %}
+  {%- else %}
+  <ol class="link-list recall-list">
+    {%- for r in data.rows %}
+    <li class="recall">
+      <p class="recall__query">{{ r.query }}</p>
+      <p class="small muted">{{ r.when }} · <span class="mono">{{ r.tool }}</span> · {{ r.claims.len() + r.more_claims }} claims returned</p>
+      {%- if !r.claims.is_empty() %}
+      <ul class="recall__claims" aria-label="Claims returned">
+        {%- for c in r.claims %}
+        <li><a class="mono small" href="{{ c.url }}">{{ c.short }}</a></li>
+        {%- endfor %}
+        {%- if r.more_claims > 0 %}
+        <li class="small muted">and {{ r.more_claims }} more</li>
+        {%- endif %}
+      </ul>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ol>
+  {%- endif %}
+  {%- if data.paged || data.older_url.is_some() %}
+  <nav class="pager" aria-label="Recall history pages">
+    {%- if data.paged %}
+    <a class="button-quiet button" href="{{ data.newest_url }}">Newest</a>
+    {%- endif %}
+    {%- if let Some(url) = data.older_url %}
+    <a class="button-quiet button" href="{{ url }}" rel="next">Older</a>
+    {%- endif %}
+  </nav>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+</section>
+{%- endblock %}

@@ -3,11 +3,11 @@
 //! Generates an OpenAPI 3.1 document for the EpiGraph REST API, served at
 //! `GET /api/v1/openapi.json`.
 //!
-//! **The document is PARTIAL.** It describes the 20 operations listed in
+//! **The document is PARTIAL.** It describes the 21 operations listed in
 //! `ApiDoc`'s `paths(...)` below (health, packet submit, RAG query, admin
 //! stats, challenges, supersede / dedup / undedup, claim get / patch / labels,
-//! agent search, five workflow routes, the hierarchical edge create and the
-//! authorship countersign), with
+//! agent search, five workflow routes, the hierarchical edge create, the
+//! authorship countersign and the caller's own recall events), with
 //! their schemas and the bearer security scheme. The router in
 //! `routes/mod.rs` registers well over two hundred routes; the rest are not
 //! described here, and no test ties this list to the route table. Each entry
@@ -119,6 +119,7 @@ use workflow_schema_stubs::{
         create_hierarchical_edge_doc,
         search_agents_doc,
         countersign_authorship_doc,
+        list_own_recall_events_doc,
     ),
     components(
         schemas(
@@ -195,6 +196,7 @@ use workflow_schema_stubs::{
         (name = "workflows", description = "Workflow management endpoints"),
         (name = "edges", description = "Edge creation and management"),
         (name = "papers", description = "Papers and their authorship"),
+        (name = "recall", description = "The caller's own recall history"),
     )
 )]
 pub struct ApiDoc;
@@ -695,6 +697,36 @@ async fn create_hierarchical_edge_doc() {}
 )]
 async fn countersign_authorship_doc() {}
 
+/// List the caller's own recall events (doc stub)
+///
+/// One page of the recall audit log, restricted to the caller's own rows
+/// (there is no agent parameter; an `agent_id` naming anyone else is a 400),
+/// newest first. The body is `{"items": [...], "next_cursor": ...}`; each
+/// item carries the MCP `get_recall_events` fields (`id`, `agent_id`, `tool`,
+/// `query_text`, `query_embedding_hash`, `params`, `returned_claim_ids`,
+/// `created_at`). Pass `next_cursor` back as `after` for the next page; it is
+/// `null` on the last page.
+#[utoipa::path(
+    get,
+    path = "/api/v1/recall-events",
+    tag = "recall",
+    params(
+        ("after" = Option<String>, Query, description = "The next_cursor of the previous page"),
+        ("limit" = Option<u32>, Query, description = "Rows per page (default 20, clamped to 1..=200)"),
+        ("since" = Option<String>, Query, description = "Only rows created at or after this RFC 3339 instant"),
+        ("until" = Option<String>, Query, description = "Only rows created at or before this RFC 3339 instant"),
+        ("claim_id" = Option<uuid::Uuid>, Query, description = "Only queries that returned this claim"),
+    ),
+    responses(
+        (status = 200, body = serde_json::Value),
+        (status = 400, body = ErrorResponse),
+        (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn list_own_recall_events_doc() {}
+
 /// Generate the OpenAPI JSON specification.
 ///
 /// The `version` field is overridden at runtime with `CARGO_PKG_VERSION` so it
@@ -837,6 +869,34 @@ mod tests {
             "200 body: {ok_ref:?}"
         );
         assert!(op["responses"]["403"].is_object());
+        let schemes: Vec<&str> = op["security"]
+            .as_array()
+            .expect("security")
+            .iter()
+            .flat_map(|o| o.as_object().unwrap().keys().map(String::as_str))
+            .collect();
+        assert!(schemes.contains(&"ed25519_signature"), "{schemes:?}");
+    }
+
+    #[test]
+    fn openapi_spec_documents_the_recall_events_route() {
+        let doc = serde_json::to_value(openapi_spec()).unwrap();
+        let op = &doc["paths"]["/api/v1/recall-events"]["get"];
+        assert!(op.is_object(), "recall-events route not described");
+        let params: Vec<&str> = op["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        for name in ["after", "limit", "since", "until", "claim_id"] {
+            assert!(params.contains(&name), "{name} missing from {params:?}");
+        }
+        assert!(
+            !params.contains(&"agent_id") && !params.contains(&"offset"),
+            "the route has no agent filter and no offset: {params:?}"
+        );
+        assert!(op["responses"]["401"].is_object());
         let schemes: Vec<&str> = op["security"]
             .as_array()
             .expect("security")

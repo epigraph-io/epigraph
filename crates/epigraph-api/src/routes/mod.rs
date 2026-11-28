@@ -120,6 +120,8 @@ pub mod mcp_twins;
 pub mod methods;
 #[cfg(test)]
 mod negative_tests;
+/// The list-endpoint pagination convention (`docs/conventions/api-pagination.md`).
+pub mod pagination;
 pub mod papers;
 pub mod perspective;
 #[cfg(feature = "db")]
@@ -136,6 +138,9 @@ pub mod provenance;
 pub mod provenance_chain;
 pub mod rag;
 pub mod reasoning;
+/// The caller's own recall history (`GET /api/v1/recall-events`).
+#[cfg(feature = "db")]
+pub mod recall_events;
 pub mod revoke_signature;
 #[cfg(feature = "db")]
 pub mod search;
@@ -981,6 +986,16 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/agents/:id/prompt-history/blobs/:hash",
             get(agent_prompt_history::get_prompt_history_blob),
+        )
+        // The caller's OWN recall audit rows (backlog 2cf7b6a1): no agent
+        // parameter; the stamped connection's row policy and the repo's
+        // explicit `agent_id = <principal>` filter both restrict the read.
+        // The answer is the caller's private query texts, so it is never
+        // stored by a shared cache.
+        .route(
+            "/api/v1/recall-events",
+            get(recall_events::list_own_recall_events)
+                .layer(middleware::map_response(viewer_scoped_cache_headers)),
         )
         .route(
             "/api/v1/agents/:id/timeline",

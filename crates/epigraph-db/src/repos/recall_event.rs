@@ -45,7 +45,7 @@ pub const DEFAULT_RETENTION_DAYS: i32 = 90;
 pub const PRUNABLE_EVENT_TYPES: &[&str] = &["tool.invoked"];
 
 /// One logged recall query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RecallEventRow {
     pub id: Uuid,
     pub agent_id: Option<Uuid>,
@@ -55,6 +55,18 @@ pub struct RecallEventRow {
     pub params: serde_json::Value,
     pub returned_claim_ids: Vec<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The optional narrowing of [`RecallEventRepository::list_own`]. None of
+/// these can widen the read past the caller's own rows.
+#[derive(Debug, Clone, Default)]
+pub struct OwnRecallFilter {
+    /// Only queries that returned this claim.
+    pub claim_id: Option<Uuid>,
+    /// Only rows created at or after this instant.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only rows created at or before this instant.
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// What to record for one recall call.
@@ -244,6 +256,82 @@ impl RecallEventRepository {
                 created_at: r.created_at,
             })
             .collect())
+    }
+
+    /// One page of the CALLER's own audit rows, newest first: the read behind
+    /// `GET /api/v1/recall-events` (backlog 2cf7b6a1).
+    ///
+    /// # Whose rows
+    ///
+    /// Only rows whose `agent_id` is `viewer`'s principal, by an explicit
+    /// filter the caller cannot choose: there is no agent parameter. A viewer
+    /// with no principal (a `Bypass` viewer) has no own rows and reads none.
+    ///
+    /// The filter is the SECOND safeguard, and it is load-bearing where the
+    /// first is not armed. On an application connection stamped with the
+    /// caller, `recall_events_tenancy` (migration 077) already admits only the
+    /// principal's rows. But an ELEVATED session also passes 126's
+    /// `recall_events_elevated_read` arm, which admits other agents' rows, and
+    /// a bypass connection passes everything; the legacy backfill stamped
+    /// rows `'public'`, so the visibility predicate below does not exclude
+    /// them either. `recall_event_test.rs::list_own_never_returns_another_agents_rows`
+    /// pins the filter on a connection where nothing else excludes them.
+    ///
+    /// The visibility predicate (the one [`Self::list`] uses) is kept, so the
+    /// route reads no row the MCP `get_recall_events` tool would hide from
+    /// the same viewer.
+    ///
+    /// # Paging
+    ///
+    /// Keyset over `(created_at DESC, id DESC)`, served by
+    /// `idx_recall_events_agent_time`. `after` is the last row of the previous
+    /// page ([`LabelCursor`](crate::repos::claim::LabelCursor)'s position;
+    /// rows logged in one statement share `created_at`, and the `id` breaks
+    /// the tie). `limit` is clamped to `[1, 1000]`; a caller that wants to
+    /// know whether another page follows asks for one row more than it
+    /// serves.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(executor, viewer, filter))]
+    pub async fn list_own<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        filter: &OwnRecallFilter,
+        after: Option<crate::repos::claim::LabelCursor>,
+        limit: i64,
+    ) -> Result<Vec<RecallEventRow>, DbError> {
+        let Some(principal) = viewer.principal() else {
+            return Ok(Vec::new());
+        };
+        let claim_filter = filter.claim_id.map(|c| vec![c]);
+        let rows = sqlx::query_as::<_, RecallEventRow>(
+            r"
+            SELECT id, agent_id, tool, query_text, query_embedding_hash,
+                   params, returned_claim_ids, created_at
+            FROM recall_events
+            WHERE agent_id = $1
+              AND ($2::uuid[] IS NULL OR returned_claim_ids @> $2)
+              AND ($3::timestamptz IS NULL OR created_at >= $3)
+              AND ($4::timestamptz IS NULL OR created_at <= $4)
+              AND ($5::timestamptz IS NULL OR (created_at, id) < ($5, $6::uuid))
+              AND ($8::bool OR visibility = 'public' OR owner_group_id = ANY($9::uuid[]))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $7
+            ",
+        )
+        .bind(principal)
+        .bind(claim_filter.as_deref())
+        .bind(filter.since)
+        .bind(filter.until)
+        .bind(after.map(|c| c.created_at))
+        .bind(after.map(|c| c.id))
+        .bind(limit.clamp(1, 1000))
+        .bind(viewer.bypass_bind())
+        .bind(viewer.group_bind().unwrap_or(&[]))
+        .fetch_all(executor)
+        .await?;
+        Ok(rows)
     }
 
     /// Retention window from `RECALL_EVENTS_RETENTION_DAYS`, falling back to

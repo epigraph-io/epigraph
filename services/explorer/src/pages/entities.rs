@@ -27,7 +27,8 @@ use crate::upstream::{
 };
 use crate::view::render;
 
-mod present;
+/// Shared with `pages::recalls`, which shows claim ids and times the same way.
+pub(crate) mod present;
 
 use present::{
     claim_text, duplicate_of, evidence_kind, fmt_pct, fmt_prob, fmt_time, humanise_key,

@@ -286,7 +286,7 @@ pub use provenance_chain::{
     PROVENANCE_INCOMING, PROVENANCE_OUTGOING,
 };
 pub use recall_event::{
-    NewRecallEvent, RecallEventRepository, RecallEventRow, DEFAULT_RETENTION_DAYS,
+    NewRecallEvent, OwnRecallFilter, RecallEventRepository, RecallEventRow, DEFAULT_RETENTION_DAYS,
     PRUNABLE_EVENT_TYPES,
 };
 pub use scoped_belief::{CommunityFoldsCleared, ScopedBeliefRepository};

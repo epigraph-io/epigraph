@@ -27,7 +27,7 @@ pub const MAX_REQUEST_BODY: usize = 64 * 1024;
 /// needs to stop restart-looping on a config typo.
 ///
 /// KEEP IN SYNC with the `.route(..)` / `.merge(..)` calls below and in
-/// `auth::routes`, `pages::{core,entities,graph,atlas}::routes` and
+/// `auth::routes`, `pages::{core,entities,graph,recalls,atlas}::routes` and
 /// `bff::{core,graph,atlas,atlas_nested,atlas_sources,atlas_timeline}::routes`. Adding a top-level route whose first
 /// segment is new means adding it here too.
 pub const RESERVED_BASE_PATH_SEGMENTS: &[&str] = &[
@@ -41,6 +41,7 @@ pub const RESERVED_BASE_PATH_SEGMENTS: &[&str] = &[
     "frame",
     "health",
     "neighborhood",
+    "recalls",
     "search",
     "static",
     "theme",
@@ -71,6 +72,7 @@ pub fn build_app_with(state: AppState, extra: Router<AppState>) -> Router {
         .merge(pages::core::routes())
         .merge(pages::entities::routes())
         .merge(pages::graph::routes())
+        .merge(pages::recalls::routes())
         .merge(bff::core::routes())
         .merge(bff::graph::routes())
         .merge(pages::atlas::routes())
@@ -164,6 +166,7 @@ fn top_level_segments() -> Vec<String> {
         "/theme/{id}",
         "/community/{id}",
         "/neighborhood/{id}",
+        "/recalls",
         "/bff/claim/{id}",
         "/bff/search",
         "/bff/graph/ego/{id}",

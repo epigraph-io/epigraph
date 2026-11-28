@@ -263,7 +263,7 @@ targeted grep across `routes/` for each suspected gap. Read this as: the gaps in
 |---|---|
 | `memorize` | No route. Distinct write path from `submit_claim` |
 | `recall` | See §8.3 — `/search/semantic` is *not* this operation |
-| `get_recall_events` | No route |
+| `get_recall_events` | Routed since (backlog ecf1b34f): `GET /api/v1/recall-events`, the caller's own rows only (§10) |
 | `get_provenance_chain` | No route (`/claims/:id/provenance` is the single-hop view) |
 | `query_undecomposed_claims` | No route |
 | `check_already_ingested` | No route. Blocks any HTTP-side idempotent ingest |
@@ -293,7 +293,7 @@ caller's viewer-stamped read, under the tool's `scope_map` scope; see
 | `suggest_alternative_sets` | Routed: `GET /api/v1/alternative-sets/suggestions` |
 | `get_provenance_chain` | Routed earlier: `GET /api/v1/claims/:id/provenance-chain` |
 | `recall` | Not here: tracked by its own backlog item (`a601168e`) |
-| `get_recall_events` | Held until tenancy covers `recall_events` (section 10) |
+| `get_recall_events` | Routed: `GET /api/v1/recall-events`, the caller's own rows only, no agent parameter (section 10) |
 | `memorize`, `update_with_evidence`, `consolidate_claims`, `ingest_document_inline`, `ingest_document_spine`, `resolve_backlog_item` | Open. These WRITE: the MCP tools sign with the MCP server's `AgentSigner` and resolve the author through `write_identity`, while `AppState` holds only the edge signer. Which key signs a claim authored over HTTP is a decision to take before they are routed |
 | `ingest_document` | Proposed: do not expose. It reads `file_path` from the serving process's own filesystem (under its working directory); over HTTP that is a read of the server's disk. `ingest_document_inline` is the HTTP-shaped form |
 | `sweep_semantic_duplicates` | Proposed: do not expose. It runs on a privileged maintenance session as the server's own agent, with no viewer; the request servers serve no maintenance surface |
@@ -388,10 +388,19 @@ it:
 - A web UI is strictly better than any Notion projection here, because a
   projection necessarily reads as one service identity and then re-exports under
   a different permission system (§7).
-- `D-PR16-recall-events-are-instance-wide` means `get_recall_events` is currently
-  readable by everyone. If it gets an API route (§8.2) and the UI surfaces it,
-  that widens the blast radius of an already-known finding. **Gate that one route
-  behind tenancy** rather than shipping it in Phase 1.
+- `get_recall_events` reads `recall_events`, which this design first treated as
+  instance-wide (`D-PR16-recall-events-are-instance-wide`). That finding is
+  corrected for NEW rows only: the table's row security is keyed on the
+  querying agent, and on the application role an agent-less row is refused
+  rather than published. Two gaps remain. Rows written before the change were
+  backfilled as `public` and still need a one-off data pass, so a privileged
+  read (the MCP tool on a bypass connection) still sees them instance-wide.
+  And a privileged write with no owner group is still declared instance-wide
+  (`recall_event.rs::log`). The route below serves neither: it filters on the
+  caller's own agent id, whatever a row's stamp. *Decided (2026-11-27, backlog
+  ecf1b34f):* the route ships for the caller's own rows only
+  (`GET /api/v1/recall-events`, no agent parameter, with an app-role leak test),
+  and the Explorer shows it as the signed-in viewer's own history (`/recalls`).
 
 ---
 
@@ -423,6 +432,7 @@ here that is genuinely unsafe.
    The `services/` precedent (`nli` is Python) means either is in keeping.
 2. **Graph library.** Force-directed at ~100 visible nodes is undemanding; the
    choice matters less than the degree cap.
-3. **Does `get_recall_events` ship at all?** See §10.
+3. **Does `get_recall_events` ship at all?** Decided (backlog ecf1b34f): yes,
+   for the caller's own rows only. See §10.
 4. **Who owns the parity backlog item** — it spans both surfaces and belongs to
    neither.

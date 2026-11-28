@@ -350,3 +350,215 @@ async fn prune_removes_only_rows_past_retention(pool: PgPool) {
     assert!(ids.contains(&fresh));
     assert!(!ids.contains(&stale));
 }
+
+/// A row of `agent`'s in the legacy backfill's shape: `('public', <the
+/// agent's personal group>)`. The visibility predicate admits it for every
+/// viewer, so only an agent filter can keep it out of someone else's read.
+async fn legacy_public_row(pool: &PgPool, agent: Uuid, query: &str, ids: &[Uuid]) -> Uuid {
+    let group = epigraph_db::ClaimRepository::personal_group_of_pool(pool, agent)
+        .await
+        .expect("resolve the author's personal group");
+    sqlx::query_scalar(
+        "INSERT INTO recall_events \
+             (agent_id, tool, query_text, params, returned_claim_ids, visibility, owner_group_id) \
+         VALUES ($1, 'recall', $2, '{}'::jsonb, $3, 'public', $4) RETURNING id",
+    )
+    .bind(agent)
+    .bind(query)
+    .bind(ids)
+    .bind(group)
+    .fetch_one(pool)
+    .await
+    .expect("seed a legacy public-stamped row")
+}
+
+/// `list_own` reads the CALLER's rows and no one else's, even where neither
+/// row security nor the visibility predicate excludes the other rows.
+///
+/// This runs on the superuser `#[sqlx::test]` pool, where no row policy
+/// applies (the same position as an elevated or bypass connection), and B's
+/// row is `'public'`-stamped as the legacy backfill left such rows, so the
+/// visibility predicate admits it: `agent_id = <principal>` is the only
+/// thing that can keep it out. Every filter a caller controls is aimed at
+/// B's row as well (its returned claim, a window around it), and the
+/// positive control shows A's own rows come back through the same filters.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_own_never_returns_another_agents_rows(pool: PgPool) {
+    use epigraph_db::OwnRecallFilter;
+    let (a, viewer_a) = author(&pool, "own-a").await;
+    let (b, _viewer_b) = author(&pool, "own-b").await;
+    let shared = Uuid::new_v4();
+
+    let own = RecallEventRepository::log(
+        &pool,
+        authored(
+            &pool,
+            a,
+            "recall",
+            "A's own query",
+            Some("[1]"),
+            vec![shared],
+        )
+        .await,
+    )
+    .await
+    .unwrap();
+    let theirs = legacy_public_row(&pool, b, "B's private query", &[shared]).await;
+
+    // CALIBRATION: the MCP-side `list` (no agent filter) does show B's row to
+    // A on this connection, so the negative legs below are not vacuous.
+    let unfiltered = RecallEventRepository::list(&pool, &viewer_a, None, None, None, None, 50, 0)
+        .await
+        .unwrap();
+    assert!(
+        unfiltered.iter().any(|r| r.id == theirs),
+        "CALIBRATION: B's public-stamped row must be visible to an unfiltered read here"
+    );
+
+    let wide = chrono::Utc::now() - chrono::Duration::days(1);
+    for filter in [
+        OwnRecallFilter::default(),
+        OwnRecallFilter {
+            claim_id: Some(shared),
+            ..OwnRecallFilter::default()
+        },
+        OwnRecallFilter {
+            since: Some(wide),
+            until: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+            ..OwnRecallFilter::default()
+        },
+    ] {
+        let rows = RecallEventRepository::list_own(&pool, &viewer_a, &filter, None, 200)
+            .await
+            .unwrap();
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            vec![own],
+            "A reads exactly its own row under {filter:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.query_text == "B's private query"),
+            "B's query text surfaced under {filter:?}"
+        );
+    }
+
+    // A cursor positioned on B's row moves the start of A's read; it does
+    // not admit B's row.
+    let theirs_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM recall_events WHERE id = $1")
+            .bind(theirs)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let after = epigraph_db::repos::claim::LabelCursor {
+        created_at: theirs_at + chrono::Duration::seconds(1),
+        id: Uuid::max(),
+    };
+    let rows = RecallEventRepository::list_own(
+        &pool,
+        &viewer_a,
+        &OwnRecallFilter::default(),
+        Some(after),
+        200,
+    )
+    .await
+    .unwrap();
+    assert!(rows.iter().all(|r| r.agent_id == Some(a)));
+    assert!(!rows.iter().any(|r| r.id == theirs));
+}
+
+/// A viewer with no principal has no own rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_own_of_a_principal_less_viewer_is_empty(pool: PgPool) {
+    let (a, _viewer_a) = author(&pool, "own-bypass").await;
+    let _row = legacy_public_row(&pool, a, "someone's query", &[]).await;
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let rows = RecallEventRepository::list_own(
+        &pool,
+        &bypass,
+        &epigraph_db::OwnRecallFilter::default(),
+        None,
+        200,
+    )
+    .await
+    .unwrap();
+    assert!(rows.is_empty(), "a bypass viewer read {} rows", rows.len());
+}
+
+/// Rows logged in one statement share `created_at`. Paging two at a time
+/// through seven such rows (plus one older) serves each row exactly once,
+/// newest first, with the id breaking the tie.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_own_pages_through_rows_sharing_a_timestamp_once_each(pool: PgPool) {
+    use epigraph_db::repos::claim::LabelCursor;
+    use epigraph_db::OwnRecallFilter;
+    let (a, viewer_a) = author(&pool, "own-pages").await;
+    let group = epigraph_db::ClaimRepository::personal_group_of_pool(&pool, a)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO recall_events \
+             (agent_id, tool, query_text, params, returned_claim_ids, visibility, owner_group_id) \
+         SELECT $1, 'recall', 'tied ' || g, '{}'::jsonb, '{}', 'group', $2 \
+           FROM generate_series(1, 7) g",
+    )
+    .bind(a)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let older = RecallEventRepository::log(
+        &pool,
+        authored(&pool, a, "recall", "older", None, vec![]).await,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE recall_events SET created_at = created_at - INTERVAL '1 hour' WHERE id = $1",
+    )
+    .bind(older)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let distinct_times: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT created_at) FROM recall_events WHERE agent_id = $1",
+    )
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        distinct_times, 2,
+        "CALIBRATION: seven rows share one timestamp"
+    );
+
+    let mut seen: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = Vec::new();
+    let mut after: Option<LabelCursor> = None;
+    for _ in 0..20 {
+        let page = RecallEventRepository::list_own(
+            &pool,
+            &viewer_a,
+            &OwnRecallFilter::default(),
+            after,
+            2,
+        )
+        .await
+        .unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some(LabelCursor {
+            created_at: last.created_at,
+            id: last.id,
+        });
+        seen.extend(page.iter().map(|r| (r.created_at, r.id)));
+    }
+    assert_eq!(seen.len(), 8, "every row served once: {seen:?}");
+    let mut sorted = seen.clone();
+    sorted.sort_by(|x, y| y.cmp(x));
+    sorted.dedup();
+    assert_eq!(
+        seen, sorted,
+        "newest first, (created_at, id) descending, no repeats"
+    );
+    assert_eq!(seen.last().map(|s| s.1), Some(older));
+}
