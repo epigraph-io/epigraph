@@ -841,6 +841,29 @@ jobs:
         # replays need no new entry. Warnings are not denied here: the
         # not(db) arm carries unused imports that the db arm needs.
         run: cargo test -p epigraph-api --no-default-features --lib --locked
+      - name: Scratch feature clippy
+        # The `scratch` feature (the database-free `epigraph-scratch` stdio
+        # binary, `src/scratch/`) is off by default, so the workspace Clippy
+        # never compiles it. Linted together with `db` (the default), whose
+        # arm is warning-free; the no-db arm carries unused imports (see
+        # above), so a no-db clippy would fail on code this feature does not
+        # touch. Targets are named: most of this crate's tests need `db`.
+        run: >-
+          cargo clippy -p epigraph-api --features scratch --locked
+          --lib --bins --test scratch_store --test scratch_snapshot
+          --test scratch_protocol --test scratch_no_db --test scratch_belief
+          --test scratch_digest --test scratch_agents -- -D warnings
+      - name: Scratch feature no-db build and tests
+        # The shape the binary ships in: `--no-default-features --features
+        # scratch`, so no `db` code, route table or pool is compiled into the
+        # scratch path. Builds the library and the binary, runs the scratch
+        # unit tests and the scratch test targets (the spawned binary
+        # included). Named targets only, never a whole-package no-db test run
+        # (critic finding X15: about 75 test files are not gated on `db`).
+        run: |
+          cargo check -p epigraph-api --no-default-features --features scratch --locked
+          cargo test -p epigraph-api --no-default-features --features scratch --locked --lib scratch::
+          cargo test -p epigraph-api --no-default-features --features scratch --locked --test scratch_store --test scratch_snapshot --test scratch_protocol --test scratch_no_db --test scratch_belief --test scratch_digest --test scratch_agents
       - name: epigraph-cli no-db build check
         # epigraph-cli's `db` feature is default-on and no other step built the
         # crate without it, so the Atlas modules (atlas_naming, atlas_nightly)
