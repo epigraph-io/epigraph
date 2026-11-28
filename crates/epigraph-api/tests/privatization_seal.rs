@@ -499,6 +499,155 @@ async fn the_seal_ceremony_round_trips_through_its_own_routes(pool: PgPool) {
     );
 }
 
+/// A real agent row whose `public_key` is `signer`'s.
+async fn keyed_agent(pool: &PgPool, signer: &epigraph_crypto::AgentSigner) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system') RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(signer.public_key().to_vec())
+    .fetch_one(pool)
+    .await
+    .expect("seed a keyed agent")
+}
+
+fn v1_verifies(
+    key: &epigraph_crypto::AgentSigner,
+    digest: &[u8],
+    signature: Option<&Vec<u8>>,
+) -> bool {
+    let Some(signature) = signature else {
+        return false;
+    };
+    epigraph_crypto::SignatureVerifier::verify_entity(
+        &key.public_key(),
+        epigraph_crypto::SignedEntity::Claim,
+        &digest.try_into().expect("a 32-byte digest"),
+        &signature
+            .as_slice()
+            .try_into()
+            .expect("a 64-byte signature"),
+    )
+    .expect("a valid public key")
+        == Some(epigraph_crypto::SignatureScheme::V1)
+}
+
+/// Backlog aa366aa6, through the routes: `seal-commit` re-signs the sealed
+/// claim with the API's own signing key (the one `AppState::edge_signer`
+/// holds) over the ciphertext digest, and `unseal-commit` puts the original
+/// signature and signer back byte for byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn seal_commit_resigns_with_the_api_key_and_unseal_commit_restores_the_original(
+    pool: PgPool,
+) {
+    use epigraph_crypto::{AgentSigner, SignedEntity};
+
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let plaintext = "a confidential result about a signed catalyst";
+    let claim = seed_subject(&pool, &world, plaintext).await;
+
+    // The original: a real v1 signature over BLAKE3 of the plaintext.
+    let author_key = AgentSigner::generate();
+    let author_signer = keyed_agent(&pool, &author_key).await;
+    let plain_digest = *blake3::hash(plaintext.as_bytes()).as_bytes();
+    let original = author_key
+        .sign_entity(SignedEntity::Claim, &plain_digest)
+        .to_vec();
+    sqlx::query(
+        "UPDATE claims SET content_hash = $2, signature = $3, signer_id = $4 WHERE id = $1",
+    )
+    .bind(claim)
+    .bind(plain_digest.to_vec())
+    .bind(&original)
+    .bind(author_signer)
+    .execute(&pool)
+    .await
+    .expect("sign the claim");
+
+    let server = AgentSigner::generate();
+    let server_id = keyed_agent(&pool, &server).await;
+    let signer = std::sync::Arc::new(epigraph_api::edge_signer::ApiEdgeSigner::new(
+        AgentSigner::from_bytes(&server.secret_key()).expect("copy the server key"),
+        server_id,
+    ));
+    let state = fx::split_state(&pool).await.with_edge_signer(Some(signer));
+    let viewer = || async {
+        epigraph_api::middleware::bearer::ViewerExtractor(
+            epigraph_db::visibility::Viewer::resolve(&pool, world.actor)
+                .await
+                .expect("resolve the actor's viewer"),
+        )
+    };
+
+    let plan = applied_seal_plan(&pool, &world, &[claim]).await;
+    let manifest = fetch_seal_manifest(&pool, &world, plan)
+        .await
+        .expect("seal manifest");
+    let body = seal_body(&manifest).await;
+    let resp = routes::seal_commit(
+        viewer().await,
+        axum::extract::State(state.clone()),
+        Some(axum::Extension(fx::auth_for(world.actor))),
+        axum::extract::Path(plan),
+        axum::Json(body),
+    )
+    .await
+    .expect("seal commit")
+    .0;
+    assert_eq!(resp.committed, 1);
+
+    let (hash, signature, signer_id): (Vec<u8>, Option<Vec<u8>>, Option<Uuid>) =
+        sqlx::query_as("SELECT content_hash, signature, signer_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the sealed claim");
+    assert_ne!(hash, plain_digest.to_vec(), "CALIBRATION: the digest moved");
+    assert!(
+        v1_verifies(&server, &hash, signature.as_ref()),
+        "seal-commit must sign the sealed claim with the API key over the ciphertext digest"
+    );
+    assert_eq!(signer_id, Some(server_id));
+    let stash: (Option<Vec<u8>>, Option<Uuid>) = sqlx::query_as(
+        "SELECT pre_seal_signature, pre_seal_signer_id FROM claim_encryption WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("read the stash");
+    assert_eq!(stash, (Some(original.clone()), Some(author_signer)));
+
+    let unseal = fetch_unseal_manifest(&pool, &world, plan).await;
+    let commit = routes::UnsealCommitRequest {
+        items: unseal.items.iter().map(unseal_entry).collect(),
+    };
+    let resp = routes::unseal_commit(
+        viewer().await,
+        axum::extract::State(state),
+        Some(axum::Extension(fx::auth_for(world.actor))),
+        axum::extract::Path(plan),
+        axum::Json(commit),
+    )
+    .await
+    .expect("unseal commit")
+    .0;
+    assert_eq!(resp.committed, 1);
+
+    let (hash, signature, signer_id): (Vec<u8>, Option<Vec<u8>>, Option<Uuid>) =
+        sqlx::query_as("SELECT content_hash, signature, signer_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the unsealed claim");
+    assert_eq!(
+        (hash.clone(), signature.clone(), signer_id),
+        (plain_digest.to_vec(), Some(original), Some(author_signer)),
+        "unseal-commit restores the original signature and signer byte for byte"
+    );
+    assert!(v1_verifies(&author_key, &hash, signature.as_ref()));
+}
+
 /// `evidence.source_url` is sealed plaintext too, and it comes back on unseal.
 ///
 /// Before backlog 43ab8c73 every writer bound NULL to the column, so a seal that

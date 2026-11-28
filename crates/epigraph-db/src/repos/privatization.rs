@@ -3870,6 +3870,20 @@ impl PrivatizationRepository {
     ///    [`SEAL_DELETE_TABLES`], keeping the writer-owned rows of
     ///    [`SEAL_KEEPS_WRITER_OWNED`] (an outsider's challenge, ruling R-5).
     ///
+    /// # Signatures: stashed, then re-signed (backlog aa366aa6)
+    ///
+    /// A claim's and an evidence row's `signature` is over the PLAINTEXT
+    /// digest. Statements 1 and 5 copy each row's `signature` / `signer_id`
+    /// into its ciphertext row (`pre_seal_signature`, `pre_seal_signer_id`,
+    /// `pre_seal_stashed`; migration 357), where 077's group-scoped policy
+    /// keeps it. Statement 2 then gives the claim `attest`'s v1 signature over
+    /// the new `content_hash` (BLAKE3 of the ciphertext) with `attest`'s
+    /// signer agent as `signer_id`, so the sealed row verifies as the server's
+    /// record of the sealed form; with no key (`None`) the claim is left
+    /// unsigned. Statement 6 leaves the stashed evidence rows unsigned: their
+    /// digest becomes an id-derived sentinel, which a signature would not
+    /// describe. [`Self::unseal_claims_conn`] restores the originals.
+    ///
     /// # Ordering: restrict first, then seal
     ///
     /// Statement 1 fires `claim_encryption_no_public_sealed` (migration 081,
@@ -3921,6 +3935,7 @@ impl PrivatizationRepository {
         group_id: Uuid,
         epoch: i32,
         items: &[SealCommitItem],
+        attest: Option<crate::repos::EdgeSigningKey<'_>>,
     ) -> Result<Vec<Uuid>, DbError> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -3938,19 +3953,58 @@ impl PrivatizationRepository {
         let labels_cts: Vec<Vec<u8>> = items.iter().map(|i| i.labels_ct.clone()).collect();
         let props_cts: Vec<Vec<u8>> = items.iter().map(|i| i.properties_ct.clone()).collect();
         let hashes: Vec<Vec<u8>> = items.iter().map(|i| i.content_hash.clone()).collect();
+        // The server's re-signature of each sealed form (backlog aa366aa6):
+        // a v1 claim signature over the NEW `content_hash` (BLAKE3 of the
+        // ciphertext), the same scheme `POST /api/v1/claims` attests a row
+        // with. `None` throughout when no key is configured: the sealed row
+        // is then left unsigned rather than keeping a signature over the
+        // plaintext digest (see statement 2).
+        let resigned: Vec<Option<Vec<u8>>> = match attest {
+            None => vec![None; items.len()],
+            Some(k) => items
+                .iter()
+                .map(|i| {
+                    let digest: [u8; 32] =
+                        i.content_hash
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| DbError::InvalidData {
+                                reason: format!(
+                                    "content_hash for claim {} is {} bytes; a BLAKE3 digest is 32",
+                                    i.claim_id,
+                                    i.content_hash.len()
+                                ),
+                            })?;
+                    Ok(Some(
+                        k.signer
+                            .sign_entity(epigraph_crypto::SignedEntity::Claim, &digest)
+                            .to_vec(),
+                    ))
+                })
+                .collect::<Result<_, DbError>>()?,
+        };
+        let resigner: Option<Uuid> = attest.map(|k| k.signer_id);
 
         // 1. The ciphertext row. ON CONFLICT DO NOTHING is what makes a
         //    re-delivered commit a no-op; the RETURNING set is what bounds
         //    every statement after it. `ORDER BY t.claim_id` is the lock
         //    order: 227's trigger locks each claim row as its row is inserted.
+        //    It also takes the PRE-SEAL STASH (migration 357): the claim's
+        //    `signature` / `signer_id` as they are now, before statement 2
+        //    replaces them, with `pre_seal_stashed` saying the stash was
+        //    taken. A LEFT JOIN, so a claim id with no row still fails on
+        //    the foreign key rather than being skipped.
         let sealed: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
             r"
             INSERT INTO public.claim_encryption
                    (claim_id, group_id, epoch, privacy_tier,
-                    encrypted_content, encrypted_labels, encrypted_properties)
-            SELECT t.claim_id, $5, $6, $7, t.content_ct, t.labels_ct, t.props_ct
+                    encrypted_content, encrypted_labels, encrypted_properties,
+                    pre_seal_signature, pre_seal_signer_id, pre_seal_stashed)
+            SELECT t.claim_id, $5, $6, $7, t.content_ct, t.labels_ct, t.props_ct,
+                   c.signature, c.signer_id, true
               FROM unnest($1::uuid[], $2::bytea[], $3::bytea[], $4::bytea[])
                 AS t(claim_id, content_ct, labels_ct, props_ct)
+              LEFT JOIN public.claims c ON c.id = t.claim_id
              ORDER BY t.claim_id
             ON CONFLICT (claim_id) DO NOTHING
             RETURNING claim_id
@@ -3971,24 +4025,36 @@ impl PrivatizationRepository {
             return Ok(Vec::new());
         }
 
-        // 2. The claim itself.
+        // 2. The claim itself. Its signature is REPLACED (backlog aa366aa6):
+        //    the original is a signature over BLAKE3 of the plaintext, so
+        //    left here it would no longer verify over the row's digest, and
+        //    it would let anyone who reads the row confirm a guessed
+        //    plaintext against the signer's public key. Statement 1 stashed
+        //    it; the row now carries the server's signature over the
+        //    ciphertext digest, signed as `resigner`, or no signature at all
+        //    when no key is configured.
         sqlx::query(&format!(
             r"
             UPDATE public.claims c
                SET content = {SEAL_CONTENT_SENTINEL},
                    content_hash = t.content_hash,
+                   signature = t.signature,
+                   signer_id = CASE WHEN t.signature IS NULL THEN NULL ELSE $4::uuid END,
                    embedding = NULL,
                    embedding_3072 = NULL,
                    labels = ARRAY[]::text[],
                    properties = '{{}}'::jsonb,
                    updated_at = now()
-              FROM unnest($1::uuid[], $2::bytea[]) AS t(claim_id, content_hash)
+              FROM unnest($1::uuid[], $2::bytea[], $5::bytea[])
+                AS t(claim_id, content_hash, signature)
              WHERE c.id = t.claim_id AND c.id = ANY($3)
             "
         ))
         .bind(&claim_ids)
         .bind(&hashes)
         .bind(&sealed)
+        .bind(resigner)
+        .bind(&resigned)
         .execute(&mut *conn)
         .await
         .map_err(|source| DbError::QueryFailed { source })?;
@@ -4208,15 +4274,25 @@ impl PrivatizationRepository {
             }
         }
         if !evidence_ids.is_empty() {
-            sqlx::query(
+            // The pre-seal stash again (migration 357): the row's signature
+            // is over its plaintext digest, the oracle backlog 12b68201
+            // removed from `content_hash`. RETURNING names the rows whose
+            // stash this statement took; only those lose their signature
+            // below, so a row whose ciphertext row already existed keeps
+            // the signature nothing stashed.
+            let stashed: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
                 r"
                 INSERT INTO public.evidence_encryption
                        (evidence_id, group_id, epoch, privacy_tier,
-                        encrypted_content, encrypted_properties)
-                SELECT t.evidence_id, $4, $5, $6, t.content_ct, t.props_ct
+                        encrypted_content, encrypted_properties,
+                        pre_seal_signature, pre_seal_signer_id, pre_seal_stashed)
+                SELECT t.evidence_id, $4, $5, $6, t.content_ct, t.props_ct,
+                       e.signature, e.signer_id, true
                   FROM unnest($1::uuid[], $2::bytea[], $3::bytea[])
                     AS t(evidence_id, content_ct, props_ct)
+                  LEFT JOIN public.evidence e ON e.id = t.evidence_id
                 ON CONFLICT (evidence_id) DO NOTHING
+                RETURNING evidence_id
                 ",
             )
             .bind(&evidence_ids)
@@ -4225,10 +4301,13 @@ impl PrivatizationRepository {
             .bind(group_id)
             .bind(epoch)
             .bind(SEALED_PRIVACY_TIER)
-            .execute(&mut *conn)
+            .fetch_all(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?;
 
+            // The evidence row is NOT re-signed: its digest becomes the
+            // id-derived [`SEAL_EVIDENCE_DIGEST_SENTINEL`], so a server
+            // signature over it would attest nothing about the row.
             sqlx::query(&format!(
                 r"
                 UPDATE public.evidence e
@@ -4237,12 +4316,15 @@ impl PrivatizationRepository {
                        embedding = NULL,
                        embedding_3072 = NULL,
                        properties = '{{}}'::jsonb,
-                       source_url = NULL
+                       source_url = NULL,
+                       signature = CASE WHEN e.id = ANY($3) THEN NULL ELSE e.signature END,
+                       signer_id = CASE WHEN e.id = ANY($3) THEN NULL ELSE e.signer_id END
                  WHERE e.id = ANY($1)
                 "
             ))
             .bind(&evidence_ids)
             .bind(SEAL_EVIDENCE_SENTINEL)
+            .bind(&stashed)
             .execute(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?;
@@ -4464,6 +4546,17 @@ impl PrivatizationRepository {
     /// runs, the claim is embedding-less, which the CLAUDE.md audit reports as a
     /// live gap rather than hiding.
     ///
+    /// # The signature IS restored
+    ///
+    /// From the pre-seal stash [`Self::seal_claims_conn`] took (migration
+    /// 357), byte for byte, on the claim and on each restored evidence row:
+    /// once the plaintext is back the server's signature over the ciphertext
+    /// digest no longer describes the row, and the original, over the
+    /// plaintext digest, does again. A ciphertext row written without the
+    /// stash (`pre_seal_stashed = false`: sealed before 357, or by an older
+    /// binary) leaves the row's signature as it is, because that seal never
+    /// replaced it.
+    ///
     /// # What unseal does NOT restore
     ///
     /// The deleted extractions. They are stated in the seal preview, and
@@ -4517,6 +4610,13 @@ impl PrivatizationRepository {
         // Bounded to rows that carry a ciphertext row BOUND TO THIS GROUP, so an
         // unseal can neither rewrite a claim that was never sealed nor reach a
         // claim sealed under another group's key.
+        //
+        // The signature comes back from the pre-seal stash (migration 357,
+        // backlog aa366aa6), byte for byte, wherever the seal took one: the
+        // server's signature over the ciphertext digest no longer describes
+        // the row once its plaintext is back. A row sealed without the stash
+        // (before 357, or by an older binary) still carries its original
+        // signature, so it is left as it is.
         let restored: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
             r"
             UPDATE public.claims c
@@ -4524,12 +4624,16 @@ impl PrivatizationRepository {
                    content_hash = t.content_hash,
                    labels = ARRAY(SELECT jsonb_array_elements_text(t.labels)),
                    properties = t.properties,
+                   signature = CASE WHEN ce.pre_seal_stashed
+                                    THEN ce.pre_seal_signature ELSE c.signature END,
+                   signer_id = CASE WHEN ce.pre_seal_stashed
+                                    THEN ce.pre_seal_signer_id ELSE c.signer_id END,
                    updated_at = now()
               FROM unnest($1::uuid[], $2::text[], $3::bytea[], $4::jsonb[], $5::jsonb[])
                 AS t(claim_id, content, content_hash, labels, properties)
+              JOIN public.claim_encryption ce
+                ON ce.claim_id = t.claim_id AND ce.group_id = $6
              WHERE c.id = t.claim_id
-               AND EXISTS (SELECT 1 FROM public.claim_encryption ce
-                            WHERE ce.claim_id = c.id AND ce.group_id = $6)
             RETURNING c.id
             ",
         )
@@ -4624,20 +4728,26 @@ impl PrivatizationRepository {
             // claim while it was sealed. Evidence has no unique key (migration
             // 171), so both rows stay, as any stored duplicate does; the unseal
             // is not refused.
+            //
+            // The signature comes back from the pre-seal stash where the
+            // seal took one (migration 357), as on the claim.
             sqlx::query(
                 r"
                 UPDATE public.evidence e
                    SET raw_content = t.raw_content,
                        properties = t.properties,
                        source_url = COALESCE(t.source_url, e.source_url),
-                       content_hash = COALESCE(t.body_hash, t.content_hash, e.content_hash)
+                       content_hash = COALESCE(t.body_hash, t.content_hash, e.content_hash),
+                       signature = CASE WHEN ee.pre_seal_stashed
+                                        THEN ee.pre_seal_signature ELSE e.signature END,
+                       signer_id = CASE WHEN ee.pre_seal_stashed
+                                        THEN ee.pre_seal_signer_id ELSE e.signer_id END
                   FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::text[],
                               $6::bytea[], $7::bytea[])
                     AS t(evidence_id, claim_id, raw_content, properties, source_url,
                          content_hash, body_hash)
+                  JOIN public.evidence_encryption ee ON ee.evidence_id = t.evidence_id
                  WHERE e.id = t.evidence_id AND e.claim_id = t.claim_id
-                   AND EXISTS (SELECT 1 FROM public.evidence_encryption ee
-                                WHERE ee.evidence_id = e.id)
                 ",
             )
             .bind(&evidence_ids)
