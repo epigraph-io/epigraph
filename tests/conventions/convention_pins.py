@@ -336,4 +336,40 @@ PINS: tuple[Pin, ...] = (
         needle="gets a `content_pins` entry in that repository's registry",
         incident="4caaec8e",
     ),
+    # --- The conjunct screen's one gated refusal (atomicity.rs, CLAUDE.md) ---
+    Pin(
+        id="atomicity-module-doc-names-the-gated-refusal",
+        file="crates/epigraph-core/src/atomicity.rs",
+        section_start="//! The atomicity heuristic: is a claim already one atomic proposition?",
+        section_end="pub const ATOMIC_MAX_CHARS",
+        needle="**The screen refuses a write in one case only** (backlog `40cdb432`):",
+        incident="40cdb432",
+    ),
+    Pin(
+        id="conjunct-screen-struct-doc-names-the-gated-refusal",
+        file="crates/epigraph-core/src/atomicity.rs",
+        section_start="/// What [`conjunct_screen`] counted in one claim's text.",
+        section_end="pub struct ConjunctScreen {",
+        needle="refuses nothing except under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse`",
+        incident="40cdb432",
+    ),
+    Pin(
+        id="conjunct-screen-fn-doc-says-why-errors-are-accepted",
+        file="crates/epigraph-core/src/atomicity.rs",
+        section_start="/// Estimate how many logically independent assertions `text` makes.",
+        section_end="pub fn conjunct_screen(",
+        needle="refusal is opt-in, off by default, and narrow (see the module doc)",
+        incident="40cdb432",
+    ),
+    Pin(
+        id="claude-md-belief-modes-names-the-gated-refusal",
+        file="CLAUDE.md",
+        section_start="## Belief modes",
+        section_end=None,
+        needle=(
+            "under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse` a `contradicts` or "
+            "`refutes` edge onto a target that screens compound"
+        ),
+        incident="40cdb432",
+    ),
 )

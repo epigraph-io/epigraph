@@ -7,13 +7,24 @@
 //! `query_undecomposed_claims` flags them with the same function, so the two
 //! surfaces cannot disagree about which rows are atomic.
 //!
-//! [`conjunct_screen`] is the finer, warn-only measure: an estimated count of
-//! independent assertions per claim. `looks_atomic` decides what
-//! `decompose_claims` skips by default; the screen decides what is reported as
-//! compound (the `submit_claim` and `ingest_document` warnings, the
-//! `screen_claim_atomicity` and `query_compound_claims` MCP tools, the
-//! `atomicity_sweep` label and `decompose_claims --redecompose`). A claim can
-//! look atomic and still screen compound ("X rose, but Y fell.").
+//! [`conjunct_screen`] is the finer measure: an estimated count of
+//! independent assertions per claim, a warning everywhere but in the one gated
+//! refusal below. `looks_atomic` decides what `decompose_claims` skips by
+//! default; the screen decides what is reported as compound (the
+//! `submit_claim` and `ingest_document` warnings, the `screen_claim_atomicity`
+//! and `query_compound_claims` MCP tools, the `atomicity_sweep` label and
+//! `decompose_claims --redecompose`). A claim can look atomic and still screen
+//! compound ("X rose, but Y fell.").
+//!
+//! **The screen refuses a write in one case only** (backlog `40cdb432`):
+//! `epigraph_engine::contradiction_guard`, when the server runs
+//! `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse`, refuses a `contradicts` or
+//! `refutes` edge (MCP `link_epistemic`, REST `POST /api/v1/edges`) onto a
+//! target that screens compound and has no in-force `decomposes_to` children,
+//! before anything is written. Under the default, `warn`, the edge is written
+//! and the response flags it (`partial_contradiction_risk`). No other surface
+//! refuses anything on the screen; the remedy for a refusal is to decompose
+//! the target and aim at the atom actually disputed.
 //!
 //! **[`conjunct_screen`] is the one canonical conjunct count** (backlog
 //! `74580d03`): every surface that reports a count of a claim's independent
@@ -194,8 +205,9 @@ pub const COMPOUND_MIN_CONJUNCTS: usize = 2;
 ///
 /// The components are reported, not only the total, so a caller can see WHY a
 /// claim screened compound: a narrative protocol or postmortem claim is
-/// legitimately long, and the screen is a warning and a discovery key, never a
-/// rejection.
+/// legitimately long, and the screen is a warning and a discovery key. It
+/// refuses nothing except under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse`
+/// (the one gated refusal, described in the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConjunctScreen {
     /// Sentences, by [`sentence_count`]'s boundaries except one right after
@@ -255,8 +267,11 @@ const CLAUSE_CONNECTORS: [&str; 9] = [
 ///   uncertainty, a range written in words), so two quantities alone do not
 ///   make a claim compound, and three do.
 ///
-/// Its errors run in both directions and are accepted because nothing is
-/// refused on it. A noun-phrase `and` ("apples and pears are fruit") is not
+/// Its errors run in both directions. They are accepted because its one
+/// refusal is opt-in, off by default, and narrow (see the module doc): under
+/// `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse` a false positive blocks only a
+/// `contradicts` or `refutes` edge onto a target with no `decomposes_to`
+/// children, and decomposing that target first clears it. A noun-phrase `and` ("apples and pears are fruit") is not
 /// counted, so "X rose and Y fell" without a comma is missed; a comma list
 /// opened by an introductory phrase ("In May, X rose, and Y fell") reads as a
 /// list and its join is missed; a non-restrictive `, which` that only
