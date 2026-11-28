@@ -944,7 +944,7 @@ async fn a_non_superuser_maintenance_member_still_seals_at_233(pool: PgPool) {
         let run = async {
             let mut tx = sqlx::Connection::begin(&mut *conn).await?;
             let sealed =
-                PrivatizationRepository::seal_claims_conn(&mut tx, group_a, 0, &items).await;
+                PrivatizationRepository::seal_claims_conn(&mut tx, group_a, 0, &items, None).await;
             match sealed {
                 Ok(s) => {
                     tx.commit().await?;

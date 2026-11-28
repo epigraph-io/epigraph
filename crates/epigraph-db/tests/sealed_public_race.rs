@@ -925,7 +925,7 @@ impl Act {
         use epigraph_db::repos::privatization::PrivatizationRepository as R;
         match *self {
             Act::Seal { group } => {
-                R::seal_claims_conn(conn, group, 0, &[seal_item(hi), seal_item(lo)]).await
+                R::seal_claims_conn(conn, group, 0, &[seal_item(hi), seal_item(lo)], None).await
             }
             Act::Unseal { group } => {
                 R::unseal_claims_conn(conn, group, &[unseal_item(hi), unseal_item(lo)]).await
@@ -1133,7 +1133,7 @@ async fn a_multi_claim_unseal_and_publicize_in_opposite_orders_do_not_deadlock(p
     for claim in [hi, lo] {
         let mut tx = pool.begin().await.expect("begin the seal");
         let sealed =
-            PrivatizationRepository::seal_claims_conn(&mut tx, group, 0, &[seal_item(claim)])
+            PrivatizationRepository::seal_claims_conn(&mut tx, group, 0, &[seal_item(claim)], None)
                 .await
                 .expect("seal the claim first");
         tx.commit().await.expect("commit the seal");
