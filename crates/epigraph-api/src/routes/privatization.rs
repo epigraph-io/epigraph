@@ -3551,15 +3551,8 @@ async fn record_custodial_act(
     )
     .await
     .map_err(|err| {
-        let ended = matches!(
-            &err,
-            epigraph_db::DbError::QueryFailed { source }
-                if source
-                    .as_database_error()
-                    .and_then(sqlx::error::DatabaseError::code)
-                    .as_deref()
-                    == Some("CUS04")
-        );
+        let ended =
+            epigraph_db::refusal_codes::route_code(&err) == Some(epigraph_db::refusal_codes::CUS04);
         if ended {
             ApiError::Forbidden {
                 reason: "not a platform custodian".to_string(),

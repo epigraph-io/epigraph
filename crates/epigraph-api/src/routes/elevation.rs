@@ -219,7 +219,7 @@ pub async fn create_ticket(
         Ok(id) => id,
         Err(e) => {
             return Err(match db_refusal(&e) {
-                Some((code, message)) if code == "ELV02" => {
+                Some((code, message)) if code == epigraph_db::refusal_codes::ELV02 => {
                     tracing::info!(
                         target: "elevation",
                         principal = ?auth.agent_id,
@@ -230,11 +230,13 @@ pub async fn create_ticket(
                         reason: format!("elevation refused: {message}"),
                     }
                 }
-                Some((code, _)) if code == "ELV06" => ApiError::Conflict {
-                    reason: "this refresh family is already elevated; end it first \
+                Some((code, _)) if code == epigraph_db::refusal_codes::ELV06 => {
+                    ApiError::Conflict {
+                        reason: "this refresh family is already elevated; end it first \
                              (POST /api/v1/elevation/end)"
-                        .into(),
-                },
+                            .into(),
+                    }
+                }
                 Some((code, message)) if code == "22004" => ApiError::BadRequest { message },
                 _ => internal("elevation::create_ticket", "open the ticket", &e),
             })

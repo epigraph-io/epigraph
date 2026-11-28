@@ -132,6 +132,9 @@ use epigraph_db::{
     CeremonyEnrollment, CeremonyTicket, Confirmation, DbError, ElevationCeremony, EnrollmentAnchor,
     PasskeyCeremony, StandingCeremony, TicketPasskey, VerifiedPasskey,
 };
+// The ceremony definers' refusals each route answers itself (migrations
+// 124, 125, 130), recognised through the refusal-code registry.
+use epigraph_db::refusal_codes::{route_code, ELV01, ELV03, ELV04, ELV06, ELV08};
 use epigraph_passkey::{
     act_challenge as act_challenge_of, ActAnchor, AuthenticationState, LineagePasskey,
     PasskeyError, Passkeys, RegistrationState, StandingAnchor, StandingRefusal, StoredPasskey,
@@ -345,17 +348,6 @@ fn internal(what: &str, e: &dyn std::fmt::Display) -> Response {
     )
 }
 
-/// The SQLSTATE a definer raised, when the error carries one.
-fn sqlstate(e: &DbError) -> Option<String> {
-    match e {
-        DbError::QueryFailed { source } => source
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .map(|c| c.to_string()),
-        _ => None,
-    }
-}
-
 fn passkeys(state: &AppState) -> Option<Arc<Passkeys>> {
     state.passkeys.clone()
 }
@@ -540,7 +532,7 @@ pub async fn enroll_challenge(State(state): State<AppState>, Path(id): Path<Uuid
     };
     match PasskeyCeremony::store_challenge(&mut conn, id, &ceremony.to_json()).await {
         Ok(()) => harden((StatusCode::OK, Json(options)).into_response()),
-        Err(err) if sqlstate(&err).as_deref() == Some("ELV04") => not_live(),
+        Err(err) if route_code(&err) == Some(ELV04) => not_live(),
         Err(err) => internal("store the challenge", &err),
     }
 }
@@ -657,9 +649,9 @@ pub async fn enroll_finish(
             "credential_already_registered",
             "this authenticator credential is already registered",
         ),
-        Err(err) => match sqlstate(&err).as_deref() {
-            Some("ELV04") => not_live(),
-            Some("ELV01") => json_error(
+        Err(err) => match route_code(&err) {
+            Some(ELV04) => not_live(),
+            Some(ELV01) => json_error(
                 StatusCode::FORBIDDEN,
                 "subject_not_eligible",
                 "the principal of this enrollment may no longer hold a passkey",
@@ -824,7 +816,7 @@ pub async fn ticket_challenge(State(state): State<AppState>, Path(id): Path<Uuid
     };
     match ElevationCeremony::store_challenge(&mut conn, id, &ceremony.to_json()).await {
         Ok(()) => harden((StatusCode::OK, Json(options)).into_response()),
-        Err(e) if sqlstate(&e).as_deref() == Some("ELV06") => ticket_not_live(),
+        Err(e) if route_code(&e) == Some(ELV06) => ticket_not_live(),
         Err(e) => internal("store the challenge", &e),
     }
 }
@@ -880,7 +872,7 @@ fn confirmation_response(id: Uuid, mode: &str, c: &Confirmation) -> Response {
 /// A confirm definer's raised refusal (ELV06: the ticket stopped being live,
 /// or its family is already elevated), or a failure.
 fn confirm_failed(e: &DbError) -> Response {
-    if sqlstate(e).as_deref() == Some("ELV06") {
+    if route_code(e) == Some(ELV06) {
         json_error(
             StatusCode::CONFLICT,
             "elevation_not_possible",
@@ -1241,7 +1233,7 @@ pub async fn act_challenge(State(state): State<AppState>, Path(id): Path<Uuid>) 
     });
     match AdminActCeremony::store_challenge(&mut conn, id, &state_json).await {
         Ok(()) => harden((StatusCode::OK, Json(options)).into_response()),
-        Err(e) if matches!(sqlstate(&e).as_deref(), Some("ELV08" | "ELV03")) => act_not_live(),
+        Err(e) if matches!(route_code(&e), Some(ELV08 | ELV03)) => act_not_live(),
         Err(e) => internal("store the challenge", &e),
     }
 }
@@ -1327,7 +1319,7 @@ fn act_confirmation_response(id: Uuid, kind: &str, c: &ActConfirmation) -> Respo
 /// An act confirm definer's raised refusal (ELV08: the act stopped being
 /// live), or a failure.
 fn act_confirm_failed(e: &DbError) -> Response {
-    if sqlstate(e).as_deref() == Some("ELV08") {
+    if route_code(e) == Some(ELV08) {
         json_error(
             StatusCode::CONFLICT,
             "act_not_confirmable",

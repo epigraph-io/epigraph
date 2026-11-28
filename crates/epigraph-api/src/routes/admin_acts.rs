@@ -170,7 +170,7 @@ pub async fn propose_act(
         Ok(id) => id,
         Err(e) => {
             return Err(match db_refusal(&e) {
-                Some((code, _)) if code == "ELV07" => {
+                Some((code, _)) if code == epigraph_db::refusal_codes::ELV07 => {
                     tracing::info!(
                         target: "elevation.act",
                         principal = ?auth.agent_id,
