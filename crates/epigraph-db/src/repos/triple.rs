@@ -5,7 +5,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 /// A row from the triples table with joined entity names
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct TripleRow {
     pub id: Uuid,
     pub claim_id: Uuid,
@@ -349,9 +349,9 @@ impl TripleRepository {
 
     /// Return all triples associated with a specific claim.
     ///
-    /// Enables the embedding-fallback path in the `search_triples` MCP tool,
-    /// where claims are located by embedding similarity and triples are retrieved
-    /// by claim_id.
+    /// The single-claim form of [`Self::get_by_claims`], which the
+    /// `search_triples` MCP tool's embedding-fallback path uses (claims located
+    /// by embedding similarity, their triples retrieved by claim_id).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -409,6 +409,62 @@ impl TripleRepository {
                 created_at: r.created_at,
             })
             .collect())
+    }
+
+    /// The triples of several claims in ONE statement (backlog d69a4d24).
+    ///
+    /// The answer is [`Self::get_by_claim`] called for each id in
+    /// `claim_ids` in turn, concatenated and cut at `limit`: the claims in
+    /// the order given, each claim's triples by confidence, highest first.
+    /// `search_triples` (MCP) used to make exactly those calls, one round trip
+    /// per embedding hit, and truncate afterwards.
+    ///
+    /// Filters `t` through the viewer splice, as `get_by_claim` does (it joins
+    /// no `claims`, so `t` is the only alias).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn get_by_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<TripleRow>, DbError> {
+        if claim_ids.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT t.id,
+                   t.claim_id,
+                   t.subject_id,
+                   se.canonical_name  AS subject_name,
+                   t.predicate,
+                   t.object_id,
+                   oe.canonical_name  AS object_name,
+                   t.object_literal,
+                   t.confidence,
+                   t.extractor,
+                   t.properties,
+                   t.created_at
+            FROM unnest($1::uuid[]) WITH ORDINALITY AS want(claim_id, ord)
+            JOIN  triples t   ON t.claim_id = want.claim_id
+            JOIN  entities se ON se.id = t.subject_id
+            LEFT JOIN entities oe ON oe.id = t.object_id
+            WHERE true /* {VISIBILITY:t} */
+            ORDER BY want.ord, t.confidence DESC
+            LIMIT $2
+            "#,
+            3,
+        );
+        let mut q = sqlx::query_as::<_, TripleRow>(&sql)
+            .bind(claim_ids)
+            .bind(limit);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Return `true` if at least one triple exists for the given claim.
