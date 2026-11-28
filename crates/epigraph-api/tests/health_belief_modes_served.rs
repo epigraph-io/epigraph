@@ -89,7 +89,10 @@ async fn a_configured_strict_mode_is_reported_as_served_legacy_on_both_surfaces(
         .expect("system_stats returns a text block");
     let stats: serde_json::Value = serde_json::from_str(&text).expect("system_stats is JSON");
 
-    assert_eq!(stats["belief_modes"]["compound_belief"], "strict", "{stats}");
+    assert_eq!(
+        stats["belief_modes"]["compound_belief"], "strict",
+        "{stats}"
+    );
     assert_eq!(
         stats.get("belief_modes_served"),
         health.get("belief_modes_served"),

@@ -40,7 +40,10 @@ const KEY: [(&str, &str); 8] = [
     ("EPIGRAPH_ATOM_FOLD", "atom_fold"),
     ("EPIGRAPH_COMPOUND_BELIEF", "compound_belief"),
     ("EPIGRAPH_COMPOUND_WRITE_GUARD", "compound_write_guard"),
-    ("EPIGRAPH_CONTRADICT_COMPOUND_GUARD", "contradict_compound_guard"),
+    (
+        "EPIGRAPH_CONTRADICT_COMPOUND_GUARD",
+        "contradict_compound_guard",
+    ),
     ("EPIGRAPH_COMPOUND_SOURCE_EDGES", "compound_source_edges"),
     ("EPIGRAPH_ATOM_CACHE_MODE", "atom_cache_mode"),
     ("EPIGRAPH_INFERENCE", "inference"),

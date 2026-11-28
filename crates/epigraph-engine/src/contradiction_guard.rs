@@ -208,7 +208,14 @@ mod tests {
             assert!(is_contradiction(rel), "{rel}");
             assert!(screen(rel, COMPOUND).is_some(), "{rel}");
         }
-        for rel in ["supports", "corroborates", "qualifies", "cites", "contradict", ""] {
+        for rel in [
+            "supports",
+            "corroborates",
+            "qualifies",
+            "cites",
+            "contradict",
+            "",
+        ] {
             assert!(!is_contradiction(rel), "{rel}");
             assert!(screen(rel, COMPOUND).is_none(), "{rel}");
         }

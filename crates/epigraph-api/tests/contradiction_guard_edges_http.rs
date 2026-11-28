@@ -153,9 +153,14 @@ async fn warn_writes_the_edge_and_flags_the_partial_contradiction_risk(pool: PgP
     let target = claim(&pool, agent, COMPOUND_TEXT).await;
 
     for relationship in ["CONTRADICTS", "refutes"] {
-        let (status, body) = post(&pool, &state, agent, claim_edge(source, target, relationship))
-            .await
-            .unwrap_or_else(|e| panic!("warn writes the {relationship} edge: {e:?}"));
+        let (status, body) = post(
+            &pool,
+            &state,
+            agent,
+            claim_edge(source, target, relationship),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("warn writes the {relationship} edge: {e:?}"));
         assert_eq!(status, StatusCode::CREATED, "{relationship}");
         let wire = serde_json::to_value(&body).expect("response JSON");
         let risk = wire
@@ -169,7 +174,11 @@ async fn warn_writes_the_edge_and_flags_the_partial_contradiction_risk(pool: PgP
             "{wire}"
         );
     }
-    assert_eq!(edges_between(&pool, source, target).await, 2, "both written");
+    assert_eq!(
+        edges_between(&pool, source, target).await,
+        2,
+        "both written"
+    );
 
     // One journal line per accepted edge, naming the caller.
     let caller_id = agent.to_string();
@@ -184,7 +193,9 @@ async fn warn_writes_the_edge_and_flags_the_partial_contradiction_risk(pool: PgP
         if accepted.iter().all(|l| l.contains(&caller_id)) {
             Ok(())
         } else {
-            Err(format!("an accepted line lacks the caller {caller_id}: {accepted:?}"))
+            Err(format!(
+                "an accepted line lacks the caller {caller_id}: {accepted:?}"
+            ))
         }
     });
     assert!(
@@ -201,9 +212,14 @@ async fn refuse_answers_422_and_writes_nothing(pool: PgPool) {
     let target = claim(&pool, agent, COMPOUND_TEXT).await;
 
     for relationship in ["contradicts", "Refutes"] {
-        let err = post(&pool, &state, agent, claim_edge(source, target, relationship))
-            .await
-            .expect_err("refuse must refuse a contradiction onto an undecomposed compound");
+        let err = post(
+            &pool,
+            &state,
+            agent,
+            claim_edge(source, target, relationship),
+        )
+        .await
+        .expect_err("refuse must refuse a contradiction onto an undecomposed compound");
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -230,7 +246,10 @@ async fn refuse_answers_422_and_writes_nothing(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_atomic_target_a_decomposed_target_and_a_positive_edge_are_unaffected(pool: PgPool) {
     let (agent, _) = seed_agent_with_group(&pool, "73317662-unaffected").await;
-    for mode in [ContradictCompoundGuard::Refuse, ContradictCompoundGuard::Warn] {
+    for mode in [
+        ContradictCompoundGuard::Refuse,
+        ContradictCompoundGuard::Warn,
+    ] {
         let state = state(&pool, mode).await;
         let source = claim(&pool, agent, "rest source").await;
         let atom = claim(&pool, agent, "the catalyst raised the yield.").await;
@@ -246,9 +265,14 @@ async fn an_atomic_target_a_decomposed_target_and_a_positive_edge_are_unaffected
             (decomposed, "refutes"),
             (compound, "supports"),
         ] {
-            let (status, body) = post(&pool, &state, agent, claim_edge(source, target, relationship))
-                .await
-                .unwrap_or_else(|e| panic!("{mode:?} {relationship}: {e:?}"));
+            let (status, body) = post(
+                &pool,
+                &state,
+                agent,
+                claim_edge(source, target, relationship),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?} {relationship}: {e:?}"));
             assert_eq!(status, StatusCode::CREATED, "{mode:?} {relationship}");
             let wire = serde_json::to_value(&body).expect("response JSON");
             assert!(

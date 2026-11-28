@@ -131,7 +131,9 @@ async fn warn_writes_the_edge_and_flags_the_partial_contradiction_risk(pool: PgP
         if accepted.iter().all(|l| l.contains(&caller_id)) {
             Ok(())
         } else {
-            Err(format!("an accepted line lacks the caller {caller_id}: {accepted:?}"))
+            Err(format!(
+                "an accepted line lacks the caller {caller_id}: {accepted:?}"
+            ))
         }
     });
     assert!(
@@ -177,7 +179,10 @@ async fn refuse_writes_nothing(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_atomic_target_a_decomposed_target_and_a_positive_edge_are_unaffected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    for mode in [ContradictCompoundGuard::Refuse, ContradictCompoundGuard::Warn] {
+    for mode in [
+        ContradictCompoundGuard::Refuse,
+        ContradictCompoundGuard::Warn,
+    ] {
         let server = server(&pool, mode).await;
         let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
 
