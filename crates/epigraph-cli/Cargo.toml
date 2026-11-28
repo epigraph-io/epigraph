@@ -31,6 +31,12 @@ name = "cache_owner_audit"
 path = "tests/cache_owner_audit.rs"
 required-features = ["db"]
 
+# Backlog fe1cdcdf: `analyze_graph`'s role-aware claim load.
+[[test]]
+name = "analyze_graph_roles"
+path = "tests/analyze_graph_roles.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "recompute_betp"
 path = "src/bin/recompute_betp.rs"

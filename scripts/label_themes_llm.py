@@ -75,6 +75,13 @@ from maintenance_dsn import maintenance_dsn
 psycopg2.extras.register_uuid()
 
 RESULT_DIR = "/tmp/theme_labels"
+
+# Migration 193's definer-rights role test, TRUE exactly when the claim bound
+# as $1 is a compound (claim_role::IS_COMPOUND_SQL decided on the whole
+# graph). The same text as the Rust constant
+# epigraph_db::repos::mass_function::IS_COMPOUND_DEFINER_CALL, which
+# crates/epigraph-db/tests/no_role_blind_belief_reads.rs pins this line to.
+IS_COMPOUND_DEFINER_CALL = "public.epigraph_claim_is_compound($1)"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CLI_CWD = os.path.dirname(SCRIPT_DIR)  # repo root
 # How long call_claude_cli keeps looking for a result file the model wrote with
@@ -414,10 +421,19 @@ def latest_cluster_run(conn):
 
 def load_neighborhoods_with_samples(conn, run_id, limit=None):
     """Load run `run_id`'s graph neighbourhoods (largest first) and up to 10 of
-    each one's current PUBLIC members (theme_lib.public_label_source), highest
-    pignistic probability first. `claim_count` is the number of such members,
-    so nothing about private members reaches the prompt. A neighbourhood with
-    no public member comes back with no samples."""
+    each one's current PUBLIC non-compound members
+    (theme_lib.public_label_source), highest pignistic probability first.
+    `claim_count` is the number of such members, so nothing about private
+    members reaches the prompt. A neighbourhood with no such member comes back
+    with no samples.
+
+    Role-aware (backlog fe1cdcdf): a compound's cached BetP is a fold of its
+    own BBAs, not a belief, so a compound is no sample and is not counted. The
+    role is migration 193's structural definer (IS_COMPOUND_DEFINER_CALL), the
+    kernel's one whole-graph role decision; run_one_theme already keeps
+    compounds out of a neighbourhood, so this drops only a member that became
+    a compound after the clustering run."""
+    is_compound = IS_COMPOUND_DEFINER_CALL.replace("$1", "c.id")
     out = []
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         sql = """
@@ -440,6 +456,7 @@ def load_neighborhoods_with_samples(conn, run_id, limit=None):
                 WHERE m.run_id = %s AND m.neighborhood_id = %s
                   AND c.is_current
                   AND {theme_lib.public_label_source("c")}
+                  AND NOT {is_compound}
                 ORDER BY c.pignistic_prob DESC NULLS LAST, c.id
                 LIMIT 10
                 """,

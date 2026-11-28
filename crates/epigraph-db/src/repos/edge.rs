@@ -3137,7 +3137,11 @@ impl EdgeRepository {
     /// # Arguments
     /// * `pool` - Database connection pool
     /// * `agent_id` - The agent UUID to find attributed claims for
-    /// * `min_truth` - Minimum truth value filter (inclusive)
+    /// * `min_truth` - Minimum truth value filter (inclusive). It is role-aware
+    ///   (backlog ef58c6ad): a compound's cached `truth_value` is a fold of
+    ///   its own BBAs, not a belief, so under a gate (`min_truth > 0`) a
+    ///   compound is excluded; at `0` the gate is vacuous and every attributed
+    ///   claim, compounds included, is listed.
     /// * `limit` - Maximum number of results
     /// * `offset` - Number of results to skip
     ///
@@ -3156,7 +3160,8 @@ impl EdgeRepository {
         offset: i64,
     ) -> Result<Vec<AttributedClaimRow>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &format!(
+                r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id,
                    c.trace_id, c.created_at, c.updated_at,
                    e.properties AS edge_properties
@@ -3166,11 +3171,13 @@ impl EdgeRepository {
               AND e.target_type = 'agent'
               AND e.source_type = 'claim'
               AND e.relationship IN ('attributed_to', 'ATTRIBUTED_TO')
-              AND c.truth_value >= $2
-              /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */
+              AND {gate}
+              /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:c}} */
             ORDER BY c.created_at DESC
             LIMIT $3 OFFSET $4
             "#,
+                gate = attribution_truth_gate(),
+            ),
             5,
         );
         let mut q = sqlx::query_as::<_, AttributedClaimRow>(&sql)
@@ -3186,7 +3193,8 @@ impl EdgeRepository {
         Ok(rows)
     }
 
-    /// Count claims attributed to an agent via ATTRIBUTED_TO edges.
+    /// Count claims attributed to an agent via ATTRIBUTED_TO edges, under the
+    /// same role-aware truth gate as [`Self::get_claims_attributed_to`].
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -3198,7 +3206,8 @@ impl EdgeRepository {
         min_truth: f64,
     ) -> Result<i64, DbError> {
         let sql = viewer.splice(
-            r#"
+            &format!(
+                r#"
             SELECT COUNT(*)
             FROM edges e
             JOIN claims c ON e.source_id = c.id
@@ -3206,9 +3215,11 @@ impl EdgeRepository {
               AND e.target_type = 'agent'
               AND e.source_type = 'claim'
               AND e.relationship IN ('attributed_to', 'ATTRIBUTED_TO')
-              AND c.truth_value >= $2
-              /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */
+              AND {gate}
+              /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:c}} */
             "#,
+                gate = attribution_truth_gate(),
+            ),
             3,
         );
         let mut q = sqlx::query_as::<_, (i64,)>(&sql)
@@ -3221,6 +3232,20 @@ impl EdgeRepository {
 
         Ok(row.0)
     }
+}
+
+/// The attribution readers' truth gate on `$2` over their `claims c` row
+/// (backlog ef58c6ad): with `$2 > 0` a claim passes when it is a
+/// non-compound whose `truth_value` reaches `$2`; a compound
+/// (`claim_role::IS_COMPOUND_SQL`) has no belief of its own to reach it and
+/// is excluded. With `$2 <= 0` the gate is vacuous and every claim passes, as
+/// the old `c.truth_value >= $2` did. One spelling for the list and its
+/// count, so the two describe one set.
+fn attribution_truth_gate() -> String {
+    format!(
+        "($2 <= 0 OR (c.truth_value >= $2 AND NOT {compound}))",
+        compound = crate::repos::claim_role::is_compound_sql("c"),
+    )
 }
 
 /// Row type for claims attributed to an agent via ATTRIBUTED_TO edges

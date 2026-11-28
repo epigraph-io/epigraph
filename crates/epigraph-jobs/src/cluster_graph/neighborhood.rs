@@ -6,11 +6,17 @@
 //!
 //! A claim is included in the theme subgraph when it:
 //!   - has `claims.theme_id = <theme>`, AND
-//!   - has **no outgoing** `decomposes_to` edge (i.e. it is a leaf in the
-//!     decomposition tree — an atom or a standalone claim).
+//!   - is neither a compound nor procedural by the ONE role spelling
+//!     (`epigraph_db::repos::claim_role::{IS_COMPOUND_SQL, IS_PROCEDURAL_SQL}`;
+//!     backlog fe1cdcdf): an atom, a standalone claim, or a rule.
 //!
-//! This deliberately matches how the visualizer defines an "atom": the
-//! finest-grained epistemic unit that has no further sub-structure.
+//! A compound's cached BetP is a fold of its own BBAs, not a belief derived
+//! from its leaves, so it must not enter a neighbourhood's `mean_betp`. The
+//! role decides "compound" over IN-FORCE `decomposes_to` edges to current
+//! children: a claim whose decomposition was retired is an atom again. (This
+//! replaced a hand-rolled "has any `decomposes_to` out-edge" test, which read
+//! retired edges too and excluded every procedural interior node but kept
+//! procedural leaves.)
 //!
 //! ## Edge weights
 //!
@@ -35,6 +41,7 @@
 
 use std::collections::HashMap;
 
+use epigraph_db::repos::claim_role::{is_compound_sql, is_procedural_sql};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -142,26 +149,29 @@ async fn run_one_theme(
     theme_id: Uuid,
     cfg: &Config,
 ) -> Result<(), sqlx::Error> {
-    // Fetch atomic/standalone claims: those in this theme that have no
-    // outgoing `decomposes_to` edge (i.e. they are leaves in the claim tree).
-    // Uses DISTINCT ON (c.id) to collapse multiple frame memberships to one row.
-    let atoms: Vec<AtomRow> = sqlx::query_as::<_, AtomRow>(
+    // Fetch the theme's atoms: every claim in this theme that is neither a
+    // compound nor procedural by the ONE role spelling (`claim_role`; backlog
+    // fe1cdcdf). A compound's cached BetP is a fold of its own BBAs, not a
+    // belief, so it stays out of the neighbourhood and its `mean_betp`; a
+    // workflow tree's truth is a lifecycle marker. Uses DISTINCT ON (c.id) to
+    // collapse multiple frame memberships to one row.
+    let atoms_sql = format!(
         r#"
         SELECT DISTINCT ON (c.id) c.id, c.pignistic_prob, cf.frame_id
         FROM claims c
         LEFT JOIN claim_frames cf ON cf.claim_id = c.id
         WHERE c.theme_id = $1
-          AND NOT EXISTS (
-              SELECT 1 FROM edges e
-              WHERE e.source_id = c.id
-                AND e.relationship = 'decomposes_to'
-          )
+          AND NOT {compound}
+          AND NOT {procedural}
         ORDER BY c.id, cf.frame_id
         "#,
-    )
-    .bind(theme_id)
-    .fetch_all(pool)
-    .await?;
+        compound = is_compound_sql("c"),
+        procedural = is_procedural_sql("c"),
+    );
+    let atoms: Vec<AtomRow> = sqlx::query_as::<_, AtomRow>(&atoms_sql)
+        .bind(theme_id)
+        .fetch_all(pool)
+        .await?;
 
     if atoms.is_empty() {
         return Ok(());
