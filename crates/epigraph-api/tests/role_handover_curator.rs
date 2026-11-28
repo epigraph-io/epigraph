@@ -39,11 +39,14 @@
 //! still the submitter's operator; the step lands in `H1`'s own group). Step
 //! 5 holds.
 //!
-//! [`a_role_handover_keeps_the_curator_publishing_and_moves_authority`] is the
-//! whole target and is `#[ignore]`d with the failing steps named.
-//! [`a_role_handover_today`] runs every step and pins what each one does now,
-//! so the ignored test cannot silently rot: when a transfer verb lands, the
-//! pin goes red and the ignored test should be un-ignored.
+//! The TARGET is the five steps above, every one holding. It is not a test
+//! function of its own: an `#[ignore]`d target would need a CI lane that runs
+//! it (the `ignored_tests_have_a_lane` ratchet), and a target that is meant to
+//! fail would keep that lane red. [`a_role_handover_today`] runs every step
+//! and pins what each one does now (steps 3 and 4b do not hold), so when a
+//! transfer verb lands, or the operator arm stops admitting the previous
+//! holder, the pin goes red and should be turned into the target's assertion
+//! that every step holds.
 #![cfg(feature = "db")]
 
 #[path = "viewer_fixture.rs"]
@@ -526,19 +529,6 @@ async fn may_run(pool: &PgPool, agent: Uuid) -> (bool, String) {
     .await
 }
 
-/// THE TARGET: every step does what the handover needs.
-#[sqlx::test(migrations = "../../migrations")]
-#[ignore = "fails at step 3 (the curator publishes generation 1 after the handover: refused, \
-            its linked human is the previous holder and no verb moves it) and at step 4b (the \
-            previous holder adds a step to the curator's PUBLIC workflow through the upward \
-            operator arm); see a_role_handover_today"]
-async fn a_role_handover_keeps_the_curator_publishing_and_moves_authority(pool: PgPool) {
-    let outcomes = run_handover(&pool).await.outcomes;
-    let failed: Vec<_> = outcomes.iter().filter(|(_, r)| r.is_err()).collect();
-    assert!(failed.is_empty(), "failed steps: {failed:#?}");
-    assert_eq!(outcomes.len(), 6, "every step ran: {outcomes:#?}");
-}
-
 /// THE PIN: what each step does today. Steps 1, 2, 4a and 5 hold. Step 3 is
 /// refused: after the handover the curator no longer derives `G` (179: an
 /// attached agent is a member only while its OWN human holds the role), so
@@ -568,7 +558,7 @@ async fn a_role_handover_today(pool: PgPool) {
             ("4b: H1 is refused on the public workflow", false),
             ("5: H2 adds a step to the private workflow", true),
         ],
-        "today's outcomes changed; update the pin and the ignored target: {outcomes:#?}"
+        "today's outcomes changed; update the pin (and the module doc's target): {outcomes:#?}"
     );
     let step3 = outcomes[2].1.as_ref().expect_err("step 3 is refused");
     assert!(
