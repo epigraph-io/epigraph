@@ -766,6 +766,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_symmetric_if_absent_row_signed_conn",
             "EdgeRepository::owned_by_session",
             "EventRepository::publish_or_log_conn",
+            // backlog b4c2fc2f: the compound-target decomposition test for a
+            // `contradicts` / `refutes` edge, read on the caller-stamped
+            // transaction before any write, over a target the handler has
+            // already read through the viewer.
+            "decide",
             "entity_exists",
             "entity_exists",
             "is_valid_entity_type",
