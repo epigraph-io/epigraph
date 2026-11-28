@@ -210,6 +210,71 @@ async fn mark_duplicate_migrates_edges_to_canonical(pool: PgPool) {
     );
 }
 
+/// `seed_edge`, returning the new edge's id.
+async fn seed_edge_id(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties, created_at) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', $3, '{}'::jsonb, NOW()) RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Backlog 356207d8: the canonical already points AT the duplicate
+/// (`canonical -> dup`, CORROBORATES and supports), the orientation of the
+/// 2026-06-17 repro. `mark_duplicate_migrates_edges_to_canonical` seeds only
+/// `dup -> canonical`, which the OUTGOING re-point's guard covers; this one
+/// reaches the INCOMING re-point, whose `AND NOT (source_type = 'claim' AND
+/// source_id = $1)` keeps both edges on the duplicate. Re-pointed, each would
+/// become a `canonical -> canonical` self-loop.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_keeps_canonical_to_dup_edges_on_dup(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, agent, "canonical").await;
+    let dup = seed_claim(&pool, agent, "duplicate").await;
+
+    let corroborates = seed_edge_id(&pool, canonical, dup, "CORROBORATES").await;
+    let supports = seed_edge_id(&pool, canonical, dup, "supports").await;
+
+    ClaimRepository::mark_duplicate(
+        &pool,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark_duplicate with live canonical -> dup edges");
+
+    let (is_current,): (bool,) = sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+        .bind(dup)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!is_current, "the duplicate is retired");
+    assert_eq!(
+        edge_count(&pool, canonical, canonical).await,
+        0,
+        "created a canonical -> canonical self-loop"
+    );
+    for (name, edge) in [("CORROBORATES", corroborates), ("supports", supports)] {
+        let (source, target, live): (Uuid, Uuid, bool) = sqlx::query_as(
+            "SELECT source_id, target_id, valid_to IS NULL FROM edges WHERE id = $1",
+        )
+        .bind(edge)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (source, target, live),
+            (canonical, dup, true),
+            "the canonical -> dup {name} edge stays live on the duplicate"
+        );
+    }
+}
+
 /// Regression test for backlog 2905150e: mark_duplicate returned HTTP 500
 /// "Duplicate entity already exists" when dup and canonical already shared
 /// a graph edge via a third claim (diamond pattern).
