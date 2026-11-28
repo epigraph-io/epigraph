@@ -290,6 +290,17 @@ migrate to head (it used to skip silently).
   (vocabulary and procedure there; `.github/scripts/tests/test_spec_index.py`,
   in CI's `plan` job, fails when they disagree or a spec has no row).
 
+## Convention pins
+
+A convention line written because of an incident (a backlog item, an issue,
+a PR) gets a pin in the same change (`4caaec8e`), so a later edit cannot drop
+or move the rule unnoticed. In this repository that is a `Pin` in
+`tests/conventions/convention_pins.py`, naming the passage, the section it
+must stay inside and the incident; `tests/conventions` runs in CI's blocking
+`plan` job, and the registry's docstring says how to pick a needle. Prompt
+text that lives in the `epiclaw-workflows` repository instead (stored
+workflow step text) gets a `content_pins` entry in that repository's registry.
+
 ## Embedding policy
 
 **Invariant:** every **non-telemetry** claim with `is_current = true` should

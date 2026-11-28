@@ -308,4 +308,32 @@ PINS: tuple[Pin, ...] = (
         needle="Never register a first-party route under `/api/v1/ext`",
         incident="#481",
     ),
+    # --- CLAUDE.md, "Convention pins": this rule pins itself ---------------
+    Pin(
+        id="incident-convention-line-gets-a-pin",
+        file="CLAUDE.md",
+        section_start="## Convention pins",
+        section_end=None,
+        needle=(
+            "A convention line written because of an incident (a backlog item, "
+            "an issue, a PR) gets a pin in the same change"
+        ),
+        incident="4caaec8e",
+    ),
+    Pin(
+        id="convention-pins-names-this-registry",
+        file="CLAUDE.md",
+        section_start="## Convention pins",
+        section_end=None,
+        needle="a `Pin` in `tests/conventions/convention_pins.py`",
+        incident="4caaec8e",
+    ),
+    Pin(
+        id="convention-pins-names-the-prompt-registry",
+        file="CLAUDE.md",
+        section_start="## Convention pins",
+        section_end=None,
+        needle="gets a `content_pins` entry in that repository's registry",
+        incident="4caaec8e",
+    ),
 )
