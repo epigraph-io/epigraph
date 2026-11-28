@@ -130,6 +130,7 @@ fn params(query: &str, diversity_radius: Option<f64>, include_workflows: bool) -
         offset: None,
         epistemic_partition: false,
         diversity_radius,
+        route: None,
     }
 }
 

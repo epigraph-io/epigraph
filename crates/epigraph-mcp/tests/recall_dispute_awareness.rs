@@ -98,6 +98,7 @@ fn params(query: &str, exclude_contested: bool) -> RecallParams {
         offset: None,
         epistemic_partition: false,
         diversity_radius: None,
+        route: None,
     }
 }
 

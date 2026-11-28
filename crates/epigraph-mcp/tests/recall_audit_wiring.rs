@@ -90,6 +90,7 @@ fn params(query: &str) -> RecallParams {
         offset: None,
         epistemic_partition: false,
         diversity_radius: None,
+        route: None,
     }
 }
 

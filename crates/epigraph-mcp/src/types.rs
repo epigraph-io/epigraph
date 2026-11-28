@@ -970,6 +970,53 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub diversity_radius: Option<f64>,
+
+    #[schemars(
+        description = "Retrieval route. \"similarity\" (the default) is the hybrid dense + lexical \
+                       page alone. \"auto\" adds a theme leg only when that page is SPARSE: fewer \
+                       than min(5, limit) hits, or a best dense similarity below 0.4. The theme \
+                       leg takes the query's 3 nearest themes by centroid and their current \
+                       members you may read, nearest first, and merges them into the page by \
+                       reciprocal rank (k = 60) before min_truth and limit apply, so a claim \
+                       whose theme is near the query can surface although the claim itself is \
+                       not. \"hierarchical\" serves the theme leg ALONE (theme members only; no \
+                       coverage fields, since no hybrid pool ran). A theme hit carries \"theme\" \
+                       in matched_via, and on a page the theme leg touched rrf_score is the \
+                       merged score. When route is given the response carries route_used: the \
+                       route that actually produced the page, so \"similarity\" when auto found \
+                       the page full and strong, when the embedder was down, or when the theme \
+                       read failed; and, when the theme leg ran, theme_leg {themes: [{theme_id, \
+                       label}], added: the returned claims that only the theme leg supplied}. \
+                       auto and hierarchical are REJECTED with tags, agent_id, offset, \
+                       theme_id or theme_label, which the theme leg cannot honour, and \
+                       hierarchical also with include_workflows=true; since is honoured. \
+                       Themes are only those with at least one current member you may read. Unknown values are rejected. Omitted: byte-identical to recall \
+                       before this parameter existed."
+    )]
+    #[serde(default)]
+    pub route: Option<RecallRouteParam>,
+}
+
+/// The spelling of `recall`'s `route` parameter (backlog a47df8ed); see
+/// [`RecallParams::route`]. Mapped onto the engine's
+/// [`epigraph_engine::recall::RecallRoute`], whose `as_str` is also the audit
+/// spelling, so the parameter and the audit row cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RecallRouteParam {
+    Similarity,
+    Auto,
+    Hierarchical,
+}
+
+impl From<RecallRouteParam> for epigraph_engine::recall::RecallRoute {
+    fn from(p: RecallRouteParam) -> Self {
+        match p {
+            RecallRouteParam::Similarity => Self::Similarity,
+            RecallRouteParam::Auto => Self::Auto,
+            RecallRouteParam::Hierarchical => Self::Hierarchical,
+        }
+    }
 }
 
 // ── Ingestion ──
@@ -2157,7 +2204,9 @@ pub struct RecallResult {
     pub similarity: f64,
     /// Reciprocal Rank Fusion score (primary ordering).
     pub rrf_score: f64,
-    /// Which legs matched: subset of `["dense","lexical"]`.
+    /// Which legs matched: subset of `["dense","lexical","theme"]`. `"theme"`
+    /// appears only when `recall`'s `route` ran the theme leg (backlog
+    /// a47df8ed) and that leg ranked this claim.
     pub matched_via: Vec<String>,
     /// Per-claim belief under the requested `(frame, perspective)` lens.
     /// Present only when a lens was supplied; omitted (not null) otherwise, so

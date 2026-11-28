@@ -114,6 +114,7 @@ async fn recall_include_workflows_true_returns_matching_workflow(pool: PgPool) {
         offset: None,
         epistemic_partition: false,
         diversity_radius: None,
+        route: None,
     };
 
     let out = recall_with_pgvec(&server, &viewer, params, Some(pgvec))
@@ -179,6 +180,7 @@ async fn recall_include_workflows_false_excludes_workflow_only_match(pool: PgPoo
         offset: None,
         epistemic_partition: false,
         diversity_radius: None,
+        route: None,
     };
 
     // include_workflows defaults false: the workflows leg must not even be

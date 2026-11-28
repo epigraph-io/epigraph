@@ -677,6 +677,7 @@ async fn plain_recall_lens_attaches_diverging_belief(pool: PgPool) {
                 offset: None,
                 epistemic_partition: false,
                 diversity_radius: None,
+                route: None,
             },
         )
     };
@@ -814,6 +815,7 @@ async fn plain_recall_lens_degrades_one_bad_claim_without_failing_page(pool: PgP
             offset: None,
             epistemic_partition: false,
             diversity_radius: None,
+            route: None,
         },
     )
     .await

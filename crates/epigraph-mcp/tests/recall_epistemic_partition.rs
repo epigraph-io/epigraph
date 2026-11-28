@@ -115,6 +115,7 @@ fn params(query: &str, epistemic_partition: bool) -> RecallParams {
         offset: None,
         epistemic_partition,
         diversity_radius: None,
+        route: None,
     }
 }
 
