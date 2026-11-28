@@ -1363,7 +1363,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // write: `EdgeRepository::create_if_not_exists_signed_conn`,
     // `EdgeRepository::create_symmetric_if_absent_oriented_signed_conn`; opener:
     // `claim_helper::begin_author_stamped_tx`; authority: `EdgeRepository::owned_by_session`;
-    // stamped: `EdgeRepository::is_in_force`; audit: `EventRepository::publish_or_log_conn`.
+    // stamped: `EdgeRepository::is_in_force`, `contradiction_guard::decide` (backlog b4c2fc2f:
+    // the compound-target decomposition test for a `contradicts` / `refutes` edge, read on the
+    // author-stamped transaction before any write; the text it screens is the target the caller
+    // already read through the viewer); audit: `EventRepository::publish_or_log_conn`.
     (
         "link_epistemic.rs",
         "do_link_epistemic",
@@ -1374,6 +1377,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::owned_by_session",
             "EventRepository::publish_or_log_conn",
             "claim_helper::begin_author_stamped_tx",
+            "contradiction_guard::decide",
         ],
     ),
     // write: `EdgeRepository::create_if_not_exists_signed_conn`,
