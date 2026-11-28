@@ -363,6 +363,17 @@ impl From<sqlx::Error> for DbError {
             // `ForeignKeyViolation`, which routes match on.
             sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
                 if crate::refusal_codes::caller_refusal_code(db_err.message()).is_some() {
+                    // DETAIL is what the reply withholds (TEN04 moved the
+                    // claim id there), and `Refused` carries only the
+                    // message, so the server log keeps it here.
+                    let db_detail = db_err
+                        .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                        .and_then(sqlx::postgres::PgDatabaseError::detail);
+                    tracing::warn!(
+                        detail = %db_err.message(),
+                        db_detail = ?db_detail,
+                        "the database refused the request (a coded 23503)"
+                    );
                     Self::Refused {
                         kind: RefusalKind::Input,
                         message: db_err.message().to_string(),
