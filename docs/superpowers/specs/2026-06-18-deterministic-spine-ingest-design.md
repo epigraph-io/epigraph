@@ -1,7 +1,8 @@
 # Deterministic Verbatim Spine for Hierarchical Ingest — Design Spec
 
 **Date:** 2026-06-18
-**Status:** Approved (brainstorming) + Council-amended — ready for implementation planning
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). `crates/epigraph-ingest/src/document/structure.rs`, the `structure_source` tool, `hierarchical_extraction_v2`.
+**Original status:** Approved (brainstorming) + Council-amended — ready for implementation planning
 **Scope:** `document` ingest path only (papers / sources). The parallel
 `workflow` path (`Step.compound`) is explicitly out of scope.
 **Revision:** v2 of this spec — amended after an adversarial Council-of-Critics

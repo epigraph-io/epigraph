@@ -1,5 +1,7 @@
 # Review-Divergence: Documenting Expected Behavior (2026-07-11)
 
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). A policy note: its decision (document, do not backfill) needs no code.
+
 ## Status
 
 Design note / policy documentation. No code change. Written to close backlog Part 10 Task 10.3

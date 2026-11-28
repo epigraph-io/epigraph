@@ -5,6 +5,17 @@
 //! - Event history for replay and audit
 //! - Subscription management with filtering by event type
 //!
+//! # Scope in the running system
+//!
+//! The bus is in-process and in-memory. Only `epigraph-api` depends on this
+//! crate: its webhook dispatcher is the one wired subscriber, and three of
+//! its handlers are the only publishers (`ClaimSubmitted` from the packet
+//! submit and supersede routes, `ClaimChallenged` from the challenge route).
+//! The MCP server, the CLI and every other API route publish nothing here,
+//! history is lost on restart, and nothing replays it. The durable event log
+//! is a different thing, the `events` table (`epigraph_db::EventRepository`).
+//! `docs/deploy.md` ("What webhooks see", backlog 5902eed5) has the list.
+//!
 //! # Core Types
 //!
 //! - [`EpiGraphEvent`]: Enum of all system events

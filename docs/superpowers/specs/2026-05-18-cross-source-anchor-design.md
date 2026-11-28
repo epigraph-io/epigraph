@@ -1,7 +1,8 @@
 # Cross-Source Anchor: Linking Paper Claims to Textbook Concepts
 
 **Date:** 2026-05-18
-**Status:** Design — awaiting review
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). The four `scripts/` passes and the `INSTANTIATES` relation are in the tree; the k-means prototype it extended was retired later.
+**Original status:** Design — awaiting review
 **Author:** Jeremy Barton (with Claude)
 
 ## Problem

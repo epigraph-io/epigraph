@@ -1,6 +1,7 @@
 # Onboarding documentation for EpiGraph and Episcience
 
-**Status:** Draft — awaiting user review
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). `README.md` and `docs/intro/01-05` (the episcience half was not checked).
+**Original status:** Draft — awaiting user review
 **Owners:** Jeremy Barton
 **Repos affected:** `epigraph-io/epigraph`, `epigraph-io/episcience`
 **Date:** 2026-05-19

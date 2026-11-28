@@ -2,7 +2,8 @@
 
 **Date:** 2026-04-30 (revised after entity-table CHECK discovery)
 **Author:** Jeremy Barton (with `code-graph-extractor` agent — fresh Ed25519 signer keypair)
-**Status:** Spec — pending implementation plan
+**Status:** implemented-with-deviations (checked against origin/main ad30094c5, 2026-11-27). The tool is `crates/epigraph-cli/examples/table_graph/`, not a `crates/epigraph-tools` crate.
+**Original status:** Spec — pending implementation plan
 
 ## Goal
 

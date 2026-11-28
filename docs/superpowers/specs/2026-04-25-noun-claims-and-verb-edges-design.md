@@ -6,7 +6,8 @@
 
 **Date:** 2026-04-25
 **Branch:** `chore/migration-renumber-2026-04-25` (lands in PR #6)
-**Status:** Approved for spec → plan → implementation
+**Status:** implemented-with-deviations (checked against origin/main ad30094c5, 2026-11-27). Landed as #16; the `UNIQUE (content_hash, agent_id)` constraint was later dropped (migration 150) for an advisory lock. See docs/superpowers/README.md.
+**Original status:** Approved for spec → plan → implementation
 **Sub-project of:** Noun-Claims and Verb-Edges architecture (S1 of S1–S4)
 
 ---

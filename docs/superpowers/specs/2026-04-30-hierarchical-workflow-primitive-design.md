@@ -6,7 +6,7 @@
 **Date:** 2026-04-30
 **Author:** brainstorming with the user, captured here
 
-**Status (checked against the tree 2026-11-14): implemented, with deviations from this text.** The design below is kept as written; where it and the code differ, the code is right:
+**Status:** implemented-with-deviations (checked against origin/main ad30094c5, 2026-11-27); first checked 2026-11-14. The design below is kept as written; where it and the code differ, the code is right:
 
 - **`store_workflow` was not left untouched.** "Coexistence and deprecation" says the flat tools "keep working unchanged". `store_workflow` (`crates/epigraph-mcp/src/tools/workflows.rs`) now builds a `WorkflowExtraction` and runs the hierarchical ingest: it writes a `workflows` row and step claims and returns a workflows-table id, not a flat-JSON claim id.
 - **The read and outcome tools were bridged, not unified.** `find_workflow` searches both stores (flat `workflow`-labelled claims and `workflows` rows); `report_workflow_outcome` delegates to `report_hierarchical_outcome` when given a workflows-table id. Both families are still registered on the MCP server: `store_workflow` and `ingest_workflow`, `find_workflow` and `find_workflow_hierarchical`, `report_workflow_outcome` and `report_hierarchical_outcome`.
