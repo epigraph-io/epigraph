@@ -5376,6 +5376,31 @@ the commit that closes it. No block is open.
 
 | Block | Held for |
 |-------|----------|
+- **360**: `role_owner_may_run` (backlog 6e633456). 166's `epigraph_role_agent_may_run(agent)`
+  answers `unattached -> may run` for an identity that was never attached to any role, so a role's
+  schedule run by such an identity ran in the role's gap. Adds `epigraph_role_owner_may_run(p_role_id
+  uuid, p_agent uuid) RETURNS text` (plpgsql, VOLATILE, SECURITY DEFINER, `SET search_path =
+  pg_catalog, pg_temp`, every name qualified, no writes): `p_role_id` is the role's node
+  (`platform_roles.role_node_id`); the answer is `not_attached` when the agent holds no live
+  `role_agents` row for the role (166's gate predicate at `clock_timestamp()`; succession copies
+  count, as for the gate), else `held` when some human holds the role (the gate's `no_holder` arm
+  over `epigraph_live_role_assignment`), else `no_holder`. `not_attached` is decided first. A NULL
+  argument or a uuid that is no role's node raises 22023, never 42883. Under a wrong owner (which
+  would read no `role_agents` row) it raises 166's ROL01 instead of answering `not_attached`. Owner
+  `epigraph_maintenance` (registered at 360 in `tenancy_backfill.rs`); EXECUTE to
+  `epigraph_identity_attestor` and the owner only, revoked from PUBLIC and `epigraph_app` (where the
+  attestor is created after this file, grant it with 161's recipe, as 166 section 4 says). Pinned by
+  `epigraph-db/tests/role_attached_agents.rs` (`owner_may_run_answers_held_no_holder_and_not_attached`,
+  `owner_may_run_counts_a_succession_copy_as_attached`,
+  `owner_may_run_refuses_an_unknown_role_or_a_swapped_call`,
+  `the_app_role_cannot_execute_owner_may_run`,
+  `a_misowned_owner_may_run_refuses_rather_than_answer_not_attached`,
+  `the_360_undo_restores_the_catalog_below_360`) and
+  `agent_identity_lineage.rs`'s attestor grant sweep. Undo: `docs/runbooks/360-undo.sql` (drops the
+  function; the host then runs owner-role schedules unchecked, with a warning). **Deploy order:**
+  either; a host that asks before 360 gets 42883 and runs the schedule as before. After deploy,
+  measure: `SELECT has_function_privilege('<host attestor login>',
+  'public.epigraph_role_owner_may_run(uuid, uuid)', 'EXECUTE');` must be true.
 
 ## `-- no-transaction` migrations
 
