@@ -246,3 +246,32 @@ async fn a_refute_that_lowers_a_cached_claim_is_not_warned(pool: PgPool) {
         "no refute-direction warning when the refute lowered belief: {json}"
     );
 }
+
+/// The no-cache case names its own cause: a claim with `truth_value` 0.0 and
+/// no cache is folded with its seed BBA, which the belief profile bounds to
+/// `truth_seed_min` (above 0.0). A weak refute can then land between 0.0 and
+/// that bound, above the prior, and the warning must blame the seed bound,
+/// not a stale cache the claim never had.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_no_cache_refute_above_a_zero_truth_value_names_the_seed_bound(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let claim = seed_claim(&pool, "b191f198 zero truth_value claim for a refute", 0.0).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    let json = run_update(&server, &viewer, claim, 0.01, false).await;
+
+    assert!(
+        json.get("pignistic_before")
+            .is_some_and(serde_json::Value::is_null)
+            && json["pignistic_prob"].as_f64() > Some(0.0),
+        "fixture premise: no cache, and the fold lands above truth_value 0.0; got {json}"
+    );
+    let warning = json["warning"].as_str().unwrap_or_default();
+    assert!(
+        warning.contains("Refuting evidence left belief above")
+            && warning.contains("truth_seed_min")
+            && !warning.contains("stale cache"),
+        "a no-cache refute above the prior must name the seed bound, not a stale cache; \
+         got {json}"
+    );
+}

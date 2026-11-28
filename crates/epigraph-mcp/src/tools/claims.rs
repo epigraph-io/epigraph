@@ -2121,13 +2121,23 @@ pub async fn update_with_evidence(
     // frame this fold does not read) is replaced by it. Without this note a
     // refute read as raising belief, with no word on why.
     if !params.supports && ds.pignistic_prob > pre_belief {
+        // With no cache the prior was `truth_value`, seeded as a BBA bounded
+        // to the profile's seed range, so the cause named differs.
+        let cause = if pre_pignistic.is_some() {
+            "the pre-call cached value was below the fold of the BBAs already stored (a \
+             stale cache, or one carried from another frame)"
+        } else {
+            "the claim had no cached belief, so the prior was its truth_value, which the \
+             fold reads as a seed BBA bounded to the belief profile's truth_seed_min / \
+             truth_seed_max, together with any BBAs already stored: the bound or those \
+             BBAs put the fold above it"
+        };
         warnings.push(format!(
             "Refuting evidence left belief above the claim's pre-call belief: pignistic_prob \
              is {} after this call, above {pre_belief} before it (pignistic_before, or \
              truth_before when the claim had no cached belief). This call re-folded every \
-             stored two-hypothesis BBA of the claim, and the pre-call value was below the \
-             fold of the BBAs already stored (a stale cache, or one carried from another \
-             frame). The refute's own BBA is mass_function_id.",
+             stored two-hypothesis BBA of the claim, and {cause}. The refute's own BBA is \
+             mass_function_id.",
             ds.pignistic_prob
         ));
     }
