@@ -94,6 +94,10 @@ const CLAIM_ENCRYPTION: ColumnContract = &[
     ("encrypted_properties", "bytea", "YES"),
     ("epoch", "integer", "NO"),
     ("group_id", "uuid", "NO"),
+    // Migration 357: the pre-seal signature stash (backlog aa366aa6).
+    ("pre_seal_signature", "bytea", "YES"),
+    ("pre_seal_signer_id", "uuid", "YES"),
+    ("pre_seal_stashed", "boolean", "NO"),
     ("privacy_tier", "character varying", "NO"),
 ];
 
@@ -117,6 +121,10 @@ const EVIDENCE_ENCRYPTION: ColumnContract = &[
     ("epoch", "integer", "NO"),
     ("evidence_id", "uuid", "NO"),
     ("group_id", "uuid", "NO"),
+    // Migration 357: the pre-seal signature stash (backlog aa366aa6).
+    ("pre_seal_signature", "bytea", "YES"),
+    ("pre_seal_signer_id", "uuid", "YES"),
+    ("pre_seal_stashed", "boolean", "NO"),
     ("privacy_tier", "character varying", "NO"),
 ];
 
