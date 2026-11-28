@@ -5329,7 +5329,7 @@ restart.
   order. **Measure after deploy**: the deploy's end-state catalog check should show no `papers`
   column or column-ACL drift between a fresh migrate and the deployed database; this change did
   not measure parity with a deployed database.
-- **310**: `direct_writer_scope_read_committed` (backlog e39af056). Re-states 256's
+- **361**: `direct_writer_scope_read_committed` (backlog e39af056). Re-states 256's
   `epigraph_require_writer_scope` and 123's `epigraph_is_instance_admin` (md5 preconditions
   refuse to apply over any other body). (1) 122's DIRECT-membership writer arm admits a write
   only under READ COMMITTED, closing
@@ -5362,12 +5362,12 @@ restart.
   SERIALIZABLE and answered true read-only, and on 123's body each refused case is admitted;
   the undo, twice, and both refusals over a foreign body),
   `derived_writer_scope_read_committed.rs` (its REPEATABLE READ personal-group control is now
-  refused; its undo test runs 310's undo first) and
+  refused; its undo test runs 361's undo first) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
-  `docs/runbooks/310-undo.sql` (run it before `256-undo.sql` and before `123-undo.sql`).
+  `docs/runbooks/361-undo.sql` (run it before `256-undo.sql` and before `123-undo.sql`).
   **Deploy order:** none; no binary depends on it. Before applying, measure that no
   application-role login has a non-default `default_transaction_isolation`
-  (`pg_db_role_setting`): such a claim write by a bound principal is refused after 310, and a
+  (`pg_db_role_setting`): such a claim write by a bound principal is refused after 361, and a
   custodian's admin arm answers false on its read-write transactions; and measure whether the
   admin-scope switch is armed (armed, AK03 reads `epigraph_is_elevated()` instead). **Applied to throwaway databases only, NOT to any
   deployed database.**

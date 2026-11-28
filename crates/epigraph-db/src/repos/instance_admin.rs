@@ -233,7 +233,7 @@ impl InstanceAdminRepository {
             is_instance_admin,
             // Read in the same statement as condition 2 and filtered to it,
             // so a caller never records an act against an assignment
-            // condition 2 did not see. Since migration 310 condition 2 asks
+            // condition 2 did not see. Since migration 361 condition 2 asks
             // at the statement's clock while this asks at the transaction's
             // `now()`; on a request's own transaction the two agree, and
             // where they do not (an assignment granted after the transaction

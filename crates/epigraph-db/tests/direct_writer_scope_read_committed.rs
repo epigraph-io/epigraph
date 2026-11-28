@@ -1,4 +1,4 @@
-//! Migration 310: the DIRECT-membership arm of the claims-path writer scope
+//! Migration 361: the DIRECT-membership arm of the claims-path writer scope
 //! (122's arm of `epigraph_require_writer_scope`, OPL02, armed only) admits a
 //! write only under READ COMMITTED, and the custodian answer
 //! (`epigraph_is_instance_admin`) is decided at the statement's clock and, on
@@ -20,7 +20,7 @@
 //! * a human whose direct writer membership is revoked, or demoted to reader,
 //!   by another session after its REPEATABLE READ / SERIALIZABLE transaction
 //!   took its snapshot is refused OPL02 at its next write (it lands on 256's
-//!   body, which `the_310_undo_restores_256s_writer_scope` re-measures);
+//!   body, which `the_361_undo_restores_256s_writer_scope` re-measures);
 //! * under those levels the direct arm admits nothing, revoked or not, the
 //!   personal group included (the level decides, as 256 decides the derived
 //!   arm);
@@ -32,7 +32,7 @@
 //!   ELAPSES, mid-transaction is refused its next cross-group write under
 //!   each of the three levels, because 123's exemption is the privileged
 //!   session alone. The same test re-bodies the exemption to 122's form (the
-//!   custodian principal arm): over 310's `epigraph_is_instance_admin` the
+//!   custodian principal arm): over 361's `epigraph_is_instance_admin` the
 //!   ended / elapsed custodian is still refused, and over 123's (at `now()`,
 //!   any level) it WRITES, so the pin discriminates;
 //! * where the custodian answer IS a write admission (239's AK03 admin arm,
@@ -59,14 +59,14 @@ use uuid::Uuid;
 const OPL02: &str = "OPL02";
 const CUSTODIAN: &str = "role:platform-custodian";
 
-/// The words of 310's refusal, which no other OPL02 carries.
+/// The words of 361's refusal, which no other OPL02 carries.
 const DIRECT_ONLY_UNDER_RC: &str = "a write through a direct membership is admitted only under \
                                     READ COMMITTED";
 /// The words of 122/123's human OPL02 refusal.
 const HUMAN_SCOPE: &str = "a human writes only where it writes";
 
 /// md5 of `prosrc` of 256's body of `epigraph_require_writer_scope`, the
-/// body 310 re-states and its undo restores.
+/// body 361 re-states and its undo restores.
 const BODY_256: &str = "9693498b3365ddfa8f97d4ead83b2ee6";
 
 const RR: &str = "REPEATABLE READ";
@@ -361,7 +361,7 @@ async fn member(pool: &PgPool, label: &str) -> Member {
 /// THE DEFECT. Armed, a human with a direct writer row opens a REPEATABLE
 /// READ or SERIALIZABLE transaction; another session revokes the row, or
 /// demotes it to reader, and commits; the human's next write into the group
-/// is refused OPL02 (310). On 256's body it LANDS, because the direct arm
+/// is refused OPL02 (361). On 256's body it LANDS, because the direct arm
 /// reads the revoked row through the transaction's older snapshot (the undo
 /// test below re-measures that). CONTROL: under READ COMMITTED the same
 /// sequence, with a write through the arm before the change that lands, is
@@ -566,7 +566,7 @@ async fn a_custodian_ended_or_elapsed_mid_transaction_is_relieved_of_nothing(poo
     }
 
     // The mutation: 122's exemption (the custodian principal arm). Over
-    // 310's `epigraph_is_instance_admin` (the statement's clock, and READ
+    // 361's `epigraph_is_instance_admin` (the statement's clock, and READ
     // COMMITTED or read-only) even that exemption relieves the ended or
     // elapsed custodian of nothing.
     sqlx::raw_sql(
@@ -586,7 +586,7 @@ async fn a_custodian_ended_or_elapsed_mid_transaction_is_relieved_of_nothing(poo
             OPL02,
             HUMAN_SCOPE,
             &format!(
-                "122's exemption over 310's custodian answer, {isolation}, custodian {} \
+                "122's exemption over 361's custodian answer, {isolation}, custodian {} \
                  mid-transaction",
                 if elapse.is_some() { "elapsed" } else { "ended" }
             ),
@@ -611,7 +611,7 @@ async fn a_custodian_ended_or_elapsed_mid_transaction_is_relieved_of_nothing(poo
 
 /// 123's `epigraph_is_instance_admin`, byte for byte (the custodian answer at
 /// the transaction's `now()`, through its snapshot, at any level): the body
-/// 310 re-states, and the one `310-undo.sql` restores.
+/// 361 re-states, and the one `361-undo.sql` restores.
 const BODY_123_IS_INSTANCE_ADMIN: &str = "\
 CREATE OR REPLACE FUNCTION public.epigraph_is_instance_admin(p_agent uuid)
 RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER
@@ -757,7 +757,7 @@ async fn key_change_across(
     .await
 }
 
-/// THE CUSTODIAN HALF, where it is a write admission (310 section 1b).
+/// THE CUSTODIAN HALF, where it is a write admission (361 section 1b).
 /// While the admin-scope switch is unarmed, 239's key definer admits a
 /// change to ANOTHER agent's key for `epigraph_is_instance_admin(principal)`.
 /// Each case: a fresh human K granted role:platform-custodian, stamped on an
@@ -921,27 +921,27 @@ async fn writer_scope_catalog(
     .expect("catalog row")
 }
 
-/// `docs/runbooks/310-undo.sql` restores 256's writer scope and 123's
+/// `docs/runbooks/361-undo.sql` restores 256's writer scope and 123's
 /// `epigraph_is_instance_admin` byte for byte (owner, volatility, grants and
 /// search path kept), and a second run changes nothing. (What 123's custodian
 /// answer admits is re-measured by the AK03 test's mutation.) On the restored body the defect is back: a REPEATABLE READ or
 /// SERIALIZABLE member whose membership is revoked, or demoted, mid-
-/// transaction WRITES (the measurement that 310 is what refuses it). Over a
-/// foreign body both 310 and its undo refuse 55000 and leave it.
+/// transaction WRITES (the measurement that 361 is what refuses it). Over a
+/// foreign body both 361 and its undo refuse 55000 and leave it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_310_undo_restores_256s_writer_scope(pool: PgPool) {
-    let undo = repo_text("docs/runbooks/310-undo.sql");
-    let migration = repo_text("migrations/310_direct_writer_scope_read_committed.sql");
-    let at_310 = writer_scope_md5(&pool).await;
+async fn the_361_undo_restores_256s_writer_scope(pool: PgPool) {
+    let undo = repo_text("docs/runbooks/361-undo.sql");
+    let migration = repo_text("migrations/361_direct_writer_scope_read_committed.sql");
+    let at_361 = writer_scope_md5(&pool).await;
     assert_ne!(
-        at_310, BODY_256,
-        "CALIBRATION: 310 re-bodied the writer scope"
+        at_361, BODY_256,
+        "CALIBRATION: 361 re-bodied the writer scope"
     );
     let catalog = writer_scope_catalog(&pool).await;
-    let admin_at_310 = instance_admin_md5(&pool).await;
+    let admin_at_361 = instance_admin_md5(&pool).await;
     assert_ne!(
-        admin_at_310, ADMIN_123,
-        "CALIBRATION: 310 re-bodied the custodian answer"
+        admin_at_361, ADMIN_123,
+        "CALIBRATION: 361 re-bodied the custodian answer"
     );
     let admin_catalog = instance_admin_catalog(&pool).await;
 
@@ -985,17 +985,17 @@ async fn the_310_undo_restores_256s_writer_scope(pool: PgPool) {
         }
     }
 
-    // 310 re-applies over 256's body and refuses a foreign one, as does the
+    // 361 re-applies over 256's body and refuses a foreign one, as does the
     // undo (which opens its own transaction: end it on the same connection).
     sqlx::raw_sql(&migration)
         .execute(&pool)
         .await
-        .expect("310 re-applies over 256's body");
-    assert_eq!(writer_scope_md5(&pool).await, at_310, "310's body again");
+        .expect("361 re-applies over 256's body");
+    assert_eq!(writer_scope_md5(&pool).await, at_361, "361's body again");
     assert_eq!(
         instance_admin_md5(&pool).await,
-        admin_at_310,
-        "310's custodian answer again"
+        admin_at_361,
+        "361's custodian answer again"
     );
     sqlx::raw_sql(
         "CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, \
@@ -1011,7 +1011,7 @@ async fn the_310_undo_restores_256s_writer_scope(pool: PgPool) {
     assert_eq!(
         code_of(&r).as_deref(),
         Some("55000"),
-        "310 over a foreign body: {r:?}"
+        "361 over a foreign body: {r:?}"
     );
     let mut conn = pool.acquire().await.expect("acquire");
     let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;

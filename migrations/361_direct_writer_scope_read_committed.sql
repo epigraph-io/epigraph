@@ -1,4 +1,4 @@
--- 310: the DIRECT-membership arm of the claims-path writer scope admits a
+-- 361: the DIRECT-membership arm of the claims-path writer scope admits a
 -- write only under READ COMMITTED, and the custodian answer of
 -- `epigraph_is_instance_admin` is decided at the statement's clock and, on a
 -- read-write transaction, only under READ COMMITTED (backlog e39af056).
@@ -22,7 +22,7 @@
 -- every read of the arm where a locked re-read of the one membership row
 -- would not. Measured on a fresh database
 -- (`direct_writer_scope_read_committed.rs`): on 256's body such a writer,
--- whose membership is revoked mid-transaction, writes; on 310's it is
+-- whose membership is revoked mid-transaction, writes; on 361's it is
 -- refused.
 --
 -- Low while the request path runs READ COMMITTED (the default; no
@@ -52,7 +52,7 @@
 --
 -- Measured on a fresh database (`direct_writer_scope_read_committed.rs`):
 -- on 123's body such a custodian changes another agent's key status
--- (AK03 admits); on 310's it is refused.
+-- (AK03 admits); on 361's it is refused.
 --
 -- Low while the request path runs READ COMMITTED and the window is never
 -- bounded below a request's length; but the answer must be the current one.
@@ -117,7 +117,7 @@
 -- `crates/epigraph-cli/src/bin/tenancy_backfill.rs`; nothing is re-owned or
 -- re-granted. A later re-statement starts from this body and keeps every
 -- fragment `schema_contract.rs::migration_165_derived_arms_survive_at_head`
--- pins (310's included).
+-- pins (361's included).
 --
 -- PRECONDITION: the writer scope in place must be 256's (md5 of `prosrc`
 -- `9693498b3365ddfa8f97d4ead83b2ee6`) and `epigraph_is_instance_admin` must
@@ -133,7 +133,7 @@
 -- no login that writes claims on the application role runs at another
 -- default level (`default_transaction_isolation` set on the database or the
 -- role in `pg_db_role_setting`): such a write by a bound principal is
--- refused OPL02 after 310 (loud) instead of outliving a revoke (silent).
+-- refused OPL02 after 361 (loud) instead of outliving a revoke (silent).
 -- The same measurement covers the custodian change: at another default
 -- level an application-role custodian's admin arm answers false on every
 -- read-write transaction. Also measure whether the admin-scope switch is
@@ -141,7 +141,7 @@
 -- `epigraph_is_elevated()` instead, and the custodian change then touches
 -- only the admin read arms.
 --
--- UNDO: `docs/runbooks/310-undo.sql` restores 256's writer scope and 123's
+-- UNDO: `docs/runbooks/361-undo.sql` restores 256's writer scope and 123's
 -- `epigraph_is_instance_admin`; run it BEFORE `256-undo.sql` and BEFORE
 -- `123-undo.sql`.
 -- **Applied to throwaway databases only, NOT to any deployed database.**
@@ -154,8 +154,8 @@ BEGIN
     SELECT pg_catalog.md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
      WHERE p.oid = pg_catalog.to_regprocedure('public.epigraph_require_writer_scope(uuid, uuid)');
     IF v_found IS DISTINCT FROM '9693498b3365ddfa8f97d4ead83b2ee6' THEN
-        RAISE EXCEPTION '310: public.epigraph_require_writer_scope(uuid, uuid) is not the body '
-                        '310 re-states (256''s, md5 9693498b3365ddfa8f97d4ead83b2ee6); found '
+        RAISE EXCEPTION '361: public.epigraph_require_writer_scope(uuid, uuid) is not the body '
+                        '361 re-states (256''s, md5 9693498b3365ddfa8f97d4ead83b2ee6); found '
                         'md5 %. Another migration re-bodied it, or 256 is not applied; nothing '
                         'was changed', COALESCE(v_found, '(absent)')
             USING ERRCODE = '55000',
@@ -165,7 +165,7 @@ BEGIN
     SELECT pg_catalog.md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
      WHERE p.oid = pg_catalog.to_regprocedure('public.epigraph_is_instance_admin(uuid)');
     IF v_found IS DISTINCT FROM 'e72b915989c3a98801e795d4eb53b769' THEN
-        RAISE EXCEPTION '310: public.epigraph_is_instance_admin(uuid) is not the body 310 '
+        RAISE EXCEPTION '361: public.epigraph_is_instance_admin(uuid) is not the body 361 '
                         're-states (123''s, md5 e72b915989c3a98801e795d4eb53b769); found '
                         'md5 %. Another migration re-bodied it, or 123 is not applied; nothing '
                         'was changed', COALESCE(v_found, '(absent)')
@@ -177,7 +177,7 @@ END $$;
 
 -- The claims-path writer scope as 256 left it (122's body, 123's HINT, 165's
 -- derived arm, 166's ROL01 line, 256's READ COMMITTED condition on the
--- derived arm); delta: 310's READ COMMITTED condition on the direct arm and
+-- derived arm); delta: 361's READ COMMITTED condition on the direct arm and
 -- its refusal.
 CREATE OR REPLACE FUNCTION public.epigraph_require_writer_scope(p_agent uuid, p_group uuid)
 RETURNS void
@@ -198,7 +198,7 @@ BEGIN
     IF v_human IS NULL THEN
         RETURN;
     END IF;
-    -- 122's direct arm; 310: it admits only under READ COMMITTED. Under
+    -- 122's direct arm; 361: it admits only under READ COMMITTED. Under
     -- REPEATABLE READ or SERIALIZABLE it reads the transaction's first
     -- snapshot, so a membership revoked or demoted (and committed) since
     -- would still read as a live writer row; the level, not the old
@@ -210,7 +210,7 @@ BEGIN
     -- 165: the principal's own derived membership, by the viewer's rule, at
     -- this statement's clock (a transaction opened in the window does not
     -- keep writing past its end). Not evaluated when the direct arm already
-    -- decided (310: that write is refused below either way).
+    -- decided (361: that write is refused below either way).
     v_derived := NOT v_direct
                  AND EXISTS (SELECT 1
                                FROM public.epigraph_role_derived_memberships(p_agent, clock_timestamp()) d

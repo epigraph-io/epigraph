@@ -1024,7 +1024,7 @@ async fn write_in_txn(
 /// and a human write under READ COMMITTED; under REPEATABLE READ and
 /// SERIALIZABLE a human (never attached) passes ROL01 and is refused only by
 /// the writer scope's own READ COMMITTED rule for its direct membership
-/// (OPL02, migration 310), so ROL01's test stays on attachability.
+/// (OPL02, migration 361), so ROL01's test stays on attachability.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
     seed_role(&pool, ROLE).await;
@@ -1050,7 +1050,7 @@ async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
         );
         assert!(
             format!("{r:?}").contains("a write through a direct membership is admitted only"),
-            "CONTROL: a human under {level} is refused by 310's direct-arm rule: {r:?}"
+            "CONTROL: a human under {level} is refused by 361's direct-arm rule: {r:?}"
         );
         assert_rol01(
             &write_in_txn(&pool, attached, h_group, level, Between::Nothing).await,

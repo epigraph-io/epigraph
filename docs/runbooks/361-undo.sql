@@ -1,9 +1,9 @@
 -- ===================================================================
--- 310-undo.sql: take migration 310 (the direct-membership writer arm admits
+-- 361-undo.sql: take migration 361 (the direct-membership writer arm admits
 -- only under READ COMMITTED; the custodian answer is current) back out, in ONE
 -- transaction, on the migration (superuser) DSN.
 --
--- READ FIRST: no binary depends on 310, so nothing needs rolling back
+-- READ FIRST: no binary depends on 361, so nothing needs rolling back
 -- first. Run this BEFORE `256-undo.sql` when taking 256 out as well (that
 -- one refuses any body but 256's or 166's), and BEFORE `123-undo.sql`.
 --
@@ -12,22 +12,22 @@
 -- `CREATE OR REPLACE` keeps its owner and grants. From then on a bound
 -- principal under REPEATABLE READ or SERIALIZABLE writes through its human's
 -- direct membership again, and keeps writing after that membership is
--- revoked or demoted by another session, until its transaction ends (310's
+-- revoked or demoted by another session, until its transaction ends (361's
 -- header). It also re-states 123's body of
 -- `public.epigraph_is_instance_admin(uuid)` byte for byte: from then on the
 -- custodian answer is decided at the transaction's `now()` through its
 -- snapshot again, at any level.
 --
--- PRECONDITION: the body in place must be 310's (md5 of `prosrc`
--- `513b346945eeff4d760c558b7d43075f`) or already 256's
+-- PRECONDITION: the body in place must be 361's (md5 of `prosrc`
+-- `11dae73d40e89ed63d540f18c7b1e46d`) or already 256's
 -- (`9693498b3365ddfa8f97d4ead83b2ee6`, a second run); over any other body it
 -- raises 55000 and changes nothing (a later migration re-bodied it: undo
--- that one first). Likewise `epigraph_is_instance_admin` must be 310's
+-- that one first). Likewise `epigraph_is_instance_admin` must be 361's
 -- (`542b6e0a2b01069f1fad385b74e892c2`) or already 123's
 -- (`e72b915989c3a98801e795d4eb53b769`).
 --
--- WHAT IT LEAVES: 310's `_sqlx_migrations` row. Re-introducing the change
--- is a NEW migration, never a re-run of 310. Idempotent.
+-- WHAT IT LEAVES: 361's `_sqlx_migrations` row. Re-introducing the change
+-- is a NEW migration, never a re-run of 361. Idempotent.
 -- ===================================================================
 BEGIN;
 SET LOCAL lock_timeout = '3s';
@@ -38,10 +38,10 @@ DECLARE
 BEGIN
     SELECT pg_catalog.md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
      WHERE p.oid = pg_catalog.to_regprocedure('public.epigraph_require_writer_scope(uuid, uuid)');
-    IF v_found IS NULL OR v_found NOT IN ('513b346945eeff4d760c558b7d43075f',
+    IF v_found IS NULL OR v_found NOT IN ('11dae73d40e89ed63d540f18c7b1e46d',
                                           '9693498b3365ddfa8f97d4ead83b2ee6') THEN
-        RAISE EXCEPTION '310-undo: public.epigraph_require_writer_scope(uuid, uuid) is neither '
-                        '310''s body nor 256''s; found md5 %. Nothing was changed',
+        RAISE EXCEPTION '361-undo: public.epigraph_require_writer_scope(uuid, uuid) is neither '
+                        '361''s body nor 256''s; found md5 %. Nothing was changed',
                         COALESCE(v_found, '(absent)')
             USING ERRCODE = '55000';
     END IF;
@@ -49,7 +49,7 @@ BEGIN
      WHERE p.oid = pg_catalog.to_regprocedure('public.epigraph_is_instance_admin(uuid)');
     IF v_found IS NULL OR v_found NOT IN ('542b6e0a2b01069f1fad385b74e892c2',
                                           'e72b915989c3a98801e795d4eb53b769') THEN
-        RAISE EXCEPTION '310-undo: public.epigraph_is_instance_admin(uuid) is neither 310''s '
+        RAISE EXCEPTION '361-undo: public.epigraph_is_instance_admin(uuid) is neither 361''s '
                         'body nor 123''s; found md5 %. Nothing was changed',
                         COALESCE(v_found, '(absent)')
             USING ERRCODE = '55000';
