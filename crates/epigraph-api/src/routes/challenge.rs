@@ -28,7 +28,7 @@
 //! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -90,6 +90,11 @@ pub struct ChallengeResponse {
     pub resolved_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<Uuid>,
+    /// Set only on a row `include_parents=true` appended (backlog d8108186):
+    /// the in-force `decomposes_to` parent of the listed claim that this open
+    /// challenge was filed on. Absent on the claim's own challenges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_parent: Option<Uuid>,
 }
 
 impl From<Challenge> for ChallengeResponse {
@@ -104,8 +109,20 @@ impl From<Challenge> for ChallengeResponse {
             created_at: c.created_at,
             resolved_at: c.resolved_at,
             resolved_by: c.resolved_by.map(Into::into),
+            via_parent: None,
         }
     }
+}
+
+/// Query string of `GET /api/v1/claims/:id/challenges`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListChallengesQuery {
+    /// Also list the OPEN challenges (`pending`, `under_review`) filed on the
+    /// claim's in-force `decomposes_to` parents, after the claim's own, each
+    /// tagged `via_parent` (backlog d8108186). Default `false`: the response
+    /// is then exactly the claim's own challenges.
+    #[serde(default)]
+    pub include_parents: bool,
 }
 
 /// Response for listing challenges
@@ -349,6 +366,7 @@ pub async fn submit_challenge(
             created_at: Utc::now(),
             resolved_at: None,
             resolved_by: None,
+            via_parent: None,
         }
     };
 
@@ -420,6 +438,11 @@ pub async fn submit_challenge(
 /// carries `/* {VISIBILITY:challenges} */`. The token requirement is no longer
 /// the whole control.
 ///
+/// `?include_parents=true` appends the open challenges on the claim's
+/// in-force `decomposes_to` parents, each tagged `via_parent`
+/// (`ChallengeRepository::list_open_for_parents`, viewer-spliced like the
+/// claim's own list). Without it the response is unchanged.
+///
 /// # Errors
 ///
 /// Returns 200 OK with an empty list if no challenges exist for the claim.
@@ -427,6 +450,7 @@ pub async fn list_challenges(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
+    Query(query): Query<ListChallengesQuery>,
 ) -> Result<Json<ListChallengesResponse>, ApiError> {
     #[cfg(feature = "db")]
     let challenge_responses = {
@@ -447,18 +471,34 @@ pub async fn list_challenges(
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to list challenges: {e}"),
             })?;
+        let parent_rows = if query.include_parents {
+            epigraph_db::ChallengeRepository::list_open_for_parents(&mut *read, &viewer, claim_id)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Failed to list parent challenges: {e}"),
+                })?
+        } else {
+            Vec::new()
+        };
+        let response = |r: epigraph_db::ChallengeRow, via_parent: Option<Uuid>| ChallengeResponse {
+            id: r.id,
+            claim_id: r.claim_id,
+            challenger_id: r.challenger_id.unwrap_or(Uuid::nil()),
+            challenge_type: r.challenge_type,
+            explanation: r.explanation,
+            state: r.state,
+            created_at: r.created_at,
+            resolved_at: r.resolved_at,
+            resolved_by: r.resolved_by,
+            via_parent,
+        };
         rows.into_iter()
-            .map(|r| ChallengeResponse {
-                id: r.id,
-                claim_id: r.claim_id,
-                challenger_id: r.challenger_id.unwrap_or(Uuid::nil()),
-                challenge_type: r.challenge_type,
-                explanation: r.explanation,
-                state: r.state,
-                created_at: r.created_at,
-                resolved_at: r.resolved_at,
-                resolved_by: r.resolved_by,
-            })
+            .map(|r| response(r, None))
+            .chain(
+                parent_rows
+                    .into_iter()
+                    .map(|(r, parent)| response(r, Some(parent))),
+            )
             .collect::<Vec<_>>()
     };
 
@@ -469,8 +509,10 @@ pub async fn list_challenges(
         // visibility predicate to apply to `challenge_service`, which is an
         // in-memory store with no tenancy columns. Bind it away explicitly
         // rather than renaming the parameter `_viewer`, so the `db` arm below
-        // keeps the name it actually filters on.
+        // keeps the name it actually filters on. The in-memory store has no
+        // decomposition edges, so `include_parents` adds nothing here.
         let _ = &viewer;
+        let _ = query.include_parents;
         let challenges = state
             .challenge_service
             .list_by_claim(ClaimId::from_uuid(claim_id));

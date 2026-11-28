@@ -2756,7 +2756,9 @@ impl EpiGraphMcpFull {
         tools::challenges::challenge_claim(self, viewer, params, auth).await
     }
 
-    #[tool(description = "List all challenges filed against a specific claim.")]
+    #[tool(
+        description = "List all challenges filed against a specific claim. With include_parents=true, also lists the open challenges filed on its decomposes_to parents, each tagged via_parent."
+    )]
     async fn list_challenges(
         &self,
         Parameters(params): Parameters<ListChallengesParams>,

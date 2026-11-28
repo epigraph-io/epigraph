@@ -3730,6 +3730,13 @@ pub struct ChallengeclaimParams {
 pub struct ListChallengesParams {
     #[schemars(description = "UUID of the claim to list challenges for")]
     pub claim_id: String,
+    /// Backlog d8108186: also list the open challenges on the claim's
+    /// in-force `decomposes_to` parents, tagged `via_parent`.
+    #[schemars(
+        description = "Also list the open (pending or under_review) challenges filed on the claim's decomposes_to parents, after its own, each tagged via_parent. Default false."
+    )]
+    #[serde(default)]
+    pub include_parents: Option<bool>,
 }
 
 /// `resolve_challenge`'s parameters. There is no resolver field, and an
