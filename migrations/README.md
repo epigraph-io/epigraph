@@ -5526,6 +5526,42 @@ the commit that closes it. No block is open.
   custodian's admin arm answers false on its read-write transactions; and measure whether the
   admin-scope switch is armed (armed, AK03 reads `epigraph_is_elevated()` instead). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **362**: `reprovision_write_scopes` (backlog c841b15f). Two maintenance verbs, no table change.
+  `epigraph_reprovision_write_scopes(scopes text[], reason, operator jsonb)` adds the given scopes
+  to every ACTIVE client whose `granted_scopes` holds `claims:write`. The scopes must be a
+  non-empty, duplicate-free subset of {`edges:write`, `evidence:write`}; anything else, admin-only
+  scopes included, is refused 22023. They are appended, existing order kept, to `allowed_scopes`,
+  to `granted_scopes`, and to `refresh_tokens.scopes` of each LIVE token of that client whose
+  stored scopes hold `claims:write`. The chains matter because the refresh grant issues stored ∩
+  granted (`token.rs::refresh_scopes`, 140/172), so a client grant alone never reaches an agent
+  connected before it. Suspended, revoked and pending clients, and chains that never consented to
+  `claims:write`, are untouched. One `oauth.write_scopes_reprovisioned` `security_events` row per
+  changed client records both arrays before and after, the widened families and token count, the
+  reason, the operator facts and `session_user`. A client with nothing to add is skipped, so a
+  re-run after a complete run changes nothing.
+  `epigraph_reprovision_write_scopes_reverse(client, the four arrays, chains jsonb, reason,
+  operator)` undoes one manifest line, compare-and-swap:
+  * it refuses 22023 a line whose `after` is not `before` followed only by the two scopes, so a
+    crafted manifest cannot grant or strip anything else;
+  * it restores the client's exact arrays only while they still equal the recorded `after`;
+    otherwise the client is HELD, chains included;
+  * it restores each chain by family, so a successor a rotation minted since is restored too;
+  * it writes one `oauth.write_scopes_reprovision_reversed` row per call.
+
+  Both are SECURITY DEFINER, owned by `epigraph_maintenance`, on `pg_catalog, pg_temp`, EXECUTE
+  for the maintenance role only, and each refuses a non-maintenance session 42501. Registered in
+  `tenancy_backfill` (deferred definers, the grant register). Caller: `epigraph-operator
+  reprovision-write-scopes` (dry run by default; `--apply --confirm-count N --manifest-out F`;
+  `--reverse --manifest F`, exit 3 when held). Pinned by
+  `epigraph-cli/tests/operator_reprovision_write_scopes.rs`: a pre-existing chain refreshes to
+  both scopes; non-active, non-writer and non-consenting rows are untouched; the exact reverse and
+  the held case; the refusals, the privilege shape and the undo. Undo: `docs/runbooks/362-undo.sql`
+  (drops both; reverse applied manifests FIRST). **Deploy order:** migrate, deploy the operator
+  binary, run the verb, and only then deploy the MCP scope remap (backlog c2dbcf27). Run the verb
+  as a dry run, then `--apply`, then the dry run again, expecting 0 clients: a rotation in flight
+  during the apply can mint a successor the run did not see. **Measure** the dry run's client and
+  token counts against a census before `--apply`. **Applied to throwaway databases only, NOT to
+  any deployed database.**
 
 ## `-- no-transaction` migrations
 

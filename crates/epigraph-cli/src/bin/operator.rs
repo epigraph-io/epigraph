@@ -16,7 +16,8 @@
 //!   `arm-operator-binding`, `approve-client`, `suspend-client`,
 //!   `revoke-client`, `allow-author-binding-client`,
 //!   `revoke-author-binding-client`, `grant-client-scope`,
-//!   `revoke-client-scope`, `list-dcr-clients`, `sweep-dcr-clients`;
+//!   `revoke-client-scope`, `list-dcr-clients`, `sweep-dcr-clients`,
+//!   `reprovision-write-scopes`;
 //! * custody, ownership and restriction: `custodial-supersede`,
 //!   `reown-claims`, `reown-linked`, `restrict-claims`, `regroup-claims`,
 //!   `reown-workflows`, `hide-evidence`, `set-workflow-submitter`,
@@ -60,6 +61,8 @@
 //! (NOT-A-MEMBER: nothing to revoke, usually a mistyped id).
 //! `retire-link` exits 1 when the agent has no operator link (NO-LINK: nothing
 //! to retire, usually a mistyped id); a link already retired exits 0.
+//! `reprovision-write-scopes --reverse` exits 3 when it held at least one
+//! client or chain (changed since the run) or a client no longer exists.
 //! `set-default-group` exits 1 when `--operator` is not a registered live
 //! human operator, or the definer refused an agent (REFUSED: not the
 //! operator's live-linked agent, or a team the agent may not write); nothing
@@ -167,6 +170,10 @@
 //!     epigraph-operator group-member remove --group <uuid> --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
+//!     epigraph-operator reprovision-write-scopes --reason TEXT \
+//!         [--apply --confirm-count N --manifest-out rws-1.jsonl]
+//!     epigraph-operator reprovision-write-scopes --reverse --manifest rws-1.jsonl --reason TEXT \
+//!         [--apply]
 //!     epigraph-operator approve-client (--client <uuid> | --client-id <string>) \
 //!         --scope S [--scope S ...] [--approved-by <uuid>] [--owner <uuid>] --reason TEXT [--apply]
 //!         (--owner is required for an agent client and refused otherwise: migration 348)
@@ -186,7 +193,7 @@ use epigraph_cli::operator::{
     client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
     evidence_edges, group_role, hide, human, legacy, link, passkey, privatization, regroup, reown,
     reown_linked, reown_workflows, restrict, retire_link, reverse, role_agent, role_restore,
-    system_agent, team_group, workflow_submitter,
+    system_agent, team_group, workflow_submitter, write_scopes,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -1405,6 +1412,35 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         older_than_hours: u32,
     },
+    /// Add `edges:write` and `evidence:write` to every ACTIVE client that
+    /// holds `claims:write` (both scope arrays) and to each of its live
+    /// refresh tokens that holds `claims:write` (migration 362), one
+    /// `oauth.write_scopes_reprovisioned` audit row per client. Dry run
+    /// (default) rolls back. With `--reverse --manifest F`, restore the exact
+    /// prior arrays of a run (exit 3: a client or chain changed since and was
+    /// held).
+    ReprovisionWriteScopes {
+        /// Recorded in every audit row (and the manifest).
+        #[arg(long)]
+        reason: String,
+        /// Commit. A forward run needs `--confirm-count` and
+        /// `--manifest-out`.
+        #[arg(long)]
+        apply: bool,
+        /// Under a forward `--apply`, the dry run's client count, repeated back.
+        #[arg(long, conflicts_with = "reverse")]
+        confirm_count: Option<usize>,
+        /// Under a forward `--apply`, where to write the undo manifest (must
+        /// not exist); fsynced before the commit.
+        #[arg(long, conflicts_with = "reverse")]
+        manifest_out: Option<PathBuf>,
+        /// Undo a run from its manifest instead (`--manifest`).
+        #[arg(long, requires = "manifest")]
+        reverse: bool,
+        /// The run's manifest, for `--reverse`.
+        #[arg(long, requires = "reverse")]
+        manifest: Option<PathBuf>,
+    },
     /// Arm migration 128's admin-scope switch: from then on every mint strips
     /// the admin-only scopes and every path that hands scopes out refuses
     /// them. Audited. Without `--apply`, the change is rolled back.
@@ -1658,6 +1694,28 @@ async fn main_inner() -> anyhow::Result<i32> {
     {
         dcr_sweep::validate_age(*older_than_hours)?;
     }
+    // reprovision-write-scopes: a blank reason, or an --apply without its
+    // count or a new manifest path, before any connection is made.
+    let write_scopes_opts = if let Command::ReprovisionWriteScopes {
+        reason,
+        apply,
+        confirm_count,
+        manifest_out,
+        reverse: false,
+        ..
+    } = &cli.command
+    {
+        let o = write_scopes::Options {
+            apply: *apply,
+            confirm_count: *confirm_count,
+            manifest_out: manifest_out.clone(),
+            reason: reason.clone(),
+        };
+        write_scopes::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
     // Refuse a non-admin-only scope before any connection is made.
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
@@ -3213,6 +3271,30 @@ async fn main_inner() -> anyhow::Result<i32> {
             let outcome =
                 dcr_sweep::run(&mut conn, older_than_hours, apply, reason.as_deref(), &who).await?;
             for line in dcr_sweep::describe(&outcome) {
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        Command::ReprovisionWriteScopes {
+            reverse: true,
+            manifest,
+            reason,
+            apply,
+            ..
+        } => {
+            let manifest = manifest.expect("clap: --reverse requires --manifest");
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome = write_scopes::reverse(&mut conn, &manifest, &reason, apply, &who).await?;
+            for line in write_scopes::describe_reverse(&outcome) {
+                println!("{line}");
+            }
+            Ok(if outcome.incomplete() { 3 } else { 0 })
+        }
+        Command::ReprovisionWriteScopes { .. } => {
+            let opts = write_scopes_opts.expect("built above");
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome = write_scopes::run(&mut conn, &opts, &who).await?;
+            for line in write_scopes::describe(&outcome) {
                 println!("{line}");
             }
             Ok(0)

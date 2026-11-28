@@ -86,7 +86,10 @@ pub const CLAIMS_ADMIN: &str = "claims:admin";
 /// if the human has superuser access, so do their agents once a consent that
 /// includes it has been given; a grant added later reaches them only after the
 /// human re-authorizes, a revocation takes effect at the next refresh, and an
-/// already-minted access token keeps the scope until it expires.
+/// already-minted access token keeps the scope until it expires. (The one
+/// audited exception: `epigraph-operator reprovision-write-scopes`, migration
+/// 362, adds `edges:write` and `evidence:write`, never an admin-only scope, to
+/// the live refresh chains that already consented to `claims:write`.)
 ///
 /// Holding `claims:admin` is NOT needed to supersede or dedup a claim the
 /// caller may write: since batch OA1 those two acts need `claims:write` plus

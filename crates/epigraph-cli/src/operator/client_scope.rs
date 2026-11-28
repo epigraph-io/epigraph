@@ -25,6 +25,9 @@
 //! it expires). A GRANT does not widen an existing refresh chain: it reaches a
 //! connector only once the human re-authorizes it (a new authorization-code
 //! grant, e.g. reconnecting the connector), whose consent can then include it.
+//! The one audited exception is `reprovision-write-scopes` (migration 362, see
+//! [`super::write_scopes`]), which adds `edges:write` / `evidence:write` to the
+//! live chains that already consented to `claims:write`.
 //!
 //! # The rules
 //!
