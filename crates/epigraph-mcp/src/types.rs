@@ -2646,9 +2646,10 @@ pub struct IngestDocumentParams {
         description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms). The JSON may carry an optional top-level `labels` array of caller labels (e.g. a stage tag), applied to every claim the ingest writes in addition to the writer's own `doi:<document key>` label; a claim another agent authored that the ingest converges onto gets the doi: label only."
     )]
     pub file_path: String,
-    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    /// Synchronous by default (backlog 81d8afe0): `None`/`true` waits for the
+    /// walk; `false` is the explicit fire-and-forget opt-in.
     #[schemars(
-        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written, the papers row included, so retrying is safe."
+        description = "Optional, default true: the call waits for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error; a failed walk writes nothing, the papers row included, so retrying is safe; a dropped or timed-out connection is not a failed walk (it may still commit), so check query_paper before treating it as one. false = fire-and-forget: returns {status: 'queued', paper_id, document_key} and a failed walk reaches only the server log."
     )]
     #[serde(default)]
     pub wait: Option<bool>,
@@ -2678,9 +2679,10 @@ pub struct IngestDocumentInlineParams {
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::document::schema::DocumentExtraction,
-    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    /// Synchronous by default (backlog 81d8afe0): `None`/`true` waits for the
+    /// walk; `false` is the explicit fire-and-forget opt-in.
     #[schemars(
-        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written, the papers row included, so retrying is safe."
+        description = "Optional, default true: the call waits for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error; a failed walk writes nothing, the papers row included, so retrying is safe; a dropped or timed-out connection is not a failed walk (it may still commit), so check query_paper before treating it as one. false = fire-and-forget: returns {status: 'queued', paper_id, document_key} and a failed walk reaches only the server log."
     )]
     #[serde(default)]
     pub wait: Option<bool>,
@@ -3136,17 +3138,16 @@ pub struct IngestDocumentResponse {
     /// than swallowed, so a caller counting a paper's claim set by label can
     /// see the gap.
     ///
-    /// **Who actually sees it.** This response reaches a caller only from the
-    /// operator `ingest-document` CLI, which calls `do_ingest_document`
-    /// synchronously (`ingest_document_spine` returns its own response type
-    /// with the same field). The two DETACHED MCP tools, `ingest_document` and
-    /// `ingest_document_inline`, answer `queued` and run `do_ingest_document`
-    /// in a spawned task whose response is dropped — for them the count reaches
-    /// only the server log (one WARN per unlabelled claim, target
-    /// `tenancy.scoped_write`). A caller
-    /// of those tools that needs the gap must compare the paper's `asserts`
-    /// edges against its `doi:` label set itself. Stated because an earlier
-    /// summary described this field as the disclosure for every ingest path.
+    /// **Who actually sees it.** This response reaches the operator
+    /// `ingest-document` CLI, which calls `do_ingest_document` synchronously,
+    /// and the MCP tools `ingest_document` and `ingest_document_inline` in
+    /// their default (`wait` omitted or true) mode (`ingest_document_spine`
+    /// returns its own response type with the same field). With an explicit
+    /// `wait: false` those two tools answer `queued` and run the walk in a
+    /// spawned task whose response is dropped — then the count reaches only
+    /// the server log (one WARN per unlabelled claim, target
+    /// `tenancy.scoped_write`), and a caller that needs the gap must compare
+    /// the paper's `asserts` edges against its `doi:` label set itself.
     pub converged_claims_unlabelled: usize,
     /// Claims this ingest RESOLVED TO that another agent authored, which got the
     /// document's `doi:` label but NOT the caller's `labels`: caller vocabulary
@@ -3155,7 +3156,8 @@ pub struct IngestDocumentResponse {
     /// it write. Disjoint from `converged_claims_unlabelled` (which counts rows
     /// that got no label at all) and always 0 when the extraction carries no
     /// `labels`. Reaches callers exactly as `converged_claims_unlabelled` does;
-    /// the detached tools log one WARN per claim (target `tenancy.scoped_write`).
+    /// a `wait: false` (detached) walk logs one WARN per claim (target
+    /// `tenancy.scoped_write`).
     pub converged_claims_caller_labels_withheld: usize,
     pub already_ingested: bool,
 }

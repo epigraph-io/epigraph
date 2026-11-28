@@ -167,7 +167,7 @@ async fn both_ingest_handlers_return_the_atomicity_warning(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     for (doi, atom, wait) in [
         ("10.9999/b42-file-waited", COMPOUND[3], Some(true)),
-        ("10.9999/b42-file-queued", COMPOUND[2], None),
+        ("10.9999/b42-file-queued", COMPOUND[2], Some(false)),
     ] {
         let file = CwdFixture::write(&extraction(doi, atom));
         let r = ingest_document(
@@ -189,12 +189,19 @@ async fn both_ingest_handlers_return_the_atomicity_warning(pool: PgPool) {
 
     // Calibration: an atomic atom gets no block, so the blocks above are the
     // screen's verdict, not something every response carries.
-    let quiet = inline(&server, &pool, "10.9999/b42-atomic", ATOMIC, None).await;
+    let quiet = inline(&server, &pool, "10.9999/b42-atomic", ATOMIC, Some(false)).await;
     assert_eq!(quiet["status"], "queued", "{quiet}");
     assert!(quiet.get("atomicity").is_none(), "{quiet}");
 
-    // ingest_document_inline, queued arm.
-    let queued = inline(&server, &pool, "10.9999/b42-queued", COMPOUND[0], None).await;
+    // ingest_document_inline, queued arm (wait=false).
+    let queued = inline(
+        &server,
+        &pool,
+        "10.9999/b42-queued",
+        COMPOUND[0],
+        Some(false),
+    )
+    .await;
     assert_eq!(queued["status"], "queued", "{queued}");
     assert_warns("inline queued", &queued);
 

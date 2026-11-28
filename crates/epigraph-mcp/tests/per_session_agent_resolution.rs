@@ -130,7 +130,7 @@ async fn control_a_new_session_of_a_live_server_agent_ingests(pool: PgPool) {
         &second,
         &viewer,
         IngestDocumentInlineParams {
-            wait: None,
+            wait: Some(false),
             extraction: doc("10.9999/per-session-control"),
             visibility: Some("public".to_string()),
             group_id: None,
@@ -182,7 +182,7 @@ async fn a_new_session_does_not_revive_a_revoked_server_agent(pool: PgPool) {
         &fresh,
         &viewer,
         IngestDocumentInlineParams {
-            wait: None,
+            wait: Some(false),
             extraction: doc("10.9999/per-session-revoked"),
             visibility: Some("public".to_string()),
             group_id: None,
@@ -245,7 +245,7 @@ async fn a_restarted_process_does_not_revive_a_revoked_server_agent(pool: PgPool
         &session,
         &viewer,
         IngestDocumentInlineParams {
-            wait: None,
+            wait: Some(false),
             extraction: doc("10.9999/per-session-restarted"),
             visibility: Some("public".to_string()),
             group_id: None,

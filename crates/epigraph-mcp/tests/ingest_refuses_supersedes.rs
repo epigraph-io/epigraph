@@ -159,7 +159,7 @@ async fn an_inline_ingest_relationship_of_supersedes_is_refused_before_the_paper
         &viewer,
         IngestDocumentInlineParams {
             extraction: document("inline-control", "supports"),
-            wait: None,
+            wait: Some(false),
             visibility: Some("public".to_string()),
             group_id: None,
         },
@@ -191,7 +191,7 @@ async fn an_inline_ingest_relationship_of_supersedes_is_refused_before_the_paper
             &viewer,
             IngestDocumentInlineParams {
                 extraction: document(&tag, spelling),
-                wait: None,
+                wait: Some(false),
                 visibility: Some("public".to_string()),
                 group_id: None,
             },
@@ -226,7 +226,7 @@ impl CwdFixture {
 
     fn params(&self) -> IngestDocumentParams {
         IngestDocumentParams {
-            wait: None,
+            wait: Some(false),
             file_path: self.0.display().to_string(),
             visibility: Some("public".to_string()),
             group_id: None,

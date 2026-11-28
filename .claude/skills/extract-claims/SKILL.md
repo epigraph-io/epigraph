@@ -111,11 +111,11 @@ path, only when the source explicitly states them (see the schema below).
 
 ### Stage 4: Submit (`ingest_document_inline`)
 
-Pass the enriched `DocumentExtraction` directly to **`ingest_document_inline`**,
-with `wait: true` so the call reports whether the write landed:
+Pass the enriched `DocumentExtraction` directly to **`ingest_document_inline`**.
+By default (`wait` omitted, or `true`) the call reports whether the write landed:
 
 ```
-ingest_document_inline({ extraction: <the enriched DocumentExtraction>, wait: true })
+ingest_document_inline({ extraction: <the enriched DocumentExtraction> })
 ```
 
 Because `structure_source` populated `source_text` and per-node `span`s, the
@@ -129,10 +129,11 @@ embeddings, and CDST mass functions for atoms.
 that must stage JSON on disk first, but `ingest_document_inline` is the primary,
 inline path and the one this flow uses.)
 
-#### Use `wait: true` — the default is a queue acknowledgement, not confirmation
+#### The default waits; `wait: false` is a queue acknowledgement, not confirmation
 
-With **`wait: true`**, `ingest_document_inline` (and `ingest_document`) run the
-all-or-nothing walk in the request and return its own result:
+By default (**`wait` omitted or `true`**), `ingest_document_inline` (and
+`ingest_document`) run the all-or-nothing walk in the request and return its
+own result:
 
 ```json
 { "doi": "<document_key>", "paper_id": "...", "claims_ingested": <n>,
@@ -145,8 +146,8 @@ returns an **error** naming the cause and the document_key; no papers row,
 claims or edges were written, so fix the cause and retry: a retry is safe and
 converges on existing nodes.
 
-**Without `wait`** (the default) the call returns immediately after spawning a
-detached task:
+**With `wait: false`** (an explicit opt-in) the call returns immediately after
+spawning a detached task:
 
 ```json
 { "status": "queued", "document_key": "...", "paper_id": "...", "note": "..." }
@@ -156,14 +157,14 @@ The write may still be in flight, and if it fails the error reaches only the
 server log. The background task writes the papers row too, in the same
 all-or-nothing transaction: a NEW document is not found by `query_paper` until
 the task commits, and one that never appears means the task failed (resubmit
-with `wait: true` to see why). Confirm a detached ingest only by
+without `wait: false` to see why). Confirm a detached ingest only by
 `query_paper(document_key)`'s `claim_count` rising: `check_already_ingested`
 can already be true from an earlier spine or ingest of the same document, so it
 does not prove the write landed. Do not fire a second
 ingest call based on a timeout — the background task may still be running.
 One write at a time per paper is the correct pattern.
 
-`ingest_document_spine`, by contrast, IS synchronous — it must return
+`ingest_document_spine` has no `wait` and is always synchronous — it must return
 `new_paragraph_paths` before the atomization LLM call can proceed. Spine writes
 are lightweight (no atoms, no CDST) and complete within typical timeout windows.
 

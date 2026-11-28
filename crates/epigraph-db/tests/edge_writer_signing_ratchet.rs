@@ -673,19 +673,14 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
-    // 4 each: the walk's two unmarked edge writes (an unmapped plan edge and
-    // the processed_by stamp), plus the ingest record after the paper's
-    // asserts edge on the created and on the converged branch. The marked
-    // edges go through `create_ingest_written_edge_if_absent_conn`.
+    // The one document walk (the full and the spine ingests, backlog
+    // 3716a30b): its two unmarked edge writes (an unmapped plan edge and the
+    // processed_by stamp), plus the ingest record after the paper's asserts
+    // edge on the created and on the converged branch. The marked edges go
+    // through `create_ingest_written_edge_if_absent_conn`.
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "ingest_document_walk_reporting",
-        4,
-        Signed,
-    ),
-    site(
-        "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_spine",
+        "walk_document",
         4,
         Signed,
     ),
