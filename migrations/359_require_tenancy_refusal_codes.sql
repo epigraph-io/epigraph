@@ -32,6 +32,16 @@
 --     user with an explicit grant of epigraph_seed reaches them, never the
 --     application role.
 --
+-- WHY TEN04 IS CODED WHEN THE PREDECESSOR ARM IS NOT. Both raise 23503 for a
+-- claim id that names no claim. TEN04 adds no existence signal the caller did
+-- not already have: before 359, a derived row naming a MISSING claim got this
+-- 23503 (the generic foreign-key 400 over HTTP), while one naming a claim the
+-- caller cannot see inherits that claim's group here and is then refused by
+-- the table's row-security WITH CHECK (42501), a different answer. The code
+-- labels an answer that was already distinct, and the claim id stays out of
+-- the message. The predecessor arm keeps 176's ruling unchanged; re-deciding
+-- it is not this file's business.
+--
 -- CREATE OR REPLACE keeps each function's owner, ACL, SECURITY mode,
 -- volatility and search_path; outside the four RAISE statements the bodies
 -- are byte-identical to 216's (pinned by
