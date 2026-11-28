@@ -23,7 +23,9 @@
 //!   sealed row unsigned, a re-delivered seal keeps the first stash, and a row
 //!   sealed WITHOUT the stash (before 357) keeps its signature through unseal;
 //! * `docs/runbooks/357-undo.sql` puts the originals back and drops the
-//!   columns, twice; and
+//!   columns, twice;
+//! * a signature revoked while sealed, or an original revoked in the race
+//!   with the seal, stays revoked through unseal and through the undo; and
 //! * a stashed signer cannot be deleted while its row is sealed.
 
 mod viewer_fixture;
@@ -680,17 +682,20 @@ async fn a_row_sealed_without_the_stash_keeps_its_signature_through_unseal(pool:
 }
 
 /// `docs/runbooks/357-undo.sql` copies every stashed original back onto its
-/// row and drops the columns; a second run changes nothing.
+/// row and drops the columns; a second run changes nothing. A claim whose
+/// signature was revoked while sealed is left unsigned, as unseal leaves it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_357_undo_puts_the_originals_back_and_drops_the_columns(pool: PgPool) {
     let world = seed_world(&pool).await;
     let (claim, evidence) = seed_claim(&pool, &world, "a finding sealed before undo", true).await;
+    let (revoked, revoked_ev) =
+        seed_claim(&pool, &world, "a finding revoked before undo", true).await;
     let before = claim_signature(&pool, claim).await;
     let ev_before = evidence_signature(&pool, evidence).await;
     seal(
         &pool,
         &world,
-        &[seal_item(claim, evidence)],
+        &[seal_item(claim, evidence), seal_item(revoked, revoked_ev)],
         Some(server_key(&world)),
     )
     .await;
@@ -698,6 +703,23 @@ async fn the_357_undo_puts_the_originals_back_and_drops_the_columns(pool: PgPool
         claim_signature(&pool, claim).await.2,
         Some(world.server_id),
         "CALIBRATION: the seal re-signed the claim"
+    );
+    let (sealed_hash, server_sig, _) = claim_signature(&pool, revoked).await;
+    record_revocation(
+        &pool,
+        revoked,
+        (
+            server_sig.as_deref().expect("a server signature"),
+            world.server_id,
+            &sealed_hash,
+        ),
+        world.author,
+        None,
+    )
+    .await;
+    assert!(
+        claim_stash(&pool, revoked).await.2,
+        "CALIBRATION: the revoked claim's stash was taken"
     );
 
     let undo = std::fs::read_to_string(concat!(
@@ -720,6 +742,12 @@ async fn the_357_undo_puts_the_originals_back_and_drops_the_columns(pool: PgPool
     );
     assert_ne!(hash, before.0, "the claim is still sealed");
     assert_eq!(evidence_signature(&pool, evidence).await, ev_before);
+    let (_, signature, signer) = claim_signature(&pool, revoked).await;
+    assert_eq!(
+        (signature, signer),
+        (None, None),
+        "the undo must not bring back a signature revoked while sealed"
+    );
     let columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns \
           WHERE table_schema = 'public' \
@@ -730,6 +758,165 @@ async fn the_357_undo_puts_the_originals_back_and_drops_the_columns(pool: PgPool
     .await
     .expect("count stash columns");
     assert_eq!(columns, 0, "the undo drops all six columns");
+}
+
+// =========================================================================
+// Revocation while sealed (review of aa366aa6)
+// =========================================================================
+
+/// What `POST /api/v1/claims/:id/revoke-signature` writes, in its order: the
+/// audit row naming what it revoked, then the claim's signature and signer
+/// nulled together. `revoked_at` is the revoke transaction's start, which can
+/// precede the seal's; `None` takes the column default.
+async fn record_revocation(
+    pool: &PgPool,
+    claim: Uuid,
+    revoked: (&[u8], Uuid, &[u8]),
+    revoked_by: Uuid,
+    revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let (previous_signature, previous_signer, previous_hash) = revoked;
+    sqlx::query(
+        "INSERT INTO claim_signature_revocations \
+            (claim_id, previous_signature, previous_signer_id, previous_content_hash, \
+             revoked_by, reason, revoked_at) \
+         VALUES ($1, $2, $3, $4, $5, 'revoked while sealed', COALESCE($6, now()))",
+    )
+    .bind(claim)
+    .bind(previous_signature)
+    .bind(previous_signer)
+    .bind(previous_hash)
+    .bind(revoked_by)
+    .bind(revoked_at)
+    .execute(pool)
+    .await
+    .expect("record the revocation");
+    sqlx::query(
+        "UPDATE claims SET signature = NULL, signer_id = NULL, updated_at = now() WHERE id = $1",
+    )
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("null the revoked signature");
+}
+
+/// A signature revoked while the claim is sealed stays revoked through
+/// unseal. The revoke nulls the SERVER's signature over the ciphertext digest
+/// and audits it; restoring the stash afterwards would bring back the
+/// author's signature, verifying, while the audit table still says the
+/// claim's signature is revoked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_signature_revoked_while_sealed_stays_revoked_through_unseal(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let content = "a finding whose signature is revoked while sealed";
+    let (claim, evidence) = seed_claim(&pool, &world, content, true).await;
+    let original = claim_signature(&pool, claim).await;
+    seal(
+        &pool,
+        &world,
+        &[seal_item(claim, evidence)],
+        Some(server_key(&world)),
+    )
+    .await;
+    let (sealed_hash, server_sig, server_signer) = claim_signature(&pool, claim).await;
+    assert_eq!(
+        server_signer,
+        Some(world.server_id),
+        "CALIBRATION: the seal re-signed the claim"
+    );
+    assert_eq!(
+        claim_stash(&pool, claim).await,
+        (original.1.clone(), original.2, true),
+        "CALIBRATION: the stash holds the original"
+    );
+
+    record_revocation(
+        &pool,
+        claim,
+        (
+            server_sig.as_deref().expect("a server signature"),
+            world.server_id,
+            &sealed_hash,
+        ),
+        world.author,
+        None,
+    )
+    .await;
+
+    unseal(&pool, &world, &[unseal_item(claim, evidence, content)]).await;
+    let (hash, signature, signer) = claim_signature(&pool, claim).await;
+    assert_eq!(
+        hash, original.0,
+        "CALIBRATION: the plaintext digest is back"
+    );
+    assert_eq!(
+        (signature, signer),
+        (None, None),
+        "a signature revoked while sealed must not come back on unseal"
+    );
+    let audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claim_signature_revocations WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("count revocations");
+    assert_eq!(audits, 1, "the audit row is untouched");
+}
+
+/// The race the seal cannot close by itself: a revoke reads the ORIGINAL
+/// signature before the seal replaces it, the seal stashes that original, and
+/// the revoke's UPDATE (which waited on the seal's row lock) then nulls the
+/// row. The audit row names the original, with a `revoked_at` from before the
+/// seal began; unseal must still leave the claim unsigned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_original_revoked_in_the_race_with_the_seal_stays_revoked(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let content = "a finding revoked as it was sealed";
+    let (claim, evidence) = seed_claim(&pool, &world, content, true).await;
+    let (plain_hash, original_sig, original_signer) = claim_signature(&pool, claim).await;
+    seal(
+        &pool,
+        &world,
+        &[seal_item(claim, evidence)],
+        Some(server_key(&world)),
+    )
+    .await;
+    let sealed_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM claim_encryption WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the seal time");
+
+    record_revocation(
+        &pool,
+        claim,
+        (
+            original_sig.as_deref().expect("an original signature"),
+            original_signer.expect("an original signer"),
+            &plain_hash,
+        ),
+        world.author,
+        Some(sealed_at - chrono::Duration::seconds(1)),
+    )
+    .await;
+    assert_eq!(
+        claim_stash(&pool, claim).await.0,
+        original_sig,
+        "CALIBRATION: the stash holds the revoked original"
+    );
+
+    unseal(&pool, &world, &[unseal_item(claim, evidence, content)]).await;
+    let (hash, signature, signer) = claim_signature(&pool, claim).await;
+    assert_eq!(
+        hash, plain_hash,
+        "CALIBRATION: the plaintext digest is back"
+    );
+    assert_eq!(
+        (signature, signer),
+        (None, None),
+        "an original revoked in the race with the seal must not come back on unseal"
+    );
 }
 
 // =========================================================================

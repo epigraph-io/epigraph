@@ -5345,14 +5345,16 @@ restart.
   (`EPIGRAPH_API_SIGNING_KEY_FILE`) over the ciphertext digest, signed as that key's signer agent,
   and leaves the evidence row unsigned (its digest is an id-derived sentinel); with no key
   configured the sealed claim is left unsigned. `unseal_claims_conn` restores both byte for byte
-  where `pre_seal_stashed`. DDL only: rows sealed before 357 keep `pre_seal_stashed = false` and
+  where `pre_seal_stashed`, except a claim whose signature was revoked after the seal took the
+  stash (a `claim_signature_revocations` row for the sealed digest or the stashed original), which
+  comes back unsigned. DDL only: rows sealed before 357 keep `pre_seal_stashed = false` and
   keep their pre-seal signature on `claims` / `evidence` (unseal leaves it, which is correct);
   re-signing them needs the API key and is not done here. **Measure**: `SELECT count(*) FROM
   claim_encryption` and `... FROM evidence_encryption` (every row is pre-357). Pinned by
   `epigraph-db/tests/sealed_row_resign.rs` and `epigraph-api/tests/privatization_seal.rs`
   (`seal_commit_resigns_with_the_api_key_and_unseal_commit_restores_the_original`). **Deploy
   order:** 357, then the binary (an older binary seals without the stash, which unseal handles).
-  Undo: `docs/runbooks/357-undo.sql` copies every stashed original back onto its row and drops
+  Undo: `docs/runbooks/357-undo.sql` copies every stashed, unrevoked original back onto its row and drops
   the columns; run it BEFORE rolling the binary back (an older binary's unseal would delete the
   stash without restoring it).
 

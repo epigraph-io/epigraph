@@ -4555,7 +4555,10 @@ impl PrivatizationRepository {
     /// plaintext digest, does again. A ciphertext row written without the
     /// stash (`pre_seal_stashed = false`: sealed before 357, or by an older
     /// binary) leaves the row's signature as it is, because that seal never
-    /// replaced it.
+    /// replaced it. A claim whose signature was REVOKED after the seal took
+    /// the stash (a `claim_signature_revocations` row for the sealed form or
+    /// for the stashed original) comes back unsigned: restoring would undo the
+    /// revocation.
     ///
     /// # What unseal does NOT restore
     ///
@@ -4617,22 +4620,61 @@ impl PrivatizationRepository {
         // the row once its plaintext is back. A row sealed without the stash
         // (before 357, or by an older binary) still carries its original
         // signature, so it is left as it is.
+        //
+        // EXCEPT a revoked one. `POST /claims/:id/revoke-signature` (migration
+        // 008's audit table) nulls `claims.signature` and records what it
+        // revoked; restoring the stash over that would bring back, verifying,
+        // a signature the audit table says is revoked. `revoked` names every
+        // claim with a revocation that touched this seal, by either of two
+        // arms, and such a claim comes back UNSIGNED (the server's signature
+        // over the ciphertext digest never survives unseal):
+        //
+        //   * `previous_content_hash = c.content_hash`: the sealed form was
+        //     revoked. The sealed digest is BLAKE3 of a ciphertext under a
+        //     fresh nonce, so it names this seal and no other.
+        //   * `previous_signature = ce.pre_seal_signature`: the ORIGINAL was
+        //     revoked by a revoke that read the row before the seal replaced
+        //     it and nulled it after (the revoke's SELECT does not lock, and
+        //     its UPDATE then waits on the seal's row lock), leaving the
+        //     revoked bytes in the stash.
+        //
+        // Neither arm reads a clock: a revoke's `revoked_at` is its own
+        // transaction's start, which can precede the seal's.
+        //
+        // The claim rows are locked above, so a revoke committed before this
+        // statement is seen here, and one still in flight nulls whatever this
+        // writes once it gets the row. Read on the route's maintenance
+        // connection, which row security does not filter.
         let restored: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
             r"
+            WITH revoked AS (
+                SELECT DISTINCT r.claim_id
+                  FROM public.claim_signature_revocations r
+                  JOIN public.claim_encryption ce
+                    ON ce.claim_id = r.claim_id AND ce.group_id = $6
+                  JOIN public.claims c ON c.id = r.claim_id
+                 WHERE r.claim_id = ANY($1)
+                   AND ce.pre_seal_stashed
+                   AND (r.previous_content_hash = c.content_hash
+                        OR r.previous_signature = ce.pre_seal_signature)
+            )
             UPDATE public.claims c
                SET content = t.content,
                    content_hash = t.content_hash,
                    labels = ARRAY(SELECT jsonb_array_elements_text(t.labels)),
                    properties = t.properties,
-                   signature = CASE WHEN ce.pre_seal_stashed
-                                    THEN ce.pre_seal_signature ELSE c.signature END,
-                   signer_id = CASE WHEN ce.pre_seal_stashed
-                                    THEN ce.pre_seal_signer_id ELSE c.signer_id END,
+                   signature = CASE WHEN NOT ce.pre_seal_stashed THEN c.signature
+                                    WHEN rv.claim_id IS NOT NULL THEN NULL
+                                    ELSE ce.pre_seal_signature END,
+                   signer_id = CASE WHEN NOT ce.pre_seal_stashed THEN c.signer_id
+                                    WHEN rv.claim_id IS NOT NULL THEN NULL
+                                    ELSE ce.pre_seal_signer_id END,
                    updated_at = now()
               FROM unnest($1::uuid[], $2::text[], $3::bytea[], $4::jsonb[], $5::jsonb[])
                 AS t(claim_id, content, content_hash, labels, properties)
               JOIN public.claim_encryption ce
                 ON ce.claim_id = t.claim_id AND ce.group_id = $6
+              LEFT JOIN revoked rv ON rv.claim_id = t.claim_id
              WHERE c.id = t.claim_id
             RETURNING c.id
             ",
