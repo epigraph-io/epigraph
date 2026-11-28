@@ -737,6 +737,20 @@ pub async fn create_claim(
     .map(Json)
 }
 
+/// BLAKE3 of the `submitted` claim content, for the provenance row.
+/// `stored_digest` is BLAKE3 of the `stored` content, already computed by
+/// [`create_claim_core`]; when the two contents are the same (every tier but
+/// fully_private, which stores a "[private]" placeholder) it is returned as
+/// is rather than hashing the same bytes a second time (backlog 90e994f0).
+#[cfg(feature = "db")]
+fn provenance_content_digest(submitted: &str, stored: &str, stored_digest: [u8; 32]) -> [u8; 32] {
+    if submitted == stored {
+        stored_digest
+    } else {
+        epigraph_crypto::ContentHasher::hash(submitted.as_bytes())
+    }
+}
+
 /// The body of `POST /api/v1/claims`, shared with `POST /api/v1/claims/batch`
 /// (one call per item) so the two cannot drift. Opens and commits its own
 /// transaction.
@@ -1046,15 +1060,27 @@ pub(crate) async fn create_claim_core(
             truth_value,
         )
     };
+    // BLAKE3 of the STORED content (`content_for_db`, so the "[private]"
+    // placeholder for the fully_private tier), computed ONCE and reused by the
+    // attestation below, the (content_hash, agent_id) duplicate check and the
+    // `content_hash` override check (backlog 90e994f0). It is NOT written to
+    // `claim.content_hash` here: `Claim::new` leaves that [0u8; 32] and only
+    // the attest path fills it, so the override must be compared against this
+    // digest, never against `claim.content_hash` (which would accept 64 zeros).
+    let content_digest = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
     let attest_signer_id = attest.map(|k| {
-        let digest = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
-        claim.content_hash = digest;
+        claim.content_hash = content_digest;
         claim.signature = Some(
             k.signer
-                .sign_entity(epigraph_crypto::SignedEntity::Claim, &digest),
+                .sign_entity(epigraph_crypto::SignedEntity::Claim, &content_digest),
         );
         k.signer_id
     });
+    // The provenance row hashes the SUBMITTED content. It equals the stored
+    // content on every tier but fully_private, so `content_digest` is reused
+    // there instead of hashing the same bytes again.
+    let provenance_digest =
+        provenance_content_digest(&request.content, &claim.content, content_digest);
 
     // Use a transaction for claim + encryption metadata atomicity, STAMPED
     // with the authenticated viewer: migration 122's claims trigger binds the
@@ -1216,7 +1242,6 @@ pub(crate) async fn create_claim_core(
         // duplicates. The contract is re-asserted here at the app layer:
         // lock_content_hash_agent, then a find, refusing a duplicate up front
         // with the same 409 the constraint would have produced.
-        let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
         let agent_uuid: Uuid = claim.agent_id.into();
         let dup_conflict = || {
             ApiError::Conflict {
@@ -1238,12 +1263,16 @@ pub(crate) async fn create_claim_core(
         // write one. The digest of a placeholder says nothing about whether the
         // ciphertexts are duplicates, and the server cannot compare those.
         if privacy_tier != "fully_private" {
-            ClaimRepository::lock_content_hash_agent(&mut tx, content_hash.as_slice(), agent_uuid)
-                .await?;
+            ClaimRepository::lock_content_hash_agent(
+                &mut tx,
+                content_digest.as_slice(),
+                agent_uuid,
+            )
+            .await?;
             if ClaimRepository::find_by_content_hash_and_agent(
                 &mut tx,
                 viewer,
-                content_hash.as_slice(),
+                content_digest.as_slice(),
                 agent_uuid,
             )
             .await?
@@ -1280,8 +1309,8 @@ pub(crate) async fn create_claim_core(
                 field: "content_hash".to_string(),
                 reason: "content_hash must be valid hex (64 chars for BLAKE3)".to_string(),
             })?;
-            let expected_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
-            if decoded.as_slice() != expected_hash.as_slice() {
+            // `content_digest`: BLAKE3(content_for_db), computed once above.
+            if decoded.as_slice() != content_digest.as_slice() {
                 return Err(ApiError::ValidationError {
                     field: "content_hash".to_string(),
                     reason: "content_hash override does not match BLAKE3(content); for non-compound claims the override must equal the server-computed hash of the claim content".to_string(),
@@ -1610,8 +1639,8 @@ pub(crate) async fn create_claim_core(
     // this call created: the action recorded is "create", and on an
     // `if_not_exists` dedup hit nothing was.
     if was_created {
-        // Content hash for provenance: BLAKE3 of claim content
-        let content_hash = blake3::hash(request.content.as_bytes());
+        // Content hash for provenance: BLAKE3 of the submitted content,
+        // computed above (`provenance_digest`).
         // `provenance_log.provenance_sig` is the AGENT's signature over its
         // request body. An HTTP caller authenticates with a bearer token and
         // signs no body, so it is empty. The row-level attestation is a
@@ -1625,7 +1654,7 @@ pub(crate) async fn create_claim_core(
             "claim",
             claim_uuid,
             "create",
-            content_hash.as_bytes(),
+            &provenance_digest,
             provenance_sig,
             None,
         )
@@ -3369,6 +3398,56 @@ pub async fn list_by_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog 90e994f0: `create_claim_core` hashes the claim content ONCE.
+    /// It hashed it up to three times (attestation, the (content_hash,
+    /// agent_id) duplicate check, the `content_hash` override check). A static
+    /// read of this file, since a digest count has no observable output; the
+    /// override's behaviour (mismatch and all-zero -> 400, correct -> created)
+    /// is `tests/content_hash_override_verification_test.rs`.
+    #[test]
+    fn create_claim_core_hashes_the_content_once() {
+        let src = include_str!("claims.rs");
+        let start = src
+            .find("pub(crate) async fn create_claim_core(")
+            .expect("create_claim_core is defined in this file");
+        let len = src[start..]
+            .find("\n}\n")
+            .expect("create_claim_core ends with a column-0 brace");
+        let body = &src[start..start + len];
+        let needle = concat!("ContentHasher", "::hash(");
+        assert_eq!(
+            body.matches(needle).count(),
+            1,
+            "create_claim_core must compute BLAKE3(content_for_db) once and reuse it"
+        );
+        // The provenance row's hash goes through `provenance_content_digest`,
+        // which reuses that digest; a direct BLAKE3 call here hashes again.
+        let direct = concat!("blake3", "::hash(");
+        assert_eq!(
+            body.matches(direct).count(),
+            0,
+            "create_claim_core must not hash the content again for provenance"
+        );
+    }
+
+    /// The provenance digest reuses the stored-content digest when the
+    /// submitted content was stored as is (a sentinel digest proves it is not
+    /// recomputed), and hashes the submitted content when the stored content
+    /// differs (fully_private's "[private]" placeholder), as before.
+    #[cfg(feature = "db")]
+    #[test]
+    fn provenance_digest_reuses_the_stored_digest() {
+        let sentinel = [7u8; 32];
+        assert_eq!(
+            provenance_content_digest("a claim", "a claim", sentinel),
+            sentinel
+        );
+        assert_eq!(
+            provenance_content_digest("a claim", "[private]", sentinel),
+            *blake3::hash(b"a claim").as_bytes()
+        );
+    }
 
     #[test]
     fn test_claim_response_from_claim() {
