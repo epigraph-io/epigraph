@@ -118,10 +118,22 @@ async fn warn_writes_the_edge_and_flags_the_partial_contradiction_risk(pool: PgP
 
     // The journal names the caller, never the content.
     let caller = server.server_agent_id().await.expect("server agent");
-    assert!(logs_contain(
-        "contradiction onto an undecomposed compound accepted"
-    ));
-    assert!(logs_contain(&caller.to_string()), "the caller is logged");
+    // One journal line per accepted edge, naming the caller.
+    let caller_id = caller.to_string();
+    logs_assert(|lines: &[&str]| {
+        let accepted = lines
+            .iter()
+            .filter(|l| l.contains("contradiction onto an undecomposed compound accepted"))
+            .collect::<Vec<_>>();
+        if accepted.len() != 2 {
+            return Err(format!("expected 2 accepted lines, got {accepted:?}"));
+        }
+        if accepted.iter().all(|l| l.contains(&caller_id)) {
+            Ok(())
+        } else {
+            Err(format!("an accepted line lacks the caller {caller_id}: {accepted:?}"))
+        }
+    });
     assert!(
         !logs_contain("shortened the column life"),
         "the guard must never log the claim's content"
