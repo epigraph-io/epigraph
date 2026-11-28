@@ -192,6 +192,21 @@ mass, belief and plausibility are `f64` (backlog `de039f69`, `3f6bc8bb`).
   `properties`, which the edge attestation digests from the row as stored
   (`crates/epigraph-db/src/repos/edge_signature.rs`).
 
+## Belief modes
+
+The belief modes are environment flags read at startup and reported on
+`/health`. The table of flags, values and defaults is the module doc of
+`crates/epigraph-engine/src/belief_modes.rs`; `docs/deploy.md` says how to
+set and flip them. The conjunct screen
+(`epigraph_core::atomicity::conjunct_screen`) is a warning and a discovery
+key, with one gated exception (backlog `40cdb432`): under
+`EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse` a `contradicts` or `refutes` edge
+onto a target that screens compound and has no in-force `decomposes_to`
+children is refused (`compound_contradiction_target`) before anything is
+written. Under the default, `warn`, the edge is written and the response
+carries `partial_contradiction_risk`. Either way, decompose the target and
+aim at the atom you dispute.
+
 ## Status claims bypass the novelty gate
 
 MCP `submit_claim` / `memorize` / `batch_submit_claims` run a write-side
@@ -289,6 +304,17 @@ migrate to head (it used to skip silently).
   deviates from or abandons one updates its Status line and its row
   (vocabulary and procedure there; `.github/scripts/tests/test_spec_index.py`,
   in CI's `plan` job, fails when they disagree or a spec has no row).
+
+## Convention pins
+
+A convention line written because of an incident (a backlog item, an issue,
+a PR) gets a pin in the same change (`4caaec8e`), so a later edit cannot drop
+or move the rule unnoticed. In this repository that is a `Pin` in
+`tests/conventions/convention_pins.py`, naming the passage, the section it
+must stay inside and the incident; `tests/conventions` runs in CI's blocking
+`plan` job, and the registry's docstring says how to pick a needle. Prompt
+text that lives in the `epiclaw-workflows` repository instead (stored
+workflow step text) gets a `content_pins` entry in that repository's registry.
 
 ## Embedding policy
 

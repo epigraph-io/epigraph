@@ -308,4 +308,111 @@ PINS: tuple[Pin, ...] = (
         needle="Never register a first-party route under `/api/v1/ext`",
         incident="#481",
     ),
+    # --- CLAUDE.md, "Convention pins": this rule pins itself ---------------
+    Pin(
+        id="incident-convention-line-gets-a-pin",
+        file="CLAUDE.md",
+        section_start="## Convention pins",
+        section_end=None,
+        needle=(
+            "A convention line written because of an incident (a backlog item, "
+            "an issue, a PR) gets a pin in the same change"
+        ),
+        incident="4caaec8e",
+    ),
+    Pin(
+        id="convention-pins-names-this-registry",
+        file="CLAUDE.md",
+        section_start="## Convention pins",
+        section_end=None,
+        needle="a `Pin` in `tests/conventions/convention_pins.py`",
+        incident="4caaec8e",
+    ),
+    Pin(
+        id="convention-pins-names-the-prompt-registry",
+        file="CLAUDE.md",
+        section_start="## Convention pins",
+        section_end=None,
+        needle="gets a `content_pins` entry in that repository's registry",
+        incident="4caaec8e",
+    ),
+    # --- The conjunct screen's one gated refusal (atomicity.rs, CLAUDE.md) ---
+    Pin(
+        id="atomicity-module-doc-names-the-gated-refusal",
+        file="crates/epigraph-core/src/atomicity.rs",
+        section_start="//! The atomicity heuristic: is a claim already one atomic proposition?",
+        section_end="pub const ATOMIC_MAX_CHARS",
+        needle="**The screen refuses a write in one case only** (backlog `40cdb432`):",
+        incident="40cdb432",
+    ),
+    Pin(
+        id="conjunct-screen-struct-doc-names-the-gated-refusal",
+        file="crates/epigraph-core/src/atomicity.rs",
+        section_start="/// What [`conjunct_screen`] counted in one claim's text.",
+        section_end="pub struct ConjunctScreen {",
+        needle="refuses nothing except under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse`",
+        incident="40cdb432",
+    ),
+    Pin(
+        id="conjunct-screen-fn-doc-says-why-errors-are-accepted",
+        file="crates/epigraph-core/src/atomicity.rs",
+        section_start="/// Estimate how many logically independent assertions `text` makes.",
+        section_end="pub fn conjunct_screen(",
+        needle="refusal is opt-in, off by default, and narrow (see the module doc)",
+        incident="40cdb432",
+    ),
+    Pin(
+        id="claude-md-belief-modes-names-the-gated-refusal",
+        file="CLAUDE.md",
+        section_start="## Belief modes",
+        section_end=None,
+        needle=(
+            "under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse` a `contradicts` or "
+            "`refutes` edge onto a target that screens compound"
+        ),
+        incident="40cdb432",
+    ),
+    # --- PR body freshness and first-parent bisect -------------------------
+    Pin(
+        id="pr-template-body-matches-final-commits",
+        file=".github/pull_request_template.md",
+        section_start="## Checklist",
+        section_end=None,
+        needle=(
+            "After each review round, the PR body was updated to match the "
+            "final commits (no stale claims)"
+        ),
+        incident="e0a1cce5",
+    ),
+    Pin(
+        id="bisect-main-with-first-parent",
+        file="docs/conventions/git-history.md",
+        section_start="## Bisecting main",
+        section_end=None,
+        needle="bisect `main` with `git bisect start --first-parent`",
+        incident="e0a1cce5",
+    ),
+    Pin(
+        id="bisect-skips-a-merge-finished-by-a-staging-fixup",
+        file="docs/conventions/git-history.md",
+        section_start="## Bisecting main",
+        section_end=None,
+        needle=(
+            "merge that is broken only because its resolution was completed in "
+            "the next commit is not the PR's fault, so `git bisect skip` it"
+        ),
+        incident="e0a1cce5",
+    ),
+    # --- The MCP screen tool's description names the gated refusal ---------
+    Pin(
+        id="screen-claim-atomicity-description-names-the-gated-refusal",
+        file="crates/epigraph-mcp/src/server.rs",
+        section_start='description = "Screen claims for compound content by id',
+        section_end="async fn screen_claim_atomicity(",
+        needle=(
+            "only the opt-in compound-contradiction guard (see link_epistemic) "
+            "refuses on it"
+        ),
+        incident="40cdb432",
+    ),
 )
