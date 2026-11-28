@@ -816,6 +816,13 @@ jobs:
         # it. It needs no database and no API key: it runs the built
         # `cross_source_sweep` binary's argument handling.
         run: cargo test -p epigraph-cli --features genai --locked --test cross_source_sweep_smoke
+      - name: Genai API handler tests
+        # routes::analyze::genai_handler_tests is `#[cfg(all(test, feature =
+        # "genai"))]`, so no other step runs it: the analyze handler must ask
+        # the LLM provider AppState carries, read once at boot, not the
+        # environment (backlog e8e14178). The mock provider; no database (a
+        # lazy pool that is never connected), no API key.
+        run: cargo test -p epigraph-api --features genai --locked --lib routes::analyze
       - name: Genai prompt drift guard
         # `rerank` is `#[cfg(feature = "genai")]`, so its unit tests run in no
         # other step. rerank::prompt::tests pins the live verifier prompt

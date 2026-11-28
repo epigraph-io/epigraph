@@ -6,6 +6,7 @@ pub mod embedding_restore;
 pub mod errors;
 #[cfg(feature = "db")]
 pub mod jobs_drain;
+pub mod llm_provider;
 pub mod metrics;
 pub mod middleware;
 #[cfg(feature = "db")]

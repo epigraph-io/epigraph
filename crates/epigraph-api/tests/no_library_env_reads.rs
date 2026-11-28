@@ -50,6 +50,8 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ("oauth/redirect.rs", "from_env", "settings pattern"),
     ("oauth/run_token.rs", "from_env", "settings pattern"),
     ("oauth/token_exchange.rs", "from_env", "settings pattern"),
+    // LlmProviderSetting::from_env (backlog e8e14178).
+    ("llm_provider.rs", "from_env", "settings pattern"),
     // AssertionV1Policy::from_env.
     ("oauth/assertion.rs", "from_env", "settings pattern"),
     // The migrate-on-boot settings, read by the binary and epigraph-migrate.
@@ -101,13 +103,6 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     // without DATABASE_URL. No backlog item moves it yet (378ee0c0 names the
     // read); it belongs with the typed config.
     ("state.rs", "new", "378ee0c0: AppState::new's DATABASE_URL"),
-    // TODO(e8e14178): read EPIGRAPH_LLM_PROVIDER once at boot, not per
-    // request; delete this entry when it lands.
-    (
-        "routes/analyze.rs",
-        "unconstrained_analysis",
-        "TODO e8e14178",
-    ),
     // TODO(b2017136): server.rs::main's env and config gates move into a
     // library `boot::check_env_gates()`. Narrow or delete this entry when
     // those reads move behind a settings type.
