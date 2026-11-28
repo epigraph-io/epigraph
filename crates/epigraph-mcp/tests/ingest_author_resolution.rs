@@ -1103,6 +1103,24 @@ async fn the_operator_cli_replaces_the_name_derived_author_and_a_name_only_reing
         1,
         "one author at the position"
     );
+    // The replacement's durable record (backlog 4b7c8b12): the replacing
+    // author's own `authored` edge into THIS paper names the node it replaced.
+    let replaces: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT e.properties->>$3 FROM edges e JOIN papers p ON p.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'authored' AND p.doi = $2 \
+            AND (e.valid_to IS NULL OR e.valid_to > now())",
+    )
+    .bind(human)
+    .bind(doi1)
+    .bind(epigraph_db::AUTHORED_REPLACES_KEY)
+    .fetch_all(&pool)
+    .await
+    .expect("read the replacing author's edge");
+    assert_eq!(
+        replaces,
+        vec![Some(key.to_string())],
+        "the replacing author's authored edge records the replaced node"
+    );
     assert_eq!(
         card_counts(&reader, &pool, key).await["authored_papers"],
         1,
