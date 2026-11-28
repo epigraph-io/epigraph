@@ -275,8 +275,8 @@ async fn find_workflow_hierarchical_flags_a_retired_step_head() {
 }
 
 /// HTTP twin of the MCP `resolve_to_latest_discloses_a_deprecated_head`. The
-/// route computes `lineage_head_deprecated` itself (head truth below
-/// `min_truth`), so the flag's true branch needs its own HTTP case: a head
+/// route computes `lineage_head_deprecated` itself (head truth at or below
+/// the 0.05 sentinel), so the flag's true branch needs its own HTTP case: a head
 /// deprecated to truth 0.05 under the default `min_truth` (0.3) is returned,
 /// marked the head, and every entry of its lineage says it is deprecated.
 #[tokio::test(flavor = "multi_thread")]
@@ -338,7 +338,7 @@ async fn find_workflow_hierarchical_resolve_to_latest_flags_a_deprecated_head() 
         assert_eq!(
             w["lineage_head_deprecated"],
             serde_json::json!(true),
-            "the head's truth (0.05) is below the default min_truth: {w}"
+            "the head's truth (0.05) is the deprecation sentinel: {w}"
         );
     }
 }
@@ -347,9 +347,10 @@ async fn find_workflow_hierarchical_resolve_to_latest_flags_a_deprecated_head() 
 //
 // HTTP twins of the MCP `workflow_deprecated_head_order.rs`. #676 made the
 // true lineage head always present and ordered it first in its group; for a
-// head deprecated below `min_truth` that put the one row a caller should not
+// deprecated head that put the one row a caller should not
 // pick ahead of every live generation. It is still returned and still flagged
-// `lineage_head_deprecated`, but it trails its group's live rows. A LIVE head
+// `lineage_head_deprecated` (truth at or below the 0.05 sentinel, whatever
+// `min_truth` is), but it trails its group's live rows. A LIVE head
 // (here `beta`'s, injected because its goal misses the query) still leads.
 
 /// Seed one `workflows` row; `embedding` is stored as its `goal_embedding`.
@@ -554,15 +555,16 @@ async fn find_workflow_hierarchical_embedding_sorts_a_deprecated_head_after_live
     );
 }
 
-/// HTTP twin of the min_truth cases in `workflow_deprecated_head_order.rs`.
-/// The route computes `lineage_head_deprecated` itself (`truth < min_truth`),
-/// after either search path, so it must use the same caller-supplied bound
-/// the repo statement sorted by: a 0.4 head leads at the default 0.3 and
-/// trails at `min_truth=0.5`, and the flag agrees with the position each time.
-/// A hardcoded `< 0.3` or `<= 0.05` in the sort or the flag fails one of the
-/// two requests.
+/// HTTP twin of the sentinel cases in `workflow_deprecated_head_order.rs`
+/// (backlog e3a003db). The route computes `lineage_head_deprecated` itself,
+/// after either search path, with the same test the repo statement sorted on:
+/// the 0.05 sentinel, whatever `min_truth` the caller passes. A 0.2 head LEADS
+/// at the default 0.3 and at `min_truth=0` (the old `truth < min_truth` rule
+/// trailed and flagged it at 0.3); a 0.05 head TRAILS at `min_truth=0` (the
+/// old rule led with it, unflagged) and at the default. The flag agrees with
+/// the position every time.
 #[tokio::test(flavor = "multi_thread")]
-async fn find_workflow_hierarchical_deprecation_follows_the_callers_min_truth() {
+async fn find_workflow_hierarchical_deprecation_is_the_sentinel_not_min_truth() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = PgPoolOptions::new()
         .max_connections(2)
@@ -575,7 +577,7 @@ async fn find_workflow_hierarchical_deprecation_follows_the_callers_min_truth() 
     let phrase = format!("qqthr{tag}");
     let a0 = seed_order_row(&pool, &alpha, 0, &format!("{phrase} digest"), 1.0, None).await;
     let a1 = seed_order_row(&pool, &alpha, 1, &format!("{phrase} digest v1"), 0.6, None).await;
-    let head = seed_order_row(&pool, &alpha, 2, "rewritten plan", 0.4, None).await;
+    let head = seed_order_row(&pool, &alpha, 2, "rewritten plan", 0.2, None).await;
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
@@ -617,8 +619,23 @@ async fn find_workflow_hierarchical_deprecation_follows_the_callers_min_truth() 
         &body,
         vec![head, a1, a0],
         false,
-        "0.4 head, default min_truth 0.3",
+        "0.2 head, default min_truth 0.3",
     );
-    let body = fetch("&min_truth=0.5").await;
-    check(&body, vec![a1, a0, head], true, "0.4 head, min_truth 0.5");
+    let body = fetch("&min_truth=0").await;
+    check(&body, vec![head, a1, a0], false, "0.2 head, min_truth 0");
+
+    sqlx::query("UPDATE workflows SET truth_value = 0.05 WHERE id = $1")
+        .bind(head)
+        .execute(&pool)
+        .await
+        .expect("deprecate the head");
+    let body = fetch("&min_truth=0").await;
+    check(&body, vec![a1, a0, head], true, "0.05 head, min_truth 0");
+    let body = fetch("").await;
+    check(
+        &body,
+        vec![a1, a0, head],
+        true,
+        "0.05 head, default min_truth 0.3",
+    );
 }

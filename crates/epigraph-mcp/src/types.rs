@@ -1363,12 +1363,12 @@ pub struct FindWorkflowHierarchicalParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and guarantee the true lineage head is present for every matched canonical_name: its highest generation (the one improve_workflow_hierarchy builds on) is added even when its goal does not match the query, it has no goal embedding, or its truth is below min_truth. Each entry then carries `is_lineage_head`, `lineage_head_generation` and `lineage_head_deprecated` (the head's truth is below min_truth); a live head leads its lineage group, while a deprecated head (truth below min_truth) sorts after the live rows of its group; the result can exceed `limit` by one head per matched lineage. Defaults to false (frozen step references, matched rows only, newest-created-at first)."
+        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and guarantee the true lineage head is present for every matched canonical_name: its highest generation (the one improve_workflow_hierarchy builds on) is added even when its goal does not match the query, it has no goal embedding, or its truth is below min_truth. Each entry then carries `is_lineage_head`, `lineage_head_generation` and `lineage_head_deprecated` (the head is deprecated: its truth is at or below the 0.05 sentinel deprecate_workflow writes, whatever min_truth is); a live head leads its lineage group, while a deprecated head (truth at or below 0.05) sorts after the live rows of its group, as does any deprecated generation that a min_truth at or below 0.05 lets match; the result can exceed `limit` by one head per matched lineage. Defaults to false (frozen step references, matched rows only, newest-created-at first)."
     )]
     pub resolve_to_latest: Option<bool>,
 
     #[schemars(
-        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows. Exception: with resolve_to_latest=true the lineage head of each matched canonical_name is always returned, flagged `lineage_head_deprecated` when its truth is below min_truth."
+        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows. Exception: with resolve_to_latest=true the lineage head of each matched canonical_name is always returned, flagged `lineage_head_deprecated` when it is deprecated (truth at or below 0.05), whatever min_truth is."
     )]
     pub min_truth: Option<f64>,
 }

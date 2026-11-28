@@ -184,7 +184,11 @@ pub async fn find_workflow_hierarchical(
             entry["is_lineage_head"] = serde_json::json!(head_id == r.id);
             entry["lineage_head_generation"] = serde_json::json!(head_generation);
             // A deprecated head is still the head; it is disclosed, not hidden.
-            entry["lineage_head_deprecated"] = serde_json::json!(head_truth < min_truth);
+            // Deprecated is the sentinel, not `min_truth` (backlog e3a003db):
+            // the same test the repo statement sorted on, and the REST route's.
+            entry["lineage_head_deprecated"] = serde_json::json!(
+                epigraph_db::WorkflowRepository::is_deprecated_truth(head_truth)
+            );
         }
 
         if resolve_to_latest {

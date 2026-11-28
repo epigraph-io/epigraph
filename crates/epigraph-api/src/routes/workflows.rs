@@ -223,7 +223,8 @@ pub struct HierarchicalSearchQuery {
     /// deprecated via `deprecate_workflow` (truth=0.05) drop out. Exception:
     /// with `resolve_to_latest=true` the lineage head of each matched
     /// `canonical_name` is always returned, flagged `lineage_head_deprecated`
-    /// when its truth is below `min_truth`.
+    /// when it is deprecated (truth at or below the 0.05 sentinel), whatever
+    /// `min_truth` is.
     pub min_truth: Option<f64>,
 }
 
@@ -272,8 +273,10 @@ pub struct HierarchicalWorkflowResult {
     /// `resolve_to_latest` only: the head's generation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineage_head_generation: Option<i32>,
-    /// `resolve_to_latest` only: the head's `truth_value` is below
-    /// `min_truth` (deprecated). It is returned anyway, so this says so.
+    /// `resolve_to_latest` only: the head is deprecated, its `truth_value` at
+    /// or below the 0.05 sentinel `deprecate_workflow` writes
+    /// (`WorkflowRepository::is_deprecated_truth`), whatever `min_truth` the
+    /// caller passed. It is returned anyway, so this says so.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineage_head_deprecated: Option<bool>,
 }
@@ -1370,7 +1373,8 @@ pub async fn report_outcome(
 /// each entry carries `is_lineage_head`, `lineage_head_generation` and
 /// `lineage_head_deprecated`. The result can then exceed `limit` by one head
 /// per matched lineage. A live head leads its lineage group; a deprecated head
-/// (truth below `min_truth`) sorts after the live rows of its group.
+/// (truth at or below the 0.05 sentinel, whatever `min_truth` is) sorts after
+/// the live rows of its group.
 ///
 /// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
 #[cfg(feature = "db")]
@@ -1482,7 +1486,11 @@ pub async fn find_workflow_hierarchical(
             HierarchicalWorkflowResult {
                 is_lineage_head: lineage.map(|(id, _, _)| id == r.id),
                 lineage_head_generation: lineage.map(|(_, generation, _)| generation),
-                lineage_head_deprecated: lineage.map(|(_, _, truth)| truth < min_truth),
+                // The sentinel, not `min_truth` (backlog e3a003db): the same
+                // test the repo statement sorted on.
+                lineage_head_deprecated: lineage.map(|(_, _, truth)| {
+                    epigraph_db::WorkflowRepository::is_deprecated_truth(truth)
+                }),
                 workflow_id: r.id,
                 canonical_name: r.canonical_name,
                 generation: r.generation,
