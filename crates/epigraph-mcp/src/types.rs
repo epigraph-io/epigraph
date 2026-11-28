@@ -2192,7 +2192,10 @@ pub struct UpdateResponse {
     /// don't mistake it for a bug), when refuting evidence left it ABOVE the
     /// pre-call prior ([`Self::pignistic_before`], else `truth_before`: the
     /// prior was below the fold of the claim's stored BBAs, which this call
-    /// re-folded; backlog b191f198), when [`Self::cache_written`] is `false`,
+    /// re-folded; backlog b191f198), when refuting evidence wrote
+    /// `truth_value` UP (it lagged the cached belief, so `truth_after` can be
+    /// above `truth_before` even when `pignistic_prob` went down), when
+    /// [`Self::cache_written`] is `false`,
     /// and for each of [`Self::fold_pignistic_prob`],
     /// [`Self::cache_repointed_from`] and [`Self::cache_owner_frame_id`] that
     /// is present. Several notes are joined by a space.

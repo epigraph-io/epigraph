@@ -111,6 +111,78 @@ async fn a_refute_that_leaves_belief_above_the_pre_call_cache_is_reported(pool: 
     );
 }
 
+/// The opposite drift: the CACHE is current (high) but the claim's
+/// `truth_value` lags far below it, as a non-owner attach leaves it (migration
+/// 114 refolds the cache and never writes `truth_value`). An owner's refute
+/// then lowers BetP below the cache, so the pignistic warning above stays
+/// silent, yet it writes `truth_value` UP to the new BetP: the item's
+/// reported "refute moved truth 0.465 -> 0.946". That must be named.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refute_that_raises_a_lagging_truth_value_is_reported(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let claim = seed_claim_with_belief(&pool, 0.99, 1.0, Some(0.999)).await;
+    sqlx::query("UPDATE claims SET truth_value = $1 WHERE id = $2")
+        .bind(STALE_CACHE)
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("set a truth_value that lags the cache");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let frame = epigraph_mcp::tools::ds_auto::ensure_binary_frame(&mut conn, &viewer)
+            .await
+            .expect("binary_truth frame");
+        for _ in 0..2 {
+            epigraph_db::MassFunctionRepository::store_with_perspective(
+                &mut *conn,
+                claim,
+                frame,
+                Some(seed_agent(&pool).await),
+                None,
+                &serde_json::json!({"0": 0.9, "0,1": 0.1}),
+                None,
+                None,
+                None,
+                Some("empirical"),
+                "unknown",
+                None,
+            )
+            .await
+            .expect("store a strong supporting BBA");
+        }
+    }
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    let json = run_update(&server, &viewer, claim, 0.3, false).await;
+
+    let truth_before = json["truth_before"].as_f64().expect("truth_before");
+    let truth_after = json["truth_after"].as_f64().expect("truth_after");
+    let pignistic = json["pignistic_prob"].as_f64().expect("pignistic_prob");
+    assert_eq!(
+        json["truth_written"], true,
+        "the caller owns the claim: {json}"
+    );
+    assert!(
+        (truth_before - STALE_CACHE).abs() < 1e-9 && truth_after > truth_before,
+        "fixture premise: the refute writes truth_value up from {STALE_CACHE}; got {json}"
+    );
+    assert!(
+        pignistic < 0.999,
+        "fixture premise: the refute lowered BetP below the cache, so the pignistic \
+         direction warning does not fire; got {json}"
+    );
+    let warning = json["warning"].as_str().unwrap_or_default();
+    assert!(
+        !warning.contains("Refuting evidence left belief above"),
+        "the pignistic warning must not fire when BetP went down: {json}"
+    );
+    assert!(
+        warning.contains("Refuting evidence raised truth_value"),
+        "a refute that writes truth_value up (it lagged the cache) must be named in \
+         `warning`; got {json}"
+    );
+}
+
 /// NONE case: a refute on a claim whose prior is consistent with its BBAs
 /// lowers belief, and no refute-direction warning appears. The claim has no
 /// cache, so `pignistic_before` is null and the prior is its `truth_value`.
@@ -133,6 +205,38 @@ async fn a_refute_that_lowers_belief_is_not_warned(pool: PgPool) {
         json.get("pignistic_before")
             .is_some_and(serde_json::Value::is_null),
         "a claim with no cache reports pignistic_before as null: {json}"
+    );
+    assert!(
+        !json["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Refuting evidence"),
+        "no refute-direction warning when the refute lowered belief: {json}"
+    );
+}
+
+/// NONE case with a cache: `truth_value` and the cache agree, and a strong
+/// refute lowers both, so neither refute-direction warning appears (the
+/// truth_value check is gated on a cache being present, which this exercises).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refute_that_lowers_a_cached_claim_is_not_warned(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let claim = seed_claim_with_belief(&pool, 0.6, 0.8, Some(0.7)).await;
+    sqlx::query("UPDATE claims SET truth_value = 0.7 WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("align truth_value with the cache");
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+
+    let json = run_update(&server, &viewer, claim, 0.8, false).await;
+
+    let truth_before = json["truth_before"].as_f64().expect("truth_before");
+    let truth_after = json["truth_after"].as_f64().expect("truth_after");
+    assert_eq!(json["pignistic_before"].as_f64(), Some(0.7), "{json}");
+    assert!(
+        truth_after < truth_before && json["pignistic_prob"].as_f64() < Some(0.7),
+        "precondition: a strong refute lowers truth_value and BetP; got {json}"
     );
     assert!(
         !json["warning"]
