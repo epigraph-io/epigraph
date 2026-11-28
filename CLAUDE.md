@@ -74,6 +74,9 @@ the composition-target exception and the ratchet that enforces it are in
 
 ## Retiring backlog items
 
+Filing an item backed only by static reading or testimony? Label it `backlog-candidate`; see
+`docs/conventions/backlog-retirement.md`, "Filing backlog items: evidence tier".
+
 When you complete or refute a claim labelled `backlog`, **always use
 `mcp__epigraph__resolve_backlog_item(original_id, resolution_content)`**.
 It creates a resolution claim (labelled `["resolved"]`, prose prefixed
@@ -128,7 +131,9 @@ A daily reconciler (`scripts/reconcile_backlog_labels.py`) catches free-text
 "Resolves <UUID>" claims filed without `resolve_backlog_item` and back-fills
 the label patch. Ambiguous matches go to `docs/superpowers/reports/reconciler-needs-review.log`.
 
-Full spec: `docs/conventions/backlog-retirement.md`.
+Full spec: `docs/conventions/backlog-retirement.md`. How every other table
+retires a row, and the filter each reader applies:
+`docs/conventions/no-longer-in-force.md`.
 
 ## Schema, migrations, claim mechanics
 
@@ -156,6 +161,36 @@ Full spec: `docs/conventions/backlog-retirement.md`.
   Do not widen its signature — extend the relevant `SELECT` in the caller
   and post-fix the returned `Claim` (see `list_by_labels` and `get_by_id`
   for the pattern).
+
+## Belief values: f64, reproducible per platform only
+
+`TruthValue` (`crates/epigraph-core/src/truth.rs`) and every Dempster-Shafer
+mass, belief and plausibility are `f64` (backlog `de039f69`, `3f6bc8bb`).
+
+- **Bit-identical on one platform.** The DS combination and belief
+  propagation folds combine their inputs in a fixed order:
+  `epigraph_ds::combination::combine_multiple` sorts them by
+  `canonical_mass_cmp` before folding, and CDST belief propagation iterates in
+  canonical order, never a `HashMap`'s (backlog `15582602`). The same inputs on
+  the same CPU architecture and build give the same bits from those folds.
+  Not every aggregate over beliefs is ordered yet: a sum accumulated in a
+  `HashMap` or a SQL `AVG` over unordered rows can differ in the last bits
+  between two runs. A new fold must fix its order; an existing unordered one
+  is a defect to file, not a reason to widen a tolerance.
+- **Not bit-identical across platforms.** The platform's math library (`ln`,
+  `exp`, `powf`) and the compiler's code generation may differ in the last
+  bits between CPU architectures (x86_64 and aarch64, say).
+- **Compare with a tolerance.** In tests, deploy deltas and replays,
+  compare a belief with an absolute tolerance (e.g. `1e-9`), not `==`. An exact
+  comparison is right only inside one run (a determinism test) or for a value
+  stored and read back rather than recomputed.
+- **Never hash or sign a computed belief.** No content hash or signature may
+  cover a value a verifier would have to recompute, because another platform
+  recomputes other bits. Where a float already sits in a signed payload it is
+  an input as written, and verification reads the stored bytes: a signed
+  submission's `truth_value`, or a matcher edge's `score` / `features` in its
+  `properties`, which the edge attestation digests from the row as stored
+  (`crates/epigraph-db/src/repos/edge_signature.rs`).
 
 ## Status claims bypass the novelty gate
 

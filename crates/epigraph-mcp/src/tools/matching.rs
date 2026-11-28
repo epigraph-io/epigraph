@@ -191,6 +191,13 @@ fn refuse_if_lost_race(candidate_id: uuid::Uuid, outcome: DecideOutcome) -> Resu
     }
 }
 
+/// Promote or reject a `pending` match candidate.
+///
+/// `promote` writes the edge the row's `verifier_verdict` calls for
+/// (`CORROBORATES` or `contradicts`), stamped with the candidate's id in
+/// `properties.candidate_id`; `reject` writes no edge. How that stamp links an
+/// edge back to its candidate, and which other paths write it, is in
+/// `docs/architecture/match-candidate-edge-provenance.md`.
 pub async fn decide_match_candidate(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -374,6 +381,9 @@ pub async fn decide_match_candidate(
 /// endpoints' belief from their surviving `mass_functions` (reported as
 /// `belief_cascade`; see `admin_cascade::apply_match_retire` for why a later
 /// `bp/propagate` cannot do that repair).
+///
+/// Why the edges are found by claim pair and not by `candidate_id`:
+/// `docs/architecture/match-candidate-edge-provenance.md`, section (d).
 pub async fn retire_match_candidate(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
