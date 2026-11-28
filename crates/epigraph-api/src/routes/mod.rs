@@ -357,6 +357,45 @@ async fn viewer_scoped_cache_headers(
     res
 }
 
+/// Response headers for a legacy UNVERSIONED alias of an `/api/v1` route
+/// (backlog f2938a03): `Deprecation: true` and
+/// `Link: </api/v1<path>>; rel="successor-version"`.
+///
+/// The aliases (`/claims`, `/claims/:id`, `/agents`, `/agents/:id`,
+/// `/agents/:id/reputation`, `/agents/:id/perspectives`,
+/// `/lineage/:claim_id`) still answer as before; these headers only tell a
+/// client where the versioned route is. Every alias's successor is the same
+/// handler at `/api/v1<path>` except `GET /claims`, whose successor
+/// `GET /api/v1/claims` is a different list handler with its own parameters
+/// and envelope; `GET /claims` keeps its own body until a later deprecation
+/// window retires it. The successor is the request path under `/api/v1`, so a
+/// path parameter carries over. Applied with `middleware::from_fn` on the
+/// method router, inside the protected chain: a response the handler or its
+/// extractors produce carries the headers, a 401 from bearer auth does not.
+#[cfg(feature = "db")]
+async fn deprecated_unversioned_alias(
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderName, HeaderValue};
+    let successor = HeaderValue::from_str(&format!(
+        "</api/v1{}>; rel=\"successor-version\"",
+        req.uri().path()
+    ));
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        HeaderName::from_static("deprecation"),
+        HeaderValue::from_static("true"),
+    );
+    // A request path is visible ASCII, so this does not fail in practice; a
+    // path that did would only lose the hint, not the response.
+    if let Ok(link) = successor {
+        h.insert(header::LINK, link);
+    }
+    res
+}
+
 /// The body limit on the two anonymous routers (`public` and `oauth`): 64 KiB.
 ///
 /// The global limit (`ApiConfig::max_request_size`, 10 MiB by default) exists
@@ -486,9 +525,17 @@ pub fn create_router_with_extensions(
     // inversion; the two halves are separate only because of the order the
     // chain was written in, not because they differ in authority.
     let protected = Router::new()
-        .route("/claims", post(claims::create_claim))
+        // The unversioned aliases carry `Deprecation` and a `Link` to their
+        // `/api/v1` successor (`deprecated_unversioned_alias`).
+        .route(
+            "/claims",
+            post(claims::create_claim).layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
         .route("/api/v1/claims", post(claims::create_claim))
-        .route("/agents", post(agents::create_agent))
+        .route(
+            "/agents",
+            post(agents::create_agent).layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
         .route("/api/v1/agents", post(agents::create_agent))
         .route("/api/v1/agents/:id", put(agents::update_agent))
         // NO claim-deletion route. `DELETE /api/v1/claims/:id` and
@@ -956,10 +1003,24 @@ pub fn create_router_with_extensions(
     // methods, so the GET arms folded in here merge with the PUT/DELETE arms
     // already registered above (`/api/v1/claims/:id` is the clearest case).
     // ------------------------------------------------------------------
+    //
+    // Every unversioned alias below carries `Deprecation` and a `Link` to its
+    // `/api/v1` successor (`deprecated_unversioned_alias`, backlog f2938a03).
+    // `GET /claims` keeps its own handler and envelope: its successor,
+    // `GET /api/v1/claims`, is a different list implementation.
     let protected = protected
-        .route("/claims", get(claims::list_claims_route))
-        .route("/claims/:id", get(claims::get_claim))
-        .route("/agents", get(agents::list_agents))
+        .route(
+            "/claims",
+            get(claims::list_claims_route).layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
+        .route(
+            "/claims/:id",
+            get(claims::get_claim).layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
+        .route(
+            "/agents",
+            get(agents::list_agents).layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
         .route("/api/v1/agents", get(agents::list_agents))
         // Name search (find_agent): registered before `/api/v1/agents/:id`
         // for readability; axum's router prefers the static segment anyway.
@@ -967,11 +1028,27 @@ pub fn create_router_with_extensions(
         // The token's own agent (backlog 076e94cc); a static segment, so
         // `me` is not read as an `:id`.
         .route("/api/v1/agents/me", get(agents::get_me))
-        .route("/agents/:id", get(agents::get_agent))
+        .route(
+            "/agents/:id",
+            get(agents::get_agent).layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
         .route("/api/v1/agents/:id", get(agents::get_agent))
-        .route("/agents/:id/reputation", get(agents::get_agent_reputation))
+        .route(
+            "/agents/:id/reputation",
+            get(agents::get_agent_reputation)
+                .layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
+        .route(
+            "/api/v1/agents/:id/reputation",
+            get(agents::get_agent_reputation),
+        )
         .route(
             "/agents/:id/perspectives",
+            get(perspective::agent_perspectives)
+                .layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
+        .route(
+            "/api/v1/agents/:id/perspectives",
             get(perspective::agent_perspectives),
         )
         .route("/api/v1/agents/:id/claims", get(agents::agent_claims))
@@ -1004,7 +1081,11 @@ pub fn create_router_with_extensions(
             "/api/v1/agents/:id/timeline",
             get(timeline::get_agent_timeline),
         )
-        .route("/lineage/:claim_id", get(lineage::get_lineage))
+        .route(
+            "/lineage/:claim_id",
+            get(lineage::get_lineage).layer(middleware::from_fn(deprecated_unversioned_alias)),
+        )
+        .route("/api/v1/lineage/:claim_id", get(lineage::get_lineage))
         .route(
             "/api/v1/search/semantic",
             post(search::semantic_search)
