@@ -887,6 +887,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::begin_author_stamped_tx",
         ],
     ),
+    // no SQL: `submission_evidence` builds the submission's evidence row in memory and signs it
+    // with the server's key (the server is handed over for its signer); it reads nothing.
+    (
+        "claims.rs",
+        "corroborate_submission",
+        &["submission_evidence"],
+    ),
     // no SQL: `claim_helper::embed_claim_author_stamped`.
     (
         "claims.rs",
@@ -961,9 +968,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         &["claim_helper::begin_author_stamped_tx"],
     ),
     // write: `ClaimRepository::update_labels_conn`, `ClaimRepository::update_truth_value_conn`,
-    // `EvidenceRepository::create_with_source_url`, `ds_divergence::record_divergence`; opener:
+    // `EvidenceRepository::create_with_source_url`; opener:
     // `claim_helper::begin_author_stamped_tx`; authority:
-    // `foreign_attach::is_foreign_public_claim`, `require_owner_or_admin`.
+    // `foreign_attach::is_foreign_public_claim`, `require_owner_or_admin`. (The DS wiring and
+    // its divergence record run in `wire_attached_evidence_in_tx`, entry below.)
     (
         "claims.rs",
         "update_with_evidence",
@@ -972,7 +980,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::update_truth_value_conn",
             "EvidenceRepository::create_with_source_url",
             "claim_helper::begin_author_stamped_tx",
-            "ds_divergence::record_divergence",
             "foreign_attach::is_foreign_public_claim",
             "require_owner_or_admin",
         ],
@@ -985,11 +992,21 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "verify_claim_report",
         &["AgentRepository::key_kind_of_public_key"],
     ),
+    // write: `ds_divergence::record_divergence`, the divergence row of the BBA this fn just
+    // combined, on the caller's author-stamped connection (`update_with_evidence`'s and the
+    // novelty gate's corroboration share this core); the claim was read through the viewer
+    // by its caller, and the frame reads here take the viewer.
+    (
+        "claims.rs",
+        "wire_attached_evidence_in_tx",
+        &["ds_divergence::record_divergence"],
+    ),
     // write: `ClaimRepository::update_labels_conn`, `ClaimRepository::update_trace_id_conn`,
     // `EvidenceRepository::create_with_source_url`,
     // `ReasoningTraceRepository::create_with_reasoning_type`,
     // `claim_helper::emit_verb_edge_best_effort`; authority:
-    // `claim_helper::claim_tenancy_report`.
+    // `claim_helper::claim_tenancy_report`; no SQL: `submission_evidence` (builds and signs
+    // the evidence row in memory).
     (
         "claims.rs",
         "write_submission",
@@ -1001,6 +1018,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::claim_tenancy_report",
             "claim_helper::emit_verb_edge_best_effort",
             "claim_helper::emit_verb_edge_best_effort",
+            "submission_evidence",
         ],
     ),
     // write: `ClaimRepository::consolidate_act_conn`; opener:
@@ -1483,6 +1501,23 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "memory.rs",
         "recall_post_embed",
         &["recall::write_recall_audit"],
+    ),
+    // write: `EvidenceRepository::create_with_source_url` (the caller's corroborating evidence
+    // on the matched claim), `claim_helper::emit_verb_edge_best_effort` (its AUTHORED edge), both
+    // on the author-stamped transaction, after the claim's tenancy was read through the viewer
+    // (`ClaimRepository::tenancy_of_conn`); opener: `claim_helper::begin_author_stamped_tx_for`;
+    // authority: `ClaimRepository::claims_not_writable_on_session` (may the session write the
+    // claim's group: ids only) and `foreign_attach::is_foreign_public_claim` (a boolean).
+    (
+        "novelty_gate.rs",
+        "corroborate",
+        &[
+            "ClaimRepository::claims_not_writable_on_session",
+            "EvidenceRepository::create_with_source_url",
+            "claim_helper::begin_author_stamped_tx_for",
+            "claim_helper::emit_verb_edge_best_effort",
+            "foreign_attach::is_foreign_public_claim",
+        ],
     ),
     // write: `EdgeRepository::create_signed`, `PerspectiveRepository::create`. Raw pool: both
     // writes run on `server.pool` (registered in `raw_pool_register.rs`).

@@ -94,11 +94,13 @@ pub async fn memorize(
         crate::tools::novelty_gate::exact_resubmit_probe(server, viewer, &content_hash, agent_id)
             .await?;
     let mut pending_embedding: Option<String> = None;
+    let mut gate_skipped: Option<crate::tools::novelty_gate::GateSkip> = None;
+    let mut near_duplicate: Option<(uuid::Uuid, Option<f64>)> = None;
     if !is_exact_resubmit {
         let novelty_threshold = params
             .novelty_threshold
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
-        if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
+        match crate::tools::novelty_gate::decide(
             server,
             viewer,
             server.embedder.as_ref(),
@@ -110,51 +112,120 @@ pub async fn memorize(
         )
         .await
         {
-            if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) = decision
-            {
-                // See submit_claim's identical branch (claims.rs) for the
-                // full rationale on both deliberate differences from
-                // content-hash dedup: corpus-wide (cross-agent) suppression
-                // — with the same epistemic-corroboration-loss consequence
-                // for memorize's caller — and this submission's `tags`
-                // being dropped since nothing is inserted.
-                let existing =
-                    crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id)
-                        .await?;
-                let deduplicated = memorize_dedup_block(
-                    DedupBy::NoveltyGate,
-                    existing_id,
-                    &MemorizeInputs {
-                        confidence_supplied: params.confidence.is_some(),
-                        tags_supplied: !tags.is_empty(),
-                        novelty_threshold_supplied: params.novelty_threshold.is_some(),
-                        provenance_written: false,
-                    },
-                );
-                return success_json(&MemorizeResponse {
-                    claim_id: existing_id.to_string(),
-                    truth_value: existing.truth_value.value(),
-                    embedded: false,
-                    tags,
-                    belief: None,
-                    plausibility: None,
-                    pignistic_prob: None,
-                    deduplicated: Some(deduplicated),
-                    visibility: None,
-                    owner_group_id: None,
-                    visibility_note: None,
-                    atomicity: crate::types::AtomicityWarning::for_content(&params.content),
-                });
-            }
-            pending_embedding = Some(pgvec);
-            if matches!(
+            // As in `submit_claim`: insert unchecked, and say so (8482b8fc).
+            Err(skip) => gate_skipped = Some(skip),
+            Ok(crate::tools::novelty_gate::GateVerdict {
                 decision,
-                crate::tools::novelty_gate::GateDecision::InsertFlagged
-            ) && !tags.iter().any(|t| t == "near-duplicate")
-            {
-                tags.push("near-duplicate".to_string());
+                embedding: pgvec,
+                nearest_distance,
+            }) => {
+                // Kept on every decision: a near-duplicate that may not
+                // corroborate is inserted below and reuses it.
+                pending_embedding = Some(pgvec);
+                if let crate::tools::novelty_gate::GateDecision::ReturnExisting(existing_id) =
+                    decision
+                {
+                    near_duplicate = Some((existing_id, nearest_distance));
+                }
+                if matches!(
+                    decision,
+                    crate::tools::novelty_gate::GateDecision::InsertFlagged
+                ) && !tags.iter().any(|t| t == "near-duplicate")
+                {
+                    tags.push("near-duplicate".to_string());
+                }
             }
         }
+    }
+
+    // A semantic duplicate CORROBORATES the claim it duplicates (backlog
+    // 4f4c6175): this memory is attached to it as testimony evidence, with its
+    // BBA and an AUTHORED edge, and no claim row is written. When the caller may
+    // not attach there (backlogs 5578f693, fef24216) the memory is inserted
+    // below as the caller's own claim, tagged `near-duplicate` when its readers
+    // may read the match. See
+    // `novelty_gate::corroborate`.
+    let mut corroboration: Option<crate::types::Corroboration> = None;
+    if let Some((existing_id, distance)) = near_duplicate {
+        // The memory's own wording is the testimony: it is the one thing this
+        // call says about the claim. Its tags are not written (they would be
+        // labels on a claim the caller does not own).
+        let evidence_text = format!(
+            "Memory corroborating this claim, stored via MCP memorize tool: {}",
+            params.content
+        );
+        let evidence_hash = ContentHasher::hash(evidence_text.as_bytes());
+        let mut evidence = Evidence::new(
+            signer_typed,
+            pub_key,
+            evidence_hash,
+            EvidenceType::Testimony {
+                source: "mcp-memorize".to_string(),
+                testified_at: chrono::Utc::now(),
+                verification: None,
+            },
+            Some(evidence_text),
+            ClaimId::from_uuid(existing_id),
+        );
+        evidence.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+        );
+        let outcome = crate::tools::novelty_gate::corroborate(
+            server,
+            viewer,
+            author,
+            existing_id,
+            crate::tools::novelty_gate::CorroboratingEvidence {
+                evidence: &evidence,
+                source_url: None,
+                strength: confidence,
+                evidence_type: "testimony",
+                tenancy: &tenancy,
+                distance,
+                tool: "memorize",
+            },
+        )
+        .await?;
+        if let crate::tools::novelty_gate::CorroborationOutcome::Attached { evidence_id } = outcome
+        {
+            let existing =
+                crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id).await?;
+            let deduplicated = memorize_dedup_block(
+                DedupBy::NoveltyGate,
+                existing_id,
+                &MemorizeInputs {
+                    confidence_supplied: params.confidence.is_some(),
+                    tags_supplied: !tags.is_empty(),
+                    novelty_threshold_supplied: params.novelty_threshold.is_some(),
+                    provenance_written: evidence_id.is_some(),
+                },
+            );
+            return success_json(&MemorizeResponse {
+                claim_id: existing_id.to_string(),
+                // The existing claim's own: a corroboration never writes it.
+                truth_value: existing.truth_value.value(),
+                embedded: false,
+                tags,
+                belief: None,
+                plausibility: None,
+                pignistic_prob: None,
+                deduplicated: Some(deduplicated),
+                visibility: None,
+                owner_group_id: None,
+                visibility_note: None,
+                atomicity: crate::types::AtomicityWarning::for_content(&params.content),
+                gate_skipped: None,
+                corroboration: Some(outcome.report(existing_id)),
+            });
+        }
+        // Tagged only when the memory's readers may read the match too
+        // (`novelty_gate::neighbour_covers_write`).
+        if outcome.flags_near_duplicate() && !tags.iter().any(|t| t == "near-duplicate") {
+            tags.push("near-duplicate".to_string());
+        }
+        corroboration = Some(outcome.report(existing_id));
     }
 
     // ── THE ONE TRANSACTION THIS SUBMISSION RUNS IN ─────────────────────
@@ -404,6 +475,8 @@ pub async fn memorize(
         visibility_note: tenancy_report.note,
         // Warn-only (backlog 72850d43): the claim above is already committed.
         atomicity: crate::types::AtomicityWarning::for_content(&params.content),
+        gate_skipped: gate_skipped.map(|reason| crate::types::GateSkipped { reason }),
+        corroboration,
     })
 }
 
@@ -412,8 +485,10 @@ struct MemorizeInputs {
     confidence_supplied: bool,
     tags_supplied: bool,
     novelty_threshold_supplied: bool,
-    /// Whether this call wrote an Evidence + ReasoningTrace (it does on a
-    /// dedup hit only when the existing claim had no trace — the orphan repair).
+    /// Whether this call wrote an Evidence row: on a content-hash hit, an
+    /// Evidence + ReasoningTrace, only when the existing claim had no trace (the
+    /// orphan repair); on a novelty-gate hit, the corroborating evidence (not
+    /// written when the caller's group had attached the same body already).
     provenance_written: bool,
 }
 
@@ -421,8 +496,13 @@ struct MemorizeInputs {
 /// (backlog a3e63a12). Measured from `memorize` above, and deliberately NOT
 /// shared with `submit_claim`'s, because the two paths keep different inputs:
 ///
-/// * [`DedupBy::NoveltyGate`] — returns before any transaction: the memory's
-///   wording, tags and confidence are written nowhere.
+/// * [`DedupBy::NoveltyGate`] — the memory CORROBORATES the existing claim
+///   (backlog 4f4c6175): its wording is the text of a testimony evidence row on
+///   that claim and its confidence that row's BBA, so both are applied; its
+///   tags are written nowhere (no claim row; the claim's labels are its
+///   owner's). When nothing was written (`provenance_written` false: the same
+///   evidence body was already attached by the caller's group), both are
+///   discarded too.
 /// * [`DedupBy::ContentHash`] — `update_labels_conn` UNIONS the tags in
 ///   (applied). Unlike `submit_claim`, `memorize` writes an Evidence +
 ///   ReasoningTrace on a dedup hit ONLY when the existing claim has no trace, so
@@ -442,9 +522,14 @@ fn memorize_dedup_block(
     let mut discarded: Vec<&'static str> = Vec::new();
     match by {
         DedupBy::NoveltyGate => {
-            discarded.push("content");
+            let evidence_inputs = if i.provenance_written {
+                &mut applied
+            } else {
+                &mut discarded
+            };
+            evidence_inputs.push("content");
             if i.confidence_supplied {
-                discarded.push("confidence");
+                evidence_inputs.push("confidence");
             }
             if i.tags_supplied {
                 discarded.push("tags");
@@ -1316,23 +1401,27 @@ pub mod __test_only {
 mod tests {
     use super::*;
 
-    /// The novelty-gate arm is unreachable through `EpiGraphMcpFull` in a test
-    /// process (see `tests/novelty_gate_test.rs`); its list is pinned here. The
-    /// content-hash arm is measured end-to-end in `tests/dedup_response_signal.rs`.
+    /// A memorize corroboration (backlog 4f4c6175) records the memory's wording
+    /// and confidence as testimony evidence on the existing claim, and drops its
+    /// tags; a repeat that wrote nothing applies nothing. Measured end-to-end in
+    /// `tests/novelty_gate_corroboration_app_role.rs`.
     #[test]
-    fn a_memorize_novelty_gate_hit_discards_content_tags_and_confidence() {
-        let d = memorize_dedup_block(
-            DedupBy::NoveltyGate,
-            uuid::Uuid::nil(),
-            &MemorizeInputs {
-                confidence_supplied: true,
-                tags_supplied: true,
-                novelty_threshold_supplied: true,
-                provenance_written: false,
-            },
+    fn a_memorize_novelty_gate_hit_applies_content_and_confidence_and_drops_tags() {
+        let inputs = |provenance_written| MemorizeInputs {
+            confidence_supplied: true,
+            tags_supplied: true,
+            novelty_threshold_supplied: true,
+            provenance_written,
+        };
+        let d = memorize_dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &inputs(true));
+        assert_eq!(d.inputs_applied, vec!["content", "confidence"], "{d:?}");
+        assert_eq!(d.inputs_discarded, vec!["tags"], "{d:?}");
+        let repeat = memorize_dedup_block(DedupBy::NoveltyGate, uuid::Uuid::nil(), &inputs(false));
+        assert!(repeat.inputs_applied.is_empty(), "{repeat:?}");
+        assert_eq!(
+            repeat.inputs_discarded,
+            vec!["content", "confidence", "tags"]
         );
-        assert!(d.inputs_applied.is_empty(), "{d:?}");
-        assert_eq!(d.inputs_discarded, vec!["content", "confidence", "tags"]);
     }
 
     /// On a content-hash hit `memorize` records the confidence only when it

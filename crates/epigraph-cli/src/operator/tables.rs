@@ -5,19 +5,20 @@
 //! `epigraph_propagate_tenancy` (migrations 070, 072) is the `claims` AFTER
 //! UPDATE trigger that copies a claim's `(owner_group_id, visibility)` onto
 //! every row derived from it. Its body carries the list as a literal,
-//! `derived text[] := ARRAY[...]`, plus two further arms: `harvester_fragments`
-//! (through `harvester_claim_provenance`) and `edges` (the MEET of both
-//! endpoints). [`propagated_tables`] parses that literal out of `pg_proc` at run
+//! `derived text[] := ARRAY[...]`, plus one further arm: `edges` (the MEET of
+//! both endpoints). [`propagated_tables`] parses that literal out of `pg_proc` at run
 //! time, so the set this tool snapshots, records and verifies is the set the
 //! trigger actually cascades to on the database it is pointed at. A table the
 //! trigger gains that this module cannot attribute is a REFUSAL, not a silent
-//! omission: see [`WRITER_COLUMNS`].
+//! omission: see [`WRITER_COLUMNS`]. (Its harvester arm, a fragment reached
+//! through its provenance link, went with the harvester tables in migration
+//! 354; on a database below 354 the provenance table is still in `derived[]`,
+//! has no entry here, and the tool refuses.)
 //!
 //! # Primary keys are read too
 //!
-//! Four of the derived tables have composite keys (`claim_frames`,
-//! `claim_cluster_membership`, `claim_neighborhood_membership`,
-//! `harvester_claim_provenance`), so a row is identified by its `pg_constraint`
+//! Three of the derived tables have composite keys (`claim_frames`,
+//! `claim_cluster_membership`, `claim_neighborhood_membership`), so a row is identified by its `pg_constraint`
 //! primary key, never by an assumed `id` column. Every key column is required
 //! to be `uuid`, which every one is today; anything else is refused.
 
@@ -47,7 +48,6 @@ pub const WRITER_COLUMNS: &[(&str, Option<&str>)] = &[
     ("ds_combined_beliefs", None),
     ("ds_bayesian_divergence", None),
     ("claim_frames", None),
-    ("harvester_claim_provenance", None),
     ("evidence", Some("signer_id")),
     ("challenges", Some("challenger_id")),
     ("reasoning_traces", None),
@@ -81,8 +81,6 @@ pub enum Kind {
     Claims,
     /// One of the trigger's `derived[]` tables: `claim_id` is the parent.
     Derived,
-    /// `harvester_fragments`, reached through `harvester_claim_provenance`.
-    Fragments,
     /// `edges` touching the claim as source or target.
     Edges,
 }
@@ -258,12 +256,12 @@ async fn has_column(conn: &mut PgConnection, table: &str, col: &str) -> anyhow::
 }
 
 /// Every table a claim's re-own touches: `claims`, the trigger's `derived[]`
-/// tables, `harvester_fragments` and `edges`.
+/// tables and `edges`.
 ///
 /// # Errors
 /// The trigger function is missing; its `derived[]` names a table with no
-/// entry in [`WRITER_COLUMNS`]; its fragment or edge arm is gone; or a table's
-/// shape is not what this module handles.
+/// entry in [`WRITER_COLUMNS`]; its edge arm is gone; or a table's shape is
+/// not what this module handles.
 pub async fn propagated_tables(conn: &mut PgConnection) -> anyhow::Result<Vec<TableSpec>> {
     let src: Option<String> = sqlx::query_scalar(
         "SELECT prosrc FROM pg_proc \
@@ -273,13 +271,11 @@ pub async fn propagated_tables(conn: &mut PgConnection) -> anyhow::Result<Vec<Ta
     .await?;
     let src = src.ok_or_else(|| anyhow!("public.epigraph_propagate_tenancy() does not exist"))?;
     let derived = parse_derived_array(&src).context("reading epigraph_propagate_tenancy")?;
-    for arm in ["public.harvester_fragments", "public.edges"] {
-        if !src.contains(arm) {
-            bail!(
-                "epigraph_propagate_tenancy no longer has its {arm} arm; this tool's model of the \
-                 cascade is out of date, refusing"
-            );
-        }
+    if !src.contains("public.edges") {
+        bail!(
+            "epigraph_propagate_tenancy no longer has its public.edges arm; this tool's model of \
+             the cascade is out of date, refusing"
+        );
     }
     let enabled: Option<String> = sqlx::query_scalar(
         "SELECT tgenabled::text FROM pg_trigger \
@@ -323,19 +319,6 @@ pub async fn propagated_tables(conn: &mut PgConnection) -> anyhow::Result<Vec<Ta
             writer_owned,
         });
     }
-    require_columns(
-        conn,
-        "harvester_fragments",
-        &["id", "owner_group_id", "visibility"],
-    )
-    .await?;
-    specs.push(TableSpec {
-        name: "harvester_fragments".into(),
-        pk: pk_columns(conn, "harvester_fragments").await?,
-        writer: None,
-        kind: Kind::Fragments,
-        writer_owned: false,
-    });
     require_columns(
         conn,
         "edges",
@@ -384,8 +367,8 @@ pub struct Attached {
     /// The claim this row was reached through (the lowest such id when several).
     pub claim: Uuid,
     /// EVERY claim in the queried set this row hangs off. An edge between two
-    /// queried claims, or a fragment that is the provenance of several, hangs
-    /// off each of them, and a non-public row must hold every one.
+    /// queried claims hangs off each of them, and a non-public row must hold
+    /// every one.
     pub claims: BTreeSet<Uuid>,
     pub tenancy: Tenancy,
     /// The writer column's value, when the table has one.
@@ -393,12 +376,8 @@ pub struct Attached {
     /// Edges only: both endpoints resolve `public` under
     /// `epigraph_node_tenancy`, the function the trigger computes the meet with.
     pub endpoints_public: Option<bool>,
-    /// Fragments only: the fragment is also the provenance of a claim outside
-    /// the set being moved.
-    pub shared_outside: bool,
-    /// Fragments and edges: the OTHER claims (outside the queried set) the row
-    /// also hangs off — the fragment's other provenance claims, the edge's
-    /// other claim endpoint.
+    /// Edges: the OTHER claims (outside the queried set) the row also hangs
+    /// off — the edge's other claim endpoint.
     pub neighbours: BTreeSet<Uuid>,
     /// Migration 114's `writer_owned`, on a table that carries it; `None`
     /// elsewhere. Read by `restrict-claims` (a narrowing clears it) and by the
@@ -519,48 +498,11 @@ pub async fn fetch_attached(
                             },
                             writer: r.get(4),
                             endpoints_public: None,
-                            shared_outside: false,
                             neighbours: BTreeSet::new(),
                             writer_owned: r.get(8),
                             evidence_type: r.get(5),
                             labels: r.get(6),
                             preview: r.get(7),
-                        },
-                    );
-                }
-            }
-            Kind::Fragments => {
-                let sql = format!(
-                    "SELECT {pk}, p.claim_id, f.owner_group_id, f.visibility::text, \
-                            ARRAY(SELECT p2.claim_id FROM harvester_claim_provenance p2 \
-                                   WHERE p2.fragment_id = f.id AND p2.claim_id <> ALL($1)) \
-                       FROM harvester_fragments f \
-                       JOIN harvester_claim_provenance p ON p.fragment_id = f.id \
-                      WHERE p.claim_id = ANY($1)",
-                    pk = s.pk_expr("f")
-                );
-                for r in sqlx::query(&sql).bind(claims).fetch_all(&mut *conn).await? {
-                    let others: Vec<Uuid> = r.get(4);
-                    insert_min(
-                        &mut out,
-                        Attached {
-                            table: s.name.clone(),
-                            pk: r.get(0),
-                            claim: r.get(1),
-                            claims: BTreeSet::new(),
-                            tenancy: Tenancy {
-                                owner: r.get(2),
-                                visibility: r.get(3),
-                                co_owner: None,
-                            },
-                            writer: None,
-                            endpoints_public: None,
-                            shared_outside: !others.is_empty(),
-                            neighbours: others.into_iter().collect(),
-                            writer_owned: None,
-                            evidence_type: None,
-                            labels: Vec::new(),
-                            preview: None,
                         },
                     );
                 }
@@ -602,7 +544,6 @@ pub async fn fetch_attached(
                             },
                             writer: r.get(5),
                             endpoints_public: Some(r.get(6)),
-                            shared_outside: false,
                             neighbours: others.into_iter().collect(),
                             writer_owned: None,
                             evidence_type: None,
@@ -643,7 +584,7 @@ pub async fn refetch_tenancy(
 /// rows changed.
 ///
 /// `scope` narrows the scan through an indexed column: `claim_id` for a
-/// derived table, `id` for fragments and edges.
+/// derived table, `id` for edges.
 ///
 /// # Errors
 /// The update fails.
@@ -662,7 +603,7 @@ pub async fn write_tenancy(
         .collect();
     let (scope, bind_ids): (&str, Vec<Uuid>) = match spec.kind {
         Kind::Derived => ("t.claim_id = ANY($2)", claims.to_vec()),
-        Kind::Fragments | Kind::Edges => (
+        Kind::Edges => (
             "t.id = ANY($2)",
             rows.iter()
                 .filter_map(|(pk, _)| Uuid::parse_str(pk).ok())
@@ -774,7 +715,7 @@ pub async fn lock_unkeyed_tables(conn: &mut PgConnection, tables: &[String]) -> 
 /// The tables every batch of a NARROWING or re-grouping act (`restrict-claims`
 /// and `regroup-claims`, apply, dry run and reverse) holds `SHARE ROW
 /// EXCLUSIVE` on for its duration: the derived tables with no key to claims
-/// ([`unkeyed_tables`]), plus `edges` and `harvester_fragments`.
+/// ([`unkeyed_tables`]), plus `edges`.
 ///
 /// Why `edges`: a concurrent edge INSERT on a moving claim is stamped by its
 /// trigger from the claim as that statement reads it, and an edge has no
@@ -787,16 +728,8 @@ pub async fn lock_unkeyed_tables(conn: &mut PgConnection, tables: &[String]) -> 
 /// until the batch commits (its trigger, which reads the claim with a fresh
 /// snapshot, then sees the move).
 ///
-/// `harvester_fragments` is defence in depth, not a second closed gap: a
-/// fragment takes its tenancy from the AFTER INSERT statement trigger on
-/// `harvester_claim_provenance` (migration 089, ranked by 218), and that
-/// insert's foreign key to `claims` already takes `KEY SHARE` on the claim,
-/// which waits for the batch's `FOR UPDATE` (or makes the batch wait). The
-/// lock keeps any other fragment writer that reads a claim's tenancy without
-/// that key serialised too. Only the edge race is exercised by a test.
-///
-/// Cost: a batch, dry runs included, blocks every edge and fragment write on
-/// the instance while it runs; keep batches short.
+/// Cost: a batch, dry runs included, blocks every edge write on the instance
+/// while it runs; keep batches short.
 ///
 /// `reown-claims` does not use this list: it moves public claims to another
 /// public owner, and a public edge's tuple does not depend on its endpoints'
@@ -804,10 +737,8 @@ pub async fn lock_unkeyed_tables(conn: &mut PgConnection, tables: &[String]) -> 
 #[must_use]
 pub fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
     let mut out: Vec<String> = unkeyed.to_vec();
-    for t in ["edges", "harvester_fragments"] {
-        if !out.iter().any(|u| u == t) {
-            out.push(t.to_string());
-        }
+    if !out.iter().any(|u| u == "edges") {
+        out.push("edges".to_string());
     }
     out
 }
@@ -1239,7 +1170,7 @@ async fn app_readable_inner(
                 s.pk_expr("t"),
                 s.name
             ),
-            Kind::Fragments | Kind::Edges => format!(
+            Kind::Edges => format!(
                 "SELECT {} FROM \"{}\" t WHERE t.id = ANY($1)",
                 s.pk_expr("t"),
                 s.name
@@ -1247,7 +1178,7 @@ async fn app_readable_inner(
         };
         let bind: &[Uuid] = match s.kind {
             Kind::Claims | Kind::Derived => claims,
-            Kind::Fragments | Kind::Edges => &ids_of_table,
+            Kind::Edges => &ids_of_table,
         };
         let rows: Vec<String> = sqlx::query_scalar(&sql)
             .bind(bind)

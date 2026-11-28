@@ -5265,6 +5265,70 @@ restart.
   `docs/runbooks/353-undo.sql`. **Deploy order:** either; a binary without the change runs on 353
   unchanged, and the change's binary runs without 353 (only the concurrent-write backstop is
   missing).
+- **354**: `drop_harvester_tables` (backlog a6e3dba2, c7752f07). Drops `harvester_sources`,
+  `harvester_fragments`, `harvester_audit_reports`, `harvester_claim_provenance` and
+  `harvester_enriched_concepts` (001; kept under tenancy by 062-079, 089, 115, 173, 215, 218, 242,
+  284 and 347). Their writer (the Python harvester; its crate and proto are gone) has no code in
+  this repository, and the operator decided on 2026-11-27 to drop them after a read-only check of
+  the deployed database found all five with no live row and no insert, update or delete since the
+  statistics reset. Guards, each refusing with nothing changed: (a) 284's
+  `epigraph_propagate_tenancy`, `epigraph_publicize_claims` and `epigraph_share_claims_with_team`
+  and 127's `epigraph_record_elevated_access` still hold the bodies 354 re-states (md5 of
+  `prosrc`, 55000); (b) the session reads every row (superuser, BYPASSRLS or the maintenance role;
+  42501), since the tables are FORCEd; (c) all five tables are empty (55000; it archives nothing).
+  Re-states those four bodies without their harvester arms (propagation: the provenance entry of
+  `derived[]` and arm (d)'s fragment statement; publicize and share: 242's fragment hold and 215's
+  source rule, and the audit keys `harvester_fragments_held`, `harvester_sources_moved`,
+  `harvester_sources_held`; their audit rows now record `migration: 354`; the recorder: its
+  `harvester_fragments` arm), then `DROP TABLE` (RESTRICT, foreign-key order) the five and
+  `DROP FUNCTION` the three trigger functions only they ran
+  (`epigraph_inherit_fragment_tenancy_stmt`, `epigraph_audit_report_inherit_tenancy`,
+  `epigraph_fragment_audit_reports_follow`), and deletes the two `tenancy_backfill_progress`
+  rows 062 seeded for the tier-A harvester tables (the ledger keeps one row per tier-A table).
+  No surviving function body names a harvester table.
+  The binary, operator CLI, tenancy backfill, ratchets and censuses drop the tables in the same
+  change (`state.rs`'s FORCE list and the 070/074/089/173 trigger tiers, the seal, the operator's
+  cascade model, `epigraph-tenancy-backfill`'s fragment entity and ownership register). Pinned by
+  `epigraph-db/tests/harvester_tables_dropped.rs` (no harvester relation, function or body at
+  head, with a calibration below 354; the three guards; the undo). Undo:
+  `docs/runbooks/354-undo.sql` re-creates the five tables EMPTY in their 347 shape (columns,
+  constraints, indexes, triggers, FORCEd row security, policies, grants, comments) and the
+  replaced bodies and dropped functions byte for byte, and re-seeds the two ledger rows as 062
+  did; it refuses (55000) over a body a later migration re-stated. Run it BEFORE any older
+  runbook that re-states one of the four bodies or names a harvester table (284's, 258's,
+  242's, 126's, ...): those refuse over 354's bodies or fail on the absent tables. **Measure first** (guard (c)): `SELECT count(*)` of each table as a
+  superuser. **Deploy order:** MIGRATE FIRST, then the binary of this change
+  (`epigraph-migrate` as ExecStartPre). That binary no longer blanks harvester fragment text in a
+  seal nor checks the harvester tables at boot, so it must not serve a database below 354 that
+  holds harvester rows (with the tables empty, as measured, nothing is lost). An OLDER binary
+  still boots on a migrated database (its trigger check skips an absent table with a warning, and
+  the 089/173 tiers are gated on functions 354 drops), but its seal fails (42P01 on
+  `harvester_fragments`). The operator CLI of this change refuses a database below 354 (its
+  cascade model no longer attributes the provenance table).
+  Apply as a superuser. **Applied to throwaway databases only, NOT to any deployed database.**
+- **355**: `papers_declare_abstract_text_properties` (backlog 158b7ce4). A deployed database's
+  `papers` carries two columns no earlier migration creates: `abstract_text text` (nullable, no
+  default; read by `scripts/run_assessment_worker.py`) and `properties jsonb NOT NULL DEFAULT
+  '{}'::jsonb` (read by no crate; it may hold data there, so it is declared, not dropped). 255
+  grants `epigraph_app` INSERT on every `papers` column but `licence` from the live column list,
+  so where the two columns predated 255 they gained INSERT, and a database migrated from empty
+  differed in both columns and column ACLs. 355 adds each column only where `pg_attribute` shows
+  it missing (so where both exist no ALTER TABLE runs and `papers` is not locked), with the
+  deployed definition, then `GRANT INSERT (abstract_text, properties) ON papers TO epigraph_app`
+  (no UPDATE: 255's UPDATE allowlist stays `title` and `journal`). **On a deployed database whose
+  columns and grants predate it, 355 changes nothing, so it has nothing to reverse there.** A
+  column that already exists with a different definition is left as it is, without a warning
+  (the `ADD COLUMN IF NOT EXISTS` behaviour); only the end-state catalog check shows it. **No
+  undo runbook ships**: an undo would have to DROP the two columns, nothing records which database
+  355 created them on, and on a deployed database that would destroy data. Pinned by
+  `epigraph-db/tests/paper_licence_operator_only.rs`
+  (`papers_declares_abstract_text_and_properties_insert_only`,
+  `the_app_role_inserts_the_declared_paper_columns_but_never_updates_them`,
+  `migration_355_keeps_columns_that_predate_255`, and 255's
+  `the_app_role_writes_only_the_allowlisted_paper_columns`). No binary depends on it; no deploy
+  order. **Measure after deploy**: the deploy's end-state catalog check should show no `papers`
+  column or column-ACL drift between a fresh migrate and the deployed database; this change did
+  not measure parity with a deployed database.
 
 ## `-- no-transaction` migrations
 

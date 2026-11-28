@@ -261,7 +261,7 @@ pub async fn register_endpoint(
             "agent" => {
                 // AUTO-ACTIVATION KILL (PR-02). This arm previously returned
                 // ("active", scopes, scopes) with eleven scopes including
-                // claims:write and ingest:write — i.e. an unauthenticated POST
+                // write scopes (claims:write among them) — i.e. an unauthenticated POST
                 // to this endpoint yielded a usable write credential. It now
                 // registers PENDING with an EMPTY granted set: `allowed_scopes`
                 // records what an admin MAY approve (a maintenance session,

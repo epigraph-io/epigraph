@@ -171,7 +171,7 @@ pub fn verify() -> Result<()> {
     eprintln!("Manual recall checks (run separately):");
     eprintln!("  recall \"what stores DST mass functions\"  → mass_functions");
     eprintln!("  recall \"belief frame definition\"         → frames");
-    eprintln!("  recall \"harvester audit reports\"         → harvester_audit_reports");
+    eprintln!("  recall \"evidence visibility pins\"        → evidence_visibility_pins");
     Ok(())
 }
 
