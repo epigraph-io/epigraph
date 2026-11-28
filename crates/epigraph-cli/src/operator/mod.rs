@@ -138,6 +138,16 @@
 //!   audit row, in one transaction. Access tokens already minted stay valid
 //!   until they expire (at most 1 h), which each run prints.
 //!
+//! And the write-scope re-provision (migration 362, backlog c841b15f; see
+//! [`write_scopes`]):
+//!
+//! * `reprovision-write-scopes --reason TEXT [--apply --confirm-count N
+//!   --manifest-out F]` — add `edges:write` and `evidence:write` to every
+//!   ACTIVE client holding `claims:write` (both scope arrays) and to each of
+//!   its live `claims:write` refresh tokens, one
+//!   `oauth.write_scopes_reprovisioned` audit row per client;
+//!   `--reverse --manifest F` restores the exact prior arrays.
+//!
 //! And role-attached agents (migration 264; see [`role_restore`]):
 //!
 //! * `restore-role-successor --role R --root <agent> --successor <agent>` —
@@ -226,6 +236,7 @@ pub mod system_agent;
 pub mod tables;
 pub mod team_group;
 pub mod workflow_submitter;
+pub mod write_scopes;
 
 use anyhow::{anyhow, bail, Context};
 use sqlx::PgConnection;

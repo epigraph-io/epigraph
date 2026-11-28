@@ -2830,6 +2830,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // CLOSED (the host skips every owner-role schedule), but with a
     // misleading reason, which this entry reports.
     ("epigraph_role_owner_may_run", 360),
+    // 362 (backlog c841b15f), the write-scope re-provision and its reverse.
+    // Neither reads a FORCEd table: `oauth_clients` and `refresh_tokens` have
+    // no row security, and the `oauth.` audit prefix is admitted by the
+    // caller's maintenance SESSION (`epigraph_bypass()` reads session_user)
+    // whoever owns the body. What a non-member owner costs is privileges: an
+    // owner without UPDATE on either table or INSERT on `security_events`
+    // refuses every run (loud, fail-closed).
+    ("epigraph_reprovision_write_scopes", 362),
+    ("epigraph_reprovision_write_scopes_reverse", 362),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4207,6 +4216,20 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_role_owner_may_run",
         "public.epigraph_role_owner_may_run(uuid, uuid)",
+        false,
+    ),
+    // 362: the write-scope re-provision verbs are maintenance-only. An app
+    // grant would let the request DSN widen every active writing client's
+    // scopes and live refresh chains (or strip them again through the
+    // reverse); the bodies' session check is defence in depth.
+    (
+        "epigraph_reprovision_write_scopes",
+        "public.epigraph_reprovision_write_scopes(text[], text, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_reprovision_write_scopes_reverse",
+        "public.epigraph_reprovision_write_scopes_reverse(uuid, text[], text[], text[], text[], jsonb, text, jsonb)",
         false,
     ),
 ];

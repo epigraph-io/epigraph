@@ -2139,6 +2139,64 @@ dynamically registered (RFC 7591) client with its authorization-code count.
 those that never completed an authorization and are older than the floor,
 with one audit row per client.
 
+**Write-scope re-provision (migration 362): a GATE for the MCP scope remap.**
+The remap that moves the MCP edge writers to `edges:write` and the evidence
+writers to `evidence:write` (backlog c2dbcf27) must not deploy until this verb
+has run on the target database. Before it, those writers need only
+`claims:write`, and many writing clients and their live refresh chains hold
+neither new scope. A grant on the client alone would not reach a connected
+agent, because the refresh grant issues the chain's stored scopes narrowed to
+the client's grant. In order:
+
+1. Migrate to 362 and install the `epigraph-operator` that has the verb.
+2. `epigraph-operator reprovision-write-scopes --reason <text>` (dry run):
+   one `CLIENT` line per active `claims:write` client it would change, one
+   `CHAIN` line per live refresh family, and the totals. Compare them with a
+   census of the same predicate. The dry run runs the real statements and
+   rolls them back. Until then it holds row locks on every candidate client
+   and on each live refresh token it would widen. A refresh of one of those
+   tokens, and any change to a candidate client's scopes or status, waits
+   for it. Other new tokens for those clients (a refresh of another chain, a
+   client_credentials mint, an authorization-code exchange) do not wait: the
+   client rows are locked `FOR NO KEY UPDATE`, which the refresh-token
+   foreign key's lock does not conflict with. `--apply` holds the same locks
+   until it commits. Run both off-peak. A run that waits more than 5 seconds
+   for a row another transaction holds fails with a lock timeout and writes
+   nothing; re-run it.
+3. `... --reason <text> --apply --confirm-count <N from step 2>
+   --manifest-out <new file>`. A different count rolls back everything. Keep
+   the manifest: it is the undo.
+4. Run the dry run again; it must report `0 client(s)`. A rotation in flight
+   during step 3 can mint a successor the run did not see. Re-run step 3 for
+   any that remain.
+5. Wait out the longest access-token lifetime (1 hour for human and service
+   clients, 15 minutes for agents; `access_token_ttl` in
+   `epigraph-api/src/oauth/token.rs`) after the last `--apply`. An access
+   token minted before the run keeps its old scopes until it expires. Under
+   the remap it is refused `insufficient_scope`, which a client does not
+   usually answer by refreshing.
+6. Check that every path that creates a NEW writing client also grants both
+   scopes. The agent provisioning set already does. A human's per-user
+   client takes the provider's `default_scopes` from the deployment's
+   provider configuration: if those list `claims:write`, add `edges:write`
+   and `evidence:write`, or clients created after step 4 are cut off.
+7. Immediately before deploying the remap, after the wait in step 5, run
+   the dry run once more; it must report `0 client(s)`. Step 4 can pass
+   while a client or chain without the new scopes is still to come. An
+   authorization started before step 3 keeps the client's scopes as they
+   were when its consent page opened (the authorize session lasts 10
+   minutes, its code 60 seconds), so its exchange after step 4 mints such a
+   chain; the step 5 wait outlasts it. A pending client approved with
+   `claims:write` after step 3 may lack both scopes, and a suspended client
+   reinstated after step 3 was never re-provisioned. If any client remains,
+   re-run step 3 for it, then repeat steps 5 and 7.
+8. Only then deploy the remap.
+
+The undo is `reprovision-write-scopes --reverse --manifest <file> --reason
+<text> --apply`. It restores each client's exact prior arrays and its chains
+(by family), and leaves alone (HELD, exit 3) any client whose arrays changed
+since. Undo the remap first.
+
 **Access-token revocation (migration 141).** `POST /oauth/revoke` with an
 access token records its `jti` in a durable denylist, which the API and the
 MCP bearer middleware read. A binary built with it on a database without 141
