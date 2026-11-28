@@ -1,4 +1,4 @@
--- 362: the caller-reachable refusals of the three *_require_tenancy trigger
+-- 359: the caller-reachable refusals of the three *_require_tenancy trigger
 -- bodies carry a refusal code (backlog baac4c90, the follow-up 176 left for
 -- these bodies).
 --
@@ -36,11 +36,11 @@
 -- volatility and search_path; outside the four RAISE statements the bodies
 -- are byte-identical to 216's (pinned by
 -- crates/epigraph-db/tests/caller_refusal_codes_restatement.rs, which compares
--- the catalog of a database before 362 with the same database at 362). A
--- later migration that restates one of these bodies must start from 362's
+-- the catalog of a database before 359 with the same database at 359). A
+-- later migration that restates one of these bodies must start from 359's
 -- text or it drops the codes.
 --
--- Undo: docs/runbooks/362-undo.sql. Idempotent: CREATE OR REPLACE only.
+-- Undo: docs/runbooks/359-undo.sql. Idempotent: CREATE OR REPLACE only.
 SET LOCAL lock_timeout = '3s';
 
 -- ===================================================================

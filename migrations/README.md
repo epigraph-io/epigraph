@@ -5329,7 +5329,7 @@ restart.
   order. **Measure after deploy**: the deploy's end-state catalog check should show no `papers`
   column or column-ACL drift between a fresh migrate and the deployed database; this change did
   not measure parity with a deployed database.
-- **362**: `require_tenancy_refusal_codes` (backlogs baac4c90, 6b332b58). The follow-up 176 left
+- **359**: `require_tenancy_refusal_codes` (backlogs baac4c90, 6b332b58). The follow-up 176 left
   for the three `*_require_tenancy` trigger bodies: each is re-stated from 216's text with only
   four RAISE statements changed, each keeping its SQLSTATE: `TEN03`
   (`epigraph_claims_require_tenancy`, an undeclared claim, 23502; the row's `id` and `agent_id`
@@ -5343,13 +5343,13 @@ restart.
   message opens with a listed code as `DbError::Refused { kind: Input }` (HTTP 400 with the
   message, the MCP designed-refusal text); an uncoded 23503 stays `ForeignKeyViolation`. Owner,
   ACL, SECURITY mode, search_path and volatility are kept by CREATE OR REPLACE. Pinned by
-  `epigraph-db/tests/caller_refusal_codes_restatement.rs` (a database below 362 against the same
-  database at 362: only the declared RAISE statements change; the undo) and
+  `epigraph-db/tests/caller_refusal_codes_restatement.rs` (a database below 359 against the same
+  database at 359: only the declared RAISE statements change; the undo) and
   `epigraph-db/tests/require_tenancy_refusal_codes.rs` and
   `epigraph-api/tests/caller_refusal_codes_http.rs` (each coded arm raised on the application
-  role). Undo: `docs/runbooks/362-undo.sql` re-states 216's bodies; it refuses (55000) over a
+  role). Undo: `docs/runbooks/359-undo.sql` re-states 216's bodies; it refuses (55000) over a
   body a later migration re-stated. A LATER migration that re-states one of these bodies must
-  start from 362's text or it drops the codes. No order against the binaries: an older binary
+  start from 359's text or it drops the codes. No order against the binaries: an older binary
   answers a coded 23503 as before (`ForeignKeyViolation`, the generic foreign-key 400) and a
   coded 23502 as before (the redacted 500, since it does not list the code); the binary of this
   change answers both 400 with the code. **Applied to throwaway databases only, NOT to any deployed database.**

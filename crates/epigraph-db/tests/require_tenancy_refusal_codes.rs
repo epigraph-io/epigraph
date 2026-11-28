@@ -1,4 +1,4 @@
-//! Migration 362 (backlog baac4c90) codes the caller-reachable refusals of the
+//! Migration 359 (backlog baac4c90) codes the caller-reachable refusals of the
 //! three `*_require_tenancy` trigger bodies, and `From<sqlx::Error> for
 //! DbError` answers a 23503 that carries a listed code as the caller's input
 //! refusal (backlog 6b332b58).
@@ -7,7 +7,7 @@
 //! (`SET SESSION AUTHORIZATION epigraph_app`: the harness role holds a grant of
 //! `epigraph_seed`, so on the default connection every undeclared write takes
 //! the seed arm and succeeds). Each test asserts the code is in the message,
-//! the SQLSTATE is the one it had before 362, and no row id is in the
+//! the SQLSTATE is the one it had before 359, and no row id is in the
 //! message. The predecessor arm stays uncoded (a code would tell a missing
 //! claim from a private one), and a plain foreign-key violation stays
 //! `DbError::ForeignKeyViolation`.

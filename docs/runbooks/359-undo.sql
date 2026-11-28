@@ -1,26 +1,26 @@
 -- ===================================================================
--- 362-undo.sql: take migration 362 (refusal codes TEN03-TEN06 on the three
+-- 359-undo.sql: take migration 359 (refusal codes TEN03-TEN06 on the three
 -- *_require_tenancy trigger bodies) back out, in ONE transaction, on the
 -- migration (superuser) DSN.
 --
--- No binary needs rolling back first: a 362 binary answers an uncoded
--- tenancy refusal as it did before 362 (an uncoded 23503 is
+-- No binary needs rolling back first: a 359 binary answers an uncoded
+-- tenancy refusal as it did before 359 (an uncoded 23503 is
 -- `ForeignKeyViolation`, an uncoded 23502 the redacted database error), so
 -- after this file the refusals simply lose their codes again.
 --
 -- WHAT IT DOES:
 --   * REFUSES (55000, nothing changed) unless each of the three bodies is
---     362's or already 216's (md5 of `prosrc`), so a body a later migration
+--     359's or already 216's (md5 of `prosrc`), so a body a later migration
 --     re-stated is never silently reverted;
 --   * re-states 216's `epigraph_claims_require_tenancy()`,
 --     `epigraph_derived_require_tenancy()` and `epigraph_root_require_tenancy()`
 --     byte for byte; `CREATE OR REPLACE` keeps their owner and ACL.
 --
--- WHAT IT LEAVES: 362's `_sqlx_migrations` row. Re-introducing the codes is a
--- NEW migration, never a re-run of 362.
+-- WHAT IT LEAVES: 359's `_sqlx_migrations` row. Re-introducing the codes is a
+-- NEW migration, never a re-run of 359.
 -- Idempotent: a second run changes nothing.
 -- Tested by crates/epigraph-db/tests/caller_refusal_codes_restatement.rs
--- (`the_362_undo_returns_the_bodies_below_362`).
+-- (`the_359_undo_returns_the_bodies_below_359`).
 -- ===================================================================
 BEGIN;
 SET LOCAL lock_timeout = '3s';
@@ -39,7 +39,7 @@ BEGIN
                              'epigraph_root_require_tenancy')
     LOOP
         IF v_md5 NOT IN (
-            -- 362's bodies
+            -- 359's bodies
             '34ae82be5d1b42d134e5826b656d848e',
             'b783f07bdb965b7eb81da698ec188af8',
             '1fbf62e96f37ddf0cf25055e9e6d5839',
@@ -48,7 +48,7 @@ BEGIN
             'e2bfce6d72f7ddc4fdbe887239b0e130',
             '892f65582789246ab3aeaf29213957a2')
         THEN
-            RAISE EXCEPTION '362-undo: % (prosrc md5 %) is neither 362''s nor 216''s body; '
+            RAISE EXCEPTION '359-undo: % (prosrc md5 %) is neither 359''s nor 216''s body; '
                             'a later migration re-stated it, so this undo would revert that '
                             'change. Nothing was changed.', v_name, v_md5
                 USING ERRCODE = '55000';

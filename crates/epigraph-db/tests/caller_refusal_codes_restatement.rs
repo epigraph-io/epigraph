@@ -9,11 +9,11 @@
 //! exception), keeps its SQLSTATE, and the codes introduced are exactly
 //! `epigraph_db::CALLER_REFUSAL_CODES` less the ones a later restatement adds.
 //!
-//! Migration 362 (backlog baac4c90) restates the three `*_require_tenancy`
+//! Migration 359 (backlog baac4c90) restates the three `*_require_tenancy`
 //! bodies 176 left out, from 216's text, the same way: the same before/after
 //! catalog comparison pins that only four RAISE statements change, each to
 //! its declared new form, and that the codes it introduces are
-//! [`MIGRATION_362_CODES`].
+//! [`MIGRATION_359_CODES`].
 //!
 //! Uses the non-macro `sqlx::query` forms so the offline `.sqlx/` cache is not
 //! extended for one test.
@@ -28,12 +28,12 @@ static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 const MIGRATION_176: &str = include_str!("../../../migrations/176_caller_refusal_codes.sql");
 
 /// The restatement of the three `*_require_tenancy` bodies.
-const MIGRATION_362_VERSION: i64 = 362;
-const MIGRATION_362: &str =
-    include_str!("../../../migrations/362_require_tenancy_refusal_codes.sql");
+const MIGRATION_359_VERSION: i64 = 359;
+const MIGRATION_359: &str =
+    include_str!("../../../migrations/359_require_tenancy_refusal_codes.sql");
 
-/// The codes 362 introduces, each also in `epigraph_db::CALLER_REFUSAL_CODES`.
-const MIGRATION_362_CODES: &[&str] = &["TEN03", "TEN04", "TEN05", "TEN06"];
+/// The codes 359 introduces, each also in `epigraph_db::CALLER_REFUSAL_CODES`.
+const MIGRATION_359_CODES: &[&str] = &["TEN03", "TEN04", "TEN05", "TEN06"];
 
 /// The functions 176 restates, by identity signature.
 const RESTATED: &[&str] = &[
@@ -334,7 +334,7 @@ async fn migration_176_changes_only_raise_statements(pool: PgPool) {
     }
     let mut expected: Vec<String> = epigraph_db::CALLER_REFUSAL_CODES
         .iter()
-        .filter(|c| !MIGRATION_362_CODES.contains(c))
+        .filter(|c| !MIGRATION_359_CODES.contains(c))
         .map(|c| (*c).to_string())
         .collect();
     expected.sort();
@@ -342,28 +342,28 @@ async fn migration_176_changes_only_raise_statements(pool: PgPool) {
     got.sort();
     assert_eq!(
         got, expected,
-        "176 introduces exactly CALLER_REFUSAL_CODES less 362's, each once"
+        "176 introduces exactly CALLER_REFUSAL_CODES less 359's, each once"
     );
 }
 
 // =============================================================================
-// Migration 362: the three *_require_tenancy bodies, from 216's text.
+// Migration 359: the three *_require_tenancy bodies, from 216's text.
 // =============================================================================
 
-/// The three functions 362 restates, by identity signature.
-const RESTATED_362: &[&str] = &[
+/// The three functions 359 restates, by identity signature.
+const RESTATED_359: &[&str] = &[
     "epigraph_claims_require_tenancy()",
     "epigraph_derived_require_tenancy()",
     "epigraph_root_require_tenancy()",
 ];
 
-/// The RAISE statements 362 changes, per function, in body order: the code,
+/// The RAISE statements 359 changes, per function, in body order: the code,
 /// and the declared edits beyond the prefix, as `(old text, new text)` pairs
 /// applied to the old statement once the code is prefixed. Every pair's old
 /// text must be in the old statement, so an edit cannot be declared vacuously.
 /// The two non-empty lists move row ids out of the MESSAGE into DETAIL.
 type Change = (&'static str, &'static [(&'static str, &'static str)]);
-const CHANGES_362: &[(&str, &[Change])] = &[
+const CHANGES_359: &[(&str, &[Change])] = &[
     (
         "epigraph_claims_require_tenancy()",
         &[(
@@ -400,31 +400,31 @@ const CHANGES_362: &[(&str, &[Change])] = &[
 ];
 
 #[test]
-fn migration_362_restates_exactly_the_three_tenancy_bodies() {
+fn migration_359_restates_exactly_the_three_tenancy_bodies() {
     assert_eq!(
-        MIGRATION_362
+        MIGRATION_359
             .matches("CREATE OR REPLACE FUNCTION public.")
             .count(),
-        RESTATED_362.len(),
+        RESTATED_359.len(),
         "one CREATE per listed function"
     );
-    for sig in RESTATED_362 {
+    for sig in RESTATED_359 {
         let name = &sig[..sig.find('(').unwrap()];
         assert!(
-            MIGRATION_362.contains(&format!("CREATE OR REPLACE FUNCTION public.{name}(")),
-            "362 restates {name}"
+            MIGRATION_359.contains(&format!("CREATE OR REPLACE FUNCTION public.{name}(")),
+            "359 restates {name}"
         );
     }
     assert_eq!(
-        CHANGES_362.iter().map(|(sig, _)| *sig).collect::<Vec<_>>(),
-        RESTATED_362,
+        CHANGES_359.iter().map(|(sig, _)| *sig).collect::<Vec<_>>(),
+        RESTATED_359,
         "every restated function declares its changes"
     );
 }
 
 #[test]
-fn migration_362_codes_are_caller_refusal_codes() {
-    for code in MIGRATION_362_CODES {
+fn migration_359_codes_are_caller_refusal_codes() {
+    for code in MIGRATION_359_CODES {
         assert_eq!(
             epigraph_db::caller_refusal_code(&format!("{code}: x")),
             Some(*code),
@@ -434,21 +434,21 @@ fn migration_362_codes_are_caller_refusal_codes() {
 }
 
 #[sqlx::test(migrations = false)]
-async fn migration_362_changes_only_the_declared_raise_statements(pool: PgPool) {
-    migrate(&pool, &up_to(MIGRATION_362_VERSION - 1)).await;
-    let before = facts_of(&pool, RESTATED_362).await;
+async fn migration_359_changes_only_the_declared_raise_statements(pool: PgPool) {
+    migrate(&pool, &up_to(MIGRATION_359_VERSION - 1)).await;
+    let before = facts_of(&pool, RESTATED_359).await;
     assert_eq!(
         before.len(),
-        RESTATED_362.len(),
-        "every function exists before 362"
+        RESTATED_359.len(),
+        "every function exists before 359"
     );
-    // Up to 362, not head, for the reason 176's test gives.
-    migrate(&pool, &up_to(MIGRATION_362_VERSION)).await;
-    let after = facts_of(&pool, RESTATED_362).await;
-    assert_eq!(after.len(), RESTATED_362.len());
+    // Up to 359, not head, for the reason 176's test gives.
+    migrate(&pool, &up_to(MIGRATION_359_VERSION)).await;
+    let after = facts_of(&pool, RESTATED_359).await;
+    assert_eq!(after.len(), RESTATED_359.len());
 
     let mut introduced: Vec<&str> = Vec::new();
-    for (sig, changes) in CHANGES_362 {
+    for (sig, changes) in CHANGES_359 {
         let (old, new) = (&before[*sig], &after[*sig]);
         assert_eq!(
             old.attributes, new.attributes,
@@ -507,41 +507,41 @@ async fn migration_362_changes_only_the_declared_raise_statements(pool: PgPool) 
         );
     }
     assert_eq!(
-        introduced, MIGRATION_362_CODES,
-        "362 introduces exactly its codes, each once"
+        introduced, MIGRATION_359_CODES,
+        "359 introduces exactly its codes, each once"
     );
 }
 
-fn undo_362() -> String {
+fn undo_359() -> String {
     std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/362-undo.sql"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/359-undo.sql"),
     )
-    .expect("read the 362 undo runbook")
+    .expect("read the 359 undo runbook")
 }
 
-/// `docs/runbooks/362-undo.sql` returns the three bodies to their definition
-/// below 362 (216's, owner, ACL, SECURITY mode and search_path included), and
+/// `docs/runbooks/359-undo.sql` returns the three bodies to their definition
+/// below 359 (216's, owner, ACL, SECURITY mode and search_path included), and
 /// a second run changes nothing.
 #[sqlx::test(migrations = false)]
-async fn the_362_undo_returns_the_bodies_below_362(pool: PgPool) {
-    migrate(&pool, &up_to(MIGRATION_362_VERSION - 1)).await;
-    let before = facts_of(&pool, RESTATED_362).await;
-    migrate(&pool, &up_to(MIGRATION_362_VERSION)).await;
+async fn the_359_undo_returns_the_bodies_below_359(pool: PgPool) {
+    migrate(&pool, &up_to(MIGRATION_359_VERSION - 1)).await;
+    let before = facts_of(&pool, RESTATED_359).await;
+    migrate(&pool, &up_to(MIGRATION_359_VERSION)).await;
     assert_ne!(
-        facts_of(&pool, RESTATED_362).await,
+        facts_of(&pool, RESTATED_359).await,
         before,
-        "CALIBRATION: 362 changed the bodies"
+        "CALIBRATION: 359 changed the bodies"
     );
-    let undo = undo_362();
+    let undo = undo_359();
     for run in ["first", "second"] {
         sqlx::raw_sql(&undo)
             .execute(&pool)
             .await
             .unwrap_or_else(|e| panic!("the {run} run of the undo applies: {e}"));
         assert_eq!(
-            facts_of(&pool, RESTATED_362).await,
+            facts_of(&pool, RESTATED_359).await,
             before,
-            "after the {run} run the three bodies are exactly as below 362"
+            "after the {run} run the three bodies are exactly as below 359"
         );
     }
 }
@@ -549,8 +549,8 @@ async fn the_362_undo_returns_the_bodies_below_362(pool: PgPool) {
 /// The undo refuses (55000, nothing changed) over a body a later migration
 /// re-stated, rather than reverting it.
 #[sqlx::test(migrations = false)]
-async fn the_362_undo_refuses_over_a_body_restated_after_362(pool: PgPool) {
-    migrate(&pool, &up_to(MIGRATION_362_VERSION)).await;
+async fn the_359_undo_refuses_over_a_body_restated_after_359(pool: PgPool) {
+    migrate(&pool, &up_to(MIGRATION_359_VERSION)).await;
     sqlx::raw_sql(
         "CREATE OR REPLACE FUNCTION public.epigraph_root_require_tenancy() RETURNS trigger \
          LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp \
@@ -559,9 +559,9 @@ async fn the_362_undo_refuses_over_a_body_restated_after_362(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("a later re-statement");
-    let at = facts_of(&pool, RESTATED_362).await;
+    let at = facts_of(&pool, RESTATED_359).await;
     let mut conn = pool.acquire().await.expect("acquire");
-    let e = sqlx::raw_sql(&undo_362())
+    let e = sqlx::raw_sql(&undo_359())
         .execute(&mut *conn)
         .await
         .expect_err("the undo refuses over a foreign body");
@@ -576,7 +576,7 @@ async fn the_362_undo_refuses_over_a_body_restated_after_362(pool: PgPool) {
         "{e}"
     );
     assert_eq!(
-        facts_of(&pool, RESTATED_362).await,
+        facts_of(&pool, RESTATED_359).await,
         at,
         "nothing was changed"
     );

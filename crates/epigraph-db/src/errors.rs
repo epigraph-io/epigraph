@@ -354,7 +354,7 @@ impl From<sqlx::Error> for DbError {
             // the classification for free; without it a bad FK is a 500.
             //
             // A DESIGNED 23503 refusal whose message opens with a listed
-            // caller-refusal code (migration 362's TEN04: a derived row whose
+            // caller-refusal code (migration 359's TEN04: a derived row whose
             // claim_id names no claim) is the caller's input refusal (HTTP
             // 400, the MCP tool error) carrying its reviewed message; the
             // SQLSTATE stays in the foreign-key class. An uncoded 23503 (a

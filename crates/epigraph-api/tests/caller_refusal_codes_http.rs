@@ -309,7 +309,7 @@ async fn an_older_coded_refusal_keeps_the_redacted_500(pool: PgPool) {
     );
 }
 
-/// Migration 362's TEN04 (a derived row whose `claim_id` names no claim) is a
+/// Migration 359's TEN04 (a derived row whose `claim_id` names no claim) is a
 /// 23503 that carries a listed code: `From<sqlx::Error>` answers it as the
 /// caller's input refusal, so the HTTP reply is a 400 carrying the code, not
 /// the generic foreign-key 400 that names no code. Raised for real by the
