@@ -1,9 +1,9 @@
 //! The OpenAPI document for `GET /api/v1/workflows/hierarchical/search` must
 //! state the `resolve_to_latest` ordering a REST consumer gets, as the MCP
 //! `find_workflow_hierarchical` schema does: a live lineage head leads its
-//! group, a deprecated head (truth below `min_truth`) sorts after the live
-//! rows of its group. It must also document `min_truth`, the bound that
-//! decides which is which.
+//! group, a deprecated head (truth at or below the 0.05 sentinel) sorts after
+//! the live rows of its group. It must also document `min_truth` and say it
+//! does NOT decide which is which (backlog e3a003db).
 
 use epigraph_api::openapi::openapi_spec;
 
@@ -27,8 +27,9 @@ fn hierarchical_search_documents_the_deprecated_head_order() {
         .expect("resolve_to_latest carries a description");
     for needle in [
         "a live head leads its lineage group",
-        "a deprecated head (truth below min_truth) sorts after the live rows of its group",
+        "a deprecated head (truth at or below 0.05) sorts after the live rows of its group",
         "lineage_head_deprecated",
+        "whatever min_truth is",
     ] {
         assert!(
             d.contains(needle),
@@ -43,5 +44,9 @@ fn hierarchical_search_documents_the_deprecated_head_order() {
     assert!(
         d.contains("0.3"),
         "min_truth must state its default; got: {d}"
+    );
+    assert!(
+        d.contains("decided by the 0.05 sentinel, not by min_truth"),
+        "min_truth must say it does not decide deprecation; got: {d}"
     );
 }

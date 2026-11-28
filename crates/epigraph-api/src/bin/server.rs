@@ -699,6 +699,10 @@ async fn main() {
             .with_token_exchange_audiences(token_exchange_audiences_from_env())
             .with_oauth_redirect_origins(oauth_redirect_origins_from_env())
             .with_assertion_v1(assertion_v1_from_env())
+            // The analyze route's LLM provider, read once here rather than on
+            // every request (backlog e8e14178). Only a `genai` build (which
+            // implies `db`) asks it.
+            .with_llm_provider(epigraph_api::llm_provider::LlmProviderSetting::from_env())
             .with_bp_apply(bp_apply_from_env())
             .with_bp_max_concurrent(bp_max_concurrent_from_env())
             .with_guest_reads(guest_reads)

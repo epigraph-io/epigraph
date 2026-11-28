@@ -494,6 +494,12 @@ pub struct AppState {
     /// `EPIGRAPH_ASSERTION_V1` at boot.
     pub assertion_v1: crate::oauth::assertion::AssertionV1Policy,
 
+    /// The LLM provider `POST /api/v1/analyze/unconstrained` asks
+    /// (`crate::llm_provider`, backlog e8e14178). `anthropic` (the default)
+    /// in every constructor; `bin/server.rs` sets it from
+    /// `EPIGRAPH_LLM_PROVIDER` at boot, so the handler reads no environment.
+    pub llm_provider: crate::llm_provider::LlmProviderSetting,
+
     /// entity_types registry cache: `type_name` -> resolved [`EntityTypeEntry`].
     ///
     /// The single source of truth (in-process) for BOTH edge entity-type
@@ -1330,6 +1336,7 @@ impl AppState {
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
+            llm_provider: crate::llm_provider::LlmProviderSetting::default(),
         }
     }
 
@@ -1392,6 +1399,7 @@ impl AppState {
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
+            llm_provider: crate::llm_provider::LlmProviderSetting::default(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -1984,6 +1992,7 @@ impl AppState {
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
+            llm_provider: crate::llm_provider::LlmProviderSetting::default(),
         }
     }
 
@@ -2035,6 +2044,7 @@ impl AppState {
             providers: Arc::new(ProviderRegistry::empty()),
             oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             assertion_v1: crate::oauth::assertion::AssertionV1Policy::Accept,
+            llm_provider: crate::llm_provider::LlmProviderSetting::default(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -2767,6 +2777,14 @@ impl AppState {
         origins: crate::oauth::redirect::RedirectOrigins,
     ) -> Self {
         self.oauth_redirect_origins = origins;
+        self
+    }
+
+    /// Set the LLM provider of `POST /api/v1/analyze/unconstrained`; see
+    /// [`Self::llm_provider`].
+    #[must_use]
+    pub fn with_llm_provider(mut self, provider: crate::llm_provider::LlmProviderSetting) -> Self {
+        self.llm_provider = provider;
         self
     }
 

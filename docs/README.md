@@ -33,7 +33,8 @@ added here with a line saying what it is for.
   canonical or informational; one without that line (the memory-features
   design) makes no claim to match the current code.
 - [`conventions/`](conventions/): how recurring work is done: backlog
-  retirement, duplicates versus index hygiene, label-family dedup.
+  retirement, duplicates versus index hygiene, label-family dedup, REST
+  pagination, and `/api/v1` versus the deprecated unversioned aliases.
 - [`governance/`](governance/): policy notes and preregistrations (the
   release gate; the experiment preregistrations).
 - [`decisions/`](decisions/README.md): decision records. Retrospective

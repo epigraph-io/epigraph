@@ -85,7 +85,7 @@ Return ONLY the JSON array, no other text. Include 5-20 claims covering the most
 pub async fn unconstrained_analysis(
     // `claims:admin`, checked before the body is parsed (backlog f2973ec9).
     _scope: crate::middleware::bearer::RequireScopeAdmin,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(request): Json<UnconstrainedAnalysisRequest>,
 ) -> Result<(StatusCode, Json<UnconstrainedAnalysisResponse>), ApiError> {
     use epigraph_cli::enrichment::llm_client::{create_llm_client, LlmError};
@@ -98,8 +98,10 @@ pub async fn unconstrained_analysis(
         });
     }
 
-    let provider = std::env::var("EPIGRAPH_LLM_PROVIDER").unwrap_or_else(|_| "anthropic".into());
-    let client = create_llm_client(&provider).map_err(|e| llm_unavailable("client init", e))?;
+    // Read once at boot (`crate::llm_provider`, backlog e8e14178), not from
+    // the environment on every request.
+    let provider = state.llm_provider.as_str();
+    let client = create_llm_client(provider).map_err(|e| llm_unavailable("client init", e))?;
     let model_used = client.model_name().to_string();
 
     let prompt = build_prompt(&question);
@@ -253,7 +255,7 @@ mod tests {
             .find("#[cfg(test)]\nmod tests")
             .expect("the test module marker")];
         for site in [
-            "create_llm_client(&provider).map_err(|e| llm_unavailable(\"client init\", e))",
+            "create_llm_client(provider).map_err(|e| llm_unavailable(\"client init\", e))",
             ".map_err(|e: LlmError| llm_unavailable(\"request\", e))",
         ] {
             assert!(code.contains(site), "the handler no longer has: {site}");
@@ -312,5 +314,58 @@ mod tests {
             search_queries: None,
         };
         assert!(req.question.trim().is_empty());
+    }
+}
+
+/// The `genai` handler asks the provider `AppState` carries (backlog
+/// e8e14178). Run by CI's "Genai API handler tests" step
+/// (`cargo test -p epigraph-api --features genai --lib routes::analyze`); no
+/// other step runs it (the genai clippy step only lints it).
+#[cfg(all(test, feature = "genai"))]
+mod genai_handler_tests {
+    use super::*;
+    use crate::llm_provider::LlmProviderSetting;
+    use crate::middleware::bearer::RequireScopeAdmin;
+
+    fn admin() -> RequireScopeAdmin {
+        RequireScopeAdmin(epigraph_auth::AuthContext {
+            client_id: uuid::Uuid::nil(),
+            agent_id: None,
+            owner_id: None,
+            client_type: epigraph_auth::ClientType::Service,
+            scopes: vec!["claims:admin".to_string()],
+            jti: uuid::Uuid::nil(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            delegated_by: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        })
+    }
+
+    /// `mock` on `AppState`, with the provider variable left unset: the
+    /// handler answers 200 from the mock provider. The old per-request read
+    /// fell back to `anthropic` here, a 503 without credentials or a real
+    /// model's name with them; either fails the `model_used` assertion.
+    #[tokio::test]
+    async fn the_handler_asks_the_provider_on_app_state_not_the_environment() {
+        // Never connected: the handler does not touch the database.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        let state = AppState::with_db(pool, crate::state::ApiConfig::default())
+            .with_llm_provider(LlmProviderSetting::parse(Some("mock")));
+        let (status, Json(body)) = unconstrained_analysis(
+            admin(),
+            State(state),
+            Json(UnconstrainedAnalysisRequest {
+                question: "At what temperature does water boil?".to_string(),
+                search_queries: None,
+            }),
+        )
+        .await
+        .expect("the mock provider answers");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.model_used, "mock");
     }
 }

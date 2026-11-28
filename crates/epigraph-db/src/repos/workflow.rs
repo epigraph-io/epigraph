@@ -88,7 +88,8 @@ pub struct HierarchicalWorkflowRow {
     pub metadata: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Deprecation signal. Live rows are 1.0; `deprecate_workflow`
-    /// cascades a write to 0.05 so callers can filter via `min_truth`.
+    /// cascades a write to 0.05 ([`WorkflowRepository::DEPRECATED_TRUTH`])
+    /// so callers can filter via `min_truth`.
     pub truth_value: f64,
 }
 
@@ -2151,10 +2152,13 @@ impl WorkflowRepository {
     /// When `resolve_to_latest` is true, callers want the newest generation
     /// per `canonical_name`; ordering becomes `(canonical_name ASC,
     /// deprecated LAST, generation DESC, created_at DESC)`, where "deprecated"
-    /// is `truth_value < min_truth`. A live head therefore leads its canonical
-    /// group, and a deprecated head (only the added head can be below
-    /// `min_truth`) sorts after the live rows of its group: still returned,
-    /// never the first row a caller walking the group picks.
+    /// is [`Self::is_deprecated_truth`] (at or below the 0.05 sentinel),
+    /// whatever `min_truth` the caller passed (backlog e3a003db). A live head
+    /// therefore leads its canonical group, and a deprecated head sorts after
+    /// the live rows of its group: still returned, never the first row a
+    /// caller walking the group picks. With a `min_truth` at or below the
+    /// sentinel a deprecated non-head generation can match too; it sorts
+    /// after the live rows the same way.
     ///
     /// **`resolve_to_latest` also guarantees the lineage head is present.** The
     /// ILIKE predicate matches each row's OWN goal text, and sibling
@@ -2197,8 +2201,9 @@ impl WorkflowRepository {
             // `matched` is the old statement, LIMIT included; `heads` adds the
             // highest generation of each matched canonical_name with no goal
             // or truth filter. Both read `workflows` alone. The union is
-            // wrapped so the ORDER BY may sort on an expression: a head below
-            // `min_truth` ($2) trails the live rows of its group.
+            // wrapped so the ORDER BY may sort on an expression: a deprecated
+            // row (truth at or below the sentinel ceiling, $4) trails the live
+            // rows of its group.
             "WITH matched AS ( \
                  SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
                  FROM workflows \
@@ -2219,7 +2224,7 @@ impl WorkflowRepository {
                  UNION ALL \
                  SELECT * FROM heads h WHERE h.id NOT IN (SELECT id FROM matched) \
              ) u \
-             ORDER BY canonical_name ASC, (truth_value < $2) ASC, generation DESC, created_at DESC, id ASC"
+             ORDER BY canonical_name ASC, (truth_value <= $4) ASC, generation DESC, created_at DESC, id ASC"
                 .to_string()
         } else {
             "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
@@ -2230,12 +2235,15 @@ impl WorkflowRepository {
              LIMIT $3"
                 .to_string()
         };
-        sqlx::query_as::<_, HierarchicalWorkflowRow>(&sql)
+        let mut q = sqlx::query_as::<_, HierarchicalWorkflowRow>(&sql)
             .bind(&pattern)
             .bind(min_truth)
-            .bind(limit)
-            .fetch_all(executor)
-            .await
+            .bind(limit);
+        if resolve_to_latest {
+            // $4: only the `resolve_to_latest` statement sorts on deprecation.
+            q = q.bind(Self::DEPRECATED_TRUTH_CEILING);
+        }
+        q.fetch_all(executor).await
     }
 
     /// One page of the hierarchical workflow LINEAGES the connection may read:
@@ -2375,10 +2383,11 @@ impl WorkflowRepository {
     /// the lineage head of every matched `canonical_name` is guaranteed
     /// present: a head with no `goal_embedding`, below the similarity floor,
     /// below `min_truth` or past the LIMIT is added. An added LIVE head sorts at
-    /// its group's best match distance, ahead of that match; an added
-    /// DEPRECATED head (`truth_value < min_truth`) sorts at its group's worst
-    /// match distance, after that match, so it trails every live row of its
-    /// group. Either way the matched rows keep their relative order.
+    /// its group's best match distance, ahead of that match; a DEPRECATED row
+    /// ([`Self::is_deprecated_truth`], whatever the caller's `min_truth`;
+    /// backlog e3a003db) sorts at its group's worst match distance, after that
+    /// match, so it trails every live row of its group. The live matched rows
+    /// keep their relative order.
     ///
     /// # An exact scan by construction (backlog b00aa40e)
     ///
@@ -2422,9 +2431,10 @@ impl WorkflowRepository {
             // embedding, similarity or truth filter. All three CTEs read
             // `workflows` alone. The final ORDER BY sits on the outermost
             // SELECT: an injected live head (no distance) takes its group's
-            // best distance and sorts ahead of that row; an injected
-            // deprecated head takes the group's worst distance and sorts after
-            // it. Only an injected head can be below `min_truth` ($3).
+            // best distance and sorts ahead of that row; a deprecated row
+            // (truth at or below the sentinel ceiling, $5) takes the group's
+            // worst distance and sorts after it. At a `min_truth` ($3) at or
+            // below the sentinel a matched row can be deprecated too.
             let sql = "WITH q AS (SELECT $1::vector AS v), \
                  matched AS ( \
                      SELECT w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
@@ -2448,8 +2458,8 @@ impl WorkflowRepository {
                      SELECT h.*, true AS injected FROM heads h \
                      WHERE h.id NOT IN (SELECT id FROM matched) \
                  ), ranked AS ( \
-                     SELECT c.*, (c.truth_value < $3) AS deprecated, \
-                            CASE WHEN c.truth_value < $3 \
+                     SELECT c.*, (c.truth_value <= $5) AS deprecated, \
+                            CASE WHEN c.truth_value <= $5 \
                                  THEN MAX(c.distance) OVER (PARTITION BY c.canonical_name) \
                                  ELSE COALESCE(c.distance, \
                                       MIN(c.distance) OVER (PARTITION BY c.canonical_name)) \
@@ -2464,6 +2474,7 @@ impl WorkflowRepository {
                 .bind(similarity_threshold)
                 .bind(min_truth)
                 .bind(limit)
+                .bind(Self::DEPRECATED_TRUTH_CEILING)
                 .fetch_all(executor)
                 .await;
         }
@@ -3039,6 +3050,27 @@ impl WorkflowRepository {
 
     /// The truth value a deprecation leaves on a `workflows` row.
     pub const DEPRECATED_TRUTH: f64 = 0.05;
+
+    /// The highest `truth_value` that counts as deprecated:
+    /// [`Self::DEPRECATED_TRUTH`] plus a tolerance for a value that went
+    /// through a float round trip. See [`Self::is_deprecated_truth`].
+    pub const DEPRECATED_TRUTH_CEILING: f64 = Self::DEPRECATED_TRUTH + 1e-6;
+
+    /// Whether a `workflows` row with this `truth_value` is deprecated: at or
+    /// below the sentinel `deprecate_workflow` writes (backlog e3a003db).
+    ///
+    /// The ONE test behind `resolve_to_latest`'s `lineage_head_deprecated`
+    /// flag on both transports and behind the deprecated-last ordering of
+    /// [`Self::search_hierarchical_by_text`] and
+    /// [`Self::find_hierarchical_by_embedding`] (which bind
+    /// [`Self::DEPRECATED_TRUTH_CEILING`]). It does not depend on the caller's
+    /// `min_truth`: that is a filter on which rows MATCH, and a head with
+    /// truth 0.2 that a `min_truth` of 0.3 would have filtered is still a live
+    /// head, while a head at the sentinel is deprecated at `min_truth` 0.0 too.
+    #[must_use]
+    pub fn is_deprecated_truth(truth: f64) -> bool {
+        truth <= Self::DEPRECATED_TRUTH_CEILING
+    }
 
     /// Deprecate `workflows` row `id` (`truth_value` to
     /// [`Self::DEPRECATED_TRUTH`]) through migration 237's audited admin
@@ -4983,14 +5015,31 @@ mod tests {
         (ids, qvec)
     }
 
-    /// Text path: "deprecated" is `truth_value < min_truth` for the CALLER's
-    /// `min_truth`, not a constant. A 0.4 head leads at 0.3 and trails at
-    /// 0.5; a 0.05 head leads at 0.0. Each case fails a hardcoded threshold
-    /// (`< 0.3` fails 0.5, `<= 0.05` fails 0.5, any constant above 0.05
-    /// fails 0.0).
+    /// The deprecation test is the sentinel, not a threshold (backlog
+    /// e3a003db): the value `deprecate_workflow` writes, a float that went
+    /// through a round trip, and anything below are deprecated; a low but
+    /// live truth is not, at any `min_truth`.
+    #[test]
+    fn is_deprecated_truth_is_the_sentinel() {
+        let dep = WorkflowRepository::is_deprecated_truth;
+        assert!(dep(WorkflowRepository::DEPRECATED_TRUTH));
+        assert!(dep(0.05_f32 as f64), "0.05 through an f32 round trip");
+        assert!(dep(0.0));
+        assert!(!dep(0.051));
+        assert!(!dep(0.2));
+        assert!(!dep(0.3));
+        assert!(!dep(1.0));
+    }
+
+    /// Text path: "deprecated" is the 0.05 sentinel
+    /// ([`WorkflowRepository::is_deprecated_truth`]) whatever `min_truth` the
+    /// caller passes (backlog e3a003db). A 0.2 head LEADS at min_truth 0.3
+    /// (the old `truth < min_truth` rule trailed it) and at 0.0; a 0.05 head
+    /// TRAILS at 0.0 (the old rule led with it) and at 0.3. A deprecated
+    /// MATCHED generation (visible at min_truth 0.0) trails the live rows too.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn search_hierarchical_by_text_deprecation_follows_min_truth(pool: sqlx::PgPool) {
-        let (ids, _) = seed_threshold_lineage(&pool, "text-threshold-test", 0.4).await;
+    async fn search_hierarchical_by_text_deprecation_is_the_sentinel(pool: sqlx::PgPool) {
+        let (ids, _) = seed_threshold_lineage(&pool, "text-threshold-test", 0.2).await;
         let order = |hits: Vec<HierarchicalWorkflowRow>| -> Vec<uuid::Uuid> {
             hits.iter().map(|h| h.id).collect()
         };
@@ -5010,12 +5059,12 @@ mod tests {
         assert_eq!(
             order(at(0.3).await.unwrap()),
             leads,
-            "0.4 head at min_truth 0.3 is live"
+            "0.2 head at min_truth 0.3 is live"
         );
         assert_eq!(
-            order(at(0.5).await.unwrap()),
-            trails,
-            "0.4 head at min_truth 0.5 is deprecated"
+            order(at(0.0).await.unwrap()),
+            leads,
+            "0.2 head at min_truth 0.0 is live"
         );
 
         WorkflowRepository::set_truth_value(&pool, ids[2], 0.05)
@@ -5023,26 +5072,38 @@ mod tests {
             .unwrap();
         assert_eq!(
             order(at(0.0).await.unwrap()),
-            leads,
-            "0.05 head at min_truth 0.0 is live"
+            trails,
+            "0.05 head at min_truth 0.0 is deprecated"
         );
         assert_eq!(
             order(at(0.3).await.unwrap()),
             trails,
             "0.05 head at min_truth 0.3 is deprecated"
         );
+
+        // A live head over a deprecated, matched gen 1.
+        WorkflowRepository::set_truth_value(&pool, ids[2], 1.0)
+            .await
+            .unwrap();
+        WorkflowRepository::set_truth_value(&pool, ids[1], 0.05)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(at(0.0).await.unwrap()),
+            vec![ids[2], ids[0], ids[1]],
+            "a deprecated matched gen 1 trails live gen 0"
+        );
     }
 
-    /// Embedding path, the same thresholds. A deprecated head takes its
-    /// group's WORST distance, which here is gen 0's: the tie is decided by
-    /// the `deprecated` tiebreak alone (`injected DESC` would put the head
-    /// first). A live head takes the BEST distance, gen 1's. The statement
-    /// spells the predicate twice (tiebreak column, distance CASE); with
-    /// either copy on a constant `< 0.3`, the 0.5 case comes out by
-    /// generation `[1, 2, 0]` instead of `[1, 0, 2]`.
+    /// Embedding path, the same cases. A deprecated row takes its group's
+    /// WORST distance, which here is gen 0's: the tie is decided by the
+    /// `deprecated` tiebreak alone (`injected DESC` would put the head first).
+    /// A live head takes the BEST distance, gen 1's. The statement spells the
+    /// predicate twice (tiebreak column, distance CASE); each copy must bind
+    /// the sentinel ceiling, not `min_truth`, for every case to come out.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn find_hierarchical_by_embedding_deprecation_follows_min_truth(pool: sqlx::PgPool) {
-        let (ids, qvec) = seed_threshold_lineage(&pool, "embed-threshold-test", 0.4).await;
+    async fn find_hierarchical_by_embedding_deprecation_is_the_sentinel(pool: sqlx::PgPool) {
+        let (ids, qvec) = seed_threshold_lineage(&pool, "embed-threshold-test", 0.2).await;
         let order = |hits: Vec<HierarchicalWorkflowRow>| -> Vec<uuid::Uuid> {
             hits.iter().map(|h| h.id).collect()
         };
@@ -5056,12 +5117,12 @@ mod tests {
         assert_eq!(
             order(at(0.3).await.unwrap()),
             leads,
-            "0.4 head at min_truth 0.3 is live"
+            "0.2 head at min_truth 0.3 is live"
         );
         assert_eq!(
-            order(at(0.5).await.unwrap()),
-            trails,
-            "0.4 head at min_truth 0.5 is deprecated"
+            order(at(0.0).await.unwrap()),
+            leads,
+            "0.2 head at min_truth 0.0 is live"
         );
 
         WorkflowRepository::set_truth_value(&pool, ids[2], 0.05)
@@ -5069,13 +5130,27 @@ mod tests {
             .unwrap();
         assert_eq!(
             order(at(0.0).await.unwrap()),
-            leads,
-            "0.05 head at min_truth 0.0 is live"
+            trails,
+            "0.05 head at min_truth 0.0 is deprecated"
         );
         assert_eq!(
             order(at(0.3).await.unwrap()),
             trails,
             "0.05 head at min_truth 0.3 is deprecated"
+        );
+
+        // A live head over a deprecated, matched gen 1 (the best match): gen 1
+        // takes gen 0's distance and trails it; the head keeps the best.
+        WorkflowRepository::set_truth_value(&pool, ids[2], 1.0)
+            .await
+            .unwrap();
+        WorkflowRepository::set_truth_value(&pool, ids[1], 0.05)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(at(0.0).await.unwrap()),
+            vec![ids[2], ids[0], ids[1]],
+            "a deprecated matched gen 1 trails live gen 0"
         );
     }
 }

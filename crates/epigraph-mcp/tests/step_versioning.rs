@@ -914,7 +914,7 @@ async fn resolve_to_latest_discloses_a_deprecated_head(pool: PgPool) {
     assert_eq!(
         live_entry["lineage_head_deprecated"],
         serde_json::json!(true),
-        "the head's truth is below min_truth, and every entry says so"
+        "the head's truth is the 0.05 deprecation sentinel, and every entry says so"
     );
 }
 

@@ -592,8 +592,8 @@ async fn evolve_step_doc() {}
     params(
         ("q" = String, Query, description = "Search query"),
         ("limit" = Option<i64>, Query, description = "Maximum results (default: 10, max: 50)"),
-        ("resolve_to_latest" = Option<bool>, Query, description = "Whether to resolve steps to latest versions. When true, the lineage head (highest generation) of every matched canonical_name is always returned, and each entry carries is_lineage_head, lineage_head_generation and lineage_head_deprecated (the head's truth is below min_truth); a live head leads its lineage group, while a deprecated head (truth below min_truth) sorts after the live rows of its group. The result can exceed limit by one head per matched lineage."),
-        ("min_truth" = Option<f64>, Query, description = "Minimum truth_value to surface (default: 0.3, so rows deprecated via deprecate_workflow at 0.05 drop out). With resolve_to_latest it also decides which lineage heads are flagged deprecated and sorted after their group's live rows."),
+        ("resolve_to_latest" = Option<bool>, Query, description = "Whether to resolve steps to latest versions. When true, the lineage head (highest generation) of every matched canonical_name is always returned, and each entry carries is_lineage_head, lineage_head_generation and lineage_head_deprecated (the head is deprecated: its truth is at or below the 0.05 sentinel deprecate_workflow writes, whatever min_truth is); a live head leads its lineage group, while a deprecated head (truth at or below 0.05) sorts after the live rows of its group, as does any deprecated generation that a min_truth at or below 0.05 lets match. The result can exceed limit by one head per matched lineage."),
+        ("min_truth" = Option<f64>, Query, description = "Minimum truth_value to surface (default: 0.3, so rows deprecated via deprecate_workflow at 0.05 drop out). It filters which rows match only: with resolve_to_latest, whether a lineage head is flagged deprecated and sorted after its group's live rows is decided by the 0.05 sentinel, not by min_truth."),
     ),
     responses(
         (status = 200, body = HierarchicalSearchResponse),
