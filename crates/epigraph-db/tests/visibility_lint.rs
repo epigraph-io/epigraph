@@ -4449,6 +4449,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `get_intra_evidence_locality_factor`.",
     ),
     (
+        "gap.rs",
+        "get_gap_analysis",
+        "READ of one `gap_analyses` row by primary key. The table has no tenancy columns and no \
+         row security, and what it stores is claim ids, gap types and scores, not claim text \
+         (backlog e21530f3). The viewer is spent by the caller instead: \
+         `routes/gaps.rs::surface_gaps` resolves each stored claim id with \
+         `ChallengeRepository::admission_of` on the same stamped transaction before it names \
+         that claim. Generic so it rides that transaction.",
+    ),
+    (
         "mass_function.rs",
         "backfill_evidence_type_where_untyped",
         "WRITE: `UPDATE mass_functions SET evidence_type` for the legacy evidence-type backfill \

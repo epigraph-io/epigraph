@@ -954,11 +954,26 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "method_gap_analysis",
         &["MethodRepository::get_methods_for_capability"],
     ),
-    // write: the stored analysis is computed from viewer-filtered claims.
+    // write: the stored analysis is computed from viewer-filtered claims and
+    // holds their ids and scores, never their text (backlog e21530f3).
     (
         "gaps.rs",
         "gap_analysis",
         &["GapRepository::store_gap_analysis"],
+    ),
+    // stamped: ONE caller-stamped write transaction (backlog 07ef644c). The
+    // analysis is read by id from untenanted `gap_analyses`, which stores claim
+    // ids only; each id is resolved with the viewer (`admission_of`) before a
+    // challenge names it, so an unreadable claim is skipped. The challenge and
+    // its event are then written on that transaction, as `submit_challenge`'s.
+    (
+        "gaps.rs",
+        "surface_gaps",
+        &[
+            "ChallengeRepository::create",
+            "EventRepository::publish_or_log_conn",
+            "GapRepository::get_gap_analysis",
+        ],
     ),
     // stamped: cluster-run metadata (untenanted; the latest run now comes from
     // `ClusterRunRepository::latest`, the lookup `/claims/:id/placement` shares)

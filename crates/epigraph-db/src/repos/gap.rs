@@ -8,12 +8,25 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// A single gap identified between graph-constrained and unconstrained analyses.
+///
+/// # What a stored record may carry
+///
+/// `gap_analyses` has no tenancy columns, and `POST /api/v1/gaps/surface`
+/// serves any stored analysis to any caller who names its id. So a record that
+/// is PERSISTED names the claim it is about by [`Self::nearest_claim_id`] and
+/// holds no claim text: `unconstrained_claim` is a fixed template around ids
+/// and scores, and `nearest_graph_claim` is `None`. A reader resolves the id
+/// through its own caller's viewer, which is where a group-private claim stays
+/// private. Rows written before the id existed deserialize with it `None`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GapRecord {
     pub gap_type: String,
     pub severity: f64,
     pub unconstrained_claim: String,
     pub nearest_graph_claim: Option<String>,
+    /// The graph claim this gap is about, when there is one.
+    #[serde(default)]
+    pub nearest_claim_id: Option<Uuid>,
     pub nearest_similarity: f64,
     pub graph_inference_path: Option<String>,
     pub recommendation: String,
@@ -50,6 +63,25 @@ struct GapAnalysisRow {
     confidence_boundary: Option<String>,
     gaps: serde_json::Value,
     created_at: DateTime<Utc>,
+}
+
+impl From<GapAnalysisRow> for GapAnalysisResult {
+    fn from(r: GapAnalysisRow) -> Self {
+        Self {
+            id: r.id,
+            question: r.question,
+            analysis_a_id: r.analysis_a_id,
+            analysis_b_id: r.analysis_b_id,
+            graph_claims_count: r.graph_claims_count,
+            unconstrained_claims_count: r.unconstrained_claims_count,
+            matched_count: r.matched_count,
+            gap_count: r.gap_count,
+            proprietary_count: r.proprietary_count,
+            confidence_boundary: r.confidence_boundary,
+            gaps: r.gaps,
+            created_at: r.created_at,
+        }
+    }
 }
 
 pub struct GapRepository;
@@ -128,22 +160,29 @@ impl GapRepository {
             .await?
         };
 
-        Ok(rows
-            .into_iter()
-            .map(|r| GapAnalysisResult {
-                id: r.id,
-                question: r.question,
-                analysis_a_id: r.analysis_a_id,
-                analysis_b_id: r.analysis_b_id,
-                graph_claims_count: r.graph_claims_count,
-                unconstrained_claims_count: r.unconstrained_claims_count,
-                matched_count: r.matched_count,
-                gap_count: r.gap_count,
-                proprietary_count: r.proprietary_count,
-                confidence_boundary: r.confidence_boundary,
-                gaps: r.gaps,
-                created_at: r.created_at,
-            })
-            .collect())
+        Ok(rows.into_iter().map(GapAnalysisResult::from).collect())
+    }
+
+    /// One stored gap analysis by id, or `None` when there is no such row.
+    ///
+    /// `gap_analyses` has no tenancy, so this answers any session; what a
+    /// caller may do with the claims a stored analysis names is decided by
+    /// resolving each `GapRecord::nearest_claim_id` through that caller's own
+    /// viewer. Generic over the executor so a handler can run it on the
+    /// transaction it writes on.
+    pub async fn get_gap_analysis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<GapAnalysisResult>, sqlx::Error> {
+        let row: Option<GapAnalysisRow> = sqlx::query_as(
+            "SELECT id, question, analysis_a_id, analysis_b_id, graph_claims_count, \
+             unconstrained_claims_count, matched_count, gap_count, proprietary_count, \
+             confidence_boundary, gaps, created_at \
+             FROM gap_analyses WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row.map(GapAnalysisResult::from))
     }
 }

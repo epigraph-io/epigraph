@@ -250,8 +250,10 @@ impl EventRepository {
     /// resolves to no `claims` row" survivor below takes, and it is reached for
     /// the same reason. Live emitters of that shape today are
     /// `epigraph-mcp/src/tools/edge_mutation.rs` (`edge.deleted`,
-    /// `edge.retired`) and `epigraph-api/src/routes/gaps.rs`
-    /// (`gap.surfaced`). Recorded as
+    /// `edge.retired`). `epigraph-api/src/routes/gaps.rs`'s `gap.surfaced`
+    /// was one until it also carried the challenged claim's `claim_id`, which
+    /// this predicate does classify; an emitter naming a non-claim tenanted
+    /// row should do the same. Recorded as
     /// `F-PR25-event-suppression-is-claims-keyed-only` in
     /// `docs/tenancy/progress.json`; widening it is a `node_type`-dispatched
     /// multi-table gate with its own placement reasoning and is deliberately
