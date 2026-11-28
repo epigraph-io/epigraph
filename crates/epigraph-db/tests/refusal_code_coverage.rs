@@ -150,6 +150,12 @@ const RECOGNISED: &[Recognised] = &[
         ],
     },
     Recognised {
+        codes: &["AID06"],
+        path: "crates/epigraph-api/src/routes/agent_prompt_history.rs",
+        source: include_str!("../../epigraph-api/src/routes/agent_prompt_history.rs"),
+        needles: &[".is_some_and(|c| c == PROMPT_HISTORY_REFUSED)"],
+    },
+    Recognised {
         codes: &["CUS04"],
         path: "crates/epigraph-api/src/routes/privatization.rs",
         source: include_str!("../../epigraph-api/src/routes/privatization.rs"),
@@ -171,9 +177,9 @@ const REDACTED: &[(&[&str], &str)] = &[
     ),
     (&["AG01"], "the agents competence guard trigger"),
     (
-        &["AID03", "AID05", "AID06", "AID07", "AID08"],
-        "agent identity registration and prompt history; repos/agent_identity.rs names them \
-         as SQLSTATE constants but no arm maps them (DbError::QueryFailed)",
+        &["AID03", "AID05", "AID07", "AID08"],
+        "agent identity registration; repos/agent_identity.rs names them as SQLSTATE \
+         constants but no arm maps them (DbError::QueryFailed); only AID06 is mapped",
     ),
     (
         &["AID09", "AID10"],
