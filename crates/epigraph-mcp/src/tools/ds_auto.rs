@@ -59,6 +59,10 @@ pub struct DsAutoResult {
     /// (index 0 is TRUE). Its masses drive the claim's Beta-Bernoulli track
     /// (`epigraph_engine::ds_divergence::beta_increments`).
     pub evidence_bba: MassFunction,
+    /// The `mass_functions` row id of [`Self::evidence_bba`], as the store
+    /// returned it: the handle `retract_bba` takes (backlog b191f198). A
+    /// `truth_value_seed` row the same call may have written is NOT this id.
+    pub mass_function_id: Uuid,
     /// What the cache write did that the values above do not show (backlog
     /// 8ff648c9). All empty for [`auto_wire_ds_for_claim`].
     pub cache_notes: CacheWriteNotes,
@@ -598,7 +602,7 @@ pub async fn auto_wire_ds_for_claim(
     // at combination time). Agent confidence is already encoded in the BBA's
     // mass shape (mass = confidence * weight, clamped); using `confidence`
     // here would double-discount.
-    MassFunctionRepository::store_with_perspective(
+    let mass_function_id = MassFunctionRepository::store_with_perspective(
         &mut *conn,
         claim_id,
         frame_id,
@@ -699,6 +703,7 @@ pub async fn auto_wire_ds_for_claim(
         frame_id,
         cache_written,
         evidence_bba: bba,
+        mass_function_id,
         cache_notes: CacheWriteNotes::default(),
     })
 }
@@ -909,7 +914,9 @@ pub async fn auto_wire_ds_update_filed_on(
     // source_strength = evidence-type reliability weight (used for Shafer
     // discount at combination time); agent confidence is already in the
     // BBA mass shape, storing it here too would double-discount.
-    MassFunctionRepository::store_for_evidence(
+    // The row id is returned to the caller (backlog b191f198): it is the
+    // handle `retract_bba` needs to undo this BBA.
+    let mass_function_id = MassFunctionRepository::store_for_evidence(
         &mut *conn,
         claim_id,
         store_frame_id, // binary_truth, or the frame the caller files on (R-17)
@@ -1114,6 +1121,7 @@ pub async fn auto_wire_ds_update_filed_on(
         frame_id,
         cache_written,
         evidence_bba: bba,
+        mass_function_id,
         cache_notes: notes,
     })
 }

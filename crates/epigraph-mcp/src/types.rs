@@ -2090,6 +2090,14 @@ pub struct UpdateResponse {
     /// caller's own group (migration 114).
     pub evidence_owner: &'static str,
     pub evidence_id: String,
+    /// The `mass_functions` row id of the BBA this call stored for its
+    /// evidence (backlog b191f198): the id `retract_bba` takes, which
+    /// `evidence_id` is not. Retracting it removes this call's BBA from the
+    /// claim's belief and refolds the cache from the BBAs left; it does not
+    /// restore `truth_before`. On a claim's first update the call may also
+    /// store a `truth_value_seed` BBA (whose pignistic probability is the
+    /// claim's `truth_value`); that row is not this id.
+    pub mass_function_id: String,
     /// Whether the Dempster-Shafer wiring for this submission landed. Always
     /// `true` in a response.
     ///

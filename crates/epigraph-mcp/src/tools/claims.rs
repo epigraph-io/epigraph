@@ -2189,6 +2189,7 @@ pub async fn update_with_evidence(
             "claim_owner"
         },
         evidence_id: evidence.id.as_uuid().to_string(),
+        mass_function_id: ds.mass_function_id.to_string(),
         belief_wired: true,
         bba_stored: true,
         cache_written: ds.cache_written,
