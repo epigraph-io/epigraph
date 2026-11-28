@@ -1692,31 +1692,6 @@ async fn walk_document(
     // write nothing" contract the rest of this branch establishes.
     let claim_labels = ingest_claim_labels(extraction, &doi)?;
 
-    // The planned claims at levels this walk does not write (a spine walk's
-    // atoms): skipped, with every plan edge that touches one. Empty for a
-    // full walk.
-    let skipped_ids: HashSet<Uuid> = plan
-        .claims
-        .iter()
-        .filter(|c| !levels.includes(c.level))
-        .map(|c| c.id)
-        .collect();
-
-    // Map para planned ID → document path e.g. "sections[0].paragraphs[1]".
-    // Builder iterates sections/paragraphs in extraction order so zipping is safe.
-    let para_id_to_path: HashMap<Uuid, String> = {
-        let mut map = HashMap::new();
-        let mut level2_iter = plan.claims.iter().filter(|c| c.level == 2);
-        for (si, section) in extraction.sections.iter().enumerate() {
-            for (pi, _para) in section.paragraphs.iter().enumerate() {
-                if let Some(pc) = level2_iter.next() {
-                    map.insert(pc.id, format!("sections[{si}].paragraphs[{pi}]"));
-                }
-            }
-        }
-        map
-    };
-
     // (Pipeline-version gate removed: deterministic node ids handle idempotency
     //  so re-ingesting an abstract then the full paper is safe — structural nodes
     //  by document-scoped id, atoms by content hash.
@@ -1786,6 +1761,31 @@ async fn walk_document(
     // The plan, with ids derived for the scope `decl` owns (backlog 8f56a641):
     // built only now, once the scope and this scope's paper row are known.
     let (plan, adopted) = ingest_plan_for_scope(&mut tx, extraction, decl, paper_id).await?;
+
+    // The planned claims at levels this walk does not write (a spine walk's
+    // atoms): skipped, with every plan edge that touches one. Empty for a
+    // full walk.
+    let skipped_ids: HashSet<Uuid> = plan
+        .claims
+        .iter()
+        .filter(|c| !levels.includes(c.level))
+        .map(|c| c.id)
+        .collect();
+
+    // Map para planned ID → document path e.g. "sections[0].paragraphs[1]".
+    // Builder iterates sections/paragraphs in extraction order so zipping is safe.
+    let para_id_to_path: HashMap<Uuid, String> = {
+        let mut map = HashMap::new();
+        let mut level2_iter = plan.claims.iter().filter(|c| c.level == 2);
+        for (si, section) in extraction.sections.iter().enumerate() {
+            for (pi, _para) in section.paragraphs.iter().enumerate() {
+                if let Some(pc) = level2_iter.next() {
+                    map.insert(pc.id, format!("sections[{si}].paragraphs[{pi}]"));
+                }
+            }
+        }
+        map
+    };
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
     // An author with an `agent_id` IS that existing agent (backlog 94cc12db).
