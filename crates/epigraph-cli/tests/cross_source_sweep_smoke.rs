@@ -18,7 +18,7 @@ fn help_lists_expected_flags() {
     let out = Command::new(bin_path()).arg("--help").output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "--help exit code: {:?}", out.status);
-    for flag in &["--limit", "--dry-run", "--apply"] {
+    for flag in &["--limit", "--dry-run", "--apply", "--recent", "--window"] {
         assert!(s.contains(flag), "--help missing {flag}: {s}");
     }
 }
@@ -62,4 +62,24 @@ fn mutually_exclusive_flags_rejected() {
         err.contains("mutually exclusive"),
         "stderr should explain mutual exclusion: {err}"
     );
+}
+
+/// `--window` is parsed by clap (`<N>d|<N>h|<N>m`, N > 0), so a bad value is
+/// refused as argv misuse before any connection is attempted.
+#[test]
+fn recent_rejects_a_malformed_window() {
+    for bad in ["0d", "1w", "abc"] {
+        let out = Command::new(bin_path())
+            .args(["--recent", "--window", bad, "--dry-run"])
+            .env_remove("DATABASE_URL")
+            .env_remove("MAINTENANCE_DATABASE_URL")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "--window {bad} must be refused");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--window") && err.contains("invalid window"),
+            "stderr should name the bad window: {err}"
+        );
+    }
 }

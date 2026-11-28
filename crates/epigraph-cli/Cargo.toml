@@ -254,6 +254,13 @@ name = "cross_source_sweep_smoke"
 path = "tests/cross_source_sweep_smoke.rs"
 required-features = ["genai"]
 
+# Backlog efc1d318: `cross_source_sweep --recent`'s selection and drain pass,
+# through the library calls the binary makes, with a mock verifier.
+[[test]]
+name = "cross_source_sweep_recent"
+path = "tests/cross_source_sweep_recent.rs"
+required-features = ["db"]
+
 [[test]]
 name = "recompute_betp_cohort"
 path = "tests/recompute_betp_cohort.rs"
