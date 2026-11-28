@@ -154,9 +154,15 @@ fn non_test_lines(lines: &[&str]) -> Vec<bool> {
             continue;
         }
         let first = i;
-        // Further attributes and comments between the cfg and its item.
-        let mut j = i + 1;
-        while j < lines.len() {
+        // An item written on the cfg's own line (`#[cfg(test)] fn f() {}`)
+        // starts there; otherwise skip further attributes and comments
+        // between the cfg and its item.
+        let same_line = lines[i].trim().split_once(")]").is_some_and(|(_, rest)| {
+            let rest = rest.trim();
+            !rest.is_empty() && !rest.starts_with("//")
+        });
+        let mut j = if same_line { i } else { i + 1 };
+        while !same_line && j < lines.len() {
             let t = lines[j].trim();
             if t.starts_with("#[") || t.starts_with("//") || t.is_empty() {
                 j += 1;
@@ -176,7 +182,12 @@ fn non_test_lines(lines: &[&str]) -> Vec<bool> {
             }
             let at_item_level = indent(l) == item_indent;
             let closes = end > j && t.trim_start().starts_with('}');
-            if at_item_level && (t.ends_with(';') || t.ends_with(',') || closes) {
+            // A one-line item (`fn helper() -> u8 { 1 }`, `struct S {}`) ends
+            // on its own line; without this the cut would run on through the
+            // next (production) item.
+            let one_line =
+                end == j && t.ends_with('}') && t.matches('{').count() == t.matches('}').count();
+            if at_item_level && (t.ends_with(';') || t.ends_with(',') || closes || one_line) {
                 break;
             }
             end += 1;
@@ -381,6 +392,37 @@ static K: std::sync::LazyLock<String> =
             (35, "<not in a fn>"),
         ],
         "detected sites and their enclosing fns"
+    );
+
+    // A one-line test item, on its own line or on the cfg's line, hides
+    // only itself: the production fns after it are still scanned.
+    let one_liners = "\
+#[cfg(test)]
+fn helper() -> u8 { 1 }
+pub fn after_helper() -> String {
+    std::env::var(\"P\").unwrap()
+}
+#[cfg(test)] struct S {}
+pub fn after_struct() -> String {
+    std::env::var(\"Q\").unwrap()
+}
+#[cfg(test)] fn inline() -> u8 { 1 }
+pub fn after_inline() -> String {
+    std::env::var(\"R\").unwrap()
+}
+";
+    let got: Vec<(usize, String)> = scan("sample.rs", one_liners)
+        .into_iter()
+        .map(|s| (s.line, s.func))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (4, "after_helper".to_string()),
+            (8, "after_struct".to_string()),
+            (12, "after_inline".to_string()),
+        ],
+        "a one-line #[cfg(test)] item must not swallow the production item after it"
     );
 
     // The real tree: the allowlisted reads are seen and attributed.
