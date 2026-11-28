@@ -11,7 +11,11 @@
 //!   (SPEC §10.4, `epigraph-cli`'s `belief_mode_check`) compares it, and its
 //!   contract is unchanged;
 //! - `belief_modes_served` carries what the process actually serves, and the
-//!   two surfaces agree on it.
+//!   two surfaces agree on it;
+//! - the two flags this build does not act on are reported as what is served
+//!   whatever is configured: `EPIGRAPH_INFERENCE=on` serves `off` (no
+//!   inference layer runs) and `EPIGRAPH_ATOM_CACHE_MODE=pure` serves
+//!   `display`.
 //!
 //! The modes are read once per process, so this binary holds one test and
 //! sets the environment before anything reads it.
@@ -28,6 +32,8 @@ use tower::ServiceExt;
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_configured_strict_mode_is_reported_as_served_legacy_on_both_surfaces(pool: PgPool) {
     std::env::set_var("EPIGRAPH_COMPOUND_BELIEF", "strict");
+    std::env::set_var("EPIGRAPH_INFERENCE", "on");
+    std::env::set_var("EPIGRAPH_ATOM_CACHE_MODE", "pure");
 
     // REST: /health.
     let router = create_router(AppState::new(ApiConfig {
@@ -57,6 +63,19 @@ async fn a_configured_strict_mode_is_reported_as_served_legacy_on_both_surfaces(
     assert_eq!(
         health["belief_modes_served"]["compound_belief"], "legacy",
         "strict is not wired in this build, so it is served as legacy: {health}"
+    );
+    assert_eq!(health["belief_modes"]["inference"], "on", "{health}");
+    assert_eq!(
+        health["belief_modes_served"]["inference"], "off",
+        "inference is not acted on in this build, so none is served: {health}"
+    );
+    assert_eq!(
+        health["belief_modes"]["atom_cache_mode"], "pure",
+        "{health}"
+    );
+    assert_eq!(
+        health["belief_modes_served"]["atom_cache_mode"], "display",
+        "atom_cache_mode is not acted on in this build: {health}"
     );
 
     // The configured report is still exactly what the CLI skew check parses.

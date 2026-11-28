@@ -27,8 +27,9 @@
 //!   `system_stats` → `belief_modes`; the pre-flip mode check (SPEC §10.4)
 //!   compares those reports across live processes. Beside it, both surfaces
 //!   report `belief_modes_served` (`belief_view::ServedBeliefModes`): what
-//!   the process serves for a flag whose served value can differ from the
-//!   configured one. The mode check never reads it;
+//!   the process serves for each flag whose served value can differ from the
+//!   configured one (`compound_belief`, and the two flags not acted on,
+//!   `atom_cache_mode` and `inference`). The mode check never reads it;
 //! - the CLI wave bins `recompute_betp`, `backfill_factors`,
 //!   `recompute_claim_belief`, `sweep_retired_source_bbas`,
 //!   `refresh_truth_mirrors` and `decompose_claims --retarget`, which compare their own [`current`] with
@@ -47,16 +48,17 @@
 //! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | yes, on the textless BBA writers MCP `submit_ds_evidence`, REST `POST /api/v1/frames/:id/evidence` and REST `POST /api/v1/claims/:id/assess` (`compound_write_guard::decide`, role by migration 193's definer, a claim the caller cannot read left to the writer's not-found): on a compound, `warn` stores the BBA inert (a compound has no cache-owner frame, so no cache fold reads it; the per-frame side rows each writer keeps, such as its Beta track, are still written), returns `deprecated_compound_target` with the caller's visible atoms and logs the caller; `refuse` refuses it (MCP `invalid_params`, REST 422, `error: compound_target`) before anything is written. `update_with_evidence` carries evidence text and is not guarded |
 //! | `EPIGRAPH_CONTRADICT_COMPOUND_GUARD` | `warn`, `refuse` | `warn` | yes, on the edge writers MCP `link_epistemic` and REST `POST /api/v1/edges` (`contradiction_guard::decide`; REST only for a `claim` target): a `contradicts` or `refutes` edge (any case) onto a target whose text screens compound (`epigraph_core::atomicity::conjunct_screen`) and that has no in-force `decomposes_to` children (migration 193's definer); `warn` writes the edge, returns `partial_contradiction_risk {conjuncts, hint}` and logs the caller; `refuse` refuses it (MCP `invalid_params`, REST 422, `error: compound_contradiction_target`) before anything is written. An atomic or a decomposed target is unaffected |
 //! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` | yes: the atom display fold (`atom_items`), the atom-cache writer, BBA retraction's cache vacate and the shadow report keep or drop edge-factor rows whose source is a compound |
-//! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` | no |
-//! | `EPIGRAPH_INFERENCE` | `off`, `shadow`, `on` | `off` | no |
+//! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` | no: `belief_modes_served` reports `display` whatever is configured |
+//! | `EPIGRAPH_INFERENCE` | `off`, `shadow`, `on` | `off` | no: `belief_modes_served` reports `off` whatever is configured |
 //! | `EPIGRAPH_BP_APPLY` | `off`, `on` | `off` | yes: the API server refuses `POST /api/v1/bp/propagate` with `apply_updates: true` (409) unless `on` |
 //!
 //! The value docs below say what each mode means. For a flag (or value) the
 //! table marks as not acted on, a reported mode is configuration, not
-//! behaviour: `inference: on` on `/health` does not mean an inference layer
-//! is served. Each flag is wired into its code path by the change
-//! that introduces the behaviour, which reads [`current`] rather than parsing
-//! the environment again, and updates the table.
+//! behaviour: `inference: on` under `belief_modes` on `/health` does not mean
+//! an inference layer is served, and `belief_modes_served` says so (`off`).
+//! Each flag is wired into its code path by the change that introduces the
+//! behaviour, which reads [`current`] rather than parsing the environment
+//! again, and updates the table and `belief_modes_served`.
 //!
 //! # Parsing
 //!
