@@ -2152,14 +2152,28 @@ the client's grant. In order:
 2. `epigraph-operator reprovision-write-scopes --reason <text>` (dry run):
    one `CLIENT` line per active `claims:write` client it would change, one
    `CHAIN` line per live refresh family, and the totals. Compare them with a
-   census of the same predicate.
+   census of the same predicate. The dry run runs the real statements and
+   rolls them back. It holds row locks on every candidate client and live
+   refresh token until then, and token refreshes on those rows wait for it.
+   Run it off-peak.
 3. `... --reason <text> --apply --confirm-count <N from step 2>
    --manifest-out <new file>`. A different count rolls back everything. Keep
    the manifest: it is the undo.
 4. Run the dry run again; it must report `0 client(s)`. A rotation in flight
    during step 3 can mint a successor the run did not see. Re-run step 3 for
    any that remain.
-5. Only then deploy the remap.
+5. Wait out the longest access-token lifetime (1 hour for human and service
+   clients, 15 minutes for agents; `access_token_ttl` in
+   `epigraph-api/src/oauth/token.rs`) after the last `--apply`. An access
+   token minted before the run keeps its old scopes until it expires. Under
+   the remap it is refused `insufficient_scope`, which a client does not
+   usually answer by refreshing.
+6. Check that every path that creates a NEW writing client also grants both
+   scopes. The agent provisioning set already does. A human's per-user
+   client takes the provider's `default_scopes` from the deployment's
+   provider configuration: if those list `claims:write`, add `edges:write`
+   and `evidence:write`, or clients created after step 4 are cut off.
+7. Only then deploy the remap.
 
 The undo is `reprovision-write-scopes --reverse --manifest <file> --reason
 <text> --apply`. It restores each client's exact prior arrays and its chains

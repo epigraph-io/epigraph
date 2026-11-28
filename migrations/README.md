@@ -5559,7 +5559,9 @@ the commit that closes it. No block is open.
   (drops both; reverse applied manifests FIRST). **Deploy order:** migrate, deploy the operator
   binary, run the verb, and only then deploy the MCP scope remap (backlog c2dbcf27). Run the verb
   as a dry run, then `--apply`, then the dry run again, expecting 0 clients: a rotation in flight
-  during the apply can mint a successor the run did not see. **Measure** the dry run's client and
+  during the apply can mint a successor the run did not see. Then wait out the longest
+  access-token lifetime (1 h; 15 min for agents) before the remap, because an access token minted
+  before the run keeps its old scopes until it expires (`docs/deploy.md` lists the steps). **Measure** the dry run's client and
   token counts against a census before `--apply`. **Applied to throwaway databases only, NOT to
   any deployed database.**
 
