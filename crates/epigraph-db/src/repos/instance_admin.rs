@@ -231,9 +231,13 @@ impl InstanceAdminRepository {
         let is_instance_admin = row.0.unwrap_or(false);
         Ok(PrivatizationAuthority {
             is_instance_admin,
-            // Read in the same statement as condition 2, so the two cannot
-            // disagree about the instant; filtered to it so a caller never
-            // records an act against an assignment condition 2 did not see.
+            // Read in the same statement as condition 2 and filtered to it,
+            // so a caller never records an act against an assignment
+            // condition 2 did not see. Since migration 361 condition 2 asks
+            // at the statement's clock while this asks at the transaction's
+            // `now()`; on a request's own transaction the two agree, and
+            // where they do not (an assignment granted after the transaction
+            // began) the id is `None` and the caller refuses: both must hold.
             custodian_assignment_id: row.4.filter(|_| is_instance_admin),
             target_group_created_at: row.1,
             other_live_admins: row.2,
