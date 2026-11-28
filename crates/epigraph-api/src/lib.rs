@@ -17,6 +17,8 @@ pub mod passkey_boot;
 #[cfg(feature = "db")]
 pub mod query_parser;
 pub mod routes;
+#[cfg(feature = "scratch")]
+pub mod scratch;
 pub mod security;
 pub mod services;
 pub mod serving;
