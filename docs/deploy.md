@@ -2881,7 +2881,8 @@ has a live attachment is refused `ROL01` unless, for every live attachment,
 the role has a live human holder and the agent's live-linked human is that
 holder. That also refuses an agent still linked to the previous holder after
 a handover: grant the role back to its human, or detach the agent and attach
-an identity linked to the new holder. `epigraph-mcp-full` asks the same question
+an identity linked to the new holder (not for a curator; see "A curator is
+re-linked, never replaced" below). `epigraph-mcp-full` asks the same question
 at boot, on every transport, and refuses to start on `may_run = false`.
 Attachments are written by a maintenance session
 (`epigraph-operator role-attach` / `role-detach`, dry run by default, over
@@ -2919,7 +2920,9 @@ one operator, ever (`epigraph_link_operator` refuses a second with `55000`),
 and `crates/epigraph-api/tests/role_handover_curator.rs` (backlog `6a1825ef`)
 pins that a handover today cuts the curator off. Until a re-link path lands,
 the only remedy that keeps a curator's lineages extensible by the curator is
-granting the role back to its human. The handover plan is backlog `cdfc586a`.
+granting the role back to its human. The `ROL01` hint the database returns
+(migration 166) still names only the two generic remedies; for a curator,
+this paragraph overrides it. The handover plan is backlog `cdfc586a`.
 
 **Group bindings that admit only attached agents (migration 179).**
 `define-group-role` and `bind-group-role` take
