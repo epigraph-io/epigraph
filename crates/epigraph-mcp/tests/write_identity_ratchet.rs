@@ -49,6 +49,14 @@ fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
+/// `src/tools` of this crate, as ONE literal: the shard planner reads a bare
+/// `join("tools")` as the repository's top-level `tools/` directory (which
+/// exists since the kanban move), and would select this ratchet for every
+/// change under it.
+fn tools_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools")
+}
+
 /// Drop `//` line comments (doc comments included), so prose that quotes the
 /// forbidden call does not trip the scan. String literals are kept: none of the
 /// tokens below is a plausible string.
@@ -70,7 +78,7 @@ const RESOLVER_EXEMPT: &[(&str, &str)] = &[(
 
 #[test]
 fn no_tool_module_resolves_the_server_agent_as_an_author() {
-    let dir = src().join("tools");
+    let dir = tools_dir();
     let mut offenders = Vec::new();
     let mut scanned = 0usize;
     for entry in std::fs::read_dir(&dir).expect("read src/tools") {
@@ -183,7 +191,7 @@ fn every_tool_body_forwards_the_requests_own_token() {
 /// fails this scan.
 #[test]
 fn no_tool_module_resolves_the_write_identity_without_the_requests_token() {
-    let dir = src().join("tools");
+    let dir = tools_dir();
     let mut offenders = Vec::new();
     let mut resolver_calls = 0usize;
     for entry in std::fs::read_dir(&dir).expect("read src/tools") {
@@ -682,7 +690,7 @@ fn every_write_body_forwards_auth_or_is_listed() {
 /// position half.
 #[test]
 fn the_signer_accessor_only_ever_names_a_signer() {
-    let dir = src().join("tools");
+    let dir = tools_dir();
     let mut offenders = Vec::new();
     let mut calls = 0usize;
     for entry in std::fs::read_dir(&dir).expect("read src/tools") {
