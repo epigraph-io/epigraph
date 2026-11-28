@@ -106,7 +106,6 @@ const REGISTER: &[(&str, usize)] = &[
     // (backlog 73d4f7ff). Both edges stay best-effort through a savepoint, a
     // form this register does not see: lowered because the `let _ =` write is
     // gone.
-    ("gaps.rs", 1),
     ("perspective.rs", 1),
     ("reasoning.rs", 3),
     // 3 -> 2 (backlog 1dea9589): `create_span`'s `let _ =` attributed_to edge
