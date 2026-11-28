@@ -17,8 +17,8 @@
 -- back onto `claims.signature` / `signer_id` and `evidence.signature` /
 -- `signer_id`, i.e. the sealed rows go back to the shape a seal below 357
 -- left (the original signature over the plaintext digest, on the row). Then
--- drops the three columns of each table (their CHECK constraints go with
--- them). Rows sealed without the stash are not touched.
+-- drops the three columns of each table (their CHECK and foreign-key
+-- constraints go with them). Rows sealed without the stash are not touched.
 --
 -- WHAT IT LEAVES: every ciphertext row; 357's `_sqlx_migrations` row.
 -- Re-introducing the columns is a NEW migration, never a re-run of 357.

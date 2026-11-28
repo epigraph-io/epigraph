@@ -5336,7 +5336,9 @@ restart.
   plaintext against the signer's public key. 357 adds `pre_seal_signature bytea`,
   `pre_seal_signer_id uuid` and `pre_seal_stashed boolean NOT NULL DEFAULT false` to
   `claim_encryption` and `evidence_encryption` (CHECKs: 64 bytes or NULL; signature and signer
-  both set or both NULL; no stash unless `pre_seal_stashed`). No grant or policy changes: the
+  both set or both NULL; no stash unless `pre_seal_stashed`; `pre_seal_signer_id` REFERENCES
+  `agents` ON DELETE RESTRICT, so a stashed signer cannot be deleted while its row is sealed, as it
+  cannot while the row is unsealed). No grant or policy changes: the
   columns inherit 077's group-scoped read policy, so a non-member of the sealing group reads no
   stash. `PrivatizationRepository::seal_claims_conn` stashes the claim's and each covered evidence
   row's `signature` / `signer_id`, re-signs the claim with the API's boot-admitted signing key

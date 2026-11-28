@@ -44,9 +44,17 @@
 --     source row still carries its original signature: leave it). Unseal
 --     restores only where this is true. A row with it false holds no stash.
 --
--- No foreign key on `pre_seal_signer_id`: `claims.signer_id` already ties
--- the agent while the row is unsealed, and an FK here would take a lock on
--- `agents` for no read this migration needs.
+-- `pre_seal_signer_id` REFERENCES `agents(id)` ON DELETE RESTRICT. While a
+-- row is unsealed, its signer cannot be deleted: `claims.signer_id` /
+-- `evidence.signer_id` are `ON DELETE SET NULL`, and nulling them under a
+-- live signature violates `*_signature_requires_signer`, so the delete is
+-- refused. While the row is sealed its `signer_id` names the server (or
+-- nothing), so without this key the original signer could be deleted and
+-- unseal would then write a dangling `signer_id` (23503) and roll back on
+-- every retry. RESTRICT keeps the sealed row's refusal the same as the
+-- unsealed row's. The columns are new and all NULL, so validating the key
+-- reads nothing; `lock_timeout` bounds the SHARE ROW EXCLUSIVE it takes on
+-- `agents`.
 --
 -- ===================================================================
 -- 2. WHO CAN READ THEM
@@ -93,7 +101,10 @@ ALTER TABLE public.claim_encryption
         CHECK ((pre_seal_signature IS NULL) = (pre_seal_signer_id IS NULL)),
     DROP CONSTRAINT IF EXISTS claim_encryption_pre_seal_only_when_stashed,
     ADD CONSTRAINT claim_encryption_pre_seal_only_when_stashed
-        CHECK (pre_seal_stashed OR pre_seal_signature IS NULL);
+        CHECK (pre_seal_stashed OR pre_seal_signature IS NULL),
+    DROP CONSTRAINT IF EXISTS claim_encryption_pre_seal_signer_id_fkey,
+    ADD CONSTRAINT claim_encryption_pre_seal_signer_id_fkey
+        FOREIGN KEY (pre_seal_signer_id) REFERENCES public.agents (id) ON DELETE RESTRICT;
 
 ALTER TABLE public.evidence_encryption
     ADD COLUMN IF NOT EXISTS pre_seal_signature bytea,
@@ -109,7 +120,10 @@ ALTER TABLE public.evidence_encryption
         CHECK ((pre_seal_signature IS NULL) = (pre_seal_signer_id IS NULL)),
     DROP CONSTRAINT IF EXISTS evidence_encryption_pre_seal_only_when_stashed,
     ADD CONSTRAINT evidence_encryption_pre_seal_only_when_stashed
-        CHECK (pre_seal_stashed OR pre_seal_signature IS NULL);
+        CHECK (pre_seal_stashed OR pre_seal_signature IS NULL),
+    DROP CONSTRAINT IF EXISTS evidence_encryption_pre_seal_signer_id_fkey,
+    ADD CONSTRAINT evidence_encryption_pre_seal_signer_id_fkey
+        FOREIGN KEY (pre_seal_signer_id) REFERENCES public.agents (id) ON DELETE RESTRICT;
 
 COMMENT ON COLUMN public.claim_encryption.pre_seal_signature IS
     'claims.signature as it was when the seal ran (migration 357); unseal restores it.';

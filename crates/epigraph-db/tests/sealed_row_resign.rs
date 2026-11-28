@@ -23,7 +23,8 @@
 //!   sealed row unsigned, a re-delivered seal keeps the first stash, and a row
 //!   sealed WITHOUT the stash (before 357) keeps its signature through unseal;
 //! * `docs/runbooks/357-undo.sql` puts the originals back and drops the
-//!   columns, twice.
+//!   columns, twice; and
+//! * a stashed signer cannot be deleted while its row is sealed.
 
 mod viewer_fixture;
 
@@ -729,4 +730,99 @@ async fn the_357_undo_puts_the_originals_back_and_drops_the_columns(pool: PgPool
     .await
     .expect("count stash columns");
     assert_eq!(columns, 0, "the undo drops all six columns");
+}
+
+// =========================================================================
+// The stashed signer is held (review of aa366aa6)
+// =========================================================================
+
+/// `pre_seal_signer_id` REFERENCES `agents` ON DELETE RESTRICT: while a row
+/// is sealed its `signer_id` names the server, so without the key the
+/// original signer could be deleted and unseal would then fail on a dangling
+/// `signer_id` every time. With it, a stashed signer is as undeletable as an
+/// unsealed row's signer is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stashed_signer_cannot_be_deleted_while_its_row_is_sealed(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let content = "a finding signed by a key that is nobody's author";
+    let (claim, evidence) = seed_claim(&pool, &world, content, false).await;
+    // Signers that author nothing, so only the signatures tie them.
+    let claim_key = AgentSigner::generate();
+    let claim_signer = agent_for(&pool, &claim_key).await;
+    let evidence_key = AgentSigner::generate();
+    let evidence_signer = agent_for(&pool, &evidence_key).await;
+    let claim_sig = claim_key
+        .sign_entity(SignedEntity::Claim, &digest(content.as_bytes()))
+        .to_vec();
+    sqlx::query("UPDATE claims SET signature = $2, signer_id = $3 WHERE id = $1")
+        .bind(claim)
+        .bind(&claim_sig)
+        .bind(claim_signer)
+        .execute(&pool)
+        .await
+        .expect("sign the claim");
+    let body = format!("the body behind {content}");
+    let evidence_sig = evidence_key
+        .sign_entity(SignedEntity::Evidence, &digest(body.as_bytes()))
+        .to_vec();
+    sqlx::query("UPDATE evidence SET signature = $2, signer_id = $3 WHERE id = $1")
+        .bind(evidence)
+        .bind(&evidence_sig)
+        .bind(evidence_signer)
+        .execute(&pool)
+        .await
+        .expect("sign the evidence");
+
+    // CALIBRATION: an agent tied to nothing is deletable on this database,
+    // so a refusal below is the stash's doing.
+    let loose = agent_for(&pool, &AgentSigner::generate()).await;
+    sqlx::query("DELETE FROM agents WHERE id = $1")
+        .bind(loose)
+        .execute(&pool)
+        .await
+        .expect("CALIBRATION: an untied agent deletes");
+
+    seal(
+        &pool,
+        &world,
+        &[seal_item(claim, evidence)],
+        Some(server_key(&world)),
+    )
+    .await;
+    assert_eq!(
+        claim_stash(&pool, claim).await,
+        (Some(claim_sig.clone()), Some(claim_signer), true)
+    );
+    assert_eq!(
+        evidence_stash(&pool, evidence).await,
+        (Some(evidence_sig.clone()), Some(evidence_signer), true)
+    );
+
+    for (agent, constraint) in [
+        (claim_signer, "claim_encryption_pre_seal_signer_id_fkey"),
+        (
+            evidence_signer,
+            "evidence_encryption_pre_seal_signer_id_fkey",
+        ),
+    ] {
+        let err = sqlx::query("DELETE FROM agents WHERE id = $1")
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .expect_err("a stashed signer must not be deletable while its row is sealed");
+        let db = err.as_database_error().expect("a database error");
+        assert_eq!(db.code().as_deref(), Some("23503"), "{db}");
+        assert_eq!(db.constraint(), Some(constraint), "{db}");
+    }
+
+    unseal(&pool, &world, &[unseal_item(claim, evidence, content)]).await;
+    assert_eq!(
+        claim_signature(&pool, claim).await.1,
+        Some(claim_sig),
+        "unseal restores the original"
+    );
+    assert_eq!(
+        evidence_signature(&pool, evidence).await,
+        (Some(evidence_sig), Some(evidence_signer))
+    );
 }
