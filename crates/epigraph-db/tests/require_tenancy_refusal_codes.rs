@@ -1,5 +1,7 @@
 //! Migration 362 (backlog baac4c90) codes the caller-reachable refusals of the
-//! three `*_require_tenancy` trigger bodies.
+//! three `*_require_tenancy` trigger bodies, and `From<sqlx::Error> for
+//! DbError` answers a 23503 that carries a listed code as the caller's input
+//! refusal (backlog 6b332b58).
 //!
 //! Each coded arm is raised for real by an INSERT on the application role
 //! (`SET SESSION AUTHORIZATION epigraph_app`: the harness role holds a grant of
@@ -7,7 +9,8 @@
 //! the seed arm and succeeds). Each test asserts the code is in the message,
 //! the SQLSTATE is the one it had before 362, and no row id is in the
 //! message. The predecessor arm stays uncoded (a code would tell a missing
-//! claim from a private one).
+//! claim from a private one), and a plain foreign-key violation stays
+//! `DbError::ForeignKeyViolation`.
 //!
 //! Uses the non-macro `sqlx::query` forms so the offline `.sqlx/` cache is not
 //! extended.
@@ -15,7 +18,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::DbError;
+use epigraph_db::{DbError, RefusalKind};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -120,7 +123,7 @@ async fn an_undeclared_claim_is_refused_with_ten03_and_its_ids_in_detail(pool: P
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_orphan_derived_row_is_refused_with_ten04(pool: PgPool) {
+async fn an_orphan_derived_row_is_refused_with_ten04_as_an_input_refusal(pool: PgPool) {
     let missing = Uuid::new_v4();
     let r = refused_as_app(
         &pool,
@@ -142,6 +145,17 @@ async fn an_orphan_derived_row_is_refused_with_ten04(pool: PgPool) {
         Some(format!("claim_id={missing}").as_str()),
         "the claim id is in DETAIL"
     );
+    let message = r.message.clone();
+    match DbError::from(r.error) {
+        DbError::Refused {
+            kind: RefusalKind::Input,
+            message: m,
+        } => assert_eq!(
+            m, message,
+            "the refusal carries the database's coded message"
+        ),
+        other => panic!("a coded 23503 is the caller's input refusal, got {other:?}"),
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -203,4 +217,34 @@ async fn a_supersedes_naming_no_claim_stays_uncoded(pool: PgPool) {
         matches!(DbError::from(r.error), DbError::ForeignKeyViolation { .. }),
         "an uncoded 23503 stays ForeignKeyViolation"
     );
+}
+
+/// A real foreign-key violation (a group created by an agent that does not
+/// exist) is still `ForeignKeyViolation`, named by its constraint, so
+/// `create_group`'s 403 for an unknown agent principal is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_real_foreign_key_violation_stays_foreign_key_violation(pool: PgPool) {
+    let group = Uuid::new_v4();
+    let e = sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ($1, 'fk', 'did:epigraph:group:' || $1::text, ''::bytea, 'team', $2)",
+    )
+    .bind(group)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect_err("a group created by an agent that does not exist is refused");
+    let message = e
+        .as_database_error()
+        .map(|d| d.message().to_string())
+        .unwrap_or_default();
+    match DbError::from(e) {
+        DbError::ForeignKeyViolation { constraint } => {
+            assert!(
+                constraint.starts_with("groups_") && constraint.ends_with("_fkey"),
+                "the groups foreign key: {constraint} ({message})"
+            );
+        }
+        other => panic!("a plain FK violation stays ForeignKeyViolation, got {other:?}"),
+    }
 }

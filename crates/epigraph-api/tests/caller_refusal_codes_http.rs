@@ -308,3 +308,77 @@ async fn an_older_coded_refusal_keeps_the_redacted_500(pool: PgPool) {
         "an unlisted code's text stays server-side: {body}"
     );
 }
+
+/// Migration 362's TEN04 (a derived row whose `claim_id` names no claim) is a
+/// 23503 that carries a listed code: `From<sqlx::Error>` answers it as the
+/// caller's input refusal, so the HTTP reply is a 400 carrying the code, not
+/// the generic foreign-key 400 that names no code. Raised for real by the
+/// database on an application-role write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn api_mapper_answers_a_coded_23503_tenancy_refusal_with_400_and_its_code(pool: PgPool) {
+    let app_pool = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let missing = Uuid::new_v4();
+    let e = sqlx::query(
+        "INSERT INTO evidence (id, claim_id, content_hash, evidence_type) \
+         VALUES (gen_random_uuid(), $1, decode(md5('ten04') || md5('ten04'), 'hex'), 'document')",
+    )
+    .bind(missing)
+    .execute(&app_pool)
+    .await
+    .expect_err("an evidence row naming no claim is refused");
+    assert_eq!(
+        e.as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("23503"),
+        "PREMISE: the refusal is a foreign-key class SQLSTATE"
+    );
+    let (status, body) = http_answer(epigraph_db::DbError::from(e)).await;
+    let text = body.to_string();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a coded 23503 is the caller's input refusal: {text}"
+    );
+    assert!(
+        text.contains("TEN04:")
+            && text.contains("evidence.claim_id references a nonexistent claim"),
+        "the body carries the refusal code and its reason: {text}"
+    );
+    assert!(
+        !text.contains(&missing.to_string()),
+        "the claim id stays in DETAIL, out of the reply: {text}"
+    );
+}
+
+/// An UNCODED 23503 keeps its answer: a real foreign-key violation (a group
+/// created by an agent that does not exist) stays
+/// `DbError::ForeignKeyViolation`, which the routes that match on it (e.g.
+/// `create_group`'s 403 for an unknown agent principal) still see, and which
+/// the shared mapper answers with the generic foreign-key 400 naming the
+/// constraint and no code.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_uncoded_foreign_key_violation_keeps_its_variant_and_answer(pool: PgPool) {
+    let group = Uuid::new_v4();
+    let e = sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ($1, 'fk-probe', 'did:epigraph:group:' || $1::text, ''::bytea, 'team', $2)",
+    )
+    .bind(group)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect_err("a group created by an agent that does not exist is refused");
+    let db = epigraph_db::DbError::from(e);
+    assert!(
+        matches!(db, epigraph_db::DbError::ForeignKeyViolation { .. }),
+        "an uncoded 23503 stays ForeignKeyViolation: {db:?}"
+    );
+    let (status, body) = http_answer(db).await;
+    let text = body.to_string();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(
+        text.contains("request references a row that does not exist"),
+        "the generic foreign-key answer: {text}"
+    );
+}
