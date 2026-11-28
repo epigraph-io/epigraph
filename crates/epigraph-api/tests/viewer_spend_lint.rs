@@ -242,6 +242,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::get_by_id",
         ],
     ),
+    // stamped: `GET /agents/me` (backlog 076e94cc) reads only the principal's
+    // OWN agent row, the one the token acts as, on `read_as(viewer)`; the id
+    // comes from the viewer, never from the request, so there is no other
+    // agent's name to disclose.
+    ("agents.rs", "get_me", &["AgentRepository::get_by_id"]),
     // `create_agent` takes a viewer only for a find-hit's NAME: the stamped
     // disclosure (as `get_agent`) on `read_as(viewer)`. The create itself and
     // the optional login client are the pre-existing writes on the pool,

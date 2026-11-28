@@ -964,6 +964,9 @@ pub fn create_router_with_extensions(
         // Name search (find_agent): registered before `/api/v1/agents/:id`
         // for readability; axum's router prefers the static segment anyway.
         .route("/api/v1/agents/search", get(agents::search_agents))
+        // The token's own agent (backlog 076e94cc); a static segment, so
+        // `me` is not read as an `:id`.
+        .route("/api/v1/agents/me", get(agents::get_me))
         .route("/agents/:id", get(agents::get_agent))
         .route("/api/v1/agents/:id", get(agents::get_agent))
         .route("/agents/:id/reputation", get(agents::get_agent_reputation))
