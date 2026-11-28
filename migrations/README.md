@@ -5348,7 +5348,9 @@ restart.
   `epigraph-db/tests/require_tenancy_refusal_codes.rs` and
   `epigraph-api/tests/caller_refusal_codes_http.rs` (each coded arm raised on the application
   role). Undo: `docs/runbooks/359-undo.sql` re-states 216's bodies; it refuses (55000) over a
-  body a later migration re-stated. A LATER migration that re-states one of these bodies must
+  body a later migration re-stated. 359 itself refuses (55000, nothing changed) unless each of
+  the three bodies is still 216's by `md5(prosrc)` (pinned by
+  `migration_359_refuses_over_a_body_that_is_not_216s`). A LATER migration that re-states one of these bodies must
   start from 359's text or it drops the codes. No order against the binaries: an older binary
   answers a coded 23503 as before (`ForeignKeyViolation`, the generic foreign-key 400) and a
   coded 23502 as before (the redacted 500, since it does not list the code); the binary of this

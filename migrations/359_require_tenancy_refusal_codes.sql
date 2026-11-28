@@ -50,8 +50,40 @@
 -- later migration that restates one of these bodies must start from 359's
 -- text or it drops the codes.
 --
--- Undo: docs/runbooks/359-undo.sql. Idempotent: CREATE OR REPLACE only.
+-- PRECONDITION (55000, nothing changed): each of the three bodies must still
+-- be 216's, by md5 of `prosrc` (as 350 and 352 do). CREATE OR REPLACE
+-- replaces a body whole, so applying this over a body re-stated elsewhere
+-- would silently drop that body's change.
+--
+-- Undo: docs/runbooks/359-undo.sql.
 SET LOCAL lock_timeout = '3s';
+
+-- -------------------------------------------------------------------
+-- Precondition: the three functions still carry 216's bodies.
+-- -------------------------------------------------------------------
+DO $$
+DECLARE
+    r record;
+    v_found text;
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('public.epigraph_claims_require_tenancy()', 'f7b1d866f389d2ab9d92c214c3bdd91c'),
+        ('public.epigraph_derived_require_tenancy()', 'e2bfce6d72f7ddc4fdbe887239b0e130'),
+        ('public.epigraph_root_require_tenancy()', '892f65582789246ab3aeaf29213957a2')) AS t(sig, md5)
+    LOOP
+        SELECT pg_catalog.md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
+         WHERE p.oid = pg_catalog.to_regprocedure(r.sig);
+        IF v_found IS DISTINCT FROM r.md5 THEN
+            RAISE EXCEPTION '359: % is not the body 359 re-states (216''s, md5 %); found md5 %. '
+                            'Another change re-bodied it, or its migration is not '
+                            'applied; nothing was changed',
+                            r.sig, r.md5, COALESCE(v_found, '(absent)')
+                USING ERRCODE = '55000',
+                      HINT = 'Apply a reconciling migration that re-states the body with '
+                             'every delta instead of this one.';
+        END IF;
+    END LOOP;
+END $$;
 
 -- ===================================================================
 -- epigraph_claims_require_tenancy: 216's body. Coded: TEN03 (undeclared,

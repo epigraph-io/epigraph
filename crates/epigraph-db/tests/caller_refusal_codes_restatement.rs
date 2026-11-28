@@ -581,3 +581,46 @@ async fn the_359_undo_refuses_over_a_body_restated_after_359(pool: PgPool) {
         "nothing was changed"
     );
 }
+
+/// 359 refuses (55000, nothing changed) when a body it re-states is no longer
+/// 216's, rather than silently replacing a change made elsewhere.
+#[sqlx::test(migrations = false)]
+async fn migration_359_refuses_over_a_body_that_is_not_216s(pool: PgPool) {
+    migrate(&pool, &up_to(MIGRATION_359_VERSION - 1)).await;
+    sqlx::raw_sql(
+        "CREATE OR REPLACE FUNCTION public.epigraph_root_require_tenancy() RETURNS trigger \
+         LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp \
+         AS $$ BEGIN RETURN NEW; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("a re-statement made outside 216");
+    let at = facts_of(&pool, RESTATED_359).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let e = up_to(MIGRATION_359_VERSION)
+        .run(&mut *conn)
+        .await
+        .expect_err("359 refuses over a body that is not 216's");
+    drop(conn.detach());
+    let sqlstate = match &e {
+        sqlx::migrate::MigrateError::Execute(err)
+        | sqlx::migrate::MigrateError::ExecuteMigration(err, _) => err
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(|c| c.into_owned()),
+        _ => None,
+    };
+    assert_eq!(sqlstate.as_deref(), Some("55000"), "{e}");
+    assert_eq!(
+        facts_of(&pool, RESTATED_359).await,
+        at,
+        "nothing was changed"
+    );
+    let applied: Option<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version = $1")
+            .bind(MIGRATION_359_VERSION)
+            .fetch_optional(&pool)
+            .await
+            .expect("read _sqlx_migrations");
+    assert_eq!(applied, None, "359 is not recorded as applied");
+}
