@@ -4612,13 +4612,14 @@ mod tests {
         let state = scoped_test_state(&pool).await;
         let promoted = seed_test_workflow(&pool, "promotion-basis-rest", &["s1", "s2"]).await;
         let plain = seed_test_workflow(&pool, "promotion-basis-rest-plain", &["s1"]).await;
-        sqlx::query(
-            "UPDATE claims SET properties = properties || \
-             '{\"promotion\": {\"promotable\": true, \"lower_bound\": 0.72}}'::jsonb \
-             WHERE id = $1",
+        // Through the repo layer, as the gate itself writes the verdict: a raw
+        // UPDATE on `claims` here would count as a route-layer write of a
+        // tenancy-scoped table (`viewer_route_table_lint`).
+        epigraph_db::ClaimRepository::merge_properties(
+            &pool,
+            epigraph_core::ClaimId::from_uuid(promoted),
+            &serde_json::json!({"promotion": {"promotable": true, "lower_bound": 0.72}}),
         )
-        .bind(promoted)
-        .execute(&pool)
         .await
         .unwrap();
 
