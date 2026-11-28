@@ -1002,7 +1002,11 @@ async fn two_acts_on_one_edge_before_a_replay_both_reach_it(pool: PgPool) {
     // Both re-derived to the explicit vacuous cache (no BBA left; backlog
     // 75726018), never NULL.
     let vacuous: Cache = (Some(0.0), Some(0.5));
-    assert_eq!(cached(&pool, a).await, vacuous, "act 1's claim is re-derived");
+    assert_eq!(
+        cached(&pool, a).await,
+        vacuous,
+        "act 1's claim is re-derived"
+    );
     assert_eq!(
         cached(&pool, c).await,
         vacuous,
