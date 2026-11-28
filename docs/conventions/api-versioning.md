@@ -1,8 +1,15 @@
 # REST routes: `/api/v1` and the unversioned aliases
 
-Every REST route lives under `/api/v1`. A few older routes were first
+Every REST data route (claims, agents, lineage, workflows and the rest of
+the API) lives under `/api/v1`. A few older data routes were first
 registered without the prefix. They still answer, but they are deprecated
 aliases (backlog f2938a03), and new code and clients use the `/api/v1` path.
+
+This does not cover the infrastructure routes that are unversioned by
+design and are not deprecated: `/health`, `/metrics`, `/.well-known/*`,
+`/oauth/*` and `/elevate/*`. Their paths are fixed by monitoring, the OAuth
+and discovery specifications, or links already handed to users, and they
+carry no `Deprecation` header. The table below lists every deprecated alias.
 
 ## What an alias answers
 
