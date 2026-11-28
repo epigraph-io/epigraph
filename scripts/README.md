@@ -155,9 +155,11 @@ even mid-confidence supporters can drive a target's BetP toward 1.0.
 
 For each NULL row:
 - If the claim has ≥1 evidence row: take the **highest** evidence-type
-  weight from `calibration.toml` (single source of truth, with the
-  DB-vocab aliases applied — and a hardcoded fallback if the alias
-  section is absent). Best-evidence wins.
+  weight from the calibration file (with the DB-vocab aliases applied —
+  and a hardcoded fallback if the alias section is absent). Best-evidence
+  wins. The file is `--calibration` if given, else `$CALIBRATION_PATH`
+  when set (the file the engine serves), else the repo-root
+  `calibration.toml`; the run prints which one it used.
 - Otherwise: fall back to the agent-only / `conversational` tier (0.3).
 
 ```bash

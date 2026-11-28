@@ -55,13 +55,12 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update_filed_on", 2, "SPEC §4.1 W1 and W4: the evidence BBA and the truth_value seed; PR-W1e puts the compound guard inside"),
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "wire_single_batch_entry", 1, "SPEC §4.1 W5: ingest atom BBA; PR-W3 keys it to the atom's evidence row"),
     // --- scripts ------------------------------------------------------------
-    ("scripts/backfill_intra_source_evidence_discount.py", "execute_backfill", 1, "SPEC §4.1 W13 script: rewrites source_strength; frozen, not edited"),
+    ("scripts/backfill_intra_source_evidence_discount.py", "execute_backfill", 1, "SPEC §4.1 W13 script: rewrites source_strength; write path frozen (af23a73d changed only its calibration-file choice and docstring)"),
     ("scripts/backfill_locality_tag.py", "<module>", 2, "rewrites the locality_tag metadata column only; masses untouched"),
-    ("scripts/backfill_source_strength.py", "execute_backfill", 2, "SPEC §4.1 W13 script: rewrites source_strength (alpha); frozen, not edited"),
+    ("scripts/backfill_source_strength.py", "execute_backfill", 2, "SPEC §4.1 W13 script: rewrites source_strength (alpha); write path frozen (af23a73d changed only its calibration-file choice and docstring)"),
     ("scripts/e2e/probe-batch-h.sh", "<file>", 1, "end-to-end probe seeding one BBA in its own throwaway database"),
     ("scripts/link_mass_function_evidence.py", "<module>", 1, "SPEC §4.1 W13 script: rewrites evidence_id, so item keys; frozen, not edited"),
-    ("scripts/migrate_mixed_bbas.py", "main", 1, "SPEC §4.1 W13 script: splits mixed BBAs; frozen, not edited"),
-    ("scripts/migrate_provenance_bba.py", "migrate", 1, "SPEC §4.1 W13 script: inserts truth_value seed BBAs; frozen, not edited"),
+    ("scripts/migrate_provenance_bba.py", "migrate", 1, "SPEC §4.1 W13 script: inserts truth_value seed BBAs; write path frozen (af23a73d changed only its docstring)"),
     ("scripts/migrate_provenance_bba.py", "rollback", 1, "SPEC §4.1 W13 script: deletes the seed BBAs it inserted"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "<module>", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "main", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
@@ -358,7 +357,9 @@ fn the_spec_named_writers_are_measured() {
         "scripts/link_mass_function_evidence.py",
         "scripts/backfill_source_strength.py",
         "scripts/backfill_intra_source_evidence_discount.py",
-        "scripts/migrate_mixed_bbas.py",
+        // SPEC §4.1 W13 also names `scripts/migrate_mixed_bbas.py`. It ran
+        // once (commit 2d67ad99e records its --execute) and was deleted as a
+        // completed one-shot (backlog dbf5eda5), so it writes nothing now.
         // SPEC §4.1 W14 names `scripts/fuzzy_dedup_claims.py`. The script now
         // marks duplicates through the REST dedup act and writes no BBA
         // itself; the act's BBA moves are this file's
