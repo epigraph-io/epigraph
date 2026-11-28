@@ -111,7 +111,7 @@ const REFERENCE_CEILINGS: &[(&str, usize)] = &[
     ("crates/epigraph-cli/src/beta_replay.rs", 2),
     ("crates/epigraph-cli/src/bin/backfill_factors.rs", 1),
     ("crates/epigraph-cli/src/bin/ingest_document.rs", 5),
-    ("crates/epigraph-cli/src/bin/ingest_git.rs", 1),
+    ("crates/epigraph-cli/src/bin/ingest_git/tests.rs", 1),
     ("crates/epigraph-cli/src/bin/ingest_literature.rs", 1),
     ("crates/epigraph-cli/src/bin/privatize.rs", 1),
     (
