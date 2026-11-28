@@ -7,6 +7,7 @@
 //! and in `scripts/`.
 
 mod belief_lint;
+mod source_files;
 
 use belief_lint::{
     find_words, python_unit_at, python_view, rust_sources, rust_view, script_sources,
@@ -163,13 +164,12 @@ fn measure(rust: &[Source], scripts: &[Source]) -> BTreeMap<(String, String), us
         let view = rust_view(&s.text);
         let units = RustUnits::new(&view.code);
         for at in writer_calls(&view.code, &units) {
-            *out.entry((s.path.clone(), units.unit_at(at).0))
-                .or_default() += 1;
+            *out.entry((s.key(), units.unit_at(at).0)).or_default() += 1;
         }
         for lit in &view.literals {
             let n = raw_writes(&sql_without_comments(&lit.text));
             if n > 0 {
-                *out.entry((s.path.clone(), units.unit_at(lit.start).0))
+                *out.entry((s.key(), units.unit_at(lit.start).0))
                     .or_default() += n;
             }
         }
@@ -418,4 +418,20 @@ fn kv_store(store: &mut Vec<u8>) { store.clear(); }
         &script_sources(),
     ));
     assert!(!names(&f, path), "nothing here writes a BBA; got {f:#?}");
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: every site in the moved code keys under the
+/// registered path (`Source::key`), so no entry goes stale and no moved site
+/// reads as unregistered. Fails on a ratchet keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let (rust, scripts) = (rust_sources(), script_sources());
+    let split = belief_lint::with_claim_split(&rust);
+    assert!(split
+        .iter()
+        .any(|s| s.path.ends_with("/repos/claim/split_probe.rs")));
+    let measured = measure(&split, &scripts);
+    assert_eq!(measured, measure(&rust, &scripts));
+    assert!(findings(&measured).is_empty(), "{:#?}", findings(&measured));
 }

@@ -35,6 +35,7 @@ pub mod challenge;
 pub mod claim;
 pub mod claim_context;
 pub mod claim_encryption;
+pub mod claim_history;
 pub mod claim_id_prefix;
 pub mod claim_ingest;
 pub mod claim_role;
@@ -192,6 +193,9 @@ pub use claim::{
 pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
     ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
+};
+pub use claim_history::{
+    PredecessorHit, RetiredLexicalHit, MAX_HISTORY_ROWS, MAX_PREDECESSOR_DEPTH,
 };
 pub use claim_id_prefix::{
     id_prefix_bounds, ClaimIdPrefixMatch, ClaimIdPrefixRepository, ID_PREFIX_CONTENT_CHARS,

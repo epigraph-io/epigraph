@@ -10,6 +10,7 @@
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+mod source_files;
 
 use epigraph_core::{AgentId, Claim, TruthValue};
 use epigraph_db::ClaimRepository;
@@ -146,36 +147,11 @@ async fn get_by_id_with_labels_matches_separate_calls(pool: PgPool) {
     );
 }
 
-const CLAIM_RS: &str = include_str!("../src/repos/claim.rs");
-
-/// The body (outermost braces included) of the function whose signature starts
-/// with `signature`. Panics when the signature is absent or appears twice, so a
-/// rename cannot make the structural assertion pass vacuously.
-fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
-    let hits: Vec<usize> = src.match_indices(signature).map(|(i, _)| i).collect();
-    assert_eq!(
-        hits.len(),
-        1,
-        "expected exactly one `{signature}` in repos/claim.rs, found {}",
-        hits.len()
-    );
-    let start = hits[0];
-    let open = start + src[start..].find('{').expect("function has a body");
-    let mut depth = 0usize;
-    for (off, ch) in src[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &src[open..=open + off];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced braces after `{signature}`");
-}
+/// The claim repository, by its registered path: `repos/claim.rs` and, once it
+/// is split, every file of the `repos/claim/` directory module
+/// (`source_files`). A function is found wherever it moved; exactly one
+/// definition across the module is still required.
+const CLAIM_MODULE: &str = "crates/epigraph-db/src/repos/claim.rs";
 
 /// The single-claim readers decode through `FromRow`, never `sqlx::Row::get`.
 ///
@@ -214,7 +190,8 @@ fn single_claim_readers_decode_fallibly() {
             &["Self::get_by_id(&mut *conn, viewer, id)"][..],
         ),
     ] {
-        let body = fn_body(CLAIM_RS, sig);
+        let module = source_files::module_files(CLAIM_MODULE);
+        let body = source_files::fn_body(&module, sig);
         for needle in required {
             assert!(
                 body.contains(needle),

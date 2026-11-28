@@ -54,8 +54,7 @@
 //!   this selector.
 
 mod lint_text;
-
-use std::path::{Path, PathBuf};
+mod source_files;
 
 /// The tenanted tables this lint covers: the claim graph's core, a SUBSET of
 /// the tables whose rows carry tenancy (`owner_group_id` / `visibility`). See
@@ -122,27 +121,10 @@ const POOL_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
 ];
 
-fn repos_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/repos")
-}
-
 fn repo_files() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(repos_dir()).expect("read repos dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf-8 file name")
-            .to_string();
-        out.push((
-            name,
-            std::fs::read_to_string(&path).expect("read repo file"),
-        ));
-    }
+    // Recursive, keyed by `source_files::module_key`: a split module's files
+    // (`claim/*.rs`) are scanned under its registered name (`claim.rs`).
+    let mut out = source_files::repo_sources();
     out.sort();
     assert!(
         out.len() > 30,

@@ -25,6 +25,29 @@ impl Source {
             text: text.to_string(),
         }
     }
+
+    /// The path a register keys this source under: its own path, or the
+    /// registered file of the split module whose directory holds it
+    /// (`crate::source_files::module_key`). Every ratchet keys its measured
+    /// sites with this, never with `path`, so moving a function into
+    /// `repos/claim/` keeps its register entry.
+    pub fn key(&self) -> String {
+        crate::source_files::module_key(&self.path)
+    }
+}
+
+/// `base` with `crates/epigraph-db/src/repos/claim.rs` split into a directory
+/// module at a top-level item boundary (`crate::source_files::split_module`),
+/// for the ratchets' "a split measures the same" self-tests.
+pub fn with_claim_split(base: &[Source]) -> Vec<Source> {
+    let files: Vec<(String, String)> = base
+        .iter()
+        .map(|s| (s.path.clone(), s.text.clone()))
+        .collect();
+    crate::source_files::split_module(&files, "crates/epigraph-db/src/repos/claim.rs")
+        .into_iter()
+        .map(|(path, text)| Source { path, text })
+        .collect()
 }
 
 /// The workspace root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`.

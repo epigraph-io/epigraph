@@ -84,6 +84,7 @@
 //!   out of scope for this rule.
 
 mod belief_lint;
+mod source_files;
 
 use belief_lint::{
     balanced_end, find_words, has_word, is_sql, is_write_sql, python_unit_span, python_view,
@@ -695,7 +696,7 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
                 continue;
             }
             let (unit, span) = units.unit_at(lit.start);
-            let u = out.entry((s.path.clone(), unit)).or_default();
+            let u = out.entry((s.key(), unit)).or_default();
             u.kinds.extend(kinds);
             u.reads |= !is_write_sql(&sql);
             u.marked |= marked(span);
@@ -704,7 +705,7 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
         // fixture list, module-level or fn-local, is not a served read.
         if !test_files.contains(&s.path) {
             for (unit, span, list) in column_list_readers(&view, &units, &column_lists) {
-                let u = out.entry((s.path.clone(), unit)).or_default();
+                let u = out.entry((s.key(), unit)).or_default();
                 u.kinds.insert(format!("column list {list}"));
                 u.reads = true;
                 u.marked |= marked(span);
@@ -725,7 +726,7 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
             if !triggered {
                 continue;
             }
-            let u = out.entry((s.path.clone(), f.name.clone())).or_default();
+            let u = out.entry((s.key(), f.name.clone())).or_default();
             u.kinds.insert(format!(".{field}"));
             u.reads = true;
             u.marked |= marked(Some((f.sig_start, f.end)));
@@ -1702,4 +1703,23 @@ pub fn scratch_report(bel: f64, row: &serde_json::Value) -> serde_json::Value {
     assert!(captures("SELECT {COLS:?} FROM", "COLS"));
     assert!(!captures("SELECT {{COLS}} FROM", "COLS"));
     assert!(!captures("SELECT {COLS_X} FROM", "COLS"));
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: every site in the moved code keys under the
+/// registered path (`Source::key`), so no entry goes stale and no moved site
+/// reads as unregistered. Fails on a ratchet keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let (rust, scripts) = (rust_sources(), script_sources());
+    let split = belief_lint::with_claim_split(&rust);
+    assert!(split
+        .iter()
+        .any(|s| s.path.ends_with("/repos/claim/split_probe.rs")));
+    let measured = measure(&split, &scripts);
+    assert_eq!(
+        format!("{measured:#?}"),
+        format!("{:#?}", measure(&rust, &scripts))
+    );
+    assert!(findings(&measured).is_empty(), "{:#?}", findings(&measured));
 }
