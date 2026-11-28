@@ -2160,7 +2160,9 @@ the client's grant. In order:
    client_credentials mint, an authorization-code exchange) do not wait: the
    client rows are locked `FOR NO KEY UPDATE`, which the refresh-token
    foreign key's lock does not conflict with. `--apply` holds the same locks
-   until it commits. Run both off-peak.
+   until it commits. Run both off-peak. A run that waits more than 5 seconds
+   for a row another transaction holds fails with a lock timeout and writes
+   nothing; re-run it.
 3. `... --reason <text> --apply --confirm-count <N from step 2>
    --manifest-out <new file>`. A different count rolls back everything. Keep
    the manifest: it is the undo.

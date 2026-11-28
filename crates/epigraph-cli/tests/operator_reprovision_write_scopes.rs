@@ -22,7 +22,8 @@
 //! * a refresh-token rotation for a client either verb has locked goes
 //!   through (the client row is locked `FOR NO KEY UPDATE`, which a foreign
 //!   key's `FOR KEY SHARE` does not wait on), while a concurrent scope writer
-//!   still waits;
+//!   still waits; a run behind another holder of a candidate row gives up at
+//!   its `lock_timeout`;
 //! * the definers refuse any scope outside {edges:write, evidence:write}
 //!   (admin-only included), a forged reverse line, and a non-maintenance
 //!   login; they are maintenance-owned and not executable by the app role;
@@ -744,6 +745,132 @@ async fn a_rotation_is_not_blocked_by_the_verbs_client_lock(pool: PgPool) {
         scope_write,
         Err("55P03".to_string()),
         "a concurrent scope writer still waits on the reverse verb"
+    );
+}
+
+/// `args` against `dsn`, killed (this child only) if it has not exited
+/// within `secs`: `None` then.
+async fn run_dsn_within(args: &[&str], dsn: &str, secs: u64) -> Option<Run> {
+    let mut child = Command::new(BIN)
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env(DSN_ENV, dsn)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn epigraph-operator");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if child.try_wait().expect("poll the child").is_some() {
+            let out = child.wait_with_output().expect("child output");
+            return Some(Run {
+                code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A run queued behind another holder of a candidate row gives up after
+/// its `lock_timeout` (exit 1, nothing written) instead of waiting, and
+/// holding every row it already locked, for as long as that holder lasts.
+///
+/// Verified to fail: `set_lock_timeout` removed from `write_scopes::run`
+/// -> the dry run is still waiting at the 60 s deadline (`None`); removed
+/// from `write_scopes::reverse` -> the reverse is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_behind_a_held_candidate_row_gives_up_at_its_lock_timeout(pool: PgPool) {
+    let w = ["claims:read", "claims:write"];
+    let (a, _, _) = service_client(&pool, "active", &w, &w).await;
+    let before = snapshot(&pool, &[a]).await;
+    let (role, dsn) = login_in(&pool, "epigraph_maintenance").await;
+
+    let mut holder = pool.begin().await.expect("holder transaction");
+    sqlx::query("SELECT 1 FROM oauth_clients WHERE id = $1 FOR UPDATE")
+        .bind(a)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the candidate row");
+    let started = std::time::Instant::now();
+    let run = run_dsn_within(
+        &["reprovision-write-scopes", "--reason", "lock probe"],
+        &dsn,
+        60,
+    )
+    .await;
+    let took = started.elapsed();
+    holder.rollback().await.expect("release the row");
+    let run = run.unwrap_or_else(|| panic!("the run was still waiting after 60 s"));
+    assert_eq!(run.code, 1, "{}", run.show());
+    assert!(
+        run.stderr.contains("lock timeout"),
+        "the failure names the lock timeout: {}",
+        run.show()
+    );
+    assert!(took.as_secs() < 30, "gave up promptly: {took:?}");
+    assert_eq!(snapshot(&pool, &[a]).await, before, "nothing was written");
+
+    // The reverse: apply once (nothing held), then hold the row again.
+    let manifest = std::env::temp_dir().join(format!("rws-{}.jsonl", Uuid::new_v4().simple()));
+    let m = manifest.to_str().expect("utf-8");
+    let applied = run_dsn(
+        &[
+            "reprovision-write-scopes",
+            "--reason",
+            "lock probe",
+            "--apply",
+            "--confirm-count",
+            "1",
+            "--manifest-out",
+            m,
+        ],
+        &dsn,
+    );
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    let widened = snapshot(&pool, &[a]).await;
+    let mut holder = pool.begin().await.expect("holder transaction");
+    sqlx::query("SELECT 1 FROM oauth_clients WHERE id = $1 FOR UPDATE")
+        .bind(a)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the candidate row");
+    let rev = run_dsn_within(
+        &[
+            "reprovision-write-scopes",
+            "--reverse",
+            "--manifest",
+            m,
+            "--reason",
+            "lock probe",
+            "--apply",
+        ],
+        &dsn,
+        60,
+    )
+    .await;
+    holder.rollback().await.expect("release the row");
+    drop_role(&pool, &role).await;
+    let _ = std::fs::remove_file(&manifest);
+    let rev = rev.unwrap_or_else(|| panic!("the reverse was still waiting after 60 s"));
+    assert_eq!(rev.code, 1, "{}", rev.show());
+    assert!(
+        rev.stderr.contains("lock timeout"),
+        "the reverse's failure names the lock timeout: {}",
+        rev.show()
+    );
+    assert_eq!(
+        snapshot(&pool, &[a]).await,
+        widened,
+        "the timed-out reverse wrote nothing"
     );
 }
 

@@ -52,6 +52,12 @@
 //! A rotation in flight during the run can mint a successor the run did not
 //! see; the verb is idempotent, so the runbook re-runs the dry run after an
 //! apply and expects zero clients.
+//!
+//! Each run's transaction sets `lock_timeout` to [`LOCK_TIMEOUT`]. The run
+//! holds the rows it has locked until it ends, so a run queued behind some
+//! other long holder of a candidate row would keep every refresh of the
+//! tokens it already locked waiting too; it fails (55P03, nothing written)
+//! instead, and is re-run.
 
 use super::client_scope::Operator;
 use super::manifest::Writer;
@@ -68,6 +74,19 @@ pub const SCOPES: [&str; 2] = ["edges:write", "evidence:write"];
 
 /// The manifest header's `kind`.
 pub const MANIFEST_KIND: &str = "reprovision-write-scopes";
+
+/// The `lock_timeout` of each run's transaction (forward and reverse).
+pub const LOCK_TIMEOUT: &str = "5s";
+
+/// Set [`LOCK_TIMEOUT`] for the rest of the transaction on `conn`.
+async fn set_lock_timeout(conn: &mut PgConnection) -> anyhow::Result<()> {
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(LOCK_TIMEOUT)
+        .execute(conn)
+        .await
+        .context("setting lock_timeout")?;
+    Ok(())
+}
 
 /// The forward run's options.
 #[derive(Debug, Clone)]
@@ -245,6 +264,7 @@ pub async fn run(
     validate(opts)?;
     let scopes: Vec<String> = SCOPES.iter().map(|s| (*s).to_string()).collect();
     let mut tx = conn.begin().await.context("beginning the transaction")?;
+    set_lock_timeout(&mut tx).await?;
     let rows: Vec<ForwardRow> = sqlx::query_as(
         "SELECT out_client, out_client_key, out_client_name, out_client_type, out_agent_id, \
                 out_allowed_before, out_granted_before, out_allowed_after, out_granted_after, \
@@ -256,7 +276,13 @@ pub async fn run(
     .bind(operator_json(operator))
     .fetch_all(&mut *tx)
     .await
-    .context("calling epigraph_reprovision_write_scopes (is migration 362 applied?)")?;
+    .with_context(|| {
+        format!(
+            "calling epigraph_reprovision_write_scopes (is migration 362 applied? a wait over \
+             the {LOCK_TIMEOUT} lock_timeout means another transaction holds a candidate row: \
+             nothing was written, re-run)"
+        )
+    })?;
 
     let mut changed = Vec::with_capacity(rows.len());
     for r in rows {
@@ -472,6 +498,7 @@ pub async fn reverse(
     }
     let lines = read_manifest(manifest)?;
     let mut tx = conn.begin().await.context("beginning the transaction")?;
+    set_lock_timeout(&mut tx).await?;
     let mut clients = Vec::with_capacity(lines.len());
     for c in &lines {
         let chains: Vec<Value> = c
