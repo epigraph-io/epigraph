@@ -10,7 +10,8 @@
 //! atom's) on the viewer-stamped read:
 //!
 //! - a viewer who can read a parent sees its open challenge, tagged;
-//! - a viewer who cannot read a private parent gets nothing from it;
+//! - a viewer who cannot read a private parent gets nothing from it, nor from
+//!   a public parent joined to the atom by a decomposition edge it cannot read;
 //! - a resolved challenge on a parent is not listed;
 //! - with the flag absent (or `false`) the response is exactly the atom's own
 //!   challenges, with no `via_parent` key anywhere;
@@ -319,10 +320,33 @@ async fn a_viewer_who_cannot_read_a_private_parent_gets_none_of_its_challenges(p
 /// non-bypass viewer: only the spliced predicates stand between the caller
 /// and a row. The hidden parent's challenge is public and reached over a
 /// public edge, so only the parent's predicate withholds it; the private
-/// atom is reached from a public parent, so only the atom's predicate does.
+/// atom is reached from a public parent, so only the atom's predicate does;
+/// and a PUBLIC parent joined to the public atom by a GROUP-PRIVATE
+/// `decomposes_to` edge, carrying a public open challenge, is withheld only
+/// by the edge's predicate (listing it would reveal a private decomposition).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_spliced_predicates_alone_withhold_an_unreadable_parent_or_atom(pool: PgPool) {
     let w = world(pool).await;
+    let owner_group: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(w.private_parent)
+        .fetch_one(&w.pool)
+        .await
+        .expect("the owner's group");
+    let edge_hidden_parent =
+        fixture::seed_public_claim(&w.pool, w.owner, "d8108186 parent over a private edge").await;
+    decomposes_to(&w.pool, edge_hidden_parent, w.atom, "group", owner_group).await;
+    let on_edge_hidden_parent = seed_challenge(
+        &w.pool,
+        edge_hidden_parent,
+        w.owner,
+        "private-edge parent open",
+    )
+    .await;
+    sqlx::query("UPDATE challenges SET visibility = 'public' WHERE id = $1")
+        .bind(on_edge_hidden_parent)
+        .execute(&w.pool)
+        .await
+        .expect("make the private-edge parent's challenge public");
     let stranger = Viewer::resolve(&w.pool, w.stranger).await.expect("viewer");
     assert!(stranger.group_bind().is_some(), "a non-bypass viewer");
 
@@ -338,7 +362,8 @@ async fn the_spliced_predicates_alone_withhold_an_unreadable_parent_or_atom(pool
     assert_eq!(
         ids(on_atom),
         BTreeSet::from([(w.on_public_parent, w.public_parent)]),
-        "neither private parent's challenge, on a connection row security does not filter"
+        "neither private parent's challenge, nor the one reached only over a private edge, \
+         on a connection row security does not filter"
     );
     let on_private_atom =
         epigraph_db::ChallengeRepository::list_open_for_parents(&w.pool, &stranger, w.private_atom)
@@ -349,7 +374,7 @@ async fn the_spliced_predicates_alone_withhold_an_unreadable_parent_or_atom(pool
         "an atom the viewer cannot read lists nothing: {on_private_atom:?}"
     );
 
-    // Control: the owner, on the same connection, sees all three.
+    // Control: the owner, on the same connection, sees all four.
     let owner = Viewer::resolve(&w.pool, w.owner).await.expect("viewer");
     assert_eq!(
         ids(
@@ -361,6 +386,7 @@ async fn the_spliced_predicates_alone_withhold_an_unreadable_parent_or_atom(pool
             (w.on_public_parent, w.public_parent),
             (w.on_private_parent, w.private_parent),
             (w.on_hidden_parent, w.hidden_parent),
+            (on_edge_hidden_parent, edge_hidden_parent),
         ])
     );
     assert_eq!(
