@@ -5,7 +5,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 /// A row from the triples table with joined entity names
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct TripleRow {
     pub id: Uuid,
     pub claim_id: Uuid,
@@ -55,8 +55,13 @@ pub struct TripleRepository;
 impl TripleRepository {
     /// Batch insert entity mentions on the caller's connection.
     ///
-    /// Inserts each mention individually and collects the returned IDs. It
-    /// opens no transaction of its own: `routes/entities.rs` passes the ONE
+    /// ONE `INSERT ... SELECT FROM UNNEST(...)` for the whole batch (backlog
+    /// 591b2f6f; it was one round trip per row). Returns one id per input
+    /// tuple, in input order: the ids are minted here and inserted with their
+    /// rows, so the order holds by construction rather than resting on the
+    /// order of `RETURNING`, and the returned set is checked against them.
+    ///
+    /// It opens no transaction of its own: `routes/entities.rs` passes the ONE
     /// viewer-stamped transaction on which it has already authorized every
     /// target claim, so the batch commits or rolls back as a whole and
     /// `entity_mentions_tenancy`'s `WITH CHECK` applies to each row.
@@ -66,7 +71,7 @@ impl TripleRepository {
     ///                 confidence, extractor, span_start, span_end)
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if any insert fails.
+    /// Returns `DbError::QueryFailed` if the insert fails (no row is written).
     #[allow(clippy::type_complexity)]
     #[instrument(skip(conn, mentions_data))]
     pub async fn batch_create_mentions(
@@ -82,8 +87,19 @@ impl TripleRepository {
             Option<i32>,
         )>,
     ) -> Result<Vec<Uuid>, DbError> {
-        let mut ids = Vec::with_capacity(mentions_data.len());
-
+        if mentions_data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = mentions_data.len();
+        let ids: Vec<Uuid> = (0..n).map(|_| Uuid::new_v4()).collect();
+        let mut entity_ids = Vec::with_capacity(n);
+        let mut claim_ids = Vec::with_capacity(n);
+        let mut surface_forms = Vec::with_capacity(n);
+        let mut mention_roles = Vec::with_capacity(n);
+        let mut confidences = Vec::with_capacity(n);
+        let mut extractors = Vec::with_capacity(n);
+        let mut span_starts = Vec::with_capacity(n);
+        let mut span_ends = Vec::with_capacity(n);
         for (
             entity_id,
             claim_id,
@@ -95,44 +111,61 @@ impl TripleRepository {
             span_end,
         ) in mentions_data
         {
-            let row = sqlx::query!(
-                r#"
-                INSERT INTO entity_mentions
-                    (entity_id, claim_id, surface_form, mention_role, confidence, extractor,
-                     span_start, span_end)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id
-                "#,
-                entity_id,
-                claim_id,
-                surface_form,
-                mention_role,
-                confidence,
-                extractor,
-                span_start,
-                span_end
-            )
-            .fetch_one(&mut *conn)
-            .await?;
-
-            ids.push(row.id);
+            entity_ids.push(entity_id);
+            claim_ids.push(claim_id);
+            surface_forms.push(surface_form);
+            mention_roles.push(mention_role);
+            confidences.push(confidence);
+            extractors.push(extractor);
+            span_starts.push(span_start);
+            span_ends.push(span_end);
         }
 
+        let returned: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO entity_mentions
+                (id, entity_id, claim_id, surface_form, mention_role, confidence, extractor,
+                 span_start, span_end)
+            SELECT u.id, u.entity_id, u.claim_id, u.surface_form, u.mention_role,
+                   u.confidence, u.extractor, u.span_start, u.span_end
+            FROM UNNEST($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::text[],
+                        $6::float8[], $7::text[], $8::int4[], $9::int4[])
+                 WITH ORDINALITY
+                 AS u(id, entity_id, claim_id, surface_form, mention_role, confidence,
+                      extractor, span_start, span_end, ord)
+            ORDER BY u.ord
+            RETURNING id
+            "#,
+        )
+        .bind(&ids)
+        .bind(&entity_ids)
+        .bind(&claim_ids)
+        .bind(&surface_forms)
+        .bind(&mention_roles)
+        .bind(&confidences)
+        .bind(&extractors)
+        .bind(&span_starts)
+        .bind(&span_ends)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        Self::check_returned(&ids, returned, "entity_mentions")?;
         Ok(ids)
     }
 
     /// Batch insert triples on the caller's connection.
     ///
-    /// Inserts each triple individually and collects the returned IDs. Like
-    /// [`Self::batch_create_mentions`] it opens no transaction of its own; the
-    /// route passes its viewer-stamped transaction.
+    /// ONE `INSERT ... SELECT FROM UNNEST(...)` for the whole batch, ids in
+    /// input order, exactly as [`Self::batch_create_mentions`]. Like it, it
+    /// opens no transaction of its own; the route passes its viewer-stamped
+    /// transaction.
     ///
     /// # Arguments
     /// Each tuple is: (claim_id, subject_id, predicate, object_id, object_literal,
     ///                 confidence, extractor, properties)
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if any insert fails.
+    /// Returns `DbError::QueryFailed` if the insert fails (no row is written).
     #[allow(clippy::type_complexity)]
     #[instrument(skip(conn, triples_data))]
     pub async fn batch_create_triples(
@@ -148,8 +181,19 @@ impl TripleRepository {
             serde_json::Value,
         )>,
     ) -> Result<Vec<Uuid>, DbError> {
-        let mut ids = Vec::with_capacity(triples_data.len());
-
+        if triples_data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = triples_data.len();
+        let ids: Vec<Uuid> = (0..n).map(|_| Uuid::new_v4()).collect();
+        let mut claim_ids = Vec::with_capacity(n);
+        let mut subject_ids = Vec::with_capacity(n);
+        let mut predicates = Vec::with_capacity(n);
+        let mut object_ids = Vec::with_capacity(n);
+        let mut object_literals = Vec::with_capacity(n);
+        let mut confidences = Vec::with_capacity(n);
+        let mut extractors = Vec::with_capacity(n);
+        let mut properties_list = Vec::with_capacity(n);
         for (
             claim_id,
             subject_id,
@@ -161,30 +205,70 @@ impl TripleRepository {
             properties,
         ) in triples_data
         {
-            let row = sqlx::query!(
-                r#"
-                INSERT INTO triples
-                    (claim_id, subject_id, predicate, object_id, object_literal,
-                     confidence, extractor, properties)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id
-                "#,
-                claim_id,
-                subject_id,
-                predicate,
-                object_id,
-                object_literal,
-                confidence,
-                extractor,
-                properties
-            )
-            .fetch_one(&mut *conn)
-            .await?;
-
-            ids.push(row.id);
+            claim_ids.push(claim_id);
+            subject_ids.push(subject_id);
+            predicates.push(predicate);
+            object_ids.push(object_id);
+            object_literals.push(object_literal);
+            confidences.push(confidence);
+            extractors.push(extractor);
+            properties_list.push(properties);
         }
 
+        let returned: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO triples
+                (id, claim_id, subject_id, predicate, object_id, object_literal,
+                 confidence, extractor, properties)
+            SELECT u.id, u.claim_id, u.subject_id, u.predicate, u.object_id, u.object_literal,
+                   u.confidence, u.extractor, u.properties
+            FROM UNNEST($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::uuid[],
+                        $6::text[], $7::float8[], $8::text[], $9::jsonb[])
+                 WITH ORDINALITY
+                 AS u(id, claim_id, subject_id, predicate, object_id, object_literal,
+                      confidence, extractor, properties, ord)
+            ORDER BY u.ord
+            RETURNING id
+            "#,
+        )
+        .bind(&ids)
+        .bind(&claim_ids)
+        .bind(&subject_ids)
+        .bind(&predicates)
+        .bind(&object_ids)
+        .bind(&object_literals)
+        .bind(&confidences)
+        .bind(&extractors)
+        .bind(&properties_list)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        Self::check_returned(&ids, returned, "triples")?;
         Ok(ids)
+    }
+
+    /// The batch inserts mint their ids, so `RETURNING` must name exactly
+    /// those ids. Anything else means the statement wrote something other than
+    /// the batch, and the caller's transaction must not commit it.
+    fn check_returned(
+        minted: &[Uuid],
+        mut returned: Vec<Uuid>,
+        table: &'static str,
+    ) -> Result<(), DbError> {
+        let mut want = minted.to_vec();
+        want.sort_unstable();
+        returned.sort_unstable();
+        if want == returned {
+            Ok(())
+        } else {
+            Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "{table} batch insert returned {} ids for {} rows, or ids it was not given",
+                    returned.len(),
+                    minted.len()
+                )),
+            })
+        }
     }
 
     /// Query triples with optional filters.
@@ -349,9 +433,9 @@ impl TripleRepository {
 
     /// Return all triples associated with a specific claim.
     ///
-    /// Enables the embedding-fallback path in the `search_triples` MCP tool,
-    /// where claims are located by embedding similarity and triples are retrieved
-    /// by claim_id.
+    /// The single-claim form of [`Self::get_by_claims`], which the
+    /// `search_triples` MCP tool's embedding-fallback path uses (claims located
+    /// by embedding similarity, their triples retrieved by claim_id).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -409,6 +493,62 @@ impl TripleRepository {
                 created_at: r.created_at,
             })
             .collect())
+    }
+
+    /// The triples of several claims in ONE statement (backlog d69a4d24).
+    ///
+    /// The answer is [`Self::get_by_claim`] called for each id in
+    /// `claim_ids` in turn, concatenated and cut at `limit`: the claims in
+    /// the order given, each claim's triples by confidence, highest first.
+    /// `search_triples` (MCP) used to make exactly those calls, one round trip
+    /// per embedding hit, and truncate afterwards.
+    ///
+    /// Filters `t` through the viewer splice, as `get_by_claim` does (it joins
+    /// no `claims`, so `t` is the only alias).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn get_by_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<TripleRow>, DbError> {
+        if claim_ids.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT t.id,
+                   t.claim_id,
+                   t.subject_id,
+                   se.canonical_name  AS subject_name,
+                   t.predicate,
+                   t.object_id,
+                   oe.canonical_name  AS object_name,
+                   t.object_literal,
+                   t.confidence,
+                   t.extractor,
+                   t.properties,
+                   t.created_at
+            FROM unnest($1::uuid[]) WITH ORDINALITY AS want(claim_id, ord)
+            JOIN  triples t   ON t.claim_id = want.claim_id
+            JOIN  entities se ON se.id = t.subject_id
+            LEFT JOIN entities oe ON oe.id = t.object_id
+            WHERE true /* {VISIBILITY:t} */
+            ORDER BY want.ord, t.confidence DESC
+            LIMIT $2
+            "#,
+            3,
+        );
+        let mut q = sqlx::query_as::<_, TripleRow>(&sql)
+            .bind(claim_ids)
+            .bind(limit);
+        if let Some(groups) = viewer.group_bind() {
+            q = q.bind(groups);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Return `true` if at least one triple exists for the given claim.

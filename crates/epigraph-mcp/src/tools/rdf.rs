@@ -200,15 +200,14 @@ pub async fn search_triples(
         .await
         .map_err(internal_error)?;
 
+    // One statement for every hit (backlog d69a4d24): the hits in similarity
+    // order, each hit's triples by confidence, cut at `limit` in the database
+    // rather than after one round trip per hit.
+    let claim_ids: Vec<Uuid> = claim_results.iter().map(|(id, _)| *id).collect();
     let mut read = server.read_as(viewer, "search_triples").await?;
-    let mut triples = Vec::new();
-    for (claim_id, _similarity) in &claim_results {
-        let claim_triples = TripleRepository::get_by_claim(&mut *read, viewer, *claim_id)
-            .await
-            .map_err(internal_error)?;
-        triples.extend(claim_triples);
-    }
-    triples.truncate(limit as usize);
+    let triples = TripleRepository::get_by_claims(&mut *read, viewer, &claim_ids, limit)
+        .await
+        .map_err(internal_error)?;
 
     success_json(&serde_json::json!({
         "count": triples.len(),
