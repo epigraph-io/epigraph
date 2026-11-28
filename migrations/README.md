@@ -5560,8 +5560,11 @@ the commit that closes it. No block is open.
   binary, run the verb, and only then deploy the MCP scope remap (backlog c2dbcf27). Run the verb
   as a dry run, then `--apply`, then the dry run again, expecting 0 clients: a rotation in flight
   during the apply can mint a successor the run did not see. Then wait out the longest
-  access-token lifetime (1 h; 15 min for agents) before the remap, because an access token minted
-  before the run keeps its old scopes until it expires (`docs/deploy.md` lists the steps). **Measure** the dry run's client and
+  access-token lifetime (1 h; 15 min for agents), because an access token minted before the run
+  keeps its old scopes until it expires, and run the dry run once more immediately before the
+  remap, again expecting 0 clients: an authorization started before the apply, or a client
+  approved or reinstated after it, can still produce a client or chain without the two scopes
+  (`docs/deploy.md` lists the steps). **Measure** the dry run's client and
   token counts against a census before `--apply`. **Applied to throwaway databases only, NOT to
   any deployed database.**
 

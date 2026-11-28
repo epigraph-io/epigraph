@@ -2178,7 +2178,17 @@ the client's grant. In order:
    client takes the provider's `default_scopes` from the deployment's
    provider configuration: if those list `claims:write`, add `edges:write`
    and `evidence:write`, or clients created after step 4 are cut off.
-7. Only then deploy the remap.
+7. Immediately before deploying the remap, after the wait in step 5, run
+   the dry run once more; it must report `0 client(s)`. Step 4 can pass
+   while a client or chain without the new scopes is still to come. An
+   authorization started before step 3 keeps the client's scopes as they
+   were when its consent page opened (the authorize session lasts 10
+   minutes, its code 60 seconds), so its exchange after step 4 mints such a
+   chain; the step 5 wait outlasts it. A pending client approved with
+   `claims:write` after step 3 may lack both scopes, and a suspended client
+   reinstated after step 3 was never re-provisioned. If any client remains,
+   re-run step 3 for it, then repeat steps 5 and 7.
+8. Only then deploy the remap.
 
 The undo is `reprovision-write-scopes --reverse --manifest <file> --reason
 <text> --apply`. It restores each client's exact prior arrays and its chains
