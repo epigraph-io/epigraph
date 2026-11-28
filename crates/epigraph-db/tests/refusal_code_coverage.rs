@@ -15,7 +15,10 @@
 //!   [`SUPERSEDE_REFUSAL_CODES`]) and the custom SQLSTATEs
 //!   `From<sqlx::Error> for DbError` maps to typed variants;
 //! * [`RECOGNISED`]: a Rust arm outside the registry names it (each entry's
-//!   recognising expression is checked to still be in its source);
+//!   recognising expression is checked to still be in its source, unless
+//!   every code of the entry is now an entry of a `REGISTRY` table in
+//!   `src/refusal_codes.rs`, read from that file's source: the arm moved into
+//!   the registry, see [`source_registry`]);
 //! * [`REDACTED`]: no Rust arm names it, with the reason. Such a code reaches
 //!   a caller as its SQLSTATE and `DbError` variant decide: for
 //!   `DbError::QueryFailed` the redacted 500 over HTTP, the coded text over
@@ -291,6 +294,89 @@ fn registry() -> BTreeSet<&'static str> {
         .collect()
 }
 
+/// The codes a `pub const REGISTRY: &[RefusalCode] = &[ .. ];` table in
+/// `src` (the source of `src/refusal_codes.rs`) registers: each code-shaped
+/// string literal in the table, and each identifier in it that a
+/// `pub const NAME: &str = "CODE";` of the same file names. Comments are
+/// skipped, so a code a comment mentions is not counted. Empty when the file
+/// has no such table.
+///
+/// Read from the source rather than imported, so this test compiles both
+/// before and after the table exists: once it does, an arm [`RECOGNISED`]
+/// cites may move into it (the entry is then satisfied by the table, and can
+/// be removed), and a code it registers is mapped.
+fn source_registry(src: &str) -> BTreeSet<String> {
+    let src = strip_rust_comments(src);
+    let consts: BTreeMap<&str, &str> = src
+        .lines()
+        .filter_map(|l| {
+            let (name, rest) = l
+                .trim()
+                .strip_prefix("pub const ")?
+                .split_once(": &str = \"")?;
+            let value = rest.strip_suffix("\";")?;
+            code_shaped(value).then_some((name, value))
+        })
+        .collect();
+    let Some((_, table)) = src.split_once("pub const REGISTRY: &[RefusalCode] = &[") else {
+        return BTreeSet::new();
+    };
+    let table = table.split_once("\n];").map_or(table, |(t, _)| t);
+    let mut out = BTreeSet::new();
+    for (i, part) in table.split('"').enumerate() {
+        if i % 2 == 1 {
+            if code_shaped(part) {
+                out.insert(part.to_string());
+            }
+            continue;
+        }
+        for ident in part.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if let Some(code) = consts.get(ident) {
+                out.insert((*code).to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Rust source with `//` line comments (outside a `"` string on that line)
+/// and `/* */` block comments removed.
+fn strip_rust_comments(src: &str) -> String {
+    let mut lines = String::with_capacity(src.len());
+    for line in src.lines() {
+        let mut in_str = false;
+        let mut prev = '\0';
+        let mut cut = line.len();
+        for (i, c) in line.char_indices() {
+            match c {
+                '"' if prev != '\\' => in_str = !in_str,
+                '/' if !in_str && prev == '/' => {
+                    cut = i - 1;
+                    break;
+                }
+                _ => {}
+            }
+            prev = c;
+        }
+        lines.push_str(&line[..cut]);
+        lines.push('\n');
+    }
+    let mut out = String::with_capacity(lines.len());
+    let mut rest = lines.as_str();
+    while let Some(open) = rest.find("/*") {
+        out.push_str(&rest[..open]);
+        rest = rest[open + 2..].split_once("*/").map_or("", |(_, r)| r);
+        out.push(' ');
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `refusal_codes.rs`'s registry table, when it has one ([`source_registry`]).
+fn table() -> BTreeSet<String> {
+    source_registry(include_str!("../src/refusal_codes.rs"))
+}
+
 fn recognised() -> BTreeSet<&'static str> {
     RECOGNISED
         .iter()
@@ -378,6 +464,12 @@ fn literals(src: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// Whether `s` is a code: two to five capitals, then two digits.
+fn code_shaped(s: &str) -> bool {
+    let caps = s.bytes().take_while(u8::is_ascii_uppercase).count();
+    (2..=5).contains(&caps) && s.len() == caps + 2 && s[caps..].bytes().all(|b| b.is_ascii_digit())
+}
+
 /// `CODE` when `lit` opens with `CODE:` (two to five capitals, two digits),
 /// the shape `caller_refusal_codes_restatement.rs`'s `code_of` reads.
 fn message_code(lit: &str) -> Option<&str> {
@@ -442,10 +534,12 @@ async fn raised(pool: &PgPool) -> BTreeMap<String, BTreeSet<String>> {
 
 /// `CODE(function, ...)` for every raised code in no list.
 fn unaccounted(raised: &BTreeMap<String, BTreeSet<String>>) -> Vec<String> {
+    let table = table();
     let known: BTreeSet<&str> = registry()
         .into_iter()
         .chain(recognised())
         .chain(redacted())
+        .chain(table.iter().map(String::as_str))
         .collect();
     raised
         .iter()
@@ -482,12 +576,38 @@ fn the_scanner_reads_codes_and_skips_comments() {
     assert!(!custom_sqlstate("HV00B"));
 }
 
+/// The table reader takes literals and the file's code constants inside the
+/// table only, and skips comments and non-code literals.
+#[test]
+fn the_registry_table_reader_reads_only_the_table() {
+    let src = r#"
+pub const ZZ_NAMED: &str = "ZZA01";
+pub const ZZ_UNUSED: &str = "ZZB01";
+pub const NOT_A_CODE: &str = "42501";
+const OUTSIDE: &[&str] = &["ZZC01"];
+pub const REGISTRY: &[RefusalCode] = &[
+    // ZZD01 is only in a comment; the family's "ZZI01" too.
+    // A lifetime &'static str must not open a literal: ZZJ01.
+    prefix("ZZE01", AUTHORITY), sqlstate(ZZ_NAMED, Answer::Route), /* ZZF01 */
+    RefusalCode { code: "ZZG01", carrier: Carrier::Prefix { sqlstate: Some("42501") }, answer: X },
+];
+const AFTER: &[&str] = &["ZZH01"];
+"#;
+    let got: Vec<String> = source_registry(src).into_iter().collect();
+    assert_eq!(got, ["ZZA01", "ZZE01", "ZZG01"]);
+    assert!(source_registry("pub const ELV01: &str = \"ELV01\";").is_empty());
+}
+
 #[test]
 fn the_lists_are_disjoint_and_each_recognising_arm_is_still_there() {
-    let (reg, rec, red) = (registry(), recognised(), redacted());
+    let (reg, rec, red, table) = (registry(), recognised(), redacted(), table());
     let both: Vec<&str> = rec.intersection(&reg).copied().collect();
     assert!(both.is_empty(), "registered AND recognised: {both:?}");
-    let mapped: BTreeSet<&str> = reg.union(&rec).copied().collect();
+    let mapped: BTreeSet<&str> = reg
+        .union(&rec)
+        .copied()
+        .chain(table.iter().map(String::as_str))
+        .collect();
     let both: Vec<&str> = red.intersection(&mapped).copied().collect();
     assert!(
         both.is_empty(),
@@ -497,6 +617,9 @@ fn the_lists_are_disjoint_and_each_recognising_arm_is_still_there() {
         + RECOGNISED.iter().map(|r| r.codes.len()).sum::<usize>();
     assert_eq!(listed, red.len() + rec.len(), "a code is listed twice");
     for r in RECOGNISED {
+        if r.codes.iter().all(|c| table.contains(*c)) {
+            continue;
+        }
         for needle in r.needles {
             assert!(
                 r.source.contains(needle),
