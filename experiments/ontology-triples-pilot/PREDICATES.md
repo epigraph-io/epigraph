@@ -126,7 +126,7 @@ term matches closely enough to emit as an equivalence.
 
 - Subject: `Person`
 - Object: `Person` or `Organization`
-- schema.org: none (schema.org defines no adviser property).
+- schema.org: none found (schema.org has no `advisor` or `adviser` term page).
 - RO/BFO: none.
 - Examples (synthetic):
   - "Prof. Hana Oduya supervised Rell Castine's doctoral thesis."
