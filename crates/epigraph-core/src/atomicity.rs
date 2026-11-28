@@ -271,11 +271,12 @@ const CLAUSE_CONNECTORS: [&str; 9] = [
 /// refusal is opt-in, off by default, and narrow (see the module doc): under
 /// `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse` a false positive blocks only a
 /// `contradicts` or `refutes` edge onto a target with no `decomposes_to`
-/// children, and decomposing that target first clears it. A noun-phrase `and` ("apples and pears are fruit") is not
-/// counted, so "X rose and Y fell" without a comma is missed; a comma list
-/// opened by an introductory phrase ("In May, X rose, and Y fell") reads as a
-/// list and its join is missed; a non-restrictive `, which` that only
-/// describes ("the lab, which is in Oslo") is counted.
+/// children, and decomposing that target first clears it. A noun-phrase `and`
+/// ("apples and pears are fruit") is not counted, so "X rose and Y fell"
+/// without a comma is missed; a comma list opened by an introductory phrase
+/// ("In May, X rose, and Y fell") reads as a list and its join is missed; a
+/// non-restrictive `, which` that only describes ("the lab, which is in Oslo")
+/// is counted.
 pub fn conjunct_screen(text: &str) -> ConjunctScreen {
     let sentences = count_sentences(text, true);
     let clause_joins = clause_join_count(text);

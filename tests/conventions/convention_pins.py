@@ -392,4 +392,16 @@ PINS: tuple[Pin, ...] = (
         needle="bisect `main` with `git bisect start --first-parent`",
         incident="e0a1cce5",
     ),
+    # --- The MCP screen tool's description names the gated refusal ---------
+    Pin(
+        id="screen-claim-atomicity-description-names-the-gated-refusal",
+        file="crates/epigraph-mcp/src/server.rs",
+        section_start='description = "Screen claims for compound content by id',
+        section_end="async fn screen_claim_atomicity(",
+        needle=(
+            "only the opt-in compound-contradiction guard (see link_epistemic) "
+            "refuses on it"
+        ),
+        incident="40cdb432",
+    ),
 )
