@@ -106,8 +106,8 @@ fn case_c_open_world_mass_keeps_betp_under_plausibility() {
     assert_within(&m, 0, "case (c) open-world-only");
 }
 
-/// Both conflict and open-world mass present - the shape
-/// `select_combination_rule` produces outside the Dempster branch, i.e. the
+/// Both conflict and open-world mass present - the shape the (since deleted)
+/// `select_combination_rule` produced outside the Dempster branch, i.e. the
 /// live corpus state.
 #[test]
 fn case_d_conflict_and_open_world_keeps_betp_under_plausibility() {

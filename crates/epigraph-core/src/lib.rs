@@ -24,7 +24,8 @@
 //! - [`prov`] holds [`ProvAgentType`], the W3C PROV-O agent type read off
 //!   labels.
 //! - [`traits`] holds [`Signable`], [`Verifiable`] and [`ContentAddressable`],
-//!   the hooks between domain types and `epigraph-crypto`.
+//!   generic signing and hashing hooks over `epigraph-crypto`. No domain type
+//!   implements them; packet signing uses `PacketSignable` in `epigraph-api`.
 //! - [`challenge`] holds [`Challenge`] and [`ChallengeService`], disputes
 //!   against an existing claim.
 //! - [`atomicity`] holds the heuristic deciding whether a claim is already one

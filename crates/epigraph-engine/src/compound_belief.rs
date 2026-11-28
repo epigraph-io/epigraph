@@ -30,6 +30,8 @@
 //! Nothing here writes. The derived value is never stored and never fed to a
 //! fold: it is a [`DerivedBelief`], not an
 //! [`EvidencedInterval`](crate::atom_items::EvidencedInterval).
+//!
+//! Rollout status: see the crate doc ([`crate`], "Atom-level belief").
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

@@ -131,6 +131,8 @@ async fn refresh_sets_then_clears_promotable(pool: PgPool) {
     );
     assert_eq!(j1["refreshed"], true);
     assert_eq!(j1["promotable"], true);
+    // Backlog 74eedb3a: the verdict rests on caller-reported outcomes.
+    assert_eq!(j1["promotion_basis"], "self_reported", "{j1}");
     assert_eq!(
         ClaimRepository::promotion_flag(&pool, &viewer, ClaimId::from_uuid(variant))
             .await

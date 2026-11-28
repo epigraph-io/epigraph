@@ -1,7 +1,9 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod auth;
-pub mod background;
+/// The detached-task tracker, moved to the service crate with `Ctx` (backlog
+/// 30133ca8); re-exported so `epigraph_mcp::background` keeps its paths.
+pub use epigraph_service::background;
 pub mod claim_helper;
 pub mod elevated_access;
 pub mod embed;

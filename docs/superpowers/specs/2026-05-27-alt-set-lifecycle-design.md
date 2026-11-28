@@ -1,7 +1,8 @@
 # Alt-Set Lifecycle Labels (Dev-Pathway Spec A.1 + A.3)
 
 **Date:** 2026-05-27
-**Status:** Design — awaiting review
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). Migration 043 (`alt_set_decisions`) and the `suggest_alternative_sets` flags.
+**Original status:** Design — awaiting review
 **Author:** Jeremy Barton (with Claude)
 **Depends on:** PR #187 (`alternative_of` + max-Pl + `suggest_alternative_sets`)
 

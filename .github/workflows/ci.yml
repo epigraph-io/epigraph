@@ -50,8 +50,9 @@ jobs:
   # in `workspace-rest`, which is selected by exclusion.
   #
   # `test` (below) is the single required check. It fails unless every shard
-  # and every feature-gated check the plan asked for succeeded, so branch
-  # protection keeps one stable name however the shards are re-cut.
+  # and every feature-gated check the plan asked for succeeded, and the commit
+  # message lint passed, so branch protection keeps one stable name however
+  # the shards are re-cut.
   #
   # ON A PULL REQUEST ONLY THE AFFECTED SHARDS RUN. The org's GitHub-hosted
   # runners are capped at 20 concurrent jobs for every PR together, and the
@@ -291,6 +292,30 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # HEAD^1 for the migration-number check below: on a pull request
+          # HEAD is the test merge commit and HEAD^1 the target branch's
+          # current tip; on a push, the commit before it. Depth 2 fetches both.
+          fetch-depth: 2
+      - name: Self-test the migration-number check
+        # Throwaway git repositories: below-head, duplicate and unversioned
+        # names fail, head+1 and reserved-block numbers pass. Proves the next
+        # step can still go red.
+        run: scripts/ci/test_check_migration_numbers.sh
+      - name: New migrations are numbered above the head and unique
+        # Every migrations/*.sql the change adds must be numbered above the
+        # highest number on the target branch and share it with no other file
+        # (migrations/README.md, "Reserved blocks", lists the only
+        # exceptions). Against the target's CURRENT tip, not the branch point,
+        # so a number another change has taken since also fails here.
+        run: scripts/ci/check_migration_numbers.sh HEAD^1
+      - name: Self-test the e2e DSN guard
+        # scripts/e2e/dsn-guard.sh keeps the hand-run e2e harness off the
+        # production cluster (it refuses a DSN with no host, no port, or port
+        # 5432) and hands every psql call the DSN's own host and port. Nothing
+        # else runs its parsers, so a regression to a hard-coded loopback host
+        # would go unseen. Synthetic DSNs only: no database, no network.
+        run: scripts/e2e/test-dsn-guard.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
@@ -547,10 +572,15 @@ jobs:
   # feature-gated check) must be `skipped`, and passes; a job the plan asked
   # for must be `success`; nothing passes unless `plan` succeeded. The rule is
   # test-shard.py `gate`, unit-tested in `plan`.
+  #
+  # commit-message-lint is in `needs` too (backlog ad3001f9), so an
+  # error-class finding in a commit message (E1-E6) blocks the merge through
+  # this required check; its warnings (W2, W3) still do not. It runs on every
+  # event and the plan has no run flag for it, so the gate requires `success`.
   test:
     name: test
     if: ${{ !cancelled() }}
-    needs: [plan, test-shard, test-extra, lint-features]
+    needs: [plan, test-shard, test-extra, lint-features, commit-message-lint]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -831,7 +861,8 @@ jobs:
         # target without running it. Warnings are not denied, as above.
         run: cargo test -p epigraph-cli --no-default-features --lib --no-run --locked
 
-  # services/kanban is standard-library-only Python with its own end-to-end
+  # tools/kanban (a developer tool for the backlog, not part of the shipped
+  # product) is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
   # patched). Without this job that suite ran only at author time. Nothing in it
   # reaches GitHub, the EpiGraph API or a real `claude`, so it needs no secrets,
@@ -848,7 +879,7 @@ jobs:
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: services/kanban
+        working-directory: tools/kanban
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Python version

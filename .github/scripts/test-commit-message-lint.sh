@@ -7,7 +7,8 @@
 #                 IPv4, E4 an unrun Verification without `Unverified:`, E5 an
 #                 unrun change to a SECURITY DEFINER function, E6 a private
 #                 deny-list term each exit 1 and name their class;
-#   2. warnings — W2, W3 are reported and exit 0;
+#   2. warnings — W2, W3 are reported and exit 0; a `style` commit (formatting
+#                 only) passes with a one-line body and no sections;
 #   3. allowed  — trailers, example.com, /home/user/, documentation, private
 #                 and loopback addresses, and a clean protocol message pass
 #                 with no finding at all;
@@ -128,6 +129,12 @@ check_range "ok definer change with a recorded run" 0 "$b3" -
 # --- warnings (exit 0) -------------------------------------------------------
 check "W2 bad subject"           0 "did some stuff$good_body" W2 -
 check "W3 no sections"           0 "fix(x): plain message" W3 -
+check "W2 style-like type"       0 "styles(x): t$good_body" W2 -
+
+# --- the style type: formatting only, a one-line body, no sections ------------
+check "ok style with a scope and a one-line body" 0 "style(api): rustfmt"$'\n\nRun cargo fmt over the crate.' - -
+check "ok style without a scope" 0 "style: fmt" - -
+check "E4 still applies to style" 1 "style(x): fmt"$'\n\n**Verification:**\n- Not run' E4 -
 
 # --- allowed -----------------------------------------------------------------
 check "ok trailer e-mail"        0 "feat(x): t$good_body"$'\n\nCo-Authored-By: A Person <'"$bad_email"'>' - "$bad_email"

@@ -15,15 +15,48 @@
 //! Truth values are **derived from evidence**, not from agent reputation.
 //! A high-reputation agent making an unsupported claim gets low truth value.
 //! This prevents the "Appeal to Authority" fallacy.
+//!
+//! # Atom-level belief (rolling out)
+//!
+//! An atom's belief as the fold of its own evidence, and a compound's belief
+//! as a query over its visible leaves, are being rolled out in stages. Until
+//! the rollout completes, a large part of this crate is `pub` but reached
+//! from no request path. Today these are reached ONLY from the CLI
+//! maintenance bins (`recompute_betp`, `backfill_factors` and the other wave
+//! bins) and from MCP `get_belief`'s `shadow` view, which is the one served
+//! consumer and only adds a view beside the served values:
+//!
+//! - [`atom_items`]: the atom evidence fold (AEF);
+//! - [`compound_belief`]: a compound's belief derived from its leaves;
+//! - [`belief_view`]'s `progressive` and `strict` modes, which this build
+//!   does not wire: both serve `legacy`
+//!   ([`belief_view::CompoundBeliefMode::serving`]);
+//! - the parameter groups of [`belief_profile`] marked "(not yet consumed)";
+//! - [`edge_factor::recompute_atom_cache`], the single atom-cache writer,
+//!   whose non-test callers are the CLI bins.
+//!
+//! [`belief_modes`] is the authoritative per-flag table of what this build
+//! acts on (`EPIGRAPH_ATOM_FOLD`, `EPIGRAPH_COMPOUND_BELIEF` and the rest);
+//! a flag's reported mode is configuration, not behaviour, wherever that
+//! table says the flag is not acted on. Read it there rather than here.
+//!
+//! **Exit criterion.** The legacy per-site folds (and the `LegacyFold` arms
+//! of the atom-cache writer) are deleted once the `strict` mode has been
+//! SERVED on every process for N days with no rollback, N = 30 unless the
+//! operator sets another value at the `strict` flip. Served means the mode
+//! [`belief_view::CompoundBeliefMode::current`] resolves, under a build that
+//! wires `strict`; setting `EPIGRAPH_COMPOUND_BELIEF=strict` on this build
+//! does not count, because it still serves `legacy`. That deletes fold CODE
+//! only: stored BBA rows are kept as rollback and attribution input.
+//! The remaining rollout steps and this criterion are tracked in the backlog
+//! (85c03e90).
 
 pub mod admin_cascade;
-pub mod agent_assessment;
 pub mod atlas_flow;
 pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
 pub mod bba_retract;
-pub mod belief_gate;
 pub mod belief_modes;
 pub mod belief_profile;
 pub mod belief_query;
@@ -36,13 +69,13 @@ pub mod classifier;
 pub mod compound_belief;
 pub mod compound_write_guard;
 pub mod confidence;
+pub mod contradiction_guard;
 pub mod cospan;
 pub mod counterfactual;
 pub mod dag;
 pub mod derivation_scope;
 pub mod diverse_retrieval;
 pub mod diverse_select;
-pub mod domain_decay;
 pub mod ds_divergence;
 pub mod edge_factor;
 pub mod epistemic_interval;
@@ -64,7 +97,6 @@ pub mod rerank;
 pub mod retention;
 pub mod retraction_cascade;
 pub mod scoped_belief;
-pub mod service;
 pub mod sheaf;
 pub mod silence_alarm;
 pub mod source_dependence;
@@ -72,7 +104,6 @@ pub mod supersede_delta;
 pub mod theme_cluster;
 pub mod triple_extractor;
 pub mod uncertainty;
-pub mod unified_bp;
 pub mod visibility_act;
 pub mod voi;
 pub mod workflow_promotion;
@@ -106,8 +137,8 @@ pub use interval_bp::{
 };
 pub use promotion::{evaluate_promotion, PromotionFailure, PromotionInput, PromotionResult};
 pub use propagation::{
-    ClaimDependency, ConcurrentOrchestrator, DatabasePropagator, PropagationAuditRecord,
-    PropagationConfig, PropagationOrchestrator, PropagationResult,
+    ClaimDependency, DatabasePropagator, PropagationAuditRecord, PropagationConfig,
+    PropagationOrchestrator, PropagationResult,
 };
 pub use reasoning::{
     Contradiction, IndirectChallenge, ReasoningClaim, ReasoningEdge, ReasoningEngine,
@@ -124,10 +155,6 @@ pub use rerank::{
     merge_rerank_scores, parse_groundedness_response, parse_rerank_response, Groundedness,
     GroundednessGate, HttpRerankClient, MockRerankClient, RerankCandidate, RerankClient,
     RerankError, RerankProviderConfig, RerankScore, RerankedHit,
-};
-pub use service::{
-    ClaimProcessingResult, EpistemicService, EpistemicServiceBuilder, EpistemicServiceConfig,
-    ReputationResult, ValidationResult,
 };
 pub use sheaf::{
     compute_cohomology, compute_edge_inconsistency, compute_expected_betp, compute_section,

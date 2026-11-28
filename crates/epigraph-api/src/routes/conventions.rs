@@ -355,6 +355,31 @@ pub async fn learn_convention(
 /// Forget a convention — adds strong counter-evidence to drive truth toward 0.
 ///
 /// `DELETE /api/v1/conventions/:id`
+///
+/// # Writers only, on a private convention (backlog 5b98b7ce)
+///
+/// Only a writer of a private convention's owner group may forget it; a
+/// reader who cannot write it is refused and nothing is written. A PRIVATE
+/// convention is one whose visibility is not `public`. A public convention is
+/// not judged by this check, and its writes are unchanged: the evidence on
+/// the caller's stamped transaction, the truth update on the raw pool after
+/// it. On a private one the truth update joins the transaction, so the forget
+/// is one write.
+///
+/// The claim and its tenancy are read on the caller's stamped transaction,
+/// through the caller's viewer, and the writer check runs before ANY write:
+/// no evidence row, no `refutes` edge, no truth change and no principal agent
+/// row for a refused caller. There is no admin override: `claims:admin` is the
+/// route's scope, held by every caller that reaches the check.
+/// `tests/forget_convention_writer_only.rs` pins the pair (a reader refused,
+/// the same principal admitted on a group it writes).
+///
+/// # Errors
+///
+/// - 401 Unauthorized: no authentication
+/// - 403 Forbidden: no `claims:admin` scope, or the convention is private and
+///   the caller does not write its owner group
+/// - 404 Not Found: no convention with this id that the caller may read
 pub async fn forget_convention(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -371,12 +396,40 @@ pub async fn forget_convention(
     let pool = &state.db_pool;
     let claim_id_typed = epigraph_core::ClaimId::from_uuid(claim_id);
 
-    let claim = epigraph_db::ClaimRepository::get_by_id(pool, &viewer, claim_id_typed)
+    // ONE transaction stamped with the CALLER's viewer carries the read, the
+    // writer check and the evidence write. The read is on it, not on the raw
+    // pool: an unstamped application session sees no private row, so a raw
+    // read 404'd every private convention, its writers' included.
+    let mut tx = state.write_as(&viewer, "forget_convention").await?;
+    let claim = epigraph_db::ClaimRepository::get_by_id(&mut *tx, &viewer, claim_id_typed)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "convention".to_string(),
             id: claim_id.to_string(),
         })?;
+
+    // Writers only, on a private convention (backlog 5b98b7ce), decided
+    // before any write: a refusal drops the transaction, so nothing is
+    // written. The caller can read the claim (the read above found it), so a
+    // 403 discloses nothing a 404 would hide.
+    let tenancy =
+        epigraph_db::ClaimRepository::tenancy_of_conn(&mut tx, &viewer, &[claim_id]).await?;
+    // Fails closed: the read above found the claim through the same viewer,
+    // so an empty answer here is not a case to admit.
+    let Some((_, visibility, owner)) = tenancy.first() else {
+        return Err(ApiError::NotFound {
+            entity: "convention".to_string(),
+            id: claim_id.to_string(),
+        });
+    };
+    let private = visibility != "public";
+    if private && !viewer.writable_groups().contains(owner) {
+        return Err(ApiError::Forbidden {
+            reason: "only a writer of a private convention's owner group may forget it; \
+                     a reader who cannot write it is refused and nothing is written"
+                .into(),
+        });
+    }
 
     // Derive a deterministic public key from the calling principal so that
     // refutation evidence is attributed to the caller, not a zero-byte system agent.
@@ -387,9 +440,13 @@ pub async fn forget_convention(
     pub_key[..16].copy_from_slice(principal_bytes);
     pub_key[16..].copy_from_slice(principal_bytes);
 
-    // Get-or-create an agent row for this principal.
+    // Get-or-create an agent row for this principal, on the transaction the
+    // read and the check opened (agents are untenanted): a second pool
+    // checkout while that transaction is held would let a burst of concurrent
+    // forgets starve the pool, and a forget refused or failed later now
+    // leaves no principal agent row behind.
     let principal_agent = if let Some(a) =
-        epigraph_db::AgentRepository::get_by_public_key(pool, &pub_key)
+        epigraph_db::AgentRepository::get_by_public_key(&mut *tx, &pub_key)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: e.to_string(),
@@ -397,7 +454,7 @@ pub async fn forget_convention(
         a
     } else {
         let agent = epigraph_core::Agent::new(pub_key, Some(format!("principal:{principal_id}")));
-        epigraph_db::AgentRepository::create(pool, &agent)
+        epigraph_db::AgentRepository::create_conn(&mut tx, &agent)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: e.to_string(),
@@ -423,16 +480,15 @@ pub async fn forget_convention(
     // 120, D8): the caller writes the edge, so between two public endpoints it
     // owns it, as the separate best-effort edge write this replaces did. The
     // evidence row is the caller's write too (migration 114's attach rule on a
-    // public claim it does not own). Every other statement of this handler
-    // autocommits on the raw pool, so this splits no transaction.
-    let mut tx = state.write_as(&viewer, "forget_convention").await?;
+    // public claim it does not own). The transaction was opened above for the
+    // read and the writer check, and carries the principal agent
+    // get-or-create since then.
     epigraph_db::EvidenceRepository::create(
         &mut *tx,
         &evidence,
         epigraph_db::EvidenceEdge::refutes(state.edge_signing_key()),
     )
     .await?;
-    tx.commit().await?;
 
     // Drive truth to near-zero via Bayesian refutation
     // TODO: migrate to CDST pignistic probability (BayesianUpdater is deprecated)
@@ -442,17 +498,32 @@ pub async fn forget_convention(
         .update_with_refutation(claim.truth_value, 1.0)
         .unwrap_or(epigraph_core::TruthValue::clamped(0.05));
 
-    epigraph_db::ClaimRepository::update_truth_value(pool, claim_id_typed, new_truth).await?;
-
-    // Read labels
+    // Read labels, on the transaction: the caller read the claim through its
+    // viewer above, and an unstamped application session sees no private row.
     let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
         .bind(claim_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })?
         .unwrap_or_default();
+
+    // The truth update. On a PRIVATE convention it is the checked writer's
+    // write, on the same transaction, so the forget is one write (backlog
+    // 5b98b7ce): on the raw pool after the commit, an application-role
+    // deployment's unstamped session sees no private row, and a writer's
+    // forget committed its evidence and then answered 404. On a PUBLIC
+    // convention it stays where it was, on the raw pool after the commit, so
+    // this change leaves the public path exactly as it behaved.
+    if private {
+        epigraph_db::ClaimRepository::update_truth_value(&mut *tx, claim_id_typed, new_truth)
+            .await?;
+        tx.commit().await?;
+    } else {
+        tx.commit().await?;
+        epigraph_db::ClaimRepository::update_truth_value(pool, claim_id_typed, new_truth).await?;
+    }
 
     Ok(Json(ConventionResponse {
         claim_id,

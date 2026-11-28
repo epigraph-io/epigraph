@@ -35,6 +35,7 @@ pub mod challenge;
 pub mod claim;
 pub mod claim_context;
 pub mod claim_encryption;
+pub mod claim_history;
 pub mod claim_id_prefix;
 pub mod claim_ingest;
 pub mod claim_role;
@@ -174,14 +175,15 @@ pub use authored_by::{
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    carries_dedup_identity_key, reserved_edge_property_refusal, AdminClaimAction, AdminClaimWrite,
-    AdminToken, BeliefBoundedClaimHit, BeliefSort, BetaTrackInput, ClaimBeliefColumns,
-    ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance,
-    ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode,
-    ConsolidateResult, CreatedWindow, DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance,
-    EdgeTenancy, EmbeddingSeedScope, EvolveStepResult, FlatPage, FlatRanking, FrameClaimBeliefHit,
-    GraphExpansionHit, GroundedNeighbor, HybridCandidates, HybridHit, HybridPage, LabelFamilyRow,
-    LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow, MarkedDuplicates, MovedBba,
+    carries_dedup_identity_key, is_telemetry_shaped, reserved_edge_property_refusal,
+    AdminClaimAction, AdminClaimWrite, AdminToken, BeliefBoundedClaimHit, BeliefSort,
+    BetaTrackInput, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimListFilter,
+    ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField, ClaimSortOrder,
+    ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult, CreatedWindow, DedupRepair,
+    DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
+    EvolveStepResult, FlatPage, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit,
+    GroundedNeighbor, HybridCandidates, HybridHit, HybridPage, LabelFamilyRow, LabelQuery,
+    LevelAndSourceType, LineageHead, MarkedDuplicateRow, MarkedDuplicates, MovedBba,
     NearestClaimHit, PatchClaimDiff, PatchClaimInput, PromotionStanding, SemanticFlatPage,
     SemanticSelectedClaim, SortDirection, SupersedeActor, SupersedeEdgeMigration, SupersedeTool,
     SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
@@ -192,6 +194,9 @@ pub use claim::{
 pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
     ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
+};
+pub use claim_history::{
+    PredecessorHit, RetiredLexicalHit, MAX_HISTORY_ROWS, MAX_PREDECESSOR_DEPTH,
 };
 pub use claim_id_prefix::{
     id_prefix_bounds, ClaimIdPrefixMatch, ClaimIdPrefixRepository, ID_PREFIX_CONTENT_CHARS,
@@ -281,7 +286,7 @@ pub use provenance_chain::{
     PROVENANCE_INCOMING, PROVENANCE_OUTGOING,
 };
 pub use recall_event::{
-    NewRecallEvent, RecallEventRepository, RecallEventRow, DEFAULT_RETENTION_DAYS,
+    NewRecallEvent, OwnRecallFilter, RecallEventRepository, RecallEventRow, DEFAULT_RETENTION_DAYS,
     PRUNABLE_EVENT_TYPES,
 };
 pub use scoped_belief::{CommunityFoldsCleared, ScopedBeliefRepository};

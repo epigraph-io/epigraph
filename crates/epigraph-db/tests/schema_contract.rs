@@ -94,6 +94,10 @@ const CLAIM_ENCRYPTION: ColumnContract = &[
     ("encrypted_properties", "bytea", "YES"),
     ("epoch", "integer", "NO"),
     ("group_id", "uuid", "NO"),
+    // Migration 357: the pre-seal signature stash (backlog aa366aa6).
+    ("pre_seal_signature", "bytea", "YES"),
+    ("pre_seal_signer_id", "uuid", "YES"),
+    ("pre_seal_stashed", "boolean", "NO"),
     ("privacy_tier", "character varying", "NO"),
 ];
 
@@ -117,6 +121,10 @@ const EVIDENCE_ENCRYPTION: ColumnContract = &[
     ("epoch", "integer", "NO"),
     ("evidence_id", "uuid", "NO"),
     ("group_id", "uuid", "NO"),
+    // Migration 357: the pre-seal signature stash (backlog aa366aa6).
+    ("pre_seal_signature", "bytea", "YES"),
+    ("pre_seal_signer_id", "uuid", "YES"),
+    ("pre_seal_stashed", "boolean", "NO"),
     ("privacy_tier", "character varying", "NO"),
 ];
 
@@ -3579,7 +3587,9 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
 /// `epigraph_live_memberships` the twin's rows for the session principal only;
 /// the fragments follow the body, and the bind is pinned on the bound read.
 /// 256 re-states the writer scope (the derived arm admits only under READ
-/// COMMITTED); its fragment is pinned too.
+/// COMMITTED); its fragment is pinned too. 361 re-states it again (the direct
+/// arm admits only under READ COMMITTED); its fragments are pinned too, and so
+/// are those of 361's custodian answer (`epigraph_is_instance_admin`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
     for (signature, fragments) in [
@@ -3594,6 +3604,9 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
                 "d.role = 'writer'",
                 // 256: the derived arm admits only under READ COMMITTED.
                 "v_derived AND current_setting('transaction_isolation') = 'read committed'",
+                // 361: the direct arm admits only under READ COMMITTED.
+                "v_direct := public.epigraph_operator_writes_group(v_human, p_group)",
+                "v_direct AND current_setting('transaction_isolation') = 'read committed'",
             ][..],
         ),
         (
@@ -3625,6 +3638,19 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
                 "p_role = 'writer'",
                 "v_binding = 'client_allowlist'",
                 "v_human = v_owner",
+            ][..],
+        ),
+        (
+            "public.epigraph_is_instance_admin(uuid)",
+            &[
+                // 123's subject binding.
+                "(p_agent = public.epigraph_principal_id() OR public.epigraph_bypass())",
+                // 361: the custodian answer at the statement's clock, and on
+                // an unprivileged read-write transaction only under READ
+                // COMMITTED.
+                "'role:platform-custodian', clock_timestamp()",
+                "current_setting('transaction_isolation') = 'read committed'",
+                "current_setting('transaction_read_only') = 'on'",
             ][..],
         ),
     ] {

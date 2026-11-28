@@ -384,6 +384,8 @@ pub enum RefusalStatus {
     Forbidden,
     /// `409`
     Conflict,
+    /// `422`
+    UnprocessableEntity,
 }
 
 impl RefusalStatus {
@@ -395,6 +397,7 @@ impl RefusalStatus {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Conflict => StatusCode::CONFLICT,
+            Self::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
         }
     }
 }
@@ -1581,6 +1584,10 @@ mod tests {
             (RefusalStatus::Unauthorized, StatusCode::UNAUTHORIZED),
             (RefusalStatus::Forbidden, StatusCode::FORBIDDEN),
             (RefusalStatus::Conflict, StatusCode::CONFLICT),
+            (
+                RefusalStatus::UnprocessableEntity,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
         ] {
             assert_eq!(s.status_code(), want);
             assert!(want.is_client_error(), "a Refused is never a server fault");

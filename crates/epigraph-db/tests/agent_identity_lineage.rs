@@ -391,7 +391,8 @@ async fn the_app_role_cannot_register_even_with_a_forged_principal(pool: PgPool)
 /// it is a maintenance-owned definer pinned to a search_path. No other role can
 /// act as it, and the only privilege granted to it BY NAME, on any function or
 /// relation in `public`, is that EXECUTE plus, since migration 166, EXECUTE on
-/// `epigraph_role_agent_may_run` (a catalog sweep, not a hand list).
+/// `epigraph_role_agent_may_run` and, since migration 360, EXECUTE on
+/// `epigraph_role_owner_may_run` (a catalog sweep, not a hand list).
 ///
 /// NOLOGIN is pinned in the migration TEXT, not on the role: the role is
 /// cluster-wide and operations give it LOGIN on any cluster where the host
@@ -448,8 +449,12 @@ async fn the_attestor_role_holds_registration_and_nothing_else_it_could_abuse(po
             // run before it starts one. A read that answers one agent at a
             // time, never the roster.
             "epigraph_role_agent_may_run(uuid) EXECUTE".to_string(),
+            // Migration 360: the host asks, before firing a role's schedule,
+            // whether the identity is attached to the role and the role is
+            // held. One (role, agent) pair at a time, never the roster.
+            "epigraph_role_owner_may_run(uuid,uuid) EXECUTE".to_string(),
         ],
-        "the attestor holds exactly the registration and the role-agent question"
+        "the attestor holds exactly the registration and the two role questions"
     );
 
     let member_of: Vec<String> = sqlx::query_scalar(
@@ -506,6 +511,7 @@ async fn the_attestor_role_holds_registration_and_nothing_else_it_could_abuse(po
             true,
         ),
         ("public.epigraph_role_agent_may_run(uuid)", true, true),
+        ("public.epigraph_role_owner_may_run(uuid, uuid)", true, false),
         (
             "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",
             false,

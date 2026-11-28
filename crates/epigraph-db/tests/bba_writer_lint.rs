@@ -7,6 +7,7 @@
 //! and in `scripts/`.
 
 mod belief_lint;
+mod source_files;
 
 use belief_lint::{
     find_words, python_unit_at, python_view, rust_sources, rust_view, script_sources,
@@ -55,18 +56,19 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update_filed_on", 2, "SPEC §4.1 W1 and W4: the evidence BBA and the truth_value seed; PR-W1e puts the compound guard inside"),
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "wire_single_batch_entry", 1, "SPEC §4.1 W5: ingest atom BBA; PR-W3 keys it to the atom's evidence row"),
     // --- scripts ------------------------------------------------------------
-    ("scripts/backfill_intra_source_evidence_discount.py", "execute_backfill", 1, "SPEC §4.1 W13 script: rewrites source_strength; frozen, not edited"),
+    ("scripts/backfill_intra_source_evidence_discount.py", "execute_backfill", 1, "SPEC §4.1 W13 script: rewrites source_strength; write path frozen (af23a73d changed only its calibration-file choice and docstring)"),
     ("scripts/backfill_locality_tag.py", "<module>", 2, "rewrites the locality_tag metadata column only; masses untouched"),
-    ("scripts/backfill_source_strength.py", "execute_backfill", 2, "SPEC §4.1 W13 script: rewrites source_strength (alpha); frozen, not edited"),
+    ("scripts/backfill_source_strength.py", "execute_backfill", 2, "SPEC §4.1 W13 script: rewrites source_strength (alpha); write path frozen (af23a73d changed only its calibration-file choice and docstring)"),
     ("scripts/e2e/probe-batch-h.sh", "<file>", 1, "end-to-end probe seeding one BBA in its own throwaway database"),
-    ("scripts/link_mass_function_evidence.py", "<module>", 1, "SPEC §4.1 W13 script: rewrites evidence_id, so item keys; frozen, not edited"),
-    ("scripts/migrate_mixed_bbas.py", "main", 1, "SPEC §4.1 W13 script: splits mixed BBAs; frozen, not edited"),
-    ("scripts/migrate_provenance_bba.py", "migrate", 1, "SPEC §4.1 W13 script: inserts truth_value seed BBAs; frozen, not edited"),
+    ("scripts/link_mass_function_evidence.py", "<module>", 3, "SPEC §4.1 W13 script: rewrites evidence_id only (masses untouched): the exact evidence-slot link, the single-candidate link, and the undo's revert to NULL of the links one run recorded"),
+    ("scripts/migrate_provenance_bba.py", "migrate", 1, "SPEC §4.1 W13 script: inserts truth_value seed BBAs; write path frozen (af23a73d changed only its docstring)"),
     ("scripts/migrate_provenance_bba.py", "rollback", 1, "SPEC §4.1 W13 script: deletes the seed BBAs it inserted"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "<module>", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "main", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
     ("scripts/tests/test_migrate_provenance_bba.py", "execute", 2, "two test doubles (seed and rollback) that match the statement text of migrate_provenance_bba.py; write nothing"),
     ("scripts/tests/test_migrate_provenance_bba.py", "test_the_delete_skips_retracted_rows_and_reports_them", 1, "selects the rollback's recorded DELETE text from a test double to assert its retracted_at predicate; writes nothing"),
+    ("scripts/tests/test_link_mass_function_evidence_db.py", "_bba", 1, "the evidence-link DB arm's fixture: one unlinked BBA (optionally on an evidence slot), in the CI-provisioned _test database only"),
+    ("scripts/tests/test_link_mass_function_evidence_db.py", "test_undo_restores_nulls_and_skips_a_row_changed_since", 1, "the evidence-link DB arm re-points one fixture BBA's evidence_id after a run, so the undo must skip it; _test database only"),
     ("scripts/tests/test_migrate_provenance_bba_db.py", "_seed_bba", 1, "the K4b DB arm's fixture: one seed BBA exactly as migrate() writes it, in the CI-provisioned _test database only"),
 ];
 
@@ -164,13 +166,12 @@ fn measure(rust: &[Source], scripts: &[Source]) -> BTreeMap<(String, String), us
         let view = rust_view(&s.text);
         let units = RustUnits::new(&view.code);
         for at in writer_calls(&view.code, &units) {
-            *out.entry((s.path.clone(), units.unit_at(at).0))
-                .or_default() += 1;
+            *out.entry((s.key(), units.unit_at(at).0)).or_default() += 1;
         }
         for lit in &view.literals {
             let n = raw_writes(&sql_without_comments(&lit.text));
             if n > 0 {
-                *out.entry((s.path.clone(), units.unit_at(lit.start).0))
+                *out.entry((s.key(), units.unit_at(lit.start).0))
                     .or_default() += n;
             }
         }
@@ -358,7 +359,9 @@ fn the_spec_named_writers_are_measured() {
         "scripts/link_mass_function_evidence.py",
         "scripts/backfill_source_strength.py",
         "scripts/backfill_intra_source_evidence_discount.py",
-        "scripts/migrate_mixed_bbas.py",
+        // SPEC §4.1 W13 also names `scripts/migrate_mixed_bbas.py`. It ran
+        // once (commit 2d67ad99e records its --execute) and was deleted as a
+        // completed one-shot (backlog dbf5eda5), so it writes nothing now.
         // SPEC §4.1 W14 names `scripts/fuzzy_dedup_claims.py`. The script now
         // marks duplicates through the REST dedup act and writes no BBA
         // itself; the act's BBA moves are this file's
@@ -417,4 +420,20 @@ fn kv_store(store: &mut Vec<u8>) { store.clear(); }
         &script_sources(),
     ));
     assert!(!names(&f, path), "nothing here writes a BBA; got {f:#?}");
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: every site in the moved code keys under the
+/// registered path (`Source::key`), so no entry goes stale and no moved site
+/// reads as unregistered. Fails on a ratchet keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let (rust, scripts) = (rust_sources(), script_sources());
+    let split = belief_lint::with_claim_split(&rust);
+    assert!(split
+        .iter()
+        .any(|s| s.path.ends_with("/repos/claim/split_probe.rs")));
+    let measured = measure(&split, &scripts);
+    assert_eq!(measured, measure(&rust, &scripts));
+    assert!(findings(&measured).is_empty(), "{:#?}", findings(&measured));
 }

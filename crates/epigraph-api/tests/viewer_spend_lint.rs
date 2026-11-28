@@ -242,6 +242,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::get_by_id",
         ],
     ),
+    // stamped: `GET /agents/me` (backlog 076e94cc) reads only the principal's
+    // OWN agent row, the one the token acts as, on `read_as(viewer)`; the id
+    // comes from the viewer, never from the request, so there is no other
+    // agent's name to disclose.
+    ("agents.rs", "get_me", &["AgentRepository::get_by_id"]),
     // `create_agent` takes a viewer only for a find-hit's NAME: the stamped
     // disclosure (as `get_agent`) on `read_as(viewer)`. The create itself and
     // the optional login client are the pre-existing writes on the pool,
@@ -561,16 +566,23 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["ConflictDensityRepository::scan"],
     ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
-    // The refuting evidence and its signed `refutes` edge (backlog 2d60f619)
-    // are ONE write on a transaction stamped with the caller's viewer
-    // (`state.write_as(&viewer, ..)`, passed as `&mut *tx`): the evidence and
-    // edge triggers and WITH CHECK decide the write, as for create_edge.
+    // The read, its tenancy (through the viewer, for the writer-only rule on
+    // a private convention, backlog 5b98b7ce), the principal agent
+    // get-or-create, the refuting evidence with its signed `refutes` edge
+    // (backlog 2d60f619) and the labels read are ONE
+    // transaction stamped with the caller's viewer (`state.write_as(&viewer,
+    // ..)`, passed as `&mut *tx`): the evidence and edge triggers and WITH
+    // CHECK decide the write. The truth update joins it on a private
+    // convention, and stays on the raw pool after the commit on a public one.
     (
         "conventions.rs",
         "forget_convention",
         &[
-            "AgentRepository::create",
+            "AgentRepository::create_conn",
             "AgentRepository::get_by_public_key",
+            // Twice: on the stamped transaction (private), on the raw pool
+            // after the commit (public).
+            "ClaimRepository::update_truth_value",
             "ClaimRepository::update_truth_value",
             "EvidenceRepository::create",
             "sqlx::query_scalar(SELECT).fetch_optional",
@@ -754,6 +766,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_symmetric_if_absent_row_signed_conn",
             "EdgeRepository::owned_by_session",
             "EventRepository::publish_or_log_conn",
+            // backlog b4c2fc2f: the compound-target decomposition test for a
+            // `contradicts` / `refutes` edge, read on the caller-stamped
+            // transaction before any write, over a target the handler has
+            // already read through the viewer.
+            "decide",
             "entity_exists",
             "entity_exists",
             "is_valid_entity_type",
@@ -954,11 +971,26 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "method_gap_analysis",
         &["MethodRepository::get_methods_for_capability"],
     ),
-    // write: the stored analysis is computed from viewer-filtered claims.
+    // write: the stored analysis is computed from viewer-filtered claims and
+    // holds their ids and scores, never their text (backlog e21530f3).
     (
         "gaps.rs",
         "gap_analysis",
         &["GapRepository::store_gap_analysis"],
+    ),
+    // stamped: ONE caller-stamped write transaction (backlog 07ef644c). The
+    // analysis is read by id from untenanted `gap_analyses`, which stores claim
+    // ids only; each id is resolved with the viewer (`admission_of`) before a
+    // challenge names it, so an unreadable claim is skipped. The challenge and
+    // its event are then written on that transaction, as `submit_challenge`'s.
+    (
+        "gaps.rs",
+        "surface_gaps",
+        &[
+            "ChallengeRepository::create",
+            "EventRepository::publish_or_log_conn",
+            "GapRepository::get_gap_analysis",
+        ],
     ),
     // stamped: cluster-run metadata (untenanted; the latest run now comes from
     // `ClusterRunRepository::latest`, the lookup `/claims/:id/placement` shares)

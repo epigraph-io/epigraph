@@ -7,7 +7,6 @@
 //!
 //! 1. `TruthValue::new()` either succeeds with value in [0.0, 1.0] or returns Err
 //! 2. `TruthValue::clamped()` always produces a valid value in [0.0, 1.0]
-//! 3. Content hashing is deterministic: same content -> same hash
 
 use epigraph_core::TruthValue;
 use proptest::prelude::*;
@@ -162,68 +161,6 @@ proptest! {
             (double_comp.value() - value).abs() < 1e-10,
             "Double complement of {} should return {}, got {}",
             value, value, double_comp.value()
-        );
-    }
-}
-
-// =============================================================================
-// CONTENT HASH DETERMINISM
-// =============================================================================
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
-
-    /// Content hashing is deterministic: same Claim content produces the same hash.
-    /// This is critical for content-addressable storage integrity.
-    #[test]
-    fn claim_content_hash_deterministic(
-        content in "[a-zA-Z0-9 ]{1,100}",
-        truth_val in 0.0..=1.0_f64,
-    ) {
-        use epigraph_core::{AgentId, Claim, ClaimId, TraceId, TruthValue};
-        use epigraph_core::ContentAddressable;
-        use chrono::Utc;
-
-        let id = ClaimId::new();
-        let agent_id = AgentId::new();
-        let trace_id = TraceId::new();
-        let truth = TruthValue::new(truth_val).unwrap();
-        let now = Utc::now();
-        let public_key = [0u8; 32];
-        let content_hash = [0u8; 32];
-
-        let claim1 = Claim::with_id(
-            id,
-            content.clone(),
-            agent_id,
-            public_key,
-            content_hash,
-            Some(trace_id),
-            None,
-            truth,
-            now,
-            now,
-        );
-
-        let claim2 = Claim::with_id(
-            id,
-            content,
-            agent_id,
-            public_key,
-            content_hash,
-            Some(trace_id),
-            None,
-            truth,
-            now,
-            now,
-        );
-
-        let hash1 = claim1.compute_hash().expect("hash computation should succeed");
-        let hash2 = claim2.compute_hash().expect("hash computation should succeed");
-
-        prop_assert_eq!(
-            hash1, hash2,
-            "Same claim content must produce the same content hash"
         );
     }
 }

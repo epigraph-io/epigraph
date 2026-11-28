@@ -5,3 +5,4 @@ pub mod atlas;
 pub mod core;
 pub mod entities;
 pub mod graph;
+pub mod recalls;

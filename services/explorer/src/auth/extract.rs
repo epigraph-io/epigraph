@@ -129,6 +129,11 @@ impl PageCtx {
         self.links.login(Some(&self.current_path))
     }
 
+    /// The signed-in caller's own recall history.
+    pub fn recalls_url(&self) -> String {
+        self.links.recalls()
+    }
+
     /// Action of the sign-out `<form method="post">`.
     pub fn logout_url(&self) -> String {
         self.links.logout()

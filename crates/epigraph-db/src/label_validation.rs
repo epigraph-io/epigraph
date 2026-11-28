@@ -46,8 +46,23 @@
 //! Removal is the remediation path for the rows already carrying
 //! `group:$EPICLAW_GROUP_ID`; rejecting a bad value in `remove` would make the
 //! corruption permanently unfixable through the API.
+//!
+//! # Size bounds
+//!
+//! [`check_label_bounds`] caps how many labels one write may set
+//! ([`MAX_LABELS_PER_CLAIM`]) and how long each may be ([`MAX_LABEL_CHARS`],
+//! counted in characters), and refuses an empty label. Before it, a caller of
+//! `POST /api/v1/submit/packet` could set an unbounded number of arbitrarily
+//! long labels on a claim (backlog 854165dd). The constants live here, once,
+//! so every label writer refuses the same sizes.
 
 use crate::errors::DbError;
+
+/// The most labels one write may set on a claim.
+pub const MAX_LABELS_PER_CLAIM: usize = 64;
+
+/// The longest label, in characters (not bytes), a write may set.
+pub const MAX_LABEL_CHARS: usize = 256;
 
 /// The character whose presence in a label indicates an unexpanded expansion.
 const SHELL_SIGIL: char = '$';
@@ -76,9 +91,61 @@ pub fn reject_unexpanded_labels(labels: &[String]) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Refuse a label set larger than [`MAX_LABELS_PER_CLAIM`], or any label
+/// that is empty or longer than [`MAX_LABEL_CHARS`] characters.
+///
+/// Like [`reject_unexpanded_labels`], for the labels a write **sets**, never
+/// for the ones it removes.
+///
+/// # Errors
+/// Returns [`DbError::InvalidData`] naming the bound that was exceeded.
+pub fn check_label_bounds(labels: &[String]) -> Result<(), DbError> {
+    if labels.len() > MAX_LABELS_PER_CLAIM {
+        return Err(DbError::InvalidData {
+            reason: format!(
+                "too many labels: {}, maximum is {MAX_LABELS_PER_CLAIM}",
+                labels.len()
+            ),
+        });
+    }
+    for (index, label) in labels.iter().enumerate() {
+        if label.is_empty() {
+            return Err(DbError::InvalidData {
+                reason: format!("label {index} is empty"),
+            });
+        }
+        let chars = label.chars().count();
+        if chars > MAX_LABEL_CHARS {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "label {index} is too long: {chars} characters, maximum is {MAX_LABEL_CHARS}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_bounds_accept_the_caps_exactly() {
+        let at_caps: Vec<String> = (0..MAX_LABELS_PER_CLAIM)
+            .map(|_| "é".repeat(MAX_LABEL_CHARS))
+            .collect();
+        assert!(check_label_bounds(&at_caps).is_ok());
+        assert!(check_label_bounds(&[]).is_ok());
+    }
+
+    #[test]
+    fn label_bounds_refuse_count_length_and_empty() {
+        let over_count: Vec<String> = (0..=MAX_LABELS_PER_CLAIM).map(|i| i.to_string()).collect();
+        assert!(check_label_bounds(&over_count).is_err());
+        assert!(check_label_bounds(&["x".repeat(MAX_LABEL_CHARS + 1)]).is_err());
+        assert!(check_label_bounds(&["ok".to_string(), String::new()]).is_err());
+    }
 
     /// The exact corruption from the backlog report must be refused.
     #[test]

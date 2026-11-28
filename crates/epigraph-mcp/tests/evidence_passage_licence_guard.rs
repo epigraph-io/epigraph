@@ -142,6 +142,7 @@ fn planned() -> PlannedClaim {
             r#"sections[0].paragraphs[2] ("Results (main)"), bytes 120..340"#.to_string(),
         ),
         enrichment: serde_json::json!({}),
+        id_scope: None,
     }
 }
 

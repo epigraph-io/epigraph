@@ -25,6 +25,29 @@ impl Source {
             text: text.to_string(),
         }
     }
+
+    /// The path a register keys this source under: its own path, or the
+    /// registered file of the split module whose directory holds it
+    /// (`crate::source_files::module_key`). Every ratchet keys its measured
+    /// sites with this, never with `path`, so moving a function into
+    /// `repos/claim/` keeps its register entry.
+    pub fn key(&self) -> String {
+        crate::source_files::module_key(&self.path)
+    }
+}
+
+/// `base` with `crates/epigraph-db/src/repos/claim.rs` split into a directory
+/// module at a top-level item boundary (`crate::source_files::split_module`),
+/// for the ratchets' "a split measures the same" self-tests.
+pub fn with_claim_split(base: &[Source]) -> Vec<Source> {
+    let files: Vec<(String, String)> = base
+        .iter()
+        .map(|s| (s.path.clone(), s.text.clone()))
+        .collect();
+    crate::source_files::split_module(&files, "crates/epigraph-db/src/repos/claim.rs")
+        .into_iter()
+        .map(|(path, text)| Source { path, text })
+        .collect()
 }
 
 /// The workspace root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`.
@@ -647,10 +670,25 @@ impl RustUnits {
 /// The enclosing `def` of the line holding `offset` in a Python code view, by
 /// indentation, or `<module>`.
 pub fn python_unit_at(code: &str, offset: usize) -> String {
+    python_unit_span(code, offset).0
+}
+
+/// [`python_unit_at`] with the unit's span in `code`: from its `def` line to
+/// the end of its body (the line before the next non-blank line indented no
+/// deeper than the `def`; a closing bracket of a continuation stays in the
+/// body). `<module>` has no span: a module-level statement is classified by
+/// nothing, so a module constant that names a role marker does not classify
+/// every statement of its file.
+pub fn python_unit_span(code: &str, offset: usize) -> (String, Option<(usize, usize)>) {
     let line_start = code[..offset].rfind('\n').map_or(0, |i| i + 1);
     let indent = |l: &str| l.len() - l.trim_start().len();
     let mut limit = indent(&code[line_start..]);
-    for line in code[..line_start].lines().rev() {
+    let mut at = line_start;
+    while at > 0 {
+        let prev_end = at - 1;
+        let prev_start = code[..prev_end].rfind('\n').map_or(0, |i| i + 1);
+        let line = &code[prev_start..prev_end];
+        at = prev_start;
         if line.trim().is_empty() {
             continue;
         }
@@ -670,14 +708,30 @@ pub fn python_unit_at(code: &str, offset: usize) -> String {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
-            return name;
+            let mut end = code.len();
+            let mut p = code[prev_end..]
+                .find('\n')
+                .map_or(code.len(), |e| prev_end + e + 1);
+            while p < code.len() {
+                let e = code[p..].find('\n').map_or(code.len(), |e| p + e);
+                let l = &code[p..e];
+                if !l.trim().is_empty()
+                    && indent(l) <= ind
+                    && !l.trim_start().starts_with([')', ']', '}'])
+                {
+                    end = p;
+                    break;
+                }
+                p = e + 1;
+            }
+            return (name, Some((prev_start, end)));
         }
         limit = ind;
         if ind == 0 {
             break;
         }
     }
-    "<module>".to_string()
+    ("<module>".to_string(), None)
 }
 
 // ---------------------------------------------------------------------------

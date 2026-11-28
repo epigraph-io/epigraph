@@ -53,7 +53,8 @@
 //!   register, and its own mint runs only after a stamped read proved the
 //!   agent has no row at all (`scripts/e2e/probe-unit-e.sh`'s REVOKED/READER
 //!   arms). The wrappers deliberately NOT expanded, each with its own pin:
-//!   - `EpiGraphMcpFull::agent_id` has a call site in nearly every tool; its
+//!   - `EpiGraphMcpFull::agent_id` (since backlog 30133ca8 a delegate of
+//!     `epigraph_service::Ctx::agent_id`) has a call site in nearly every tool; its
 //!     one `ensure_personal_group` call runs once per PROCESS
 //!     (`SessionFactory` shares the cell), pinned by `server.rs`'s
 //!     `session_factory_tests`. The outcome (no revival, no ingest) is pinned
@@ -94,6 +95,8 @@
 //!   the connection they run on is stamped. That axis is the arms that call the
 //!   function as `epigraph_app`
 //!   (`epigraph-db/tests/personal_group_no_revival.rs`) and the e2e harness.
+
+mod source_files;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -209,19 +212,21 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          or reader membership is refused, never revived (migration 105).",
     ),
     (
-        "epigraph-mcp/src/server.rs",
+        "epigraph-service/src/ctx.rs",
         "ensure_personal_group",
         1,
-        "`EpiGraphMcpFull::agent_id` (PR-09). Once per PROCESS since `SessionFactory` shares the \
-         cell (F1); a revoked row is refused and warned, the id still resolves \
+        "`Ctx::agent_id` (PR-09; moved verbatim from `EpiGraphMcpFull::agent_id`, which now \
+         delegates, backlog 30133ca8). Once per PROCESS since `SessionFactory` shares the \
+         context's cell (F1); a revoked row is refused and warned, the id still resolves \
          (`per_session_agent_resolution`).",
     ),
     (
-        "epigraph-mcp/src/claim_helper.rs",
+        "epigraph-service/src/ctx.rs",
         "resolve_write_decl",
         1,
-        "`resolve_claim_visibility`, every MCP claim write's visibility resolution, on a pool \
-         connection. Definer answer, as `create_claim_core`'s; the refusal maps through \
+        "`resolve_claim_visibility` (moved from the MCP crate's `claim_helper.rs`, backlog \
+         30133ca8), every MCP claim write's visibility resolution, on a pool connection. \
+         Definer answer, as `create_claim_core`'s; the MCP server maps the refusal through \
          `visibility_caller_error`.",
     ),
     (
@@ -622,13 +627,30 @@ fn rel(p: &Path) -> String {
 }
 
 fn measured_calls() -> BTreeMap<(String, String), usize> {
+    measured_calls_in(&src_texts())
+}
+
+/// `(path under crates/, text)` for every [`src_files`] entry.
+fn src_texts() -> Vec<(String, String)> {
+    src_files()
+        .iter()
+        .map(|p| (rel(p), std::fs::read_to_string(p).expect("read source")))
+        .collect()
+}
+
+/// [`measured_calls`] over given sources. A file inside a split module's
+/// directory keys as the module's registered file
+/// (`source_files::module_key`), and counts for one key are SUMMED across
+/// files, so a move never overwrites a site.
+fn measured_calls_in(files: &[(String, String)]) -> BTreeMap<(String, String), usize> {
     let mut out = BTreeMap::new();
-    for p in src_files() {
-        let text = strip_comments(&std::fs::read_to_string(&p).expect("read source"));
+    for (path, text) in files {
+        let text = strip_comments(text);
         for name in WATCHED {
             let n = count_calls(&text, name);
             if n > 0 {
-                out.insert((rel(&p), (*name).to_string()), n);
+                *out.entry((source_files::module_key(path), (*name).to_string()))
+                    .or_default() += n;
             }
         }
     }
@@ -989,4 +1011,18 @@ fn the_revival_matcher_sees_every_spelling() {
     assert!(n.contains("create or replace function epigraph_ensure_personal_group("));
     let q = normalise("CREATE FUNCTION \"public\" . \"epigraph_community_add_member\"(a uuid)");
     assert!(q.contains("create function public.epigraph_community_add_member("));
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: the calls in the moved code key under the
+/// registered path and are summed, never overwritten. Fails on a measurement
+/// keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let files = src_texts();
+    let split = source_files::split_module(&files, "epigraph-db/src/repos/claim.rs");
+    assert!(split
+        .iter()
+        .any(|(p, _)| p == "epigraph-db/src/repos/claim/split_probe.rs"));
+    assert_eq!(measured_calls_in(&split), measured_calls_in(&files));
 }

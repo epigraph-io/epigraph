@@ -407,26 +407,34 @@ impl MatchCandidateRepo {
         Ok(DecideOutcome::Decided)
     }
 
-    /// Retract a candidate's promotion: delete every matcher-created edge
-    /// between its claim pair together with the derived records that hang off
-    /// those edges, then flip the row to `stale`. One transaction.
+    /// Retract a candidate's promotion: retract (close `valid_to` on) every
+    /// matcher-created edge between its claim pair, delete the derived records
+    /// that hang off those edges, then flip the row to `stale`. One transaction.
+    /// The design note on how matcher edges link back to their candidate is
+    /// `docs/architecture/match-candidate-edge-provenance.md`.
     ///
     /// # Why this is not `set_status(id, "stale", by)`
     ///
     /// The `edges_auto_factor` AFTER INSERT trigger (migration
     /// `001_initial_schema.sql`, matcher-score strength added in `038`)
     /// derives a `factors` row from every claim→claim edge, keyed
-    /// `properties->>'source_edge_id'`, and there is **no** delete trigger. So
-    /// dropping the edge alone leaves the factor — and its `bp_messages` —
-    /// corroborating in the belief graph permanently. This mirrors the proven
-    /// cull order of migration `012_cull_low_similarity_corroborates`:
-    /// `bp_messages` → `factors` → `edges`, all keyed by `source_edge_id`.
+    /// `properties->>'source_edge_id'`, and no trigger fires when the edge is
+    /// retracted (or deleted). So closing the edge's `valid_to` alone leaves the
+    /// factor — and its `bp_messages` — corroborating in the belief graph
+    /// permanently. This follows the cull order of migration
+    /// `012_cull_low_similarity_corroborates` (`bp_messages` → `factors` →
+    /// edge, all keyed by `source_edge_id`), except that the edge is retracted
+    /// rather than deleted.
     ///
-    /// `mass_functions` keyed on the edge's slot (`slot_kind = 'edge'`) are deleted too.
-    /// The promote paths
-    /// (`epigraph-api/src/routes/cross_source.rs::decide_candidate`,
-    /// `epigraph-mcp/src/tools/matching.rs::decide_match_candidate`) call
-    /// `EdgeRepository::create_symmetric_if_absent` and never
+    /// `mass_functions` keyed on the edge's slot (`slot_kind = 'edge'`) are
+    /// deleted too (not retracted, so `unretract_bba` cannot revive them).
+    /// The edge writers
+    /// (`epigraph-api/src/routes/cross_source.rs::decide_candidate` and
+    /// `epigraph-mcp/src/tools/matching.rs::decide_match_candidate`, both
+    /// through `MatchCandidateRepo::promote_if_pending` / `promote_if_pending_conn`
+    /// and `EdgeRepository::create_symmetric_if_absent_signed_conn`, and the
+    /// matcher's auto-promote, `epigraph-engine/src/matching/policy.rs::write_edge`,
+    /// through `EdgeRepository::create_symmetric_if_absent`) never call
     /// `auto_wire_edge_if_epistemic`, so today that count is 0 — but
     /// `epigraph-engine/src/retraction_cascade.rs` documents why leaving one
     /// behind is unrecoverable: `auto_wire_edge_if_epistemic` short-circuits on
@@ -457,8 +465,8 @@ impl MatchCandidateRepo {
     /// Attribution of the retirement lives in `decided_by` / `decided_at`.
     ///
     /// Tolerates any starting status (the CLI does the same): a candidate that
-    /// is `pending`, `rejected` or already `stale` simply has no matcher edge
-    /// to delete, and the flip to `stale` is idempotent.
+    /// is `pending`, `rejected` or already `stale` simply has no in-force
+    /// matcher edge to retract, and the flip to `stale` is idempotent.
     ///
     /// # Migrations 117 and 118: an administrative act, on a privileged session
     ///

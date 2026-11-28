@@ -56,7 +56,9 @@
 //! beside them on `get_belief`. The `progressive` and `strict` modes, which
 //! change served values, are not wired in this build: either one serves
 //! `legacy`, and the process logs that once, so no setting can move a served
-//! value. `/health` reports the configured mode, not the served one.
+//! value. `/health` and `system_stats` report the configured mode under
+//! `belief_modes` and the served one under `belief_modes_served`
+//! ([`ServedBeliefModes`]).
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -373,6 +375,45 @@ impl CompoundBeliefMode {
         match self {
             Self::Legacy => "legacy",
             Self::Shadow => "shadow",
+        }
+    }
+}
+
+/// What this process SERVES for each belief mode whose served value can
+/// differ from its configured one, as `/health` and `system_stats` report it
+/// under `belief_modes_served` (backlog 820c15f1), beside the configured
+/// `belief_modes`.
+///
+/// - `compound_belief`: [`CompoundBeliefMode::serving`] the configured mode.
+/// - `atom_cache_mode` and `inference`: this build does not act on either
+///   flag ("no" in `belief_modes`' table), so whatever is configured, the
+///   atom cache holds what `display` describes and no inference layer runs.
+///   Both are constants: no accessor is read, which keeps the
+///   `belief_mode_readers` ratchet's "no" rows true. The change that wires
+///   either flag must report its served value here instead.
+///
+/// Every other flag this build acts on serves exactly its configured value,
+/// so it is not repeated here. The configured report keeps its contract: the
+/// cross-process skew check compares `belief_modes`, never this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ServedBeliefModes {
+    /// [`CompoundBeliefMode::current`]: `legacy` for a configured `legacy`,
+    /// `progressive` or `strict`, `shadow` for `shadow`.
+    pub compound_belief: CompoundBeliefMode,
+    /// Always `display`: `EPIGRAPH_ATOM_CACHE_MODE` is not acted on.
+    pub atom_cache_mode: crate::belief_modes::AtomCacheMode,
+    /// Always `off`: `EPIGRAPH_INFERENCE` is not acted on.
+    pub inference: crate::belief_modes::Inference,
+}
+
+impl ServedBeliefModes {
+    /// This process's served modes.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            compound_belief: CompoundBeliefMode::current(),
+            atom_cache_mode: crate::belief_modes::AtomCacheMode::Display,
+            inference: crate::belief_modes::Inference::Off,
         }
     }
 }

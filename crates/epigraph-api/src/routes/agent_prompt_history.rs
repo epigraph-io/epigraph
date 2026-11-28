@@ -85,6 +85,21 @@
 //! which fetches that one blob and no other, so neither the database nor the
 //! server builds more than one file's content per request.
 //!
+//! # What an agent's signature certifies
+//!
+//! A declared configuration, not a computation (backlog a8c6a943, provisional
+//! ruling d29f2f75). Where the agent signed a claim, the signature binds the
+//! claim to the agent's key, and `authored_by.prompt_snapshot` names the model
+//! and prompt hash that agent was running at the claim's `created_at`: the
+//! snapshot the host attestor recorded (migration 161), the one this route
+//! lists, joined to the claim at read time and not a signed field of it.
+//! Neither commits to which recalled claims fed the output. `recall_events`
+//! records retrieval separately (the query and the claim ids it returned, per
+//! agent); it is not signed, not linked to the claims the agent then filed,
+//! and pruned after its retention. A signed context manifest, a separate row
+//! linked to the claim, is the planned extension once `recall_events` tenancy
+//! is decided.
+//!
 //! # No registration route
 //!
 //! Registering an identity is the EpiClaw host's act, on a database role the
@@ -99,7 +114,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use epigraph_core::AgentId;
-use epigraph_db::agent_identity::PROMPT_HISTORY_REFUSED;
+use epigraph_db::refusal_codes::{route_code, PROMPT_HISTORY_REFUSED};
 use epigraph_db::{
     AgentIdentityRepository, AgentRepository, DbError, PromptBlob, PromptBlobRead,
     PromptHistoryCursor, PromptHistoryIndexEntry, PromptSnapshotIndex,
@@ -385,13 +400,7 @@ pub fn group_history(
 
 /// True when the definer refused the caller (neither operator nor admin).
 fn is_refused(e: &DbError) -> bool {
-    match e {
-        DbError::QueryFailed { source } => source
-            .as_database_error()
-            .and_then(|d| d.code())
-            .is_some_and(|c| c == PROMPT_HISTORY_REFUSED),
-        _ => false,
-    }
+    route_code(e) == Some(PROMPT_HISTORY_REFUSED)
 }
 
 fn not_found(id: Uuid) -> ApiError {

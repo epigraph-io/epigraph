@@ -1,4 +1,4 @@
-//! One-shot operator binary: recompute cached `claims.{belief, plausibility,
+//! Operator binary: recompute cached `claims.{belief, plausibility,
 //! pignistic_prob, conflict_k, missing_mass}` from current
 //! `mass_functions` state for a list of claim_ids.
 //!

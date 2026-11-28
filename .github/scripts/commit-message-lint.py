@@ -3,6 +3,7 @@
 
     .github/scripts/commit-message-lint.py <base> <head>
     .github/scripts/commit-message-lint.py --cited-shas <base> <head>
+    PR_TITLE=... PR_BODY=... .github/scripts/commit-message-lint.py --pr-text
 
 Reads the NON-MERGE commits in <base>..<head> (only <head> when <base> is empty
 or all zeros) and reports per commit. ERRORS fail the run (exit 1):
@@ -22,9 +23,19 @@ or all zeros) and reports per commit. ERRORS fail the run (exit 1):
      deny-list of customer names would publish them.
 WARNINGS never change the exit status: W2 a subject outside
 `<type>(<scope>)?: <text>`, W3 none of the Evidence/Reasoning/Verification
-sections. Offending values are NEVER printed (public CI logs): each finding is
+sections (not reported for a `style` commit: formatting only, whose body is
+one line; E4 and E5 still apply to it). Offending values are NEVER printed (public CI logs): each finding is
 redacted, and a subject that itself holds an error is withheld. Run from the
 repository root.
+
+`--pr-text` lints a pull request's title and body instead of commits, read
+from the PR_TITLE and PR_BODY environment variables (a workflow passes them
+through `env:`, never interpolated into a shell line): E1, E2, E3 and E6 as
+above, on every line (trailer-shaped lines included), exit 1 on any finding.
+The PR text is as public as a commit message, and it can be edited after the
+commits were checked (.github/workflows/pr-text-lint.yml runs on each edit).
+Each finding names only the rule, `title` or the body line number, and the
+redacted description; no line of the title or body is printed.
 
 `--cited-shas` runs ONLY W4 and always exits 0 (a workflow on every push to
 main runs it, .github/workflows/cited-sha-check.yml): W4 a token in a message
@@ -67,9 +78,13 @@ IPV4_RE = re.compile(r"(?<![0-9.])([0-9]{1,3}(?:\.[0-9]{1,3}){3})(?![0-9]|\.[0-9
 # RFC 5737 documentation blocks, allowed in messages.
 DOC_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
 # Subject shape of the Epistemic Commit Protocol.
-SUBJECT_RE = re.compile(r"^(feat|fix|refactor|perf|test|docs|chore|security)(\([^)\s][^)]*\))?: \S")
+SUBJECT_RE = re.compile(r"^(feat|fix|refactor|perf|test|docs|chore|security|style)(\([^)\s][^)]*\))?: \S")
 # Subjects exempt from W2.
-SUBJECT_EXEMPT = ("Merge ", "Revert ", "merge(", "style(")
+SUBJECT_EXEMPT = ("Merge ", "Revert ", "merge(")
+# Types whose body is one line and carries none of the three sections (no W3):
+# `style` is a formatting-only change (rustfmt, whitespace) with no claim to
+# give evidence for.
+NO_SECTION_TYPES = {"style"}
 # The three protocol sections, as they appear in a message body.
 SECTIONS = ("**Evidence:**", "**Reasoning:**", "**Verification:**")
 # Phrases that say a verification was not actually performed.
@@ -142,10 +157,11 @@ def deny_terms():
 DENY = deny_terms()
 
 
-def scan_deny(line):
-    """Return the redacted E6 findings of one line (any line, trailers included)."""
+def scan_deny(line, deny=None):
+    """Return the redacted E6 findings of one line (any line, trailers included).
+    <deny> is a list from deny_terms(); None means the list read at start-up."""
     return [("E6", f"deny-listed term (entry {i + 1} of the private list)")
-            for i, rx in enumerate(DENY) if rx.search(line)]
+            for i, rx in enumerate(DENY if deny is None else deny) if rx.search(line)]
 
 
 def verification_not_run(message):
@@ -235,11 +251,42 @@ def lint(subject, message):
     warnings = []
     if verification_not_run(message) and not UNVERIFIED_RE.search(message):
         errors.append(("E4", "Verification records something not run and the message has no Unverified: line"))
-    if not subject.startswith(SUBJECT_EXEMPT) and not SUBJECT_RE.match(subject):
+    subject_m = SUBJECT_RE.match(subject)
+    if not subject.startswith(SUBJECT_EXEMPT) and not subject_m:
         warnings.append(("W2", "subject does not match <type>(<scope>)?: <text>"))
-    if not any(s in message for s in SECTIONS):
+    sectionless = subject_m is not None and subject_m.group(1) in NO_SECTION_TYPES
+    if not sectionless and not any(s in message for s in SECTIONS):
         warnings.append(("W3", "none of the Evidence/Reasoning/Verification sections"))
     return errors, warnings
+
+
+def lint_pr_text(title, body, deny):
+    """`--pr-text`: the redacted E1, E2, E3 and E6 findings of a pull request's
+    title and body, as (where, class, description), where is `title` or
+    `body line <n>`. Every line is read, trailer-shaped ones included: a PR body
+    has no git attribution to protect, so an address there is a leak like any
+    other. CRLF (the web editor's line ending) splits like LF."""
+    found = []
+    parts = [("title", l) for l in re.split(r"\r\n|\r|\n", title or "")]
+    parts += [(f"body line {n}", l)
+              for n, l in enumerate(re.split(r"\r\n|\r|\n", body or ""), 1)]
+    for where, line in parts:
+        found += [(where, cls, text) for cls, text in scan_line(line) + scan_deny(line, deny)]
+    return found
+
+
+def main_pr_text(env):
+    """`--pr-text`: lint PR_TITLE and PR_BODY from <env>; exit 1 on any finding.
+    Neither the title nor any line of the body is ever printed."""
+    deny = deny_terms()
+    print(f"commit-message-lint --pr-text: private deny-list {'configured' if deny else 'not configured'}")
+    body = env.get("PR_BODY", "")
+    findings = lint_pr_text(env.get("PR_TITLE", ""), body, deny)
+    for where, cls, text in findings:
+        print(f"error {cls} {where}: {text}")
+    n_lines = len(re.split(r"\r\n|\r|\n", body)) if body else 0
+    print(f"commit-message-lint --pr-text: title and {n_lines} body line(s), {len(findings)} error(s)")
+    return 1 if findings else 0
 
 
 def cited_shas(message):
@@ -305,8 +352,10 @@ def main_cited(base, head):
 def main(argv):
     if len(argv) == 4 and argv[1] == "--cited-shas":
         return main_cited(argv[2], argv[3])
+    if len(argv) == 2 and argv[1] == "--pr-text":
+        return main_pr_text(os.environ)
     if len(argv) != 3:
-        print("usage: commit-message-lint.py [--cited-shas] <base> <head>", file=sys.stderr)
+        print("usage: commit-message-lint.py [--cited-shas] <base> <head> | --pr-text", file=sys.stderr)
         return 2
     n = n_err = n_warn = 0
     print(f"commit-message-lint: private deny-list {'configured' if DENY else 'not configured'}")

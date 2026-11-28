@@ -84,9 +84,10 @@
 //!   out of scope for this rule.
 
 mod belief_lint;
+mod source_files;
 
 use belief_lint::{
-    balanced_end, find_words, has_word, is_sql, is_write_sql, python_unit_at, python_view,
+    balanced_end, find_words, has_word, is_sql, is_write_sql, python_unit_span, python_view,
     rust_fns, rust_sources, rust_view, script_sources, sql_without_comments, with_scratch,
     RustUnits, Source, View,
 };
@@ -127,25 +128,12 @@ const ROW_TYPES: &[&str] = &[
 ];
 
 /// The plan PRs a reader may be tagged with (IMPL-PLAN rows that convert a
-/// reader), plus `unassigned` for a reader no plan row converts yet.
+/// reader). There is no `unassigned`: every reader is converted, tagged with
+/// the plan PR that converts it, or ruled [`Tag::ByDesign`] (backlog
+/// e178dfe0), so a new reader no plan row converts needs a ruling first.
 const PLAN_PRS: &[&str] = &[
-    "PR-1",
-    "PR-5b1",
-    "PR-5b2",
-    "PR-C2",
-    "PR-F2",
-    "PR-M1",
-    "PR-M2",
-    "PR-R1a",
-    "PR-R1b",
-    "PR-R2",
-    "PR-R3",
-    "PR-R5",
-    "PR-W1a",
-    "PR-W1b",
-    "PR-W1c",
-    "PR-W4",
-    "unassigned",
+    "PR-1", "PR-5b1", "PR-5b2", "PR-C2", "PR-F2", "PR-M1", "PR-M2", "PR-R1a", "PR-R1b", "PR-R2",
+    "PR-R3", "PR-R5", "PR-W1a", "PR-W1b", "PR-W1c", "PR-W4",
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -155,15 +143,18 @@ enum Tag {
     /// A reader, converted by the named plan PR.
     Todo { pr: &'static str, why: &'static str },
     /// A reader that stays role-blind BY DESIGN, on an operator ruling: it
-    /// must read every claim's raw cache columns, compounds included, for a
-    /// bit-exact record or restore. Not D5 debt; the reason names the ruling.
+    /// must read every claim's raw cache columns, compounds included (a
+    /// bit-exact record or restore, a dry-run delta, a cache-presence
+    /// report), or it reads a procedural claim's `truth_value`, which is a
+    /// workflow lifecycle marker and not a belief. Not D5 debt; the reason
+    /// names the ruling.
     ByDesign(&'static str),
 }
 
 /// Every role-blind belief reader (and writer) in the tree today, measured
-/// on this branch. A reader names the plan PR that converts it; `unassigned`
-/// marks a reader no plan row converts yet (D5 cannot pass while one is
-/// left). Sorted by path, then unit.
+/// on this branch. A reader names the plan PR that converts it, or the
+/// operator ruling that keeps it role-blind by design. Sorted by path, then
+/// unit.
 const REGISTER: &[(&str, &str, Tag)] = &[
     // --- epigraph-api -------------------------------------------------------
     ("crates/epigraph-api/src/routes/belief.rs", "claim_divergence", Tag::Todo { pr: "PR-R1b", why: "REST divergence serves a compound's BetP divergence; SPEC §7.2 reads it as derived, see leaves" }),
@@ -188,27 +179,20 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-cli/src/belief_cache.rs", "restore_scoped", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; PR-C2's compare-and-swap restore of a wave's ds_combined_beliefs rows by row id, whose probe compares the raw stored columns; it serves no belief")),
     ("crates/epigraph-cli/src/belief_cache.rs", "restore_wave_with", Tag::ByDesign("the same operator ruling as write_snapshot: stays role-blind by design; PR-C1's compare-and-swap restore writes a wave's before values back where the columns still equal what it wrote, and its probe reads the stored columns through CACHE_COLUMN_NAMES (measured as a read since backlog 4e4d6ad4); it serves no belief")),
     ("crates/epigraph-cli/src/belief_cache.rs", "write_snapshot", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; the snapshot copies every current claim's raw cache columns, compounds included (the compound-cache cleanup NULLs them only after a snapshot), so it must be bit-exact")),
-    ("crates/epigraph-cli/src/bin/analyze_graph.rs", "main", Tag::Todo { pr: "unassigned", why: "operator analysis report buckets claims by truth_value; no plan row converts it" }),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", Tag::Todo { pr: "PR-W4", why: "dekg migrate reads claim Pl to bootstrap raw BBAs; SPEC §4.1 W13" }),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", Tag::Todo { pr: "PR-W4", why: "CLI hypothesis prior from neighbours' cached Bel/Pl; SPEC §4.1 W13" }),
     // --- epigraph-db --------------------------------------------------------
     ("crates/epigraph-db/src/repos/alternative_set.rs", "scan_candidates", Tag::Todo { pr: "PR-R5", why: "suggest_alternative_sets scores pairs by LEAST(COALESCE(pignistic_prob, 0)); SPEC §7.2 excludes compounds, no NULL as 0" }),
-    ("crates/epigraph-db/src/repos/analysis.rs", "get_claims_for_analysis", Tag::Todo { pr: "unassigned", why: "analysis selection ordered on truth_value; no plan row converts it" }),
-    ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_hierarchical", Tag::Todo { pr: "unassigned", why: "workflow selection gated on truth_value; procedural trees are out of scope (SPEC §4.1 W11), no plan row splices the role" }),
-    ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_lineage", Tag::Todo { pr: "unassigned", why: "workflow selection gated on truth_value; procedural, no plan row splices the role" }),
+    ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_hierarchical", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow selection gated on it")),
+    ("crates/epigraph-db/src/repos/behavioral_execution.rs", "behavioral_affinity_lineage", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow selection gated on it")),
     ("crates/epigraph-db/src/repos/claim.rs", "const EFFECTIVE_BELIEF_SCORE_SQL", Tag::Todo { pr: "PR-R1a", why: "the effective-belief choke point (recall, traverse, query_claims); SPEC §7.2 dispatches on role" }),
-    ("crates/epigraph-db/src/repos/claim.rs", "const FILTER_WHERE", Tag::Todo { pr: "unassigned", why: "ClaimRepository::list min/max truth filter on truth_value; no plan row converts it" }),
     ("crates/epigraph-db/src/repos/claim.rs", "dispute_batch", Tag::Todo { pr: "PR-R2", why: "recall's dispute read orders contradicting sources by truth_value; SPEC §7.2 dispute roll-up" }),
     ("crates/epigraph-db/src/repos/claim.rs", "frame_claims_sorted", Tag::Todo { pr: "PR-R3", why: "range list on c.belief / c.plausibility; SPEC §7.2 role predicate" }),
     ("crates/epigraph-db/src/repos/claim.rs", "get_belief_columns", Tag::Todo { pr: "PR-R1a", why: "the cache read under get_belief; SPEC §7.2 choke point" }),
-    ("crates/epigraph-db/src/repos/claim.rs", "get_high_truth", Tag::Todo { pr: "unassigned", why: "list gated on truth_value; no non-test caller and no plan row" }),
-    ("crates/epigraph-db/src/repos/claim.rs", "get_low_truth", Tag::Todo { pr: "unassigned", why: "list gated on truth_value; no non-test caller and no plan row" }),
     ("crates/epigraph-db/src/repos/claim.rs", "grounded_neighborhood", Tag::Todo { pr: "PR-W4", why: "hypothesis neighbourhood returns c.belief / c.plausibility; SPEC §4.1 W13" }),
     ("crates/epigraph-db/src/repos/claim.rs", "list_by_belief_bounds", Tag::Todo { pr: "PR-R3", why: "range list on c.belief / c.plausibility; SPEC §7.2 floor row or omitted" }),
-    ("crates/epigraph-db/src/repos/claim.rs", "list_by_labels", Tag::Todo { pr: "unassigned", why: "query_claims_by_label min-truth gate on truth_value; no plan row converts it" }),
-    ("crates/epigraph-db/src/repos/claim.rs", "rag_hybrid_context", Tag::Todo { pr: "unassigned", why: "RAG context ranked and gated on truth_value; no plan row converts it" }),
     ("crates/epigraph-db/src/repos/claim.rs", "retire_for_workflow_deprecation", Tag::Writer("one UPDATE retires a workflow claim and records its own prior truth_value in properties for a later revival (backlog 1767f2ae); it serves no belief")),
-    ("crates/epigraph-db/src/repos/claim.rs", "search_by_label_and_text", Tag::Todo { pr: "unassigned", why: "workflow text search gated on truth_value; procedural, no plan row" }),
+    ("crates/epigraph-db/src/repos/claim.rs", "search_by_label_and_text", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow text search gated on it")),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_graph_neighbors", Tag::Todo { pr: "PR-R5", why: "semantic search graph expansion returns c.belief / c.plausibility; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_search_flat_on", Tag::Todo { pr: "PR-R5", why: "the semantic_search_flat row carries c.belief / c.plausibility (the statement moved into the connection form, backlog 28b79b1e); SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_selected_claims", Tag::Todo { pr: "PR-R5", why: "the diverse /search/semantic row carries c.belief / c.plausibility, the read moved out of routes/search.rs's inline full_sql (backlog 67c905a3); SPEC §7.2" }),
@@ -217,8 +201,6 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/divergence.rs", "get_latest", Tag::Todo { pr: "PR-R1b", why: "divergence row BetP; SPEC §7.2 derived, see leaves" }),
     ("crates/epigraph-db/src/repos/divergence.rs", "store", Tag::Writer("writes ds_bayesian_divergence.pignistic_prob; reads no claim belief")),
     ("crates/epigraph-db/src/repos/divergence.rs", "top_divergent", Tag::Todo { pr: "PR-R1b", why: "divergence rows ordered by BetP gap; SPEC §7.2" }),
-    ("crates/epigraph-db/src/repos/edge.rs", "count_claims_attributed_to", Tag::Todo { pr: "unassigned", why: "agent attribution count gated on truth_value; no plan row converts it" }),
-    ("crates/epigraph-db/src/repos/edge.rs", "get_claims_attributed_to", Tag::Todo { pr: "unassigned", why: "agent attribution list gated on truth_value; no plan row converts it" }),
     ("crates/epigraph-db/src/repos/factor.rs", "bp_priors", Tag::Todo { pr: "PR-1", why: "BP propagation seeds from cached BetP, compounds included; SPEC D4 (BP machinery excludes compounds). Moved from routes/computation.rs::propagate_beliefs (backlog 073d24a3). Also serves graph/compose's node beliefs, compounds included, which was routes/computation.rs::compose_subgraphs' own unassigned Todo until backlog 52b96600 moved its read here" }),
     ("crates/epigraph-db/src/repos/graph_view.rs", "compound_neighbors", Tag::Todo { pr: "PR-R3", why: "graph view compound neighbour BetP; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/graph_view.rs", "expand_cluster_nodes", Tag::Todo { pr: "PR-R3", why: "graph view cluster node BetP; SPEC §7.2" }),
@@ -229,7 +211,6 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/mass_function.rs", "clear_claim_belief", Tag::Writer("NULLs the cache columns; reads none (SPEC §4.2 stops calling it on atoms)")),
     ("crates/epigraph-db/src/repos/mass_function.rs", "update_claim_belief", Tag::Writer("writes the cache columns; reads none")),
     ("crates/epigraph-db/src/repos/method.rs", "get_evidence_strength", Tag::Todo { pr: "PR-M2", why: "aggregates BetP / truth_value over claims, compounds included; SPEC §7.2 excludes compounds" }),
-    ("crates/epigraph-db/src/repos/policy.rs", "list_active_network", Tag::Todo { pr: "unassigned", why: "policy claims gated and ordered on truth_value; no plan row converts it (moved from routes/policies.rs::list_network_policies)" }),
     ("crates/epigraph-db/src/repos/scoped_belief.rs", "get", Tag::Todo { pr: "PR-R1b", why: "scoped belief row read; SPEC §7.2 filters the constant derived scope rows" }),
     ("crates/epigraph-db/src/repos/scoped_belief.rs", "list_for_claim", Tag::Todo { pr: "PR-R1b", why: "returns every scoped row; SPEC §7.2 filters the constant derived scope rows" }),
     ("crates/epigraph-db/src/repos/scoped_belief.rs", "list_for_scope", Tag::Todo { pr: "PR-R1b", why: "scoped rows per scope; SPEC §7.2" }),
@@ -237,32 +218,30 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/sheaf.rs", "get_claim_neighbor_betp_pairs", Tag::Todo { pr: "PR-M1", why: "sheaf neighbour BetP pairs include compound endpoints; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/sheaf.rs", "get_epistemic_edge_pairs", Tag::Todo { pr: "PR-M1", why: "sheaf edge pairs include compound endpoints; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/structural.rs", "belief_intervals", Tag::Todo { pr: "PR-M2", why: "structural belief intervals over claims, compounds included; SPEC §7.2 excludes compounds" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "executed_structural_claims", Tag::Todo { pr: "unassigned", why: "workflow claims gated on truth_value; procedural (SPEC §4.1 W11), no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "find_by_embedding", Tag::Todo { pr: "unassigned", why: "workflow search gated and scored on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "find_by_text", Tag::Todo { pr: "unassigned", why: "workflow search gated and scored on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "find_hierarchical_by_embedding", Tag::Todo { pr: "unassigned", why: "workflow search gated on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "list", Tag::Todo { pr: "unassigned", why: "workflow list ordered on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "list_hierarchical_lineage_heads", Tag::Todo { pr: "unassigned", why: "workflow lineage enumeration gated on its generations' truth_value (deprecation, highest live generation); procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_embedding_scored", Tag::Todo { pr: "unassigned", why: "workflow search scored on truth_value; procedural, no plan row" }),
-    ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_text", Tag::Todo { pr: "unassigned", why: "workflow search scored on truth_value; procedural, no plan row" }),
+    ("crates/epigraph-db/src/repos/workflow.rs", "executed_structural_claims", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow claims gated on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "find_by_embedding", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search gated and scored on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "find_by_text", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search gated and scored on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "find_hierarchical_by_embedding", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search gated on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "list", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow list ordered on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "list_hierarchical_lineage_heads", Tag::ByDesign("operator ruling (2026-11-24, backlog 5a4d94b7): stays role-blind by design; the workflow lineage enumeration is gated on its generations' truth_value (deprecation, highest live generation), which joins the procedural class: a workflow's truth_value is a lifecycle marker, not a belief")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_embedding_scored", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search scored on it")),
+    ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_text", Tag::ByDesign("operator ruling (2026-11-17): stays role-blind by design; procedural: a workflow claim's truth_value is a lifecycle marker, not a belief, and workflow trees are out of the atom-level belief program (SPEC §4.1 W11); workflow search scored on it")),
     // --- epigraph-engine ----------------------------------------------------
     ("crates/epigraph-engine/src/belief_query.rs", "get_belief_conn", Tag::Todo { pr: "PR-R1a", why: "the get_belief choke point (body in get_belief_conn; the pool forms delegate) serves the cache columns; SPEC §7.2 dispatches on role" }),
     ("crates/epigraph-engine/src/edge_factor.rs", "auto_wire_ds_for_edge", Tag::Todo { pr: "PR-F2", why: "builds an edge BBA from the source's cached Bel/Pl, compound sources included; SPEC §4.1 W8" }),
-    ("crates/epigraph-engine/src/retraction_cascade.rs", "claim_holds_belief_cache", Tag::Todo { pr: "unassigned", why: "the retraction cascade's report reads whether a claim still holds any cache column (the columns clear_claim_belief's guard tests) to tell a declined clear from nothing to clear, compounds included; it decides only the report's bucket and serves no belief" }),
-    ("crates/epigraph-engine/src/supersede_delta.rs", "delta_block", Tag::Todo { pr: "unassigned", why: "the supersede dry-run delta (supersede SPEC §11 K0) reads the raw cache that the supersede cascade's repair recomputes, compounds included, to report old beside new; role-aware when that repair is" }),
+    ("crates/epigraph-engine/src/retraction_cascade.rs", "claim_holds_belief_cache", Tag::ByDesign("operator ruling (2026-11-24, backlog 5a4d94b7): stays role-blind by design; the retraction cascade's report reads whether a claim still holds any raw cache column (the columns clear_claim_belief's guard tests), compounds included, to tell a declined clear from nothing to clear; it decides only the report's bucket and serves no belief")),
+    ("crates/epigraph-engine/src/supersede_delta.rs", "delta_block", Tag::ByDesign("operator ruling (2026-11-17) and backlog 5a4d94b7 (2026-11-24): stays role-blind by design; the supersede dry-run delta (supersede SPEC §11 K0) must read the raw cache the supersede cascade's repair recomputes, compounds included, to report old beside new; it serves no belief")),
     // --- epigraph-jobs ------------------------------------------------------
-    ("crates/epigraph-jobs/src/cluster_graph/neighborhood.rs", "run_one_theme", Tag::Todo { pr: "unassigned", why: "theme neighbourhood BetP; SPEC §7.2 calls it atoms-only, but the predicate is not the IS_COMPOUND_SQL spelling" }),
     ("crates/epigraph-jobs/src/cluster_graph/runner.rs", "run_clustering", Tag::Todo { pr: "PR-M2", why: "cluster mean_betp over claims, compounds included; SPEC §7.2" }),
     // --- epigraph-mcp -------------------------------------------------------
     ("crates/epigraph-mcp/src/tools/claims.rs", "update_with_evidence", Tag::Todo { pr: "PR-5b1", why: "reads the cache for the monotonicity clamp and the response; SPEC §4.1 W1" }),
     ("crates/epigraph-mcp/src/tools/ds.rs", "get_divergence", Tag::Todo { pr: "PR-R1b", why: "MCP divergence serves BetP; SPEC §7.2" }),
     ("crates/epigraph-mcp/src/tools/ds.rs", "scoped_belief", Tag::Todo { pr: "PR-R1b", why: "MCP scoped_belief serves scoped rows; SPEC §7.2" }),
     ("crates/epigraph-mcp/src/tools/ds.rs", "submit_ds_evidence", Tag::Todo { pr: "PR-W1a", why: "reads and reports the cache around a textless BBA write; SPEC §4.1 W3" }),
-    ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update_filed_on", Tag::Todo { pr: "PR-5b1", why: "reads the cached BetP as the clamp's prior; SPEC §4.1 W1" }),
+    ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update_filed_on", Tag::Todo { pr: "PR-5b1", why: "reads the cached BetP as the clamp's prior, and the recorded cache frame to report a re-point; SPEC §4.1 W1" }),
     ("crates/epigraph-mcp/src/tools/link_epistemic.rs", "do_link_epistemic", Tag::Todo { pr: "PR-W1b", why: "reads the source's cache to wire an edge and reports the target's; SPEC §4.1 W7" }),
     ("crates/epigraph-mcp/src/tools/recall.rs", "fetch_batched_context", Tag::Todo { pr: "PR-R2", why: "recall_with_context context rows gated on truth_value; SPEC §7.2" }),
     // --- scripts ------------------------------------------------------------
-    ("scripts/label_themes_llm.py", "load_neighborhoods_with_samples", Tag::Todo { pr: "unassigned", why: "orders a neighbourhood's public sample claims by cached BetP for the labelling prompt, compounds included; no plan row converts it" }),
     ("scripts/migrate_provenance_bba.py", "census", Tag::Todo { pr: "PR-W4", why: "seed-migration census on truth_value; SPEC §4.1 W13 script, frozen" }),
 ];
 
@@ -717,7 +696,7 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
                 continue;
             }
             let (unit, span) = units.unit_at(lit.start);
-            let u = out.entry((s.path.clone(), unit)).or_default();
+            let u = out.entry((s.key(), unit)).or_default();
             u.kinds.extend(kinds);
             u.reads |= !is_write_sql(&sql);
             u.marked |= marked(span);
@@ -726,7 +705,7 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
         // fixture list, module-level or fn-local, is not a served read.
         if !test_files.contains(&s.path) {
             for (unit, span, list) in column_list_readers(&view, &units, &column_lists) {
-                let u = out.entry((s.path.clone(), unit)).or_default();
+                let u = out.entry((s.key(), unit)).or_default();
                 u.kinds.insert(format!("column list {list}"));
                 u.reads = true;
                 u.marked |= marked(span);
@@ -747,7 +726,7 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
             if !triggered {
                 continue;
             }
-            let u = out.entry((s.path.clone(), f.name.clone())).or_default();
+            let u = out.entry((s.key(), f.name.clone())).or_default();
             u.kinds.insert(format!(".{field}"));
             u.reads = true;
             u.marked |= marked(Some((f.sig_start, f.end)));
@@ -765,10 +744,15 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
             if kinds.is_empty() {
                 continue;
             }
-            let unit = python_unit_at(&view.code, lit.start);
+            let (unit, span) = python_unit_span(&view.code, lit.start);
             let u = out.entry((s.path.clone(), unit)).or_default();
             u.kinds.extend(kinds);
             u.reads |= !is_write_sql(&sql);
+            // The `def`'s CODE (strings and comments blanked) names a marker:
+            // a module constant spelling migration 193's definer call or the
+            // compound predicate, used inside the function.
+            u.marked |= span
+                .is_some_and(|(a, e)| ROLE_MARKERS.iter().any(|m| has_word(&view.code[a..e], m)));
         }
     }
     out
@@ -1332,6 +1316,99 @@ def report(cur):
     );
 }
 
+/// A Python `def` is classified the way a Rust fn is: by a role marker its
+/// CODE names (a module constant spelling migration 193's definer call or
+/// the compound predicate, used inside the function). A marker only in a
+/// string or a comment, or only at module level, classifies nothing.
+#[test]
+fn a_python_def_is_classified_only_by_a_marker_in_its_code() {
+    let path = "scripts/scratch_role_reader.py";
+    let unit = format!("{path}::samples");
+    let run = |src: &str| {
+        findings(&measure(
+            &rust_sources(),
+            &with_scratch(&script_sources(), path, src),
+        ))
+    };
+
+    let raw = r#"
+IS_COMPOUND_DEFINER_CALL = "public.epigraph_claim_is_compound($1)"
+
+def samples(cur):
+    cur.execute("SELECT id FROM claims c ORDER BY c.pignistic_prob DESC")
+    return cur.fetchall()
+"#;
+    let f = run(raw);
+    assert!(
+        f.iter().any(|l| l.contains(&unit)),
+        "a marker defined at module level but unused in the def classifies nothing; got {f:#?}"
+    );
+
+    let in_string_and_comment = r#"
+def samples(cur):
+    # ordered by IS_COMPOUND_DEFINER_CALL first
+    note = "IS_COMPOUND_SQL"
+    cur.execute("SELECT id FROM claims c ORDER BY c.pignistic_prob DESC")
+    return cur.fetchall()
+"#;
+    let f = run(in_string_and_comment);
+    assert!(
+        f.iter().any(|l| l.contains(&unit)),
+        "a marker in a comment or a string classifies nothing; got {f:#?}"
+    );
+
+    let spliced = r#"
+IS_COMPOUND_DEFINER_CALL = "public.epigraph_claim_is_compound($1)"
+
+def samples(cur):
+    is_compound = IS_COMPOUND_DEFINER_CALL.replace("$1", "c.id")
+    cur.execute(
+        f"""SELECT id FROM claims c
+            ORDER BY {is_compound}, c.pignistic_prob DESC"""
+    )
+    return cur.fetchall()
+
+
+def other(cur):
+    cur.execute("SELECT id FROM claims c ORDER BY c.pignistic_prob DESC")
+"#;
+    let f = run(spliced);
+    assert!(
+        !f.iter().any(|l| l.contains(&unit)),
+        "a def whose code names a role marker is classified; got {f:#?}"
+    );
+    assert!(
+        f.iter().any(|l| l.contains(&format!("{path}::other"))),
+        "the marker classifies its own def only, not the next one; got {f:#?}"
+    );
+}
+
+/// `scripts/label_themes_llm.py` spells migration 193's definer call in a
+/// module constant (Python cannot import the Rust one); it must stay the
+/// Rust constant's text, or the script tests something else.
+#[test]
+fn the_python_definer_call_is_the_rust_constant() {
+    let path = "scripts/label_themes_llm.py";
+    let src = script_sources()
+        .into_iter()
+        .find(|s| s.path == path)
+        .unwrap_or_else(|| panic!("{path} is scanned"));
+    let prefix = "IS_COMPOUND_DEFINER_CALL = \"";
+    let line = src
+        .text
+        .lines()
+        .find(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("{path} defines IS_COMPOUND_DEFINER_CALL at module level"));
+    let value = line[prefix.len()..]
+        .strip_suffix('"')
+        .unwrap_or_else(|| panic!("one plain string literal: {line}"));
+    assert_eq!(
+        value,
+        epigraph_db::repos::mass_function::IS_COMPOUND_DEFINER_CALL,
+        "{path}'s definer call drifted from the Rust constant"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Column lists built at runtime (backlog 4e4d6ad4)
 // ---------------------------------------------------------------------------
@@ -1626,4 +1703,23 @@ pub fn scratch_report(bel: f64, row: &serde_json::Value) -> serde_json::Value {
     assert!(captures("SELECT {COLS:?} FROM", "COLS"));
     assert!(!captures("SELECT {{COLS}} FROM", "COLS"));
     assert!(!captures("SELECT {COLS_X} FROM", "COLS"));
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: every site in the moved code keys under the
+/// registered path (`Source::key`), so no entry goes stale and no moved site
+/// reads as unregistered. Fails on a ratchet keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let (rust, scripts) = (rust_sources(), script_sources());
+    let split = belief_lint::with_claim_split(&rust);
+    assert!(split
+        .iter()
+        .any(|s| s.path.ends_with("/repos/claim/split_probe.rs")));
+    let measured = measure(&split, &scripts);
+    assert_eq!(
+        format!("{measured:#?}"),
+        format!("{:#?}", measure(&rust, &scripts))
+    );
+    assert!(findings(&measured).is_empty(), "{:#?}", findings(&measured));
 }

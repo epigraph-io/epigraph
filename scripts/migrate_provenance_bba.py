@@ -5,6 +5,11 @@ Plan: docs/superpowers/plans/2026-09-16-provenance-bba-migration.md
 Spec context: backlogs 14b98adc (recall ranks on a column no DS path refreshes),
 0183a294 (BetP bounds), 696d3a1c (one frame owns the cached scalars).
 
+Mirrors: `MassFunction::from_pignistic_prior` in crates/epigraph-ds/src/mass.rs,
+the seed `ds_auto::auto_wire_ds_update` (crates/epigraph-mcp/src/tools/ds_auto.rs)
+gives a BBA-less claim on its first evidence update. This script re-implements
+that shape in Python; a change to either Rust function must be made here too.
+
 WHY
 ---
 `epigraph_engine::bayesian::calculate_initial_truth` gives ingested claims a
@@ -68,7 +73,8 @@ WHY DIRECT SQL RATHER THAN submit_ds_evidence
 ---------------------------------------------
 The MCP write path mints a fresh perspective per call. At corpus scale that would
 add hundreds of thousands of junk perspective rows and make the G4 problem
-permanent. This follows the precedent of scripts/migrate_mixed_bbas.py.
+permanent. This follows the precedent of the mixed-BBA migration (commit
+2d67ad99e, since deleted as a completed one-shot).
 
 DOES NOT RUN recompute_beliefs
 ------------------------------

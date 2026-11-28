@@ -1529,8 +1529,8 @@ pub async fn apply_after_consolidate(
 /// edge-keyed BBA), the belief of both endpoints is re-derived from the
 /// `mass_functions` that survive, like every other cascade that removes belief
 /// inputs ([`crate::retraction_cascade::cascade_after_edge_withdrawal`]: each
-/// endpoint is recomputed on `binary_truth`, or has its cache cleared when no
-/// BBA on any frame backs it), and the re-derivation writes its own
+/// endpoint is recomputed on `binary_truth`, or has its cache vacated to the
+/// explicit vacuous value when no BBA on any frame backs it), and the re-derivation writes its own
 /// [`EVENT_BELIEF`] row. This is the only operation that repairs a
 /// `pignistic_prob` a past `POST /api/v1/bp/propagate` with
 /// `apply_updates: true` biased through the retired factor: a later propagate

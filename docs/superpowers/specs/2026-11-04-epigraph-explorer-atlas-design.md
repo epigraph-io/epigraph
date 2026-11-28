@@ -1,7 +1,8 @@
 # EpiGraph Explorer: Atlas (zoomable map, sources, timeline)
 
 **Date:** 2026-11-04
-**Status:** spec
+**Status:** in-progress (checked against origin/main ad30094c5, 2026-11-27). See the phasing table in §10; the neighbourhood level is replaced by `2026-11-12-atlas-nested-groups-and-subgraph-view-design.md`.
+**Original status:** spec
 **Repo:** `epigraph` (public)
 **Builds on:** `2026-09-15-epigraph-explorer-ui-design.md` (the Explorer: BFF, auth,
 claim pages, graph canvas) and `../plans/2026-09-15-epigraph-explorer-impl-plan.md`.
@@ -66,7 +67,7 @@ Defaults taken on recommendation, recorded with A1-A6:
 - Deep links carry claim ids, resolved through `/claims/:id/placement`, never theme
   or neighbourhood ids alone.
 - Tours live in a Notion database, read with the viewer's own Notion connection.
-- `get_recall_events` gets no Explorer route until tenancy covers it.
+- `get_recall_events` is served to its own caller only: `GET /api/v1/recall-events` and the Explorer's `/recalls` page (decided under backlog ecf1b34f; `recall_events` row security is keyed on the querying agent).
 
 ---
 
@@ -217,12 +218,15 @@ Upstream: `GET /claims/:id`, `/claims/:id/context` (backlog `cadfc550`),
   `/claims/by-labels`. `/` focuses it; arrow keys and Enter pick a result, which
   flies to the item in the current view, or switches to Topics if the item is not in
   that view.
-- **Deep links** are a `#name` for one item: `t-<id8>` for a theme, `c-<id8>` for a
-  claim, `x…` keys in Sources, `tc-<id8>` in the Timeline, `tour-<id>-<n>` for a
-  tour stop. The BFF resolves claim keys through `/claims/:id/placement`, so links
-  survive re-clustering. Theme ids alone are not durable: themes were rebuilt on
-  2026-10-07 after a probe wiped them (backlog `5abe23de`). A link holds only an id,
-  never claim text.
+- **Deep links** are a `#name` for one item. The served key is `c-<32 lower-case
+  hex>` for a claim: its full id in simple form, as `bff/atlas.rs::claim_key` in
+  `services/explorer` writes it. `parse_key` there also accepts the hyphenated
+  lower-case id, and refuses upper case, a shortened `c-<id8>` and anything else.
+  There is no theme key. `x…` keys in Sources, `tc-` keys in the Timeline and
+  `tour-<id>-<n>` for a tour stop are not served yet (§10). The BFF resolves claim
+  keys through `/claims/:id/placement`, so links survive re-clustering. Theme ids
+  alone are not durable: themes were rebuilt on 2026-10-07 after a probe wiped them
+  (backlog `5abe23de`). A link holds only an id, never claim text.
 - **Tours (A4)** are a Notion database with one row per stop: tour, order, Explorer
   link, caption. The BFF reads it with the viewer's own Notion connection, so Notion's
   sharing decides who sees a tour. A stop the viewer cannot read in EpiGraph is
@@ -351,6 +355,33 @@ in the repository, not what is deployed.
 P3a can start before the layout route exists by packing themes by size, as the
 prototype first did, and switch once positions ship.
 
+**P3a owner questions** (backlog `6285e0cf`; provisional ruling `4df9ec4b`,
+2026-11-27, which the owner may reverse). The P3a unit PRs left six questions open:
+
+1. *Deep-link keys.* As shipped: full-id `c-` keys only, no theme key (§4.6).
+2. *A viewer-filtered `dispute_count` on `POST /claims/batch-get`*, for the
+   contested ring on theme bubbles. Deferred to the per-viewer view; not served.
+3. *Per-viewer placement of a theme with no public member.* As shipped, the layout
+   route puts such a theme in the region nearest the centroid of the members the
+   caller can read, with no `x`/`y` (`placement: "viewer"`). A per-viewer position
+   waits for the per-viewer view.
+4. *The `atlas_layout --min-public-members` default.* Stands at 1.
+5. *Whether `cites` counts in layout links.* It does, at weight 0 in this
+   design's shared theme layout: `/graph/links` and the layout's links count it
+   (`ATLAS_DEFAULT_RELATIONSHIPS`), and it moves no region or theme, because
+   `atlas_layout`'s `build_layout` places regions and themes before it reads
+   any link (so no relationship moves a position there; the build test
+   `a_cites_link_is_kept_in_the_links_and_moves_no_position` pins that `cites`
+   stays counted and moves nothing). It also carries flow weight 0 and sign 0
+   in a leaf (`epigraph-engine` `atlas_flow`). Two layouts of the nested maps
+   (design 2026-11-12) still pull on `cites` at full weight, and whether they
+   should is open for the owner: group-child placement, where the sibling
+   bundles count `cites` (`atlas_links` `COUNTED_RELATIONSHIPS`) and
+   `atlas_layout`'s group force layout pulls linked children together by the
+   bundle count, and the leaf force layout, which pulls on every edge of a
+   leaf.
+6. *`POST /claims/batch-get` on the elevated read-only POST allowlist.* Stands.
+
 **Prerequisites.** This PR rebased on `main` and split into kernel and Explorer
 PRs. The OAuth hardening it was blocked on is resolved (backlog `3ae14c11`).
 
@@ -398,3 +429,4 @@ All labelled `explorer-atlas`, filed 2026-11-04.
 | `0720d208` | feature-gap (MCP) | claim context by id |
 | `7b8f47a7` | ruling | owner rulings A1-A6 and defaults |
 | `19e64a7b` | ruling | owner ruling A7 |
+| `4df9ec4b` | ruling | P3a owner questions (provisional), §10 |

@@ -21,6 +21,11 @@ pub struct PaperRow {
     pub journal: Option<String>,
 }
 
+/// One claim a paper asserts, as [`PaperRepository::asserted_claims_conn`]
+/// reads it: the claim id and, when the session reads the claim row, its
+/// stored `content_hash`.
+pub type AssertedClaim = (Uuid, Option<Vec<u8>>);
+
 /// A `papers` row as `POST /api/v1/papers` answers it
 /// ([`PaperRepository::registered_row`]).
 #[derive(Debug, Clone)]
@@ -533,6 +538,171 @@ impl PaperRepository {
                 .fetch_optional(executor)
                 .await?;
         Ok(licence.flatten())
+    }
+
+    /// Every claim the paper `paper_id` asserts through an in-force,
+    /// ingest-written `paper -asserts-> claim` edge, with the claim's stored
+    /// `content_hash` when the caller's connection can read the claim row
+    /// (`None` otherwise).
+    ///
+    /// For the document ingest walk, which asks it on its own author-stamped
+    /// transaction about the paper row it just got or created in the ingest's
+    /// scope, to find the ids an ingest of the same document in the same scope
+    /// recorded before ids became scope-derived
+    /// (`epigraph_ingest::document::adopt_recorded_ids`). Only ingest-written
+    /// edges count: `paper -asserts->` is refused on every application edge
+    /// write, and the marker ([`crate::repos::ingest_written`]) is what says
+    /// the walk wrote it. Row security on the caller's connection decides
+    /// which edges and claim rows are seen; the paper is the caller's own
+    /// in-scope row, and every id returned is one an earlier ingest of it
+    /// already reported to that scope.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn asserted_claims_conn(
+        conn: &mut sqlx::PgConnection,
+        paper_id: Uuid,
+    ) -> Result<Vec<AssertedClaim>, DbError> {
+        // Runtime-checked, not `query!`: see `get_or_create`.
+        let sql = format!(
+            "SELECT DISTINCT e.target_id, c.content_hash \
+               FROM edges e \
+               LEFT JOIN claims c ON c.id = e.target_id \
+              WHERE e.source_id = $1 \
+                AND e.source_type = 'paper' \
+                AND e.target_type = 'claim' \
+                AND e.relationship = 'asserts' \
+                AND {in_force} \
+                AND {marked}",
+            in_force = crate::repos::edge::EDGE_IN_FORCE,
+            marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+        );
+        let rows: Vec<AssertedClaim> = sqlx::query_as(&sql)
+            .bind(paper_id)
+            .fetch_all(&mut *conn)
+            .await?;
+        Ok(rows)
+    }
+
+    /// The claims the group `owner_group_id` itself owns, NON-PUBLIC, that
+    /// hold one of `ids` or one of the stored hashes `hashes`, oldest first,
+    /// each with its stored `content_hash`.
+    ///
+    /// For the document ingest walk, which asks it on its own author-stamped
+    /// transaction with the GLOBAL plan's ids and stored hashes of the document
+    /// it is about to write in `owner_group_id`'s non-public scope (backlog
+    /// 8f56a641): the rows that group's earlier ingest of the same text wrote
+    /// under global ids, before ids were scope-derived, so the re-ingest
+    /// converges on them instead of writing scoped duplicates. It covers what
+    /// [`Self::asserted_claims_conn`] cannot: an ingest from before migration
+    /// 246, whose `papers` row was backfilled PUBLIC, so the group's own
+    /// in-scope paper row is new and asserts nothing.
+    ///
+    /// The scope is the SQL itself, not only row security (the operator CLI's
+    /// maintenance pool bypasses it): `owner_group_id = $1` keeps every other
+    /// group's row out, and `visibility <> 'public'` keeps out the group's own
+    /// PUBLIC rows (a public ingest's claims are owned by its author's group
+    /// too, and a later non-public ingest must not fold into them). Oldest
+    /// first, so a hash two rows share resolves to the same row every time.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, ids, hashes))]
+    pub async fn own_group_legacy_claims_conn(
+        conn: &mut sqlx::PgConnection,
+        owner_group_id: Uuid,
+        ids: &[Uuid],
+        hashes: &[Vec<u8>],
+    ) -> Result<Vec<AssertedClaim>, DbError> {
+        if ids.is_empty() && hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Runtime-checked, not `query!`: see `get_or_create`.
+        let rows: Vec<AssertedClaim> = sqlx::query_as(
+            "SELECT c.id, c.content_hash \
+               FROM claims c \
+              WHERE c.owner_group_id = $1 \
+                AND c.visibility::text <> 'public' \
+                AND (c.id = ANY($2) OR c.content_hash = ANY($3)) \
+              ORDER BY c.created_at, c.id",
+        )
+        .bind(owner_group_id)
+        .bind(ids)
+        .bind(hashes)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(rows)
+    }
+
+    /// What the PUBLIC `papers` row of the same document key as `paper_id`
+    /// asserts, through in-force ingest-written `asserts` edges, kept to the
+    /// rows the group `owner_group_id` may converge onto: its own and public
+    /// ones, each with its stored `content_hash`, oldest first. Empty unless
+    /// that public row asserts at least one NON-PUBLIC row `owner_group_id`
+    /// owns.
+    ///
+    /// For the document ingest walk, after [`Self::asserted_claims_conn`] and
+    /// [`Self::own_group_legacy_claims_conn`], on its own author-stamped
+    /// transaction, with `paper_id` its in-scope (group) row (backlog
+    /// 8f56a641). Before migration 246 a document had ONE `papers` row, which
+    /// 246 made public: a group's pre-246 non-public ingest recorded its
+    /// claims there, including atoms it converged onto an existing PUBLIC row
+    /// with the same text. Those are the document's recorded ids; reading
+    /// them is a lookup by the document's record, not by text.
+    ///
+    /// The gate (the public row asserts one of the group's own non-public
+    /// rows) is what says the group's earlier ingest wrote through that row; a
+    /// document only ever ingested publicly gives nothing, so a group's first
+    /// non-public ingest of it still writes its own claims. Another group's
+    /// non-public row is never returned. Both are in the SQL, not only row
+    /// security (the operator CLI's maintenance pool bypasses it).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn public_twin_recorded_claims_conn(
+        conn: &mut sqlx::PgConnection,
+        paper_id: Uuid,
+        owner_group_id: Uuid,
+    ) -> Result<Vec<AssertedClaim>, DbError> {
+        // Runtime-checked, not `query!`: see `get_or_create`.
+        let sql = format!(
+            "WITH twin AS ( \
+                 SELECT p.id FROM papers p \
+                   JOIN papers mine ON mine.id = $1 \
+                  WHERE p.doi = mine.doi \
+                    AND p.visibility = 'public' \
+                    AND p.id <> mine.id \
+             ), recorded AS ( \
+                 SELECT c.id, c.content_hash, c.created_at, c.visibility::text AS vis, \
+                        c.owner_group_id \
+                   FROM edges e \
+                   JOIN twin ON twin.id = e.source_id \
+                   JOIN claims c ON c.id = e.target_id \
+                  WHERE e.source_type = 'paper' \
+                    AND e.target_type = 'claim' \
+                    AND e.relationship = 'asserts' \
+                    AND {in_force} \
+                    AND {marked} \
+             ) \
+             SELECT DISTINCT r.id, r.content_hash, r.created_at \
+               FROM recorded r \
+              WHERE (r.vis = 'public' OR r.owner_group_id = $2) \
+                AND EXISTS (SELECT 1 FROM recorded g \
+                             WHERE g.owner_group_id = $2 AND g.vis <> 'public') \
+              ORDER BY r.created_at, r.id",
+            in_force = crate::repos::edge::EDGE_IN_FORCE,
+            marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+        );
+        // The third column is the ORDER BY key `SELECT DISTINCT` must project.
+        type Row = (Uuid, Option<Vec<u8>>, Option<chrono::DateTime<chrono::Utc>>);
+        let rows: Vec<Row> = sqlx::query_as(&sql)
+            .bind(paper_id)
+            .bind(owner_group_id)
+            .fetch_all(&mut *conn)
+            .await?;
+        Ok(rows.into_iter().map(|(id, hash, _)| (id, hash)).collect())
     }
 
     /// Returns true if the paper has any outgoing `processed_by` edge whose

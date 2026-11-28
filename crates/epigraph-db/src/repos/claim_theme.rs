@@ -728,6 +728,69 @@ impl ClaimThemeRepository {
         Ok(results)
     }
 
+    /// The query's nearest themes by centroid that `viewer` can see, as
+    /// `(theme_id, label, similarity)`, nearest first.
+    ///
+    /// "Can see" is [`Self::list_summaries`]' rule (backlog 06f5c5b2): at
+    /// least one current member the viewer can read.
+    /// [`Self::find_similar_themes_at_dim`] ranks every theme row, so a caller
+    /// that names its shortlist (MCP `recall`'s `theme_leg.themes`, backlog
+    /// a47df8ed) would publish the id and label of a theme made only of
+    /// another team's private claims, and such a theme would also take a
+    /// shortlist slot from a theme the viewer can read. The predicate sits
+    /// before `LIMIT`, so the `limit` slots go to visible themes.
+    ///
+    /// `centroid_dim` selects the column as in
+    /// [`Self::find_similar_themes_at_dim`]; any other value is
+    /// `DbError::InvalidData`.
+    pub async fn find_similar_visible_themes_at_dim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_vec: &str,
+        limit: i32,
+        centroid_dim: u32,
+    ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
+        let (theme_col, _) =
+            centroid_columns_for_dim(centroid_dim).ok_or_else(|| DbError::InvalidData {
+                reason: format!("unsupported centroid_dim: {centroid_dim} (must be 1536 or 3072)"),
+            })?;
+
+        // `c.is_current`, not `COALESCE(c.is_current, true)`: the column is
+        // `NOT NULL DEFAULT true`; the bare form is `list_summaries`' predicate.
+        let sql = format!(
+            "SELECT t.id, t.label, (1 - (t.{theme_col} <=> $1::vector))::float8 AS similarity \
+             FROM claim_themes t \
+             WHERE t.{theme_col} IS NOT NULL \
+               AND EXISTS ( \
+                   SELECT 1 FROM claims c \
+                   WHERE c.theme_id = t.id AND c.is_current \
+                     /* {{VISIBILITY:c}} */ \
+               ) \
+             ORDER BY t.{theme_col} <=> $1::vector \
+             LIMIT $2"
+        );
+        // Doubled braces above: this is a `format!` template, so `{{` emits the
+        // single brace `Viewer::splice` looks for.
+        let sql = viewer.splice(&sql, 3);
+
+        let mut q = sqlx::query(&sql).bind(query_vec).bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g); // $3
+        }
+        let rows = q.fetch_all(executor).await.map_err(DbError::from)?;
+
+        let results = rows
+            .iter()
+            .map(|row| {
+                let id: Uuid = row.get("id");
+                let label: String = row.get("label");
+                let similarity: f64 = row.get("similarity");
+                (id, label, similarity)
+            })
+            .collect();
+        Ok(results)
+    }
+
     /// Get claims within the specified themes, ranked by similarity to the query vector.
     ///
     /// Returns `(claim_id, content, similarity)` tuples ordered by descending similarity.

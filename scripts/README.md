@@ -6,26 +6,36 @@ build; invoked manually or by the deployment's scheduled maintenance tasks
 
 ## Dependencies and database
 
-There is no `scripts/requirements.txt`. The Python packages these scripts
-import (psycopg2, numpy, scikit-learn, umap-learn, requests, ...) are pinned,
-with hashes, in `tests/requirements-ci.txt`, the file the CI `python` job
-installs and tests them against (edit `tests/requirements-ci.in` and recompile;
-its header says how). Install it into a virtual environment on the host that
-runs them:
+The Python packages these scripts import (psycopg2, numpy, scikit-learn,
+umap-learn, requests, httpx, networkx) are pinned, with hashes, in
+`scripts/requirements.txt`. It is compiled from `scripts/requirements.in`
+against `tests/requirements-ci.txt`, the file the CI `python` job installs and
+tests them against, so every version and hash in it equals the CI one
+(`tests/ci/test_requirements_locked.py` fails otherwise; the `.in` header says
+how to recompile). Install it into a virtual environment on the host that runs
+them, before the first run:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install --require-hashes --only-binary :all: -r tests/requirements-ci.txt
+.venv/bin/pip install --require-hashes --only-binary :all: -r scripts/requirements.txt
 ```
+
+No script installs a package at run time: a missing one is an `ImportError`
+naming this file.
 
 A script that opens a database connection has no built-in DSN: it connects on
 `--database-url`, else `MAINTENANCE_DATABASE_URL`, else `DATABASE_URL`, and
-refuses to start with none of them (`scripts/maintenance_dsn.py`). Three
+refuses to start with none of them (`scripts/maintenance_dsn.py`). Four
 scripts differ:
 
 - `subcluster_outliers.py` is read-only and deliberately stays off the
   maintenance login: `--database-url` or `DATABASE_URL` only. Give it a
   read-only login; nothing enforces that.
+- `screen_public_claims.py` is read-only (its session is set read-only) and
+  takes `--database-url` only (required; not read from the environment). Give
+  it a read-only login, and leave the password out of the DSN: a command line
+  is visible to other users of the host and lands in shell history, while
+  libpq still reads `~/.pgpass` (or the file `PGPASSFILE` names).
 - `lib/tiered_enrichment.py --claim-id` takes `--database-url` only (not from
   the environment), so a privileged `DATABASE_URL` exported for another job is
   never used for it.
@@ -34,6 +44,38 @@ scripts differ:
   `DATABASE_ADMIN_URL`, and exits at startup unless both sides are set. Which jobs to schedule, and with what
 role and cadence, is in `docs/deploy.md`, "Step 10 — Schedule the maintenance
 jobs" (the theme pipeline is there too).
+
+## screen_public_claims.py
+
+Screens every public claim, current or superseded (the guest claim card reads
+a claim by id whatever its `is_current`), for text that should not be readable
+without a login, before guest reads are turned on: long verbatim text (content
+over 300 characters, or a quoted span of more than 40 words), internal
+identifiers (full UUIDs, internal host names and private addresses,
+home-directory and `*-private/` paths, operator-listed markers and private
+group names) and personal data (e-mail addresses, phone numbers, street
+addresses). It writes one JSON line per flagged claim (`{"claim_id",
+"is_current", "reasons"}`), optionally the flagged ids in the format `epigraph-operator
+restrict-claims --claims-file` reads, and per-reason counts on stderr. It never
+prints a claim's text, a matched term or the DSN.
+
+The private group names and markers come from files the operator supplies (one
+per line, `#` comments); none is built in, because that list is itself private.
+Both flags are required (an empty file is allowed): list every private
+directory and project name in the markers file, since the built-in path rule
+only knows home directories and a `*-private/` directory.
+
+Not screened: credentials or connection strings, IPv6 addresses, UUIDs written
+without dashes, and the guest card's `sources` (document key and title).
+
+```bash
+python3 scripts/screen_public_claims.py --database-url "$READONLY_DSN" \
+    --private-groups groups.txt --private-markers markers.txt \
+    --out hits.jsonl --claims-file-out restrict-candidates.txt
+```
+
+Review the hits, make the ones that should not be public private with
+`restrict-claims`, and only then turn guest reads on.
 
 ## audit_claims_content_hash_agent.py
 
@@ -155,9 +197,11 @@ even mid-confidence supporters can drive a target's BetP toward 1.0.
 
 For each NULL row:
 - If the claim has ≥1 evidence row: take the **highest** evidence-type
-  weight from `calibration.toml` (single source of truth, with the
-  DB-vocab aliases applied — and a hardcoded fallback if the alias
-  section is absent). Best-evidence wins.
+  weight from the calibration file (with the DB-vocab aliases applied —
+  and a hardcoded fallback if the alias section is absent). Best-evidence
+  wins. The file is `--calibration` if given, else `$CALIBRATION_PATH`
+  when set (the file the engine serves), else the repo-root
+  `calibration.toml`; the run prints which one it used.
 - Otherwise: fall back to the agent-only / `conversational` tier (0.3).
 
 ```bash

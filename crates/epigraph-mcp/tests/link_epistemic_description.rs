@@ -113,3 +113,19 @@ fn link_epistemic_description_names_the_belief_wired_reason_values() {
         assert!(d.contains(needle), "description lacks {needle:?}: {d}");
     }
 }
+
+/// A contradiction onto an undecomposed compound-looking target is flagged
+/// or refused (backlog b4c2fc2f): the description names the response field,
+/// the refusal code and the flag, so an agent can act on either.
+#[test]
+fn link_epistemic_description_names_the_contradiction_guard() {
+    let d = link_epistemic_description();
+    for needle in [
+        "partial_contradiction_risk",
+        "compound_contradiction_target",
+        "EPIGRAPH_CONTRADICT_COMPOUND_GUARD=refuse",
+        "decomposes_to children",
+    ] {
+        assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+    }
+}

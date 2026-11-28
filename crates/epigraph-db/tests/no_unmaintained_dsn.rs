@@ -162,10 +162,25 @@ const EXEMPT: &[(&str, &str)] = &[
          silently escalate it to a writable role whenever a sibling job exports that variable.",
     ),
     (
+        "scripts/screen_public_claims.py",
+        "Read-only privacy screen of public claims (backlog 85fb918a): its session is set \
+         read-only before its one SELECT, it is meant for a read-only login, and it takes \
+         its DSN from --database-url only (required; not read from the environment). \
+         Reading MAINTENANCE_DATABASE_URL would hand it the writer's role whenever a \
+         sibling job exports that variable.",
+    ),
+    (
         "scripts/lib/tiered_enrichment.py",
         "Single-claim debug lookup by operator-supplied UUID, on a login the operator names \
          with --database-url (required; not read from the environment). Not a corpus \
          enumeration and not a write path, so FORCE has nothing to truncate here.",
+    ),
+    (
+        "scripts/tests/test_screen_public_claims_db.py",
+        "A pytest DB arm, not an operator script: its fixture connects only to the \
+         CI-provisioned disposable database named by DEDUP_TEST_DATABASE_URL, refuses any \
+         name not ending in _test, and seeds and removes its own claims as the harness \
+         superuser. The screen under test runs on the maintenance login (tests/db_roles.py).",
     ),
     (
         "scripts/tests/test_migrate_provenance_bba_db.py",
@@ -174,6 +189,14 @@ const EXEMPT: &[(&str, &str)] = &[
          _test (the tests/dedup guard), and seeds and removes its own fixture rows as the \
          harness superuser, which it needs to retract a row through migration 184's definer \
          on a stamped epigraph_app session.",
+    ),
+    (
+        "scripts/tests/test_link_mass_function_evidence_db.py",
+        "A pytest DB arm, not an operator script: its fixture connects only to the \
+         CI-provisioned disposable database named by DEDUP_TEST_DATABASE_URL, refuses any \
+         name not ending in _test, and seeds and removes its own rows as the harness \
+         superuser (it retracts one through migration 184's definer). The script under \
+         test runs on the maintenance login (tests/db_roles.py).",
     ),
 ];
 

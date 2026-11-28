@@ -50,7 +50,6 @@ pub mod errors;
 pub mod frame;
 pub mod mass;
 pub mod measures;
-pub mod monoid;
 
 // Re-export primary types
 pub use errors::DsError;
@@ -58,9 +57,4 @@ pub use frame::FrameOfDiscernment;
 pub use mass::{focal_serde, FocalElement, MassFunction};
 
 // Re-export combination types
-pub use combination::{
-    select_combination_rule, CombinationMethod, CombinationReport, CombinationRule,
-};
-
-// Re-export monoid types
-pub use monoid::{fold_monoid, ConjunctiveMonoid, DempsterMonoid, EpistemicMonoid};
+pub use combination::{CombinationMethod, CombinationReport, CombinationRule};

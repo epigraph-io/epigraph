@@ -1,6 +1,7 @@
 //! Claim repository for database operations
 
 use crate::errors::DbError;
+use crate::repos::claim_role::is_compound_sql;
 use crate::repos::edge_signature::EdgeSigningKey;
 use crate::repos::vector_scan::{
     begin_exact_vector_scan, begin_iterative_hnsw, exact_retry_or_first_pass,
@@ -59,12 +60,36 @@ pub(crate) const EFFECTIVE_BELIEF_SCORE_SQL: &str =
 /// embedded population" and "is its vector missing right now" are different
 /// questions, and `claim_text_for_embedding`'s caller already holds a row it
 /// intends to (re)embed.
+///
+/// The two telemetry clauses (`'telemetry' = ANY(labels)`, `properties->>'event'
+/// IS NOT NULL`) are ONE rule with [`is_telemetry_shaped`], which applies them
+/// to a claim that is not a row yet (the `POST /submit/packet` embed). Change
+/// both together: a write path that skipped less than this predicate would pay
+/// to embed claims the enumerator never would, and one that skipped more would
+/// leave a gap the enumerator then fills.
 const EMBEDDABLE_POPULATION: &str = "COALESCE(is_current, true) = true \
      AND NOT ('telemetry' = ANY(labels)) \
      AND (properties->>'event') IS NULL \
      AND NOT EXISTS ( \
          SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
      )";
+
+/// Whether a claim with these `labels` and `properties` is telemetry-shaped,
+/// and so outside the embedded population: it carries the exact label
+/// `telemetry`, or its `properties` is a JSON object with a non-null `event`
+/// key (any value, of any JSON type).
+///
+/// The in-memory half of [`EMBEDDABLE_POPULATION`]'s two telemetry clauses, one
+/// rule in two languages: `'telemetry' = ANY(labels)` is the label test, and
+/// `(properties->>'event') IS NOT NULL` is the event test (`->>` yields NULL for
+/// a missing key, a JSON `null`, and a non-object `properties`, and text for any
+/// other value). Change both together.
+pub fn is_telemetry_shaped(labels: &[String], properties: Option<&serde_json::Value>) -> bool {
+    labels.iter().any(|l| l == "telemetry")
+        || properties
+            .and_then(|p| p.get("event"))
+            .is_some_and(|e| !e.is_null())
+}
 
 /// `hnsw.ef_search` for a hybrid dense leg of `candidate_pool` rows: the pool
 /// itself, clamped to pgvector's default (40) below and its maximum (1000)
@@ -4156,6 +4181,17 @@ impl ClaimRepository {
     /// gate that distinguishes this from plain semantic search; `domain`, when
     /// `Some`, restricts to claims carrying that label.
     ///
+    /// Both the gate and the truth term read a NON-compound's `truth_value`
+    /// only (backlog ef58c6ad). Under a gate (`min_truth > 0`, and the route
+    /// defaults to 0.7) a compound (`claim_role::IS_COMPOUND_SQL`) is
+    /// EXCLUDED: it has no belief of its own to reach the gate, and "compound"
+    /// is `decomposes_to` structure any `edges:write` caller can add between
+    /// two public claims, so letting it through ungated would let that caller
+    /// put a refuted claim into the LLM's context. At `min_truth <= 0` a
+    /// compound is kept and scores `similarity * 0.6 + min(edge_count / 10, 1)
+    /// * 0.2`, ranking after a non-compound of equal score; its row still
+    /// reports its stored `truth_value`.
+    ///
     /// # Why this is here and not in `routes/rag.rs`
     ///
     /// Until PR-07 this statement was inline in the handler with no visibility
@@ -4185,8 +4221,16 @@ impl ClaimRepository {
         domain: Option<&str>,
         limit: i64,
     ) -> Result<Vec<RagContextHit>, DbError> {
+        // Role-aware (backlog ef58c6ad): a compound's cached `truth_value` is
+        // a fold of its own BBAs, not a belief. A gate (`$2 > 0`) fails
+        // closed on it (excluded, never passed ungated), and it is applied in
+        // `base`, truth test first, so a row it prunes never pays for the
+        // `edge_count` subquery. A compound kept at `$2 <= 0` scores with no
+        // truth term (similarity and connectivity alone); on an equal score
+        // the non-compound ranks first.
         let sql = viewer.splice(
-            r#"
+            &format!(
+                r#"
             WITH query_vec AS (
                 SELECT $1::vector AS vec
             ),
@@ -4204,24 +4248,27 @@ impl ClaimRepository {
                         SELECT COUNT(*)
                         FROM edges e
                         WHERE (e.source_id = c.id OR e.target_id = c.id)
-                          /* {EDGE_VISIBILITY:e} */
-                    ), 0) as edge_count
+                          /* {{EDGE_VISIBILITY:e}} */
+                    ), 0) as edge_count,
+                    {compound} AS is_compound
                 FROM claims c, query_vec q
                 WHERE c.embedding IS NOT NULL
-                  AND c.truth_value >= $2
+                  AND ($2 <= 0 OR (c.truth_value >= $2 AND NOT {compound}))
                   AND 1 - (c.embedding <=> q.vec) >= 0.0
                   AND ($3::text IS NULL OR $3 = ANY(c.labels))
-                  /* {VISIBILITY:c} */
+                  /* {{VISIBILITY:c}} */
             )
             SELECT *,
                 similarity * 0.6
-                    + truth_value * 0.2
+                    + CASE WHEN is_compound THEN 0.0 ELSE truth_value * 0.2 END
                     + LEAST(edge_count::float / 10.0, 1.0) * 0.2
                 as hybrid_score
             FROM base
-            ORDER BY hybrid_score DESC
+            ORDER BY hybrid_score DESC, is_compound
             LIMIT $4
             "#,
+                compound = is_compound_sql("c"),
+            ),
             5,
         );
         let mut q = sqlx::query_as::<_, RagContextHit>(&sql)
@@ -5756,96 +5803,6 @@ impl ClaimRepository {
         }
     }
 
-    /// Get claims with truth value above a threshold
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
-    pub async fn get_high_truth<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        threshold: f64,
-    ) -> Result<Vec<Claim>, DbError> {
-        // MACRO SITE — static three-bind spelling; see `get_by_id`.
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims
-            WHERE truth_value >= $1
-              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
-            ORDER BY truth_value DESC, created_at DESC
-            "#,
-            threshold,
-            viewer.bypass_bind(),
-            viewer.group_bind().unwrap_or(&[]),
-        )
-        .fetch_all(executor)
-        .await?;
-
-        let mut claims = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let truth_value = TruthValue::new(row.truth_value)?;
-
-            claims.push(claim_from_row(
-                row.id,
-                row.content,
-                row.agent_id,
-                row.trace_id,
-                truth_value,
-                row.created_at,
-                row.updated_at,
-            ));
-        }
-
-        Ok(claims)
-    }
-
-    /// Get claims with truth value below a threshold
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
-    pub async fn get_low_truth<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        threshold: f64,
-    ) -> Result<Vec<Claim>, DbError> {
-        // MACRO SITE — static three-bind spelling; see `get_by_id`.
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims
-            WHERE truth_value <= $1
-              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
-            ORDER BY truth_value ASC, created_at DESC
-            "#,
-            threshold,
-            viewer.bypass_bind(),
-            viewer.group_bind().unwrap_or(&[]),
-        )
-        .fetch_all(executor)
-        .await?;
-
-        let mut claims = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let truth_value = TruthValue::new(row.truth_value)?;
-
-            claims.push(claim_from_row(
-                row.id,
-                row.content,
-                row.agent_id,
-                row.trace_id,
-                truth_value,
-                row.created_at,
-                row.updated_at,
-            ));
-        }
-
-        Ok(claims)
-    }
-
     /// Delete a claim by ID
     ///
     /// # Returns
@@ -6065,10 +6022,24 @@ impl ClaimRepository {
     /// The bind indices differ (`$10` for the count, `$14` after
     /// `LIMIT`/`OFFSET` and the cursor), so the viewer half of these two
     /// statements could never have been literally shared anyway.
+    ///
+    /// # The truth gate is NOT in here either: it is role-aware
+    ///
+    /// `$2` / `$3` (`truth_min` / `truth_max`) gate a claim's cached
+    /// `truth_value`, which for a compound is a fold of its own BBAs rather
+    /// than a belief (backlog ef58c6ad). Only a non-compound can meet a
+    /// bound, so under a non-vacuous bound a compound is EXCLUDED (fail
+    /// closed): "compound" is `decomposes_to` structure that any
+    /// `edges:write` caller can add between two public claims, and a compound
+    /// that passed ungated would let that caller push a claim past a bound
+    /// its value fails. A vacuous bound (`truth_min <= 0`, `truth_max >= 1`)
+    /// gates nothing and lists compounds too. Deciding that needs
+    /// `claim_role::IS_COMPOUND_SQL` rendered over the row, which a `const`
+    /// cannot hold, so [`Self::filter_where`] appends the gate to this
+    /// clause; both methods take the clause from it, and the one clause and
+    /// one bind order still hold.
     const FILTER_WHERE: &'static str = r#"
             WHERE ($1::text IS NULL OR content ILIKE $1)
-              AND ($2::float8 IS NULL OR truth_value >= $2)
-              AND ($3::float8 IS NULL OR truth_value <= $3)
               AND ($4::uuid IS NULL OR agent_id = $4)
               AND ($5::uuid IS NULL OR agent_id <> $5)
               AND ($6::bool IS NULL OR COALESCE(is_current, true) = $6)
@@ -6077,7 +6048,23 @@ impl ClaimRepository {
               AND ($9::uuid[] IS NULL OR id = ANY($9))
     "#;
 
-    /// Bind `$1..$9` of [`Self::FILTER_WHERE`], in order.
+    /// [`Self::FILTER_WHERE`] with the role-aware truth gate on `$2` / `$3`:
+    /// a non-compound is gated on its `truth_value`; a compound
+    /// (`claim_role::IS_COMPOUND_SQL` over the unaliased `claims` row) fails
+    /// any non-vacuous bound and passes a vacuous one. The ONE `WHERE` clause
+    /// [`Self::list_filtered`] and [`Self::count_filtered`] share.
+    fn filter_where() -> String {
+        let compound = is_compound_sql("claims");
+        format!(
+            "{base}  AND ($2::float8 IS NULL OR $2 <= 0 \
+                    OR (claims.truth_value >= $2 AND NOT {compound})) \
+               AND ($3::float8 IS NULL OR $3 >= 1 \
+                    OR (claims.truth_value <= $3 AND NOT {compound}))\n",
+            base = Self::FILTER_WHERE,
+        )
+    }
+
+    /// Bind `$1..$9` of [`Self::filter_where`], in order.
     ///
     /// Generic over the query type so `query_as` (rows) and `query_scalar`
     /// (count) share one implementation — the binds cannot diverge between
@@ -6154,7 +6141,7 @@ impl ClaimRepository {
         let sql = viewer.splice(
             &format!(
                 "SELECT COUNT(*) FROM claims{where_clause}\n              /* {{VISIBILITY:claims}} */",
-                where_clause = Self::FILTER_WHERE,
+                where_clause = Self::filter_where(),
             ),
             10,
         );
@@ -6220,13 +6207,20 @@ impl ClaimRepository {
             supersedes: Option<Uuid>,
         }
 
-        let sort_column = match filter.sort_by {
-            ClaimSortField::CreatedAt => "created_at",
-            ClaimSortField::TruthValue => "truth_value",
-        };
         let (direction, past) = match filter.sort_order {
             ClaimSortOrder::Desc => ("DESC", "<"),
             ClaimSortOrder::Asc => ("ASC", ">"),
+        };
+        // A `truth_value` sort ranks non-compounds only (backlog ef58c6ad): a
+        // compound's cached value is no belief, so every compound comes after
+        // the non-compounds in either direction, ordered among themselves by
+        // `id` alone.
+        let sort_column = match filter.sort_by {
+            ClaimSortField::CreatedAt => "created_at".to_string(),
+            ClaimSortField::TruthValue => {
+                let compound = is_compound_sql("claims");
+                format!("{compound}, CASE WHEN {compound} THEN NULL ELSE claims.truth_value END")
+            }
         };
         if filter.after.is_some() && filter.sort_by != ClaimSortField::CreatedAt {
             return Err(DbError::InvalidData {
@@ -6252,7 +6246,7 @@ impl ClaimRepository {
             ORDER BY {sort_column} {direction}, id {direction}
             LIMIT $10 OFFSET $11
             "#,
-                where_clause = Self::FILTER_WHERE,
+                where_clause = Self::filter_where(),
             ),
             14,
         );
@@ -6820,7 +6814,10 @@ impl ClaimRepository {
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
     /// Results are ordered by `(created_at DESC, id DESC)`, a total order, and
-    /// filtered by optional truth threshold.
+    /// filtered by optional truth threshold. Only a non-compound can meet
+    /// it: under a gate (`min_truth > 0`) a compound
+    /// (`claim_role::IS_COMPOUND_SQL`) is excluded, fail closed; at the
+    /// default `0` every labelled claim, compounds included, is listed.
     ///
     /// # Paging
     /// - `after` (keyset, preferred): rows strictly after a [`LabelCursor`]
@@ -6882,21 +6879,30 @@ impl ClaimRepository {
 
         let limit = limit.clamp(1, 1000);
         let offset = offset.max(0);
+        // Role-aware, fail closed (backlog ef58c6ad): a compound's cached
+        // `truth_value` is a fold of its own BBAs, not a belief, so under a
+        // gate (`$2 > 0`) it is excluded rather than passed ungated. Passing
+        // it would let any `edges:write` caller, by adding one
+        // `decomposes_to` edge, list a public claim whose value fails the
+        // gate. At `$2 <= 0` (the default) every compound is listed.
         let sql = viewer.splice(
-            r#"
+            &format!(
+                r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
                    c.created_at, c.updated_at, c.labels, c.is_current, c.supersedes
             FROM claims c
             WHERE c.labels @> $1
-              AND c.truth_value >= $2
-              AND ($3::text[] = '{}'::text[] OR NOT (c.labels && $3))
+              AND ($2 <= 0 OR (c.truth_value >= $2 AND NOT {compound}))
+              AND ($3::text[] = '{{}}'::text[] OR NOT (c.labels && $3))
               AND ($4 = false OR COALESCE(c.is_current, true) = true)
               AND ($7::timestamptz IS NULL OR (c.created_at, c.id) < ($7::timestamptz, $8::uuid))
-              /* {VISIBILITY:c} */
+              /* {{VISIBILITY:c}} */
             ORDER BY c.created_at DESC, c.id DESC
             LIMIT $5
             OFFSET $6
             "#,
+                compound = is_compound_sql("c"),
+            ),
             9,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
@@ -11699,6 +11705,41 @@ pub struct ClaimDispute {
 mod tests {
     use super::*;
 
+    /// [`is_telemetry_shaped`] against the cases on which `EMBEDDABLE_POPULATION`'s
+    /// telemetry clauses decide: exact-case label, an `event` of any non-null
+    /// JSON type, a JSON-null `event`, and a `properties` that is not an object.
+    #[test]
+    fn is_telemetry_shaped_matches_the_population_predicate() {
+        use serde_json::json;
+        let none: &[String] = &[];
+        let labelled = ["src:host".to_string(), "telemetry".to_string()];
+        let cases: [(&[String], Option<serde_json::Value>, bool); 12] = [
+            (none, None, false),
+            (none, Some(json!({})), false),
+            (none, Some(json!({"kind": "note"})), false),
+            (none, Some(json!({"event": null})), false),
+            (none, Some(json!({"event": "some_future_event"})), true),
+            (none, Some(json!({"event": "container_exited"})), true),
+            (none, Some(json!({"event": 0})), true),
+            (none, Some(json!({"event": false})), true),
+            (none, Some(json!({"event": {"kind": "x"}})), true),
+            (none, Some(json!(["event"])), false),
+            (&labelled, None, true),
+            (
+                &["Telemetry".to_string(), "telemetry-adjacent".to_string()],
+                None,
+                false,
+            ),
+        ];
+        for (labels, properties, expected) in cases {
+            assert_eq!(
+                is_telemetry_shaped(labels, properties.as_ref()),
+                expected,
+                "labels {labels:?}, properties {properties:?}"
+            );
+        }
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_claim_crud(_pool: sqlx::PgPool) {
         // Placeholder: full CRUD coverage is in tests/claim_tests.rs
@@ -13230,11 +13271,13 @@ impl ClaimRepository {
     ///
     /// That matters for two distinct reasons, confirmed by
     /// `docs/audits/audit-edge-collision-mark-duplicate.md`:
-    /// - `alternative_of` carries a symmetric partial unique index
-    ///   (`edges_alternative_of_symmetric_uniq`, migration 042), so a collision
-    ///   is a HARD error that rolls the whole merge back. Because the index is
-    ///   keyed on `(LEAST, GREATEST)` it is direction-agnostic, so those edges
-    ///   are deduped ignoring direction.
+    /// - The pair-unique relationships ([`crate::PAIR_UNIQUE_RELATIONSHIPS`]:
+    ///   `alternative_of`, `edges_alternative_of_symmetric_uniq`, migration
+    ///   042; `shifted_to`, `edges_shifted_to_pair_uniq`, migration 358) carry
+    ///   a partial unique index, so a collision is a HARD error that rolls the
+    ///   whole merge back. Because each index is keyed on `(LEAST, GREATEST)`
+    ///   it is direction-agnostic, so those edges are deduped ignoring
+    ///   direction (per relationship).
     /// - Every other relationship collides SILENTLY (migration 018 dropped the
     ///   triple-uniqueness constraint and nothing re-added it), producing
     ///   duplicate rows that feed the same Dempster-Shafer mass twice through
@@ -13944,16 +13987,24 @@ async fn migrate_consolidated_edges(
         } else {
             (*source_id, source_type.clone())
         };
-        // alternative_of's unique index is keyed on (LEAST, GREATEST) and
-        // is therefore direction-agnostic; every other relationship
-        // duplicates per-direction.
-        let direction = if relationship == "alternative_of" {
-            0
-        } else if src_in {
-            1
-        } else {
-            -1
-        };
+        // A pair-unique relationship (`alternative_of`, 042/091; `shifted_to`,
+        // 358; see [`crate::PAIR_UNIQUE_RELATIONSHIPS`]) carries a unique
+        // index keyed on (LEAST, GREATEST), so it is direction-agnostic: two
+        // of its edges between the merged claim and one third claim collide
+        // even when oriented oppositely, so they share ONE slot. That holds
+        // for `shifted_to` although the relationship itself is directional:
+        // the INDEX decides, not what the edge means. Every other
+        // relationship duplicates per-direction. The relationship stays in
+        // the key, so two different pair-unique relationships over one pair
+        // (separate partial indexes) never take each other's slot.
+        let direction =
+            if crate::repos::edge::PAIR_UNIQUE_RELATIONSHIPS.contains(&relationship.as_str()) {
+                0
+            } else if src_in {
+                1
+            } else {
+                -1
+            };
         let key = (other, other_type, relationship.clone(), direction);
         if seen.insert(key) {
             survivors.push(*id);
@@ -14722,32 +14773,43 @@ async fn repair_marked_duplicate(
         .await?,
     );
 
-    // Symmetric-collision guard for `alternative_of` (migration 042).
+    // Pair-key collision guard for every relationship with a
+    // direction-agnostic partial unique index: `alternative_of` (042/091) and
+    // `shifted_to` (358). [`crate::PAIR_UNIQUE_RELATIONSHIPS`] is the one list
+    // this site and `consolidate` both read.
     //
-    // That relationship is governed by `edges_alternative_of_symmetric_uniq`,
-    // a UNIQUE index on `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`
-    // — so the pair {A,B} is unique *regardless of direction*.  The two
-    // directional pre-deletes above only recognise same-`(source,target,
-    // relationship)` triples, so they miss the case where `dup` and
-    // `canonical` are joined to a common third claim T by `alternative_of`
-    // edges of *opposite* orientation (e.g. `dup→T` and `T→canonical`).
-    // Migrating `dup→canonical` would then rewrite `dup→T` into `canonical→T`,
-    // whose symmetric key {canonical,T} collides with the existing `T→canonical`
-    // edge, tripping the unique index and rolling the whole transaction back
-    // before `is_current` is flipped (backlog 2905150e / issue #286).
+    // Those indexes are keyed on
+    // `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`, so the
+    // pair {A,B} is unique *regardless of direction*, for `shifted_to` too
+    // although that relationship is directional.  The two directional
+    // pre-deletes above only recognise same-`(source,target,relationship)`
+    // triples, so they miss the case where `dup` and `canonical` are joined
+    // to a common third claim T by edges of *opposite* orientation (e.g.
+    // `dup→T` and `T→canonical`).  Migrating `dup→canonical` would then
+    // rewrite `dup→T` into `canonical→T`, whose pair key {canonical,T}
+    // collides with the existing `T→canonical` edge, tripping the unique
+    // index and rolling the whole transaction back before `is_current` is
+    // flipped (backlog 2905150e / issue #286).
     //
-    // Pre-delete the redundant dup-side `alternative_of` edge whenever
-    // `canonical` already shares a symmetric `alternative_of` edge with the
-    // same third claim.  Edges where `canonical` is itself an endpoint are
-    // left for the self-loop guards in the migration UPDATEs below. An
-    // INCOMING (`T→dup`) edge carrying the act marker is left alone: the
-    // incoming re-point keeps it on the duplicate, so it cannot collide (as
-    // in the incoming guard above).
+    // Retract the redundant dup-side edge whenever `canonical` already
+    // shares an edge OF THE SAME RELATIONSHIP with the same third claim.
+    // `e2.relationship = e.relationship`, not a second `ANY($5)`: the indexes
+    // are PER-relationship partial indexes, so an `alternative_of` and a
+    // `shifted_to` edge over one pair do not collide, and neither may retract
+    // the other.  Edges where `canonical` is itself an endpoint are left for
+    // the self-loop guards in the migration UPDATEs below. An INCOMING
+    // (`T→dup`) edge carrying the act marker is left alone: the incoming
+    // re-point keeps it on the duplicate, so it cannot collide (as in the
+    // incoming guard above).
+    let pair_unique: Vec<String> = crate::repos::edge::PAIR_UNIQUE_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     deleted_edges.extend(
         sqlx::query_as::<_, (Uuid, Uuid)>(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
              UPDATE edges AS e SET valid_to = now()
-             WHERE e.relationship = 'alternative_of'
+             WHERE e.relationship = ANY($5)
              AND e.valid_to IS NULL
              AND e.source_type = 'claim' AND e.target_type = 'claim'
              AND (e.source_id = $2 OR e.target_id = $2)
@@ -14755,7 +14817,7 @@ async fn repair_marked_duplicate(
              AND NOT (e.target_id = $2 AND COALESCE(e.properties->>$4 = ANY($3), false))
              AND EXISTS (
              SELECT 1 FROM edges e2
-             WHERE e2.relationship = 'alternative_of'
+             WHERE e2.relationship = e.relationship
              AND e2.source_type = 'claim' AND e2.target_type = 'claim'
              AND e2.id <> e.id
              AND (e2.valid_to IS NULL OR e2.valid_to > now())
@@ -14770,6 +14832,7 @@ async fn repair_marked_duplicate(
         .bind(dup_uuid)
         .bind(&act_tools)
         .bind(SUPERSEDE_ACT_PROPERTY)
+        .bind(&pair_unique)
         .fetch_all(&mut *conn)
         .await?,
     );

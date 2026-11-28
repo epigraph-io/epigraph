@@ -76,6 +76,8 @@
 //! sites (`emit_verb_edge_best_effort`, `create_edge_under_savepoint`, the
 //! `EdgeRepository` primitives), so their callers are covered through them.
 
+mod source_files;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -671,19 +673,14 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
-    // 4 each: the walk's two unmarked edge writes (an unmapped plan edge and
-    // the processed_by stamp), plus the ingest record after the paper's
-    // asserts edge on the created and on the converged branch. The marked
-    // edges go through `create_ingest_written_edge_if_absent_conn`.
+    // The one document walk (the full and the spine ingests, backlog
+    // 3716a30b): its two unmarked edge writes (an unmapped plan edge and the
+    // processed_by stamp), plus the ingest record after the paper's asserts
+    // edge on the created and on the converged branch. The marked edges go
+    // through `create_ingest_written_edge_if_absent_conn`.
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "ingest_document_walk_reporting",
-        4,
-        Signed,
-    ),
-    site(
-        "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_spine",
+        "walk_document",
         4,
         Signed,
     ),
@@ -835,6 +832,12 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// `(file, fn) -> (count, body)` over every crate's `src/`.
 fn measure() -> BTreeMap<(String, String), (usize, String)> {
+    measure_files(&workspace_sources())
+}
+
+/// `(workspace-relative path, text)` for every `.rs` under every crate's
+/// `src/`.
+fn workspace_sources() -> Vec<(String, String)> {
     let root = workspace_root();
     let mut crates: Vec<_> = std::fs::read_dir(root.join("crates"))
         .expect("crates/")
@@ -842,7 +845,7 @@ fn measure() -> BTreeMap<(String, String), (usize, String)> {
         .map(|e| e.path())
         .collect();
     crates.sort();
-    let mut out = BTreeMap::new();
+    let mut out = Vec::new();
     for krate in crates {
         let mut files = Vec::new();
         rs_files(&krate.join("src"), &mut files);
@@ -852,12 +855,28 @@ fn measure() -> BTreeMap<(String, String), (usize, String)> {
                 .expect("under the root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            let src = std::fs::read_to_string(&f).expect("read source");
-            let scan = scan_source(&src);
-            for (func, n) in scan.sites {
-                let body = scan.bodies.get(&func).cloned().unwrap_or_default();
-                out.insert((rel.clone(), func), (n, body));
-            }
+            out.push((rel, std::fs::read_to_string(&f).expect("read source")));
+        }
+    }
+    out
+}
+
+/// [`measure`] over given sources. A file inside a split module's directory
+/// keys as the module's registered file (`source_files::module_key`), and the
+/// sites of one `(file, fn)` key are SUMMED across files and their bodies
+/// joined, exactly as two same-named fns in one file are, so a move never
+/// overwrites a site.
+fn measure_files(files: &[(String, String)]) -> BTreeMap<(String, String), (usize, String)> {
+    let mut out: BTreeMap<(String, String), (usize, String)> = BTreeMap::new();
+    for (rel, src) in files {
+        let scan = scan_source(src);
+        for (func, n) in scan.sites {
+            let body = scan.bodies.get(&func).cloned().unwrap_or_default();
+            let e = out
+                .entry((source_files::module_key(rel), func))
+                .or_default();
+            e.0 += n;
+            e.1.push_str(&body);
         }
     }
     out
@@ -1379,4 +1398,27 @@ mod tests {
             key.1
         );
     }
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: every edge-emitting site in the moved code keys
+/// under the registered path, and the register still holds. Fails on a
+/// measurement keyed by the raw file path, or one that overwrites a key.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let files = workspace_sources();
+    let split = source_files::split_module(&files, "crates/epigraph-db/src/repos/claim.rs");
+    assert!(split
+        .iter()
+        .any(|(p, _)| p.ends_with("/repos/claim/split_probe.rs")));
+    let measured = measure_files(&split);
+    assert_eq!(measured, measure_files(&files));
+    let problems = check(
+        &measured,
+        REGISTER,
+        &measure_migrations(),
+        DB_REGISTER,
+        UNSIGNED_SITES_HIGH_WATER,
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

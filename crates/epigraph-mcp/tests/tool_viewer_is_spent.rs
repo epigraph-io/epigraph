@@ -1235,11 +1235,21 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
     // migration 246 `PaperRepository::get_or_create_stored` writes `papers` in the ingest's declared
     // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`; since
-    // backlog b995f117 it is the only write of that row on the detached path too. The body of
-    // `do_ingest_document_reporting` (a thin wrapper now, with no SQL of its own).
+    // backlog b995f117 it is the only write of that row on the detached path too. The one
+    // document walk (backlog 3716a30b): the full ingests (`do_ingest_document_reporting`,
+    // `ingest_document_walk`) and the spine ingest (`do_ingest_document_spine`) are thin
+    // wrappers over it, with no SQL of their own; the spine level takes no atom lock and
+    // opens no second (DS) transaction, but the calls are the same fn's. stamped:
+    // `ingest_plan_for_scope` (backlog 8f56a641) reads `PaperRepository::asserted_claims_conn`
+    // on the same stamped transaction, for the paper row the walk got or created in its own
+    // declared scope: the ids that scope's earlier ingest of the document recorded; then
+    // `PaperRepository::own_group_legacy_claims_conn`, the owning group's own non-public rows
+    // under the global plan's ids or hashes (scoped in its SQL), for a pre-246 ingest; then
+    // `PaperRepository::public_twin_recorded_claims_conn`, what the document key's public row
+    // recorded, gated and filtered to the group's own and public rows in its SQL.
     (
         "ingestion.rs",
-        "ingest_document_walk_reporting",
+        "walk_document",
         &[
             "ClaimIngestRepository::record_signed_conn",
             "ClaimIngestRepository::record_signed_conn",
@@ -1259,45 +1269,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
             "epigraph_db::create_ingest_written_edge_if_absent_conn",
-            "label_resolved_claim",
-            "persist_planned_claim",
-            "resolve_ingest_visibility",
-            "spawn_ingest_embeds",
-        ],
-    ),
-    // write: `ClaimIngestRepository::record_signed_conn`,
-    // `ClaimRepository::set_properties_conn`, `ClaimRepository::update_labels_conn`,
-    // `ClaimRepository::update_trace_id_conn`,
-    // `EdgeRepository::create_if_absent_including_retracted_signed_conn`,
-    // `EdgeRepository::create_processed_by_stamp_if_absent_signed_conn`,
-    // `EvidenceRepository::create`, `PaperRepository::get_or_create_stored`,
-    // `ReasoningTraceRepository::create`,
-    // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
-    // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
-    // `resolve_ingest_visibility`; stamped: `PaperRepository::licence`, read by the id the
-    // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
-    // migration 246 `PaperRepository::get_or_create_stored` writes `papers` in the ingest's declared
-    // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`.
-    (
-        "ingestion.rs",
-        "do_ingest_document_spine",
-        &[
-            "ClaimIngestRepository::record_signed_conn",
-            "ClaimIngestRepository::record_signed_conn",
-            "ClaimRepository::set_properties_conn",
-            "ClaimRepository::update_labels_conn",
-            "ClaimRepository::update_trace_id_conn",
-            "EdgeRepository::create_if_absent_including_retracted_signed_conn",
-            "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn",
-            "EvidenceRepository::create",
-            "PaperRepository::get_or_create_stored",
-            "PaperRepository::licence",
-            "ReasoningTraceRepository::create",
-            "begin_ingest_tx",
-            "epigraph_db::create_ingest_written_edge_if_absent_conn",
-            "epigraph_db::create_ingest_written_edge_if_absent_conn",
-            "epigraph_db::create_ingest_written_edge_if_absent_conn",
-            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "ingest_plan_for_scope",
             "label_resolved_claim",
             "persist_planned_claim",
             "resolve_ingest_visibility",
@@ -1391,7 +1363,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // write: `EdgeRepository::create_if_not_exists_signed_conn`,
     // `EdgeRepository::create_symmetric_if_absent_oriented_signed_conn`; opener:
     // `claim_helper::begin_author_stamped_tx`; authority: `EdgeRepository::owned_by_session`;
-    // stamped: `EdgeRepository::is_in_force`; audit: `EventRepository::publish_or_log_conn`.
+    // stamped: `EdgeRepository::is_in_force`, `contradiction_guard::decide` (backlog b4c2fc2f:
+    // the compound-target decomposition test for a `contradicts` / `refutes` edge, read on the
+    // author-stamped transaction before any write; the text it screens is the target the caller
+    // already read through the viewer); audit: `EventRepository::publish_or_log_conn`.
     (
         "link_epistemic.rs",
         "do_link_epistemic",
@@ -1402,6 +1377,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::owned_by_session",
             "EventRepository::publish_or_log_conn",
             "claim_helper::begin_author_stamped_tx",
+            "contradiction_guard::decide",
         ],
     ),
     // write: `EdgeRepository::create_if_not_exists_signed_conn`,
@@ -1581,7 +1557,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // claim was read or created through the viewer.
     // resolves: `Viewer::resolve`.
     (
-        "src/claim_helper.rs",
+        "epigraph-service/src/ctx.rs",
         "author_write_authority",
         &["Viewer::resolve"],
     ),
@@ -2027,26 +2003,41 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
 /// the viewer into one would count as viewed with the helper's own body never
 /// read. `server.rs` is left out: its `#[tool]` methods take `&self` and only
 /// resolve the viewer and delegate to `src/tools/` (measured 2026-11-22).
+///
+/// The service crate's root files are read too, keyed
+/// `epigraph-service/src/<name>.rs`: the tenancy entry points the tools hand
+/// their viewer and their server to (`author_write_authority`, `read_as`,
+/// `write_identity`) moved there from `claim_helper.rs`, `tools/viewer.rs` and
+/// `server.rs` (backlog 30133ca8), and a scan of this crate alone would stop
+/// reading their bodies.
 fn root_files() -> Vec<(String, String)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read src dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
+    let roots = [
+        (Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), "src"),
+        (
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../epigraph-service/src"),
+            "epigraph-service/src",
+        ),
+    ];
+    for (dir, key) in roots {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("utf-8 file name")
+                .to_string();
+            if key == "src" && name == "server.rs" {
+                continue;
+            }
+            out.push((
+                format!("{key}/{name}"),
+                std::fs::read_to_string(&path).expect("read src file"),
+            ));
         }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf-8 file name")
-            .to_string();
-        if name == "server.rs" {
-            continue;
-        }
-        out.push((
-            format!("src/{name}"),
-            std::fs::read_to_string(&path).expect("read src file"),
-        ));
     }
     out.sort();
     out

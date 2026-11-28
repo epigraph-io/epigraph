@@ -9,6 +9,12 @@
 //! belief program will consume (class weights, the testimonial ceiling and
 //! its policies, forecasts, necessity, test-selection interest).
 //!
+//! A profile change is a cache event (backlog 4d14e902, ruling a2162099): a
+//! changed calibration file gets the cohort recompute in `docs/deploy.md`
+//! ("Every upgrade: a calibration change needs a belief recompute"), and the
+//! operator override writer (backlog 8773a687) must enqueue the affected
+//! frame's recompute in the same act as the write.
+//!
 //! # Resolution
 //!
 //! Each parameter is resolved through the same tier chain the per-BBA

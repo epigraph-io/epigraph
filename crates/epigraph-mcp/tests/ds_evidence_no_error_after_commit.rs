@@ -166,3 +166,83 @@ async fn a_caller_who_cannot_read_the_claim_gets_error_with_nothing_written(pool
     let res = tools::ds::submit_ds_evidence(&server, &viewer, params(claim, frame), None).await;
     assert_no_error_with_commit(&pool, claim, &res).await;
 }
+
+/// The claim's cached DS columns, as text, so "unchanged" compares every one.
+async fn cached_belief(pool: &PgPool, claim: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT row(belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing)::text
+         FROM claims WHERE id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Backlog 5d37eb67. The arm above accepts either outcome; this one pins the
+/// refusal itself. A caller who cannot read the claim (here, the public
+/// viewer over the server agent's group-private claim) is refused before
+/// anything is written, and the refusal is the one a NONEXISTENT claim id
+/// gets (same code, same message once the id is substituted, same data), so
+/// the answer cannot tell an unreadable claim from a missing one. The claim's
+/// cached belief does not move, and a repeat call writes nothing either. The
+/// owner arm (`an_own_group_claim_on_an_app_role_pool_is_not_error_with_commit`)
+/// is the control: the same claim and frame succeed for a caller who can read
+/// the claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreadable_claim_is_refused_exactly_as_a_nonexistent_one(pool: PgPool) {
+    let scoped = fixture::scoped_pool(&pool).await;
+    let (_agent, claim, frame) = plant(&pool, &scoped).await;
+    // A non-null cache, so "unchanged" is not just NULL staying NULL.
+    sqlx::query(
+        "UPDATE claims SET belief = 0.3, plausibility = 0.7, mass_on_empty = 0.05,
+                pignistic_prob = 0.5, mass_on_missing = 0.1
+         WHERE id = $1",
+    )
+    .bind(claim)
+    .execute(&pool)
+    .await
+    .expect("seed the claim's cached belief");
+    let before = cached_belief(&pool, claim).await;
+
+    let server = server_on(pool.clone(), scoped);
+    let viewer = fixture::public_viewer(&pool).await;
+
+    let unreadable = tools::ds::submit_ds_evidence(&server, &viewer, params(claim, frame), None)
+        .await
+        .expect_err("a caller who cannot read the claim must be refused");
+    let missing_id = Uuid::new_v4();
+    let missing = tools::ds::submit_ds_evidence(&server, &viewer, params(missing_id, frame), None)
+        .await
+        .expect_err("a nonexistent claim id is refused");
+
+    assert_eq!(
+        unreadable.code, missing.code,
+        "unreadable {unreadable:?} vs nonexistent {missing:?}"
+    );
+    assert_eq!(
+        unreadable.message.replace(&claim.to_string(), "<id>"),
+        missing.message.replace(&missing_id.to_string(), "<id>"),
+        "the refusal must not tell an unreadable claim from a missing one"
+    );
+    assert!(
+        !unreadable.message.contains(&missing_id.to_string())
+            && unreadable.message.contains(&claim.to_string()),
+        "CALIBRATION: each message names its own id: {unreadable:?}"
+    );
+    assert_eq!(unreadable.data, missing.data);
+    assert_eq!(
+        cached_belief(&pool, claim).await,
+        before,
+        "a refused call must not move the claim's cached belief"
+    );
+
+    // A repeat call is refused the same way and still writes nothing.
+    let again = tools::ds::submit_ds_evidence(&server, &viewer, params(claim, frame), None)
+        .await
+        .expect_err("the repeat is refused too");
+    assert_eq!(again.code, unreadable.code);
+    assert_eq!(bbas_for(&pool, claim).await, 0, "no BBA stored");
+    assert_eq!(frame_rows_for(&pool, claim).await, 0, "no frame assignment");
+    assert_eq!(cached_belief(&pool, claim).await, before);
+}

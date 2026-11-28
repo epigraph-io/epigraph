@@ -154,6 +154,7 @@ LIGHT_TARGETS = {
         "maintenance_surface_register",
         "no_unscoped_pool",
         "personal_group_mint_ratchet",
+        "refusal_code_coverage",
         "tenancy_coverage",
         "viewer_ratchet",
         "visibility_act_callers_ratchet",
@@ -188,6 +189,9 @@ WALKERS = {
         "crates/epigraph-auth/src/*",
     ),
     "crates/epigraph-api/tests/delegated_run_token_viewer.rs": ("crates/epigraph-mcp/src/*",),
+    # Every listed crate's src and manifest, and the workspace manifest: the
+    # crate-layering register (#1163).
+    "crates/epigraph-api/tests/crate_layering_ratchet.rs": ("crates/*/src/*", "*Cargo.toml"),
     # `Viewer::public_only` is built only in routes/guest.rs: every crate's src.
     # The API's error texts, and the engine error collections it serves.
     "crates/epigraph-api/tests/error_text_ratchet.rs": ("crates/*/src/*",),
@@ -237,6 +241,9 @@ WALKERS = {
     "crates/epigraph-db/tests/no_unscoped_pool.rs": (),
     "crates/epigraph-db/tests/owner_scoped_delete.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/personal_group_mint_ratchet.rs": ("crates/*/src/*", "migrations/*"),
+    # Every coded refusal in every crate's src against the refusal_codes
+    # registry (#1168).
+    "crates/epigraph-db/tests/refusal_code_matches_ratchet.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/schema_contract.rs": (),
     # Every vector writer in every crate's src.
     "crates/epigraph-db/tests/sealed_vector_writer_ratchet.rs": ("crates/*/src/*",),
@@ -265,6 +272,12 @@ WALKERS = {
     "crates/epigraph-mcp/tests/plan_order_under_one_transaction.rs": ("crates/*/src/*",),
     "crates/epigraph-mcp/tests/raw_pool_register.rs": (),
     "crates/epigraph-mcp/tests/residual_unstamped_writes.rs": ("crates/*/src/*",),
+    # The stamp-borrow and server-agent-resolution ratchets scan every member's
+    # src since the Ctx move (#1163, #1177).
+    "crates/epigraph-mcp/tests/write_identity_ratchet.rs": ("crates/*/src/*", "tests/*/src/*"),
+    # `Ctx` is defined once; the `test-support` feature is enabled by
+    # dev-dependencies only: every member's src and every manifest (#1163).
+    "crates/epigraph-service/tests/ctx_is_the_only_definition.rs": ("crates/*/src/*", "*Cargo.toml"),
 }
 
 # Tests that read files a change can only break by deleting or renaming them,

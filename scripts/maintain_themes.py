@@ -49,14 +49,21 @@ Environment:
 
 import json
 import os
-import subprocess
 import sys
+
+# Dependencies come from the hash-locked scripts/requirements.txt, installed
+# before the job runs. A missing package is an error, never a run-time pip
+# install: that would fetch unpinned, unhashed code into the job's interpreter
+# on the host that runs it (backlog 8afe831f).
+REQUIREMENTS_HINT = (
+    "install the pinned script dependencies first: "
+    "pip install --require-hashes --only-binary :all: -r scripts/requirements.txt"
+)
 
 try:
     import requests
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "requests"])
-    import requests
+except ImportError as exc:
+    raise ImportError(f"maintain_themes.py needs requests; {REQUIREMENTS_HINT}") from exc
 
 API_URL = os.environ.get("EPIGRAPH_API_URL", "http://127.0.0.1:8080")
 # Allow --api-url override
@@ -223,10 +230,10 @@ def auto_split_theme(theme_id, theme_label, n_clusters=3, min_claims=500):
     try:
         import numpy as np
         from sklearn.cluster import MiniBatchKMeans
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "scikit-learn"])
-        import numpy as np
-        from sklearn.cluster import MiniBatchKMeans
+    except ImportError as exc:
+        raise ImportError(
+            f"auto_split_theme needs numpy and scikit-learn; {REQUIREMENTS_HINT}"
+        ) from exc
 
     # Fetch embeddings via API
     data = api_get(f"/api/v1/themes/{theme_id}/embeddings", {"limit": 5000}, timeout=600)

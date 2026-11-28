@@ -60,9 +60,16 @@
 //! refused as a cycle. The ids come from the MCP `query_compound_claims` tool
 //! or the `compound-atom` label (`atomicity_sweep`). Afterwards the
 //! re-decomposed claim is a decomposed parent, so `--retarget` moves its
-//! contradicts/refutes edges onto the new atoms; challenges (their own
-//! table) are not moved. `--apply-plan` of a `--redecompose` plan needs
-//! `--redecompose` again; without it every line is refused.
+//! contradicts/refutes edges onto the new atoms; challenges stay on the
+//! parent by design: they are reported in the manifest and listed
+//! on atoms with list_challenges include_parents. Every `--redecompose` mode
+//! that calls the LLM or writes, and every `--retarget` mode, prints one
+//! `OPEN-CHALLENGE` line per open challenge (state not accepted, rejected or
+//! withdrawn) on a parent it touched and an `open challenges:` count; a
+//! `--redecompose --plan` line and a retarget manifest entry carry them as
+//! `parent_open_challenges` (`{id, state, challenger_id}`). No challenge row
+//! is changed (backlog 122ac356). `--apply-plan` of a `--redecompose` plan
+//! needs `--redecompose` again; without it every line is refused.
 //!
 //! Two filters default ON: skip `backlog`-labelled claims
 //! (`--include-backlog`) and skip claims that look atomic, one sentence and
@@ -114,11 +121,14 @@
 //! * `--retarget` stays on the maintenance path, and `--priority conflict`'s
 //!   report of decomposed conflict parents is printed only there.
 //!
-//! Pass the agent the API token acts as (the service client's agent). The
-//! binary does not check that the two match: atoms are created as the
-//! token's agent and edges as `--as-agent`, so a mismatch splits their
-//! attribution. That is an operator check at deploy time, not a privilege
-//! question (the application login can already stamp any agent).
+//! Pass the agent the API token acts as (the service client's agent). Atoms
+//! are created as the token's agent and edges as `--as-agent`, so a writing
+//! run first asks the API which agent its token is (`GET /api/v1/agents/me`,
+//! backlog 076e94cc) and refuses, before any LLM call or write, unless it is
+//! the `--as-agent` agent. A minted token asks for `claims:read` as well,
+//! which that route needs; an API without the route (older than this binary)
+//! is refused too, so deploy the API first. A read-only mode resolves no token
+//! and makes no check.
 //!
 //! Coverage against the maintenance view (measured on a fixture in
 //! `tests/decompose_claims_as_agent.rs`):
@@ -200,10 +210,11 @@
 
 use clap::Parser;
 use epigraph_cli::decompose::{
-    atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
-    run_decomposition_batches, select_candidates, select_redecompose_candidates, verify_plan_for,
-    visible_claim_count, write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb,
-    EligibilityFilters, PlanGaps, Population, Priority, SingletonLedger,
+    atom_create_body, attach_open_challenges, open_challenges, persist_planned,
+    plan_decomposition_batches_with_gaps, read_plan_jsonl, run_decomposition_batches,
+    select_candidates, select_redecompose_candidates, verify_plan_for, visible_claim_count,
+    write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb, EligibilityFilters,
+    PlanGaps, Population, Priority, SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -796,6 +807,85 @@ fn provider_writes_to_api(provider: &str) -> bool {
     provider != "mock"
 }
 
+/// The scope `GET /api/v1/agents/me` needs; a minted `--as-agent` token asks
+/// for it besides the mode's write scope.
+const WHOAMI_SCOPE: &str = "claims:read";
+
+/// The scope a minted token asks for: the mode's write scope, plus
+/// [`WHOAMI_SCOPE`] for an `--as-agent` run, whose identity check reads
+/// `GET /api/v1/agents/me`.
+fn token_scope(mode: &Mode, as_agent: bool) -> String {
+    if as_agent {
+        format!("{} {WHOAMI_SCOPE}", mode.mint_scope())
+    } else {
+        mode.mint_scope().to_string()
+    }
+}
+
+/// Refuse unless the API token acts as `agent` (backlog 076e94cc).
+///
+/// A writing `--as-agent` run creates atoms through the API as the TOKEN's
+/// agent and writes `decomposes_to` edges stamped for `agent`. Two different
+/// agents would split one decomposition's attribution, so the run asks
+/// `GET /api/v1/agents/me` which agent the token is and refuses on any
+/// answer other than `agent`, or on no usable answer at all.
+async fn check_token_acts_as(
+    http: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    agent: uuid::Uuid,
+) -> Result<(), String> {
+    let url = format!("{}/api/v1/agents/me", api_base.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| {
+            format!("--as-agent {agent}: cannot ask the API which agent the token acts as: {e}")
+        })?;
+    let status = resp.status();
+    if matches!(status.as_u16(), 400 | 404 | 405) {
+        return Err(format!(
+            "--as-agent {agent}: the API answered {status} to GET /api/v1/agents/me, so it \
+             cannot say which agent the token acts as (an API older than this binary reads \
+             `me` as an agent id); deploy the API first"
+        ));
+    }
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(format!(
+            "--as-agent {agent}: the API refused the token on GET /api/v1/agents/me \
+             ({status}); the token needs {WHOAMI_SCOPE}"
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "--as-agent {agent}: GET /api/v1/agents/me answered {status}"
+        ));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("--as-agent {agent}: GET /api/v1/agents/me answered no JSON: {e}"))?;
+    let token_agent = body
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<uuid::Uuid>().ok())
+        .ok_or_else(|| {
+            format!("--as-agent {agent}: GET /api/v1/agents/me carried no agent_id: {body}")
+        })?;
+    if token_agent != agent {
+        return Err(format!(
+            "--as-agent {agent}: the API token acts as agent {token_agent}, so atoms would be \
+             created as {token_agent} and decomposes_to edges as {agent}; pass \
+             --as-agent {token_agent}, or a token for {agent}"
+        ));
+    }
+    eprintln!("identity: the API token acts as {agent}, as --as-agent says");
+    Ok(())
+}
+
 /// Resolve the bearer token for API writes, or fail fast (gh-375). Called
 /// BEFORE any LLM work in every writing mode.
 async fn resolve_token(
@@ -1003,11 +1093,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Mode::writes` / `provider_writes_to_api`.
     let token = if mode.writes(&cli.provider) {
         eprintln!("api_base={api_base}");
-        resolve_token(&api_base, mode.mint_scope(), &http).await?
+        let scope = token_scope(&mode, cli.as_agent.is_some());
+        resolve_token(&api_base, &scope, &http).await?
     } else {
         eprintln!("token: not resolved — this mode performs no API write");
         String::new()
     };
+
+    // --as-agent: atoms are created as the TOKEN's agent and `decomposes_to`
+    // edges as `--as-agent`. A writing run refuses, before any LLM call or
+    // write, unless they are the same agent (backlog 076e94cc).
+    if let (Some(agent), true) = (cli.as_agent, mode.writes(&cli.provider)) {
+        check_token_acts_as(&http, &api_base, &token, agent).await?;
+    }
 
     match mode {
         Mode::RetargetDryRun(manifest) | Mode::RetargetApply(manifest) => {
@@ -1043,6 +1141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             print_retarget_plan(&run.plan);
+            report_open_challenges(
+                &run.plan
+                    .iter()
+                    .filter(|e| !e.parent_open_challenges.is_empty())
+                    .map(|e| (e.parent_id, e.parent_open_challenges.clone()))
+                    .collect(),
+                distinct_count(run.plan.iter().map(|e| e.parent_id)),
+            );
             eprintln!("manifest: {}", manifest.display());
             if !apply {
                 eprintln!(
@@ -1070,6 +1176,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pool = maint_pool.ok_or("--retarget needs the maintenance path")?;
             let applied = apply_retarget(pool, viewer, &api, &plan, Some(&manifest)).await?;
             print_applied(&applied);
+            let parents: Vec<uuid::Uuid> = plan.iter().map(|e| e.parent_id).collect();
+            report_open_challenges(
+                &open_challenges(pool, viewer, &parents).await?,
+                distinct_count(parents.iter().copied()),
+            );
         }
         Mode::ApplyPlan(path) => {
             let planned = read_plan_jsonl(&path)?;
@@ -1090,6 +1201,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("FAILED {id}: {why}");
             }
             report_cycles(&totals.cycles);
+            if cli.redecompose {
+                let parents: Vec<uuid::Uuid> = ok.iter().map(|p| p.claim_id).collect();
+                report_open_challenges(
+                    &open_challenges(db, viewer, &parents).await?,
+                    distinct_count(parents.iter().copied()),
+                );
+            }
             eprintln!(
                 "apply-plan complete: {} applied, {} failed (still undecomposed; re-run this \
                  plan to retry them), {} refused, {} atoms, {} decomposes_to edges",
@@ -1225,11 +1343,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // write-path exercise.
             let llm = resolve_llm_client(&cli.provider, std::env::var(FIXTURE_PATH_ENV).ok())?;
             if let Mode::Plan(path) = &mode {
-                let (plans, gaps) =
+                let (mut plans, gaps) =
                     plan_decomposition_batches_with_gaps(&claims, llm.as_ref(), cli.batch_size)
                         .await;
+                if cli.redecompose {
+                    attach_open_challenges(db, viewer, &mut plans).await?;
+                }
                 write_plan_jsonl(path, &plans)?;
                 print_plan(&plans);
+                if cli.redecompose {
+                    report_open_challenges(
+                        &plans
+                            .iter()
+                            .filter(|p| !p.parent_open_challenges.is_empty())
+                            .map(|p| (p.claim_id, p.parent_open_challenges.clone()))
+                            .collect(),
+                        distinct_count(plans.iter().map(|p| p.claim_id)),
+                    );
+                }
                 let singletons: Vec<uuid::Uuid> = plans
                     .iter()
                     .filter(|p| p.atoms.len() <= 1)
@@ -1258,6 +1389,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             report_unplanned(&totals.gaps, &totals.singletons);
             report_cycles(&totals.cycles);
+            if cli.redecompose {
+                let parents: Vec<uuid::Uuid> = claims.iter().map(|c| c.claim_id).collect();
+                report_open_challenges(
+                    &open_challenges(db, viewer, &parents).await?,
+                    distinct_count(parents.iter().copied()),
+                );
+            }
             eprintln!(
                 "decompose complete: {} atoms, {} decomposes_to edges",
                 totals.atoms, totals.edges
@@ -1447,6 +1585,37 @@ async fn report_decomposed_conflict_parents(
     Ok(())
 }
 
+/// Name every open challenge on a parent this run touched, one line each,
+/// then their count over the `touched` parents (backlog 122ac356). Nothing
+/// here changes a challenge: they stay on the parent by design.
+fn report_open_challenges(
+    open: &std::collections::BTreeMap<uuid::Uuid, Vec<epigraph_cli::decompose::OpenChallenge>>,
+    touched: usize,
+) {
+    for (parent, challenges) in open {
+        for c in challenges {
+            eprintln!(
+                "OPEN-CHALLENGE parent={parent} challenge={} state={} challenger={}",
+                c.id,
+                c.state,
+                c.challenger_id
+                    .map_or_else(|| "none".to_string(), |a| a.to_string())
+            );
+        }
+    }
+    let total: usize = open.values().map(Vec::len).sum();
+    eprintln!(
+        "open challenges: {total} on {} of {touched} touched parents (they stay on the parent; \
+         list_challenges include_parents lists them on its atoms)",
+        open.len()
+    );
+}
+
+/// How many distinct ids `ids` holds.
+fn distinct_count(ids: impl Iterator<Item = uuid::Uuid>) -> usize {
+    ids.collect::<std::collections::BTreeSet<_>>().len()
+}
+
 fn print_retarget_plan(plan: &[epigraph_cli::retarget::RetargetPlanEntry]) {
     let mut left: Vec<&epigraph_cli::retarget::RetargetPlanEntry> = Vec::new();
     for e in plan {
@@ -1550,9 +1719,9 @@ fn print_applied(applied: &[epigraph_cli::retarget::AppliedEntry]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        mint_service_token, provider_writes_to_api, resolve_api_base, resolve_auth_plan,
-        resolve_llm_client, resolve_service_credentials, resolve_token_url, AuthError, AuthPlan,
-        MintError,
+        check_token_acts_as, mint_service_token, provider_writes_to_api, resolve_api_base,
+        resolve_auth_plan, resolve_llm_client, resolve_service_credentials, resolve_token_url,
+        token_scope, AuthError, AuthPlan, MintError,
     };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2231,6 +2400,83 @@ mod tests {
         assert_eq!(
             resolve_service_credentials(Some("id".to_string()), Some("secret".to_string())),
             Some(("id".to_string(), "secret".to_string()))
+        );
+    }
+
+    /// `--as-agent`'s identity check (backlog 076e94cc): only an answer
+    /// naming exactly the acting agent passes. A different agent, an API
+    /// without the route (an older API answers `me` as an `:id`, 400), a
+    /// token without `claims:read` (403) and an answer with no `agent_id` are
+    /// each refused, with a message saying which.
+    #[tokio::test]
+    async fn the_identity_check_passes_only_the_acting_agent() {
+        let agent = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let http = reqwest::Client::new();
+        let answer = |status: u16, body: serde_json::Value| async move {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/agents/me"))
+                .and(wiremock::matchers::header("authorization", "Bearer tok"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            server
+        };
+
+        let s = answer(
+            200,
+            serde_json::json!({"agent_id": agent, "display_name": "a"}),
+        )
+        .await;
+        check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .expect("the token's own agent passes");
+
+        let s = answer(
+            200,
+            serde_json::json!({"agent_id": other, "display_name": "b"}),
+        )
+        .await;
+        let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains(&format!("--as-agent {agent}"))
+                && err.contains(&format!("acts as agent {other}")),
+            "{err}"
+        );
+
+        let s = answer(400, serde_json::json!({"error": "bad uuid"})).await;
+        let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .unwrap_err();
+        assert!(err.contains("deploy the API first"), "{err}");
+
+        let s = answer(403, serde_json::json!({"error": "scope"})).await;
+        let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .unwrap_err();
+        assert!(err.contains("claims:read"), "{err}");
+
+        let s = answer(200, serde_json::json!({"display_name": "a"})).await;
+        let err = check_token_acts_as(&http, &s.uri(), "tok", agent)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no agent_id"), "{err}");
+    }
+
+    /// A minted `--as-agent` token asks for `claims:read` too, which the
+    /// identity check's route requires; without `--as-agent` the mint is
+    /// unchanged.
+    #[test]
+    fn an_as_agent_mint_also_asks_for_claims_read() {
+        assert_eq!(token_scope(&Mode::Run, false), "claims:write");
+        assert_eq!(token_scope(&Mode::Run, true), "claims:write claims:read");
+        assert_eq!(
+            token_scope(&Mode::ApplyPlan(PathBuf::from("p.jsonl")), true),
+            "claims:write claims:read"
         );
     }
 }

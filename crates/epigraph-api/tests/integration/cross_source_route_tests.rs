@@ -3,7 +3,6 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::Router;
-use epigraph_api::middleware::SignatureVerificationState;
 use epigraph_api::{create_router, ApiConfig, AppState};
 use http_body_util::BodyExt;
 use serde::Deserialize;
@@ -28,8 +27,7 @@ async fn create_test_router(pool: PgPool) -> Router {
     )
     .await
     .expect("ScopedPool over the test database");
-    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-    let mut state = AppState::with_db_and_signature_state(pool, config, signature_state);
+    let mut state = AppState::with_db(pool, config);
     state.scoped = Some(scoped);
     create_router(state)
 }
@@ -1598,8 +1596,8 @@ async fn retire_rederives_endpoint_belief_from_surviving_bbas(pool: PgPool) {
 }
 
 /// Default decision (scope Q2): an endpoint with NO BBA on any frame whose
-/// cache a retirement leaves unbacked is cleared, the `edge_retract` cascade's
-/// semantics. The only writer that can have put a value there without a BBA
+/// cache a retirement leaves unbacked is vacated (the explicit vacuous cache,
+/// never NULL: backlog 75726018), the `edge_retract` cascade's semantics. The only writer that can have put a value there without a BBA
 /// is the factor graph that just lost an edge.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retire_clears_an_unbacked_endpoint_cache(pool: PgPool) {
@@ -1617,8 +1615,8 @@ async fn retire_clears_an_unbacked_endpoint_cache(pool: PgPool) {
     assert_eq!(json["cascade"]["status"], "applied", "{json}");
     assert_eq!(
         betp_of(&pool, a).await,
-        None,
-        "an endpoint no BBA backs must have its stale cache cleared: {json}"
+        Some(0.5),
+        "an endpoint no BBA backs must have its stale cache vacated: {json}"
     );
     assert_eq!(
         json["belief_cascade"]["unbacked"],

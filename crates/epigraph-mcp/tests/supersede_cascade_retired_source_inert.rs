@@ -214,8 +214,9 @@ async fn a_retired_refuters_edge_bba_is_invalidated_and_its_target_rederived(poo
     );
     assert_eq!(
         scalars(&pool, lonely).await,
-        (None, None, None),
-        "a claim whose only BBA came from the retired claim is unbacked"
+        (Some(0.0), Some(1.0), Some(0.5)),
+        "a claim whose only BBA came from the retired claim is unbacked: the explicit \
+         vacuous cache, never NULL (backlog 75726018)"
     );
 
     let report = &body["belief_cascade"];

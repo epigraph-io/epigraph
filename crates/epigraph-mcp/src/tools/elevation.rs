@@ -268,7 +268,7 @@ pub async fn sudo(
         Ok(id) => id,
         Err(e) => {
             return Err(match db_refusal(&e) {
-                Some((code, message)) if code == "ELV02" => {
+                Some((code, message)) if code == epigraph_db::refusal_codes::ELV02 => {
                     tracing::info!(
                         target: "elevation",
                         principal = ?auth.agent_id,
@@ -277,10 +277,13 @@ pub async fn sudo(
                     );
                     McpError::invalid_request(format!("sudo refused: {message}"), None)
                 }
-                Some((code, _)) if code == "ELV06" => McpError::invalid_request(
-                    "sudo: this refresh family is already elevated; call unsudo first".to_string(),
-                    None,
-                ),
+                Some((code, _)) if code == epigraph_db::refusal_codes::ELV06 => {
+                    McpError::invalid_request(
+                        "sudo: this refresh family is already elevated; call unsudo first"
+                            .to_string(),
+                        None,
+                    )
+                }
                 Some((code, message)) if code == "22004" => McpError::invalid_params(message, None),
                 _ => internal("sudo", "open the ticket", &e),
             })
@@ -401,7 +404,7 @@ pub async fn propose_admin_act(
         Ok(id) => id,
         Err(e) => {
             return Err(match db_refusal(&e) {
-                Some((code, _)) if code == "ELV07" => {
+                Some((code, _)) if code == epigraph_db::refusal_codes::ELV07 => {
                     tracing::info!(
                         target: "elevation.act",
                         principal = ?auth.agent_id,

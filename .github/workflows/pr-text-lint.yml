@@ -1,0 +1,50 @@
+name: PR text lint
+
+# Gates a pull request's TITLE and BODY on the privacy rules of the commit
+# lint (`commit-message-lint.py --pr-text`): E1 e-mail address, E2 developer
+# home path, E3 address-encoding host or bare public IPv4, E6 a term from the
+# private deny-list. A finding fails the job; the output names only the rule
+# and the line, never the value (CI logs are public). Documented beside the
+# commit lint in CLAUDE.md ("Commit-message lint").
+#
+# The PR text of this public repository is as public as its history, and,
+# unlike a commit, it can change after CI ran, so the job also runs on every
+# `edited` event. It is a separate workflow so that a body edit does not
+# re-run (and, through ci.yml's per-PR concurrency group, cancel) the whole CI.
+#
+# `pull_request`, not `pull_request_target`: the job holds only a read token,
+# and a fork's run gets no secrets (E6 then reports "not configured"). The run
+# uses the PR's own copy of the script, and GitHub skips `pull_request` runs
+# while the PR has a merge conflict, so this is prevention for trusted
+# contributors' mistakes, not a guarantee (CLAUDE.md lists the limits).
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+# One run per pull request; a newer edit or push supersedes the older run.
+concurrency:
+  group: pr-text-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr-text-lint:
+    name: PR text lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Pinned to the same full commit sha as ci.yml (a floating tag can be
+      # moved upstream).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Lint the pull request's title and body
+        env:
+          # The title and body reach the script through env, never
+          # interpolated into the shell body: PR text is attacker-controlled.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          # The commit lint's private deny-list (one term per line), from the
+          # same repository secret.
+          COMMIT_LINT_DENY_TERMS: ${{ secrets.COMMIT_LINT_DENY_TERMS }}
+        run: python3 .github/scripts/commit-message-lint.py --pr-text

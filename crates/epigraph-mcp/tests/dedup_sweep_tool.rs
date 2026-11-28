@@ -538,10 +538,14 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
             .fetch_one(&pool)
             .await
             .unwrap();
+    // The retired duplicate is marked unbacked with the explicit vacuous
+    // cache (BetP 0.5), never NULL (backlog 75726018): a derived record with
+    // nothing behind it is written as vacuous, not left stale.
     assert_eq!(
-        weak_betp_after, None,
-        "the duplicate's supporter moved to the survivor; keeping its old \
-         cached BetP is a derived record with nothing behind it"
+        weak_betp_after,
+        Some(0.5),
+        "the duplicate's supporter moved to the survivor; its cache is the \
+         explicit vacuous value, not its old derived BetP"
     );
 }
 

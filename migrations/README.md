@@ -1192,6 +1192,11 @@ unused number below the head is not free by default: several are held by
 entries in this list (133-139 for the elevation stack, 155-157 by the drain
 register), and sqlx applies a file numbered below an already-applied head out
 of order (see the **Deploy order** notes on 140 and 141).
+CI enforces the number: `scripts/ci/check_migration_numbers.sh` (the lint job)
+fails a change that adds a `migrations/*.sql` numbered at or below the highest
+number on the target branch, or one sharing its number with another file. The
+only numbers below the head it accepts are those in a block listed under
+[Reserved blocks](#reserved-blocks); none is open.
 Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
@@ -5329,6 +5334,198 @@ restart.
   order. **Measure after deploy**: the deploy's end-state catalog check should show no `papers`
   column or column-ACL drift between a fresh migrate and the deployed database; this change did
   not measure parity with a deployed database.
+- **356**: `agent_scopes` (backlog d7ee64a6, the first step of the declared agent scope model
+  f8cde19f). Records, but does not yet enforce, a declared `(agent, group, action class)` write
+  scope per agent identity. Adds `agent_scopes` (`action_class` CHECK in `claim_write`,
+  `evidence_write`, `edge_write`, `label_write`, `share_publicize`, `group_admin`; a validity window
+  `valid_from` / `valid_to`; `granted_by` recorded as `session_user`; a non-blank `reason`; an
+  optional `role_attachment_id` referencing `role_agents`, which must be a live attachment of the
+  SAME agent; a revoke recorded in `revoked_at` / `revoked_by` / `revoke_reason`, final). Append-only
+  under the guard `epigraph_agent_scopes_guard` (`AGS02`, 55000: no supplied provenance, no
+  back-dating, no human or role node as the agent, no edit but the revoke, no DELETE or TRUNCATE
+  on any role); one un-revoked row per key (`agent_scopes_one_unrevoked`, 23505). Row security
+  ENABLE + FORCE admits only `epigraph_bypass()` / `epigraph_definer_bypass()` (no DELETE policy);
+  the application role holds no privilege on the table, not even SELECT. The maintenance verbs
+  `epigraph_agent_scope_grant(agent, group, class, reason, valid_from, valid_to, attachment) ->
+  uuid` and `epigraph_agent_scope_revoke(scope, reason) -> boolean` (SECURITY DEFINER, owned by
+  `epigraph_maintenance`, on `pg_catalog, pg_temp`, EXECUTE for the maintenance role only, and each
+  body refuses a non-maintenance session 42501 `AGS02`); the AFTER trigger
+  `epigraph_agent_scopes_audit` writes exactly one `security_events` row per grant
+  (`platform.agent_scope_granted`) and per revoke (`platform.agent_scope_revoked`), whatever path
+  wrote the row; a repeated revoke returns false and writes nothing. The events carry the scoped
+  agent as `agent_id`, so through 169's own-row arm the agent reads its own grant and revoke events
+  (scope, group, class, window, the granting or revoking login and the reason text), as with 166's
+  `platform.role_agent_*` events; write a reason as the agent may read it. Adds `agent_scope_arming`
+  (one row, installed `armed = false`; the application and maintenance roles hold SELECT only, so
+  only a superuser moves it until the first enforcing door brings its audited verb). No write door
+  reads either table, so applying 356 changes no write and no read. Registered in
+  `tenancy_backfill` (deferred definers at 356, the grant register, the trigger exemption) and in
+  `elevation_arms_census.rs` (excluded). Pinned by `epigraph-db/tests/agent_scopes.rs`. Undo:
+  `docs/runbooks/356-undo.sql` (discards every declared row; the audit rows stay). **Deploy
+  order:** either; no binary reads it.
+- **357**: `sealed_row_resign` (backlog aa366aa6). Before it, the seal replaced
+  `claims.content_hash` with BLAKE3 of the ciphertext but left `claims.signature` (a v1 signature
+  over BLAKE3 of the PLAINTEXT) on the row, and left `evidence.signature` beside the sentinel
+  digest: neither verified over its row, and both let a reader of the row confirm a guessed
+  plaintext against the signer's public key. 357 adds `pre_seal_signature bytea`,
+  `pre_seal_signer_id uuid` and `pre_seal_stashed boolean NOT NULL DEFAULT false` to
+  `claim_encryption` and `evidence_encryption` (CHECKs: 64 bytes or NULL; signature and signer
+  both set or both NULL; no stash unless `pre_seal_stashed`; `pre_seal_signer_id` REFERENCES
+  `agents` ON DELETE RESTRICT, so a stashed signer cannot be deleted while its row is sealed, as it
+  cannot while the row is unsealed). No grant or policy changes: the
+  columns inherit 077's group-scoped read policy, so a non-member of the sealing group reads no
+  stash. `PrivatizationRepository::seal_claims_conn` stashes the claim's and each covered evidence
+  row's `signature` / `signer_id`, re-signs the claim with the API's boot-admitted signing key
+  (`EPIGRAPH_API_SIGNING_KEY_FILE`) over the ciphertext digest, signed as that key's signer agent,
+  and leaves the evidence row unsigned (its digest is an id-derived sentinel); with no key
+  configured the sealed claim is left unsigned. `unseal_claims_conn` restores both byte for byte
+  where `pre_seal_stashed`, except a claim whose signature was revoked after the seal took the
+  stash (a `claim_signature_revocations` row for the sealed digest or the stashed original), which
+  comes back unsigned. DDL only: rows sealed before 357 keep `pre_seal_stashed = false` and
+  keep their pre-seal signature on `claims` / `evidence` (unseal leaves it, which is correct);
+  re-signing them needs the API key and is not done here. **Measure**: `SELECT count(*) FROM
+  claim_encryption` and `... FROM evidence_encryption` (every row is pre-357). Pinned by
+  `epigraph-db/tests/sealed_row_resign.rs` and `epigraph-api/tests/privatization_seal.rs`
+  (`seal_commit_resigns_with_the_api_key_and_unseal_commit_restores_the_original`). **Deploy
+  order:** 357, then the binary (an older binary seals without the stash, which unseal handles).
+  Undo: `docs/runbooks/357-undo.sql` copies every stashed, unrevoked original back onto its row and drops
+  the columns; run it BEFORE rolling the binary back (an older binary's unseal would delete the
+  stash without restoring it).
+- **358**: `shifted_to_edge_type` (backlog d639d492, split 1/2 of 52eff3ab's port of the
+  `shifted_to` temporal-succession edge). One partial unique index,
+  `edges_shifted_to_pair_uniq ON edges (LEAST(source_id, target_id), GREATEST(source_id,
+  target_id)) WHERE relationship = 'shifted_to' AND valid_to IS NULL AND source_type = 'claim' AND
+  target_type = 'claim'`: on a DIRECTIONAL relation the
+  pair key enforces anti-symmetry, so it refuses both an exact duplicate and the reversal of an
+  in-force `shifted_to`, while a chain `A -> B -> C` stays legal. `valid_to IS NULL` is a
+  deliberate divergence from the ported source (091's rule: a retracted row must not hold the slot),
+  and so is the claim/claim conjunct (the merge paths' pair guard sees claim/claim edges only).
+  **A writer already exists:** the document ingest copies a caller's relationship verbatim, so it
+  can store `shifted_to` today; after 358 an ingest that collides with an in-force pair is refused
+  as a whole with the designed STATE refusal `epigraph_db::SHIFTED_TO_PAIR_REFUSAL` (HTTP 409 / the
+  MCP tool error), which `From<sqlx::Error> for DbError` maps from this index's 23505.
+  `shifted_to` has no `edge_to_factor_type` row (175's body), so it mints no factor. The merge paths
+  pay the index's cost: `ClaimRepository::mark_duplicate`'s repair and `consolidate` dedup
+  `epigraph_db::PAIR_UNIQUE_RELATIONSHIPS` (`alternative_of`, `shifted_to`) by pair key, so a merge
+  never re-points a `shifted_to` edge into an occupied pair. `-- no-transaction`, one `CREATE
+  UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` statement (registered in `tenancy_migration_shape.rs`'s
+  `INDEX_MIGRATIONS`). Pinned by `epigraph-db/tests/shifted_to_pair_index.rs` (duplicate and
+  reversal refused, chain and post-retraction re-assertion admitted, undo runbook drops it) and
+  the merge fixtures in `consolidate_test.rs` / `mark_duplicate_repo.rs`. **Measure first, a
+  required step** (a UNIQUE CONCURRENTLY build fails on a collision and leaves an INVALID index;
+  the grouping catches reversals too): `SELECT LEAST(source_id, target_id), GREATEST(source_id,
+  target_id), count(*) FROM edges WHERE relationship = 'shifted_to' AND valid_to IS NULL AND
+  source_type = 'claim' AND target_type = 'claim' GROUP BY 1, 2 HAVING count(*) > 1;`. A
+  non-empty result: per pair keep the intended row, retract the others (`valid_to = now()`), re-run
+  until empty, then migrate. Undo: `docs/runbooks/358-undo.sql`. **Deploy order:** migrate BEFORE
+  any binary that adds a dedicated `shifted_to` writer (the second half of the port); the
+  merge-path change and the refusal mapping run with or without 358.
+
+## Reserved blocks
+
+A block of numbers held below the head for a series that has not landed yet.
+`scripts/ci/check_migration_numbers.sh` reads this table: a new migration may
+take a number at or below the head only inside a block listed here (it must
+still be unique), and every other new migration takes a number above the head.
+A row's first cell is one number (`NNN`) or a range (`NNN-MMM`). Add a row only
+with the operator's ruling, in the commit that opens the block, and remove it in
+the commit that closes it. No block is open.
+
+| Block | Held for |
+|-------|----------|
+- **359**: `require_tenancy_refusal_codes` (backlogs baac4c90, 6b332b58). The follow-up 176 left
+  for the three `*_require_tenancy` trigger bodies: each is re-stated from 216's text with only
+  four RAISE statements changed, each keeping its SQLSTATE: `TEN03`
+  (`epigraph_claims_require_tenancy`, an undeclared claim, 23502; the row's `id` and `agent_id`
+  move from the message to DETAIL), `TEN04` (`epigraph_derived_require_tenancy`, a `claim_id` that
+  names no claim, 23503; the claim id moves to DETAIL), `TEN05` (the same body, undeclared with
+  `claim_id` NULL, 23502) and `TEN06` (`epigraph_root_require_tenancy`, undeclared, 23502). Not
+  coded, as in 176: the claims body's predecessor and step-lineage arms (a code would tell a
+  missing claim from a private one) and the three seed escape-hatch arms (no application session
+  reaches them). The codes join `epigraph_db::CALLER_REFUSAL_CODES`, so the HTTP mapper answers
+  the 23502 arms 400 with their message, and `From<sqlx::Error> for DbError` answers a 23503 whose
+  message opens with a listed code as `DbError::Refused { kind: Input }` (HTTP 400 with the
+  message, the MCP designed-refusal text); an uncoded 23503 stays `ForeignKeyViolation`. Owner,
+  ACL, SECURITY mode, search_path and volatility are kept by CREATE OR REPLACE. Pinned by
+  `epigraph-db/tests/caller_refusal_codes_restatement.rs` (a database below 359 against the same
+  database at 359: only the declared RAISE statements change; the undo) and
+  `epigraph-db/tests/require_tenancy_refusal_codes.rs` and
+  `epigraph-api/tests/caller_refusal_codes_http.rs` (each coded arm raised on the application
+  role). Undo: `docs/runbooks/359-undo.sql` re-states 216's bodies; it refuses (55000) over a
+  body a later migration re-stated. 359 itself refuses (55000, nothing changed) unless each of
+  the three bodies is still 216's by `md5(prosrc)` (pinned by
+  `migration_359_refuses_over_a_body_that_is_not_216s`). A LATER migration that re-states one of these bodies must
+  start from 359's text or it drops the codes. No order against the binaries: an older binary
+  answers a coded 23503 as before (`ForeignKeyViolation`, the generic foreign-key 400) and a
+  coded 23502 as before (the redacted 500, since it does not list the code); the binary of this
+  change answers both 400 with the code. **Applied to throwaway databases only, NOT to any deployed database.**
+- **360**: `role_owner_may_run` (backlog 6e633456). 166's `epigraph_role_agent_may_run(agent)`
+  answers `unattached -> may run` for an identity that was never attached to any role, so a role's
+  schedule run by such an identity ran in the role's gap. Adds `epigraph_role_owner_may_run(p_role_id
+  uuid, p_agent uuid) RETURNS text` (plpgsql, VOLATILE, SECURITY DEFINER, `SET search_path =
+  pg_catalog, pg_temp`, every name qualified, no writes): `p_role_id` is the role's node
+  (`platform_roles.role_node_id`); the answer is `not_attached` when the agent holds no live
+  `role_agents` row for the role (166's gate predicate at `clock_timestamp()`; succession copies
+  count, as for the gate), else `held` when some human holds the role (the gate's `no_holder` arm
+  over `epigraph_live_role_assignment`), else `no_holder`. `not_attached` is decided first. A NULL
+  argument or a uuid that is no role's node raises 22023, never 42883. Under a wrong owner (which
+  would read no `role_agents` row) it raises 166's ROL01 instead of answering `not_attached`. Owner
+  `epigraph_maintenance` (registered at 360 in `tenancy_backfill.rs`); EXECUTE to
+  `epigraph_identity_attestor` and the owner only, revoked from PUBLIC and `epigraph_app` (where the
+  attestor is created after this file, grant it with 161's recipe, as 166 section 4 says). Pinned by
+  `epigraph-db/tests/role_attached_agents.rs` (`owner_may_run_answers_held_no_holder_and_not_attached`,
+  `owner_may_run_counts_a_succession_copy_as_attached`,
+  `owner_may_run_refuses_an_unknown_role_or_a_swapped_call`,
+  `the_app_role_cannot_execute_owner_may_run`,
+  `a_misowned_owner_may_run_refuses_rather_than_answer_not_attached`,
+  `the_360_undo_restores_the_catalog_below_360`) and
+  `agent_identity_lineage.rs`'s attestor grant sweep. Undo: `docs/runbooks/360-undo.sql` (drops the
+  function; the host then runs owner-role schedules unchecked, with a warning). **Deploy order:**
+  either; a host that asks before 360 gets 42883 and runs the schedule as before. After deploy,
+  measure: `SELECT has_function_privilege('<host attestor login>',
+  'public.epigraph_role_owner_may_run(uuid, uuid)', 'EXECUTE');` must be true.
+- **361**: `direct_writer_scope_read_committed` (backlog e39af056). Re-states 256's
+  `epigraph_require_writer_scope` and 123's `epigraph_is_instance_admin` (md5 preconditions
+  refuse to apply over any other body). (1) 122's DIRECT-membership writer arm admits a write
+  only under READ COMMITTED, closing
+  the residual 256 recorded. Under REPEATABLE READ or SERIALIZABLE the arm read
+  `group_memberships` (and the human registration and link behind `epigraph_human_of`) through
+  the transaction's first snapshot, so a membership revoked or demoted to reader by another
+  session after it still read as a live writer row and the writer kept writing into the group.
+  Now, under any level other than READ COMMITTED, a write the direct arm would admit is refused
+  OPL02 ("a write through a direct membership is admitted only under READ COMMITTED"), after the
+  privileged-session exemption (the maintenance DSN's REPEATABLE READ tools are unaffected); an
+  unbound principal, 256's derived-arm refusal and both of 122's OPL02 refusals are unchanged.
+  Same signature, STABLE, owner, grants and search path (`public, pg_temp`). (2) The custodian
+  half: the writer scope no longer consults the custodian role (123 re-bodied
+  `epigraph_operator_scope_exempt` to `epigraph_bypass()` alone), but `epigraph_is_instance_admin`
+  is still a write admission elsewhere (239's AK03 admin arm on another agent's key, while the
+  admin-scope switch is unarmed) and decided at the transaction's `now()` through its snapshot,
+  so a custodian whose assignment elapsed (READ COMMITTED) or was ended by another session
+  (REPEATABLE READ / SERIALIZABLE) mid-transaction kept it. It now checks the role at
+  `clock_timestamp()` and, for an unprivileged session, answers true only under READ COMMITTED or
+  in a READ ONLY transaction (which can write nothing); a read-write REPEATABLE READ /
+  SERIALIZABLE application session gets false, its admin read arms included. Same signature,
+  SQL, STABLE, owner, grants and search path. Pinned by
+  `epigraph-db/tests/direct_writer_scope_read_committed.rs` (a
+  membership revoked or demoted from a second session mid-transaction: the REPEATABLE READ and
+  SERIALIZABLE writer is refused and lands on 256's body; READ COMMITTED, unarmed and privileged
+  controls; a custodian ended or elapsed mid-transaction is refused its cross-group write at
+  all three levels, even with 122's exemption restored, and writes with 122's exemption over
+  123's custodian answer; the same custodian is refused AK03 on another agent's key at all three
+  levels, a live one is admitted under READ COMMITTED, refused on read-write REPEATABLE READ /
+  SERIALIZABLE and answered true read-only, and on 123's body each refused case is admitted;
+  the undo, twice, and both refusals over a foreign body),
+  `derived_writer_scope_read_committed.rs` (its REPEATABLE READ personal-group control is now
+  refused; its undo test runs 361's undo first) and
+  `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
+  `docs/runbooks/361-undo.sql` (run it before `256-undo.sql` and before `123-undo.sql`).
+  **Deploy order:** none; no binary depends on it. Before applying, measure that no
+  application-role login has a non-default `default_transaction_isolation`
+  (`pg_db_role_setting`): such a claim write by a bound principal is refused after 361, and a
+  custodian's admin arm answers false on its read-write transactions; and measure whether the
+  admin-scope switch is armed (armed, AK03 reads `epigraph_is_elevated()` instead). **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 

@@ -1,7 +1,8 @@
-//! `epigraph-operator`: the reviewed, in-repo tool for the one-time operator
-//! ownership backfill that migration 107 left out of scope.
+//! `epigraph-operator`: the reviewed, in-repo library of the audited operator
+//! verbs. It began as the operator ownership backfill that migration 107 left
+//! out of scope; `src/bin/operator.rs` lists the standing verbs it carries now.
 //!
-//! Four subcommands, each dry-run by default:
+//! The ownership subcommands, each dry-run by default:
 //!
 //! * `link-retired` — call `epigraph_link_retired_agent` for a list of
 //!   historical agent identities, so the operator OWNS their claims while the

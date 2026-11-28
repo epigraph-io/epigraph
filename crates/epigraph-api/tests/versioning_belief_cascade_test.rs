@@ -196,8 +196,9 @@ async fn supersede_route_reports_and_applies_the_belief_cascade() {
     // test body calls `recompute_beliefs`.)
     assert_eq!(
         betp(&pool, b).await,
-        None,
-        "B's sole supporter was retracted; its cached BetP must not survive"
+        Some(0.5),
+        "B's sole supporter was retracted; its cached BetP must not survive: the \
+         cache is vacated to the explicit vacuous value, never NULLed (backlog 75726018)"
     );
 }
 
@@ -291,9 +292,10 @@ async fn dedup_route_reports_and_applies_the_belief_cascade() {
     );
     assert_eq!(
         betp(&pool, dup).await,
-        None,
+        Some(0.5),
         "the duplicate's supporter moved to canonical; its cached BetP is a \
-         derived record with nothing behind it"
+         derived record with nothing behind it, so the cache is vacated (the \
+         explicit vacuous value, never NULL: backlog 75726018)"
     );
 }
 

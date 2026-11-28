@@ -11,6 +11,55 @@
 use sqlx::postgres::PgPoolOptions;
 mod common;
 
+/// Backlog 90e994f0: the override is compared against the digest the handler
+/// computes over the stored content, never against `claim.content_hash`.
+/// `Claim::new` leaves that field all zeros when the API has no signing key
+/// (only the attest path fills it), so comparing against it would accept
+/// 64 zero characters and refuse the correct BLAKE3.
+#[tokio::test(flavor = "multi_thread")]
+async fn all_zero_content_hash_override_is_rejected() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let agent = common::seed_system_agent(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+
+    let content = format!("all-zero content_hash override {}", uuid::Uuid::new_v4());
+    let body = serde_json::json!({
+        "content": content,
+        "agent_id": agent,
+        "content_hash": "0".repeat(64),
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        status, 400,
+        "an all-zero content_hash override must be rejected with 400; got {status} body={resp_body}"
+    );
+    assert_eq!(
+        resp_body["details"]["field"], "content_hash",
+        "expected field=content_hash, got {resp_body}"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "no claim row for a refused all-zero override");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mismatched_content_hash_override_is_rejected() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");

@@ -11,243 +11,17 @@ use sqlx::{Acquire, PgConnection};
 use crate::errors::{internal_error, internal_error_logged, internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
 
-/// The two things every author-stamped write needs and neither can be faked:
-/// the [`epigraph_db::ScopedPool`] that can stamp a connection at all, and the
-/// author's own [`Viewer`](epigraph_db::visibility::Viewer), proven to carry
-/// write authority.
-///
-/// Extracted from [`begin_author_stamped_tx`] when the post-commit embed became
-/// the second caller. It is ONE function rather than two copies because the
-/// three refusals below are the whole safety argument — a second site that
-/// resolved a viewer and skipped the empty-writable check would stamp a session
-/// with an empty writable set and get a bare `42501` from whichever statement
-/// ran first, which is precisely the diagnosis-free failure this module exists
-/// to remove.
-///
-/// # Why it takes the pool and the `ScopedPool` rather than the server
-///
-/// Because [`crate::embed::McpEmbedder`] is the third caller and is not the
-/// server: it holds its own `ScopedPool` (declared via
-/// `McpEmbedder::with_scoped_pool`) and is cloned into detached background tasks
-/// where no `&EpiGraphMcpFull` survives — `tools/ingestion.rs`'s embed queue is
-/// `tokio::spawn`ed with `Arc::clone(&server.embedder)` alone. Parameterising
-/// here is what lets all three write paths share ONE refusal triple instead of a
-/// second copy that resolved a viewer and skipped the empty-writable check.
-///
-/// # Errors
-/// * `McpError::internal_error` if this process was not built from a
-///   [`epigraph_db::ScopedPool`] — never a fallback to the unstamped pool.
-/// * `McpError::internal_error` if the author's viewer cannot be resolved.
-/// * `McpError::internal_error` if that viewer has no writable group.
-async fn author_write_authority<'p>(
-    scoped: Option<&'p epigraph_db::ScopedPool>,
-    pool: &sqlx::PgPool,
-    author_agent_id: uuid::Uuid,
-    tool_name: &'static str,
-) -> Result<(&'p epigraph_db::ScopedPool, epigraph_db::visibility::Viewer), McpError> {
-    let scoped = scoped.ok_or_else(|| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            tool = tool_name,
-            "write refused: this MCP process was not built from a ScopedPool, so no \
-             connection can be stamped with the author's tenancy context. Refusing rather \
-             than writing on the unstamped pool, which commits the claim and then loses its \
-             trace, evidence and AUTHORED edge to a 42501. Construct the server with \
-             EpiGraphMcpFull::with_scoped_pool."
-        );
-        internal_error_text(format!(
-            "{tool_name}: this MCP server was not built from a ScopedPool, so the write \
-             path cannot stamp a connection with the author's tenancy context. Nothing was \
-             written. Construct the server with EpiGraphMcpFull::with_scoped_pool."
-        ))
-    })?;
-
-    let author_viewer = epigraph_db::visibility::Viewer::resolve(pool, author_agent_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "tenancy.scoped_write",
-                tool = tool_name,
-                author = %author_agent_id,
-                error = %e,
-                "could not resolve the author's viewer"
-            );
-            internal_error_text(format!(
-                "{tool_name}: could not resolve the author's viewer"
-            ))
-        })?;
-
-    if author_viewer.writable_groups().is_empty() {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            tool = tool_name,
-            author = %author_agent_id,
-            "write refused: the author's viewer carries NO writable group, so the session \
-             would be stamped with an empty writable set and every tier-A WITH CHECK would \
-             refuse this submission from inside the transaction. What is missing is a live \
-             `admin`/`writer` membership in a group the submission's rows would be owned by. \
-             Nothing was written."
-        );
-        return Err(internal_error_text(format!(
-            "{tool_name}: the author ({author_agent_id}) has no live writable group membership, \
-             so no connection can be stamped with write authority for the rows this submission \
-             would own. Nothing was written."
-        )));
-    }
-
-    Ok((scoped, author_viewer))
-}
-
-/// Begin the ONE transaction an MCP submission runs in, stamped from the
-/// **author's** viewer.
-///
-/// # Whose viewer: the author's, which since batch H-b IS the caller's
-///
-/// The author is a [`crate::write_identity::WriteIdentity`], which only
-/// `EpiGraphMcpFull::write_identity` constructs: the principal of the request's
-/// own viewer, i.e. `auth.agent_id` over HTTP and the server's own agent on
-/// stdio. Taking the newtype rather than a bare `Uuid` is the ratchet: no tool
-/// can stamp from an agent it picked itself, and the compiler enumerates every
-/// site. Before batch H-b every tool passed `server.agent_id()` here whatever
-/// the transport, so an authenticated caller's writes were authored and stamped
-/// as the shared server signer (#505 F5).
-///
-/// The rows a submission writes inherit `owner_group_id` from the AUTHOR
-/// (`default_decl_for_author`: the author's personal group, or its operator's
-/// for an operated agent), and migration 077's `WITH CHECK` on every
-/// claim-derived table asks `owner_group_id = ANY(epigraph_writable_groups())`,
-/// so the stamp must be the author's writable set.
-/// `epigraph-db/tests/rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`
-/// is the pin: its arm 3 stamps the author's group and succeeds, its arm 4
-/// stamps a *different* real group and is still refused.
-///
-/// `Viewer::resolve` reads `group_memberships` through
-/// `epigraph_live_memberships(uuid)`, a SECURITY DEFINER function granted to
-/// `epigraph_app` (migration 077), so resolving on the *unstamped* pool returns
-/// the author's real memberships rather than the empty set
-/// `group_memberships_tenancy` would otherwise yield. That is what makes this
-/// bootstrap non-circular.
-///
-/// # Why `None` is a refusal and never a fallback
-///
-/// Falling back to `server.pool` when no `ScopedPool` is attached is precisely
-/// how the defect this exists to fix presents: the claim INSERT is admitted (by
-/// an orphan `claims_privacy` policy, where one exists), the trace INSERT is
-/// refused with `42501`, and the caller receives an error carrying no claim id
-/// for a row that is now a permanent orphan. A loud refusal with nothing written
-/// is the only safe shape. Same decision, same reasoning and the same
-/// `tenancy.scoped_write` log target as
-/// `epigraph-api/src/routes/groups.rs::rotate_key`.
-///
-/// # Why an empty writable set is a REFUSAL, and why the group is NOT ensured here
-///
-/// The stamp is taken from the viewer as it is at `BEGIN` time, and every row
-/// this submission writes is owned by the author's personal group — so if that
-/// group has no live writable membership, the viewer's writable set is EMPTY and
-/// the `WITH CHECK` on `claims` / `reasoning_traces` / `evidence` refuses the
-/// write from inside the transaction. Minting inside the transaction cannot
-/// repair that either: `create_claim_idempotent`'s first statement is
-/// `ClaimRepository::default_decl_for_author`, whose `personal_group_of` does
-/// mint on a miss, but the GUCs were stamped before it ran and a session's
-/// writable set is not re-read per statement. So the empty set is refused up
-/// front: it reports the real cause — this author has no writable group —
-/// instead of a `42501` from whichever statement happened to be first, and
-/// nothing is half-written.
-///
-/// A belt-and-braces `ClaimRepository::personal_group_of_pool` call was added
-/// here first and then REMOVED, because on this connection it is not the
-/// read-first lookup its name promises. MEASURED on a migrated database, as
-/// `epigraph_app` with no GUCs: `SELECT id FROM groups WHERE did_key = …`
-/// returns **0 rows** for a group that exists — `groups_tenancy`'s USING is
-/// `bypass OR definer_bypass OR id = ANY(session_groups) OR created_by_agent_id =
-/// principal_id`, and on an unstamped app session every arm is false. So the read
-/// is BLIND in production and `personal_group_of` would take its mint path on
-/// EVERY submission; migration 077's `epigraph_ensure_personal_group` membership
-/// statement was `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET
-/// revoked_at = NULL, role = 'admin'`, which was measured to take a revoked
-/// membership from 0 live rows back to 1 — a privilege change hidden inside an
-/// unrelated claim insert. Migration 105 makes that call refuse a revoked row
-/// instead of reviving it, so the hazard is gone at its root; the call stays
-/// removed because a per-submission control-plane write on the pool buys
-/// nothing the refusal below does not already report.
-/// `epigraph-db/tests/author_stamped_write_loop.rs` pins both measurements.
-///
-/// The group is therefore ensured exactly where it already was:
-/// `server.rs::agent_id`'s PR-09 block, once per process, before either caller
-/// reaches this function.
-///
-/// The refusal is the one part of this conversion that changes behaviour for a
-/// deployment that currently works: on a superuser DSN `epigraph_bypass()` is
-/// true, so a submission by an author with no writable group commits today. That
-/// is exactly the configuration whose DSN change turned the same write into a
-/// half-landed orphan, and a write that only succeeds because the session
-/// bypasses RLS is not a write this path should be making.
-///
-/// # Errors
-/// * `McpError::internal_error` if this process was not built from a
-///   [`epigraph_db::ScopedPool`].
-/// * `McpError::internal_error` if the author's viewer cannot be resolved, if
-///   that viewer has no writable group, or if `BEGIN` / the GUC stamp fails.
-pub async fn begin_author_stamped_tx<'p>(
-    server: &'p EpiGraphMcpFull,
-    author: crate::write_identity::WriteIdentity,
-    tool_name: &'static str,
-) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
-    begin_author_stamped_tx_for(server, author, tool_name, None).await
-}
-
-/// [`begin_author_stamped_tx`] for a claim write whose declared tenancy may
-/// name a TEAM the author writes only through its live human (owner decision
-/// D-V3, `docs/tenancy/claim-visibility-controls.md`).
-///
-/// `grant` is the [`epigraph_db::TeamWriteGrant`] that
-/// `ClaimRepository::resolve_write_decl` returned, and only that function mints
-/// one. With it, the stamp carries the team in its writable set
-/// (`Viewer::with_team_write_grant`). The grant must name THIS author, or the
-/// write is refused. Everything else, including all three refusals of
-/// [`author_write_authority`], is unchanged.
-///
-/// # Errors
-/// As [`begin_author_stamped_tx`], plus `McpError::internal_error` for a grant
-/// that names another agent.
-pub async fn begin_author_stamped_tx_for<'p>(
-    server: &'p EpiGraphMcpFull,
-    author: crate::write_identity::WriteIdentity,
-    tool_name: &'static str,
-    grant: Option<&epigraph_db::TeamWriteGrant>,
-) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
-    let author_agent_id = author.agent_id();
-    let (scoped, author_viewer) = author_write_authority(
-        server.scoped.as_ref(),
-        &server.pool,
-        author_agent_id,
-        tool_name,
-    )
-    .await?;
-    let author_viewer = match grant {
-        None => author_viewer,
-        Some(g) => author_viewer.with_team_write_grant(g).ok_or_else(|| {
-            internal_error_text(format!(
-                "{tool_name}: the team-write grant names agent {}, not the author {author_agent_id}; \
-                 nothing was written",
-                g.agent()
-            ))
-        })?,
-    };
-
-    scoped.begin_as(&author_viewer).await.map_err(|e| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            tool = tool_name,
-            author = %author_agent_id,
-            error = %e,
-            "could not begin an author-stamped transaction"
-        );
-        internal_error_text(format!(
-            "{tool_name}: could not begin an author-stamped transaction"
-        ))
-    })
-}
+use epigraph_service::ctx::author_write_authority;
+/// The author-stamped write transaction and its refusal triple
+/// ([`author_write_authority`]), defined in the service crate since backlog
+/// 30133ca8 (`epigraph_service::ctx`, where the full rationale is) and
+/// re-exported here so every `claim_helper::begin_author_stamped_tx(server,
+/// ..)` call site is unchanged: [`EpiGraphMcpFull`] is an
+/// `epigraph_service::ServiceHost`, so the helpers stamp from its `Ctx` and
+/// answer in its own error type. The service crate holds the only definitions.
+pub use epigraph_service::ctx::{
+    begin_author_stamped_tx, begin_author_stamped_tx_for, resolve_claim_visibility,
+};
 
 /// Map a visibility-control error for the caller. A designed refusal keeps its
 /// text, with `Input` as `INVALID_PARAMS` and `Authority`/`State` as
@@ -270,33 +44,6 @@ pub fn visibility_caller_error(e: epigraph_db::DbError) -> McpError {
         }
         other => crate::errors::db_caller_error(other),
     }
-}
-
-/// Resolve a claim write's `visibility` / `group_id` parameters for `author`
-/// (docs/tenancy/claim-visibility-controls.md): team by default, else private,
-/// never public unless asked. Runs BEFORE the author-stamped transaction
-/// because a team the author writes only through its human (D-V3) must be
-/// stamped into it ([`begin_author_stamped_tx_for`]). Every read is a migration
-/// 206 or 107 definer. Since migration 346 the team lists answer only for the
-/// session principal, so `ClaimRepository::resolve_write_decl` stamps `author`
-/// for its one team read on the pool connection (and rolls the stamp back);
-/// callers pass the request's own principal as `author`.
-///
-/// # Errors
-/// `INVALID_PARAMS` for a malformed or contradictory pair, and the caller
-/// errors of [`visibility_caller_error`] for a refused team or author.
-pub async fn resolve_claim_visibility(
-    server: &EpiGraphMcpFull,
-    author: uuid::Uuid,
-    visibility: Option<&str>,
-    group_id: Option<&str>,
-) -> Result<epigraph_db::ResolvedWriteDecl, McpError> {
-    let choice = epigraph_core::VisibilityChoice::parse_str(visibility, group_id)
-        .map_err(crate::errors::invalid_params)?;
-    let mut conn = server.pool.acquire().await.map_err(internal_error)?;
-    ClaimRepository::resolve_write_decl(&mut conn, author, choice)
-        .await
-        .map_err(visibility_caller_error)
 }
 
 /// The viewer the reads of ONE write run through (the DS wiring, the
@@ -762,7 +509,7 @@ pub(crate) async fn store_embedding_author_stamped_for(
     // warn line carries it too.
     let (scoped, author_viewer) = author_write_authority(scoped, pool, author_agent_id, tool_name)
         .await
-        .map_err(|e| e.message.to_string())?;
+        .map_err(|e| e.to_string())?;
     let author_viewer = match grant {
         None => author_viewer,
         Some(g) => author_viewer.with_team_write_grant(g).ok_or_else(|| {

@@ -88,6 +88,7 @@
 //! for the MCP tools.
 
 mod lint_text;
+mod source_files;
 
 use lint_text::spend_views;
 use std::path::{Path, PathBuf};
@@ -305,22 +306,9 @@ fn repos_dir() -> PathBuf {
 }
 
 fn repo_files() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(repos_dir()).expect("read repos dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf-8 file name")
-            .to_string();
-        out.push((
-            name,
-            std::fs::read_to_string(&path).expect("read repo file"),
-        ));
-    }
+    // Recursive, keyed by `source_files::module_key`: a split module's files
+    // (`claim/*.rs`) are scanned under its registered name (`claim.rs`).
+    let mut out = source_files::repo_sources();
     out.sort();
     assert!(
         out.len() > 30,
@@ -905,6 +893,40 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          writes, and the scope's conflicting row is always one the writer reads (public, or \
          its own group's). The id and title it returns are the writer's own row's; it reads \
          nothing else.",
+    ),
+    (
+        "paper.rs",
+        "asserted_claims_conn",
+        "READ of the ids (and, where the session reads the claim row, the stored \
+         content_hash) of the claims one `papers` row asserts through ingest-written \
+         `asserts` edges, on the document ingest's own author-stamped transaction, for the \
+         paper row that transaction just got or created in its declared scope (backlog \
+         8f56a641). Row security on that transaction filters both `edges` and `claims`; every \
+         id it can return is one an earlier ingest of that scope's own paper reported to that \
+         scope, and it is used only to re-use those ids, never returned to a caller.",
+    ),
+    (
+        "paper.rs",
+        "own_group_legacy_claims_conn",
+        "READ of the ids and stored content_hash of the claims ONE group owns, non-public, \
+         that hold one of the document ingest's global plan ids or stored hashes, on that \
+         ingest's own author-stamped transaction, for the group the ingest writes into \
+         (backlog 8f56a641: a pre-246 ingest of the same document by that group). The scope is \
+         in the SQL (`owner_group_id = $1 AND visibility <> 'public'`), not only row security, \
+         so the operator CLI's RLS-bypassing pool reads no other group's row either; used only \
+         to re-use the group's own ids, never returned to a caller.",
+    ),
+    (
+        "paper.rs",
+        "public_twin_recorded_claims_conn",
+        "READ of what the PUBLIC `papers` row of the same document key as the ingest's own \
+         in-scope row asserts through in-force ingest-written `asserts` edges, on the document \
+         ingest's own author-stamped transaction (backlog 8f56a641: a pre-246 non-public \
+         ingest recorded its claims on the one row 246 made public). In the SQL: only when \
+         that row asserts one of the ingest group's own non-public rows, and only that group's \
+         rows and public rows are returned, never another group's non-public row, so the \
+         operator CLI's RLS-bypassing pool reads no other group's row either; used only to \
+         re-use those ids, never returned to a caller.",
     ),
     (
         "passkey.rs",
@@ -4325,10 +4347,13 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "UPDATE `claims` SET `truth_value` by primary key, RETURNING the row. A write; the \
          control depends on the connection. The update_truth_value_conn wrapper's non-test \
          callers pass their stamped transaction, so there it is claims_tenancy's WITH CHECK \
-         against that connection's GUCs, as for update_labels_conn. The one non-test raw-pool \
-         caller, routes/conventions.rs::forget_convention, is NOT under a stamped WITH CHECK: \
-         its gate is the handler's earlier ClaimRepository::get_by_id(pool, &viewer, ..), \
-         which refuses a claim the caller cannot see before this write runs \
+         against that connection's GUCs, as for update_labels_conn. \
+         routes/conventions.rs::forget_convention calls it twice. On a PRIVATE convention it \
+         passes its stamped transaction (claims_tenancy's WITH CHECK, after the handler's \
+         writer-only check). On a PUBLIC convention it is the one non-test raw-pool caller, \
+         NOT under a stamped WITH CHECK, after the stamped transaction commits: its gate is \
+         the handler's earlier ClaimRepository::get_by_id(&mut *tx, &viewer, ..) on that \
+         transaction, which refuses a claim the caller cannot see before any write runs \
          (viewer_spend_lint's forget_convention row). A new \
          raw-pool caller needs its own gate. A `&Viewer` would be spendable only through \
          splice_write, which is not this change's. SCOPE: executor only; the SQL is \
@@ -4459,6 +4484,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "get_per_frame_evidence_type_weights",
         "READ of one `frames` row's property by primary key; same argument as \
          `get_intra_evidence_locality_factor`.",
+    ),
+    (
+        "gap.rs",
+        "get_gap_analysis",
+        "READ of one `gap_analyses` row by primary key. The table has no tenancy columns and no \
+         row security, and what it stores is claim ids, gap types and scores, not claim text \
+         (backlog e21530f3). The viewer is spent by the caller instead: \
+         `routes/gaps.rs::surface_gaps` resolves each stored claim id with \
+         `ChallengeRepository::admission_of` on the same stamped transaction before it names \
+         that claim. Generic so it rides that transaction.",
     ),
     (
         "mass_function.rs",
@@ -4764,17 +4799,25 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          stamped transaction, for `POST /api/v1/papers`'s response; the row security of \
          that transaction admits it because the caller wrote or reads it.",
     ),
-    // EPIGRAPH_COMPOUND_WRITE_GUARD's role test (backlog 7435772c).
+    // EPIGRAPH_COMPOUND_WRITE_GUARD's role test (backlog 7435772c), also
+    // EPIGRAPH_CONTRADICT_COMPOUND_GUARD's decomposition test (backlog b4c2fc2f).
     (
         "claim_role.rs",
         "is_compound_by_definer",
         "READ of one boolean, `public.epigraph_claim_is_compound($1)`, migration 193's SECURITY \
          DEFINER role test over `edges` (an in-force `decomposes_to` out-edge), on the whole graph \
          by design: role is structural, so a caller who cannot see a compound's decomposition must \
-         still be guarded. It returns no row, id or content. Its one caller, \
-         `compound_write_guard::decide`, first checks the claim is visible to the caller \
-         (`visible_claim_ids`, viewer-spliced) and answers an unreadable claim as not-a-compound, \
-         so the bit is never learned about a claim the caller cannot read.",
+         still be guarded. It returns no row, id or content. Its two callers never learn the \
+         bit about a claim the caller cannot read: `compound_write_guard::decide` first checks \
+         the claim is visible to the caller (`visible_claim_ids`, viewer-spliced) and answers an \
+         unreadable claim as not-a-compound, and `contradiction_guard::decide` (backlog \
+         b4c2fc2f) runs only after its writer read the target's content on the caller's \
+         viewer-spliced transaction. The second caller uses the bit the other way round: a \
+         decomposition the caller cannot see turns its warning OFF (the target's cache is \
+         derived from its parts whoever can see them). So a reader of a compound-text claim \
+         learns whether it has a decomposition it cannot see, the same bit \
+         `compound_write_guard` already discloses for a readable claim and migration 193 \
+         accepts.",
     ),
     // Backlog 30c84267: the experiment-loop and method-catalog handlers run
     // every statement on the caller's stamped transaction or read, so the repo

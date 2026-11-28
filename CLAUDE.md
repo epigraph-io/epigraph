@@ -64,7 +64,18 @@ and tenancy are the extension's own job; see
 Never register a first-party route under `/api/v1/ext`
 (`tests/router_extension_seam_lint.rs` fails if you do).
 
+## Crate layering
+
+`epigraph-api`, `epigraph-mcp` and `epigraph-cli` are front ends; an operation
+more than one of them needs goes into `epigraph-service`, never into
+`epigraph-mcp`, and no front end may gain a dependency on another. The rule,
+the composition-target exception and the ratchet that enforces it are in
+`docs/architecture/crate-layering.md`.
+
 ## Retiring backlog items
+
+Filing an item backed only by static reading or testimony? Label it `backlog-candidate`; see
+`docs/conventions/backlog-retirement.md`, "Filing backlog items: evidence tier".
 
 When you complete or refute a claim labelled `backlog`, **always use
 `mcp__epigraph__resolve_backlog_item(original_id, resolution_content)`**.
@@ -120,7 +131,9 @@ A daily reconciler (`scripts/reconcile_backlog_labels.py`) catches free-text
 "Resolves <UUID>" claims filed without `resolve_backlog_item` and back-fills
 the label patch. Ambiguous matches go to `docs/superpowers/reports/reconciler-needs-review.log`.
 
-Full spec: `docs/conventions/backlog-retirement.md`.
+Full spec: `docs/conventions/backlog-retirement.md`. How every other table
+retires a row, and the filter each reader applies:
+`docs/conventions/no-longer-in-force.md`.
 
 ## Schema, migrations, claim mechanics
 
@@ -148,6 +161,36 @@ Full spec: `docs/conventions/backlog-retirement.md`.
   Do not widen its signature — extend the relevant `SELECT` in the caller
   and post-fix the returned `Claim` (see `list_by_labels` and `get_by_id`
   for the pattern).
+
+## Belief values: f64, reproducible per platform only
+
+`TruthValue` (`crates/epigraph-core/src/truth.rs`) and every Dempster-Shafer
+mass, belief and plausibility are `f64` (backlog `de039f69`, `3f6bc8bb`).
+
+- **Bit-identical on one platform.** The DS combination and belief
+  propagation folds combine their inputs in a fixed order:
+  `epigraph_ds::combination::combine_multiple` sorts them by
+  `canonical_mass_cmp` before folding, and CDST belief propagation iterates in
+  canonical order, never a `HashMap`'s (backlog `15582602`). The same inputs on
+  the same CPU architecture and build give the same bits from those folds.
+  Not every aggregate over beliefs is ordered yet: a sum accumulated in a
+  `HashMap` or a SQL `AVG` over unordered rows can differ in the last bits
+  between two runs. A new fold must fix its order; an existing unordered one
+  is a defect to file, not a reason to widen a tolerance.
+- **Not bit-identical across platforms.** The platform's math library (`ln`,
+  `exp`, `powf`) and the compiler's code generation may differ in the last
+  bits between CPU architectures (x86_64 and aarch64, say).
+- **Compare with a tolerance.** In tests, deploy deltas and replays,
+  compare a belief with an absolute tolerance (e.g. `1e-9`), not `==`. An exact
+  comparison is right only inside one run (a determinism test) or for a value
+  stored and read back rather than recomputed.
+- **Never hash or sign a computed belief.** No content hash or signature may
+  cover a value a verifier would have to recompute, because another platform
+  recomputes other bits. Where a float already sits in a signed payload it is
+  an input as written, and verification reads the stored bytes: a signed
+  submission's `truth_value`, or a matcher edge's `score` / `features` in its
+  `properties`, which the edge attestation digests from the row as stored
+  (`crates/epigraph-db/src/repos/edge_signature.rs`).
 
 ## Status claims bypass the novelty gate
 
@@ -241,6 +284,11 @@ migrate to head (it used to skip silently).
      the next batch.
 - `gh pr merge --merge --delete-branch` by default; never `--squash`
   unless explicitly told.
+- A PR that adds a design spec (`docs/superpowers/specs/`) adds its
+  `docs/superpowers/README.md` row as `proposed`; a PR that implements,
+  deviates from or abandons one updates its Status line and its row
+  (vocabulary and procedure there; `.github/scripts/tests/test_spec_index.py`,
+  in CI's `plan` job, fails when they disagree or a spec has no row).
 
 ## Embedding policy
 
@@ -299,8 +347,9 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `evolve_step`** and **HTTP `POST /api/v1/workflows/steps/:id/evolve`** — the new step, `supersedes` or `revises`, embedded post-commit through the caller that authored it (`tools/evolve_step.rs`, `embed_created_workflow_claims`; `routes/workflows.rs::evolve_step`, `embed_inserted_workflow_claims`)
 - **CLI `unmark_duplicate`** — the operator's un-mark on the maintenance DSN (request servers refuse one under D9); re-embeds each restored claim post-commit through `store_embedding_if_unsealed`, best-effort (`crates/epigraph-cli/src/bin/unmark_duplicate.rs::embed_restored`)
 - **CLI `epigraph-operator custodial-supersede`** — the custodian's revision of a platform-owned claim inserts a current successor with new text; after the act commits (`--apply`) it embeds the successor on the same maintenance session through `store_embedding_if_unsealed`, best-effort, and prints `embedded=` (`crates/epigraph-cli/src/operator/custodian.rs::embed_successor`)
-- **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format the vector with `epigraph_db::pgvector_literal` (the one helper; `embedding_stack_ratchet` refuses a hand-written `[v,v,...]`), bind as `$N::vector`)
-- **CLI `method_search`** — `crates/epigraph-cli/src/bin/method_search.rs` (embedding included directly in INSERT, matches `hypothesis` pattern)
+- **CLI `hypothesis`** and **CLI `method_search`** — `crates/epigraph-cli/src/bin/hypothesis.rs::create`, `crates/epigraph-cli/src/bin/method_search.rs::insert_unless_hash_exists`. The canonical CLI claim writer: the claim is created through `ClaimRepository` (`create_with_id_if_absent_conn` with a fresh id, then `set_properties_conn`), and its vector is stored by `ClaimRepository::store_embedding_if_unsealed` in the SAME transaction, so the claim never commits without it. Acquire the embedder via `epigraph_cli::embedding_service()` and format the vector with `epigraph_db::pgvector_literal` (the one helper; `embedding_stack_ratchet` refuses a hand-written `[v,v,...]`).
+
+CLI claim writers go through `ClaimRepository`, never their own `INSERT INTO claims`. Exemption: maintenance-DSN operator bins classified `one-shot` or `admin` (the README's ceremony class) in `crates/epigraph-cli/README.md` may use reviewed SQL. `crates/epigraph-cli/tests/readme_bin_classification.rs` enforces the class half: it fails on a claim INSERT in the production code of `crates/epigraph-cli/src` (`tests/` and `#[cfg(test)]` module bodies are not scanned) unless the file is the root source of a `[[bin]]` classified `one-shot` or `admin`. That such a bin runs on the maintenance DSN is checked in review, not by the scan.
 
 `epigraph-ingest-executor` is pure-DB and does **not** embed itself; it returns
 `WorkflowIngestExecutionResult::claims_to_embed()` (the claims it `inserted`
@@ -537,8 +586,25 @@ only the non-merge commits a change adds. It refuses:
   committed, because a public deny-list would publish the names it protects.
 
 It only warns about a subject outside `<type>(<scope>): <text>` (W2) and a
-message with none of the three sections (W3). Output is redacted, never the
+message with none of the three sections (W3). A `style` commit (formatting
+only: rustfmt, whitespace) is a valid type whose one-line body is not warned
+about (no W3); E1-E6 still apply to it. Output is redacted, never the
 offending value.
+
+The job is in the `needs` of the required `test` check, so an E-class finding
+(E1-E6) turns `test` red and blocks the merge; warnings (W2-W4) do not.
+
+**Pull request title and body.** The `PR text lint` workflow
+(`.github/workflows/pr-text-lint.yml`, `commit-message-lint.py --pr-text`)
+applies E1, E2, E3 and E6 to the PR's title and body on every open, edit and
+push, and fails on a finding. Every line is read, trailer-shaped lines included
+(a PR body has no git attribution to protect). A finding names the rule and
+`title` or `body line <n>`, never the text. It checks new and edited PR text
+only; it does not rewrite PR bodies that were already published. Its limits:
+GitHub runs no `pull_request` workflow while a PR has a merge conflict, so an
+edit made then is not checked until the next push; the job runs the PR's own
+copy of the script, so a PR can weaken the check on itself (as with the commit
+lint); and E2 matches a home path only with a segment after the account name.
 
 **Citing commits.** Cite a commit by sha only once it is on `main`, or when it
 is an earlier commit of the same change. Cite anything else (a commit on

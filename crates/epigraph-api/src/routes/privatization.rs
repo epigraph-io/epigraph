@@ -2340,10 +2340,20 @@ pub async fn seal_commit(
     PrivatizationRepository::begin_batch_conn(&mut tx)
         .await
         .map_err(plan_write_error)?;
-    let sealed =
-        PrivatizationRepository::seal_claims_conn(&mut tx, plan.target_group_id, epoch, &items)
-            .await
-            .map_err(plan_write_error)?;
+    // The sealed form is re-signed with the API's own signing key, the key
+    // boot admitted (`edge_signer`), and the pre-seal signature moves into
+    // the ciphertext row (backlog aa366aa6). With no key configured the
+    // sealed claim is left unsigned rather than keeping a signature over its
+    // plaintext digest.
+    let sealed = PrivatizationRepository::seal_claims_conn(
+        &mut tx,
+        plan.target_group_id,
+        epoch,
+        &items,
+        state.edge_signing_key(),
+    )
+    .await
+    .map_err(plan_write_error)?;
     PrivatizationRepository::record_seal_audit_conn(
         &mut tx,
         plan_id,
@@ -3551,15 +3561,8 @@ async fn record_custodial_act(
     )
     .await
     .map_err(|err| {
-        let ended = matches!(
-            &err,
-            epigraph_db::DbError::QueryFailed { source }
-                if source
-                    .as_database_error()
-                    .and_then(sqlx::error::DatabaseError::code)
-                    .as_deref()
-                    == Some("CUS04")
-        );
+        let ended =
+            epigraph_db::refusal_codes::route_code(&err) == Some(epigraph_db::refusal_codes::CUS04);
         if ended {
             ApiError::Forbidden {
                 reason: "not a platform custodian".to_string(),

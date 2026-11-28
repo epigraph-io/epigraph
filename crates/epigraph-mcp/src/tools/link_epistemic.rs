@@ -283,15 +283,45 @@ pub async fn do_link_epistemic(
             "source_claim_id {source_id} not found"
         )));
     }
-    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(target_id))
-        .await
-        .map_err(internal_error)?
-        .is_none()
-    {
+    let Some(target_claim) =
+        ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(target_id))
+            .await
+            .map_err(internal_error)?
+    else {
         return Err(invalid_params(format!(
             "target_claim_id {target_id} not found"
         )));
-    }
+    };
+
+    // EPIGRAPH_CONTRADICT_COMPOUND_GUARD (backlog b4c2fc2f): a `contradicts` /
+    // `refutes` edge onto a target whose text asserts several things and that
+    // nobody has decomposed would dispute all of them at once. Decided after
+    // the not-found checks above (on the text this caller could read, so it
+    // answers nothing about a hidden claim) and before any write. `refuse`
+    // refuses with nothing written; `warn` writes the edge, reports the risk
+    // and, once the edge commits, logs the caller.
+    let partial_contradiction_risk = match epigraph_engine::contradiction_guard::decide(
+        &mut tx,
+        &params.relationship,
+        target_id,
+        &target_claim.content,
+        server.contradict_compound_guard,
+        "link_epistemic",
+        Some(actor_id),
+    )
+    .await
+    .map_err(internal_error)?
+    {
+        epigraph_engine::contradiction_guard::ContradictionDecision::Unaffected => None,
+        epigraph_engine::contradiction_guard::ContradictionDecision::Warn(risk) => Some(risk),
+        epigraph_engine::contradiction_guard::ContradictionDecision::Refuse(risk) => {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_PARAMS,
+                message: std::borrow::Cow::from(risk.refusal(target_id)),
+                data: Some(risk.refusal_data(target_id)),
+            });
+        }
+    };
 
     // Symmetric relationships (`contradicts`, `corroborates`) dedup in BOTH
     // directions, so the two call orders collapse to ONE row; everything else
@@ -543,6 +573,10 @@ pub async fn do_link_epistemic(
         .map_err(internal_error)?;
 
     tx.commit().await.map_err(internal_error)?;
+    // The edge has landed: only now does it count in the guard's journal.
+    if let Some(risk) = &partial_contradiction_risk {
+        risk.log_accepted("link_epistemic", Some(actor_id));
+    }
 
     success_json(&LinkEpistemicResponse {
         edge_id: edge_id.to_string(),
@@ -553,6 +587,7 @@ pub async fn do_link_epistemic(
         belief_wired_reason,
         belief_target_claim_id: wire_target.to_string(),
         target_belief,
+        partial_contradiction_risk,
     })
 }
 

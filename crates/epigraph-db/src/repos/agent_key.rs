@@ -2,14 +2,10 @@
 //!
 //! # Design Notes
 //!
-//! The `KeyRepository` trait in `epigraph-api` is synchronous, which is incompatible
-//! with sqlx async operations. Additionally, `epigraph-db` cannot depend on
-//! `epigraph-api` without creating a circular dependency.
-//!
-//! This repository therefore implements a concrete `PgKeyRepository` with async
-//! methods that mirror the operations `KeyManager` needs. The `epigraph-api` crate
-//! adapts these into the synchronous `KeyRepository` trait using a blocking executor
-//! or by restructuring `KeyManager` to accept async repos.
+//! `epigraph-db` cannot depend on `epigraph-api` without creating a circular
+//! dependency, so this is a concrete `AgentKeyRepository` with async methods
+//! that the API's agent-key routes and the signer-admission checks call
+//! directly.
 //!
 //! The row type (`AgentKeyRow`) uses primitive types to stay decoupled from
 //! `epigraph-api`'s domain models (`AgentKey`, `KeyType`, `KeyStatus`).
@@ -674,8 +670,7 @@ impl AgentKeyRepository {
     /// application role holds no UPDATE on `agent_keys`, so this runs only on a
     /// privileged connection; the request path uses [`Self::update_status`].
     ///
-    /// Replaces all mutable fields. Used by `KeyManager::rotate_key` and
-    /// `KeyManager::revoke_key` after in-memory state changes.
+    /// Replaces all mutable fields.
     ///
     /// # Errors
     /// Returns `DbError::NotFound` if no key with the given ID exists.

@@ -249,8 +249,9 @@ async fn retire_apply_rederives_the_endpoints_belief(pool: PgPool) {
     );
     assert_eq!(
         betp_of(&pool, a).await,
-        None,
-        "an endpoint no BBA backs must have its stale cache cleared\n{stdout}"
+        Some(0.5),
+        "an endpoint no BBA backs must have its stale cache vacated (the explicit vacuous \
+         cache, never NULL: backlog 75726018)\n{stdout}"
     );
     assert!(
         !stdout.contains("bp/propagate reloads"),
@@ -260,7 +261,7 @@ async fn retire_apply_rederives_the_endpoints_belief(pool: PgPool) {
     for line in [
         "Belief re-derived on the 2 affected endpoint(s)",
         "recomputed:                   1",
-        "cache cleared (no BBA backs): 1",
+        "cache vacated (no BBA backs): 1",
     ] {
         assert!(
             stdout.contains(line),

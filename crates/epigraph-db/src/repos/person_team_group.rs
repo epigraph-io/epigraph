@@ -24,7 +24,8 @@
 //! [`DbError::NotFound`] (TGP08: a group or invitation the caller may not
 //! see answers exactly as a missing one).
 
-use crate::errors::{DbError, RefusalKind};
+use crate::errors::DbError;
+use crate::refusal_codes::{self, Answer, Family};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -75,24 +76,16 @@ pub struct AcceptedInvitation {
 /// conversion.
 fn map_refusal(e: sqlx::Error, entity: &str, id: Uuid) -> DbError {
     if let sqlx::Error::Database(db) = &e {
-        let message = db.message().to_string();
-        let kind = match db.code().as_deref() {
-            Some("TGP08") => {
-                return DbError::NotFound {
-                    entity: entity.to_string(),
-                    id,
-                }
-            }
-            Some("TGP01" | "TGP02") => Some(RefusalKind::Authority),
-            Some("TGP03" | "TGP09") => Some(RefusalKind::Input),
-            Some("TGP04" | "TGP05" | "TGP06" | "TGP07") => Some(RefusalKind::State),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            return DbError::Refused { kind, message };
+        if let Some(Answer::NotFound) =
+            refusal_codes::lookup_in(&**db, Family::Tgp).map(|c| c.answer)
+        {
+            return DbError::NotFound {
+                entity: entity.to_string(),
+                id,
+            };
         }
     }
-    DbError::from(e)
+    DbError::from_definer(e, Family::Tgp)
 }
 
 /// The repository for migration 263's definers.
@@ -266,5 +259,43 @@ impl PersonTeamGroupRepository {
                 },
             )
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::fake_db::{error, shape};
+
+    /// Migration 263's TGP SQLSTATEs, each answered by its kind with the
+    /// database's text (TGP08 as the missing target); anything else is the
+    /// ordinary conversion. The SQLSTATE decides, not the message.
+    #[test]
+    fn tgp_sqlstates_are_answered_by_their_kind() {
+        let id = Uuid::from_bytes([7; 16]);
+        for (code, want) in [
+            ("TGP01", "Refused(Authority): TGP01: x".to_string()),
+            ("TGP02", "Refused(Authority): TGP02: x".to_string()),
+            ("TGP03", "Refused(Input): TGP03: x".to_string()),
+            ("TGP04", "Refused(State): TGP04: x".to_string()),
+            ("TGP05", "Refused(State): TGP05: x".to_string()),
+            ("TGP06", "Refused(State): TGP06: x".to_string()),
+            ("TGP07", "Refused(State): TGP07: x".to_string()),
+            ("TGP08", format!("NotFound(group {id})")),
+            ("TGP09", "Refused(Input): TGP09: x".to_string()),
+            ("TGP10", "QueryFailed".to_string()),
+        ] {
+            let message = format!("{code}: x");
+            assert_eq!(
+                shape(&map_refusal(error(code, &message), "group", id)),
+                want,
+                "{code}"
+            );
+        }
+        // The message alone is not the code.
+        assert_eq!(
+            shape(&map_refusal(error("P0001", "TGP01: x"), "group", id)),
+            "QueryFailed"
+        );
     }
 }

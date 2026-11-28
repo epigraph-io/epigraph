@@ -14,7 +14,7 @@ use epigraph_engine::reputation::{ClaimOutcome, ReputationCalculator};
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
               probability but still on the live path (epigraph-api `submission.rs`, \
-              engine `service.rs`); the invariant must keep being covered until those \
+              `routes/computation.rs`); the invariant must keep being covered until those \
               callers migrate"
 )]
 use epigraph_engine::{
@@ -45,7 +45,7 @@ fn make_claim(truth: f64) -> Claim {
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
               probability but still on the live path (epigraph-api `submission.rs`, \
-              engine `service.rs`); the invariant must keep being covered until those \
+              `routes/computation.rs`); the invariant must keep being covered until those \
               callers migrate"
 )]
 fn bench_bayesian_single_update(c: &mut Criterion) {
@@ -65,7 +65,7 @@ fn bench_bayesian_single_update(c: &mut Criterion) {
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
               probability but still on the live path (epigraph-api `submission.rs`, \
-              engine `service.rs`); the invariant must keep being covered until those \
+              `routes/computation.rs`); the invariant must keep being covered until those \
               callers migrate"
 )]
 fn bench_bayesian_sequential_updates(c: &mut Criterion) {
@@ -88,7 +88,7 @@ fn bench_bayesian_sequential_updates(c: &mut Criterion) {
     deprecated,
     reason = "exercises `BayesianUpdater`, deprecated in favour of CDST pignistic \
               probability but still on the live path (epigraph-api `submission.rs`, \
-              engine `service.rs`); the invariant must keep being covered until those \
+              `routes/computation.rs`); the invariant must keep being covered until those \
               callers migrate"
 )]
 fn bench_bayesian_initial_truth(c: &mut Criterion) {

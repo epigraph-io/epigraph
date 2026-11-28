@@ -35,44 +35,20 @@ use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+mod source_files;
 mod viewer_fixture;
 use viewer_fixture as fixture;
 
-const CLAIM_RS: &str = include_str!("../src/repos/claim.rs");
-
-/// The body (outermost braces included) of the function whose signature starts
-/// with `signature`. Panics when the signature is absent or appears twice, so a
-/// rename cannot make the structural assertions pass vacuously.
-fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
-    let hits: Vec<usize> = src.match_indices(signature).map(|(i, _)| i).collect();
-    assert_eq!(
-        hits.len(),
-        1,
-        "expected exactly one `{signature}` in repos/claim.rs, found {}; the \
-         structural pin must name the function it checks",
-        hits.len()
-    );
-    let start = hits[0];
-    let open = start + src[start..].find('{').expect("function has a body");
-    let mut depth = 0usize;
-    for (off, ch) in src[open..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &src[open..=open + off];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced braces after `{signature}`");
-}
+/// The claim repository, by its registered path: `repos/claim.rs` and, once it
+/// is split, every file of the `repos/claim/` directory module
+/// (`source_files`). A function is found wherever it moved; exactly one
+/// definition across the module is still required.
+const CLAIM_MODULE: &str = "crates/epigraph-db/src/repos/claim.rs";
 
 #[test]
 fn get_by_id_conn_is_a_pure_delegation() {
-    let body = fn_body(CLAIM_RS, "pub async fn get_by_id_conn(");
+    let module = source_files::module_files(CLAIM_MODULE);
+    let body = source_files::fn_body(&module, "pub async fn get_by_id_conn(");
     for forbidden in [
         "sqlx::query",
         ".splice(",

@@ -30,6 +30,9 @@ epigraph-authz = { workspace = true }  # Fail-closed write gate for the declassi
 epigraph-embeddings = { workspace = true }
 epigraph-ingest = { workspace = true }
 epigraph-ingest-executor = { workspace = true }
+# The transport-neutral service layer (backlog 93e01896): shared operations
+# move there from this crate and are re-exported here.
+epigraph-service = { workspace = true }
 
 # `O_NOFOLLOW | O_NONBLOCK` for the label-dedup profile file open (a symlink
 # or a FIFO at the profile path must be refused, never followed or waited on).
@@ -98,6 +101,9 @@ axum = "0.8"
 http = "1"
 
 [dev-dependencies]
+# `Ctx::seed_agent_id_for_tests` for the SessionFactory unit tests in
+# `server.rs`. Test builds only.
+epigraph-service = { workspace = true, features = ["test-support"] }
 # `ScopedPool::connect_downgraded_for_tests`: the app-role tool tests
 # (`tests/writer_owned_attach_app_role.rs`). Test builds only.
 epigraph-db = { workspace = true, features = ["test-support"] }

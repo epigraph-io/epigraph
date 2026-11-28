@@ -28,8 +28,10 @@ pub struct PlannedClaim {
     /// necessarily `blake3(content)`. For document-scoped (compound) claims
     /// the builder sets this to
     /// [`crate::common::ids::compound_content_hash`], which folds in the
-    /// artifact seed; for atoms it is the plain content hash. Writers must
-    /// bind this value rather than re-deriving from `content`.
+    /// artifact seed; for atoms it is the plain content hash, except in a
+    /// non-public document ingest, where it is
+    /// [`crate::common::ids::scoped_atom_content_hash`]. Writers must bind
+    /// this value rather than re-deriving from `content`.
     pub content_hash: [u8; 32],
     pub confidence: f64,
     pub methodology: Option<String>,
@@ -53,25 +55,40 @@ pub struct PlannedClaim {
     /// plans with no source document (workflows).
     pub supporting_locator: Option<String>,
     pub enrichment: serde_json::Value,
+    /// The owning group folded into this claim's id and stored hash, or `None`
+    /// for a global (public-ingest or workflow) id. See
+    /// [`crate::common::ids`], "Scope-derived ids". A scoped claim's
+    /// `properties` also carry
+    /// [`ID_SCOPE_KEY`](crate::common::ids::ID_SCOPE_KEY) so a reader of the
+    /// persisted row knows it.
+    pub id_scope: Option<Uuid>,
 }
 
 impl PlannedClaim {
-    /// True iff `id` was minted with
-    /// [`COMPOUND_NAMESPACE`](crate::common::ids::COMPOUND_NAMESPACE) — i.e.
-    /// this is a structural node (thesis / section-phase / paragraph-step)
-    /// whose identity is scoped to its host artifact.
+    /// True iff `id` is NOT the global content address
+    /// `uuid_v5(ATOM_NAMESPACE, blake3(content))`: a structural node (thesis /
+    /// section-phase / paragraph-step) minted with
+    /// [`COMPOUND_NAMESPACE`](crate::common::ids::COMPOUND_NAMESPACE) and
+    /// scoped to its host artifact, or an atom of a non-public ingest whose id
+    /// folds in its owning group
+    /// ([`scoped_atom_id`](crate::common::ids::scoped_atom_id), `id_scope`
+    /// set).
     ///
     /// This is the single predicate a write path may use to choose between
     /// preserving the planner's id (`true`) and letting content-hash
-    /// convergence pick the row (`false`). Levels 0–2 are minted by
+    /// convergence pick the row (`false`). A scoped atom MUST take the id
+    /// path: content-hash convergence looks the text up in every scope, which
+    /// is exactly what a non-public ingest may not do. Levels 0–2 are minted by
     /// [`compound_claim_id`](crate::common::ids::compound_claim_id) and level 3
-    /// by [`atom_id`](crate::common::ids::atom_id) in BOTH builders
+    /// by [`scoped_atom_id`](crate::common::ids::scoped_atom_id) (with no
+    /// scope, [`atom_id`](crate::common::ids::atom_id)) in BOTH builders
     /// (`document::builder`, `workflow::builder`); the drift guard
     /// `planned_id_namespace_matches_declared_scope` in `lib.rs` re-derives
-    /// every id in a built plan and fails if that ever stops holding.
+    /// every id in a built plan, public and scoped, and fails if that ever
+    /// stops holding.
     #[must_use]
     pub const fn id_is_document_scoped(&self) -> bool {
-        self.level < 3
+        self.level < 3 || self.id_scope.is_some()
     }
 }
 

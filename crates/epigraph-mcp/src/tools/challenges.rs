@@ -251,21 +251,37 @@ pub async fn list_challenges(
     let challenges = ChallengeRepository::list_for_claim(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?;
+    // Backlog d8108186: the open challenges on the claim's in-force
+    // `decomposes_to` parents, on the same viewer-stamped read, appended and
+    // tagged `via_parent`. Absent flag: nothing appended, output unchanged.
+    let parent_challenges = if params.include_parents.unwrap_or(false) {
+        ChallengeRepository::list_open_for_parents(&mut *read, viewer, claim_id)
+            .await
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
+    };
     read.commit().await.map_err(internal_error)?;
 
+    let entry = |c: epigraph_db::ChallengeRow| {
+        serde_json::json!({
+            "id": c.id,
+            "claim_id": c.claim_id,
+            "challenger_id": c.challenger_id,
+            "challenge_type": c.challenge_type,
+            "explanation": c.explanation,
+            "state": c.state,
+            "created_at": c.created_at.to_rfc3339(),
+        })
+    };
     let results: Vec<serde_json::Value> = challenges
         .into_iter()
-        .map(|c| {
-            serde_json::json!({
-                "id": c.id,
-                "claim_id": c.claim_id,
-                "challenger_id": c.challenger_id,
-                "challenge_type": c.challenge_type,
-                "explanation": c.explanation,
-                "state": c.state,
-                "created_at": c.created_at.to_rfc3339(),
-            })
-        })
+        .map(entry)
+        .chain(parent_challenges.into_iter().map(|(c, parent)| {
+            let mut e = entry(c);
+            e["via_parent"] = serde_json::json!(parent);
+            e
+        }))
         .collect();
 
     Ok(CallToolResult::success(vec![ContentBlock::text(

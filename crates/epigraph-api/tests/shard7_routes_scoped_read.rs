@@ -1037,10 +1037,15 @@ async fn list_challenges_serves_the_viewers_own_group_private_challenge(pool: Pg
     let viewer = viewer_for(&pool, viewer_agent).await;
     let state = split_state(&pool).await;
 
-    let body = list_challenges(ViewerExtractor(viewer), State(state), Path(claim))
-        .await
-        .expect("list_challenges")
-        .0;
+    let body = list_challenges(
+        ViewerExtractor(viewer),
+        State(state),
+        Path(claim),
+        axum::extract::Query(epigraph_api::routes::challenge::ListChallengesQuery::default()),
+    )
+    .await
+    .expect("list_challenges")
+    .0;
 
     let ids: Vec<Uuid> = body.challenges.iter().map(|c| c.id).collect();
     assert_eq!(

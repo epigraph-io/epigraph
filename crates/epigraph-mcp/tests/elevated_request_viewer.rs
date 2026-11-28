@@ -323,6 +323,7 @@ fn recall_params(query: &str) -> epigraph_mcp::types::RecallParams {
         offset: None,
         epistemic_partition: false,
         diversity_radius: None,
+        route: None,
     }
 }
 
@@ -482,7 +483,7 @@ fn refused_as_elevated<T: std::fmt::Debug>(r: &Result<T, rmcp::model::ErrorData>
 
 fn inline_doc(doi: &str) -> epigraph_mcp::types::IngestDocumentInlineParams {
     epigraph_mcp::types::IngestDocumentInlineParams {
-        wait: None,
+        wait: Some(false),
         extraction: serde_json::from_value(serde_json::json!({
             "source": {"title": format!("Elevated ingest {doi}"), "doi": doi,
                        "source_type": "Paper", "authors": []},

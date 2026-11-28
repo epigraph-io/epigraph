@@ -8,6 +8,8 @@
 //! exactly what it was.
 
 use serde_json::Value;
+
+use super::claim_role::is_compound_sql;
 use sqlx::{PgConnection, PgExecutor};
 use uuid::Uuid;
 
@@ -16,6 +18,24 @@ pub struct PolicyRepository;
 
 impl PolicyRepository {
     /// Active network policies with `truth_value >= min_truth`, highest first.
+    ///
+    /// Role-aware (backlog fe1cdcdf): a compound policy claim's cached
+    /// `truth_value` is a fold of its own BBAs, not a belief, so only a
+    /// non-compound can reach `min_truth`.
+    ///
+    /// # Fail closed: a compound never passes a gate
+    ///
+    /// Under a gate (`min_truth > 0`) a compound
+    /// (`claim_role::IS_COMPOUND_SQL`) is EXCLUDED, the attribution readers'
+    /// spelling (`edge.rs::attribution_truth_gate`). This list is an ALLOW
+    /// list, and "compound" is decided by `decomposes_to` structure that any
+    /// `edges:write` caller can add between two public claims. Letting a
+    /// compound through ungated would let that caller re-list a policy an
+    /// admin had driven below the gate. Excluding it means a structural edit
+    /// can at most drop a policy from the list, never add one. At
+    /// `min_truth <= 0` the gate is vacuous and every policy is listed, with
+    /// the compounds after every non-compound, by `id`. The row shape is
+    /// unchanged.
     pub async fn list_active_network<'e, E>(
         executor: E,
         min_truth: f64,
@@ -23,17 +43,21 @@ impl PolicyRepository {
     where
         E: PgExecutor<'e>,
     {
-        sqlx::query_as(
-            "SELECT id, truth_value, properties \
-             FROM claims \
-             WHERE 'policy:active' = ANY(labels) \
-               AND 'policy:network' = ANY(labels) \
-               AND truth_value >= $1 \
-             ORDER BY truth_value DESC",
-        )
-        .bind(min_truth)
-        .fetch_all(executor)
-        .await
+        let compound = is_compound_sql("c");
+        let sql = format!(
+            "SELECT c.id, c.truth_value, c.properties \
+             FROM claims c \
+             WHERE 'policy:active' = ANY(c.labels) \
+               AND 'policy:network' = ANY(c.labels) \
+               AND ($1 <= 0 OR (c.truth_value >= $1 AND NOT {compound})) \
+             ORDER BY {compound}, \
+                      CASE WHEN {compound} THEN NULL ELSE c.truth_value END DESC, \
+                      c.id"
+        );
+        sqlx::query_as(&sql)
+            .bind(min_truth)
+            .fetch_all(executor)
+            .await
     }
 
     /// One policy challenge's `(id, properties)` by id.

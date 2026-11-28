@@ -25,7 +25,14 @@
 
 use uuid::Uuid;
 
-use crate::errors::{DbError, RefusalKind};
+use crate::errors::DbError;
+
+/// Map migration 208's refusals (`CSG01`, `CSG02`: the caller is neither the
+/// named agent nor its live operator) to designed refusals, and anything else
+/// to the ordinary conversion (the refusal-code registry gives the kinds).
+fn map_countersign_error(e: sqlx::Error) -> DbError {
+    DbError::from_definer(e, crate::refusal_codes::Family::Csg)
+}
 
 /// What the named person decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,17 +105,7 @@ impl CountersignRepository {
         .bind(ingested_by)
         .fetch_all(&mut *conn)
         .await
-        .map_err(|e| match &e {
-            sqlx::Error::Database(d)
-                if d.message().starts_with("CSG01") || d.message().starts_with("CSG02") =>
-            {
-                DbError::Refused {
-                    kind: RefusalKind::Authority,
-                    message: d.message().to_string(),
-                }
-            }
-            _ => DbError::from(e),
-        })?;
+        .map_err(map_countersign_error)?;
         Ok(rows
             .into_iter()
             .map(|(edge_id, ingested_by, outcome)| CountersignedRow {
@@ -117,5 +114,29 @@ impl CountersignRepository {
                 outcome,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::fake_db::{error, shape};
+
+    /// Migration 208's CSG codes are authority refusals with the database's
+    /// text; anything else is the ordinary conversion.
+    #[test]
+    fn csg_codes_are_authority_refusals() {
+        for (message, want) in [
+            ("CSG01: x", "Refused(Authority): CSG01: x"),
+            ("CSG02: x", "Refused(Authority): CSG02: x"),
+            ("CSG03: x", "QueryFailed"),
+            ("VIS01: x", "QueryFailed"),
+        ] {
+            assert_eq!(
+                shape(&map_countersign_error(error("42501", message))),
+                want,
+                "{message}"
+            );
+        }
     }
 }

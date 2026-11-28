@@ -411,9 +411,10 @@ async fn commit_seal(pool: &PgPool, world: &World, items: &[SealCommitItem]) -> 
     let mut tx = sqlx::Connection::begin(&mut *conn)
         .await
         .expect("begin seal tx");
-    let sealed = PrivatizationRepository::seal_claims_conn(&mut tx, world.group, EPOCH, items)
-        .await
-        .expect("seal");
+    let sealed =
+        PrivatizationRepository::seal_claims_conn(&mut tx, world.group, EPOCH, items, None)
+            .await
+            .expect("seal");
     tx.commit().await.expect("commit seal");
     sealed
 }

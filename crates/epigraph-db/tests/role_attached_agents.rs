@@ -23,6 +23,10 @@
 //!   without exposing the roster. Both the application role and the identity
 //!   attestor can EXECUTE it; since 248 the application role is answered only
 //!   about its own stamped principal.
+//! * Since 360 `epigraph_role_owner_may_run(role node, agent)` answers the
+//!   host, for a schedule that names its owner role, `held`, `no_holder` or
+//!   `not_attached`; the attestor and the owner may ask, the application role
+//!   may not.
 //! * Since 248 the attach verb refuses (`ROL03`) an identity the host has not
 //!   registered yet, whose first registration the attachment would abort.
 //! * A succession registered by the attestor copies the parent's live
@@ -1021,8 +1025,10 @@ async fn write_in_txn(
 /// agent that COULD be attached (any agent: not a human, not a role node)
 /// writes only under READ COMMITTED, attached or not (as 123's CUS06 refuses
 /// a grant under REPEATABLE READ). POSITIVE CONTROLS: the attached agent
-/// writes under READ COMMITTED, and a human (never attached) writes under
-/// REPEATABLE READ and SERIALIZABLE.
+/// and a human write under READ COMMITTED; under REPEATABLE READ and
+/// SERIALIZABLE a human (never attached) passes ROL01 and is refused only by
+/// the writer scope's own READ COMMITTED rule for its direct membership
+/// (OPL02, migration 361), so ROL01's test stays on attachability.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
     seed_role(&pool, ROLE).await;
@@ -1036,10 +1042,20 @@ async fn an_attached_agent_writes_only_on_a_fresh_snapshot(pool: PgPool) {
     write_in_txn(&pool, attached, h_group, "READ COMMITTED", Between::Nothing)
         .await
         .expect("CONTROL: the holder's agent writes under READ COMMITTED");
+    write_in_txn(&pool, h, h_group, "READ COMMITTED", Between::Nothing)
+        .await
+        .expect("CONTROL: the human writes under READ COMMITTED");
     for level in ["REPEATABLE READ", "SERIALIZABLE"] {
-        write_in_txn(&pool, h, h_group, level, Between::Nothing)
-            .await
-            .unwrap_or_else(|e| panic!("CONTROL: a human writes under {level}: {e}"));
+        let r = write_in_txn(&pool, h, h_group, level, Between::Nothing).await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some("OPL02"),
+            "CONTROL: a human under {level} is not refused ROL01: {r:?}"
+        );
+        assert!(
+            format!("{r:?}").contains("a write through a direct membership is admitted only"),
+            "CONTROL: a human under {level} is refused by 361's direct-arm rule: {r:?}"
+        );
         assert_rol01(
             &write_in_txn(&pool, attached, h_group, level, Between::Nothing).await,
             &format!("an attached agent under {level}"),
@@ -3679,4 +3695,432 @@ async fn an_unlinked_shared_successor_stays_refused_until_it_is_linked(pool: PgP
     write_as(&pool, shared, shared, h_group)
         .await
         .expect("linked to the holder by hand, it writes");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Migration 360: the host's owner-role question for a role's schedule
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The migration that adds `epigraph_role_owner_may_run` (renumber here, in
+/// the file name, the README row and the undo runbook together).
+const OWNER_MAY_RUN_MIGRATION: i64 = 360;
+const OWNER_MAY_RUN: &str = "public.epigraph_role_owner_may_run(uuid, uuid)";
+const INVALID_PARAMETER: &str = "22023";
+const UNDEFINED_FUNCTION: &str = "42883";
+
+/// The role's node: the uuid a schedule names as its owner role.
+async fn role_node(pool: &PgPool, key: &str) -> Uuid {
+    sqlx::query_scalar("SELECT role_node_id FROM platform_roles WHERE key = $1")
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .expect("role node")
+}
+
+/// `epigraph_role_owner_may_run(role_node, agent)` on a `role` session, inside
+/// a READ ONLY transaction (so an answer that tried to write would fail
+/// `25006` instead of passing), unstamped unless `principal` is given.
+async fn owner_may_run_on(
+    pool: &PgPool,
+    role: &str,
+    principal: Option<Uuid>,
+    role_id: Option<Uuid>,
+    agent: Option<Uuid>,
+) -> Result<String, sqlx::Error> {
+    fixture::as_role(pool, role, |mut conn| async move {
+        use sqlx::Executor;
+        if let Some(p) = principal {
+            stamp(&mut conn, p, &[]).await;
+        }
+        conn.execute("BEGIN READ ONLY")
+            .await
+            .expect("begin read only");
+        let r =
+            sqlx::query_scalar::<_, String>("SELECT public.epigraph_role_owner_may_run($1, $2)")
+                .bind(role_id)
+                .bind(agent)
+                .fetch_one(&mut *conn)
+                .await;
+        conn.execute("ROLLBACK").await.expect("rollback");
+        unstamp(&mut conn).await;
+        (conn, r)
+    })
+    .await
+}
+
+/// The host's question, on the attestor's login.
+async fn owner_may_run(pool: &PgPool, role_key: &str, agent: Uuid) -> String {
+    let node = role_node(pool, role_key).await;
+    owner_may_run_on(pool, ATTESTOR, None, Some(node), Some(agent))
+        .await
+        .unwrap_or_else(|e| panic!("the attestor asks about {agent} in {role_key}: {e}"))
+}
+
+/// Backlog 6e633456 (migration 360). A schedule that belongs to a role is
+/// run by an identity the host resolves at fire time; 166's
+/// `epigraph_role_agent_may_run` answers `unattached -> may run` for an
+/// identity that was never attached, so the role's ruling never reached such
+/// a schedule. 360's question names the role and the identity and answers
+/// exactly one of `held`, `no_holder` or `not_attached`:
+///
+/// * an attached identity: `no_holder` while nobody holds the role, `held`
+///   while someone does, `no_holder` again once the assignment ends;
+/// * an identity NOT attached to the role reads `not_attached` WHILE THE
+///   ROLE IS HELD (the tripwire: 166's gate would let it run) and while it
+///   is not (`not_attached` is decided first, so the role's holder state is
+///   not disclosed about an outsider);
+/// * an identity attached only to ANOTHER role, and one whose attachment
+///   was detached, read `not_attached`; a bounded attachment that has not
+///   opened yet reads `not_attached`, and one that has ended does too.
+///
+/// Every answer is on the attestor's login (the host's), in a READ ONLY
+/// transaction. The maintenance role (the owner) gets the same answers.
+///
+/// Verified to fail: without 360 every call is `42883`; with the attachment
+/// check removed the held-but-unattached identity reads `held`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn owner_may_run_answers_held_no_holder_and_not_attached(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    seed_role(&pool, OTHER_ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let outsider = agent_of(&pool, h, "outsider").await;
+    let elsewhere = agent_of(&pool, h, "elsewhere").await;
+    let later = agent_of(&pool, h, "later").await;
+    let ended = agent_of(&pool, h, "ended").await;
+    attach(&pool, ROLE, attached).await;
+    attach(&pool, OTHER_ROLE, elsewhere).await;
+    attach_window(&pool, ROLE, later, "now() + interval '1 hour'", "NULL").await;
+    attach_window(
+        &pool,
+        ROLE,
+        ended,
+        "now() - interval '5 seconds'",
+        "now() - interval '5 seconds' + interval '1 millisecond'",
+    )
+    .await;
+
+    for (agent, want, what) in [
+        (
+            attached,
+            "no_holder",
+            "an attached identity, nobody holds the role",
+        ),
+        (
+            outsider,
+            "not_attached",
+            "an outsider, nobody holds the role",
+        ),
+        (elsewhere, "not_attached", "attached to another role only"),
+        (later, "not_attached", "an attachment that opens later"),
+        (ended, "not_attached", "an attachment that has ended"),
+    ] {
+        assert_eq!(owner_may_run(&pool, ROLE, agent).await, want, "{what}");
+    }
+
+    let assignment = grant(&pool, ROLE, h, None).await;
+    for (agent, want, what) in [
+        (
+            attached,
+            "held",
+            "an attached identity while its role is held",
+        ),
+        (
+            outsider,
+            "not_attached",
+            "THE TRIPWIRE: an identity never attached, while the role is held",
+        ),
+        (
+            elsewhere,
+            "not_attached",
+            "attached to another role only, role held",
+        ),
+        (
+            later,
+            "not_attached",
+            "an attachment that opens later, role held",
+        ),
+        (
+            ended,
+            "not_attached",
+            "an attachment that has ended, role held",
+        ),
+    ] {
+        assert_eq!(owner_may_run(&pool, ROLE, agent).await, want, "{what}");
+        let node = role_node(&pool, ROLE).await;
+        assert_eq!(
+            owner_may_run_on(&pool, "epigraph_maintenance", None, Some(node), Some(agent))
+                .await
+                .unwrap_or_else(|e| panic!("the owner asks: {e}")),
+            want,
+            "the maintenance role: {what}"
+        );
+    }
+
+    end_assignment(&pool, assignment).await;
+    assert_eq!(
+        owner_may_run(&pool, ROLE, attached).await,
+        "no_holder",
+        "the assignment ended: no holder again"
+    );
+
+    grant(&pool, ROLE, h, None).await;
+    assert_eq!(owner_may_run(&pool, ROLE, attached).await, "held");
+    assert_eq!(detach(&pool, ROLE, attached).await, 1);
+    assert_eq!(
+        owner_may_run(&pool, ROLE, attached).await,
+        "not_attached",
+        "a detached identity is not attached, though the role is held"
+    );
+}
+
+/// The lineage: an identity attached through a SUCCESSION COPY (166's
+/// registration copy, and the attach-time follow 195 chains) is attached for
+/// this question exactly as for 166's gate: `no_holder` in a gap, `held` once
+/// its human holds the role. Never `not_attached`, which would make the host
+/// refuse the job's next identity after every prompt edit.
+///
+/// Verified to fail: with the attached read restricted to rows made by name
+/// (`inherited_from IS NULL`) both successors read `not_attached`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn owner_may_run_counts_a_succession_copy_as_attached(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let parent = register(&pool, &random32(), None, "g-360-lineage").await;
+    link(&pool, parent, h).await;
+    // Registered BEFORE the attach: the attach-time lineage follow copies it.
+    let followed = register(&pool, &random32(), Some(parent), "g-360-lineage").await;
+    let row = attach(&pool, ROLE, parent).await;
+    // Registered AFTER the attach: the registration copies the parent's row.
+    let copied = register(&pool, &random32(), Some(parent), "g-360-lineage").await;
+    for (agent, what) in [
+        (followed, "the follow's copy"),
+        (copied, "the registration's copy"),
+    ] {
+        let rows = live_attachments(&pool, agent).await;
+        assert_eq!(
+            rows,
+            vec![(ROLE.to_string(), Some(row))],
+            "CALIBRATION: {what} is a succession copy, not a row made by name"
+        );
+        assert_eq!(
+            owner_may_run(&pool, ROLE, agent).await,
+            "no_holder",
+            "{what}: attached, in a gap"
+        );
+    }
+    grant(&pool, ROLE, h, None).await;
+    for (agent, what) in [
+        (followed, "the follow's copy"),
+        (copied, "the registration's copy"),
+    ] {
+        assert_eq!(
+            owner_may_run(&pool, ROLE, agent).await,
+            "held",
+            "{what}: attached, role held"
+        );
+    }
+}
+
+/// A NULL argument, a uuid that is no role's node, and the arguments swapped
+/// (agent first, then the role node) are refused `22023` with no answer:
+/// never read as `not_attached` / `no_holder`, and never `42883`, which the
+/// host reads as "this database predates the question" and then runs the
+/// schedule unchecked.
+///
+/// Verified to fail: without the role lookup's refusal the unknown and the
+/// swapped calls answer `not_attached`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn owner_may_run_refuses_an_unknown_role_or_a_swapped_call(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    let node = role_node(&pool, ROLE).await;
+    assert_eq!(
+        owner_may_run(&pool, ROLE, attached).await,
+        "no_holder",
+        "CONTROL: the well-formed call answers"
+    );
+
+    for (role_id, agent, what) in [
+        (
+            Some(Uuid::new_v4()),
+            Some(attached),
+            "a uuid that is no role's node",
+        ),
+        (Some(attached), Some(node), "the arguments swapped"),
+        (Some(h), Some(attached), "a human's id as the role"),
+        (None, Some(attached), "no role"),
+        (Some(node), None, "no agent"),
+    ] {
+        let r = owner_may_run_on(&pool, ATTESTOR, None, role_id, agent).await;
+        let code = code_of(&r);
+        assert_eq!(
+            code.as_deref(),
+            Some(INVALID_PARAMETER),
+            "{what}: refused 22023, got {r:?}"
+        );
+        assert_ne!(code.as_deref(), Some(UNDEFINED_FUNCTION), "{what}");
+    }
+}
+
+/// EXECUTE is the attestor's (the host) and the owner's alone: PUBLIC and the
+/// application role hold none, so an application session, stamped as the
+/// very agent it asks about, is refused `42501` (the roster oracle 248
+/// narrowed stays closed). The function is a maintenance-owned SECURITY
+/// DEFINER on 172's `pg_catalog, pg_temp` path.
+///
+/// Verified to fail: with 360's `REVOKE ... FROM PUBLIC` removed the
+/// application role can EXECUTE it and gets an answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_execute_owner_may_run(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    let node = role_node(&pool, ROLE).await;
+
+    for (grantee, want) in [
+        ("public", false),
+        ("epigraph_app", false),
+        (ATTESTOR, true),
+        ("epigraph_maintenance", true),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(grantee)
+            .bind(OWNER_MAY_RUN)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, want, "{grantee} EXECUTE on {OWNER_MAY_RUN}");
+    }
+
+    for principal in [None, Some(attached)] {
+        let r =
+            owner_may_run_on(&pool, "epigraph_app", principal, Some(node), Some(attached)).await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "an application session (stamped: {principal:?}) may not ask: {r:?}"
+        );
+    }
+    assert_eq!(
+        owner_may_run(&pool, ROLE, attached).await,
+        "no_holder",
+        "CONTROL: the attestor asks"
+    );
+
+    let (secdef, volatile, owner, config): (bool, String, String, Option<Vec<String>>) =
+        sqlx::query_as(
+            "SELECT p.prosecdef, p.provolatile::text, pg_get_userbyid(p.proowner)::text, \
+                    p.proconfig \
+               FROM pg_proc p WHERE p.oid = $1::text::regprocedure",
+        )
+        .bind(OWNER_MAY_RUN)
+        .fetch_one(&pool)
+        .await
+        .expect("catalog row");
+    assert!(secdef, "SECURITY DEFINER");
+    assert_eq!(volatile, "v", "VOLATILE: it reads the statement's clock");
+    assert_eq!(owner, "epigraph_maintenance");
+    assert_eq!(
+        config.unwrap_or_default(),
+        vec!["search_path=pg_catalog, pg_temp".to_string()],
+        "172's path"
+    );
+}
+
+/// Review round (360). `role_agents` and `role_assignments` admit only a
+/// maintenance-owned definer frame, so under any other owner the question
+/// would see no attachment and answer `not_attached` for an identity that IS
+/// attached, on a held role: the run is still refused, but the reason sends
+/// the operator to attach what is attached. It fails LOUD instead, with
+/// 166's `ROL01`, which is neither an answer nor the host's `42883`.
+/// CONTROL: restoring the owner restores the answer.
+///
+/// Verified to fail: without the inline owner check the attestor's call on
+/// the misowned function answers `not_attached`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_misowned_owner_may_run_refuses_rather_than_answer_not_attached(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    attach(&pool, ROLE, attached).await;
+    grant(&pool, ROLE, h, None).await;
+    assert_eq!(
+        owner_may_run(&pool, ROLE, attached).await,
+        "held",
+        "CALIBRATION: maintenance-owned, an attached identity on a held role"
+    );
+
+    sqlx::query(&format!(
+        "ALTER FUNCTION {OWNER_MAY_RUN} OWNER TO epigraph_app"
+    ))
+    .execute(&pool)
+    .await
+    .expect("misown the function");
+    let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+        .bind(ATTESTOR)
+        .bind(OWNER_MAY_RUN)
+        .fetch_one(&pool)
+        .await
+        .expect("privilege");
+    assert!(
+        can,
+        "CALIBRATION: the attestor keeps EXECUTE, so the refusal measured is the body's"
+    );
+    let node = role_node(&pool, ROLE).await;
+    let r = owner_may_run_on(&pool, ATTESTOR, None, Some(node), Some(attached)).await;
+    assert_rol01(&r, "the attestor asks a misowned owner-role question");
+    assert_ne!(
+        code_of(&r).as_deref(),
+        Some(UNDEFINED_FUNCTION),
+        "never the host's not-deployed code"
+    );
+
+    sqlx::query(&format!(
+        "ALTER FUNCTION {OWNER_MAY_RUN} OWNER TO epigraph_maintenance"
+    ))
+    .execute(&pool)
+    .await
+    .expect("restore the owner");
+    assert_eq!(
+        owner_may_run(&pool, ROLE, attached).await,
+        "held",
+        "CONTROL: with the owner restored the question answers again"
+    );
+}
+
+/// `docs/runbooks/360-undo.sql`, applied twice to a database migrated through
+/// 360, returns the catalog to exactly what it was below 360 (the function
+/// and its grants gone, nothing else touched), and the host's question then
+/// fails `42883`, the code the host reads as "not deployed".
+#[sqlx::test(migrations = false)]
+async fn the_360_undo_restores_the_catalog_below_360(pool: PgPool) {
+    migrate(&pool, &up_to_below(OWNER_MAY_RUN_MIGRATION)).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to_below(OWNER_MAY_RUN_MIGRATION + 1)).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 360 changed the catalog"
+    );
+
+    let undo = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        format!("../../docs/runbooks/{OWNER_MAY_RUN_MIGRATION}-undo.sql"),
+    ))
+    .expect("the 360 undo runbook");
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the undo script applies (run {run}): {e}"));
+    }
+    assert_eq!(catalog(&pool).await, before, "the catalog below 360");
+
+    seed_role(&pool, ROLE).await;
+    let node = role_node(&pool, ROLE).await;
+    let r = owner_may_run_on(&pool, ATTESTOR, None, Some(node), Some(Uuid::new_v4())).await;
+    assert_eq!(code_of(&r).as_deref(), Some(UNDEFINED_FUNCTION), "{r:?}");
 }

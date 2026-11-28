@@ -39,6 +39,7 @@
 //! * Lower-case SQL is not SQL to this scan; the tree has none today.
 
 mod belief_lint;
+mod source_files;
 
 use belief_lint::{
     find_words, is_sql, rust_sources, rust_view, sql_without_comments, with_scratch, RustUnits,
@@ -133,7 +134,7 @@ fn measure(rust: &[Source]) -> BTreeMap<(String, String), usize> {
             let sql = sql_without_comments(&lit.text);
             let n = read_sites(&sql).saturating_sub(filters(&lit.text, &sql));
             if n > 0 {
-                *out.entry((s.path.clone(), units.unit_at(lit.start).0))
+                *out.entry((s.key(), units.unit_at(lit.start).0))
                     .or_default() += n;
             }
         }
@@ -279,7 +280,7 @@ fn the_named_readers_are_scanned() {
             let n = read_sites(&sql_without_comments(&lit.text));
             if n > 0 {
                 *seen
-                    .entry((s.path.clone(), units.unit_at(lit.start).0))
+                    .entry((s.key(), units.unit_at(lit.start).0))
                     .or_default() += n;
             }
         }
@@ -322,4 +323,20 @@ fn the_named_readers_are_scanned() {
             .all(|(_, _, n, why)| *n > 0 && why.len() > 20),
         "every entry needs a count and a reason"
     );
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: every site in the moved code keys under the
+/// registered path (`Source::key`), so no entry goes stale and no moved site
+/// reads as unregistered. Fails on a ratchet keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let rust = rust_sources();
+    let split = belief_lint::with_claim_split(&rust);
+    assert!(split
+        .iter()
+        .any(|s| s.path.ends_with("/repos/claim/split_probe.rs")));
+    let measured = measure(&split);
+    assert_eq!(measured, measure(&rust));
+    assert!(findings(&measured).is_empty(), "{:#?}", findings(&measured));
 }

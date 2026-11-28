@@ -23,7 +23,6 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use epigraph_api::middleware::SignatureVerificationState;
 use epigraph_api::{create_router, ApiConfig, AppState};
 use epigraph_core::{Agent, ClaimId, TruthValue};
 use epigraph_db::{AgentRepository, ClaimRepository, PgPool};
@@ -84,8 +83,7 @@ fn create_test_router(pool: PgPool) -> Router {
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
     };
-    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-    let state = AppState::with_db_and_signature_state(pool, config, signature_state);
+    let state = AppState::with_db(pool, config);
     create_router(state)
 }
 
@@ -160,9 +158,7 @@ async fn create_agent_is_idempotent_on_public_key(pool: PgPool) {
             public_base_url: "http://localhost:8080".to_string(),
             ..ApiConfig::default()
         };
-        let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-        let mut state =
-            AppState::with_db_and_signature_state(pool.clone(), config, signature_state);
+        let mut state = AppState::with_db(pool.clone(), config);
         state.scoped = Some(
             epigraph_db::ScopedPool::connect(
                 &fixture::database_url_for(&pool).await,
@@ -716,11 +712,9 @@ fn create_test_router_with_embedder(pool: PgPool) -> Router {
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
     };
-    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
     let service: Arc<dyn EmbeddingService> =
         Arc::new(MockProvider::new(EmbeddingConfig::local(1536)));
-    let state = AppState::with_db_and_signature_state(pool, config, signature_state)
-        .with_embedding_service(service);
+    let state = AppState::with_db(pool, config).with_embedding_service(service);
     create_router(state)
 }
 
@@ -1316,4 +1310,133 @@ async fn submit_packet_sets_labels_at_creation(pool: PgPool) {
             "label '{expected}' must be set at creation; got {labels:?}"
         );
     }
+}
+
+/// Backlog 854165dd: `claim.labels` on `POST /submit/packet` is bounded. More
+/// than 64 labels, a label longer than 256 characters, or an empty label is a
+/// 400 naming `claim.labels`, and nothing is written. The boundary packet (64
+/// labels of exactly 256 characters, multi-byte so a byte-length check would
+/// refuse it) is accepted, so the caps are `>` and counted in characters.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_bounds_claim_labels(pool: PgPool) {
+    let agent = fixed_agent(71, "label-bounds-agent");
+    let agent_uuid: Uuid = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed")
+        .id
+        .into();
+    let router = create_test_router(pool.clone());
+
+    let over_count: Vec<String> = (0..65).map(|i| format!("label:{i}")).collect();
+    let over_length = vec!["ok".to_string(), "x".repeat(257)];
+    let empty = vec!["ok".to_string(), String::new()];
+    for (case, labels) in [
+        ("65 labels", over_count),
+        ("a 257-character label", over_length),
+        ("an empty label", empty),
+    ] {
+        let content = format!("854165dd refused: {case}");
+        let mut packet = evidence_packet(agent_uuid, &content);
+        packet["claim"]["labels"] = serde_json::json!(labels);
+        let (status, body) = post_packet(&router, packet).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{case} must be refused: {body}"
+        );
+        assert!(
+            body.contains("claim.labels"),
+            "the refusal for {case} names the field: {body}"
+        );
+        let written: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+            .bind(&content)
+            .fetch_one(&pool)
+            .await
+            .expect("count claims");
+        assert_eq!(written, 0, "a refused packet ({case}) writes no claim");
+    }
+
+    // Boundary control: exactly at both caps, in multi-byte characters.
+    let boundary: Vec<String> = (0..64)
+        .map(|i| format!("{i:02}{}", "é".repeat(254)))
+        .collect();
+    assert!(boundary
+        .iter()
+        .all(|l| l.chars().count() == 256 && l.len() > 256));
+    let mut packet = evidence_packet(agent_uuid, "854165dd accepted: at both caps");
+    packet["claim"]["labels"] = serde_json::json!(boundary);
+    let (status, body) = post_packet(&router, packet).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "64 labels of 256 characters are within the caps: {body}"
+    );
+    let claim_id = Uuid::parse_str(
+        serde_json::from_str::<serde_json::Value>(&body).expect("json")["claim_id"]
+            .as_str()
+            .expect("claim_id present"),
+    )
+    .expect("claim_id parses");
+    let stored: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("labels query should succeed");
+    assert_eq!(stored, boundary, "the boundary labels are stored as sent");
+}
+
+/// Backlog 854165dd: a duplicate submit never relabels the canonical claim.
+///
+/// The second submit carries the same `idempotency_key` and content but a
+/// DIFFERENT, non-empty label set, and goes through a fresh router so the
+/// in-memory idempotency cache misses and the request reaches `persist_packet`
+/// and its label write. Both submits come from the claim's own author, who may
+/// write its labels, so only the `was_created` guard on that write keeps the
+/// first submit's labels in place.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_dedup_leaves_the_first_submits_labels(pool: PgPool) {
+    let agent = fixed_agent(72, "dedup-labels-agent");
+    let agent_uuid: Uuid = AgentRepository::create(&pool, &agent)
+        .await
+        .expect("agent creation should succeed")
+        .id
+        .into();
+    let token = submit_bearer_token_for(agent_uuid);
+    let claim_content = "854165dd: a claim submitted twice with different labels";
+    let first_labels = vec!["first:a".to_string(), "first:b".to_string()];
+
+    let mut first = evidence_packet(agent_uuid, claim_content);
+    first["claim"]["idempotency_key"] = serde_json::json!("idem-854165dd-labels");
+    first["claim"]["labels"] = serde_json::json!(first_labels);
+    let mut second = first.clone();
+    second["claim"]["labels"] = serde_json::json!(["second:x"]);
+
+    let (status, body) =
+        post_packet_with_token(&create_test_router(pool.clone()), first, &token).await;
+    assert_eq!(status, StatusCode::CREATED, "first submit: {body}");
+    let json_1: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let claim_id = json_1["claim_id"].as_str().expect("claim_id").to_string();
+    assert_eq!(json_1["was_duplicate"], false, "{body}");
+
+    let (status, body) =
+        post_packet_with_token(&create_test_router(pool.clone()), second, &token).await;
+    assert_eq!(status, StatusCode::CREATED, "dedup submit: {body}");
+    let json_2: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        json_2["claim_id"].as_str(),
+        Some(claim_id.as_str()),
+        "the dedup submit resolves to the first claim: {body}"
+    );
+    assert_eq!(json_2["was_duplicate"], true, "{body}");
+
+    let stored: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1::uuid")
+        .bind(&claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("labels query should succeed");
+    assert_eq!(
+        stored, first_labels,
+        "a duplicate submit must leave the canonical claim's labels as the first \
+         submit set them"
+    );
 }

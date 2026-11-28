@@ -1,6 +1,8 @@
 # Atlas: nested groups down to a force-directed subgraph view
 
-Status: for the operator's approval (questions answered 2026-11-12). It extends
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). Atlas waves W1-W12: nested levels, leaf subgraphs, group names and the latency gates are in the tree.
+
+Original status: for the operator's approval (questions answered 2026-11-12). It extends
 `2026-11-04-epigraph-explorer-atlas-design.md` (the Atlas). It replaces that design's
 "neighbourhood level" (§4.2, phase P3e) and the inside-a-theme claim placement.
 

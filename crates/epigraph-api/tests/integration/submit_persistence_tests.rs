@@ -41,7 +41,6 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, Utc};
-use epigraph_api::middleware::SignatureVerificationState;
 use epigraph_api::{create_router, ApiConfig, AppState};
 use epigraph_core::{Agent, ClaimId, EvidenceId, TraceId};
 use epigraph_db::{
@@ -258,9 +257,7 @@ fn create_test_router(pool: PgPool) -> Router {
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
     };
-    // Bypass signature verification for all routes in tests
-    let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-    let state = AppState::with_db_and_signature_state(pool, config, signature_state);
+    let state = AppState::with_db(pool, config);
     create_router(state)
 }
 

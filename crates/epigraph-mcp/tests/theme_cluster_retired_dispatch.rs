@@ -1,27 +1,23 @@
-//! The retired MCP `theme_cluster` tool (backlog a0ed0180, ruling R-29 as
-//! revised 2026-10-26), driven through the server's REAL tool-call path: a
-//! streamable-HTTP listener behind the production bearer middleware, a signed
-//! token, `initialize`, then `tools/call`. So `call_tool`'s scope gate, the
-//! router's parameter deserialization and the tool body all run, as they do
-//! for the scheduled `theme-maintenance` prompt whose fallback still calls
-//! `theme_cluster` (`docs/ops/theme-v2-promotion-runbook.md`). That call path
-//! is the reason the name stays registered at all, so it is the clause under
-//! test here; `theme_kmeans_retired.rs` pins the served text.
+//! The removed MCP `theme_cluster` tool (backlog 90993e95, ruling ea3a3d0c;
+//! the k-means prototype it wrapped was retired by backlog a0ed0180), driven
+//! through the server's REAL tool-call path: a streamable-HTTP listener behind
+//! the production bearer middleware, a signed token, `initialize`, then
+//! `tools/call`. So `call_tool`'s routing, the scope gate and (were the name
+//! still registered) the tool body all run, as they do for a scheduled prompt
+//! that still carries a stale `theme_cluster` fallback
+//! (`docs/ops/theme-v2-promotion-runbook.md`).
 //!
-//! What a stale call must get: the retirement refusal (`INVALID_REQUEST`,
-//! `data.status = "retired"`, a message naming `scripts/maintain_themes.py`),
-//! even when it carries the old k-means arguments, under a `claims:read`-only
-//! token (the tool's scope was lowered from `claims:write` because it writes
-//! nothing), and no change to `claim_themes` or to a claim's `theme_id`.
+//! What a stale call must get now: the kernel's ROUTING refusal
+//! (`INVALID_REQUEST`, "Unknown or unavailable tool 'theme_cluster'", no
+//! `data`), even when it carries the old k-means arguments, and no change to
+//! `claim_themes` or to a claim's `theme_id`. `stage_claims`, removed in the
+//! same change, gets the same routing refusal.
 //!
-//! Verified to fail against each of (uncommitted probes, one run each):
-//! `server.rs::theme_cluster` returning `Ok(CallToolResult::success(..))`
-//! (the call is served); `#[serde(deny_unknown_fields)]` on
-//! `RetiredThemeClusterParams` (the old arguments get a "failed to deserialize
-//! parameters: unknown field" tool error instead of the refusal); `scope_map`
-//! putting `theme_cluster` back under `claims:write` (the scope gate refuses
-//! the read-only token). The scope refusal carries the SAME code, -32600, so
-//! the code alone does not tell it apart: `data.status` does.
+//! Verified to fail on the tree before the removal: there the call reached
+//! the registered refusal, whose message named the UMAP pipeline and whose
+//! `data.status` was `"retired"`. The routing refusal and the retirement
+//! refusal share the code -32600, so the code alone does not tell them apart:
+//! the message and the absent `data` do.
 
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::embed::McpEmbedder;
@@ -32,7 +28,7 @@ use uuid::Uuid;
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-const SECRET: &[u8] = b"theme-cluster-retired-dispatch-test-secret-32b!!";
+const SECRET: &[u8] = b"theme-cluster-removed-dispatch-test-secret-32b!!";
 
 /// A streamable-HTTP MCP listener behind the production bearer middleware,
 /// serving sessions cloned from one template the way `main` does, on the
@@ -142,7 +138,7 @@ async fn call(
         serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                       "clientInfo": {"name": "theme-cluster-retired", "version": "0"}}
+                       "clientInfo": {"name": "theme-cluster-removed", "version": "0"}}
         }),
     )
     .await;
@@ -192,12 +188,12 @@ async fn theme_state(pool: &PgPool, claim: Uuid) -> (i64, Option<Uuid>) {
     (rows, theme)
 }
 
-/// The scheduled fallback's stale call, with the old k-means arguments
+/// The stale scheduled fallback, with the old k-means arguments
 /// (`wipe_first` would have deleted every theme), under a read-only token, is
-/// answered with the retirement refusal and changes nothing.
+/// refused as an unknown tool and changes nothing.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_stale_theme_cluster_call_is_refused_through_dispatch_and_writes_nothing(pool: PgPool) {
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "theme-cluster-retired").await;
+async fn a_stale_theme_cluster_call_is_refused_as_unknown_and_writes_nothing(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "theme-cluster-removed").await;
     let theme: Uuid = sqlx::query_scalar(
         "INSERT INTO claim_themes (label, description, claim_count) \
          VALUES ('auto-0 seeded theme', 'kept across a stale call', 1) RETURNING id",
@@ -217,33 +213,35 @@ async fn a_stale_theme_cluster_call_is_refused_through_dispatch_and_writes_nothi
     assert_eq!(before, (1, Some(theme)), "fixture shape");
 
     let url = listener(&pool).await;
-    let answer = call(
-        &url,
-        &token(agent, &["claims:read"]),
-        "theme_cluster",
-        serde_json::json!({"wipe_first": true, "label_prefix": "auto", "k_max": 16}),
-    )
-    .await;
-
-    let error = answer
-        .get("error")
-        .unwrap_or_else(|| panic!("the call must be refused, not served: {answer}"));
-    assert_eq!(
-        error["code"],
-        serde_json::json!(-32600),
-        "INVALID_REQUEST: {answer}"
-    );
-    // The scope gate's refusal is also -32600; only the retirement answer
-    // carries this `data`.
-    assert_eq!(
-        error["data"]["status"], "retired",
-        "the retirement refusal, not the scope gate's: {answer}"
-    );
-    let message = error["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("retired") && message.contains("maintain_themes.py"),
-        "the refusal names the replacement: {answer}"
-    );
+    for (tool, arguments) in [
+        (
+            "theme_cluster",
+            serde_json::json!({"wipe_first": true, "label_prefix": "auto", "k_max": 16}),
+        ),
+        (
+            "stage_claims",
+            serde_json::json!({"claims": ["a claim long enough to pass the old length check"]}),
+        ),
+    ] {
+        let answer = call(&url, &token(agent, &["claims:read"]), tool, arguments).await;
+        let error = answer
+            .get("error")
+            .unwrap_or_else(|| panic!("{tool}: the call must be refused, not served: {answer}"));
+        assert_eq!(
+            error["code"],
+            serde_json::json!(-32600),
+            "{tool}: INVALID_REQUEST: {answer}"
+        );
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(&format!("Unknown or unavailable tool '{tool}'")),
+            "{tool}: the routing refusal, not a registered tool's answer: {answer}"
+        );
+        assert!(
+            error.get("data").is_none_or(serde_json::Value::is_null),
+            "{tool}: no retirement data rides on the routing refusal: {answer}"
+        );
+    }
     assert_eq!(
         theme_state(&pool, claim).await,
         before,

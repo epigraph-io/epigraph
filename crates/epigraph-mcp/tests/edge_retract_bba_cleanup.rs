@@ -750,16 +750,18 @@ async fn the_owners_claim_and_another_writers_claim_are_both_rederived(pool: PgP
     assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
     assert!(!bba_exists(&pool, foreign).await, "the replay removed b's");
 
-    let none: Cache = (None, None);
+    // No BBA left: the cascade marks the claim unbacked with the explicit
+    // vacuous cache (Bel 0, BetP 0.5), never NULL (backlog 75726018).
+    let vacuous: Cache = (Some(0.0), Some(0.5));
     assert_eq!(
         cached(&pool, a).await,
-        none,
-        "a has no BBA left, so no cache"
+        vacuous,
+        "a has no BBA left, so its cache is the explicit vacuous value"
     );
     assert_eq!(
         cached(&pool, b).await,
-        none,
-        "b has no BBA left, so no cache"
+        vacuous,
+        "b has no BBA left, so its cache is the explicit vacuous value too"
     );
 }
 
@@ -997,11 +999,17 @@ async fn two_acts_on_one_edge_before_a_replay_both_reach_it(pool: PgPool) {
 
     let report = replay_now(&pool).await;
     assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
-    let none: Cache = (None, None);
-    assert_eq!(cached(&pool, a).await, none, "act 1's claim is re-derived");
+    // Both re-derived to the explicit vacuous cache (no BBA left; backlog
+    // 75726018), never NULL.
+    let vacuous: Cache = (Some(0.0), Some(0.5));
+    assert_eq!(
+        cached(&pool, a).await,
+        vacuous,
+        "act 1's claim is re-derived"
+    );
     assert_eq!(
         cached(&pool, c).await,
-        none,
+        vacuous,
         "act 2's claim is re-derived too, though its deferral collapsed into act 1's"
     );
 }

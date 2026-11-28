@@ -21,6 +21,7 @@
 //! same review.
 
 mod belief_lint;
+mod source_files;
 
 use belief_lint::{
     has_word, rust_sources, rust_view, sql_without_comments, with_scratch, RustUnits, Source,
@@ -77,7 +78,7 @@ fn sites(sources: &[Source]) -> BTreeSet<(String, String)> {
         let units = RustUnits::new(&view.code);
         for lit in &view.literals {
             if inserts_a_claim_naming_supersedes(&sql_without_comments(&lit.text)) {
-                out.insert((s.path.clone(), units.unit_at(lit.start).0));
+                out.insert((s.key(), units.unit_at(lit.start).0));
             }
         }
     }
@@ -174,4 +175,19 @@ fn the_pin_finds_a_new_writer_and_ignores_fixtures() {
         .is_empty(),
         "the column outside the INSERT statement"
     );
+}
+
+/// Splitting `repos/claim.rs` into a directory module (backlog 39955709)
+/// measures exactly the same: every site in the moved code keys under the
+/// registered path (`Source::key`), so no entry goes stale and no moved site
+/// reads as unregistered. Fails on a ratchet keyed by the raw file path.
+#[test]
+fn splitting_the_claim_module_measures_the_same() {
+    let rust = rust_sources();
+    let split = belief_lint::with_claim_split(&rust);
+    assert!(split
+        .iter()
+        .any(|s| s.path.ends_with("/repos/claim/split_probe.rs")));
+    assert_eq!(sites(&split), sites(&rust));
+    assert_eq!(sites(&split), register());
 }

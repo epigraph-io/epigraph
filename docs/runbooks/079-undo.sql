@@ -156,7 +156,10 @@ DECLARE t text;
           'papers',
           -- ---- enriched harvester concepts (347) -------------------------
           -- FORCEd by 347 with its tenancy columns, same precedent and reason.
-          'harvester_enriched_concepts'];
+          'harvester_enriched_concepts',
+          -- ---- declared agent scopes (356) -------------------------------
+          -- FORCEd by 356 at creation, same precedent and reason.
+          'agent_scopes'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

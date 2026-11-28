@@ -18,6 +18,7 @@ use epigraph_db::{
 
 use crate::embed::{HYBRID_CANDIDATE_POOL, HYBRID_RRF_K, RECALL_MATCH_MIN_SIMILARITY};
 use epigraph_db::pgvector_literal;
+use epigraph_engine::recall::{ann_page_is_sparse, rrf_merge, theme_leg_on, RecallRoute, ThemeLeg};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -618,6 +619,24 @@ async fn recall_post_embed(
     let tags = params.tags;
     let tags_opt: Option<&[String]> = if tags.is_empty() { None } else { Some(&tags) };
 
+    // Route (backlog a47df8ed). Omitted is `Similarity`, the page this tool
+    // served before the parameter existed; the engine's `RecallRoute` has no
+    // `Default` precisely so that each surface picks its own.
+    let route: RecallRoute = params
+        .route
+        .map(Into::into)
+        .unwrap_or(RecallRoute::Similarity);
+    if route != RecallRoute::Similarity {
+        refuse_unscoped_theme_route(
+            route,
+            &tags,
+            agent_filter,
+            offset,
+            params.theme_id.is_some() || params.theme_label.is_some(),
+            params.include_workflows,
+        )?;
+    }
+
     // Every read of the page (theme, lens, retrieval, workflows leg, belief,
     // dispute and diversity post-passes) on ONE connection stamped with the
     // caller's viewer, taken after the query embedding: on the plain pool row
@@ -706,8 +725,36 @@ async fn recall_post_embed(
     // `candidates` (backlog 8c511f13) is the hybrid pool's well-matched count
     // before the page cut. The embedder-down path has no ANN candidate pool,
     // so it reports none and the response omits the coverage fields.
-    let (hits, candidates): (Vec<HybridHit>, Option<epigraph_db::HybridCandidates>) =
+    //
+    // Route (backlog a47df8ed). `Hierarchical` runs the theme leg IN PLACE of
+    // the hybrid page; if it cannot run (no query vector) or fails, the hybrid
+    // page is served and `route_used` says `similarity`, the way the engine's
+    // routed recall falls back.
+    let mut theme_leg: Option<ThemeLeg> = None;
+    if route == RecallRoute::Hierarchical {
+        if let Some(pgvec) = pgvec_opt.as_deref() {
+            match theme_leg_on(
+                &mut read,
+                viewer,
+                pgvec,
+                RECALL_QUERY_DIM,
+                limit as usize,
+                params.since,
+            )
+            .await
+            {
+                Ok(leg) => theme_leg = Some(leg),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "recall: hierarchical theme leg failed; serving the similarity page"
+                ),
+            }
+        }
+    }
+    let (mut hits, candidates): (Vec<HybridHit>, Option<epigraph_db::HybridCandidates>) =
         match pgvec_opt.as_deref() {
+            // No hybrid pool ran, so there is no coverage to report.
+            Some(_) if theme_leg.is_some() => (Vec::new(), None),
             Some(pgvec) => {
                 let page = ClaimRepository::search_hybrid_page_conn(
                     &mut read,
@@ -746,6 +793,45 @@ async fn recall_post_embed(
                 None,
             ),
         };
+    // `Auto` adds the theme leg only when the hybrid page is sparse by the
+    // engine's own test, read off the page's dense similarities (a
+    // lexical-only hit counts as 0.0: it is not near the query in embedding
+    // space). A failed theme read serves the hybrid page as it is.
+    if route == RecallRoute::Auto {
+        if let Some(pgvec) = pgvec_opt.as_deref() {
+            let ann = ann_view(&hits);
+            if ann_page_is_sparse(&ann, limit as usize) {
+                match theme_leg_on(
+                    &mut read,
+                    viewer,
+                    pgvec,
+                    RECALL_QUERY_DIM,
+                    limit as usize,
+                    params.since,
+                )
+                .await
+                {
+                    Ok(leg) => theme_leg = Some(leg),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "recall: auto theme leg failed; serving the hybrid page alone"
+                    ),
+                }
+            }
+        }
+    }
+    // Merged BEFORE the workflows merge, the `limit` cut and the `min_truth`
+    // gate below, so a theme hit competes for the page on rank and is gated
+    // like any other claim.
+    let theme_on_page: std::collections::HashMap<uuid::Uuid, f64> = match &theme_leg {
+        Some(leg) => {
+            let (fused, on_page) = fuse_theme_leg(hits, &leg.members, limit as usize);
+            hits = fused;
+            on_page
+        }
+        None => std::collections::HashMap::new(),
+    };
+
     // The page's well-matched claims, by the same rule the pool count uses, so
     // the coverage numerator and denominator count the same kind of row.
     let matched_on_page: std::collections::HashSet<uuid::Uuid> = hits
@@ -876,6 +962,10 @@ async fn recall_post_embed(
                         if hit.in_lexical {
                             matched_via.push("lexical".to_string());
                         }
+                        let theme_similarity = theme_on_page.get(&hit.claim_id).copied();
+                        if theme_similarity.is_some() {
+                            matched_via.push("theme".to_string());
+                        }
 
                         // Without a workflows leg (include_workflows=false, the
                         // default), `merged_rrf_score` is 1/(k+rank) where rank is
@@ -890,7 +980,10 @@ async fn recall_post_embed(
                             content: claim.content,
                             truth_value: tv,
                             belief_score: score,
-                            similarity: hit.dense_similarity.unwrap_or(0.0),
+                            // A theme-only hit has no dense leg entry, but
+                            // the theme leg ranked it on the same column, so
+                            // its real cosine is reported, not 0.0.
+                            similarity: hit.dense_similarity.or(theme_similarity).unwrap_or(0.0),
                             rrf_score: hit.rrf_score,
                             matched_via,
                             // Populated by the bounded lens post-pass below (once
@@ -1181,6 +1274,11 @@ async fn recall_post_embed(
             // retrieval. `epistemic_partition` is deliberately NOT recorded —
             // it regroups the response without changing the set.
             "diversity_radius": params.diversity_radius,
+            // The route, and whether the theme leg actually ran, change which
+            // claims came back, so without them the row cannot be replayed.
+            // Same keys and spellings as the engine's routed recall writes.
+            "route": route.as_str(),
+            "theme_leg": theme_leg.is_some(),
         });
         let scoped = server.scoped.clone();
         // Tracked, like `recall_with_context`'s (backlog 8a23217d): the stdio
@@ -1246,6 +1344,30 @@ async fn recall_post_embed(
     // chosen here: this site used to pass `truth_value`, which the gate stopped
     // reading when it moved to the DS cache, so the threshold and the gate
     // disagreed on every claim whose evidence has moved it.
+    // Counted on what the caller receives, after every gate and cut: the claims
+    // only the theme leg supplied.
+    let theme_leg_out = theme_leg.map(|leg| ThemeLegOut {
+        themes: leg
+            .themes
+            .into_iter()
+            .map(|(id, label)| ThemeLegTheme {
+                theme_id: id.to_string(),
+                label,
+            })
+            .collect(),
+        added: results
+            .iter()
+            .filter(|r| r.result_type.is_none() && r.matched_via == ["theme"])
+            .count(),
+    });
+    let route_used = params.route.map(|_| {
+        if theme_leg_out.is_some() {
+            route.as_str()
+        } else {
+            RecallRoute::Similarity.as_str()
+        }
+    });
+
     let (results, epistemic_partition) =
         crate::types::split_epistemic(results, params.epistemic_partition);
 
@@ -1271,7 +1393,121 @@ async fn recall_post_embed(
         n_total_candidates: coverage.map(|c| c.n_total_candidates),
         coverage_rate: coverage.map(|c| c.coverage_rate),
         candidate_pool_saturated: coverage.map(|c| c.candidate_pool_saturated),
+        route_used,
+        theme_leg: theme_leg_out,
     })
+}
+
+/// The dimension of the query vector `recall` embeds: its claims legs search
+/// `claims.embedding`, the 1536-d column, so the theme leg reads the 1536-d
+/// centroids and member vectors to rank on the same geometry.
+const RECALL_QUERY_DIM: usize = 1536;
+
+/// Refuse a theme route beside a scope the theme leg does not filter on
+/// (backlog a47df8ed). The leg reads theme members by centroid, viewer-scoped
+/// and `since`-windowed, but it has no tag, author, offset or pinned-theme
+/// predicate: served anyway, it would hand back claims outside the scope the
+/// caller asked for, the silent widening this tool refuses elsewhere.
+///
+/// `Hierarchical` is also refused beside `include_workflows=true`: it serves
+/// theme members only, and the workflows leg would merge non-member rows into
+/// that page. `Auto` keeps the workflows leg, which merges after the theme
+/// leg exactly as it merges after the plain hybrid page.
+fn refuse_unscoped_theme_route(
+    route: RecallRoute,
+    tags: &[String],
+    agent_filter: Option<uuid::Uuid>,
+    offset: i64,
+    theme_scoped: bool,
+    include_workflows: bool,
+) -> Result<(), McpError> {
+    if route == RecallRoute::Hierarchical && include_workflows {
+        return Err(invalid_params(
+            "route=hierarchical cannot be combined with include_workflows=true: hierarchical \
+             serves theme members only, and workflows are not theme members. Drop \
+             include_workflows, or use route=auto or route=similarity.",
+        ));
+    }
+    let clash = if !tags.is_empty() {
+        Some("tags")
+    } else if agent_filter.is_some() {
+        Some("agent_id")
+    } else if offset > 0 {
+        Some("offset")
+    } else if theme_scoped {
+        Some("theme_id/theme_label")
+    } else {
+        None
+    };
+    match clash {
+        None => Ok(()),
+        Some(what) => Err(invalid_params(format!(
+            "route={} cannot be combined with {what}: the theme leg does not filter or page on \
+             it, so its hits could fall outside what you asked for. Drop {what}, or use \
+             route=similarity.",
+            route.as_str()
+        ))),
+    }
+}
+
+/// The hybrid page as the ranked `(claim_id, similarity)` list the engine's
+/// sparse test and [`rrf_merge`] take, in page order. A lexical-only hit has
+/// no dense similarity and counts as 0.0.
+fn ann_view(hits: &[HybridHit]) -> Vec<(uuid::Uuid, f64)> {
+    hits.iter()
+        .map(|h| (h.claim_id, h.dense_similarity.unwrap_or(0.0)))
+        .collect()
+}
+
+/// Fuse the hybrid page with the theme leg's members by the engine's
+/// [`rrf_merge`], cut to `limit`. A hybrid hit keeps its legs and takes the
+/// fused score as its `rrf_score`; a theme-only claim enters as a hit with no
+/// dense or lexical leg. Also returns, for every claim the theme leg ranked
+/// that made the page, its cosine similarity to the query.
+fn fuse_theme_leg(
+    hits: Vec<HybridHit>,
+    theme: &[(uuid::Uuid, f64)],
+    limit: usize,
+) -> (Vec<HybridHit>, std::collections::HashMap<uuid::Uuid, f64>) {
+    let ann = ann_view(&hits);
+    let mut by_id: std::collections::HashMap<uuid::Uuid, HybridHit> =
+        hits.into_iter().map(|h| (h.claim_id, h)).collect();
+    let mut on_page = std::collections::HashMap::new();
+    let fused = rrf_merge(&ann, theme, limit)
+        .into_iter()
+        .map(|m| {
+            if m.via_theme {
+                on_page.insert(m.claim_id, m.similarity);
+            }
+            match by_id.remove(&m.claim_id) {
+                Some(mut hit) => {
+                    hit.rrf_score = m.rrf_score;
+                    hit
+                }
+                None => HybridHit {
+                    claim_id: m.claim_id,
+                    rrf_score: m.rrf_score,
+                    dense_similarity: None,
+                    in_lexical: false,
+                },
+            }
+        })
+        .collect();
+    (fused, on_page)
+}
+
+/// `theme_leg` in a routed recall's response: which themes the leg drew from
+/// and how many returned claims only it supplied.
+#[derive(serde::Serialize)]
+struct ThemeLegOut {
+    themes: Vec<ThemeLegTheme>,
+    added: usize,
+}
+
+#[derive(serde::Serialize)]
+struct ThemeLegTheme {
+    theme_id: String,
+    label: String,
 }
 
 /// How much of the well-matched candidate pool a recall response covers
@@ -1373,6 +1609,15 @@ struct RecallEnvelope {
     coverage_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     candidate_pool_saturated: Option<bool>,
+    /// Present only when the caller passed `route` (backlog a47df8ed), so a
+    /// recall without it is byte-identical to before the parameter existed.
+    /// The route that produced the page: the requested one when the theme leg
+    /// ran, else `similarity`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_used: Option<&'static str>,
+    /// Present exactly when the theme leg ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme_leg: Option<ThemeLegOut>,
 }
 
 #[doc(hidden)]

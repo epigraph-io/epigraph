@@ -745,6 +745,54 @@ pub async fn search_agents(
     Ok(Json(result))
 }
 
+/// `GET /api/v1/agents/me`: the agent the bearer token acts as. Exactly these
+/// two fields.
+#[cfg(feature = "db")]
+#[derive(Serialize, Debug)]
+pub struct WhoAmIResponse {
+    pub agent_id: Uuid,
+    pub display_name: Option<String>,
+}
+
+/// The scope `GET /api/v1/agents/me` requires.
+#[cfg(feature = "db")]
+pub const WHOAMI_SCOPE: &str = "claims:read";
+
+/// Who am I
+///
+/// GET /api/v1/agents/me
+///
+/// The agent id of the request's verified principal (the token's agent,
+/// never anything the request names) and that agent's display name. A client
+/// that acts for an agent checks with it that its token writes as the agent
+/// it was told to act as (`decompose_claims --as-agent`, backlog 076e94cc).
+/// 401 without a token, 403 without `claims:read`.
+#[cfg(feature = "db")]
+pub async fn get_me(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): ViewerExtractor,
+) -> Result<Json<WhoAmIResponse>, ApiError> {
+    // Fail closed: no AuthContext is a 401, never a skipped scope check.
+    let Some(axum::Extension(auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "GET /api/v1/agents/me requires authentication".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(&auth, &[WHOAMI_SCOPE])?;
+    let agent_id = viewer.principal().ok_or_else(|| ApiError::Unauthorized {
+        reason: "GET /api/v1/agents/me needs a token that acts as an agent".into(),
+    })?;
+    let mut read = scoped_read(&state, &viewer, "get_me").await?;
+    let display_name = AgentRepository::get_by_id(&mut *read, AgentId::from_uuid(agent_id))
+        .await?
+        .and_then(|a| a.display_name);
+    Ok(Json(WhoAmIResponse {
+        agent_id,
+        display_name,
+    }))
+}
+
 /// Get an agent's reputation score
 ///
 /// GET /agents/:id/reputation
@@ -962,6 +1010,19 @@ pub async fn agent_claims(
     let total =
         EdgeRepository::count_claims_attributed_to(&mut *read, &viewer, id, min_truth).await?;
 
+    // The page's labels, in one read on the same viewer-stamped connection
+    // (backlog a8b785a7: every item used to carry `labels: []`). A failed read
+    // is an error, not an empty label list: `[]` would claim the claims are
+    // unlabelled. The page has one row per attribution EDGE, so a claim with
+    // two edges to this agent appears twice; each row reads the map without
+    // consuming it, so both copies carry the labels.
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let labels = ClaimRepository::labels_by_ids(&mut *read, &viewer, &ids)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("agent_claims: failed to read the claims' labels: {e}"),
+        })?;
+
     let items: Vec<AttributedClaimResponse> = rows
         .into_iter()
         .map(|row| {
@@ -977,7 +1038,7 @@ pub async fn agent_claims(
                 encrypted_content: None,
                 encryption_epoch: None,
                 group_id: None,
-                labels: Vec::new(),
+                labels: labels.get(&row.id).cloned().unwrap_or_default(),
                 was_created: false,
                 authored_by: None,
                 visibility: None,

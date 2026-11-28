@@ -287,6 +287,7 @@ async fn listing_a_privatized_claims_challenges_is_no_existence_oracle(pool: PgP
     let listed = |r: rmcp::model::CallToolResult| ok_json(&r)["total"].as_u64().expect("total");
     let list = |id: Uuid| ListChallengesParams {
         claim_id: id.to_string(),
+        include_parents: None,
     };
     let before = list_challenges(&server, &stranger_viewer, list(claim))
         .await

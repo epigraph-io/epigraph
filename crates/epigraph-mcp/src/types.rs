@@ -970,6 +970,53 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub diversity_radius: Option<f64>,
+
+    #[schemars(
+        description = "Retrieval route. \"similarity\" (the default) is the hybrid dense + lexical \
+                       page alone. \"auto\" adds a theme leg only when that page is SPARSE: fewer \
+                       than min(5, limit) hits, or a best dense similarity below 0.4. The theme \
+                       leg takes the query's 3 nearest themes by centroid and their current \
+                       members you may read, nearest first, and merges them into the page by \
+                       reciprocal rank (k = 60) before min_truth and limit apply, so a claim \
+                       whose theme is near the query can surface although the claim itself is \
+                       not. \"hierarchical\" serves the theme leg ALONE (theme members only; no \
+                       coverage fields, since no hybrid pool ran). A theme hit carries \"theme\" \
+                       in matched_via, and on a page the theme leg touched rrf_score is the \
+                       merged score. When route is given the response carries route_used: the \
+                       route that actually produced the page, so \"similarity\" when auto found \
+                       the page full and strong, when the embedder was down, or when the theme \
+                       read failed; and, when the theme leg ran, theme_leg {themes: [{theme_id, \
+                       label}], added: the returned claims that only the theme leg supplied}. \
+                       auto and hierarchical are REJECTED with tags, agent_id, offset, \
+                       theme_id or theme_label, which the theme leg cannot honour, and \
+                       hierarchical also with include_workflows=true; since is honoured. \
+                       Themes are only those with at least one current member you may read. Unknown values are rejected. Omitted: byte-identical to recall \
+                       before this parameter existed."
+    )]
+    #[serde(default)]
+    pub route: Option<RecallRouteParam>,
+}
+
+/// The spelling of `recall`'s `route` parameter (backlog a47df8ed); see
+/// [`RecallParams::route`]. Mapped onto the engine's
+/// [`epigraph_engine::recall::RecallRoute`], whose `as_str` is also the audit
+/// spelling, so the parameter and the audit row cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RecallRouteParam {
+    Similarity,
+    Auto,
+    Hierarchical,
+}
+
+impl From<RecallRouteParam> for epigraph_engine::recall::RecallRoute {
+    fn from(p: RecallRouteParam) -> Self {
+        match p {
+            RecallRouteParam::Similarity => Self::Similarity,
+            RecallRouteParam::Auto => Self::Auto,
+            RecallRouteParam::Hierarchical => Self::Hierarchical,
+        }
+    }
 }
 
 // ── Ingestion ──
@@ -1685,13 +1732,24 @@ pub struct UndecomposedClaimResponse {
     /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
     /// backlog and not a defect.
     pub looks_atomic: bool,
-    /// `epigraph_core::atomicity::conjunct_estimate(content).count`: the
-    /// estimated number of independent assertions (backlog `72850d43`).
-    /// Advisory. It does not change `looks_atomic` or what `decompose_claims`
-    /// selects, and the two can disagree on a short coordinated sentence.
+    /// The claim's conjunct count: `epigraph_core::atomicity::conjunct_screen
+    /// (content).conjunct_count`, the one canonical count of independent
+    /// assertions, the same number `screen_claim_atomicity` and
+    /// `query_compound_claims` report as `conjunct_count` (backlog
+    /// `74580d03`). The field keeps its old name for compatibility; it used
+    /// to carry `conjunct_estimate(content).count`, a second counter with its
+    /// own rules (backlog `72850d43`). Advisory. It does not change
+    /// `looks_atomic` or what `decompose_claims` selects, and the two can
+    /// disagree (`"X rose, but Y fell."` looks atomic and counts 2).
     pub conjunct_estimate: usize,
-    /// The rules behind an estimate above 1 (`sentences`, `semicolon`,
-    /// `coordination`, `enumeration`, `respectively`); empty otherwise.
+    /// DIAGNOSTIC ONLY: the rules of the retired second counter
+    /// (`epigraph_core::atomicity::conjunct_estimate`) that fire on the text
+    /// (`sentences`, `semicolon`, `coordination`, `enumeration`,
+    /// `respectively`), empty when that counter reads at most 1. They do not
+    /// explain [`Self::conjunct_estimate`], which is `conjunct_screen`'s
+    /// count, and they may fire on a text that count reads as 1 (a
+    /// finite-verb coordination without a comma, `"The test passed and the
+    /// build failed."`).
     pub conjunct_signals: Vec<&'static str>,
 }
 
@@ -2085,12 +2143,38 @@ pub struct UpdateResponse {
     pub plausibility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
+    /// Present only when the supports=true monotonicity clamp RAISED this
+    /// call's result (backlog 8ff648c9): the BetP its fold of the claim's
+    /// two-hypothesis BBAs gave before the clamp. `pignistic_prob` (and
+    /// `truth_after`) is then the clamped value, bounded below by the claim's
+    /// prior, not a fold of the stored BBAs; equal to the prior means the
+    /// supporting update moved nothing. `warning` says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fold_pignistic_prob: Option<f64>,
+    /// Present only when this call wrote the claim's cache and the cache had
+    /// been carried on ANOTHER frame (`belief_frame_id`): that frame's id, or
+    /// `"hidden"` when the caller cannot see that frame (frames are tenanted,
+    /// so its id is not disclosed). The cache now records `binary_truth` and
+    /// holds this call's fold (backlog 8ff648c9). `warning` says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_repointed_from: Option<String>,
+    /// Present only when this call wrote the claim's cache and the cache-owner
+    /// rule elects ANOTHER frame for it (the frame's id, or `"none"` for a
+    /// claim with no owner: a compound, or template-only input). The next
+    /// recompute refolds the cache there, and its values may differ from the
+    /// ones above (the clamp, and per-frame overrides keyed on the frame
+    /// folded); with no owner, no recompute keeps them (backlog 8ff648c9).
+    /// `warning` says so. Absent too when the owner could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_owner_frame_id: Option<String>,
     /// Populated when supporting evidence *lowered* the pignistic probability
     /// (the claim's prior sits above the plausibility its stored BBAs allow, so
     /// the monotonicity clamp yields to that bound; this is mathematically
     /// correct Dempster-Shafer combination, and the warning exists so callers
-    /// don't mistake it for a bug), and when
-    /// [`Self::cache_written`] is `false`. Several notes are joined by a space.
+    /// don't mistake it for a bug), when [`Self::cache_written`] is `false`,
+    /// and for each of [`Self::fold_pignistic_prob`],
+    /// [`Self::cache_repointed_from`] and [`Self::cache_owner_frame_id`] that
+    /// is present. Several notes are joined by a space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -2157,7 +2241,9 @@ pub struct RecallResult {
     pub similarity: f64,
     /// Reciprocal Rank Fusion score (primary ordering).
     pub rrf_score: f64,
-    /// Which legs matched: subset of `["dense","lexical"]`.
+    /// Which legs matched: subset of `["dense","lexical","theme"]`. `"theme"`
+    /// appears only when `recall`'s `route` ran the theme leg (backlog
+    /// a47df8ed) and that leg ranked this claim.
     pub matched_via: Vec<String>,
     /// Per-claim belief under the requested `(frame, perspective)` lens.
     /// Present only when a lens was supplied; omitted (not null) otherwise, so
@@ -2560,9 +2646,10 @@ pub struct IngestDocumentParams {
         description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms). The JSON may carry an optional top-level `labels` array of caller labels (e.g. a stage tag), applied to every claim the ingest writes in addition to the writer's own `doi:<document key>` label; a claim another agent authored that the ingest converges onto gets the doi: label only."
     )]
     pub file_path: String,
-    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    /// Synchronous by default (backlog 81d8afe0): `None`/`true` waits for the
+    /// walk; `false` is the explicit fire-and-forget opt-in.
     #[schemars(
-        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written, the papers row included, so retrying is safe."
+        description = "Optional, default true: the call waits for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error; a failed walk writes nothing, the papers row included, so retrying is safe; a dropped or timed-out connection is not a failed walk (it may still commit), so check query_paper before treating it as one. false = fire-and-forget: returns {status: 'queued', paper_id, document_key} and a failed walk reaches only the server log."
     )]
     #[serde(default)]
     pub wait: Option<bool>,
@@ -2592,9 +2679,10 @@ pub struct IngestDocumentInlineParams {
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::document::schema::DocumentExtraction,
-    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    /// Synchronous by default (backlog 81d8afe0): `None`/`true` waits for the
+    /// walk; `false` is the explicit fire-and-forget opt-in.
     #[schemars(
-        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written, the papers row included, so retrying is safe."
+        description = "Optional, default true: the call waits for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error; a failed walk writes nothing, the papers row included, so retrying is safe; a dropped or timed-out connection is not a failed walk (it may still commit), so check query_paper before treating it as one. false = fire-and-forget: returns {status: 'queued', paper_id, document_key} and a failed walk reaches only the server log."
     )]
     #[serde(default)]
     pub wait: Option<bool>,
@@ -3008,6 +3096,13 @@ pub struct LinkEpistemicResponse {
     pub belief_target_claim_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_belief: Option<LinkEpistemicBelief>,
+    /// Present only under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=warn` (the
+    /// default) for a `contradicts` / `refutes` edge whose target text screens
+    /// compound and that has no decomposition (backlog b4c2fc2f): `{conjuncts,
+    /// hint}`. The edge was written exactly as without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_contradiction_risk:
+        Option<epigraph_engine::contradiction_guard::PartialContradictionRisk>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3050,17 +3145,16 @@ pub struct IngestDocumentResponse {
     /// than swallowed, so a caller counting a paper's claim set by label can
     /// see the gap.
     ///
-    /// **Who actually sees it.** This response reaches a caller only from the
-    /// operator `ingest-document` CLI, which calls `do_ingest_document`
-    /// synchronously (`ingest_document_spine` returns its own response type
-    /// with the same field). The two DETACHED MCP tools, `ingest_document` and
-    /// `ingest_document_inline`, answer `queued` and run `do_ingest_document`
-    /// in a spawned task whose response is dropped — for them the count reaches
-    /// only the server log (one WARN per unlabelled claim, target
-    /// `tenancy.scoped_write`). A caller
-    /// of those tools that needs the gap must compare the paper's `asserts`
-    /// edges against its `doi:` label set itself. Stated because an earlier
-    /// summary described this field as the disclosure for every ingest path.
+    /// **Who actually sees it.** This response reaches the operator
+    /// `ingest-document` CLI, which calls `do_ingest_document` synchronously,
+    /// and the MCP tools `ingest_document` and `ingest_document_inline` in
+    /// their default (`wait` omitted or true) mode (`ingest_document_spine`
+    /// returns its own response type with the same field). With an explicit
+    /// `wait: false` those two tools answer `queued` and run the walk in a
+    /// spawned task whose response is dropped — then the count reaches only
+    /// the server log (one WARN per unlabelled claim, target
+    /// `tenancy.scoped_write`), and a caller that needs the gap must compare
+    /// the paper's `asserts` edges against its `doi:` label set itself.
     pub converged_claims_unlabelled: usize,
     /// Claims this ingest RESOLVED TO that another agent authored, which got the
     /// document's `doi:` label but NOT the caller's `labels`: caller vocabulary
@@ -3069,7 +3163,8 @@ pub struct IngestDocumentResponse {
     /// it write. Disjoint from `converged_claims_unlabelled` (which counts rows
     /// that got no label at all) and always 0 when the extraction carries no
     /// `labels`. Reaches callers exactly as `converged_claims_unlabelled` does;
-    /// the detached tools log one WARN per claim (target `tenancy.scoped_write`).
+    /// a `wait: false` (detached) walk logs one WARN per claim (target
+    /// `tenancy.scoped_write`).
     pub converged_claims_caller_labels_withheld: usize,
     pub already_ingested: bool,
 }
@@ -3233,11 +3328,10 @@ pub struct FindWorkflowResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub behavioral_execution_count: Option<i64>,
     /// Set by the workflow-promotion maintenance pass (`refresh_workflow_promotion`)
-    /// from the variant's `properties.promotion.promotable`. `Some(true)` means
-    /// the gate found this variant statistically better than its parent; absent
-    /// when never evaluated. Advisory — callers may prefer promoted variants.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub promotable: Option<bool>,
+    /// from the variant's `properties.promotion.promotable`, serialized flat as
+    /// `promotable` plus `promotion_basis`; absent when never evaluated.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<PromotionFlag>,
     /// Hierarchical results only (absent for flat workflow claims). `steps` is
     /// the FROZEN plan text: the claims the workflow's `executes` edges named
     /// at ingest. `Some(true)` when at least one of those steps has since been
@@ -3261,6 +3355,30 @@ pub struct FindWorkflowResult {
     /// workflow that the caller can read (backlog 41d7b27a), `[]` when none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub references: Option<Vec<WorkflowReference>>,
+}
+
+/// The promotion gate's verdict on a workflow variant as discovery shows it.
+///
+/// `promotable: true` means the gate found the variant statistically better
+/// than its parent. It is ADVISORY (backlog 74eedb3a): the executions it
+/// counts are outcome reports the callers submitted themselves, so the flag
+/// never appears without `promotion_basis` naming that basis
+/// ([`epigraph_engine::workflow_promotion::PROMOTION_BASIS`]). One struct, so
+/// the two fields cannot be emitted apart.
+#[derive(Debug, Serialize)]
+pub struct PromotionFlag {
+    pub promotable: bool,
+    pub promotion_basis: &'static str,
+}
+
+impl PromotionFlag {
+    #[must_use]
+    pub fn new(promotable: bool) -> Self {
+        Self {
+            promotable,
+            promotion_basis: epigraph_engine::workflow_promotion::PROMOTION_BASIS,
+        }
+    }
 }
 
 /// One workflow reference of a hierarchical workflow, as `find_workflow` and
@@ -3793,6 +3911,13 @@ pub struct ChallengeclaimParams {
 pub struct ListChallengesParams {
     #[schemars(description = "UUID of the claim to list challenges for")]
     pub claim_id: String,
+    /// Backlog d8108186: also list the open challenges on the claim's
+    /// in-force `decomposes_to` parents, tagged `via_parent`.
+    #[schemars(
+        description = "Also list the open (pending or under_review) challenges filed on the claim's decomposes_to parents, after its own, each tagged via_parent. Default false."
+    )]
+    #[serde(default)]
+    pub include_parents: Option<bool>,
 }
 
 /// `resolve_challenge`'s parameters. There is no resolver field, and an
@@ -4123,12 +4248,6 @@ impl From<BatchClaimEntry> for SubmitClaimParams {
             dataset,
         }
     }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct StageClaimsParams {
-    #[schemars(description = "Array of claim content strings to validate without persisting")]
-    pub claims: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

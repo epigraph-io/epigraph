@@ -171,10 +171,10 @@ async fn audit_admin_key_change(
     )
     .await
     .map_err(|e| {
-        // Only the definer's own `ADM02` is the missing grant. Any other
-        // refusal (a 42501 from row security on a misowned definer, say) is
-        // a server fault, not the caller's, and is reported as what it is.
-        if crate::errors::db_is_insufficient_privilege(&e) && e.to_string().contains("ADM02:") {
+        // Only the definer's own `ADM02` (as 42501) is the missing grant. Any
+        // other refusal (a 42501 from row security on a misowned definer, say)
+        // is a server fault, not the caller's, and is reported as what it is.
+        if epigraph_db::refusal_codes::route_code(&e) == Some(epigraph_db::refusal_codes::ADM02) {
             ApiError::Forbidden {
                 reason: "the token carries claims:admin, but its client record grants no live \
                          claims:admin to this principal (ADM02); the override on another \
@@ -235,11 +235,11 @@ pub async fn list_agent_keys(
     })
 }
 
-/// Which of the database's key-write refusals (SQLSTATE 42501) a refusal's
-/// message names. Matched on the definers' own codes, so a 42501 that is
-/// neither (for example the application role's missing EXECUTE on the
-/// rotation definer) is never reported as one of them.
-#[cfg(any(feature = "db", test))]
+/// Which of the database's key-write refusals (SQLSTATE 42501) a refusal
+/// carries. Matched on the definers' own codes through the refusal-code
+/// registry, so a 42501 that is neither (for example the application role's
+/// missing EXECUTE on the rotation definer) is never reported as one of them.
+#[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyWriteRefusal {
     /// `AK02` (migration 161): a `signing` (or `identity-legacy`) key is
@@ -259,14 +259,13 @@ enum KeyWriteRefusal {
     RolePrivilege,
 }
 
-#[cfg(any(feature = "db", test))]
-fn classify_key_write_refusal(message: &str) -> KeyWriteRefusal {
-    if message.contains("AK02:") {
-        KeyWriteRefusal::Attested
-    } else if message.contains("AK03:") {
-        KeyWriteRefusal::NotOwnerOrAdmin
-    } else {
-        KeyWriteRefusal::RolePrivilege
+#[cfg(feature = "db")]
+fn classify_key_write_refusal(e: &epigraph_db::DbError) -> KeyWriteRefusal {
+    use epigraph_db::refusal_codes::{route_code, AK02, AK03};
+    match route_code(e) {
+        Some(c) if c == AK02 => KeyWriteRefusal::Attested,
+        Some(c) if c == AK03 => KeyWriteRefusal::NotOwnerOrAdmin,
+        _ => KeyWriteRefusal::RolePrivilege,
     }
 }
 
@@ -279,7 +278,7 @@ fn key_write_refusal(e: epigraph_db::DbError) -> ApiError {
     if !crate::errors::db_is_insufficient_privilege(&e) {
         return e.into();
     }
-    let reason = match classify_key_write_refusal(&e.to_string()) {
+    let reason = match classify_key_write_refusal(&e) {
         KeyWriteRefusal::Attested => {
             "this is an attested signing key: it is rotated through the host's \
              identity registration, and revoked by a maintenance session"
@@ -653,9 +652,50 @@ pub async fn revoke_agent_key(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "db"))]
 mod tests {
     use super::{classify_key_write_refusal, KeyWriteRefusal};
+    use epigraph_db::DbError;
+    use std::borrow::Cow;
+
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: &'static str,
+        message: &'static str,
+    }
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+    impl std::error::Error for FakeDbError {}
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            self.message
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// A key write's database refusal as the route meets it.
+    fn refused(code: &'static str, message: &'static str) -> DbError {
+        DbError::QueryFailed {
+            source: sqlx::Error::Database(Box::new(FakeDbError { code, message })),
+        }
+    }
 
     /// Each 42501 a key write can meet is reported as what it is. The two
     /// definer codes are matched by name, so a plain role-privilege refusal
@@ -665,31 +705,30 @@ mod tests {
     #[test]
     fn a_key_write_refusal_is_classified_by_its_definer_code() {
         assert_eq!(
-            classify_key_write_refusal(
-                "error returned from database: AK02: agent key 1 is a signing key, attested \
-                 state; only a maintenance session rotates it (migration 161)"
-            ),
+            classify_key_write_refusal(&refused(
+                "42501",
+                "AK02: agent key 1 is a signing key, attested state; only a maintenance \
+                 session rotates it (migration 161)"
+            )),
             KeyWriteRefusal::Attested
         );
         assert_eq!(
-            classify_key_write_refusal(
-                "error returned from database: AK03: agent key 1 belongs to another agent; \
-                 only that agent, an admin or a maintenance session changes its status \
-                 (migration 239)"
-            ),
+            classify_key_write_refusal(&refused(
+                "42501",
+                "AK03: agent key 1 belongs to another agent; only that agent, an admin or \
+                 a maintenance session changes its status (migration 239)"
+            )),
             KeyWriteRefusal::NotOwnerOrAdmin
         );
         assert_eq!(
-            classify_key_write_refusal(
-                "error returned from database: permission denied for function \
-                 epigraph_agent_key_rotate"
-            ),
+            classify_key_write_refusal(&refused(
+                "42501",
+                "permission denied for function epigraph_agent_key_rotate"
+            )),
             KeyWriteRefusal::RolePrivilege
         );
         assert_eq!(
-            classify_key_write_refusal(
-                "error returned from database: permission denied for table agent_keys"
-            ),
+            classify_key_write_refusal(&refused("42501", "permission denied for table agent_keys")),
             KeyWriteRefusal::RolePrivilege
         );
     }

@@ -1,9 +1,10 @@
 //! Deterministic document-ingest authors (backlog 94cc12db).
 //!
-//! Shared by the two document walks (`do_ingest_document`, behind
-//! `ingest_document` / `ingest_document_inline` and the CLI bin, and
-//! `do_ingest_document_spine`), which used to carry two copies of the same
-//! name-derived loop.
+//! Called by the one document walk (`tools::ingestion::walk_document`), at
+//! both of its levels: the full ingest (`do_ingest_document`, behind
+//! `ingest_document` / `ingest_document_inline` and the CLI bin) and the spine
+//! (`do_ingest_document_spine`). The two walks used to carry two copies of the
+//! same name-derived loop, and were later folded into one (backlog 3716a30b).
 //!
 //! # Resolution, per real (non-placeholder) author
 //!

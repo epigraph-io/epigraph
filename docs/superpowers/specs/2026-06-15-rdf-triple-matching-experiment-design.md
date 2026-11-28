@@ -1,7 +1,8 @@
 # RDF Triple Substrate → Cross-Source Matching: Experiment Design
 
 **Date:** 2026-06-15
-**Status:** Design — pending user review, then implementation plan
+**Status:** implemented (checked against origin/main ad30094c5, 2026-11-27). The experiment ran (#275) and its result was negative: `experiments/rdf-triple-matching/CONCLUSION.md`.
+**Original status:** Design — pending user review, then implementation plan
 **Branch:** `exp/rdf-triple-matching` (worktree `/home/jeremy/epigraph-wt-triples-exp`, off `origin/main`)
 **Scope:** Contained experiment — populate the empty entity/triple substrate on a **scientific-dense
 DNA-origami/nanomachine slice** and measure whether triple/entity signals carry discriminative power

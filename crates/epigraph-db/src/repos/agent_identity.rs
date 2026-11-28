@@ -51,8 +51,10 @@ pub const PARENT_NOT_LLM_AGENT: &str = "AID03";
 /// SQLSTATE: the identity is an existing agent with claims that was never
 /// registered, so it is not an EpiClaw identity to adopt.
 pub const NOT_ADOPTABLE: &str = "AID05";
-/// SQLSTATE: the caller is neither the agent's operator nor an admin.
-pub const PROMPT_HISTORY_REFUSED: &str = "AID06";
+/// SQLSTATE: the caller is neither the agent's operator nor an admin. Kept in
+/// the refusal-code registry, which a route asks for it
+/// (`refusal_codes::route_code`).
+pub use crate::refusal_codes::PROMPT_HISTORY_REFUSED;
 /// SQLSTATE: the child is linked to a different operator than its live parent's.
 pub const OPERATOR_CONFLICT: &str = "AID07";
 /// SQLSTATE: the identity already has a different active signing key.

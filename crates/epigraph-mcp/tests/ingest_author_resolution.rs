@@ -575,7 +575,7 @@ async fn an_absent_agent_id_keeps_the_name_derived_node_created_then_matched(poo
     assert_eq!(authored_edges(&pool, key_node, doi2).await, 1);
 }
 
-/// Each refusal reaches the caller of the QUEUED path (`wait` omitted), before
+/// Each refusal reaches the caller of the QUEUED path (`wait: false`), before
 /// anything is written (the walk, not the handler, writes the `papers` row).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool: PgPool) {
@@ -635,7 +635,7 @@ async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool:
             &viewer,
             IngestDocumentInlineParams {
                 extraction: doc(&doi, authors),
-                wait: None,
+                wait: Some(false),
                 visibility: Some("public".to_string()),
                 group_id: None,
             },
@@ -674,7 +674,7 @@ async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool:
         &viewer,
         IngestDocumentParams {
             file_path: path.display().to_string(),
-            wait: None,
+            wait: Some(false),
             visibility: Some("public".to_string()),
             group_id: None,
         },
@@ -1102,6 +1102,24 @@ async fn the_operator_cli_replaces_the_name_derived_author_and_a_name_only_reing
         authored_in_force(&pool, human, doi1).await,
         1,
         "one author at the position"
+    );
+    // The replacement's durable record (backlog 4b7c8b12): the replacing
+    // author's own `authored` edge into THIS paper names the node it replaced.
+    let replaces: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT e.properties->>$3 FROM edges e JOIN papers p ON p.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'authored' AND p.doi = $2 \
+            AND (e.valid_to IS NULL OR e.valid_to > now())",
+    )
+    .bind(human)
+    .bind(doi1)
+    .bind(epigraph_db::AUTHORED_REPLACES_KEY)
+    .fetch_all(&pool)
+    .await
+    .expect("read the replacing author's edge");
+    assert_eq!(
+        replaces,
+        vec![Some(key.to_string())],
+        "the replacing author's authored edge records the replaced node"
     );
     assert_eq!(
         card_counts(&reader, &pool, key).await["authored_papers"],

@@ -207,7 +207,6 @@ _SCRIPTS = [
     ("audit_mixed_bbas.py", [], "MAINTENANCE_DATABASE_URL"),
     ("audit_claims_content_hash_agent.py", [], "MAINTENANCE_DATABASE_URL"),
     ("backfill_locality_tag.py", [], "MAINTENANCE_DATABASE_URL"),
-    ("migrate_mixed_bbas.py", [], "MAINTENANCE_DATABASE_URL"),
     ("link_mass_function_evidence.py", [], "MAINTENANCE_DATABASE_URL"),
     # Resolved through theme_lib.maintenance_dsn.
     ("theme_pipeline.py", ["discover"], "MAINTENANCE_DATABASE_URL"),
@@ -216,6 +215,9 @@ _SCRIPTS = [
     ("subcluster_outliers.py", [], "DATABASE_URL"),
     ("lib/tiered_enrichment.py",
      ["--tier", "1", "--claim-id", "00000000-0000-0000-0000-000000000001"], "--database-url"),
+    # Read-only privacy screen: --database-url only, never the environment.
+    ("screen_public_claims.py", ["--private-groups", "/dev/null", "--private-markers", "/dev/null"],
+     "--database-url"),
     # Refuses at import: both halves of its read/write split are required.
     ("run_assessment_worker.py", [], "DATABASE_URL"),
 ]
