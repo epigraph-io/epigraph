@@ -72,14 +72,13 @@ use std::path::{Path, PathBuf};
 ///   sites there. PR-11 built the Rust half (`crates/epigraph-authz`) and spent
 ///   it on the two declassification tools, which is why `assign_ownership` and
 ///   `update_partition` are no longer in this list.
-/// * **No corpus read (2).** `stage_claims` validates strings and takes
-///   `_server`; `list_mcp_tools` reads the compiled-in manifest, filtered per
+/// * **No corpus read (1).** `list_mcp_tools` reads the compiled-in manifest, filtered per
 ///   caller by `EpiGraphMcpFull::manifest_for` (elevation plan EL-11), whose
 ///   one database read is an authority fact about the caller (does it hold
 ///   an elevating role), never a corpus row. A viewer here would be a
 ///   parameter with nothing to filter.
 /// * **Reads PR-09 did not convert (now none that read content).** This was 3
-///   until PR-14 deleted `get_ownership`; `theme_cluster` below is a refusal.
+///   until PR-14 deleted `get_ownership`.
 ///   - `get_workflow_executions` — **CONVERTED, entry removed.** It was carried
 ///     here because `behavioral_executions` and `workflows` were both outside
 ///     migration 062's `tier_a` array. That stopped being true at migration
@@ -101,11 +100,11 @@ use std::path::{Path, PathBuf};
 ///     removal rather than by filtering — the resolution its own
 ///     `suggested_fix` named. Recorded in `docs/tenancy/progress.json` under
 ///     `closed_findings`.
-///   - `theme_cluster` is now a REFUSAL: it wrapped the k-means prototype
-///     (`epigraph_engine::theme_kmeans`), which is retired with its HTTP twin
-///     `build_themes_from_corpus` and the scheduled rebuild job (backlog
-///     a0ed0180, ruling R-29). Its corpus-wide clustering read no longer exists
-///     on any transport; the name stays registered only to answer "retired".
+///   - `theme_cluster` and `stage_claims` — **RESOLVED BY DELETION, entries
+///     removed** (backlog 90993e95). `theme_cluster` wrapped the retired
+///     k-means prototype (backlog a0ed0180) and had become a refusal that
+///     read and wrote nothing; `stage_claims` read no corpus. Both tools are
+///     gone from the router.
 const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     // Batch H-b removed `challenge_claim`, `create_perspective`,
     // `ingest_document_spine` and `retire_match_candidate`: each now authors or
@@ -128,12 +127,9 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     "structure_source",
     // no corpus read
     "list_mcp_tools",
-    "stage_claims",
     // reads not converted by PR-09 — see the module doc for the owner of each.
     // `get_ownership` was here until PR-14 deleted the tool, and
     // `get_workflow_executions` until it acquired a viewer.
-    // RETIRED (backlog a0ed0180): a refusal that reads and writes nothing.
-    "theme_cluster",
 ];
 
 /// Tools that deliberately bypass tenancy with a `MaintenanceLease`.

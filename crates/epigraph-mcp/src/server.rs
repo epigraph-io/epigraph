@@ -1831,7 +1831,7 @@ impl EpiGraphMcpFull {
     // ── Provenance (3 tools) ──
 
     #[tool(
-        description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order. Walks derivation edges only: supports/elaborates/decomposes_to (incoming) and supersedes (to the predecessor the claim replaced). Contradicts, refutes and cross-source corroborations are not ancestry and are not walked — use get_neighborhood for those."
+        description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order. Walks derivation edges only: supports/elaborates/decomposes_to (incoming) and supersedes (to the predecessor the claim replaced). Contradicts, refutes and cross-source corroborations are not ancestry and are not walked — use get_neighborhood for those. See docs/architecture/mcp-tool-overlaps.md."
     )]
     async fn get_provenance(
         &self,
@@ -1997,7 +1997,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recall relevant memories using semantic search with epistemic quality scoring. Optional theme_id / theme_label (from list_themes) PINS the candidate pool to one theme's members in SQL — on the hybrid dense leg, the hybrid lexical leg, and the embedder-down lexical fallback alike — before each leg's LIMIT, and echoes the resolved theme back as theme_scope. Unlike recall_with_context's diverse=true, which picks themes internally by centroid similarity and exposes neither the choice nor a way to override it. With offset, walks one theme to exhaustion: the response's paging.more_available (derived from the SQL page size, not the post-filtered results) is the stop condition, because min_truth / exclude_contested run after the page and can empty it while pages remain. theme_id/theme_label and offset are both rejected alongside include_workflows=true — workflows carry no theme_id and have no page-consistent counterpart. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — buckets read each hit's belief_score (the value min_truth gates on, not the authored truth_value), and contest wins over score, so a 0.9 claim with a live refutation lands in open_question. Candidate coverage: n_total_candidates counts the well-matched candidates in the hybrid pool before limit/offset (every lexical match plus every dense candidate with similarity >= 0.40), coverage_rate is the share of them this response returns (0.0-1.0; 1.0 when there are none), and candidate_pool_saturated=true means the true total may be higher (a leg hit its 50-row cap, or the dense leg's exact retry timed out and the count comes from its possibly short first pass). Lexical matches count regardless of the similarity floor, so a common term can fill the lexical leg. A low coverage_rate means well-matched candidates were left out: by the limit/offset window (raise limit or page on with offset) or by min_truth / exclude_contested / diversity_radius dropping rows (raising limit does not bring those back). The three fields are absent on the embedder-down lexical fallback."
+        description = "Recall relevant memories using semantic search with epistemic quality scoring. Optional theme_id / theme_label (from list_themes) PINS the candidate pool to one theme's members in SQL — on the hybrid dense leg, the hybrid lexical leg, and the embedder-down lexical fallback alike — before each leg's LIMIT, and echoes the resolved theme back as theme_scope. Unlike recall_with_context's diverse=true, which picks themes internally by centroid similarity and exposes neither the choice nor a way to override it. With offset, walks one theme to exhaustion: the response's paging.more_available (derived from the SQL page size, not the post-filtered results) is the stop condition, because min_truth / exclude_contested run after the page and can empty it while pages remain. theme_id/theme_label and offset are both rejected alongside include_workflows=true — workflows carry no theme_id and have no page-consistent counterpart. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — buckets read each hit's belief_score (the value min_truth gates on, not the authored truth_value), and contest wins over score, so a 0.9 claim with a live refutation lands in open_question. Candidate coverage: n_total_candidates counts the well-matched candidates in the hybrid pool before limit/offset (every lexical match plus every dense candidate with similarity >= 0.40), coverage_rate is the share of them this response returns (0.0-1.0; 1.0 when there are none), and candidate_pool_saturated=true means the true total may be higher (a leg hit its 50-row cap, or the dense leg's exact retry timed out and the count comes from its possibly short first pass). Lexical matches count regardless of the similarity floor, so a common term can fill the lexical leg. A low coverage_rate means well-matched candidates were left out: by the limit/offset window (raise limit or page on with offset) or by min_truth / exclude_contested / diversity_radius dropping rows (raising limit does not bring those back). The three fields are absent on the embedder-down lexical fallback. See docs/architecture/mcp-tool-overlaps.md."
     )]
     async fn recall(
         &self,
@@ -2275,7 +2275,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array. For a hierarchical result, `steps` is the frozen plan text recorded at ingest, not the current step versions: `has_evolved_steps` is true when a step has since been evolved (evolve_step), `evolved_steps` lists each such step with its current head (`head_claim_id`, `head_content`: the newest head with is_current=true, the one evolve_step acts on; `is_current` is false when every head of that step is retired; `pending_resolution` when concurrent heads exist), and `latest_generation` is the newest generation of the same canonical_name (a newer generation exists when it exceeds `generation`). Use find_workflow_hierarchical with resolve_to_latest=true for the full per-step head view. A hierarchical result also lists `references`: the in-force workflow references you can read (invokes, depends_on, related_to, alternative_of), each with its `direction` (outgoing, incoming, or mutual for the symmetric two), the other workflow's id, canonical_name, generation and goal, and for a step claim's invokes `via_step_claim_id`."
+        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array. For a hierarchical result, `steps` is the frozen plan text recorded at ingest, not the current step versions: `has_evolved_steps` is true when a step has since been evolved (evolve_step), `evolved_steps` lists each such step with its current head (`head_claim_id`, `head_content`: the newest head with is_current=true, the one evolve_step acts on; `is_current` is false when every head of that step is retired; `pending_resolution` when concurrent heads exist), and `latest_generation` is the newest generation of the same canonical_name (a newer generation exists when it exceeds `generation`). Use find_workflow_hierarchical with resolve_to_latest=true for the full per-step head view. A hierarchical result also lists `references`: the in-force workflow references you can read (invokes, depends_on, related_to, alternative_of), each with its `direction` (outgoing, incoming, or mutual for the symmetric two), the other workflow's id, canonical_name, generation and goal, and for a step claim's invokes `via_step_claim_id`. A flat result may carry `promotable` with `promotion_basis: \"self_reported\"`: advisory only, computed from outcome reports callers submitted themselves, with no independent review."
     )]
     async fn find_workflow(
         &self,
@@ -2301,7 +2301,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Evaluate whether a workflow variant is statistically ready to be promoted over its immediate (variant_of) parent: the Wilson lower bound of the variant's behavioral success rate vs the parent's rate, over the same window, gated on a minimum sample. Read-only — returns a verdict, does not promote."
+        description = "Evaluate whether a workflow variant is statistically ready to be promoted over its immediate (variant_of) parent: the Wilson lower bound of the variant's behavioral success rate vs the parent's rate, over the same window, gated on a minimum sample. Read-only — returns a verdict, does not promote. The verdict is advisory and its promotion_basis is self_reported: the runs it counts are outcome reports callers submitted themselves, with no independent review."
     )]
     async fn evaluate_workflow_promotion(
         &self,
@@ -2314,7 +2314,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Re-evaluate a workflow variant's promotion verdict and write it to the variant's properties.promotion, overwriting any prior value (so a regressed variant is demoted, not left stale). The apply layer of the workflow-evolution gate; the maintenance pass calls this per candidate variant. Write."
+        description = "Re-evaluate a workflow variant's promotion verdict and write it to the variant's properties.promotion, overwriting any prior value (so a regressed variant is demoted, not left stale). The apply layer of the workflow-evolution gate; the maintenance pass calls this per candidate variant. Write. The flag is advisory (promotion_basis self_reported: it rests on outcome reports callers submitted themselves); nothing acts on it automatically."
     )]
     async fn refresh_workflow_promotion(
         &self,
@@ -2342,7 +2342,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Deprecate a workflow (and, with cascade, its lineage), all-or-nothing. With cascade, a hierarchical lineage that has a generation you cannot read (private to a group you are not in) is refused with nothing written, never deprecated in part. A flat workflow claim gets truth 0.05 and is_current=false (cascade follows its variant_of / supersedes claims). A hierarchical workflow id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return) retires the workflow as a unit: its `workflows` row gets truth 0.05, and its thesis, phase and step claims are retired (is_current=false, embeddings removed) unless another live workflow still executes them, in which case they are kept and listed in kept_shared_claim_ids; operation atoms are never retired, since their ids are shared globally. With cascade, every later generation or variant linked to it as parent is deprecated in the same call. Over HTTP a hierarchical workflow can be deprecated only by its submitter, the submitter's operator, an agent acting for the submitter or for the submitter's operator through a live operator link, a live writer of its owner group, or a claims:admin token whose client record still grants it claims:admin (the audited admin path, recorded as a workflows.admin_write security event); a workflow with no recorded submitter (created before batch H-b) only by a writer of its owner group or through that admin path; a refusal writes nothing. Over stdio (no token) this server's own agent is checked against the target workflow: it must read the workflow on its own stamp (a workflow it cannot read is refused without being named) and, for a group workflow, write that group; then the recorded submitter, the submitter's operator, an agent acting for the submitter or for the submitter's operator through a live operator link, or a live writer of the workflow's owner group is admitted (no admin path without a token), while a workflow with no recorded submitter is admitted on stdio only to a live writer of its owner group (reading it is not enough); each admitted stdio write is recorded as a workflows.caller_write security event with transport stdio and no token. Every write admitted over HTTP through the submitter, operator or owner-group writer arm is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves are authored by the acting agent). The response lists only what changed: deprecated_ids (workflow ids whose state changed; a re-run lists none) and retired_claim_ids. An id that is neither a claim you can read nor a workflows row is an error. Known limitation: a retired thesis, phase or step claim is not revived when a later generation or add_step reuses its exact text, so that workflow then executes a non-current claim."
+        description = "Deprecate a workflow (and, with cascade, its lineage), all-or-nothing. With cascade, a hierarchical lineage that has a generation you cannot read (private to a group you are not in) is refused with nothing written, never deprecated in part. A flat workflow claim gets truth 0.05 and is_current=false (cascade follows its variant_of / supersedes claims). A hierarchical workflow id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return) retires the workflow as a unit: its `workflows` row gets truth 0.05, and its thesis, phase and step claims are retired (is_current=false, embeddings removed) unless another live workflow still executes them, in which case they are kept and listed in kept_shared_claim_ids; operation atoms are never retired, since their ids are shared globally. With cascade, every later generation or variant linked to it as parent is deprecated in the same call. A fork under another canonical_name that you cannot read (private to a group you are not in; for a flat workflow claim, any variant you cannot read) belongs to its own group: the cascade neither deprecates it nor reports it, and it does not make the cascade refuse; that group's members deprecate it. Over HTTP a hierarchical workflow can be deprecated only by its submitter, the submitter's operator, an agent acting for the submitter or for the submitter's operator through a live operator link, a live writer of its owner group, or a claims:admin token whose client record still grants it claims:admin (the audited admin path, recorded as a workflows.admin_write security event); a workflow with no recorded submitter (created before batch H-b) only by a writer of its owner group or through that admin path; a refusal writes nothing. Over stdio (no token) this server's own agent is checked against the target workflow: it must read the workflow on its own stamp (a workflow it cannot read is refused without being named) and, for a group workflow, write that group; then the recorded submitter, the submitter's operator, an agent acting for the submitter or for the submitter's operator through a live operator link, or a live writer of the workflow's owner group is admitted (no admin path without a token), while a workflow with no recorded submitter is admitted on stdio only to a live writer of its owner group (reading it is not enough); each admitted stdio write is recorded as a workflows.caller_write security event with transport stdio and no token. Every write admitted over HTTP through the submitter, operator or owner-group writer arm is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves are authored by the acting agent). The response lists only what changed: deprecated_ids (workflow ids whose state changed; a re-run lists none) and retired_claim_ids. An id that is neither a claim you can read nor a workflows row is an error. Known limitation: a retired thesis, phase or step claim is not revived when a later generation or add_step reuses its exact text, so that workflow then executes a non-current claim."
     )]
     async fn deprecate_workflow(
         &self,
@@ -2562,7 +2562,7 @@ impl EpiGraphMcpFull {
         tools::events::publish_event(self, viewer, params, auth).await
     }
 
-    // ── Batch / Staging / Stats (3 tools) ──
+    // ── Batch / Stats (2 tools) ──
 
     #[tool(
         description = "Submit multiple claims in a single batch (max 100). Each entry accepts every submit_claim field: content, evidence_data and evidence_type are required; methodology, confidence, source_url, reasoning, labels and novelty_threshold are optional. An entry with no methodology is submitted as inductive_generalization and one with no confidence at 0.5, as before these fields existed. Entries are submitted one at a time, exactly as submit_claim, each on its own transaction. The response keeps submitted (a count), errors (a count) and error_details, and adds results: one object per entry in input order, either {index, status: 'ok', ...} carrying that entry's full submit_claim response (claim_id, truth_value, content_hash, embedded, and belief, plausibility, pignistic_prob, frame_id when a belief was wired, and the deduplicated block when the entry matched an existing claim, as submit_claim documents), or {index, status: 'error', error}. An entry that repeats an earlier entry of the same batch, or an existing claim, is reported with deduplicated rather than as a new insert; its inputs_applied / inputs_discarded name only fields the entry supplied, so an omitted (defaulted) methodology or confidence appears in neither. A refused entry (an unknown methodology or evidence_type, a bad label, a refused write) writes nothing, and the other entries still land. If an operator has revoked the personal-group membership of the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), or (HTTP) the caller's agent has no live writable membership at all, every entry is refused that way. The membership is never restored or created; that is an operator action."
@@ -2576,16 +2576,6 @@ impl EpiGraphMcpFull {
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
         tools::batch::batch_submit_claims(self, viewer, params, auth).await
-    }
-
-    #[tool(
-        description = "Validate claims without persisting them. Returns validity checks and warnings for each claim."
-    )]
-    async fn stage_claims(
-        &self,
-        Parameters(params): Parameters<StageClaimsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        tools::batch::stage_claims(self, params).await
     }
 
     #[tool(
@@ -2859,7 +2849,7 @@ impl EpiGraphMcpFull {
         crate::tools::embeddings::backfill_embeddings(self, &mut session, params).await
     }
 
-    // ── Themes (2 read tools, and the retired `theme_cluster` refusal) ──
+    // ── Themes (2 read tools) ──
 
     #[tool(
         description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of the is_current claims assigned to it that YOU can read), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Only themes with at least one current member you can read are listed. Optional label_prefix filter (e.g. \"auto\" for the legacy auto-NN family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME predicate (prefix and visibility), so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this to answer \"what topics does this graph cover\"."
@@ -2885,16 +2875,6 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::themes::get_theme(self, viewer, params).await
-    }
-
-    #[tool(
-        description = "RETIRED. Was server-side k-means theme clustering; that prototype is removed. Every call is refused with nothing written. Themes are maintained by the UMAP theme pipeline (scripts/maintain_themes.py, theme_pipeline.py grow); read them with list_themes / get_theme."
-    )]
-    async fn theme_cluster(
-        &self,
-        Parameters(_params): Parameters<crate::tools::themes::RetiredThemeClusterParams>,
-    ) -> Result<CallToolResult, McpError> {
-        Err(crate::tools::themes::theme_cluster_retired())
     }
 
     // ── RDF Triple Layer (3 tools) ──
@@ -3089,23 +3069,24 @@ impl EpiGraphMcpFull {
     /// yet / call tool-search first". That is client-side deferral, NOT a
     /// missing server tool — `tools/list` returns every registered tool.
     ///
-    /// `tool_count` is derived from the live tool router (`all_tools_json`),
-    /// so it can never drift from the registered tool set the way a
-    /// hardcoded constant would.
+    /// It states NO tool count (backlog d43cbba7). A count here could only be
+    /// the unfiltered kernel router, while `tools/list` and `list_mcp_tools`
+    /// answer per caller (elevation-gated tools are hidden from callers who
+    /// cannot reach them) and append every federated tool, so no single
+    /// number was true for every client. Clients enumerate instead.
     #[must_use]
     pub fn server_instructions(read_only: bool) -> String {
         let mode = if read_only { "read-only" } else { "full" };
-        let tool_count = Self::all_tools_json().as_array().map_or(0, Vec::len);
         format!(
-            "EpiGraph {mode} MCP server with {tool_count} epistemic tools. \
+            "EpiGraph {mode} MCP server. \
              Many EpiGraph tools are DEFERRED by your client — their names may appear but \
              their schemas are not loaded, so a direct call can fail with \
              \"not loaded yet / call tool-search first\". This is NOT a missing tool. \
              Use your client's tool-search mechanism (e.g. tool_search / ToolSearch) to load \
              a tool's schema by name before calling it (the edge-writers submit_claim, \
              link_hierarchical, supersede_claim and the graph reads get_neighborhood, traverse, \
-             query_claims are all available this way), or call list_mcp_tools to enumerate every \
-             tool with its full schema."
+             query_claims are all available this way), or call list_mcp_tools (or tools/list) to \
+             enumerate every tool you can call, federated tools included, with its full schema."
         )
     }
 }
@@ -3616,8 +3597,8 @@ mod instructions_tests {
     /// gate guidance is present there, so an agent that sees a tool name but no
     /// schema knows how to load it (rather than reporting the tool "missing").
     ///
-    /// No DB: `server_instructions` is a pure function of `read_only` + the
-    /// static tool router, so it exercises the real production code path.
+    /// No DB: `server_instructions` is a pure function of `read_only`, so it
+    /// exercises the real production code path.
     #[test]
     fn instructions_advertise_the_tool_search_gate() {
         let s = EpiGraphMcpFull::server_instructions(false);
@@ -3640,23 +3621,35 @@ mod instructions_tests {
         );
     }
 
-    /// The tool count in the instructions must equal the LIVE registered tool
-    /// count, computed dynamically here (never a hardcoded literal) — that is
-    /// exactly what stops it going stale. If a tool is added/removed and this
-    /// substring stops matching, the production string is wrong.
+    /// The handshake carries NO tool count (backlog d43cbba7). The number it
+    /// used to print was the unfiltered kernel router, while `tools/list` and
+    /// `list_mcp_tools` answer per caller and include federated tools, so no
+    /// single count was true for every client. Clients enumerate instead.
     #[test]
-    fn instructions_tool_count_matches_live_router() {
-        let n = EpiGraphMcpFull::tool_router().list_all().len();
-        let s = EpiGraphMcpFull::server_instructions(false);
-        assert!(
-            s.contains(&format!("{n} epistemic tools")),
-            "instructions must report the live tool count ({n}); got: {s}"
-        );
+    fn instructions_carry_no_tool_count() {
+        for read_only in [false, true] {
+            let s = EpiGraphMcpFull::server_instructions(read_only);
+            assert!(
+                !s.contains("epistemic tools"),
+                "the handshake must not state a tool count; got: {s}"
+            );
+            let words: Vec<&str> = s.split_whitespace().collect();
+            for pair in words.windows(2) {
+                assert!(
+                    !(pair[0].chars().all(|c| c.is_ascii_digit()) && pair[1].starts_with("tool")),
+                    "the handshake must not state a tool count ({} {}); got: {s}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            // The enumeration route the count is replaced by stays.
+            assert!(s.contains("list_mcp_tools"), "{s}");
+        }
     }
 
     /// `read_only` only changes the human-readable mode label, not the
     /// registered tool set (read-only is enforced at call time, not
-    /// registration), so the count is identical across modes.
+    /// registration).
     #[test]
     fn instructions_reflect_mode_label() {
         assert!(EpiGraphMcpFull::server_instructions(true).contains("read-only"));

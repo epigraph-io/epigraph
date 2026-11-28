@@ -131,6 +131,8 @@ async fn promotes_confident_variant_over_weaker_parent(pool: PgPool) {
         json["promotable"], true,
         "confident variant promotes over 0.5 parent"
     );
+    // Backlog 74eedb3a: the verdict rests on caller-reported outcomes.
+    assert_eq!(json["promotion_basis"], "self_reported", "{json}");
     assert!(json["variant_lower_bound"].as_f64().unwrap() > 0.5);
 }
 
@@ -194,4 +196,5 @@ async fn lineage_root_has_nothing_to_promote_over(pool: PgPool) {
     );
     assert_eq!(json["promotable"], false);
     assert!(json["parent_id"].is_null(), "a root has no parent");
+    assert_eq!(json["promotion_basis"], "self_reported", "{json}");
 }

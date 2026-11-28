@@ -871,14 +871,19 @@ pub async fn list_workflows(
                 message: format!("Failed to list workflows: {e}"),
             })?;
 
+    // A flat workflow claim's properties carry the promotion gate's
+    // `promotion.promotable` verdict; label its self-reported basis (backlog
+    // 74eedb3a, `epigraph_engine::workflow_promotion`).
     let results: Vec<serde_json::Value> = workflows
         .iter()
         .map(|w| {
+            let mut properties = w.properties.clone();
+            epigraph_engine::workflow_promotion::label_promotion_basis(&mut properties);
             serde_json::json!({
                 "workflow_id": w.id,
                 "content": w.content,
                 "truth_value": w.truth_value,
-                "properties": w.properties,
+                "properties": properties,
             })
         })
         .collect();
@@ -956,13 +961,19 @@ pub async fn get_workflow(
             id: workflow_id.to_string(),
         })?;
 
+    // The promotion verdict in a flat workflow's properties is labelled with
+    // its self-reported basis, as on `list_workflows` (backlog 74eedb3a).
+    let mut properties = row.properties;
+    if let Some(p) = properties.as_mut() {
+        epigraph_engine::workflow_promotion::label_promotion_basis(p);
+    }
     Ok(Json(serde_json::json!({
         "workflow_id": row.id,
         "content": serde_json::from_str::<serde_json::Value>(&row.content)
             .unwrap_or(serde_json::Value::String(row.content)),
         "goal": serde_json::Value::Null,
         "truth_value": row.truth_value,
-        "properties": row.properties,
+        "properties": properties,
         "canonical_name": serde_json::Value::Null,
     })))
 }
@@ -2149,7 +2160,7 @@ pub async fn evolve_step(
     params(
         ("id" = uuid::Uuid, Path, description = "UUID of the workflow to deprecate"),
         ("reason" = String, Query, description = "Reason for deprecation"),
-        ("cascade" = Option<bool>, Query, description = "Whether to cascade deprecation to descendants"),
+        ("cascade" = Option<bool>, Query, description = "Whether to cascade deprecation to descendants. A fork under another canonical_name that the caller cannot read belongs to its own group: the cascade neither deprecates it nor reports it."),
     ),
     responses(
         (status = 200, body = serde_json::Value),
@@ -4588,6 +4599,79 @@ mod tests {
         assert!(body["content"].is_string() || body["content"].is_object());
         assert!(body["truth_value"].is_number());
         assert!(body["properties"].is_object());
+    }
+
+    /// Backlog 74eedb3a: a flat workflow's claim properties carry the
+    /// promotion gate's `promotion.promotable` verdict, which rests on outcome
+    /// reports the callers submit themselves. Both REST reads that return
+    /// those properties label it `promotion_basis: "self_reported"`; a
+    /// workflow never evaluated carries no `promotion` at all. Fails on the
+    /// tree before the label (the verdict came back unlabelled).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn workflow_reads_label_the_promotion_basis(pool: PgPool) {
+        let state = scoped_test_state(&pool).await;
+        let promoted = seed_test_workflow(&pool, "promotion-basis-rest", &["s1", "s2"]).await;
+        let plain = seed_test_workflow(&pool, "promotion-basis-rest-plain", &["s1"]).await;
+        sqlx::query(
+            "UPDATE claims SET properties = properties || \
+             '{\"promotion\": {\"promotable\": true, \"lower_bound\": 0.72}}'::jsonb \
+             WHERE id = $1",
+        )
+        .bind(promoted)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let router = Router::new()
+            .route("/api/v1/workflows", get(list_workflows))
+            .route("/api/v1/workflows/:id", get(get_workflow))
+            .layer(axum::Extension(test_auth()))
+            .with_state(state);
+
+        let one = |id: Uuid| {
+            Request::builder()
+                .uri(format!("/api/v1/workflows/{id}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let body = parse_body(router.clone().oneshot(one(promoted)).await.unwrap()).await;
+        assert_eq!(
+            body["properties"]["promotion"]["promotable"], true,
+            "CALIBRATION: {body}"
+        );
+        assert_eq!(
+            body["properties"]["promotion"]["promotion_basis"], "self_reported",
+            "get_workflow: {body}"
+        );
+        let body = parse_body(router.clone().oneshot(one(plain)).await.unwrap()).await;
+        assert!(
+            body["properties"].get("promotion").is_none(),
+            "an unevaluated workflow gains no promotion block: {body}"
+        );
+
+        let list = parse_body(
+            router
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/workflows?limit=100")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let entry = list["workflows"]
+            .as_array()
+            .expect("workflows array")
+            .iter()
+            .find(|w| w["workflow_id"] == promoted.to_string())
+            .unwrap_or_else(|| panic!("the promoted workflow is listed: {list}"))
+            .clone();
+        assert_eq!(
+            entry["properties"]["promotion"]["promotion_basis"], "self_reported",
+            "list_workflows: {entry}"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

@@ -60,10 +60,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // holds.
     ("get_theme", "claims:read"),
     ("list_themes", "claims:read"),
-    // RETIRED (backlog a0ed0180): every call is refused with the retirement
-    // message and nothing is read or written, so the lowest scope lets any
-    // caller (a stale scheduled prompt included) see WHY, rather than a 403.
-    ("theme_cluster", "claims:read"),
     ("consolidate_claims", "claims:write"),
     ("countersign_authorship", "claims:write"),
     ("get_workflow_executions", "claims:read"),
@@ -105,8 +101,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("scoped_belief", "claims:read"),
     ("search_triples", "claims:read"),
     ("sheaf_cohomology", "claims:read"),
-    // Validates the submitted strings in memory; no database access at all.
-    ("stage_claims", "claims:read"),
     ("structure_source", "claims:read"),
     ("suggest_alternative_sets", "claims:read"),
     ("system_stats", "claims:read"),
@@ -327,9 +321,6 @@ mod tests {
     fn theme_read_tools_are_read_scoped() {
         assert_eq!(required_scope("list_themes"), Some("claims:read"));
         assert_eq!(required_scope("get_theme"), Some("claims:read"));
-        // The k-means writer is retired (backlog a0ed0180): what remains is a
-        // refusal, mapped at the read scope so every caller sees the reason.
-        assert_eq!(required_scope("theme_cluster"), Some("claims:read"));
     }
 
     /// The backlog batch B41 read tools write nothing, so a read-scoped
@@ -357,15 +348,14 @@ mod tests {
         }
     }
 
-    /// `verify_claim`, `reconcile_sheaf` and `stage_claims` write nothing: the
-    /// first two open only a viewer-stamped read (`server.read_as`) and the
-    /// third touches no database. They sat in the `claims:write` bucket
-    /// (backlog 6fb9e913), so a read-scoped principal could not verify a
-    /// claim's signature. Asserted by name because the coverage test passes
+    /// `verify_claim` and `reconcile_sheaf` write nothing: both open only a
+    /// viewer-stamped read (`server.read_as`). They sat in the `claims:write`
+    /// bucket (backlog 6fb9e913), so a read-scoped principal could not verify
+    /// a claim's signature. Asserted by name because the coverage test passes
     /// for any mapping.
     #[test]
     fn pure_read_tools_are_read_scoped() {
-        for tool in ["verify_claim", "reconcile_sheaf", "stage_claims"] {
+        for tool in ["verify_claim", "reconcile_sheaf"] {
             assert_eq!(required_scope(tool), Some("claims:read"), "{tool}");
         }
     }

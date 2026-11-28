@@ -119,6 +119,9 @@ Packet 1: "[docs][readme,intro,deploy] state the minimum pgvector version (0.8.0
   Methodology: heuristic, confidence: 85%, initial_truth: 0.4
 ```
 
+The second packet is a real historical commit: `stage_claims`, which it names,
+was later removed from the MCP server (backlog 90993e95).
+
 Each commit packet carries the idempotency key `git:<full sha>`, and its
 properties include `source`, `commit_hash`, `commit_type`, `scope` and `files_changed`.
 

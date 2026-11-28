@@ -4,13 +4,13 @@
 //! The theme layer is maintained by the UMAP theme pipeline
 //! (`scripts/cluster_claims.py`, `scripts/maintain_themes.py` and the REST
 //! routes they call). The `theme_cluster` tool this module used to implement
-//! wrapped the k-means prototype (`epigraph_engine::theme_kmeans`), which is
-//! retired (backlog a0ed0180, operator ruling R-29): no MCP tool rebuilds or
-//! wipes themes. The tool NAME stays registered as a refusal
-//! ([`theme_cluster_retired`]) because a scheduled agent prompt can still reach
-//! it (the `theme-maintenance` task falls back to a bare `theme_cluster` call,
-//! `docs/ops/theme-v2-promotion-runbook.md`); the ruling says such a caller
-//! gets a clear "retired" answer, not an unknown-tool error.
+//! wrapped the k-means prototype (`epigraph_engine::theme_kmeans`), retired by
+//! backlog a0ed0180: no MCP tool rebuilds or wipes themes. The name was then
+//! kept registered as a refusal that named the replacement; backlog 90993e95
+//! (ruling ea3a3d0c) removed the tool outright, superseding that refusal. A
+//! stale caller now gets the kernel's unknown-tool routing error, and the
+//! replacement jobs are documented in `docs/deploy.md` (Step 10) and
+//! `docs/ops/theme-v2-promotion-runbook.md`.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -23,42 +23,6 @@ use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 
 use epigraph_db::{ClaimThemeRepository, ThemeSummaryRow};
-
-/// Parameters of the RETIRED `theme_cluster` tool. Empty, and unknown fields
-/// are ignored, so a call carrying the old tool's arguments (`k`, `wipe_first`,
-/// `label_prefix`, ...) reaches the retirement answer rather than a parameter
-/// error.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct RetiredThemeClusterParams {}
-
-/// What a `theme_cluster` call is told. Names the replacement so an agent
-/// following a stale workflow can recover without operator help.
-pub const THEME_CLUSTER_RETIRED: &str = "theme_cluster is retired: the k-means theme prototype it \
-     ran was removed (backlog a0ed0180). Use the UMAP theme pipeline instead: \
-     scripts/maintain_themes.py for incremental maintenance (assign-unthemed, reassign, \
-     split-candidates, recompute-centroids over /api/v1/themes/*), and theme_pipeline.py grow \
-     run by an operator on the host for a full rebuild (not on a timer: it replaces every theme \
-     id and needs --i-understand-full-rebuild and the rebuild steps in \
-     docs/ops/theme-v2-promotion-runbook.md). Read themes with list_themes / get_theme. \
-     Nothing was written; do not retry.";
-
-/// The refusal every `theme_cluster` call gets: JSON-RPC `INVALID_REQUEST`
-/// (the caller-error class, so it is not retried as an internal error), with a
-/// machine-readable `data` like the D9 MOVED refusal's. Writes nothing and
-/// reads nothing.
-#[must_use]
-pub fn theme_cluster_retired() -> McpError {
-    McpError::invalid_request(
-        THEME_CLUSTER_RETIRED.to_string(),
-        Some(serde_json::json!({
-            "status": "retired",
-            "surface": "theme_cluster",
-            "replacement": "scripts/maintain_themes.py (UMAP theme pipeline)",
-            "retryable": false,
-            "backlog": "a0ed0180",
-        })),
-    )
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // READ SIDE — `list_themes` / `get_theme`

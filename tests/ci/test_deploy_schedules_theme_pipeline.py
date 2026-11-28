@@ -1,16 +1,17 @@
-"""The deploy guide schedules the theme pipeline the code points operators at (backlog 469f3655).
+"""The deploy guide schedules the theme pipeline (backlog 469f3655).
 
-`theme_cluster` is retired, and its refusal (THEME_CLUSTER_RETIRED in
-crates/epigraph-mcp/src/tools/themes.rs) sends callers to two host jobs:
-`scripts/maintain_themes.py` for incremental maintenance and
-`theme_pipeline.py grow` for a periodic rebuild. `recall(diverse=true)` reads
-the themes those jobs keep, yet docs/deploy.md's "Schedule the maintenance
-jobs" step listed neither, so a deployment following the guide never ran them.
+The theme layer is kept by two host jobs: `scripts/maintain_themes.py` for
+incremental maintenance and `theme_pipeline.py grow` for an operator-run full
+rebuild. `recall(diverse=true)` reads the themes those jobs keep, yet
+docs/deploy.md's "Schedule the maintenance jobs" step once listed neither, so a
+deployment following the guide never ran them.
 
-This ties the guide to the pointer in code: every script the refusal names
-must have a row in Step 10's table, with the subcommand the refusal names.
-It also checks that scripts/README.md says where the pinned Python
-dependencies live (scripts/requirements.txt, backlog 8afe831f).
+These jobs used to be named by the refusal of the retired MCP `theme_cluster`
+tool (THEME_CLUSTER_RETIRED in crates/epigraph-mcp/src/tools/themes.rs); that
+tool and its refusal were removed (backlog 90993e95), so the jobs are listed
+here directly. Every one must have a row in Step 10's table, and
+scripts/README.md must say where the pinned Python dependencies live
+(scripts/requirements.txt, backlog 8afe831f).
 """
 from __future__ import annotations
 
@@ -18,17 +19,15 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-THEMES_RS = REPO / "crates" / "epigraph-mcp" / "src" / "tools" / "themes.rs"
 DEPLOY_MD = REPO / "docs" / "deploy.md"
 SCRIPTS_README = REPO / "scripts" / "README.md"
 
 
-def retired_message() -> str:
-    src = THEMES_RS.read_text()
-    m = re.search(r'pub const THEME_CLUSTER_RETIRED: &str = "(.*?)";', src, re.S)
-    assert m, "THEME_CLUSTER_RETIRED not found in themes.rs"
-    # A Rust string continuation (`\` + newline + indentation) is one space.
-    return re.sub(r"\\\n\s*", "", m.group(1))
+# (script, subcommand) for every host job that keeps the theme layer.
+THEME_JOBS: list[tuple[str, str | None]] = [
+    ("maintain_themes.py", None),
+    ("theme_pipeline.py", "grow"),
+]
 
 
 def step10() -> str:
@@ -42,33 +41,28 @@ def table_rows(section: str) -> list[str]:
     return [line for line in section.splitlines() if line.startswith("| ") and "---" not in line]
 
 
-def named_jobs(message: str) -> list[tuple[str, str | None]]:
-    """(script, subcommand) pairs the refusal names: `scripts/x.py` or
-    `x.py <subcommand>`."""
-    jobs = []
-    for m in re.finditer(r"(?:scripts/)?([a-z_]+\.py)(?: (grow|discover|project|label)\b)?", message):
-        jobs.append((m.group(1), m.group(2)))
-    return jobs
+def test_every_theme_job_is_a_real_script():
+    # THEME_JOBS is the only place the jobs are enumerated, so tie it to the
+    # tree: each script exists, and a subcommand is one the script documents.
+    for script, sub in THEME_JOBS:
+        path = REPO / "scripts" / script
+        assert path.exists(), f"THEME_JOBS names a missing script: {path}"
+        if sub:
+            assert re.search(rf"^\s*{re.escape(sub)}\b", path.read_text(), re.M), (
+                f"{script} documents no {sub!r} subcommand"
+            )
 
 
-def test_the_refusal_still_names_the_theme_jobs():
-    # Calibration: if the message stops naming scripts, the next test would
-    # pass vacuously.
-    jobs = named_jobs(retired_message())
-    assert ("maintain_themes.py", None) in jobs, jobs
-    assert ("theme_pipeline.py", "grow") in jobs, jobs
-
-
-def test_step_10_schedules_every_theme_job_the_refusal_names():
+def test_step_10_schedules_every_theme_job():
     rows = table_rows(step10())
     assert rows, "Step 10 has no job table"
     missing = []
-    for script, sub in named_jobs(retired_message()):
+    for script, sub in THEME_JOBS:
         needle = f"{script} {sub}" if sub else script
         if not any(needle in row for row in rows):
             missing.append(needle)
     assert not missing, (
-        "THEME_CLUSTER_RETIRED points operators at these host jobs, but "
+        "the theme layer needs these host jobs, but "
         f"docs/deploy.md Step 10 has no table row for them: {missing}"
     )
 
@@ -111,7 +105,3 @@ def test_the_rebuild_is_operator_run_with_the_flag_and_the_rebuild_steps():
     assert "docs/ops/theme-v2-promotion-runbook.md" in notes, notes
     assert "A projection is a full rebuild" in (
         REPO / "docs" / "ops" / "theme-v2-promotion-runbook.md").read_text()
-    # The refusal sends callers to an operator job, not a periodic one.
-    message = retired_message()
-    assert "periodic" not in message, message
-    assert flag in message, message

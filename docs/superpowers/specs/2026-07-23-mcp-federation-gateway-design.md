@@ -115,8 +115,11 @@ when the static `tool_router` does not own the requested name.
     verbatim** to the downstream via an rmcp client `call_tool`; else existing
     unknown-tool error. `tool.invoked` still emits at the chokepoint, tagged with the
     extension.
-  - `all_tools_json` / `server_instructions` tool-count / `list_mcp_tools` include
-    federated tools (dynamic count stays correct).
+  - `tools/list` and `list_mcp_tools` include federated tools (both answer from the
+    one per-caller manifest, `manifest_for`); `all_tools_json` is the static kernel set
+    only. The `server_instructions` handshake carries NO tool count (backlog d43cbba7):
+    a single number could not match a per-caller, federation-extended list, so clients
+    enumerate via `list_mcp_tools` / `tools/list`.
 - **Scope handling:** `enforce_tool_scope` currently fails closed for names not in the
   static `scope_map`. Extend it: a federated tool's required scope comes from its
   extension's config (`scope=…`). The gateway checks the caller has that scope, then

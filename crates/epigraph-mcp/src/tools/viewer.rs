@@ -12,7 +12,8 @@
 //!
 //! What PR-09 still owns: moving the eight inline-SQL tools to the repo layer,
 //! `no_inline_sql_in_tools.rs`, `theme_cluster`'s within-viewer clustering (moot:
-//! the tool is retired with the k-means prototype, backlog a0ed0180), and
+//! the tool is removed with the k-means prototype, backlogs a0ed0180 and
+//! 90993e95), and
 //! the `auth.rs::unauthenticated_context()` change. This file is the acquisition
 //! half only.
 //!

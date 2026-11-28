@@ -23,9 +23,10 @@
 #                 also when the APPLICATION DSN is itself bypass-capable
 #   supersede     supersede_claim on own-public / own-private / foreign-private /
 #                 foreign-public claims (fresh rows, so no other arm sees them)
-#   theme         theme_cluster is RETIRED (backlog a0ed0180): a call with the
-#                 old k-means arguments must be refused (status=retired) and
-#                 leave the existing themes exactly as they were
+#   theme         theme_cluster is REMOVED (backlogs a0ed0180, 90993e95): a
+#                 call with the old k-means arguments must be refused as an
+#                 unknown tool (no data.status) and leave the existing themes
+#                 exactly as they were
 #   maint_auth    the same tools over AUTHENTICATED HTTP (--jwt-secret, a
 #                 random per-run secret that is never written to disk): a
 #                 claims:write-only bearer with no membership must be refused
@@ -361,10 +362,10 @@ if want supersede; then
   done
 fi
 
-# ── theme_cluster (RETIRED) ────────────────────────────────────────────────
+# ── theme_cluster (REMOVED) ────────────────────────────────────────────────
 if want theme; then
   echo
-  echo "=== theme_cluster: retired with the k-means prototype (backlog a0ed0180), refuses and writes nothing ==="
+  echo "=== theme_cluster: removed (backlogs a0ed0180, 90993e95), refused as an unknown tool, writes nothing ==="
   PRIOR=$(q "INSERT INTO claim_themes (label, description) VALUES ('bh-prior-$LABEL', 'a theme from an earlier run') RETURNING id" | head -1)
   BEFORE=$(q "SELECT count(*) FROM claim_themes")
   R=$(tool theme_cluster '{"k":2,"min_claims_per_theme":1,"wipe_first":true,"label_prefix":"auto"}')

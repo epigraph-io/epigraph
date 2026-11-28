@@ -15,6 +15,7 @@ use epigraph_db::{
 };
 
 use epigraph_db::pgvector_literal;
+use epigraph_engine::workflow_promotion::PROMOTION_BASIS;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -161,6 +162,7 @@ impl PromotionAssessment {
                 "workflow_id": self.variant_id,
                 "parent_id": serde_json::Value::Null,
                 "promotable": false,
+                "promotion_basis": PROMOTION_BASIS,
                 "reason": "workflow has no variant_of/supersedes parent (it is a lineage root); nothing to promote over",
             }),
             Some(v) => serde_json::json!({
@@ -171,6 +173,7 @@ impl PromotionAssessment {
                 "variant": { "successes": self.variant.0, "total": self.variant.1 },
                 "parent": { "successes": self.parent.0, "total": self.parent.1, "success_rate": self.parent_rate() },
                 "promotable": v.promotable,
+                "promotion_basis": PROMOTION_BASIS,
                 "variant_lower_bound": v.variant_lower_bound,
                 "parent_rate": v.parent_rate,
                 "reason": v.reason,
@@ -306,6 +309,7 @@ pub async fn refresh_workflow_promotion(
         "parent_id": assessment.parent_id,
         "refreshed": true,
         "promotable": verdict.promotable,
+        "promotion_basis": PROMOTION_BASIS,
         "variant_lower_bound": verdict.variant_lower_bound,
         "parent_rate": verdict.parent_rate,
         "reason": verdict.reason,
@@ -1111,7 +1115,7 @@ async fn hierarchical_workflow_result(
         // `promotable` is written by `refresh_workflow_promotion` onto the FLAT
         // claim's `properties.promotion`; hierarchical rows have no equivalent
         // field, so it stays absent rather than being faked as `false`.
-        promotable: None,
+        promotion: None,
         has_evolved_steps,
         evolved_steps,
         latest_generation,
@@ -1189,11 +1193,13 @@ async fn enrich_workflow_result(
     };
 
     // Promotion flag set by the refresh_workflow_promotion maintenance pass.
-    // Advisory metadata; best-effort (a lookup failure must not drop the result).
-    let promotable =
+    // Advisory metadata, labelled with its self-reported basis; best-effort (a
+    // lookup failure must not drop the result).
+    let promotion =
         ClaimRepository::promotion_flag(&mut *conn, viewer, ClaimId::from_uuid(workflow_id))
             .await
-            .unwrap_or(None);
+            .unwrap_or(None)
+            .map(PromotionFlag::new);
 
     Some(FindWorkflowResult {
         workflow_id: workflow_id.to_string(),
@@ -1208,7 +1214,7 @@ async fn enrich_workflow_result(
         behavioral_affinity,
         behavioral_success_rate,
         behavioral_execution_count,
-        promotable,
+        promotion,
         // Flat workflow claims carry their steps inline; there is no step
         // lineage to disclose.
         has_evolved_steps: None,
@@ -2128,10 +2134,13 @@ async fn deprecate_hierarchical_workflow(
         // would deprecate the part it sees and report success. Refused
         // instead, nothing written, when any generation of a target's name is
         // hidden from the caller (migration 202's check, as every workflow
-        // write asks it). A wholly hidden fork under another name (a private
-        // variant of a visible parent, named differently) is not seen by this
-        // check and is not part of the cascade: it belongs to a group the
-        // caller cannot read, whose members deprecate it. Asked after the
+        // write asks it). BY DESIGN (ruling e5f6a9d7, backlog aa2fb722): a
+        // wholly hidden fork under another name (a private variant of a
+        // visible parent, named differently) is not seen by this check and is
+        // not part of the cascade. It belongs to a group the caller cannot
+        // read, whose members deprecate it; the cascade neither deprecates it
+        // nor signals it (no count, no event), and the tool description says
+        // so. This is not an open gap. Asked after the
         // authority check, so a caller with no authority over the part it
         // sees is refused by the gate and learns nothing about hidden rows.
         let names = WorkflowRepository::canonical_names_of(&mut *tx, &targets)
