@@ -261,12 +261,16 @@ impl TripleRepository {
         if want == returned {
             Ok(())
         } else {
-            Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
-                    "{table} batch insert returned {} ids for {} rows, or ids it was not given",
+            // A repo-authored refusal, not a protocol error: built as
+            // `sqlx::Error::Protocol` the MCP layer redacts it as sqlx's own.
+            Err(DbError::Refused {
+                kind: crate::errors::RefusalKind::State,
+                message: format!(
+                    "{table} batch insert returned {} ids for {} rows, or ids it was not given; \
+                     nothing was kept",
                     returned.len(),
                     minted.len()
-                )),
+                ),
             })
         }
     }
