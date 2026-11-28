@@ -4325,10 +4325,13 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "UPDATE `claims` SET `truth_value` by primary key, RETURNING the row. A write; the \
          control depends on the connection. The update_truth_value_conn wrapper's non-test \
          callers pass their stamped transaction, so there it is claims_tenancy's WITH CHECK \
-         against that connection's GUCs, as for update_labels_conn. The one non-test raw-pool \
-         caller, routes/conventions.rs::forget_convention, is NOT under a stamped WITH CHECK: \
-         its gate is the handler's earlier ClaimRepository::get_by_id(pool, &viewer, ..), \
-         which refuses a claim the caller cannot see before this write runs \
+         against that connection's GUCs, as for update_labels_conn. \
+         routes/conventions.rs::forget_convention calls it twice. On a PRIVATE convention it \
+         passes its stamped transaction (claims_tenancy's WITH CHECK, after the handler's \
+         writer-only check). On a PUBLIC convention it is the one non-test raw-pool caller, \
+         NOT under a stamped WITH CHECK, after the stamped transaction commits: its gate is \
+         the handler's earlier ClaimRepository::get_by_id(&mut *tx, &viewer, ..) on that \
+         transaction, which refuses a claim the caller cannot see before any write runs \
          (viewer_spend_lint's forget_convention row). A new \
          raw-pool caller needs its own gate. A `&Viewer` would be spendable only through \
          splice_write, which is not this change's. SCOPE: executor only; the SQL is \
