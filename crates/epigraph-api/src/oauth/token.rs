@@ -535,12 +535,23 @@ struct VerifiedAssertion {
     /// the nonce is spent under (migration 213), whatever spelling of it the
     /// client row's `client_id` carries.
     public_key: [u8; 32],
+    /// Which message the signature verified over (version 2 is bound to this
+    /// issuer; version 1 is not).
+    version: crate::oauth::assertion::AssertionVersion,
 }
 
 /// Verify an Ed25519 agent assertion for the client_credentials grant.
 ///
-/// Assertion format: `timestamp(8B big-endian) || nonce(16B) || Ed25519_signature(64B)`
-/// The signature covers `timestamp || nonce` (24 bytes).
+/// Assertion format: `timestamp(8B big-endian) || nonce(16B) || Ed25519_signature(64B)`.
+/// The signature covers, tried in this order:
+/// 1. version 2: `epigraph_crypto::oauth_assertion_message(issuer, timestamp, nonce)`,
+///    where `issuer` is this server's published issuer
+///    ([`crate::oauth::metadata::issuer`]), so the assertion is good here only;
+/// 2. version 1 (deprecated): the bare `timestamp || nonce` (24 bytes).
+///
+/// The version that verified is returned; whether version 1 is still
+/// accepted is the caller's decision (`EPIGRAPH_ASSERTION_V1`, see
+/// [`crate::oauth::assertion`]).
 ///
 /// Security properties:
 /// - Real Ed25519 verification via `verify_strict` (rejects small-subgroup attacks)
@@ -550,13 +561,15 @@ struct VerifiedAssertion {
 /// [`authenticate_confidential_client`], which records the returned nonce
 /// under the returned public key (migration 213) and refuses a
 /// `(public key, nonce)` already recorded, so a
-/// captured assertion cannot be replayed inside its window. The signed message
-/// is still not bound to a domain or audience (backlog 950696a1, step 2).
+/// captured assertion cannot be replayed inside its window.
 fn verify_agent_assertion(
     assertion_bytes: &[u8],
     pub_key_bytes: &[u8],
     client_id_str: &str,
+    issuer: &str,
 ) -> Result<VerifiedAssertion, ApiError> {
+    use crate::oauth::assertion::AssertionVersion;
+
     if assertion_bytes.len() != 88 {
         return Err(ApiError::BadRequest {
             message: format!(
@@ -603,8 +616,9 @@ fn verify_agent_assertion(
         });
     }
 
-    // Verify Ed25519 signature over timestamp+nonce
-    let message = &assertion_bytes[..24]; // timestamp(8) + nonce(16)
+    let nonce: [u8; 16] = assertion_bytes[8..24]
+        .try_into()
+        .expect("slice is exactly 16 bytes");
     let sig_bytes: [u8; 64] = assertion_bytes[24..88]
         .try_into()
         .expect("slice is exactly 64 bytes");
@@ -615,23 +629,79 @@ fn verify_agent_assertion(
         })?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
-    if verifying_key.verify_strict(message, &signature).is_err() {
+    // Version 2 (bound to this issuer) first, then the deprecated bare
+    // `timestamp || nonce` (24 bytes).
+    let v2_message = epigraph_crypto::oauth_assertion_message(issuer, assertion_ts, &nonce);
+    let version = if verifying_key.verify_strict(&v2_message, &signature).is_ok() {
+        AssertionVersion::V2
+    } else if verifying_key
+        .verify_strict(&assertion_bytes[..24], &signature)
+        .is_ok()
+    {
+        AssertionVersion::V1
+    } else {
         tracing::warn!(
             client_id = %client_id_str,
-            "Agent assertion rejected: Ed25519 signature verification failed"
+            "Agent assertion rejected: Ed25519 signature verification failed (neither the \
+             version-2 message for this issuer nor the version-1 message)"
         );
         return Err(ApiError::Unauthorized {
             reason: "Ed25519 signature verification failed".to_string(),
         });
-    }
+    };
 
     Ok(VerifiedAssertion {
         timestamp: assertion_ts,
-        nonce: assertion_bytes[8..24]
-            .try_into()
-            .expect("slice is exactly 16 bytes"),
+        nonce,
         public_key: verifying_key.to_bytes(),
+        version,
     })
+}
+
+/// Log and count one ACCEPTED version-1 agent assertion (its nonce already
+/// spent, so a replay never counts): a warning naming the client and one
+/// `security_events` row ([`crate::oauth::assertion::V1_ACCEPTED_EVENT`]),
+/// the measurement an operator reads before setting
+/// `EPIGRAPH_ASSERTION_V1=refuse`. Unattributed (`agent_id` NULL, which the
+/// append policy always admits); the client is in `details`. A failure to
+/// write the row only warns: the count is not authority.
+#[cfg(feature = "db")]
+async fn record_v1_assertion(
+    state: &AppState,
+    client: &epigraph_db::repos::oauth_client::OAuthClientRow,
+    grant_type: &str,
+) {
+    use epigraph_db::repos::security_event::{SecurityEventRepository, SecurityEventRow};
+    tracing::warn!(
+        client_id = %client.client_id,
+        grant_type,
+        "Agent assertion accepted as VERSION 1 (signed over the bare timestamp and nonce, \
+         bound to no issuer): the client must sign the version-2 message before \
+         EPIGRAPH_ASSERTION_V1=refuse"
+    );
+    let row = SecurityEventRow {
+        id: uuid::Uuid::new_v4(),
+        event_type: crate::oauth::assertion::V1_ACCEPTED_EVENT.to_string(),
+        agent_id: None,
+        success: Some(true),
+        details: serde_json::json!({
+            "client_id": client.client_id,
+            "client_row": client.id,
+            "agent_id": client.agent_id,
+            "grant_type": grant_type,
+        }),
+        ip_address: None,
+        user_agent: None,
+        correlation_id: None,
+        created_at: Utc::now(),
+    };
+    if let Err(e) = SecurityEventRepository::log(&state.db_pool, row).await {
+        tracing::warn!(
+            client_id = %client.client_id,
+            error = %e,
+            "could not record the version-1 agent assertion measurement"
+        );
+    }
 }
 
 /// Record a VERIFIED assertion's nonce under the public key it verified with
@@ -873,10 +943,31 @@ async fn verify_client_credential(
                 hex::decode(&client.client_id).map_err(|_| ApiError::BadRequest {
                     message: "client_id must be hex-encoded public key for agents".to_string(),
                 })?;
-            let verified =
-                verify_agent_assertion(&assertion_bytes, &pub_key_bytes, &client.client_id)?;
+            let verified = verify_agent_assertion(
+                &assertion_bytes,
+                &pub_key_bytes,
+                &client.client_id,
+                crate::oauth::metadata::issuer(state),
+            )?;
+            let v1 = verified.version == crate::oauth::assertion::AssertionVersion::V1;
+            if v1 && state.assertion_v1 == crate::oauth::assertion::AssertionV1Policy::Refuse {
+                // Before the nonce is spent: a refused assertion writes nothing.
+                tracing::warn!(
+                    client_id = %client.client_id,
+                    "Agent assertion rejected: a version-1 assertion (bound to no issuer) \
+                     while EPIGRAPH_ASSERTION_V1=refuse"
+                );
+                return Err(ApiError::Unauthorized {
+                    reason: "client_assertion is version 1 (bound to no issuer); sign the \
+                             version-2 message"
+                        .to_string(),
+                });
+            }
             refuse_non_verifier_agent_key(state, client, &verified.public_key).await?;
             consume_assertion_nonce(state, client, verified).await?;
+            if v1 {
+                record_v1_assertion(state, client, &req.grant_type).await;
+            }
         }
         "service" => {
             let secret = req.client_secret.as_deref().ok_or(ApiError::BadRequest {
@@ -972,16 +1063,15 @@ async fn handle_client_credentials(
     // Effective scopes = intersection of requested and granted, through the
     // mint chokepoint (never the elevation scope; the admin-only scopes per
     // migration 128's switch).
+    // A retired scope in the request is dropped (`epigraph_auth::requested_scopes`);
+    // a request naming nothing else means "as granted".
     let requested_scopes = {
         let granted = &client.granted_scopes;
-        match &req.scope {
-            Some(requested) => {
-                let requested: Vec<String> = requested.split(' ').map(|s| s.to_string()).collect();
-                requested
-                    .into_iter()
-                    .filter(|s| granted.contains(s))
-                    .collect::<Vec<_>>()
-            }
+        match epigraph_auth::requested_scopes(req.scope.as_deref()) {
+            Some(requested) => requested
+                .into_iter()
+                .filter(|s| granted.contains(s))
+                .collect::<Vec<_>>(),
             None => granted.clone(),
         }
     };
@@ -1247,7 +1337,13 @@ async fn handle_refresh_token(
     // again after the mint chokepoint below, which can strip what a request
     // named (an admin-only scope while migration 128's switch is armed, or
     // when the switch cannot be read).
-    let consented = refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref())
+    //
+    // A retired scope (`epigraph_auth::RETIRED_SCOPES`) in the request is
+    // dropped first, so naming one narrows it away (alone, the request means
+    // "as originally granted") instead of failing `invalid_scope`; one the
+    // chain still holds is dropped by the chokepoint.
+    let requested = epigraph_auth::requested_scopes(req.scope.as_deref()).map(|r| r.join(" "));
+    let consented = refresh_scopes(&stored.scopes, &client.granted_scopes, requested.as_deref())
         .ok_or_else(refresh_invalid_scope)?;
     // Then through the mint chokepoint (never the elevation scope; the
     // admin-only scopes per migration 128's switch), which only ever removes.
@@ -1258,7 +1354,7 @@ async fn handle_refresh_token(
         crate::oauth::scopes::MintGrant::RefreshToken,
     )
     .await;
-    if effective_scopes.is_empty() && names_a_scope(req.scope.as_deref()) {
+    if effective_scopes.is_empty() && names_a_scope(requested.as_deref()) {
         return Err(refresh_invalid_scope());
     }
 
@@ -1916,13 +2012,13 @@ mod elevate_scope_tests {
                 "groups:admin",
                 "claims:write",
                 "agents:write",
-                "evidence:read",
+                "edges:read",
                 "instance:admin",
                 "clients:admin",
                 "entity-types:write",
                 "not-a-known:scope",
             ])),
-            v(&["claims:read", "evidence:read", "platform:admin"])
+            v(&["claims:read", "edges:read", "platform:admin"])
         );
         assert_eq!(elevated_scopes(&[]), v(&["platform:admin"]));
     }
@@ -1933,13 +2029,86 @@ mod assertion_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
-    /// Build a valid agent assertion: timestamp(8B) || nonce(16B) || sig(64B)
+    use crate::oauth::assertion::AssertionVersion;
+
+    /// The issuer the version-2 assertions below are signed for and checked
+    /// against.
+    const ISSUER: &str = "https://epigraph.example";
+
+    /// Build a VERSION-1 agent assertion: timestamp(8B) || nonce(16B) ||
+    /// sig(64B), the signature over the bare timestamp || nonce.
     fn build_assertion(signing_key: &SigningKey, timestamp_secs: u64) -> Vec<u8> {
         let timestamp = timestamp_secs.to_be_bytes();
         let nonce: [u8; 16] = rand::random();
         let message = [&timestamp[..], &nonce[..]].concat();
         let signature = signing_key.sign(&message);
         [&timestamp[..], &nonce[..], signature.to_bytes().as_slice()].concat()
+    }
+
+    /// Build a VERSION-2 agent assertion for `issuer`: the same 88-byte wire
+    /// format, the signature over `oauth_assertion_message(issuer, ts, nonce)`.
+    fn build_v2_assertion(signing_key: &SigningKey, timestamp_secs: u64, issuer: &str) -> Vec<u8> {
+        let nonce: [u8; 16] = rand::random();
+        let message = epigraph_crypto::oauth_assertion_message(issuer, timestamp_secs, &nonce);
+        let signature = signing_key.sign(&message);
+        [
+            &timestamp_secs.to_be_bytes()[..],
+            &nonce[..],
+            signature.to_bytes().as_slice(),
+        ]
+        .concat()
+    }
+
+    /// A version-2 assertion signed for this issuer verifies, as version 2.
+    #[test]
+    fn a_v2_assertion_for_this_issuer_passes_as_v2() {
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        let ts = now_secs();
+        let assertion = build_v2_assertion(&sk, ts, ISSUER);
+        let client_id = hex::encode(pk);
+
+        let verified =
+            verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).expect("verifies");
+        assert_eq!(verified.version, AssertionVersion::V2);
+        assert_eq!(verified.timestamp, ts);
+        assert_eq!(&verified.nonce[..], &assertion[8..24]);
+    }
+
+    /// The audience binding: a version-2 assertion signed for ANOTHER issuer
+    /// (a captured assertion presented to the wrong server) does not verify
+    /// here under either version.
+    #[test]
+    fn a_v2_assertion_for_another_issuer_is_refused() {
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        let assertion = build_v2_assertion(&sk, now_secs(), "https://other.example");
+        let client_id = hex::encode(pk);
+
+        let err = verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).unwrap_err();
+        match err {
+            ApiError::Unauthorized { reason } => {
+                assert!(reason.contains("signature verification failed"), "{reason}");
+            }
+            other => panic!("Expected Unauthorized, got {other:?}"),
+        }
+        // A trailing slash is another issuer too: the bytes are compared.
+        let slash = build_v2_assertion(&sk, now_secs(), &format!("{ISSUER}/"));
+        assert!(verify_agent_assertion(&slash, &pk, &client_id, ISSUER).is_err());
+    }
+
+    /// A version-1 assertion still verifies, and says it is version 1 (the
+    /// caller decides whether to accept it).
+    #[test]
+    fn a_v1_assertion_passes_as_v1() {
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        let assertion = build_assertion(&sk, now_secs());
+        let client_id = hex::encode(pk);
+
+        let verified =
+            verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).expect("verifies");
+        assert_eq!(verified.version, AssertionVersion::V1);
     }
 
     fn now_secs() -> u64 {
@@ -1956,7 +2125,7 @@ mod assertion_tests {
         let assertion = build_assertion(&sk, now_secs());
         let client_id = hex::encode(pk);
 
-        assert!(verify_agent_assertion(&assertion, &pk, &client_id).is_ok());
+        assert!(verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).is_ok());
     }
 
     /// The nonce recorded for single use (migration 213) is the SIGNED one,
@@ -1970,7 +2139,8 @@ mod assertion_tests {
         let assertion = build_assertion(&sk, ts);
         let client_id = hex::encode(pk);
 
-        let verified = verify_agent_assertion(&assertion, &pk, &client_id).expect("verifies");
+        let verified =
+            verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).expect("verifies");
         assert_eq!(verified.timestamp, ts);
         assert_eq!(&verified.nonce[..], &assertion[8..24]);
         assert_eq!(
@@ -1987,7 +2157,7 @@ mod assertion_tests {
         let assertion = build_assertion(&sk, now_secs());
         let client_id = hex::encode(wrong_pk);
 
-        let err = verify_agent_assertion(&assertion, &wrong_pk, &client_id).unwrap_err();
+        let err = verify_agent_assertion(&assertion, &wrong_pk, &client_id, ISSUER).unwrap_err();
         match err {
             ApiError::Unauthorized { reason } => {
                 assert!(reason.contains("signature verification failed"), "{reason}");
@@ -2006,7 +2176,7 @@ mod assertion_tests {
         // Flip a bit in the nonce region
         assertion[12] ^= 0xFF;
 
-        let err = verify_agent_assertion(&assertion, &pk, &client_id).unwrap_err();
+        let err = verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).unwrap_err();
         match err {
             ApiError::Unauthorized { reason } => {
                 assert!(reason.contains("signature verification failed"), "{reason}");
@@ -2023,7 +2193,7 @@ mod assertion_tests {
         let assertion = build_assertion(&sk, now_secs() - 600);
         let client_id = hex::encode(pk);
 
-        let err = verify_agent_assertion(&assertion, &pk, &client_id).unwrap_err();
+        let err = verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).unwrap_err();
         match err {
             ApiError::Unauthorized { reason } => {
                 assert!(reason.contains("too old"), "{reason}");
@@ -2040,7 +2210,7 @@ mod assertion_tests {
         let assertion = build_assertion(&sk, now_secs() + 300);
         let client_id = hex::encode(pk);
 
-        let err = verify_agent_assertion(&assertion, &pk, &client_id).unwrap_err();
+        let err = verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).unwrap_err();
         match err {
             ApiError::Unauthorized { reason } => {
                 assert!(reason.contains("future"), "{reason}");
@@ -2055,7 +2225,7 @@ mod assertion_tests {
         let short = vec![0u8; 50];
         let client_id = hex::encode(pk);
 
-        let err = verify_agent_assertion(&short, &pk, &client_id).unwrap_err();
+        let err = verify_agent_assertion(&short, &pk, &client_id, ISSUER).unwrap_err();
         match err {
             ApiError::BadRequest { message } => {
                 assert!(message.contains("exactly 88 bytes"), "{message}");
@@ -2072,7 +2242,7 @@ mod assertion_tests {
         let assertion = build_assertion(&sk, now_secs() + 20);
         let client_id = hex::encode(pk);
 
-        assert!(verify_agent_assertion(&assertion, &pk, &client_id).is_ok());
+        assert!(verify_agent_assertion(&assertion, &pk, &client_id, ISSUER).is_ok());
     }
 }
 
@@ -2284,7 +2454,7 @@ mod refresh_scope_tests {
     fn a_blank_scope_parameter_means_as_originally_granted() {
         // stored != granted, so "as originally granted" (stored ∩ granted) is
         // told apart from "the client's grant" and from "the stored set".
-        let stored = v(&["claims:read", "evidence:read"]);
+        let stored = v(&["claims:read", "edges:read"]);
         let granted = v(&["claims:read", "claims:write"]);
         for blank in [None, Some(""), Some("   ")] {
             assert_eq!(
@@ -2297,13 +2467,8 @@ mod refresh_scope_tests {
 
     #[test]
     fn a_requested_scope_outside_the_stored_set_is_never_added() {
-        let stored = v(&["claims:read", "evidence:read"]);
-        let granted = v(&[
-            "claims:read",
-            "claims:write",
-            "agents:write",
-            "evidence:read",
-        ]);
+        let stored = v(&["claims:read", "edges:read"]);
+        let granted = v(&["claims:read", "claims:write", "agents:write", "edges:read"]);
         assert_eq!(
             refresh_scopes(
                 &stored,
@@ -2332,7 +2497,7 @@ mod refresh_scope_tests {
 
     #[test]
     fn the_stored_order_is_kept_and_a_lost_grant_is_dropped() {
-        let stored = v(&["claims:write", "evidence:read", "claims:read"]);
+        let stored = v(&["claims:write", "edges:read", "claims:read"]);
         let granted = v(&["claims:read", "claims:write"]);
         assert_eq!(
             refresh_scopes(&stored, &granted, None),

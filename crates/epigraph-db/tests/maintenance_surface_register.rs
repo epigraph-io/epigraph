@@ -131,11 +131,13 @@ const ALLOWED: &[(&str, &str, usize)] = &[
         1,
     ),
     // `ClaimEmbeddingJobService`, the `embedding_generation` handler: only
-    // `jobs_drain::build_job_runner` (the drain timer) registers it.
+    // `jobs_drain::build_job_runner` (the drain timer) registers it. One per
+    // trait method that touches the database: `already_embedded`,
+    // `get_claim_text`, `generate_and_store`.
     (
         "crates/epigraph-api/src/embedding_restore.rs",
         "unscoped_for_maintenance(",
-        2,
+        3,
     ),
 ];
 

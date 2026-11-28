@@ -6,6 +6,13 @@
 //! and a `status` field in `properties`.
 //!
 //! Reference implementation: `epigraph-nano/src/persistence.rs:7332-7530`.
+//!
+//! Read-and-challenge only. The three admin writes that used to live here
+//! (`POST /api/v1/policies/:claim_id/outcome`, `POST /api/v1/policies/decay-sweep`
+//! and `POST /api/v1/policy-challenges/:id/resolve`) ran unaudited inline
+//! claim updates on the raw pool and had no caller; they were deleted
+//! (backlog ec968070). Policy learning would be rebuilt on an audited admin
+//! write path if a host ever wires it.
 
 #[cfg(feature = "db")]
 use axum::{
@@ -29,21 +36,10 @@ const fn default_min_truth() -> f64 {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct OutcomeRequest {
-    pub supports: bool,
-    pub strength: f64,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct CreateChallengeRequest {
     pub host: String,
     pub port: i64,
     pub protocol: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ResolveChallengeRequest {
-    pub approved: bool,
 }
 
 /// GET /api/v1/policies/network — list active network-access policies.
@@ -74,53 +70,6 @@ pub async fn list_network_policies(
         .collect();
 
     Ok(Json(serde_json::json!({ "policies": policies })))
-}
-
-/// POST /api/v1/policies/:claim_id/outcome — Bayesian-style nudge.
-///
-/// `supports = true` increases truth toward 1.0; `false` decreases.
-/// `strength` is the magnitude in (0, 1]; clamped server-side.
-#[cfg(feature = "db")]
-pub async fn record_outcome(
-    State(state): State<AppState>,
-    _scope: crate::middleware::bearer::RequireScopeAdmin,
-    Path(claim_id): Path<Uuid>,
-    Json(req): Json<OutcomeRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    // Scope already verified by extractor: caller has `claims:admin`.
-    // See `RequireScopeAdmin` in `middleware::bearer`.
-    let strength = req.strength.clamp(0.0, 1.0);
-    let signed = if req.supports { strength } else { -strength };
-
-    // Same closed-form update as epigraph-nano/src/persistence.rs:7430.
-    let row: Option<(f64,)> = sqlx::query_as(
-        "UPDATE claims SET \
-            truth_value = LEAST(0.99, GREATEST(0.01, \
-                truth_value + $1 * (1.0 - truth_value) * \
-                CASE WHEN $1 > 0 THEN 1.0 ELSE truth_value END)), \
-            updated_at = NOW() \
-         WHERE id = $2 AND 'policy:active' = ANY(labels) \
-         RETURNING truth_value",
-    )
-    .bind(signed)
-    .bind(claim_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to update policy outcome: {e}"),
-    })?;
-
-    let new_truth = row
-        .ok_or(ApiError::NotFound {
-            entity: "policy".to_string(),
-            id: claim_id.to_string(),
-        })?
-        .0;
-
-    Ok(Json(serde_json::json!({
-        "claim_id": claim_id,
-        "truth_value": new_truth,
-    })))
 }
 
 /// POST /api/v1/policy-challenges — create a pending challenge claim.
@@ -336,102 +285,6 @@ pub async fn get_challenge(
     })))
 }
 
-/// POST /api/v1/policy-challenges/:id/resolve — approve or deny.
-///
-/// On `approved=false`, also strengthens the default-deny policy claim
-/// by +0.03 (capped at 0.99). Default-deny is identified by host='*' in properties.
-#[cfg(feature = "db")]
-pub async fn resolve_challenge(
-    State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-    Path(id): Path<Uuid>,
-    Json(req): Json<ResolveChallengeRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = auth_ctx
-        .ok_or(ApiError::Unauthorized {
-            reason: "resolve_challenge requires authentication".into(),
-        })?
-        .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
-    let new_status = if req.approved { "approved" } else { "denied" };
-
-    let updated: Option<(Uuid,)> = sqlx::query_as(
-        "UPDATE claims SET \
-            properties = jsonb_set(properties, '{status}', to_jsonb($2::text), true), \
-            updated_at = NOW() \
-         WHERE id = $1 AND 'policy:challenge' = ANY(labels) \
-         RETURNING id",
-    )
-    .bind(id)
-    .bind(new_status)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to resolve challenge: {e}"),
-    })?;
-
-    if updated.is_none() {
-        return Err(ApiError::NotFound {
-            entity: "policy-challenge".to_string(),
-            id: id.to_string(),
-        });
-    }
-
-    if !req.approved {
-        sqlx::query(
-            "UPDATE claims SET \
-                truth_value = LEAST(0.99, truth_value + 0.03), \
-                updated_at = NOW() \
-             WHERE 'policy:active' = ANY(labels) \
-               AND properties->>'host' = '*'",
-        )
-        .execute(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to strengthen default-deny: {e}"),
-        })?;
-    }
-
-    Ok(Json(serde_json::json!({
-        "id": id,
-        "status": new_status,
-    })))
-}
-
-/// POST /api/v1/policies/decay-sweep — pull stale active policies toward 0.5.
-///
-/// Skips claims with `properties->>'decay_exempt' = 'true'`. Returns the
-/// number of rows updated.
-#[cfg(feature = "db")]
-pub async fn decay_sweep(
-    State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = auth_ctx
-        .ok_or(ApiError::Unauthorized {
-            reason: "decay_sweep requires authentication".into(),
-        })?
-        .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
-    let result = sqlx::query(
-        "UPDATE claims SET \
-            truth_value = truth_value + 0.1 * (0.5 - truth_value), \
-            updated_at = NOW() \
-         WHERE 'policy:active' = ANY(labels) \
-           AND COALESCE((properties->>'decay_exempt')::boolean, false) IS NOT TRUE \
-           AND updated_at < NOW() - INTERVAL '90 days'",
-    )
-    .execute(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Decay sweep failed: {e}"),
-    })?;
-
-    Ok(Json(serde_json::json!({
-        "rows_affected": result.rows_affected(),
-    })))
-}
-
 #[cfg(all(test, feature = "db"))]
 mod tests {
     use super::*;
@@ -456,14 +309,8 @@ mod tests {
     fn policy_router(state: AppState) -> Router {
         Router::new()
             .route("/api/v1/policies/network", get(list_network_policies))
-            .route("/api/v1/policies/:claim_id/outcome", post(record_outcome))
-            .route("/api/v1/policies/decay-sweep", post(decay_sweep))
             .route("/api/v1/policy-challenges", post(create_challenge))
             .route("/api/v1/policy-challenges/:id", get(get_challenge))
-            .route(
-                "/api/v1/policy-challenges/:id/resolve",
-                post(resolve_challenge),
-            )
             .with_state(state)
     }
 

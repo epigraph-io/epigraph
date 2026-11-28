@@ -18,6 +18,14 @@
 //!   400 `invalid_client` (RFC 6749 section 5.2, backlog 31d799b3), and each
 //!   refusal leaves the presented refresh token usable with a fresh assertion.
 //!
+//! Version 2 (backlog bada894d, 950696a1 step 2): the same 88 bytes, the
+//! signature over `epigraph_crypto::oauth_assertion_message(issuer, ts,
+//! nonce)`, bound to the server's published issuer. Tried first; a version-2
+//! assertion for another issuer is refused; version 1 is accepted and counted
+//! (one `security_events` row per accepted assertion) under the default
+//! `EPIGRAPH_ASSERTION_V1=accept`, and refused under `refuse`; a version-2
+//! assertion is single use like a version-1 one.
+//!
 //! The grants this file cannot see (the definer's EXECUTE grant to the
 //! application role, the revoked table DML) are measured as `epigraph_app` in
 //! `epigraph-db/tests/app_role_table_lockdown.rs`
@@ -100,6 +108,40 @@ fn assertion_with(key: &SigningKey, nonce: [u8; 16]) -> String {
 
 fn fresh_assertion(key: &SigningKey) -> String {
     assertion_with(key, Uuid::new_v4().into_bytes())
+}
+
+/// The issuer `config()` publishes (`public_base_url` without a trailing `/`).
+const ISSUER: &str = "http://localhost:8080";
+
+/// A VERSION-2 assertion for `issuer`: `timestamp(8B BE) || nonce(16B) ||
+/// Ed25519(oauth_assertion_message(issuer, timestamp, nonce))`, base64.
+fn v2_assertion_for(key: &SigningKey, issuer: &str) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let nonce = Uuid::new_v4().into_bytes();
+    let sig = key.sign(&epigraph_crypto::oauth_assertion_message(
+        issuer, ts, &nonce,
+    ));
+    let mut wire = Vec::with_capacity(88);
+    wire.extend_from_slice(&ts.to_be_bytes());
+    wire.extend_from_slice(&nonce);
+    wire.extend_from_slice(&sig.to_bytes());
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, wire)
+}
+
+/// How many version-1 assertions by `client_id` were accepted and counted.
+async fn v1_accepted_rows(pool: &PgPool, client_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = $1 AND details->>'client_id' = $2",
+    )
+    .bind(epigraph_api::oauth::assertion::V1_ACCEPTED_EVENT)
+    .bind(client_id)
+    .fetch_one(pool)
+    .await
+    .expect("count v1 rows")
 }
 
 fn credentials_grant(client_id: &str, assertion: &str) -> Value {
@@ -420,5 +462,243 @@ async fn an_agent_client_whose_key_no_agent_holds_still_authenticates(pool: PgPo
         status,
         StatusCode::OK,
         "an agent client whose key no agent holds must still mint: {body}"
+    );
+}
+
+/// Catches: the token endpoint not verifying the version-2 message (bound to
+/// its own issuer), and a version-2 assertion being replayable. The first
+/// presentation mints and is not counted as version 1; the same assertion
+/// again is refused like any replay.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_v2_assertion_mints_once_and_its_replay_is_refused(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    let captured = v2_assertion_for(&key, ISSUER);
+    let (status, body) = post_token(&app, credentials_grant(&client_id, &captured)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a v2 assertion for this issuer: {body}"
+    );
+    assert!(body["access_token"].is_string(), "{body}");
+    assert_eq!(
+        v1_accepted_rows(&pool, &client_id).await,
+        0,
+        "a v2 assertion is not counted as v1"
+    );
+
+    let (status, body) = post_token(&app, credentials_grant(&client_id, &captured)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the same v2 assertion replayed: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
+
+    // And on the refresh grant, which runs the same check.
+    let (status, body) = post_token(
+        &app,
+        credentials_grant(&client_id, &v2_assertion_for(&key, ISSUER)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let refresh = refresh_token_of(&body);
+    let (status, body) = post_token(
+        &app,
+        refresh_grant(&refresh, &client_id, &v2_assertion_for(&key, ISSUER)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a v2 assertion refreshes: {body}");
+}
+
+/// Catches: an assertion signed for ANOTHER authorization server (another
+/// issuer, or the connect URL instead of the published issuer) authenticating
+/// here. Refused as `invalid_client`, under the default switch, with no
+/// token; the same client then mints with an assertion for this issuer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_v2_assertion_for_another_issuer_is_refused(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    for other in [
+        "https://other.example",
+        "http://localhost:8080/",
+        "http://localhost:8080/mcp",
+    ] {
+        let (status, body) = post_token(
+            &app,
+            credentials_grant(&client_id, &v2_assertion_for(&key, other)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a v2 assertion for {other} minted at {ISSUER}: {body}"
+        );
+        assert!(body.get("access_token").is_none(), "{body}");
+        assert_eq!(body["error"], "invalid_client", "{body}");
+    }
+
+    let (status, body) = post_token(
+        &app,
+        credentials_grant(&client_id, &v2_assertion_for(&key, ISSUER)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: the same client mints with an assertion for this issuer: {body}"
+    );
+}
+
+/// Catches: a version-1 assertion going uncounted, or counted more than once.
+/// Under the default switch it mints and writes exactly one
+/// `security_events` row naming the client; its replay is refused and adds no
+/// row (the count is written after the nonce is spent).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_v1_assertion_is_accepted_and_counted_by_default(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+    assert_eq!(v1_accepted_rows(&pool, &client_id).await, 0);
+
+    let captured = fresh_assertion(&key);
+    let (status, body) = post_token(&app, credentials_grant(&client_id, &captured)).await;
+    assert_eq!(status, StatusCode::OK, "v1 is accepted by default: {body}");
+    assert_eq!(
+        v1_accepted_rows(&pool, &client_id).await,
+        1,
+        "one accepted v1 assertion, one row"
+    );
+
+    let (status, body) = post_token(&app, credentials_grant(&client_id, &captured)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "the v1 replay: {body}");
+    assert_eq!(
+        v1_accepted_rows(&pool, &client_id).await,
+        1,
+        "a refused replay is not counted"
+    );
+
+    let grant: String = sqlx::query_scalar(
+        "SELECT details->>'grant_type' FROM security_events \
+          WHERE event_type = $1 AND details->>'client_id' = $2",
+    )
+    .bind(epigraph_api::oauth::assertion::V1_ACCEPTED_EVENT)
+    .bind(&client_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the row");
+    assert_eq!(grant, "client_credentials");
+}
+
+/// Catches: `EPIGRAPH_ASSERTION_V1=refuse` not refusing. A version-1
+/// assertion is then `invalid_client` on both grants (no token, no count),
+/// while a version-2 assertion by the same client mints and refreshes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_v1_assertion_is_refused_under_refuse(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(
+        AppState::with_db(pool.clone(), config())
+            .with_assertion_v1(epigraph_api::oauth::assertion::AssertionV1Policy::Refuse),
+    );
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a v1 assertion minted under refuse: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
+    assert_eq!(v1_accepted_rows(&pool, &client_id).await, 0);
+
+    let (status, body) = post_token(
+        &app,
+        credentials_grant(&client_id, &v2_assertion_for(&key, ISSUER)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "calibration: v2 mints: {body}");
+    let refresh = refresh_token_of(&body);
+
+    let (status, body) = post_token(
+        &app,
+        refresh_grant(&refresh, &client_id, &fresh_assertion(&key)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a v1 assertion refreshed under refuse: {body}"
+    );
+    assert_eq!(body["error"], "invalid_client", "{body}");
+
+    let (status, body) = post_token(
+        &app,
+        refresh_grant(&refresh, &client_id, &v2_assertion_for(&key, ISSUER)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused v1 refresh left the chain usable for v2: {body}"
+    );
+}
+
+/// A pool on the same database whose every connection runs as the deployed
+/// application role, `epigraph_app`.
+async fn app_role_pool(pool: &PgPool) -> PgPool {
+    use sqlx::Executor;
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("current_database()");
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let prefix = base
+        .split_once('?')
+        .map_or(base.as_str(), |(a, _)| a)
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .expect("DATABASE_URL must carry a database path")
+        .0
+        .to_string();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&format!("{prefix}/{db}"))
+        .await
+        .expect("application-role pool")
+}
+
+/// Catches: the version-1 count row failing to write on the DEPLOYED role.
+/// The write is fail-open (a failure only warns), so a grant or row-security
+/// refusal would leave the operator's measurement silently at zero and the
+/// rollout would flip `refuse` on clients that still sign version 1. Served
+/// by a router whose pool is `epigraph_app`, an accepted version-1 assertion
+/// still leaves exactly one row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_v1_count_row_is_written_as_the_application_role(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(app_role_pool(&pool).await, config()));
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(status, StatusCode::OK, "v1 mints as epigraph_app: {body}");
+    assert_eq!(
+        v1_accepted_rows(&pool, &client_id).await,
+        1,
+        "the count row is written on the application role"
     );
 }
