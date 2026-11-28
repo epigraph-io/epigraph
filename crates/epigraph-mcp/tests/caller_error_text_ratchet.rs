@@ -401,6 +401,82 @@ fn no_caller_facing_internal_error_carries_an_error() {
     }
 }
 
+/// The service crate's caller-text constructors (backlog 30133ca8 moved the
+/// viewer-resolution and claim-helper error sites of [`CONVERTED`]'s
+/// `tools/viewer.rs` and `claim_helper.rs` there, into `Ctx`): a
+/// `ServiceError` whose message the MCP server sends as written
+/// (`InvalidParams`, `Denied`, `Internal`, and `InternalLogged`'s `message`
+/// field). Its `cause` field is the logged side and is not scanned.
+const SERVICE_CONSTRUCTORS: &[&str] = &[
+    "ServiceError::Internal(",
+    "ServiceError::Denied(",
+    "ServiceError::InvalidParams(",
+    "message: ",
+];
+
+/// The same scan over `crates/epigraph-service/src`, whose `ServiceError`
+/// messages this server forwards to its callers as written
+/// (`crate::errors::from_service`).
+#[test]
+fn no_caller_facing_service_error_carries_an_error() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../epigraph-service/src");
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    files.sort();
+    let mut offenders = Vec::new();
+    let mut in_ctx = 0usize;
+    for path in &files {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = strip(&std::fs::read_to_string(path).expect("read source"));
+        let found = sites(&text, SERVICE_CONSTRUCTORS);
+        if rel == "ctx.rs" {
+            in_ctx = found.len();
+        }
+        for (line, why) in found.into_iter().filter(|(_, why)| !why.is_empty()) {
+            offenders.push(format!(
+                "epigraph-service/src/{rel}:{line} ({})",
+                why.join(", ")
+            ));
+        }
+    }
+    assert!(
+        in_ctx >= 8,
+        "epigraph-service/src/ctx.rs holds only {in_ctx} caller-text ServiceError sites; the \
+         moved read_as / author_write_authority / write-identity refusals are no longer \
+         scanned"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a ServiceError's caller-facing message interpolates an error: the MCP server sends it \
+         as written. Put the error in InternalLogged's `cause`, or hand the typed error over \
+         as ServiceError::Fault / ServiceError::Repository. Sites:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// The service-crate scan catches an interpolated error in each spelling, and
+/// leaves the logged `cause` alone.
+#[test]
+fn the_service_scan_catches_error_text_in_every_constructor() {
+    let leaky = |src: &str| -> Vec<usize> {
+        sites(&strip(src), SERVICE_CONSTRUCTORS)
+            .into_iter()
+            .filter(|(_, why)| !why.is_empty())
+            .map(|(line, _)| line)
+            .collect()
+    };
+    let src = "a.map_err(|e| ServiceError::Internal(format!(\"x: {e}\")))?;\n\
+               b.map_err(|err| ServiceError::Denied(err.to_string()))?;\n\
+               c.map_err(|e| ServiceError::InternalLogged {\n    message: format!(\"y: {e}\"),\n    cause: e.to_string(),\n})?;\n\
+               d.map_err(|e| ServiceError::InternalLogged {\n    message: \"z\".to_string(),\n    cause: e.to_string(),\n})?;\n\
+               f.map_err(|e| ServiceError::InvalidParams(format!(\"{}\", e)))?;";
+    assert_eq!(leaky(src), vec![1, 2, 4, 11]);
+}
+
 /// The scanner itself: the shapes it must catch and the ones it must skip.
 #[test]
 fn the_scanner_catches_error_text_in_every_constructor() {

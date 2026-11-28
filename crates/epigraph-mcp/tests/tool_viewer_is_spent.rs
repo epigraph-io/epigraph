@@ -1581,7 +1581,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // claim was read or created through the viewer.
     // resolves: `Viewer::resolve`.
     (
-        "src/claim_helper.rs",
+        "epigraph-service/src/ctx.rs",
         "author_write_authority",
         &["Viewer::resolve"],
     ),
@@ -2027,26 +2027,41 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
 /// the viewer into one would count as viewed with the helper's own body never
 /// read. `server.rs` is left out: its `#[tool]` methods take `&self` and only
 /// resolve the viewer and delegate to `src/tools/` (measured 2026-11-22).
+///
+/// The service crate's root files are read too, keyed
+/// `epigraph-service/src/<name>.rs`: the tenancy entry points the tools hand
+/// their viewer and their server to (`author_write_authority`, `read_as`,
+/// `write_identity`) moved there from `claim_helper.rs`, `tools/viewer.rs` and
+/// `server.rs` (backlog 30133ca8), and a scan of this crate alone would stop
+/// reading their bodies.
 fn root_files() -> Vec<(String, String)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read src dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
+    let roots = [
+        (Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), "src"),
+        (
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../epigraph-service/src"),
+            "epigraph-service/src",
+        ),
+    ];
+    for (dir, key) in roots {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("utf-8 file name")
+                .to_string();
+            if key == "src" && name == "server.rs" {
+                continue;
+            }
+            out.push((
+                format!("{key}/{name}"),
+                std::fs::read_to_string(&path).expect("read src file"),
+            ));
         }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf-8 file name")
-            .to_string();
-        if name == "server.rs" {
-            continue;
-        }
-        out.push((
-            format!("src/{name}"),
-            std::fs::read_to_string(&path).expect("read src file"),
-        ));
     }
     out.sort();
     out

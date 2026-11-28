@@ -13,7 +13,7 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use crate::embed::McpEmbedder;
-use crate::errors::{internal_error, McpError};
+use crate::errors::McpError;
 use crate::tools;
 use crate::types::*;
 
@@ -33,49 +33,23 @@ pub const DEFAULT_AUTH_LINEAGE_TTL: std::time::Duration = std::time::Duration::f
 #[derive(Clone)]
 pub struct EpiGraphMcpFull {
     pub(crate) tool_router: ToolRouter<Self>,
-    pub(crate) pool: PgPool,
-    /// The tenancy-aware pool, when this process built one.
+    /// The context the tenancy entry points run in (backlog 30133ca8):
+    /// the plain `pool`, the `ScopedPool` (`scoped`), the privileged-pool
+    /// declaration (`privileged_pool`), the detached `background` tasks, the
+    /// `signer`, the identity key and the process's own agent id cell. Those
+    /// fields' docs, and the methods `read_as`, `write_identity`,
+    /// `admin_borrowed_server_identity`, `signer_agent_id` and `agent_id`, moved
+    /// to `epigraph_service::Ctx` verbatim; this server's methods of the same
+    /// names delegate to it and answer in its own error type.
     ///
-    /// `Option` for the same reason as `epigraph_api::AppState::scoped`:
-    /// `ScopedPool::connect` owns pool construction (the `after_release` scrub
-    /// can only be installed at build time), so it cannot be wrapped around a
-    /// `PgPool` a caller already has. The four legacy constructors set `None`;
-    /// [`Self::with_scoped_pool`] is the one that populates it.
+    /// Private to this module and reached by the tools through [`Deref`]
+    /// (`server.pool`, `server.scoped`, `server.signer` read the context's
+    /// fields), so no tool call site changed. There is no `DerefMut`: only this
+    /// module's builders change the context. `None` for `scoped` still means
+    /// the write path AND the read path fail closed (`Ctx`'s doc).
     ///
-    /// `None` here means the WRITE path fails closed:
-    /// `crate::claim_helper::begin_author_stamped_tx` refuses rather than
-    /// running `submit_claim` / `memorize` on an unstamped connection, where the
-    /// claim commits and its trace is then refused with `42501`.
-    ///
-    /// `Some` here does NOT license the three maintenance tools. They require a
-    /// privileged maintenance pool attached to this `ScopedPool`, and a leased
-    /// connection that passes `MaintenanceSession::assert_privileged` on every
-    /// call. See `crate::maintenance::maintenance_viewer`.
-    pub(crate) scoped: Option<epigraph_db::ScopedPool>,
-    /// `Some(reason)` when the caller DECLARED that `pool` is a privileged
-    /// (BYPASSRLS) maintenance pool — set only through
-    /// [`Self::on_a_privileged_pool`]. The operator `ingest-document` CLI runs
-    /// its whole ingest on `MaintenancePool`, where there is no tenancy context
-    /// to stamp and a plain transaction is the correct shape. Declared rather
-    /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
-    /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
-    pub(crate) privileged_pool: Option<&'static str>,
-    /// The tasks tools detach and answer ahead of (a queued document walk, a
-    /// post-commit embedding loop), counted so the stdio entry point can wait
-    /// for them before the process exits. Shared by every clone of the server.
-    /// See [`crate::background`].
-    pub(crate) background: crate::background::BackgroundTasks,
-    /// The key every signature this server makes is by. In the legacy modes
-    /// it is also the agent's identity (`agents.public_key`); in the
-    /// separate-signing-key mode (agent identity lineage design D2) it is the
-    /// agent's registered `agent_keys` signing key and names no agent.
-    pub(crate) signer: Arc<AgentSigner>,
-    /// The agent's IDENTITY public key when it is not the signer's
-    /// ([`Self::with_identity_public_key`]): [`Self::agent_id`] finds the agent
-    /// by this key, and the signer only signs. `None` in every constructor,
-    /// which keeps the legacy behaviour (the signer's key is the identity).
-    pub(crate) identity_public_key: Option<[u8; 32]>,
-    pub(crate) agent_db_id: Arc<Mutex<Option<uuid::Uuid>>>,
+    /// [`Deref`]: std::ops::Deref
+    ctx: epigraph_service::Ctx,
     pub(crate) embedder: Arc<McpEmbedder>,
     pub(crate) read_only: bool,
     /// The federation gateway's routing table over downstream extension MCPs.
@@ -90,13 +64,6 @@ pub struct EpiGraphMcpFull {
     /// Shared behind an `RwLock` so `main`'s reconnect timer can revive an
     /// extension that was unreachable at boot without restarting the process.
     pub(crate) federation: crate::federation::SharedFederation,
-    /// `(llm_model, llm_prompt_hash)` when this server's agent identity was
-    /// derived deterministically from an LLM config (see `main::select_signer`),
-    /// else `None`. When `Some`, `agent_id()`'s CREATE branch records these on
-    /// the freshly-created agent row via `AgentRepository::set_llm_properties`.
-    /// `None` (the default for every unconfigured process) preserves the legacy
-    /// behavior exactly — no properties are written.
-    pub(crate) llm_identity: Option<(String, String)>,
     /// Whether this server's signer identity was DECLARED by the operator
     /// (`--agent-key` / `--agent-model`) rather than freshly generated per
     /// process (`main::select_signer` rung 4).
@@ -200,6 +167,35 @@ pub struct EpiGraphMcpFull {
     pub(crate) compound_write_guard: epigraph_engine::belief_modes::CompoundWriteGuard,
 }
 
+/// The tools read the context's fields (`server.pool`, `server.scoped`,
+/// `server.signer`, `server.background`, `server.privileged_pool`) through this,
+/// as they read them when they were this struct's own fields. Read-only: there
+/// is no `DerefMut`, so only this module's builders change the context.
+impl std::ops::Deref for EpiGraphMcpFull {
+    type Target = epigraph_service::Ctx;
+
+    fn deref(&self) -> &epigraph_service::Ctx {
+        &self.ctx
+    }
+}
+
+/// The service crate's write helpers (`begin_author_stamped_tx`,
+/// `begin_author_stamped_tx_for`, `resolve_claim_visibility`, re-exported from
+/// `crate::claim_helper`) take any host that lends its `Ctx` and answers a
+/// `ServiceError` in its own error type: this server, with
+/// [`crate::errors::from_service`].
+impl epigraph_service::ServiceHost for EpiGraphMcpFull {
+    type Error = McpError;
+
+    fn ctx(&self) -> &epigraph_service::Ctx {
+        &self.ctx
+    }
+
+    fn service_error(e: epigraph_service::ServiceError) -> McpError {
+        crate::errors::from_service(e)
+    }
+}
+
 impl EpiGraphMcpFull {
     /// The server's own `agents.id`, for callers outside this crate's `crate::`
     /// visibility — specifically `main.rs`, which needs it to build the
@@ -212,22 +208,20 @@ impl EpiGraphMcpFull {
         self.agent_id().await
     }
 
-    /// The agent a write on this request authors and stamps as (batch H-b, D1).
+    /// The agent a write on this request authors and stamps as (batch H-b, D1):
+    /// `epigraph_service::Ctx::write_identity`, whose doc carries the decision,
+    /// answered in this server's error type (backlog 30133ca8 moved it).
     ///
     /// * `Some(auth)` (the HTTP listener): the caller, `auth.agent_id`. A token
     ///   with no agent principal is refused, as `request_viewer` refuses it. So
     ///   is a principal-less caller (`auth::is_principal_less`, the
-    ///   `--allow-unauthenticated-http` context) without a write scope: no human
-    ///   is named there, so there is no author to write as (batch HTTP-id).
+    ///   `--allow-unauthenticated-http` context) without a write scope.
     /// * `None` (stdio, and the operator CLIs that drive the tool functions
     ///   directly): this server's own agent, exactly as before batch H-b.
     ///
-    /// `viewer` is the request's own viewer, and over HTTP it MUST name the same
-    /// principal: `request_viewer` resolved it from the same `auth`, so a
-    /// mismatch means a caller wired a viewer from one principal to a write as
-    /// another. That is refused rather than resolved in either direction, so a
-    /// tool's read and write authority cannot silently name two agents. See
-    /// [`crate::write_identity`] for the decision and the ratchet.
+    /// Over HTTP `viewer` MUST name the same principal as `auth`, or the write
+    /// is refused. See [`crate::write_identity`] for the decision and the
+    /// ratchet.
     ///
     /// # Errors
     ///
@@ -239,59 +233,19 @@ impl EpiGraphMcpFull {
         auth: Option<&epigraph_auth::AuthContext>,
         viewer: &epigraph_db::visibility::Viewer,
     ) -> Result<crate::write_identity::WriteIdentity, McpError> {
-        // An elevated request is read-only (elevation plan §1.4), on every
-        // transport, before anything else: nothing below would see it.
-        crate::write_identity::refuse_elevated(viewer)?;
-        let Some(auth) = auth else {
-            return Ok(crate::write_identity::WriteIdentity::from_resolved(
-                self.agent_id().await?,
-            ));
-        };
-        // Batch HTTP-id: a principal-less caller writes only where the listener
-        // opted in (`--allow-unauthenticated-writes`, which grants the write
-        // scopes); by default its context is read-only and nothing is authored.
-        if crate::auth::is_principal_less(auth) && !auth.has_scope("claims:write") {
-            return Err(crate::write_identity::principal_less_write_refusal());
-        }
-        let principal = auth
-            .agent_id
-            .ok_or_else(crate::write_identity::no_agent_principal_refusal)?;
-        if viewer.principal() != Some(principal) {
-            return Err(crate::write_identity::diverging_principals(
-                principal,
-                viewer.principal(),
-            ));
-        }
-        Ok(crate::write_identity::WriteIdentity::from_resolved(
-            principal,
-        ))
+        self.ctx
+            .write_identity(auth, viewer)
+            .await
+            .map_err(crate::errors::from_service)
     }
 
     /// The ONE way an authenticated caller acts under this server's own
-    /// agent's stamp (batch OA1 on top of batch H-b).
+    /// agent's stamp (batch OA1 on top of batch H-b):
+    /// `epigraph_service::Ctx::admin_borrowed_server_identity`, whose doc
+    /// carries the rule, answered in this server's error type.
     ///
-    /// OA1 lets a `claims:admin` caller supersede or dedup a claim in a group
-    /// it does not write by acting on a transaction stamped from this server's
-    /// agent, as those tools did before OA1 when `claims:admin` was their scope
-    /// (`tools::supersede::begin_claim_act`). No other admission may borrow
-    /// that stamp: it would hand a `claims:write` caller the server agent's
-    /// write authority. Since batch H-b a tool module cannot construct a
-    /// [`crate::write_identity::WriteIdentity`] itself
-    /// (`tests/write_identity_ratchet.rs`), so the check that licenses the
-    /// borrow lives here, beside [`Self::write_identity`], and is re-checked on
-    /// every call rather than trusted from the caller.
-    ///
-    /// The token's `claims:admin` SCOPE is necessary, not sufficient. MCP
-    /// verifies a token's signature and expiry but not its revocation, so the
-    /// token's client record must still grant `claims:admin` to this principal:
-    /// migration 111's `ADM02` predicate, re-read on `conn` (the caller's own
-    /// stamped transaction) through
-    /// `SecurityEventRepository::admin_grant_is_live`, exactly as the audited
-    /// admin paths of `patch_claim` (111) and the workflow step ops do. A
-    /// de-scoped or revoked client's still-unexpired token is refused here at
-    /// once instead of borrowing the server agent's stamp until it expires. The
-    /// only caller is `tools::supersede::begin_claim_act`; the ratchet in
-    /// `tests/write_identity_ratchet.rs` pins that.
+    /// `pub(crate)`, and its only caller is `tools::supersede::begin_claim_act`;
+    /// the ratchet in `tests/write_identity_ratchet.rs` pins that.
     ///
     /// # Errors
     ///
@@ -304,58 +258,27 @@ impl EpiGraphMcpFull {
         auth: &epigraph_auth::AuthContext,
         conn: &mut sqlx::PgConnection,
     ) -> Result<crate::write_identity::WriteIdentity, McpError> {
-        if !auth.has_scope("claims:admin") {
-            return Err(McpError::invalid_request(
-                "only a claims:admin caller may act under this server's own agent's stamp; \
-                 nothing was written"
-                    .to_string(),
-                None,
-            ));
-        }
-        let principal = auth
-            .agent_id
-            .ok_or_else(crate::write_identity::no_agent_principal_refusal)?;
-        let live = epigraph_db::SecurityEventRepository::admin_grant_is_live(
-            &mut *conn,
-            auth.client_id,
-            principal,
-            auth.admin_scopes == epigraph_auth::AdminScopePosture::Armed,
-        )
-        .await
-        .map_err(|e| {
-            crate::errors::internal_error_logged("could not re-check the admin grant", e)
-        })?;
-        if !live {
-            return Err(McpError::invalid_request(
-                format!(
-                    "caller agent {principal} holds claims:admin in its token, but the token's \
-                     client record ({}) grants it no live claims:admin, so it may not act under \
-                     this server's own agent's stamp (ADM02); nothing was written",
-                    auth.client_id
-                ),
-                None,
-            ));
-        }
-        Ok(crate::write_identity::WriteIdentity::from_resolved(
-            self.agent_id().await?,
-        ))
+        self.ctx
+            .admin_borrowed_server_identity(auth, conn)
+            .await
+            .map_err(crate::errors::from_service)
     }
 
     /// The agent whose key SIGNS this server's digests: the server's own agent,
-    /// whatever the author.
+    /// whatever the author (`epigraph_service::Ctx::signer_agent_id`).
     ///
     /// Named apart from [`Self::write_identity`] because the two are different
-    /// facts once an authenticated caller authors a row. `claims.signer_id` and
-    /// `evidence.signer_id` record this agent, and `verify_claim` checks the
-    /// stored signature against its `public_key`, so a row authored by the caller
-    /// and signed by the server verifies instead of reporting a mismatch against
-    /// the author's (often `derived`, keyless) agent.
+    /// facts once an authenticated caller authors a row: `claims.signer_id` and
+    /// `evidence.signer_id` record this agent.
     ///
     /// # Errors
     ///
     /// Propagates whatever [`Self::agent_id`] returns.
     pub async fn signer_agent_id(&self) -> Result<uuid::Uuid, McpError> {
-        self.agent_id().await
+        self.ctx
+            .signer_agent_id()
+            .await
+            .map_err(crate::errors::from_service)
     }
 
     /// The key this server attests the edges it INSERTS with (rulings R-49,
@@ -472,153 +395,18 @@ impl crate::auth::ServerPrincipalSource for EpiGraphMcpFull {
 }
 
 impl EpiGraphMcpFull {
-    /// Ensure agent exists in DB, return cached ID.
+    /// Ensure agent exists in DB, return cached ID:
+    /// `epigraph_service::Ctx::agent_id` (backlog 30133ca8 moved it verbatim,
+    /// with its doc), answered in this server's error type.
     ///
-    /// # Tenancy (PR-09)
-    ///
-    /// This now calls `AgentRepository::ensure_personal_group` on **both**
-    /// branches — the call sits after the if/else, not inside the create arm.
-    /// That is deliberate and it is the only placement that works: an
-    /// already-provisioned server agent (i.e. every existing deployment) takes
-    /// the *found* branch, so a create-only call would leave exactly the
-    /// installations that matter with no personal group.
-    ///
-    /// Without it this path — unlike `epigraph-api`'s `oauth/token.rs`, which has
-    /// called it since PR-02 — left the server's own agent with **no**
-    /// `group_memberships` row, so `Viewer::resolve(server_agent_id)` returned an
-    /// empty group set. Every stdio read and every `--allow-unauthenticated-http`
-    /// read was therefore public-only *by accident*, and PR-09's own acceptance
-    /// criterion ("the stdio read default becomes `Viewer::resolve(pool,
-    /// server_agent_id)`") would have been inert: the viewer would resolve, and
-    /// mean nothing. It is best-effort for the same reason `set_llm_properties`
-    /// below is: a failure here must not break agent resolution.
-    ///
-    /// ## Three properties an operator should know, stated rather than implied
-    ///
-    /// 1. **This is a write on a read path.** Resolving the agent id already
-    ///    inserted into `agents` on first call; it now also writes `groups` and
-    ///    `group_memberships`. `reject_if_read_only` is a per-tool gate, so a
-    ///    `--read-only` server performs these writes on its first tool call.
-    ///    That is pre-existing in kind (the `agents` insert) and widened in
-    ///    degree here.
-    /// 2. **It provisions; it does not restore.** It used to be an authority
-    ///    restoration: migration 077's `epigraph_ensure_personal_group` ended in
-    ///    `ON CONFLICT … DO UPDATE SET revoked_at = NULL, role = 'admin'`, so an
-    ///    operator who revoked this membership saw it revived, at admin, on the
-    ///    next process boot — and, before `SessionFactory`, on every new HTTP
-    ///    session. Since migration 105 a revoked membership makes the call
-    ///    REFUSE (`DbError::MembershipRevoked`), a live one is returned with its
-    ///    role untouched, and only an agent with no row at all is provisioned.
-    ///    The refusal takes arm 3 below: the id still resolves (it is the
-    ///    process's identity, not an authority grant), and the revocation
-    ///    stands.
-    /// 3. **It fails closed.** A failure — the refusal included — warns and
-    ///    leaves the agent with whatever live groups it has, which for a revoked
-    ///    personal membership means no personal group: its writes are refused
-    ///    by the ingest preflight and the author-stamped transaction.
+    /// It calls `AgentRepository::ensure_personal_group` on both branches
+    /// (PR-09), once per PROCESS: the resolved id is cached in the context's
+    /// cell, which every clone of this server shares (`SessionFactory`).
     pub(crate) async fn agent_id(&self) -> Result<uuid::Uuid, McpError> {
-        let mut cached = self.agent_db_id.lock().await;
-        if let Some(id) = *cached {
-            return Ok(id);
-        }
-        // The identity key names the agent; the signer only signs (D2). In the
-        // legacy modes the two are one key.
-        let pub_key = self.identity_key();
-        let agent = if let Some(a) =
-            epigraph_db::AgentRepository::get_by_public_key(&self.pool, &pub_key)
-                .await
-                .map_err(internal_error)?
-        {
-            a
-        } else {
-            let agent = epigraph_core::Agent::new(pub_key, Some("mcp-agent".to_string()));
-            // Backlog 9d4673a0: the server's own signer is never a human, so
-            // it is not left on migration 001's `agent_type` default
-            // ('human'), which lineage-parent (161/166/195) and role-attach
-            // (166 ROL02) gates read as a person. 'llm' when the identity is
-            // derived from an LLM config, else 'software_agent'. Set at
-            // INSERT: the application role cannot UPDATE `agent_type` (118).
-            let agent_type = if self.llm_identity.is_some() {
-                epigraph_db::SignerAgentType::Llm
-            } else {
-                epigraph_db::SignerAgentType::SoftwareAgent
-            };
-            let created =
-                epigraph_db::AgentRepository::create_signer(&self.pool, &agent, agent_type)
-                    .await
-                    .map_err(internal_error)?;
-            // CREATE branch ONLY: record the derived LLM identity on the fresh
-            // row. Best-effort — a failure here must not break agent resolution
-            // or any downstream dispatch (the agent still exists and is usable;
-            // it just lacks the provenance annotation). The FOUND branch above
-            // deliberately does NOT re-set properties: an identical-config
-            // process reuses the SAME pubkey -> same row -> properties already
-            // set by whoever created it first.
-            if let Some((model, prompt_hash)) = &self.llm_identity {
-                if let Err(e) = epigraph_db::AgentRepository::set_llm_properties(
-                    &self.pool,
-                    created.id.as_uuid(),
-                    model,
-                    prompt_hash,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        agent_id = %created.id.as_uuid(),
-                        error = ?e,
-                        "failed to record LLM identity on newly-created agent; \
-                         continuing without provenance annotation"
-                    );
-                }
-            }
-            created
-        };
-        let id = agent.id.as_uuid();
-
-        // PR-09: the server agent needs a personal group, or the viewer it
-        // resolves to has an empty group set and reads public rows only. See
-        // the doc comment above. Migration 105's contract: a LIVE membership
-        // reads and writes nothing (role kept); a REVOKED one is refused with
-        // `DbError::MembershipRevoked` (RVK01) and a group squatting the
-        // agent's did_key with `PersonalGroupNotOwned` (RVK02), each logged
-        // below as a warning, never restored; only an agent with no row of
-        // any state is provisioned. It runs once per PROCESS: every session
-        // shares this cell (`SessionFactory`), and later calls are served
-        // from `cached`.
-        match self.pool.acquire().await {
-            Ok(mut conn) => {
-                match epigraph_db::AgentRepository::ensure_personal_group(&mut conn, id).await {
-                    Ok(_) => {}
-                    // Migration 122 (armed): a LIVE-LINKED agent writes into its
-                    // operator's group, and a writer/admin row in its own
-                    // personal group is in a group its operator does not
-                    // write, so the membership door refuses it. Expected on
-                    // every boot of a correctly linked fleet agent, so neither
-                    // a warning nor an OPL02 line in the log (review C5).
-                    Err(epigraph_db::DbError::OperatorScopeRefused { .. }) => tracing::info!(
-                        agent_id = %id,
-                        "the server agent is live-linked and writes into its operator's group; \
-                         its own personal group is not provisioned"
-                    ),
-                    Err(e) => tracing::warn!(
-                        agent_id = %id,
-                        error = %e,
-                        "did not provision the server agent's personal group (a revoked \
-                         membership is refused, never restored); its viewer resolves to its \
-                         remaining live groups only"
-                    ),
-                }
-            }
-            Err(e) => tracing::warn!(
-                agent_id = %id,
-                error = ?e,
-                "could not acquire a connection to ensure the server agent's personal group"
-            ),
-        }
-
-        *cached = Some(id);
-        drop(cached);
-        Ok(id)
+        self.ctx
+            .agent_id()
+            .await
+            .map_err(crate::errors::from_service)
     }
 
     /// Emit a durable `tool.invoked` event for an MCP dispatch, attributed to
@@ -1300,17 +1088,10 @@ impl EpiGraphMcpFull {
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            pool,
-            scoped: None,
-            privileged_pool: None,
-            background: crate::background::BackgroundTasks::default(),
-            signer: Arc::new(signer),
-            identity_public_key: None,
-            agent_db_id: Arc::new(Mutex::new(None)),
+            ctx: epigraph_service::Ctx::new(pool, Arc::new(signer), llm_identity),
             embedder: Arc::new(embedder),
             read_only,
             federation,
-            llm_identity,
             signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashMap::new())),
             auth_lineage_ttl: DEFAULT_AUTH_LINEAGE_TTL,
@@ -1349,7 +1130,7 @@ impl EpiGraphMcpFull {
     /// ```
     #[must_use]
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
-        self.scoped = Some(scoped);
+        self.ctx = self.ctx.with_scoped_pool(scoped);
         self
     }
 
@@ -1421,7 +1202,7 @@ impl EpiGraphMcpFull {
     /// still requires [`Self::with_scoped_pool`] and fails closed without it.
     #[must_use]
     pub fn on_a_privileged_pool(mut self, reason: &'static str) -> Self {
-        self.privileged_pool = Some(reason);
+        self.ctx = self.ctx.on_a_privileged_pool(reason);
         self
     }
 
@@ -1462,17 +1243,10 @@ impl EpiGraphMcpFull {
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            pool,
-            scoped: None,
-            privileged_pool: None,
-            background: crate::background::BackgroundTasks::default(),
-            signer,
-            identity_public_key: None,
-            agent_db_id: Arc::new(Mutex::new(None)),
+            ctx: epigraph_service::Ctx::new(pool, signer, llm_identity),
             embedder,
             read_only,
             federation,
-            llm_identity,
             signer_identity_declared: true,
             seen_auth_lineage: Arc::new(Mutex::new(HashMap::new())),
             auth_lineage_ttl: DEFAULT_AUTH_LINEAGE_TTL,
@@ -1521,7 +1295,7 @@ impl EpiGraphMcpFull {
     /// [`SessionFactory`] are clones of the template, so they carry it.
     #[must_use]
     pub fn with_identity_public_key(mut self, key: [u8; 32]) -> Self {
-        self.identity_public_key = Some(key);
+        self.ctx = self.ctx.with_identity_public_key(key);
         self
     }
 
@@ -1529,8 +1303,7 @@ impl EpiGraphMcpFull {
     /// key, else the signer's own.
     #[must_use]
     pub fn identity_key(&self) -> [u8; 32] {
-        self.identity_public_key
-            .unwrap_or_else(|| self.signer.public_key())
+        self.ctx.identity_key()
     }
 
     /// Inject a deployment's own write-authorization gate (builder pattern).
@@ -3994,7 +3767,7 @@ mod session_factory_tests {
         let sessions = SessionFactory::new(unreachable_template());
         let (a, b) = (sessions.session(), sessions.session());
         assert!(
-            Arc::ptr_eq(&a.agent_db_id, &b.agent_db_id),
+            a.ctx.shares_agent_cell_with(&b.ctx),
             "every session must share the template's agent_db_id cell"
         );
         assert!(
@@ -4137,7 +3910,11 @@ mod session_factory_tests {
     async fn a_new_session_answers_from_the_resolved_cell_without_the_database() {
         let sessions = SessionFactory::new(unreachable_template());
         let resolved = uuid::Uuid::new_v4();
-        *sessions.session().agent_db_id.lock().await = Some(resolved);
+        sessions
+            .session()
+            .ctx
+            .seed_agent_id_for_tests(resolved)
+            .await;
 
         let fresh = sessions.session();
         let got = fresh

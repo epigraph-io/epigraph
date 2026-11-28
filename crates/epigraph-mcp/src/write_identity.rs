@@ -58,7 +58,10 @@
 //! # The ratchet
 //!
 //! [`WriteIdentity`] has a private field and one constructor,
-//! [`crate::server::EpiGraphMcpFull::write_identity`]. Every author-stamped
+//! [`crate::server::EpiGraphMcpFull::write_identity`] (since backlog 30133ca8
+//! it delegates to `epigraph_service::Ctx::write_identity`, and the type and its
+//! `from_resolved` constructor live in `epigraph_service::write_identity`, where
+//! the constructor is private to that crate). Every author-stamped
 //! transaction ([`crate::claim_helper::begin_author_stamped_tx`]) takes one, so
 //! the compiler enumerates every write site: a tool cannot stamp from an agent it
 //! chose itself. `tests/write_identity_ratchet.rs` pins the other halves — that
@@ -78,94 +81,19 @@
 //! signer's key, so a claim authored by a caller and signed by the server
 //! verifies. See [`crate::server::EpiGraphMcpFull::signer_agent_id`].
 
-use uuid::Uuid;
+pub use epigraph_service::write_identity::WriteIdentity;
 
-use crate::errors::McpError;
-
-/// The agent an MCP write authors its rows as and stamps its transaction from.
-///
-/// Constructed only by [`crate::server::EpiGraphMcpFull::write_identity`]; see
-/// the module doc.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteIdentity {
-    agent_id: Uuid,
-}
-
-impl WriteIdentity {
-    /// The author's `agents.id`.
-    #[must_use]
-    pub const fn agent_id(self) -> Uuid {
-        self.agent_id
-    }
-
-    /// Crate-private: the only constructor outside tests is
-    /// `EpiGraphMcpFull::write_identity`.
-    pub(crate) const fn from_resolved(agent_id: Uuid) -> Self {
-        Self { agent_id }
-    }
-}
-
-/// A token that carries no `agents.id` has no author, as it has no reader
-/// (`tools::viewer::request_viewer` refuses it the same way).
-pub(crate) fn no_agent_principal_refusal() -> McpError {
-    McpError::invalid_request(
-        "token carries no agent principal, so this write has no author (see plan D3). \
-         Re-mint the token through /oauth/token, which attaches an agents.id to every \
-         principal. Nothing was written."
-            .to_string(),
-        None,
-    )
-}
-
-/// A principal-less caller (the `--allow-unauthenticated-http` listener's
-/// injected context, `auth::is_principal_less`) without a write scope has no
-/// author that belongs to a human, so it writes nothing (batch HTTP-id; see
-/// `auth::UnauthenticatedWrites`). The per-tool scope gate refuses the same
-/// calls first; this is a second layer for the AUTHOR-STAMPED writes only,
-/// keyed on the resolver every author-stamped transaction goes through. A
-/// write tool that never calls `write_identity` is covered by the scope gate
-/// alone (see `auth::UnauthenticatedWrites`).
-pub(crate) fn principal_less_write_refusal() -> McpError {
-    McpError::invalid_request(
-        "this listener serves callers with no authenticated principal, and such a caller \
-         cannot write: an HTTP write is authored by the calling human's agent, and no human \
-         is named here. Call this tool through an authenticated (OAuth bearer) listener, \
-         where the write is authored as your own agent. Nothing was written."
-            .to_string(),
-        None,
-    )
-}
+use crate::errors::{from_service, McpError};
 
 /// An ELEVATED request asked to write (elevation plan §1.4: the elevated
-/// viewer is read-only). The same `ELEVATED READ-ONLY` refusal
-/// `ScopedPool::begin_as` gives, raised HERE because the MCP write path never
-/// meets `begin_as` with the request's viewer: an author-stamped transaction is
-/// stamped from a freshly resolved SCOPED viewer of the author
-/// (`claim_helper::author_write_authority`), and a detached ingest carries the
-/// request's viewer only after `detach_scoped` has downgraded it, so neither
-/// that refusal nor migration 126's restrictive policies (keyed on the
-/// elevation settings that scoped stamp leaves empty) would ever see the
-/// elevation.
+/// viewer is read-only): `epigraph_service::write_identity::refuse_elevated`,
+/// answered as this server answers a repository refusal
+/// ([`crate::errors::db_caller_error`]'s `INVALID_REQUEST`). The resolver
+/// raises it before anything else; `server.rs`'s dispatch check
+/// (`refuse_elevated_write`) raises it for a federated write too.
 ///
 /// # Errors
 /// The refusal, when `viewer` is elevated.
 pub(crate) fn refuse_elevated(viewer: &epigraph_db::visibility::Viewer) -> Result<(), McpError> {
-    if viewer.is_elevated() {
-        Err(crate::errors::db_caller_error(
-            epigraph_db::DbError::ElevatedReadOnly,
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// The request's viewer and its token name different principals.
-pub(crate) fn diverging_principals(token: Uuid, viewer: Option<Uuid>) -> McpError {
-    McpError::internal_error(
-        format!(
-            "refusing a write whose read and write principals diverge: the token names agent \
-             {token}, the request viewer names {viewer:?}. Nothing was written."
-        ),
-        None,
-    )
+    epigraph_service::write_identity::refuse_elevated(viewer).map_err(from_service)
 }

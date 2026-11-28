@@ -19,6 +19,10 @@
 //! rather than a `JoinSet`: the tasks are spawned from `&self` tool handlers on
 //! clones of the server, and nothing needs their results, only to know when
 //! there are none left.
+//!
+//! It moved here from the MCP crate with the service context (backlog
+//! 30133ca8): [`crate::ctx::Ctx`] carries the set, and the MCP crate
+//! re-exports this module under its old path (`background`).
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,7 +104,8 @@ impl BackgroundTasks {
 /// keeps the default; `0` waits not at all (the behaviour before the wait
 /// existed). Read by the stdio entry point after its client disconnects, by
 /// the HTTP listener after SIGTERM / SIGINT (where it bounds the whole stop,
-/// open requests included, from the signal: `crate::serve_with_listener_until`),
+/// open requests included, from the signal: the MCP crate's
+/// `serve_with_listener_until`),
 /// and by the operator `ingest-document` CLI after its walk returns with the
 /// embedding loop still running. The name predates the HTTP use and is kept
 /// so existing deployments keep their setting.
