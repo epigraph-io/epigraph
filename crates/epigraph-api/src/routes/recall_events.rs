@@ -14,8 +14,11 @@
 //!    admits only rows whose `agent_id` is the session principal. The viewer
 //!    is always the plain scoped one ([`UnelevatedViewer`]): elevation could
 //!    only add 126's read arm, which admits OTHER agents' rows this route
-//!    never serves, so an elevated token gains nothing here and its read is
-//!    not an elevated access.
+//!    never serves, so an elevated token reads exactly what its plain token
+//!    reads. The request is still recorded as an elevated access: the
+//!    per-access layer (`middleware::elevated_access`) resolves the token's
+//!    elevation claim for every route outside its `UNELEVATED_ROUTES`,
+//!    whichever viewer the handler reads on.
 //! 2. [`RecallEventRepository::list_own`] filters `agent_id = <the viewer's
 //!    principal>` itself, so a connection on which the row policy admits more
 //!    (a bypass connection, or a legacy `'public'`-stamped row read there)
