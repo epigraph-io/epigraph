@@ -357,6 +357,12 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   `EPIGRAPH_TRUSTED_PROXIES` does not name it), well above
   `EPIGRAPH_RATE_LIMIT_RPM`. The boot log says `per-address rate limiter ON`
   or `OFF`.
+- **The production posture** (backlog `67b1ab86`, provisional ruling
+  `6bd77743`), a policy: production is to set `EPIGRAPH_RATE_LIMIT_RPM` and
+  `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` from its measured peak request rates with
+  about 3x headroom, and to leave `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` unset (no
+  instance-wide ceiling). Revisit a global ceiling only if load data justifies
+  it. The values are a deployment's own and are not recorded here.
 - **A handler that panics** is answered `500` with the body `Service
   panicked` and the request's `x-request-id`; the panic message is logged at
   ERROR (`Service panicked: ...`) in the request's span and never sent to the
@@ -588,7 +594,7 @@ For the others, anything else is off.
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
 | `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
 | `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
-| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. Production is to leave it unset (Step 8, "The production posture"). |
 | `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` | unset (no per-address limit) | Requests a minute per client address, counted before authentication and routing, so 401s and unknown-path 404s are limited too (Step 8, "Per-address rate limiting"). Independent of `EPIGRAPH_RATE_LIMIT_RPM`; `EPIGRAPH_RATE_LIMIT=off` turns it off. Not a positive whole number → exit 1. |
 | `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. It does not turn rate limiting on. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
@@ -616,7 +622,7 @@ For the others, anything else is off.
 | `EPIGRAPH_GUEST_READS` | `off` | `on` serves every `visibility = 'public'` claim, edge and theme count to signed-out callers under `GET /api/v1/guest/*` (`docs/tenancy.md`); off, each answers 404. Any other value stays off and is warned about. With no rate limit configured, the guest routes are limited at 600 a minute per client address (Step 8, "Rate limiting"). |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
 | `OPENAI_API_KEY`, `JINA_API_KEY`, `EMBEDDING_DIMENSION` | unset, unset, `1536` | The embedding provider. OpenAI first; then Jina, which works only in a build with the `jina` feature; otherwise a mock provider for development (`Embedding service: Mock (development only)`). |
-| `CALIBRATION_PATH` | the `calibration.toml` compiled into the binary | An override file. One that does not load is logged as an error, and the compiled-in calibration is served instead. Changes need a restart. |
+| `CALIBRATION_PATH` | the `calibration.toml` compiled into the binary | An override file. One that does not load is logged as an error, and the compiled-in calibration is served instead. Changes need a restart, and a changed calibration needs a belief recompute after the rollout ([section 11](#every-upgrade-a-calibration-change-needs-a-belief-recompute)). |
 | `EPIGRAPH_ATOM_FOLD` (`legacy`\|`aef_standalone`\|`aef`), `EPIGRAPH_COMPOUND_BELIEF` (`legacy`\|`shadow`\|`progressive`\|`strict`), `EPIGRAPH_COMPOUND_WRITE_GUARD` (`warn`\|`refuse`), `EPIGRAPH_COMPOUND_SOURCE_EDGES` (`frozen`\|`excluded`), `EPIGRAPH_ATOM_CACHE_MODE` (`display`\|`pure`), `EPIGRAPH_INFERENCE` (`off`\|`shadow`\|`on`) | the first value listed for each | The belief modes. Logged at boot (`belief modes read at startup`) and reported in `/health`. An unrecognised value runs the default and logs `belief-mode flag ignored`. `EPIGRAPH_COMPOUND_WRITE_GUARD` governs the textless BBA writers (MCP `submit_ds_evidence`, `POST /api/v1/frames/:id/evidence`, `POST /api/v1/claims/:id/assess`) on a compound target: `warn` accepts the write (never folded into the compound's cached belief), answers `deprecated_compound_target` and logs a WARN under target `epigraph::compound_write_guard` (writer, claim id, caller) once the write commits, so a request that fails later adds no line; `refuse` refuses it (422 / `invalid_params`, `compound_target`) before anything is written. Read that log before flipping to `refuse`. |
 | `RUST_LOG` | `info,epigraph_api=debug` | Log filter. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | In an `otel` build, only logged: the OTLP exporter is not initialised by this binary. |
@@ -2857,6 +2863,18 @@ agent process a different, active `signing` key of that agent:
 stdio only. `epigraph-mcp-full` refuses to serve unless the signing key is an
 ACTIVE `signing` key of the agent the identity key names.
 
+**What an agent's signature certifies** (backlog `a8c6a943`, provisional
+ruling `d29f2f75`): a declared configuration, not a computation. Where the
+agent signed a claim, the signature binds the claim to the agent's key, and
+`authored_by.prompt_snapshot` names the model and prompt hash the agent was
+running at the claim's `created_at` (the snapshot the host attestor recorded,
+joined at read time; not a signed field of the claim). Neither commits to
+which recalled claims fed the output. `recall_events` records retrieval
+separately; it is not signed, not linked to the claims the agent then filed,
+and pruned after `RECALL_EVENTS_RETENTION_DAYS`. A signed context manifest, a
+separate row linked to the claim, is the planned extension once
+`recall_events` tenancy is decided.
+
 **Role-attached agents (migration 166).** An agent attached to a role runs
 only while a human holds the role. An application write whose acting agent
 has a live attachment is refused `ROL01` unless, for every live attachment,
@@ -3296,11 +3314,18 @@ both must be active `team` or `community` groups (see **Who** above).
    the dry run's `ELIGIBLE-WORKFLOW-ROWS` (generations, not lineages).
 1. Before the move, add the reader principal's agent to the target group
    (`epigraph-operator group-member add --group <target> --agent <reader agent>
-   --role <role per operator ruling> --reason "<why>" --apply`). The role is
-   the operator's ruling, not this runbook's: the target group's membership
-   policy may admit new members as writers only, and an operated agent is a
-   member only where its operator writes. Check the non-member principal is not in the
-   target (`epigraph-operator group-roster --group <target>`). If the client
+   --role reader --reason "<why>" --apply`). The plan reader needs read only;
+   a writer membership would let it ingest workflows into the group (backlog
+   `b15754b0`, ruling `63b0da6e`). Give it this direct `reader` row, not a
+   writer row and not a group-role binding. `group-member add` is the
+   operator's own audited membership verb on the maintenance session, so it
+   writes the `reader` row even where the group's members otherwise join as
+   writers; do not grant writer to fit that. An operated agent is still a
+   member only where its operator writes (`GRP03`). The verb serves a keyless
+   `team` target only, as here, and refuses every other kind (`GRP05`); for a
+   `community` target, stop and get the operator's ruling on how the reader
+   joins. Check the non-member principal is not in the target
+   (`epigraph-operator group-roster --group <target>`). If the client
    publishes new generations, its publishing agent needs a writer membership
    of the target too.
 2. Dry run the move (`--from-group <source> --target-group <target>
@@ -5018,6 +5043,66 @@ Undo: re-run 011's `edge_to_factor_type` body and 090's index statement.
 Both files are unchanged and re-runnable. A factor backfill for `corroborates`
 / `refutes` edges that have no factors row is a separate decision, not part
 of 175.
+
+### Every upgrade: a calibration change needs a belief recompute
+
+The cached DS beliefs on `claims` are folded under the served belief profile,
+which is built from the calibration (`epigraph-engine`'s `belief_profile.rs`).
+Nothing recomputes them when the calibration changes, so they stay on the old
+profile until recomputed (backlog `4d14e902`, ruling `a2162099`). On every
+upgrade:
+
+1. **Diff the calibration the new release serves against the deployed one.**
+   With `CALIBRATION_PATH` set, diff the file the new units will read against
+   the one the running units read. With it unset, the binaries serve the
+   `calibration.toml` compiled into them:
+   `git diff <deployed commit> <new commit> -- calibration.toml`. No change:
+   skip this section.
+2. **Roll the release out.** A process reads the calibration once, at its
+   first use, so the API, the MCP servers and every job or timer binary that
+   writes beliefs must restart on the new one, with the same
+   `CALIBRATION_PATH`.
+3. **Confirm the maintenance session serves the API's calibration.** Each
+   recompute run loads the calibration itself, and nothing checks that it is
+   the API's: the writing runs compare only the belief modes with the API's
+   `/health`, and no calibration identity is served. So, before any writing
+   run, check by hand that the session runs the binaries of the commit the API
+   runs, that its `CALIBRATION_PATH` is the API unit's value (or unset in
+   both), and that the file's checksum (`sha256sum`) equals the one the API
+   reads. A file that does not load is logged (`CALIBRATION_PATH could not be
+   loaded; serving the calibration compiled into this binary`) and the run
+   goes on under the compiled-in calibration: if a run logs that line, stop it
+   and undo what it wrote with `restore_belief_cache --from <its wave file>`.
+4. **Then recompute the cohort on the maintenance session**, from the NEW
+   build and with the API's belief modes:
+   * Under `EPIGRAPH_ATOM_FOLD=legacy` (the default): `recompute_claim_belief`
+     over every current claim with a cached belief
+     (`SELECT id FROM claims WHERE is_current AND pignistic_prob IS NOT NULL`
+     on the maintenance DSN), each run with its own `--snapshot <wave file>`
+     and the disk gate ([section 5](#pool-sizing-and-the-recompute-binaries)).
+     It is not a calibration-only refold: it recomputes each claim from its
+     owner frame (the binary's "Frame handling"), so it can also re-point a
+     claim's `belief_frame_id` and pick up drift unrelated to the calibration.
+     Its `--dry-run` only counts the ids, so run a small sample first and
+     read its wave file (`before` and `written`, `belief_frame_id` included)
+     before running the rest. A bad run is undone with
+     `restore_belief_cache --from <wave file>`.
+   * Under an atom fold: `recompute_betp` waves, `--role standalone`, then
+     `--role leaf` under `aef`. Take the baseline S0 first, before any wave
+     writes (`belief_snapshot --out <S0 file>`; it never overwrites a file).
+     Review each wave with `recompute_betp --dry-run --role <role> --s0 <S0
+     file>`, then write it with `--snapshot <wave file> --wave <name>
+     --disk-path <path> (--disk-check-cmd <cmd> | --no-backup-check)`, one
+     wave file per wave.
+
+The recompute refolds the stored rows. It does not rewrite rows built from
+the profile's write-time constants (the edge-factor parameters and the DS
+write path's bounds; `belief_profile.rs`, "Where it applies"), which keep the
+profile they were written under.
+
+A frame or perspective override is not covered here: under the same ruling
+the override writer (backlog `8773a687`, not built yet) must schedule the
+affected frame's recompute in the same act, or refuse the write.
 
 ## 12. Undo scripts and rollback order
 

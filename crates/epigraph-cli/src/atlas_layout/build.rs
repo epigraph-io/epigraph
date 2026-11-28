@@ -320,6 +320,60 @@ mod tests {
         assert_eq!(a.build.themes.len(), 12);
     }
 
+    /// Region and theme positions only: no links, no ids drawn at random.
+    fn positions(b: &LayoutBuild) -> String {
+        let regions: Vec<_> = b
+            .regions
+            .iter()
+            .map(|r| (r.ordinal, r.x.to_bits(), r.y.to_bits(), r.r.to_bits()))
+            .collect();
+        let themes: Vec<_> = b
+            .themes
+            .iter()
+            .map(|t| (t.theme_id, t.rank_in_region, t.x.to_bits(), t.y.to_bits()))
+            .collect();
+        format!("{regions:?}{themes:?}")
+    }
+
+    /// Backlog 6285e0cf: `cites` stays in the shared theme layout's links
+    /// (counted, as `ATLAS_DEFAULT_RELATIONSHIPS` does) at weight 0: it
+    /// moves no region and no theme. `build_layout` places regions and themes
+    /// before it reads the links, so no relationship moves a position here;
+    /// this pins that `cites` stays counted while moving nothing. The nested
+    /// maps' group and leaf force layouts do pull on `cites` (design spec
+    /// 2026-11-04, section 10, question 5).
+    #[test]
+    fn a_cites_link_is_kept_in_the_links_and_moves_no_position() {
+        let without = build_layout(&inputs(), &BuildOptions::default()).unwrap();
+        let mut inp = inputs();
+        inp.links.push(PublicThemeLinkCount {
+            theme_a: Uuid::from_u128(4),
+            theme_b: Uuid::from_u128(3),
+            relationship: "cites".into(),
+            link_count: 40,
+        });
+        let with = build_layout(&inp, &BuildOptions::default()).unwrap();
+
+        assert_eq!(positions(&with.build), positions(&without.build));
+
+        let cites: Vec<&LayoutLinkOut> = with
+            .build
+            .theme_links
+            .iter()
+            .filter(|l| l.relationship == "cites")
+            .collect();
+        assert_eq!(cites.len(), 1, "{:?}", with.build.theme_links);
+        assert_eq!(
+            (cites[0].theme_a, cites[0].theme_b, cites[0].link_count),
+            (Uuid::from_u128(3), Uuid::from_u128(4), 40)
+        );
+        assert_eq!(with.report["links"]["cites"], 40);
+        assert_eq!(
+            with.build.public_link_count,
+            without.build.public_link_count + 40
+        );
+    }
+
     #[test]
     fn ranks_are_dense_per_region() {
         let built = build_layout(&inputs(), &BuildOptions::default())
