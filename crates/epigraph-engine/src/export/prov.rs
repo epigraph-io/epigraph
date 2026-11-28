@@ -193,7 +193,7 @@ fn clip_content(content: String, max: Option<usize>) -> (String, Option<usize>) 
 ///
 /// # A claim the viewer cannot read is absent everywhere
 ///
-/// A claim id is emitted only once [`ClaimRepository::get_by_ids_with_labels`]
+/// A claim id is emitted only once [`ClaimRepository::get_by_ids_with_labels`](epigraph_db::ClaimRepository::get_by_ids_with_labels)
 /// has returned it for `viewer`: as an entity, an attribution, or an endpoint
 /// of a relation. A `supersedes` edge the viewer can see may still point at a
 /// claim it cannot (an edge is visible on its own row, not its endpoints'),

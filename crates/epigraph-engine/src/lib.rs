@@ -1,20 +1,51 @@
 //! Epistemic Engine for `EpiGraph`
 //!
-//! This crate implements the core epistemic algorithms:
-//! - **Evidence Weighting**: Calculate how much a piece of evidence supports a claim
-//! - **Bayesian Truth Update**: Update claim truth values based on new evidence
-//! - **DAG Validation**: Ensure the reasoning graph has no cycles
-//! - **Reputation Calculation**: Compute agent reputation from track record
+//! This crate computes what the graph believes about each claim and keeps
+//! that belief consistent as evidence, edges and claims change. What the
+//! served paths run:
+//!
+//! - **The DS fold.** A claim's belief is a Dempster-Shafer fold of its
+//!   stored BBAs (mass functions). [`bba`] builds a BBA from a piece of
+//!   evidence, with the calibrated constants of [`calibration`].
+//!   [`edge_factor::recompute_claim_cached_belief`] refreshes a claim's
+//!   cache: it discounts each stored BBA by its source strength, combines
+//!   them (BBAs from one source, or from agents acting for one human, are
+//!   reduced first: [`source_dependence`]), classifies the result
+//!   ([`classifier`]) and writes Bel, Pl and BetP to the claim row.
+//!   [`scoped_belief`] keeps the per-perspective and per-community folds.
+//! - **The belief profile and modes.** [`belief_profile`] holds every
+//!   parameter of the fold (evidence-type weights, locality factors, tier
+//!   tables, thresholds) in one hashed object. [`belief_modes`] reads the
+//!   belief rollout flags once at startup and is the one place they are
+//!   parsed.
+//! - **Edge factors** ([`edge_factor`]). An epistemic edge `A -[rel]-> B` is
+//!   a factor on `B`: `A`'s interval, restricted by the relationship's
+//!   transmission factor, is stored as a BBA in the edge's slot and folded
+//!   with `B`'s other evidence.
+//! - **Cascades.** A supersede, a duplicate mark, a consolidation or a
+//!   match-candidate retirement repairs the beliefs downstream of it.
+//!   [`retraction_cascade`] re-points or retracts the affected edges,
+//!   invalidates the BBAs they froze onto other claims and refolds those
+//!   claims; [`admin_cascade`] runs that cascade as an audited
+//!   administrative act. [`bba_retract`] refolds a claim after one of its
+//!   BBAs is retracted or restored.
 //! - **Cross-source matching** ([`matching`]): blocker → scorer → verifier
 //!   → policy pipeline that emits `CORROBORATES` edges between same-claim
 //!   pairs across sources. See
 //!   `docs/superpowers/specs/2026-05-21-cross-source-matching-design.md`.
 //!
+//! Beside these, [`cdst_sheaf`] measures how inconsistent the graph's
+//! beliefs are (sheaf cohomology over the CDST intervals) and
+//! [`reconciliation`] runs interval belief propagation over the clusters of
+//! inconsistent edges. [`bayesian`] is deprecated in favour of the DS fold,
+//! though some API routes still reach it.
+//!
 //! # Core Principle
 //!
 //! Truth values are **derived from evidence**, not from agent reputation.
-//! A high-reputation agent making an unsupported claim gets low truth value.
-//! This prevents the "Appeal to Authority" fallacy.
+//! [`reputation`] computes an agent's reputation FROM the outcomes of its
+//! claims, and the fold never reads it. This prevents the "Appeal to
+//! Authority" fallacy.
 //!
 //! # Atom-level belief (rolling out)
 //!
@@ -145,10 +176,7 @@ pub use reasoning::{
     ReasoningResult, ReasoningStats, SupportCluster, TransitiveSupport,
 };
 pub use recall::{recall, recall_routed, RecallError, RecallResult, RecallRoute};
-pub use reconciliation::{
-    cluster_obstructions, extract_cospan, reconcile, ClusterSummary, ReconciliationConfig,
-    ReconciliationResult,
-};
+pub use reconciliation::{reconcile, ClusterSummary, ReconciliationConfig, ReconciliationResult};
 pub use reputation::ReputationCalculator;
 pub use rerank::{
     apply_groundedness, build_groundedness_prompt, build_rerank_client_from_env,
@@ -157,7 +185,7 @@ pub use rerank::{
     RerankError, RerankProviderConfig, RerankScore, RerankedHit,
 };
 pub use sheaf::{
-    compute_cohomology, compute_edge_inconsistency, compute_expected_betp, compute_section,
-    restriction_kind, RestrictionKind, SheafCohomology, SheafObstruction, SheafSection,
+    compute_edge_inconsistency, compute_expected_betp, compute_section, restriction_kind,
+    RestrictionKind, SheafCohomology, SheafObstruction, SheafSection,
 };
 pub use voi::{compute_voi, Neighbor, VoiResult};

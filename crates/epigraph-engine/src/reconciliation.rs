@@ -133,7 +133,7 @@ impl UnionFind {
     }
 }
 
-// ── Public API ─────────────────────────────────────────────────────────────
+// ── Clustering, cospan extraction and the orchestrator ───────────────────
 
 /// Cluster a slice of obstructions by connected node components.
 ///
@@ -143,7 +143,7 @@ impl UnionFind {
 ///
 /// Empty input returns an empty `Vec`.
 #[must_use]
-pub fn cluster_obstructions(
+pub(crate) fn cluster_obstructions(
     obstructions: &[CdstSheafObstruction],
 ) -> Vec<Vec<&CdstSheafObstruction>> {
     if obstructions.is_empty() {
@@ -189,7 +189,7 @@ pub fn cluster_obstructions(
 /// interior node.  Nodes absent from `all_intervals` receive
 /// [`EpistemicInterval::VACUOUS`].
 #[must_use]
-pub fn extract_cospan(
+pub(crate) fn extract_cospan(
     cluster: &[&CdstSheafObstruction],
     all_intervals: &HashMap<Uuid, EpistemicInterval>,
 ) -> CdstDecoratedCospan {
