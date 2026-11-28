@@ -2073,7 +2073,17 @@ pub struct VerifyResponse {
 #[derive(Debug, Serialize)]
 pub struct UpdateResponse {
     pub claim_id: String,
+    /// The claim's `truth_value` before this call. It can differ from the
+    /// cached belief the update folds against; see [`Self::pignistic_before`].
     pub truth_before: f64,
+    /// The claim's cached `pignistic_prob` before this call, `null` when it
+    /// had none (backlog b191f198). This, not `truth_before`, is the prior the
+    /// monotonicity clamp and the direction warnings compare `pignistic_prob`
+    /// against (with `truth_before` standing in when it is `null`), so
+    /// `pignistic_before -> pignistic_prob` is the movement this call made to
+    /// the cached belief. `truth_before -> truth_after` can show a different
+    /// movement when the `truth_value` and the cache had diverged.
+    pub pignistic_before: Option<f64>,
     /// The claim's `truth_value` after this call. Equal to `truth_before` when
     /// [`Self::truth_written`] is `false`.
     pub truth_after: f64,
@@ -2179,7 +2189,10 @@ pub struct UpdateResponse {
     /// (the claim's prior sits above the plausibility its stored BBAs allow, so
     /// the monotonicity clamp yields to that bound; this is mathematically
     /// correct Dempster-Shafer combination, and the warning exists so callers
-    /// don't mistake it for a bug), when [`Self::cache_written`] is `false`,
+    /// don't mistake it for a bug), when refuting evidence left it ABOVE the
+    /// pre-call prior ([`Self::pignistic_before`], else `truth_before`: the
+    /// prior was below the fold of the claim's stored BBAs, which this call
+    /// re-folded; backlog b191f198), when [`Self::cache_written`] is `false`,
     /// and for each of [`Self::fold_pignistic_prob`],
     /// [`Self::cache_repointed_from`] and [`Self::cache_owner_frame_id`] that
     /// is present. Several notes are joined by a space.

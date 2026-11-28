@@ -2114,6 +2114,23 @@ pub async fn update_with_evidence(
                 .to_string(),
         );
     }
+    // The refuting counterpart (backlog b191f198). A refute is not clamped
+    // (that would write a value no fold of the BBAs gives), so its result can
+    // land ABOVE the prior: the fold re-reads every stored two-hypothesis BBA,
+    // and a prior below their fold (a stale cache, or one carried from a
+    // frame this fold does not read) is replaced by it. Without this note a
+    // refute read as raising belief, with no word on why.
+    if !params.supports && ds.pignistic_prob > pre_belief {
+        warnings.push(format!(
+            "Refuting evidence left belief above the claim's pre-call belief: pignistic_prob \
+             is {} after this call, above {pre_belief} before it (pignistic_before, or \
+             truth_before when the claim had no cached belief). This call re-folded every \
+             stored two-hypothesis BBA of the claim, and the pre-call value was below the \
+             fold of the BBAs already stored (a stale cache, or one carried from another \
+             frame). The refute's own BBA is mass_function_id.",
+            ds.pignistic_prob
+        ));
+    }
     // Migration 114: a non-owner refreshes a claim's cached belief only on the
     // frame the cache already carries, and seeds one only on `binary_truth`
     // when the claim has no cache at all. When that refused the write, the
@@ -2181,6 +2198,7 @@ pub async fn update_with_evidence(
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
+        pignistic_before: pre_pignistic,
         truth_after: after_truth.value(),
         truth_written: !foreign_claim,
         evidence_owner: if foreign_claim {
