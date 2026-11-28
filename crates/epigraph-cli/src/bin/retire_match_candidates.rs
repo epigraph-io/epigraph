@@ -29,8 +29,8 @@
 //! edge retracted, or a derived factor or bp_message deleted) are re-derived
 //! from the `mass_functions` that survive
 //! (`epigraph_engine::retraction_cascade::cascade_after_edge_withdrawal`:
-//! recomputed on `binary_truth`, or the cache cleared when no BBA on any frame
-//! backs the claim), the same re-derivation the online retirement
+//! recomputed on `binary_truth`, or the cache vacated to the explicit vacuous
+//! value when no BBA on any frame backs the claim), the same re-derivation the online retirement
 //! (`epigraph_engine::admin_cascade::apply_match_retire`) runs. A pair that
 //! withdrew nothing (a pending or already-retired candidate in a mixed batch)
 //! fed no cache and is left alone, as the online path's per-candidate guard
@@ -394,7 +394,7 @@ async fn main() -> anyhow::Result<()> {
         "  recomputed:                   {}",
         report.recomputed.len()
     );
-    println!("  cache cleared (no BBA backs): {}", report.unbacked.len());
+    println!("  cache vacated (no BBA backs): {}", report.unbacked.len());
     println!("  cache left as it was:         {}", report.unchanged.len());
     if !report.errors.is_empty() {
         for e in &report.errors {

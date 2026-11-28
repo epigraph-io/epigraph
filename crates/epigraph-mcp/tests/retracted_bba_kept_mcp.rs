@@ -390,7 +390,11 @@ async fn assert_stayed_outcome(pool: &PgPool, w: &StayedWorld) {
         .fetch_one(pool)
         .await
         .expect("read b's cache");
-    assert_eq!(cache, None, "b's cache is cleared");
+    assert_eq!(
+        cache,
+        Some(0.0),
+        "b's cache is vacated (Bel 0, the explicit vacuous cache; backlog 75726018)"
+    );
 }
 
 /// K10(2) mixed case through `supersede_claim` with the cascade inline on the

@@ -298,7 +298,9 @@ fn close(a: Option<f64>, b: Option<f64>) -> bool {
 /// predicted, with why; empty when every one is.
 ///
 /// * `recomputed`: Bel, Pl and BetP are the predicted fold's;
-/// * `unbacked`: Bel, Pl and BetP are NULL (the cache was cleared);
+/// * `unbacked`: Bel, Pl and BetP are the explicit vacuous value the
+///   measurement predicts (0, 1, 0.5: the cache was vacated, backlog
+///   75726018);
 /// * `kept_other_frame`, `no_cache`: the cache is exactly what it was.
 #[must_use]
 pub fn check_predictions(
@@ -316,14 +318,11 @@ pub fn check_predictions(
             continue;
         };
         let ok = match c.outcome {
-            DeltaOutcome::Recomputed => c.new.is_some_and(|n| {
+            DeltaOutcome::Recomputed | DeltaOutcome::Unbacked => c.new.is_some_and(|n| {
                 close(got.belief, n.belief)
                     && close(got.plausibility, n.plausibility)
                     && close(got.pignistic_prob, n.betp)
             }),
-            DeltaOutcome::Unbacked => {
-                got.belief.is_none() && got.plausibility.is_none() && got.pignistic_prob.is_none()
-            }
             DeltaOutcome::KeptOtherFrame | DeltaOutcome::NoCache => before.get(&c.id) == Some(got),
             DeltaOutcome::VacatePossible => false,
         };
@@ -867,11 +866,7 @@ mod tests {
         ClaimDelta {
             id,
             old: served(0.0, 0.64, 0.32),
-            new: Some(Served {
-                belief: None,
-                plausibility: None,
-                betp: None,
-            }),
+            new: Some(served(0.0, 1.0, 0.5)),
             delta: None,
             outcome: DeltaOutcome::Unbacked,
             causes: vec!["k10_retro"],
@@ -997,16 +992,20 @@ mod tests {
             (kept, cache(Some(0.3), Some(0.8), Some(0.55))),
         ]);
         let good = HashMap::from([
-            (gone, cache(None, None, None)),
+            (gone, cache(Some(0.0), Some(1.0), Some(0.5))),
             (folded, cache(Some(0.2), Some(0.6), Some(0.4))),
             (kept, cache(Some(0.3), Some(0.8), Some(0.55))),
         ]);
         assert!(check_predictions(&plan, &before, &good).is_empty());
 
-        // Each wrong: a cleared claim that kept a value, a fold off the
+        // Each wrong: a vacated claim that kept its value, a fold off the
         // prediction, a kept cache that moved, a holder that vanished.
         let mut bad = good.clone();
         bad.insert(gone, cache(Some(0.0), Some(0.64), Some(0.32)));
+        // A NULLed cache is not the vacate either (backlog 75726018).
+        let mut nulled = good.clone();
+        nulled.insert(gone, cache(None, None, None));
+        assert_eq!(check_predictions(&plan, &before, &nulled).len(), 1);
         bad.insert(folded, cache(Some(0.2), Some(0.6), Some(0.41)));
         bad.insert(kept, cache(Some(0.3), Some(0.8), Some(0.56)));
         assert_eq!(check_predictions(&plan, &before, &bad).len(), 3);

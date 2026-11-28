@@ -134,6 +134,115 @@ async fn query_undecomposed_claims_flags_looks_atomic_rows(pool: PgPool) {
     assert_eq!(atomic_row["is_current"], Value::Bool(true), "{atomic_row}");
 }
 
+/// One canonical conjunct count (backlog `74580d03`): for every text of a
+/// shared fixture, `query_undecomposed_claims`' `conjunct_estimate` is the
+/// count `screen_claim_atomicity` reports as `conjunct_count`
+/// (`conjunct_screen`'s), and `conjunct_signals` still lists the retired
+/// counter's rules as diagnostics.
+///
+/// The fixture holds texts on which the two counters DISAGREE (a finite-verb
+/// coordination with no comma, which only the estimate counts; several
+/// quantities, which only the screen counts), so a row that still reported
+/// `conjunct_estimate(content).count` fails here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn undecomposed_and_screen_report_the_same_conjunct_count(pool: PgPool) {
+    use epigraph_core::atomicity::{conjunct_estimate, conjunct_screen};
+
+    const TEXTS: [&str; 5] = [
+        // estimate 2 (coordination), screen 1
+        "The test passed and the build failed.",
+        // estimate 1, screen 3 (six quantities)
+        "Yields were 12 g, 15 g, 19 g, 23 g, 31 g and 40 g in the six runs.",
+        // both 2 (a comma join, and two sentences)
+        "The catalyst raised the yield, but it shortened the column life.",
+        "The rotor arm turns freely. Its friction coefficient is about 4e-22 N m s.",
+        // both 1
+        "The rotor arm friction coefficient is about 4e-22 N m s.",
+    ];
+    // The fixture must exercise a disagreement both ways, or the test proves
+    // nothing about which counter the row serves.
+    assert!(
+        TEXTS
+            .iter()
+            .any(|t| conjunct_estimate(t).count > conjunct_screen(t).conjunct_count)
+            && TEXTS
+                .iter()
+                .any(|t| conjunct_estimate(t).count < conjunct_screen(t).conjunct_count),
+        "fixture: the two counters must disagree in both directions on some text"
+    );
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let mut ids = Vec::new();
+    for text in TEXTS {
+        ids.push(seed_claim(&pool, agent, text).await);
+    }
+    let server = build_test_server(pool.clone());
+
+    let undecomposed = parse_array(
+        &query_undecomposed_claims(
+            &server,
+            &viewer,
+            QueryUndecomposedClaimsParams {
+                limit: Some(1000),
+                offset: Some(0),
+            },
+        )
+        .await
+        .expect("query_undecomposed_claims"),
+    );
+    let screened: Value = {
+        let result = epigraph_mcp::tools::atomicity::screen_claim_atomicity(
+            &server,
+            &viewer,
+            epigraph_mcp::types::ScreenClaimAtomicityParams {
+                claim_ids: ids.iter().map(Uuid::to_string).collect(),
+            },
+        )
+        .await
+        .expect("screen_claim_atomicity");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("text content block");
+        serde_json::from_str(&text).expect("screen response is JSON")
+    };
+    let screened = screened["claims"].as_array().expect("claims array").clone();
+
+    for (text, id) in TEXTS.iter().zip(&ids) {
+        let row = find_claim(&undecomposed, *id);
+        let screen_row = screened
+            .iter()
+            .find(|c| c["claim_id"].as_str() == Some(id.to_string().as_str()))
+            .unwrap_or_else(|| panic!("{id} not screened: {screened:?}"));
+        assert_eq!(
+            row["conjunct_estimate"], screen_row["conjunct_count"],
+            "query_undecomposed_claims and screen_claim_atomicity must report the same \
+             canonical count for {text:?}: {row} vs {screen_row}"
+        );
+        assert_eq!(
+            row["conjunct_signals"],
+            serde_json::json!(conjunct_estimate(text).signals),
+            "conjunct_signals must still list the estimate's rules (diagnostic) for {text:?}: \
+             {row}"
+        );
+    }
+    let coordinated = find_claim(&undecomposed, ids[0]);
+    assert_eq!(
+        coordinated["conjunct_estimate"],
+        serde_json::json!(1),
+        "{coordinated}"
+    );
+    assert_eq!(
+        coordinated["conjunct_signals"],
+        serde_json::json!(["coordination"]),
+        "the diagnostic signal survives on a text the canonical count reads as one: \
+         {coordinated}"
+    );
+}
+
 /// The description is the contract the maintenance agents read. It must say
 /// that flagged rows are terminal and must stop sending them to the CLI.
 #[test]

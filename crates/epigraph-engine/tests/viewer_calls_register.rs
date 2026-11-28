@@ -368,20 +368,17 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "mark_duplicate_with_cascade",
         &["ClaimRepository::mark_duplicate_with_repair_conn"],
     ),
-    // write + keyed: the clear, then whether the claim (whose BBAs the fn
-    // just read through its viewer) still holds a cache.
+    // keyed: whether the claim (whose BBAs the fn just read through its
+    // viewer) holds a cache to vacate; the vacate itself is handed the viewer.
     (
         "retraction_cascade.rs",
         "mark_unbacked_if_evidence_free",
-        &[
-            "MassFunctionRepository::clear_claim_belief",
-            "claim_holds_belief_cache",
-        ],
+        &["claim_holds_belief_cache"],
     ),
     (
         "retraction_cascade.rs",
         "repair_one",
-        &["MassFunctionRepository::clear_claim_belief"],
+        &["claim_holds_belief_cache"],
     ),
     // narrows
     (

@@ -1573,11 +1573,13 @@ const DS_UPDATE_STEPS: &[&str] = &[
     "assign_claim",
     "binary frame",
     "build BBA",
+    "cache_owner_frame_for_claim",
     "combine_multiple",
     "discount",
     "evidence source_url read",
     "evidence_type_weights",
     "fallback get_by_name",
+    "frame visibility",
     "get_by_name",
     "get_for_claim_binary_frames",
     "intra_evidence_locality_factor",
@@ -2105,6 +2107,47 @@ pub async fn update_with_evidence(
              not the claim's cached values."
         ));
     }
+    // Backlog 8ff648c9: the three ways the cache write departs from "this
+    // call's fold, on the frame that owns the cache", each named, never silent.
+    let notes = ds.cache_notes;
+    if let (Some(fold), Some(prior)) = (notes.clamped_from, notes.clamp_prior) {
+        warnings.push(format!(
+            "The monotonicity clamp fired: this call's fold of the claim's two-hypothesis BBAs \
+             gives pignistic_prob {fold}, below the claim's prior {prior} (its cached \
+             pignistic_prob, or its truth_value when it had none), so the supporting update \
+             was held at {} instead. That value is not a fold of the stored BBAs, and a \
+             recompute from them will not reproduce it.",
+            ds.pignistic_prob
+        ));
+    }
+    // The previous frame's id is named only when the caller can see that
+    // frame (frames are tenanted); otherwise the re-point is still reported.
+    if let Some(from) = notes.repointed_from {
+        let carried_on = match from {
+            ds_auto::RepointedFrom::Frame(id) => format!("frame {id}"),
+            ds_auto::RepointedFrom::Hidden => "a frame not visible to this caller".to_string(),
+        };
+        warnings.push(format!(
+            "claim {claim_id}'s cached belief was carried on {carried_on}; this call replaced \
+             it with its fold and re-pointed the cache to {} (belief_frame_id).",
+            ds.frame_id
+        ));
+    }
+    if let Some(owner) = notes.owner_elsewhere {
+        warnings.push(match owner {
+            Some(owner) => format!(
+                "The cache-owner rule elects frame {owner} for claim {claim_id}, not {} where \
+                 this call wrote its cache: the next recompute refolds the cache on {owner}, \
+                 and its values may differ from these (the clamp, per-frame overrides).",
+                ds.frame_id
+            ),
+            None => format!(
+                "claim {claim_id} has no cache-owner frame (a compound, whose belief is a query \
+                 over its leaves, or a claim whose only inputs are ingest templates): the cache \
+                 this call wrote is not one any recompute keeps."
+            ),
+        });
+    }
     let warning = (!warnings.is_empty()).then(|| warnings.join(" "));
 
     // `belief_wired` / `bba_stored` / `ds_wire_error` are #497's response fields,
@@ -2132,6 +2175,14 @@ pub async fn update_with_evidence(
         belief: Some(ds.belief),
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),
+        fold_pignistic_prob: notes.clamped_from,
+        cache_repointed_from: notes.repointed_from.map(|from| match from {
+            ds_auto::RepointedFrom::Frame(id) => id.to_string(),
+            ds_auto::RepointedFrom::Hidden => "hidden".to_string(),
+        }),
+        cache_owner_frame_id: notes
+            .owner_elsewhere
+            .map(|owner| owner.map_or_else(|| "none".to_string(), |f| f.to_string())),
         warning,
     })
 }
@@ -3514,8 +3565,14 @@ pub async fn undecomposed_claims_page(
             let id = c.id.as_uuid();
             let looks_atomic = epigraph_core::atomicity::looks_atomic(&c.content);
             // Advisory conjunct count (backlog `72850d43`): reported next to
-            // `looks_atomic`, never used to filter or to override it.
-            let conjuncts = epigraph_core::atomicity::conjunct_estimate(&c.content);
+            // `looks_atomic`, never used to filter or to override it. The
+            // count is `conjunct_screen`'s, the one canonical count every
+            // surface reports (backlog `74580d03`), so this row and
+            // `screen_claim_atomicity` cannot disagree on the same text.
+            // `conjunct_estimate`'s own rules ride along as diagnostic
+            // signals only.
+            let count = epigraph_core::atomicity::conjunct_screen(&c.content).conjunct_count;
+            let signals = epigraph_core::atomicity::conjunct_estimate(&c.content).signals;
             let claim = ClaimResponse {
                 id: id.to_string(),
                 content: c.content.clone(),
@@ -3535,8 +3592,8 @@ pub async fn undecomposed_claims_page(
             crate::types::UndecomposedClaimResponse {
                 claim,
                 looks_atomic,
-                conjunct_estimate: conjuncts.count,
-                conjunct_signals: conjuncts.signals,
+                conjunct_estimate: count,
+                conjunct_signals: signals,
             }
         })
         .collect();

@@ -337,7 +337,9 @@ pub struct Served {
 pub enum DeltaOutcome {
     /// The binary frame's fold of the BBAs that survive.
     Recomputed,
-    /// No BBA survives anywhere and the claim held a cache: cleared (NULL).
+    /// No BBA survives anywhere and the claim held a cache: vacated to the
+    /// explicit vacuous value (Bel 0, Pl 1, BetP 0.5; backlog 75726018), as
+    /// the cascade's unbacked arm writes it.
     Unbacked,
     /// No BBA survives on the binary frame, but one does on another frame:
     /// the cache is kept as it is.
@@ -950,12 +952,15 @@ async fn delta_block(
             if elsewhere {
                 (DeltaOutcome::KeptOtherFrame, Some(old))
             } else if had_cache {
+                // The cascade vacates (`edge_factor::write_vacuous_cache`),
+                // never NULLs: Bel 0, Pl 1, BetP 0.5.
                 (
                     DeltaOutcome::Unbacked,
                     Some(Served {
-                        belief: None,
-                        plausibility: None,
-                        betp: None,
+                        belief: Some(0.0),
+                        plausibility: Some(1.0),
+                        // belief-profile: allow-literal (the vacuous interval's BetP on a binary frame)
+                        betp: Some(0.5),
                     }),
                 )
             } else {

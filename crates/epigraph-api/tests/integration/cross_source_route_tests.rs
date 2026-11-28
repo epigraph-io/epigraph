@@ -1596,8 +1596,8 @@ async fn retire_rederives_endpoint_belief_from_surviving_bbas(pool: PgPool) {
 }
 
 /// Default decision (scope Q2): an endpoint with NO BBA on any frame whose
-/// cache a retirement leaves unbacked is cleared, the `edge_retract` cascade's
-/// semantics. The only writer that can have put a value there without a BBA
+/// cache a retirement leaves unbacked is vacated (the explicit vacuous cache,
+/// never NULL: backlog 75726018), the `edge_retract` cascade's semantics. The only writer that can have put a value there without a BBA
 /// is the factor graph that just lost an edge.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retire_clears_an_unbacked_endpoint_cache(pool: PgPool) {
@@ -1615,8 +1615,8 @@ async fn retire_clears_an_unbacked_endpoint_cache(pool: PgPool) {
     assert_eq!(json["cascade"]["status"], "applied", "{json}");
     assert_eq!(
         betp_of(&pool, a).await,
-        None,
-        "an endpoint no BBA backs must have its stale cache cleared: {json}"
+        Some(0.5),
+        "an endpoint no BBA backs must have its stale cache vacated: {json}"
     );
     assert_eq!(
         json["belief_cascade"]["unbacked"],

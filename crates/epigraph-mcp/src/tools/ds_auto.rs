@@ -59,6 +59,57 @@ pub struct DsAutoResult {
     /// (index 0 is TRUE). Its masses drive the claim's Beta-Bernoulli track
     /// (`epigraph_engine::ds_divergence::beta_increments`).
     pub evidence_bba: MassFunction,
+    /// What the cache write did that the values above do not show (backlog
+    /// 8ff648c9). All empty for [`auto_wire_ds_for_claim`].
+    pub cache_notes: CacheWriteNotes,
+}
+
+/// Where [`auto_wire_ds_update_filed_on`]'s cache write diverged from a plain
+/// "this call's fold, on the frame that owns the cache" (backlog 8ff648c9).
+/// Each field is `None` when its divergence did not happen, so a default
+/// value means the write was exactly that.
+///
+/// The update folds every two-hypothesis frame's BBAs, clamps a supporting
+/// result up to the claim's prior, and writes the cache on `binary_truth`;
+/// the owner recompute (`cache_owner_frame_for_claim`, then that frame's fold)
+/// folds ONE frame and does not clamp. Where the two differ, a caller that
+/// reads only `pignistic_prob` and `cache_written` was told nothing: a clamp
+/// to the prior made a supporting update a silent no-op, and a cache carried
+/// on another frame was silently re-pointed.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CacheWriteNotes {
+    /// This call's fold BetP BEFORE the supports=true monotonicity clamp,
+    /// when the clamp RAISED it (the fold was below the claim's prior). The
+    /// written and returned `pignistic_prob` is the clamped value, not a fold
+    /// of the stored BBAs, and the next owner recompute will not reproduce it.
+    pub clamped_from: Option<Prob>,
+    /// The prior the clamp bounded BetP by (the cached `pignistic_prob`, or
+    /// the claim's `truth_value` when it had no cache), when it fired.
+    pub clamp_prior: Option<Prob>,
+    /// Set when the cache was written and the frame it recorded
+    /// (`claims.belief_frame_id`) before this call is not the one this call
+    /// wrote: the cache was RE-POINTED from it to `binary_truth`.
+    pub repointed_from: Option<RepointedFrom>,
+    /// The frame the cache-owner rule elects after this call, when the cache
+    /// was written and the rule does NOT elect the frame this call wrote:
+    /// `Some(None)` when the claim has no owner (a compound, or template-only
+    /// input). The next owner recompute refolds the cache there (or, with no
+    /// owner, never from these BBAs), and its values may differ from the ones
+    /// written here (the clamp, and per-frame overrides keyed on the frame
+    /// folded). `None` too when the owner read failed (the note is omitted).
+    pub owner_elsewhere: Option<Option<Uuid>>,
+}
+
+/// The frame a re-pointed cache was carried on before this call, as far as
+/// the caller may be told (frames are tenanted, so a response names only a
+/// frame the caller can see).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepointedFrom {
+    /// A frame the caller can see: its id.
+    Frame(Uuid),
+    /// A frame the caller cannot see (or whose visibility read failed): the
+    /// re-point is still reported, without the id.
+    Hidden,
 }
 
 /// Entry for batch DS wiring (used by `do_ingest_document`).
@@ -428,6 +479,69 @@ async fn frame_profile_overrides(
     }
 }
 
+/// Whether `viewer` can see frame `frame_id`, read under a savepoint: an
+/// optional read whose failure answers `false` (fail closed) and must not
+/// abort the caller's transaction. Backlog 8ff648c9: decides whether a
+/// re-pointed cache's previous frame may be named in a response.
+async fn frame_visible_to(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    frame_id: Uuid,
+) -> Result<bool, String> {
+    let what = "frame visibility";
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("{what}: could not open a savepoint: {e}"))?;
+    match FrameRepository::get_by_id(&mut *sp, viewer, frame_id).await {
+        Ok(row) => {
+            sp.commit()
+                .await
+                .map_err(|e| format!("{what}: could not release the savepoint: {e}"))?;
+            Ok(row.is_some())
+        }
+        Err(e) => {
+            tracing::warn!(read = what, error = %e, "optional read failed; treated as invisible");
+            sp.rollback()
+                .await
+                .map_err(|e| format!("{what}: could not roll back to the savepoint: {e}"))?;
+            Ok(false)
+        }
+    }
+}
+
+/// The cache-owner frame `viewer` resolves for `claim_id`, read under a
+/// savepoint: `Some(owner)` (itself `None` for a claim with no owner), or
+/// `None` when the read failed. It only feeds a diagnostic note (backlog
+/// 8ff648c9), so a failure omits that note and never aborts the caller's
+/// transaction.
+async fn cache_owner_frame_optional(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<Option<Option<Uuid>>, String> {
+    let what = "cache_owner_frame_for_claim";
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("{what}: could not open a savepoint: {e}"))?;
+    match MassFunctionRepository::cache_owner_frame_for_claim(&mut *sp, viewer, claim_id).await {
+        Ok(owner) => {
+            sp.commit()
+                .await
+                .map_err(|e| format!("{what}: could not release the savepoint: {e}"))?;
+            Ok(Some(owner))
+        }
+        Err(e) => {
+            tracing::warn!(read = what, error = %e, "optional read failed; treated as absent");
+            sp.rollback()
+                .await
+                .map_err(|e| format!("{what}: could not roll back to the savepoint: {e}"))?;
+            Ok(None)
+        }
+    }
+}
+
 /// The belief profile a DS write folds under: the served profile with this
 /// frame's tier, exactly what `edge_factor::compute_combined_belief` resolves,
 /// so the cached value this write leaves is the value a recompute reproduces.
@@ -585,6 +699,7 @@ pub async fn auto_wire_ds_for_claim(
         frame_id,
         cache_written,
         evidence_bba: bba,
+        cache_notes: CacheWriteNotes::default(),
     })
 }
 
@@ -706,9 +821,11 @@ pub async fn auto_wire_ds_update_filed_on(
     // (the seed's source). PR-09: a per-id read over a caller-supplied uuid, so
     // it is filtered rather than exempted; an invisible claim reads as "no
     // prior", the same answer a nonexistent one gives.
-    let claim_prior: Option<(Option<f64>, f64, Uuid)> = {
+    // The recorded cache frame (`belief_frame_id`) is read here too, so the
+    // response can say when this write re-points the cache (backlog 8ff648c9).
+    let claim_prior: Option<(Option<f64>, f64, Uuid, Option<Uuid>)> = {
         let sql = viewer.splice(
-            "SELECT c.pignistic_prob, c.truth_value, c.agent_id FROM claims c \
+            "SELECT c.pignistic_prob, c.truth_value, c.agent_id, c.belief_frame_id FROM claims c \
                  WHERE c.id = $1 /* {VISIBILITY:c} */",
             // belief-profile: allow-literal (the SQL bind slot the visibility splice uses)
             2,
@@ -717,7 +834,8 @@ pub async fn auto_wire_ds_update_filed_on(
         let group: Option<Vec<Uuid>> = viewer.group_bind().map(<[Uuid]>::to_vec);
         optional_read_under_savepoint(&mut *conn, "claim prior", move |c| {
             Box::pin(async move {
-                let mut q = sqlx::query_as::<_, (Option<f64>, f64, Uuid)>(&sql).bind(claim_id);
+                let mut q = sqlx::query_as::<_, (Option<f64>, f64, Uuid, Option<Uuid>)>(&sql)
+                    .bind(claim_id);
                 if let Some(g) = group {
                     q = q.bind(g);
                 }
@@ -733,7 +851,7 @@ pub async fn auto_wire_ds_update_filed_on(
     // recompute) and no binary BBA, and a claim whose BBAs sit on a legacy
     // binary frame already has its prior in the combine below.
     if seed_truth_prior {
-        if let Some((_, truth, author)) = claim_prior {
+        if let Some((_, truth, author, _)) = claim_prior {
             let existing =
                 MassFunctionRepository::get_for_claim_binary_frames(&mut *conn, viewer, claim_id)
                     .await
@@ -873,7 +991,7 @@ pub async fn auto_wire_ds_update_filed_on(
     // value: the cached `pignistic_prob`, or the authored `truth_value` when the
     // claim has no cache (backlog fc55465b: with no fallback the clamp never
     // fired on exactly the claims whose prior was otherwise discarded).
-    let prior_betp: Option<f64> = claim_prior.map(|(cached, truth, _)| cached.unwrap_or(truth));
+    let prior_betp: Option<f64> = claim_prior.map(|(cached, truth, _, _)| cached.unwrap_or(truth));
 
     // The second value is the conflict the fold SAW. Since U025 every
     // `combine_multiple` step is Dempster, which normalises conflict out of
@@ -931,10 +1049,16 @@ pub async fn auto_wire_ds_update_filed_on(
     // plausibility is not a weaker guarantee, it is an impossible one. Clamping
     // to `prior.min(pl)` keeps 30bfbb19's intent wherever the prior is
     // representable, and yields to `pl` only when it is not.
+    let mut notes = CacheWriteNotes::default();
     if supports {
         if let Some(prior) = prior_betp {
             let bounded_prior = prior.min(pl);
             if betp < bounded_prior {
+                // Backlog 8ff648c9: the clamp is reported, not silent. When it
+                // pins BetP to the prior, this supporting update moved
+                // nothing, and the value written is no fold of the BBAs.
+                notes.clamped_from = Some(betp);
+                notes.clamp_prior = Some(prior);
                 betp = bounded_prior;
             }
         }
@@ -955,6 +1079,32 @@ pub async fn auto_wire_ds_update_filed_on(
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
 
+    // Backlog 8ff648c9: when this write took the cache, say where it departs
+    // from the owner recompute's frame. Read AFTER the write, so the owner is
+    // the one every later recompute elects (this call's BBA included).
+    // Both reads below only feed these notes, so each is OPTIONAL: run under
+    // a savepoint, and a failure omits its note instead of rolling back the
+    // submission.
+    if cache_written {
+        let recorded_before = claim_prior.and_then(|(_, _, _, recorded)| recorded);
+        if let Some(from) = recorded_before.filter(|recorded| *recorded != frame_id) {
+            // The recorded frame's id is disclosed only to a caller who can
+            // see that frame (frames are tenanted). An invisible frame, or a
+            // failed read, still reports the re-point, without the id.
+            let visible = frame_visible_to(&mut *conn, viewer, from).await?;
+            notes.repointed_from = Some(if visible {
+                RepointedFrom::Frame(from)
+            } else {
+                RepointedFrom::Hidden
+            });
+        }
+        if let Some(owner) = cache_owner_frame_optional(&mut *conn, viewer, claim_id).await? {
+            if owner != Some(frame_id) {
+                notes.owner_elsewhere = Some(owner);
+            }
+        }
+    }
+
     Ok(DsAutoResult {
         belief: bel,
         plausibility: pl,
@@ -964,6 +1114,7 @@ pub async fn auto_wire_ds_update_filed_on(
         frame_id,
         cache_written,
         evidence_bba: bba,
+        cache_notes: notes,
     })
 }
 
