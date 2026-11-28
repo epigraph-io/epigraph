@@ -356,6 +356,14 @@ pub struct AppState {
     /// [`Self::with_compound_write_guard`] overrides it (tests).
     #[cfg(feature = "db")]
     pub compound_write_guard: epigraph_engine::belief_modes::CompoundWriteGuard,
+    /// What a `contradicts` / `refutes` edge onto an undecomposed target whose
+    /// text screens compound does (`EPIGRAPH_CONTRADICT_COMPOUND_GUARD`,
+    /// `epigraph_engine::contradiction_guard`; read by `POST /api/v1/edges`).
+    /// Every constructor takes the mode this process read at startup, the
+    /// value `/health` reports; [`Self::with_contradict_compound_guard`]
+    /// overrides it (tests).
+    #[cfg(feature = "db")]
+    pub contradict_compound_guard: epigraph_engine::belief_modes::ContradictCompoundGuard,
     /// Whether the anonymous guest reads under `/api/v1/guest/` answer
     /// (`routes/guest.rs`). OFF in every constructor, where each guest route
     /// answers a bare 404 as if it were not routed; `bin/server.rs` sets it
@@ -1360,6 +1368,8 @@ impl AppState {
             bp_apply: BpApply::Off,
             bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
             compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard(),
+            contradict_compound_guard: epigraph_engine::belief_modes::current()
+                .contradict_compound_guard(),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1478,6 +1488,18 @@ impl AppState {
         guard: epigraph_engine::belief_modes::CompoundWriteGuard,
     ) -> Self {
         self.compound_write_guard = guard;
+        self
+    }
+
+    /// Set what a `contradicts` / `refutes` edge onto an undecomposed
+    /// compound-looking target does; see [`Self::contradict_compound_guard`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_contradict_compound_guard(
+        mut self,
+        guard: epigraph_engine::belief_modes::ContradictCompoundGuard,
+    ) -> Self {
+        self.contradict_compound_guard = guard;
         self
     }
 
@@ -1989,6 +2011,8 @@ impl AppState {
             bp_apply: BpApply::Off,
             bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
             compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard(),
+            contradict_compound_guard: epigraph_engine::belief_modes::current()
+                .contradict_compound_guard(),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,

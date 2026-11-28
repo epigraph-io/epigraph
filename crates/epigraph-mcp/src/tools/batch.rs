@@ -169,6 +169,9 @@ pub async fn system_stats(
         // mode check (SPEC §10.4) compares it across live processes, stdio
         // clients included.
         "belief_modes": epigraph_engine::belief_modes::current(),
+        // What the process SERVES where that can differ from the configured
+        // mode (backlog 820c15f1), as `/health` → `belief_modes_served`.
+        "belief_modes_served": epigraph_engine::belief_view::ServedBeliefModes::current(),
     });
 
     if detailed {

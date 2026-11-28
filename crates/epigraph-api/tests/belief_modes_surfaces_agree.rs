@@ -21,10 +21,11 @@ use epigraph_api::state::{ApiConfig, AppState};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-const SET: [(&str, &str); 7] = [
+const SET: [(&str, &str); 8] = [
     ("EPIGRAPH_ATOM_FOLD", "aef"),
     ("EPIGRAPH_COMPOUND_BELIEF", "progressive"),
     ("EPIGRAPH_COMPOUND_WRITE_GUARD", "refuse"),
+    ("EPIGRAPH_CONTRADICT_COMPOUND_GUARD", "refuse"),
     ("EPIGRAPH_COMPOUND_SOURCE_EDGES", "excluded"),
     ("EPIGRAPH_ATOM_CACHE_MODE", "pure"),
     ("EPIGRAPH_INFERENCE", "on"),
@@ -38,6 +39,7 @@ fn defaults() -> serde_json::Value {
         "atom_fold": "legacy",
         "compound_belief": "legacy",
         "compound_write_guard": "warn",
+        "contradict_compound_guard": "warn",
         "compound_source_edges": "frozen",
         "atom_cache_mode": "display",
         "inference": "off",
@@ -110,7 +112,7 @@ async fn system_stats_and_health_report_the_same_belief_modes(pool: PgPool) {
     // non-default value, no field may still read its default.
     let defaults = defaults();
     let reported = from_stats.as_object().expect("belief_modes is an object");
-    assert_eq!(reported.len(), 7, "seven flags: {from_stats}");
+    assert_eq!(reported.len(), 8, "eight flags: {from_stats}");
     for (key, default) in defaults.as_object().unwrap() {
         let got = reported
             .get(key)

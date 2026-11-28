@@ -3096,6 +3096,13 @@ pub struct LinkEpistemicResponse {
     pub belief_target_claim_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_belief: Option<LinkEpistemicBelief>,
+    /// Present only under `EPIGRAPH_CONTRADICT_COMPOUND_GUARD=warn` (the
+    /// default) for a `contradicts` / `refutes` edge whose target text screens
+    /// compound and that has no decomposition (backlog b4c2fc2f): `{conjuncts,
+    /// hint}`. The edge was written exactly as without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_contradiction_risk:
+        Option<epigraph_engine::contradiction_guard::PartialContradictionRisk>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3904,6 +3911,13 @@ pub struct ChallengeclaimParams {
 pub struct ListChallengesParams {
     #[schemars(description = "UUID of the claim to list challenges for")]
     pub claim_id: String,
+    /// Backlog d8108186: also list the open challenges on the claim's
+    /// in-force `decomposes_to` parents, tagged `via_parent`.
+    #[schemars(
+        description = "Also list the open (pending or under_review) challenges filed on the claim's decomposes_to parents, after its own, each tagged via_parent. Default false."
+    )]
+    #[serde(default)]
+    pub include_parents: Option<bool>,
 }
 
 /// `resolve_challenge`'s parameters. There is no resolver field, and an

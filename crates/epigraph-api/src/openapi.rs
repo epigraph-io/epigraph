@@ -254,8 +254,9 @@ pub struct ErrorResponse {
 
 /// Health check
 ///
-/// Returns service status, version, current timestamp and `belief_modes`, the
-/// belief-mode flags this process read at startup.
+/// Returns service status, version, current timestamp, `belief_modes` (the
+/// belief-mode flags this process read at startup) and `belief_modes_served`
+/// (what it serves where that can differ from the configured mode).
 /// Used for monitoring and load balancer health checks.
 #[utoipa::path(
     get,
@@ -372,13 +373,16 @@ async fn submit_challenge() {}
 /// List challenges for a claim
 ///
 /// Returns all challenges submitted against a specific claim,
-/// ordered by submission time (newest first).
+/// ordered by submission time (newest first). With `include_parents=true`,
+/// the open challenges on the claim's in-force `decomposes_to` parents
+/// follow, each tagged `via_parent`.
 #[utoipa::path(
     get,
     path = "/api/v1/claims/{id}/challenges",
     tag = "challenge",
     params(
         ("id" = uuid::Uuid, Path, description = "The claim ID"),
+        ("include_parents" = Option<bool>, Query, description = "Also list the open challenges on the claim's in-force decomposes_to parents, each tagged via_parent (default: false; only true or false is accepted)"),
     ),
     responses(
         (status = 200, description = "List of challenges", body = Vec<ChallengeResponse>),

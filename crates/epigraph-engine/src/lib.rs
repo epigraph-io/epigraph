@@ -69,6 +69,7 @@ pub mod classifier;
 pub mod compound_belief;
 pub mod compound_write_guard;
 pub mod confidence;
+pub mod contradiction_guard;
 pub mod cospan;
 pub mod counterfactual;
 pub mod dag;

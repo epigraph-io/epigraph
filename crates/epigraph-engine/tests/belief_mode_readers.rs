@@ -59,6 +59,7 @@ const FLAG_TYPES: &[&str] = &[
     "CompoundBelief",
     "CompoundBeliefMode",
     "CompoundWriteGuard",
+    "ContradictCompoundGuard",
     "CompoundSourceEdges",
     "AtomCacheMode",
     "Inference",
@@ -158,6 +159,15 @@ const ACTED_ON_BY: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "contradict_compound_guard",
+        &[
+            // Each AppState constructor, for `POST /api/v1/edges`.
+            "crates/epigraph-api/src/state.rs",
+            // Each server constructor, for MCP `link_epistemic`.
+            "crates/epigraph-mcp/src/server.rs",
+        ],
+    ),
+    (
         "compound_source_edges",
         &[
             "crates/epigraph-cli/src/shadow_report.rs",
@@ -214,7 +224,7 @@ fn acts_on_flag(src: &str, key: &str) -> bool {
     })
 }
 
-/// Every method of `BeliefModes`'s inherent impls in the reader: the seven
+/// Every method of `BeliefModes`'s inherent impls in the reader: the eight
 /// accessors, the constructors and the report forms. Pinned because a method
 /// added there (`fn bp_writes(&self) -> bool { self.bp_apply == BpApply::On
 /// }`) is a way to act on a flag that calls no accessor, so the scan of the
@@ -226,6 +236,7 @@ const MODE_METHODS: &[&str] = &[
     "compound_belief",
     "compound_source_edges",
     "compound_write_guard",
+    "contradict_compound_guard",
     "fields",
     "from_env",
     "from_lookup",
@@ -527,7 +538,7 @@ fn the_modes_fields_are_private() {
     }
 }
 
-/// The reader adds no way to act on a flag besides the seven accessors: its
+/// The reader adds no way to act on a flag besides the eight accessors: its
 /// `BeliefModes` methods are pinned, a flag's field is read only by its
 /// accessor and `fields()`, and it calls no accessor itself.
 #[test]

@@ -10,7 +10,7 @@
 //!
 //! The modes are process-global, so this binary holds exactly one test, and it
 //! sets the environment before anything in the process can read it. Every one
-//! of the seven flags is set to a NON-default value: a handler that returned
+//! of the eight flags is set to a NON-default value: a handler that returned
 //! the defaults (or any hard-coded table) cannot pass. Two values are spelled
 //! the way an operator might type them (mixed case, padding), which the
 //! report must normalise rather than echo.
@@ -24,10 +24,11 @@ use epigraph_api::state::{ApiConfig, AppState};
 use tower::ServiceExt;
 
 /// (environment variable, value set, the value `/health` must report).
-const SET: [(&str, &str, &str); 7] = [
+const SET: [(&str, &str, &str); 8] = [
     ("EPIGRAPH_ATOM_FOLD", "aef_standalone", "aef_standalone"),
     ("EPIGRAPH_COMPOUND_BELIEF", " Shadow ", "shadow"),
     ("EPIGRAPH_COMPOUND_WRITE_GUARD", "REFUSE", "refuse"),
+    ("EPIGRAPH_CONTRADICT_COMPOUND_GUARD", " Refuse", "refuse"),
     ("EPIGRAPH_COMPOUND_SOURCE_EDGES", "excluded", "excluded"),
     ("EPIGRAPH_ATOM_CACHE_MODE", "pure", "pure"),
     ("EPIGRAPH_INFERENCE", "shadow", "shadow"),
@@ -35,10 +36,14 @@ const SET: [(&str, &str, &str); 7] = [
 ];
 
 /// The JSON key `/health` → `belief_modes` reports each flag under.
-const KEY: [(&str, &str); 7] = [
+const KEY: [(&str, &str); 8] = [
     ("EPIGRAPH_ATOM_FOLD", "atom_fold"),
     ("EPIGRAPH_COMPOUND_BELIEF", "compound_belief"),
     ("EPIGRAPH_COMPOUND_WRITE_GUARD", "compound_write_guard"),
+    (
+        "EPIGRAPH_CONTRADICT_COMPOUND_GUARD",
+        "contradict_compound_guard",
+    ),
     ("EPIGRAPH_COMPOUND_SOURCE_EDGES", "compound_source_edges"),
     ("EPIGRAPH_ATOM_CACHE_MODE", "atom_cache_mode"),
     ("EPIGRAPH_INFERENCE", "inference"),
@@ -89,7 +94,7 @@ async fn health_reports_the_belief_modes_this_process_read_from_its_environment(
         .and_then(serde_json::Value::as_object)
         .unwrap_or_else(|| panic!("/health has no `belief_modes` object: {body}"));
 
-    // Exactly the seven flags: a missing one cannot be compared across processes,
+    // Exactly the eight flags: a missing one cannot be compared across processes,
     // and an extra one would be a mode no process can be configured with.
     let mut keys: Vec<&str> = modes.keys().map(String::as_str).collect();
     keys.sort_unstable();

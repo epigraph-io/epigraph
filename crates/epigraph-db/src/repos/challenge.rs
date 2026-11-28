@@ -225,6 +225,60 @@ impl ChallengeRepository {
         q.fetch_all(executor).await
     }
 
+    /// The OPEN challenges (`pending`, `under_review`) on the in-force
+    /// `decomposes_to` PARENTS of `claim_id`, each with the parent it was
+    /// filed on (backlog d8108186). A dispute of a compound is a dispute of
+    /// its atoms too, and an atom's own challenge list does not show it.
+    ///
+    /// Only direct parents, over an in-force (`EDGE_IN_FORCE`)
+    /// claim-to-claim `decomposes_to` edge into `claim_id`. Every relation the
+    /// statement touches is spliced, so a viewer learns nothing it could not
+    /// read: the challenge (`VISIBILITY:challenges`, the predicate migration
+    /// 168's `challenges_claim_readable` policy states in row security), the
+    /// decomposition edge (`EDGE_VISIBILITY`), the parent claim and `claim_id`
+    /// itself (a claim the viewer cannot read lists exactly as a nonexistent
+    /// one, as [`Self::list_for_claim`]). Ordered newest first, as
+    /// [`Self::list_for_claim`]; a challenge appears once however many
+    /// parallel edges join its parent to `claim_id`.
+    pub async fn list_open_for_parents<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<(ChallengeRow, Uuid)>, sqlx::Error> {
+        let template = format!(
+            "SELECT id, claim_id, challenger_id, challenge_type, explanation, state, \
+                    resolved_by, resolution_details, resolved_at, created_at \
+             FROM challenges \
+             WHERE state IN ('pending', 'under_review') \
+             /* {{VISIBILITY:challenges}} */ \
+               AND EXISTS (SELECT 1 FROM edges e \
+                             JOIN claims c ON c.id = e.source_id \
+                            WHERE e.source_id = challenges.claim_id \
+                              AND e.target_id = $1 \
+                              AND e.relationship = 'decomposes_to' \
+                              AND e.source_type = 'claim' \
+                              AND e.target_type = 'claim' \
+                              AND {in_force} \
+                              /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:c}} */) \
+               AND EXISTS (SELECT 1 FROM claims a WHERE a.id = $1 /* {{VISIBILITY:a}} */) \
+             ORDER BY created_at DESC, id",
+            in_force = crate::repos::edge::EDGE_IN_FORCE,
+        );
+        let sql = viewer.splice(&template, 2);
+        let mut q = sqlx::query_as::<_, ChallengeRow>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let parent = row.claim_id;
+                (row, parent)
+            })
+            .collect())
+    }
+
     /// Update challenge state (e.g. pending -> accepted/rejected).
     ///
     /// A plain UPDATE of all four resolution columns with a caller-supplied
