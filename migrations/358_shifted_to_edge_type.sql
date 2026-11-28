@@ -1,0 +1,87 @@
+-- no-transaction
+--
+-- Backlog d639d492 (split 1/2 of 52eff3ab: port the `shifted_to` temporal
+-- edge). `shifted_to` is TEMPORAL SUCCESSION
+-- between two claims: the SOURCE end is the value that held in an earlier
+-- world, the TARGET end the value that holds now. "The throughput ceiling
+-- shifted from 400/s to 900/s" is written `400/s -shifted_to-> 900/s`.
+--
+-- Deliberately NOT an epistemic relationship: a later remeasurement is not
+-- evidence that the earlier value was false, so `shifted_to` must never move
+-- belief. `edge_to_factor_type` (latest body: 175) has no `shifted_to` row,
+-- so `auto_create_factor_from_edge` mints no factor for it. Its dedicated
+-- writers and the recall re-rank it licenses are the second half of the
+-- port, not this file.
+--
+-- A WRITER ALREADY EXISTS: the document ingest copies a caller's
+-- `relationships[].relationship` verbatim (only `supersedes` is refused), so
+-- `ingest_document` can store a claim/claim `shifted_to` edge today, and a
+-- live database may already hold one, duplicated or reversed. Once this index
+-- holds, such an ingest is refused as a whole with a designed STATE refusal
+-- (`epigraph_db::SHIFTED_TO_PAIR_REFUSAL`, mapped from this index's 23505 in
+-- `From<sqlx::Error> for DbError`), not with an opaque internal error.
+--
+-- This index is the same `(LEAST, GREATEST)` shape as 042/091's
+-- `edges_alternative_of_symmetric_uniq`, but does a different job. 042
+-- stores a SYMMETRIC fact once. On a DIRECTIONAL relation the pair key
+-- enforces ANTI-SYMMETRY: `A shifted_to B` plus `B shifted_to A` is a
+-- temporal contradiction, not two facts, so it rejects the reversal as well
+-- as the exact duplicate. Nothing else in the schema stops either shape
+-- (`edges.relationship` is free text, and the old triple unique index is
+-- gone).
+--
+-- Deliberately NOT unique on `source_id`: 400 -> 900 -> 1500 is a legitimate
+-- succession chain. No closure VIEW either (unlike 042): succession is a
+-- chain, not an equivalence class.
+--
+-- DIVERGENCE FROM THE PORTED SOURCE: the predicate adds `valid_to IS NULL`.
+-- Edge removal is a retraction now, not a delete, and 091 rules that a
+-- uniqueness constraint over edges must exclude retracted rows: otherwise a
+-- retracted `A shifted_to B` would hold the pair forever and refuse the
+-- corrected `B shifted_to A`, and the dedup repair, which retracts the
+-- redundant copy and then re-points the survivor, would collide with the row
+-- it just retracted.
+--
+-- SECOND DIVERGENCE: the predicate is narrowed to claim/claim edges
+-- (`source_type = 'claim' AND target_type = 'claim'`; 042 has no endpoint
+-- conjunct). Succession is between two claims' values, and the merge paths'
+-- pair guard (below) sees only claim/claim edges: an unnarrowed index would
+-- let a merge re-point a non-claim `shifted_to` edge into an occupied pair
+-- that guard cannot see, and roll the merge back. A narrow predicate, as
+-- 353 argued, keeps the index to exactly the rows the guard owns.
+--
+-- THE COST THIS INDEX PUTS ON THE MERGE PATHS: `ClaimRepository::
+-- mark_duplicate`'s repair and `ClaimRepository::consolidate` must treat
+-- `shifted_to` as direction-agnostic-unique when they re-point edges,
+-- exactly as they do `alternative_of`. Both read
+-- `epigraph_db::PAIR_UNIQUE_RELATIONSHIPS`, which lists both; without it a
+-- merge re-pointing a `shifted_to` edge trips this index and rolls the whole
+-- transaction back (backlog 2905150e / issue #286, for a second
+-- relationship). The binary carrying that list ships with this file.
+--
+-- CONCURRENTLY, so the build does not block edge writes while it scans
+-- `edges`. A UNIQUE CONCURRENTLY build FAILS on an existing duplicate and
+-- leaves an INVALID index behind. MEASURE FIRST, a REQUIRED pre-deploy step
+-- (the ingest above can have written a colliding pair; the LEAST/GREATEST
+-- grouping catches a reversal as well as an exact duplicate):
+--   SELECT LEAST(source_id, target_id), GREATEST(source_id, target_id), count(*)
+--     FROM public.edges
+--    WHERE relationship = 'shifted_to' AND valid_to IS NULL
+--      AND source_type = 'claim' AND target_type = 'claim'
+--    GROUP BY 1, 2 HAVING count(*) > 1;
+-- A non-empty result: per pair, keep the row the owner means (the earliest,
+-- absent other evidence), retract the others (`valid_to = now()`, never a
+-- DELETE), re-run the query until it is empty, then apply this file.
+--
+-- INVALID-INDEX TRAP: a cancelled or failed CONCURRENTLY build leaves an
+-- INVALID index of this name, and IF NOT EXISTS then skips it on a re-run.
+-- Recovery: DROP INDEX CONCURRENTLY edges_shifted_to_pair_uniq, re-apply.
+--
+-- Exactly one statement (see 312), so the index comment lives here:
+-- anti-symmetric pair uniqueness for in-force claim/claim `shifted_to` edges; the
+-- directional analogue of 042's `edges_alternative_of_symmetric_uniq`.
+-- Undo: docs/runbooks/358-undo.sql
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS edges_shifted_to_pair_uniq
+    ON public.edges (LEAST(source_id, target_id), GREATEST(source_id, target_id))
+    WHERE relationship = 'shifted_to' AND valid_to IS NULL
+      AND source_type = 'claim' AND target_type = 'claim';

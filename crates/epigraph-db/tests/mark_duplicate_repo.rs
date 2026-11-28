@@ -402,6 +402,155 @@ async fn mark_duplicate_with_shared_alternative_of_edge_succeeds(pool: PgPool) {
     );
 }
 
+/// The same regression class for the SECOND pair-unique relationship,
+/// `shifted_to` (migration 358, backlog d639d492). The test ships WITH the
+/// index that creates the hazard: `edges_shifted_to_pair_uniq` is keyed on
+/// `(LEAST(source_id,target_id), GREATEST(source_id,target_id))`, so issue
+/// #286's failing shape reproduces verbatim:
+///
+///   `dup →[shifted_to]→ third`  AND  `third →[shifted_to]→ canonical`
+///
+/// Migrating `dup→canonical` rewrites the first into `canonical→third`, whose
+/// pair key {canonical,third} collides with the in-force `third→canonical`.
+///
+/// The trap `alternative_of` does not set: `shifted_to` is DIRECTIONAL, so it
+/// is easy to reason that the directional diamond guards already cover it.
+/// They do not: the INDEX is direction-agnostic although the RELATIONSHIP is
+/// not, and the index is what rolls the transaction back. The repair is
+/// driven from `epigraph_db::PAIR_UNIQUE_RELATIONSHIPS`, not from what the
+/// relationship means.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_with_shared_shifted_to_edge_succeeds(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, agent, "canonical").await;
+    let dup = seed_claim(&pool, agent, "duplicate").await;
+    let third = seed_claim(&pool, agent, "third").await;
+
+    // Opposite orientations the directional pre-deletes miss.
+    seed_edge(&pool, dup, third, "shifted_to").await;
+    seed_edge(&pool, third, canonical, "shifted_to").await;
+
+    ClaimRepository::mark_duplicate(
+        &pool,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark_duplicate must succeed despite a shifted_to pair-key collision");
+
+    // dup must be retired: proof the transaction COMMITTED. A constraint
+    // violation would have rolled back before `is_current` flipped.
+    let (sup, is_current): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        sup,
+        Some(canonical),
+        "dup.supersedes should point at canonical"
+    );
+    assert!(
+        !is_current,
+        "dup must not be is_current after mark_duplicate"
+    );
+
+    // Exactly one shifted_to edge remains IN FORCE: the canonical↔third pair,
+    // in its original orientation. The redundant dup-side edge is retracted
+    // (still a row), never re-pointed.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE relationship = 'shifted_to' AND valid_to IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        total, 1,
+        "the redundant dup-side shifted_to edge should be retracted"
+    );
+    assert_eq!(
+        edge_count(&pool, third, canonical).await,
+        1,
+        "third→canonical shifted_to must survive in its own direction"
+    );
+    assert_eq!(
+        edge_count(&pool, canonical, third).await,
+        0,
+        "no reversed canonical→third succession may be created"
+    );
+    let (dup_side_retracted,): (bool,) = sqlx::query_as(
+        "SELECT valid_to IS NOT NULL FROM edges \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'shifted_to'",
+    )
+    .bind(dup)
+    .bind(third)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        dup_side_retracted,
+        "dup→third stays on the retired dup, retracted"
+    );
+}
+
+/// The pair guard retracts a dup-side edge only when the canonical shares an
+/// edge OF THE SAME RELATIONSHIP with the third claim. The pair indexes are
+/// per-relationship partial indexes, so `dup →[alternative_of]→ third` and
+/// `third →[shifted_to]→ canonical` do not collide once the first is
+/// re-pointed: both are legitimate and both must stay in force on the
+/// canonical. Matching the colliding edge by "any pair-unique relationship"
+/// instead would retract the `alternative_of` for nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_keeps_distinct_pair_unique_relationships_apart(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let canonical = seed_claim(&pool, agent, "canonical").await;
+    let dup = seed_claim(&pool, agent, "duplicate").await;
+    let third = seed_claim(&pool, agent, "third").await;
+
+    seed_edge(&pool, dup, third, "alternative_of").await;
+    seed_edge(&pool, third, canonical, "shifted_to").await;
+
+    ClaimRepository::mark_duplicate(
+        &pool,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark_duplicate");
+
+    for (rel, source, target) in [
+        ("alternative_of", canonical, third),
+        ("shifted_to", third, canonical),
+    ] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM edges \
+              WHERE relationship = $1 AND source_id = $2 AND target_id = $3 \
+                AND valid_to IS NULL",
+        )
+        .bind(rel)
+        .bind(source)
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            n, 1,
+            "'{rel}' {source}→{target} must be in force after the mark: the two \
+             pair-unique relationships have separate indexes and do not collide"
+        );
+    }
+    let on_dup: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE (source_id = $1 OR target_id = $1) \
+            AND relationship IN ('alternative_of', 'shifted_to') AND valid_to IS NULL",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(on_dup, 0, "nothing pair-keyed stays in force on the dup");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_rejects_missing_canonical(pool: PgPool) {
     let agent = seed_agent(&pool).await;

@@ -1,0 +1,28 @@
+-- ===================================================================
+-- 358-undo.sql: take migration 358 (`edges_shifted_to_pair_uniq`;
+-- backlog d639d492) back out, on the migration (superuser) DSN.
+--
+-- ORDER: no binary of the first half of the port (backlog d639d492) needs
+-- the index to run. A binary with the `PAIR_UNIQUE_RELATIONSHIPS` merge-path
+-- handling keeps working without it (it only dedups `shifted_to` edges by
+-- pair key, which is then stricter than the schema asks). What goes is the
+-- schema's refusal of a duplicate or reversed in-force claim/claim
+-- `shifted_to` pair: the document ingest, which already accepts the
+-- relationship, then stores a reversal or a duplicate silently instead of
+-- answering `SHIFTED_TO_PAIR_REFUSAL`.
+--
+-- RE-CHECK BEFORE RUNNING, once the second half of the port (the dedicated
+-- `shifted_to` writers) is deployed: those writers dedup by direction and
+-- rely on THIS index to refuse a reversal. Dropping it under them admits
+-- `A shifted_to B` beside `B shifted_to A` with no error anywhere, so either
+-- roll that binary back first or accept that contradiction until the index
+-- is re-introduced (and re-measure before re-introducing it).
+--
+-- WHAT IT DOES: drops the index, CONCURRENTLY (run it outside a transaction
+-- block, as its own statement), so edge writes are not blocked.
+--
+-- WHAT IT LEAVES: every `edges` row, `shifted_to` edges included; 358's
+-- `_sqlx_migrations` row. Re-introducing the index is a NEW migration,
+-- never a re-run of 358.
+-- ===================================================================
+DROP INDEX CONCURRENTLY IF EXISTS public.edges_shifted_to_pair_uniq;

@@ -346,6 +346,21 @@ pub enum DbError {
 impl From<sqlx::Error> for DbError {
     fn from(err: sqlx::Error) -> Self {
         match err {
+            // 23505 on migration 358's `shifted_to` pair index: a designed
+            // refusal of the graph's STATE (the pair already holds an in-force
+            // succession), answered with its own text on every surface (HTTP
+            // 409, the MCP tool error) instead of an opaque duplicate. Matched
+            // by constraint name BEFORE the generic arm below, so every other
+            // unique violation keeps its classification.
+            sqlx::Error::Database(db_err)
+                if db_err.is_unique_violation()
+                    && db_err.constraint() == Some(crate::repos::edge::SHIFTED_TO_PAIR_INDEX) =>
+            {
+                Self::Refused {
+                    kind: RefusalKind::State,
+                    message: crate::repos::edge::SHIFTED_TO_PAIR_REFUSAL.to_string(),
+                }
+            }
             // Check for unique constraint violations
             sqlx::Error::Database(db_err) if db_err.is_unique_violation() => Self::DuplicateKey {
                 entity: "entity".to_string(),

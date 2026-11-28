@@ -639,6 +639,48 @@ async fn a_chain_of_dedups_unmarks_in_reverse_order(pool: PgPool) {
     );
 }
 
+/// The reverse path over a pair-unique relationship (backlog d639d492).
+/// `shifted_to`'s pair index (migration 358) is direction-agnostic, so the
+/// mark's repair retracts `dup→third` rather than re-point it onto the pair
+/// `third→canonical` already holds, and re-points `earlier→dup` onto the
+/// canonical. The un-mark moves `earlier→canonical` back and brings the
+/// retracted `dup→third` back into force: every row is as before the mark,
+/// no reversed or duplicate succession was ever written, and no step trips
+/// the index.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shifted_to_pair_collision_marks_and_unmarks_exactly(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "ceiling 900/s").await;
+    let dup = fixture::seed_public_claim(&pool, a, "ceiling 900 per second").await;
+    let third = fixture::seed_public_claim(&pool, a, "ceiling 1500/s").await;
+    let earlier = fixture::seed_public_claim(&pool, a, "ceiling 400/s").await;
+    let dup_side = edge(&pool, dup, third, "shifted_to").await;
+    edge(&pool, third, canonical, "shifted_to").await;
+    let incoming = edge(&pool, earlier, dup, "shifted_to").await;
+    let claims = [canonical, dup, third, earlier];
+    let before = snapshot(&pool, &claims).await;
+
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(
+        repair.retracted_edges,
+        vec![dup_side],
+        "the pair guard retracts the dup-side edge"
+    );
+    assert_eq!(repair.retargeted_edges, vec![incoming]);
+    let marked = snapshot(&pool, &claims).await;
+    assert_ne!(before, marked, "calibration: the mark changed the snapshot");
+
+    let reversal = unmark(&pool, dup, &repair.revert).await;
+    assert!(reversal.drifted.is_empty(), "{:?}", reversal.drifted);
+    let after = snapshot(&pool, &claims).await;
+    let lost: Vec<&String> = before.iter().filter(|r| !after.contains(r)).collect();
+    let gained: Vec<&String> = after.iter().filter(|r| !before.contains(r)).collect();
+    assert!(
+        lost.is_empty() && gained.is_empty(),
+        "mark -> unmark is not the identity.\nmissing: {lost:#?}\nextra: {gained:#?}"
+    );
+}
+
 async fn bba_tenancy(pool: &PgPool, id: Uuid) -> (Uuid, String, Uuid, bool) {
     sqlx::query_as(
         "SELECT claim_id, visibility::text, owner_group_id, writer_owned \

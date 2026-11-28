@@ -5329,6 +5329,35 @@ restart.
   order. **Measure after deploy**: the deploy's end-state catalog check should show no `papers`
   column or column-ACL drift between a fresh migrate and the deployed database; this change did
   not measure parity with a deployed database.
+- **358**: `shifted_to_edge_type` (backlog d639d492, split 1/2 of 52eff3ab's port of the
+  `shifted_to` temporal-succession edge). One partial unique index,
+  `edges_shifted_to_pair_uniq ON edges (LEAST(source_id, target_id), GREATEST(source_id,
+  target_id)) WHERE relationship = 'shifted_to' AND valid_to IS NULL AND source_type = 'claim' AND
+  target_type = 'claim'`: on a DIRECTIONAL relation the
+  pair key enforces anti-symmetry, so it refuses both an exact duplicate and the reversal of an
+  in-force `shifted_to`, while a chain `A -> B -> C` stays legal. `valid_to IS NULL` is a
+  deliberate divergence from the ported source (091's rule: a retracted row must not hold the slot),
+  and so is the claim/claim conjunct (the merge paths' pair guard sees claim/claim edges only).
+  **A writer already exists:** the document ingest copies a caller's relationship verbatim, so it
+  can store `shifted_to` today; after 358 an ingest that collides with an in-force pair is refused
+  as a whole with the designed STATE refusal `epigraph_db::SHIFTED_TO_PAIR_REFUSAL` (HTTP 409 / the
+  MCP tool error), which `From<sqlx::Error> for DbError` maps from this index's 23505.
+  `shifted_to` has no `edge_to_factor_type` row (175's body), so it mints no factor. The merge paths
+  pay the index's cost: `ClaimRepository::mark_duplicate`'s repair and `consolidate` dedup
+  `epigraph_db::PAIR_UNIQUE_RELATIONSHIPS` (`alternative_of`, `shifted_to`) by pair key, so a merge
+  never re-points a `shifted_to` edge into an occupied pair. `-- no-transaction`, one `CREATE
+  UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` statement (registered in `tenancy_migration_shape.rs`'s
+  `INDEX_MIGRATIONS`). Pinned by `epigraph-db/tests/shifted_to_pair_index.rs` (duplicate and
+  reversal refused, chain and post-retraction re-assertion admitted, undo runbook drops it) and
+  the merge fixtures in `consolidate_test.rs` / `mark_duplicate_repo.rs`. **Measure first, a
+  required step** (a UNIQUE CONCURRENTLY build fails on a collision and leaves an INVALID index;
+  the grouping catches reversals too): `SELECT LEAST(source_id, target_id), GREATEST(source_id,
+  target_id), count(*) FROM edges WHERE relationship = 'shifted_to' AND valid_to IS NULL AND
+  source_type = 'claim' AND target_type = 'claim' GROUP BY 1, 2 HAVING count(*) > 1;`. A
+  non-empty result: per pair keep the intended row, retract the others (`valid_to = now()`), re-run
+  until empty, then migrate. Undo: `docs/runbooks/358-undo.sql`. **Deploy order:** migrate BEFORE
+  any binary that adds a dedicated `shifted_to` writer (the second half of the port); the
+  merge-path change and the refusal mapping run with or without 358.
 
 ## `-- no-transaction` migrations
 

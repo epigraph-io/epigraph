@@ -87,6 +87,8 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "353_edges_related_to_symmetric_uniq.sql",
         "edges_related_to_symmetric_uniq",
     ),
+    // Backlog d639d492: the anti-symmetric pair key for `shifted_to`.
+    ("358_shifted_to_edge_type.sql", "edges_shifted_to_pair_uniq"),
 ];
 
 /// `-- no-transaction` index files whose index no longer exists at head: 312 and
