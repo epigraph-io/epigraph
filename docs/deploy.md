@@ -2153,9 +2153,14 @@ the client's grant. In order:
    one `CLIENT` line per active `claims:write` client it would change, one
    `CHAIN` line per live refresh family, and the totals. Compare them with a
    census of the same predicate. The dry run runs the real statements and
-   rolls them back. It holds row locks on every candidate client and live
-   refresh token until then, and token refreshes on those rows wait for it.
-   Run it off-peak.
+   rolls them back. Until then it holds row locks on every candidate client
+   and on each live refresh token it would widen. A refresh of one of those
+   tokens, and any change to a candidate client's scopes or status, waits
+   for it. Other new tokens for those clients (a refresh of another chain, a
+   client_credentials mint, an authorization-code exchange) do not wait: the
+   client rows are locked `FOR NO KEY UPDATE`, which the refresh-token
+   foreign key's lock does not conflict with. `--apply` holds the same locks
+   until it commits. Run both off-peak.
 3. `... --reason <text> --apply --confirm-count <N from step 2>
    --manifest-out <new file>`. A different count rolls back everything. Keep
    the manifest: it is the undo.

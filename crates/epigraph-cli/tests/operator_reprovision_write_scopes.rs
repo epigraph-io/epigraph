@@ -19,6 +19,10 @@
 //!   pre-existing `evidence:write` in `allowed_scopes` kept), restores a chain
 //!   by family (the successor a rotation minted since), and HOLDS a client
 //!   whose arrays changed since (exit 3);
+//! * a refresh-token rotation for a client either verb has locked goes
+//!   through (the client row is locked `FOR NO KEY UPDATE`, which a foreign
+//!   key's `FOR KEY SHARE` does not wait on), while a concurrent scope writer
+//!   still waits;
 //! * the definers refuse any scope outside {edges:write, evidence:write}
 //!   (admin-only included), a forged reverse line, and a non-maintenance
 //!   login; they are maintenance-owned and not executable by the app role;
@@ -607,6 +611,139 @@ async fn reprovision_widens_live_chains_of_active_writers_and_reverses_exactly(p
             .iter()
             .all(|x| !back_scopes.contains(&(*x).to_string())),
         "after the reverse the chain mints neither: {back_scopes:?}"
+    );
+}
+
+/// `refresh_tokens.token_hash` of `id`: what a rotation presents.
+async fn token_hash(pool: &PgPool, id: Uuid) -> Vec<u8> {
+    sqlx::query_scalar("SELECT token_hash FROM refresh_tokens WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("token hash")
+}
+
+/// `sql` on its own connection, in a transaction under a 2 s
+/// `lock_timeout`, rolled back: `Ok(())` or the SQLSTATE it failed with.
+async fn under_lock_timeout(
+    pool: &PgPool,
+    sql: &str,
+    hash: Option<&[u8]>,
+    client: Uuid,
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.expect("probe transaction");
+    sqlx::query("SELECT set_config('lock_timeout', '2s', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("lock_timeout");
+    let fresh: [u8; 32] = *blake3::hash(Uuid::new_v4().as_bytes()).as_bytes();
+    let mut q = sqlx::query(sql);
+    q = match hash {
+        Some(h) => q.bind(h.to_vec()).bind(fresh.to_vec()),
+        None => q.bind(client),
+    };
+    let out = q.execute(&mut *tx).await.map(|_| ()).map_err(|e| {
+        e.as_database_error()
+            .and_then(|d| d.code())
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|| e.to_string())
+    });
+    let _ = tx.rollback().await;
+    out
+}
+
+const ROTATE: &str =
+    "SELECT outcome FROM public.epigraph_refresh_token_rotate($1, $2, now() + interval '1 day')";
+const SCOPE_WRITE: &str = "UPDATE oauth_clients \
+                             SET granted_scopes = granted_scopes || ARRAY['agents:read'] \
+                           WHERE id = $1";
+
+/// The verbs lock client rows `FOR NO KEY UPDATE`, not `FOR UPDATE`.
+///
+/// Every refresh-token insert takes `FOR KEY SHARE` on its client row (the
+/// foreign key), and only `FOR UPDATE` conflicts with that. Under
+/// `FOR UPDATE` a rotation that had locked its old token waited on the
+/// client while the verb waited on that token (a deadlock), and every mint
+/// for a candidate client waited out the whole run, dry runs included. This
+/// pins that a real rotation (`epigraph_refresh_token_rotate`, which updates
+/// the old token and inserts its successor) goes through while either verb
+/// holds its locks, and that a concurrent scope writer on the same client
+/// still waits (the lock still serializes scope changes).
+///
+/// Verified to fail: either `FOR NO KEY UPDATE OF oc` put back to
+/// `FOR UPDATE OF oc` -> the rotation under that verb's open transaction
+/// fails 55P03 (lock timeout) instead of rotating.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rotation_is_not_blocked_by_the_verbs_client_lock(pool: PgPool) {
+    let w = ["claims:read", "claims:write"];
+    let (a, _, _) = service_client(&pool, "active", &w, &w).await;
+    // Chains the verb does not widen (no claims:write), so it does not lock
+    // the token rows; only the client row is contended.
+    let t1 = token_hash(&pool, live_token(&pool, a, &["claims:read"]).await).await;
+    let t2 = token_hash(&pool, live_token(&pool, a, &["claims:read"]).await).await;
+
+    // CALIBRATION: with no verb running, the rotation goes through (it is
+    // rolled back, so the token stays live).
+    assert_eq!(
+        under_lock_timeout(&pool, ROTATE, Some(&t1), a).await,
+        Ok(())
+    );
+
+    // The forward verb, its transaction left open.
+    let mut fwd = pool.begin().await.expect("forward transaction");
+    let changed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.epigraph_reprovision_write_scopes(\
+             ARRAY['edges:write', 'evidence:write'], 'lock probe', '{}'::jsonb)",
+    )
+    .fetch_one(&mut *fwd)
+    .await
+    .expect("forward verb");
+    assert_eq!(
+        changed, 1,
+        "PREMISE: the client is a candidate, so it is locked"
+    );
+    let rotated = under_lock_timeout(&pool, ROTATE, Some(&t1), a).await;
+    let scope_write = under_lock_timeout(&pool, SCOPE_WRITE, None, a).await;
+    fwd.rollback().await.expect("roll back the forward verb");
+    assert_eq!(
+        rotated,
+        Ok(()),
+        "a rotation inserts its successor while the forward verb holds the client"
+    );
+    assert_eq!(
+        scope_write,
+        Err("55P03".to_string()),
+        "a concurrent scope writer still waits on the forward verb"
+    );
+
+    // The reverse verb (a no-op line: the `already` arm, which still locks
+    // the client), its transaction left open.
+    let mut rev = pool.begin().await.expect("reverse transaction");
+    let state: String = sqlx::query_scalar(
+        "SELECT out_client_state FROM public.epigraph_reprovision_write_scopes_reverse(\
+             $1, $2, $2, $2, $2, '[]'::jsonb, 'lock probe', '{}'::jsonb)",
+    )
+    .bind(a)
+    .bind(v(&w))
+    .fetch_one(&mut *rev)
+    .await
+    .expect("reverse verb");
+    assert_eq!(
+        state, "already",
+        "PREMISE: the reverse read (and locked) the client"
+    );
+    let rotated = under_lock_timeout(&pool, ROTATE, Some(&t2), a).await;
+    let scope_write = under_lock_timeout(&pool, SCOPE_WRITE, None, a).await;
+    rev.rollback().await.expect("roll back the reverse verb");
+    assert_eq!(
+        rotated,
+        Ok(()),
+        "a rotation inserts its successor while the reverse verb holds the client"
+    );
+    assert_eq!(
+        scope_write,
+        Err("55P03".to_string()),
+        "a concurrent scope writer still waits on the reverse verb"
     );
 }
 

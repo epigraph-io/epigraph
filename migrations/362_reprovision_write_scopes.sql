@@ -50,8 +50,16 @@
 --     login (`session_user`, recorded here, not taken from the caller).
 --     Per-token before/after arrays are RETURNED (for the operator's undo
 --     manifest), not stored in the audit row.
---   * Rows are locked `FOR UPDATE` (clients, then each client's tokens) and
---     changed from the state the lock read.
+--   * Rows are locked `FOR NO KEY UPDATE` (clients, then each client's
+--     tokens) and changed from the state the lock read. NOT `FOR UPDATE`:
+--     every insert into a table with a foreign key to `oauth_clients`
+--     (a refresh-token rotation's successor, a client_credentials mint, an
+--     authorization-code exchange) takes `FOR KEY SHARE` on the client row,
+--     and `FOR UPDATE` is the only row-lock mode that conflicts with it. A
+--     rotation that had already locked its old token would then wait on the
+--     client while this verb waited on that token (40P01). No update here
+--     touches a key column, so the weaker lock still serializes every
+--     concurrent scope writer.
 --
 -- A rotation that is in flight while the verb runs can insert a successor
 -- the verb's snapshot does not see (its scopes are the old token's narrowed
@@ -169,7 +177,7 @@ BEGIN
          WHERE oc.status = 'active'
            AND 'claims:write' = ANY (oc.granted_scopes)
          ORDER BY oc.id
-           FOR UPDATE OF oc
+           FOR NO KEY UPDATE OF oc
     LOOP
         v_allowed := c.allowed_scopes || ARRAY(
             SELECT u.s FROM unnest(p_scopes) WITH ORDINALITY AS u(s, ord)
@@ -188,7 +196,7 @@ BEGIN
                AND 'claims:write' = ANY (rt.scopes)
                AND NOT (rt.scopes @> p_scopes)
              ORDER BY rt.id
-               FOR UPDATE OF rt
+               FOR NO KEY UPDATE OF rt
         LOOP
             v_scopes := t.scopes || ARRAY(
                 SELECT u.s FROM unnest(p_scopes) WITH ORDINALITY AS u(s, ord)
@@ -331,7 +339,7 @@ BEGIN
            COALESCE(oc.allowed_scopes, ARRAY[]::text[]) AS allowed_scopes,
            COALESCE(oc.granted_scopes, ARRAY[]::text[]) AS granted_scopes
       INTO v_cur
-      FROM public.oauth_clients oc WHERE oc.id = p_client FOR UPDATE OF oc;
+      FROM public.oauth_clients oc WHERE oc.id = p_client FOR NO KEY UPDATE OF oc;
     IF NOT FOUND THEN
         v_state := 'missing';
     ELSIF v_cur.allowed_scopes = p_allowed_after AND v_cur.granted_scopes = p_granted_after
