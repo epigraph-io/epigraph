@@ -987,9 +987,12 @@ pub fn create_router_with_extensions(
         // The caller's OWN recall audit rows (backlog 2cf7b6a1): no agent
         // parameter; the stamped connection's row policy and the repo's
         // explicit `agent_id = <principal>` filter both restrict the read.
+        // The answer is the caller's private query texts, so it is never
+        // stored by a shared cache.
         .route(
             "/api/v1/recall-events",
-            get(recall_events::list_own_recall_events),
+            get(recall_events::list_own_recall_events)
+                .layer(middleware::map_response(viewer_scoped_cache_headers)),
         )
         .route(
             "/api/v1/agents/:id/timeline",

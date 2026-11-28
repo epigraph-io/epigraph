@@ -20,7 +20,7 @@ mod common;
 mod viewer_fixture;
 
 use axum::body::Body;
-use axum::http::{header, Method, Request, StatusCode};
+use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use epigraph_api::create_router;
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::{NewRecallEvent, RecallEventRepository, ScopedPool, SessionGucMode};
@@ -83,8 +83,13 @@ async fn log(pool: &PgPool, agent: Uuid, query: &str, ids: Vec<Uuid>) -> Uuid {
     .expect("log a recall")
 }
 
-/// `GET uri` through the full router, with `token` as the bearer when given.
-async fn get_with(state: &AppState, token: Option<&str>, uri: &str) -> (StatusCode, Value) {
+/// `GET uri` through the full router, with `token` as the bearer when given:
+/// the status, the response headers and the body.
+async fn get_full(
+    state: &AppState,
+    token: Option<&str>,
+    uri: &str,
+) -> (StatusCode, HeaderMap, Value) {
     let mut req = Request::builder().method(Method::GET).uri(uri);
     if let Some(t) = token {
         req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
@@ -94,9 +99,16 @@ async fn get_with(state: &AppState, token: Option<&str>, uri: &str) -> (StatusCo
         .await
         .expect("response");
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = resp.into_body().collect().await.expect("body").to_bytes();
     let body = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, headers, body)
+}
+
+/// `GET uri` through the full router, with `token` as the bearer when given.
+async fn get_with(state: &AppState, token: Option<&str>, uri: &str) -> (StatusCode, Value) {
+    let (status, _, body) = get_full(state, token, uri).await;
     (status, body)
 }
 
@@ -254,4 +266,37 @@ async fn pages_walk_the_history_newest_first_and_end_with_a_null_cursor(pool: Pg
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (status, body) = get_as(&state, a, "/api/v1/recall-events?since=yesterday").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// The answer is one caller's private query texts: like the other routes
+/// whose whole response depends on the caller (semantic search, papers, the
+/// sources overview), it is `Cache-Control: private, no-store` and
+/// `Vary: Authorization`, so no shared cache stores it or serves it to
+/// another bearer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_answer_is_private_and_varies_on_the_bearer(pool: PgPool) {
+    let (a, _) = viewer_fixture::seed_agent_with_group(&pool, "recall-route-cache").await;
+    let row = log(&pool, a, "a private query", vec![]).await;
+    let state = app_role_state(&pool).await;
+    let token = common::mint_token_with_agent(&["claims:read"], a);
+
+    let (status, headers, page) = get_full(&state, Some(&token), "/api/v1/recall-events").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        ids_of(&page),
+        vec![row.to_string()],
+        "CONTROL: the route served"
+    );
+    assert_eq!(
+        headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, no-store"),
+        "{headers:?}"
+    );
+    assert_eq!(
+        headers.get(header::VARY).and_then(|v| v.to_str().ok()),
+        Some("Authorization"),
+        "{headers:?}"
+    );
 }

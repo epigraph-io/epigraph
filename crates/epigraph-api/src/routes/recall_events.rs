@@ -37,6 +37,10 @@
 //!
 //! `since`, `until` (RFC 3339) and `claim_id` narrow the read; none of them
 //! can widen it.
+//!
+//! The answer is `Cache-Control: private, no-store` and `Vary: Authorization`
+//! (set where the route is registered), like every route whose whole answer
+//! depends on the caller.
 
 use axum::{
     extract::{Query, State},
