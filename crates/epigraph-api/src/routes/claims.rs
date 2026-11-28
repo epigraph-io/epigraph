@@ -737,6 +737,20 @@ pub async fn create_claim(
     .map(Json)
 }
 
+/// BLAKE3 of the `submitted` claim content, for the provenance row.
+/// `stored_digest` is BLAKE3 of the `stored` content, already computed by
+/// [`create_claim_core`]; when the two contents are the same (every tier but
+/// fully_private, which stores a "[private]" placeholder) it is returned as
+/// is rather than hashing the same bytes a second time (backlog 90e994f0).
+#[cfg(feature = "db")]
+fn provenance_content_digest(submitted: &str, stored: &str, stored_digest: [u8; 32]) -> [u8; 32] {
+    if submitted == stored {
+        stored_digest
+    } else {
+        epigraph_crypto::ContentHasher::hash(submitted.as_bytes())
+    }
+}
+
 /// The body of `POST /api/v1/claims`, shared with `POST /api/v1/claims/batch`
 /// (one call per item) so the two cannot drift. Opens and commits its own
 /// transaction.
@@ -1062,6 +1076,11 @@ pub(crate) async fn create_claim_core(
         );
         k.signer_id
     });
+    // The provenance row hashes the SUBMITTED content. It equals the stored
+    // content on every tier but fully_private, so `content_digest` is reused
+    // there instead of hashing the same bytes again.
+    let provenance_digest =
+        provenance_content_digest(&request.content, &claim.content, content_digest);
 
     // Use a transaction for claim + encryption metadata atomicity, STAMPED
     // with the authenticated viewer: migration 122's claims trigger binds the
@@ -1620,8 +1639,8 @@ pub(crate) async fn create_claim_core(
     // this call created: the action recorded is "create", and on an
     // `if_not_exists` dedup hit nothing was.
     if was_created {
-        // Content hash for provenance: BLAKE3 of claim content
-        let content_hash = blake3::hash(request.content.as_bytes());
+        // Content hash for provenance: BLAKE3 of the submitted content,
+        // computed above (`provenance_digest`).
         // `provenance_log.provenance_sig` is the AGENT's signature over its
         // request body. An HTTP caller authenticates with a bearer token and
         // signs no body, so it is empty. The row-level attestation is a
@@ -1635,7 +1654,7 @@ pub(crate) async fn create_claim_core(
             "claim",
             claim_uuid,
             "create",
-            content_hash.as_bytes(),
+            &provenance_digest,
             provenance_sig,
             None,
         )
@@ -3401,6 +3420,32 @@ mod tests {
             body.matches(needle).count(),
             1,
             "create_claim_core must compute BLAKE3(content_for_db) once and reuse it"
+        );
+        // The provenance row's hash goes through `provenance_content_digest`,
+        // which reuses that digest; a direct BLAKE3 call here hashes again.
+        let direct = concat!("blake3", "::hash(");
+        assert_eq!(
+            body.matches(direct).count(),
+            0,
+            "create_claim_core must not hash the content again for provenance"
+        );
+    }
+
+    /// The provenance digest reuses the stored-content digest when the
+    /// submitted content was stored as is (a sentinel digest proves it is not
+    /// recomputed), and hashes the submitted content when the stored content
+    /// differs (fully_private's "[private]" placeholder), as before.
+    #[cfg(feature = "db")]
+    #[test]
+    fn provenance_digest_reuses_the_stored_digest() {
+        let sentinel = [7u8; 32];
+        assert_eq!(
+            provenance_content_digest("a claim", "a claim", sentinel),
+            sentinel
+        );
+        assert_eq!(
+            provenance_content_digest("a claim", "[private]", sentinel),
+            *blake3::hash(b"a claim").as_bytes()
         );
     }
 
