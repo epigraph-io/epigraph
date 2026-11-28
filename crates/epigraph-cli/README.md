@@ -30,7 +30,7 @@ row names no `[[bin]]`, or when a row's class is not one of the five below.
 | `prune_recall_events` | standing | Daily retention prune of the recall audit log and telemetry events. |
 | `assign_unthemed_themes` | standing | Nightly: assigns every unthemed, embedded claim to its nearest theme. |
 | `atlas_nightly` | standing | The nightly Atlas refresh (`deploy/systemd/epigraph-atlas-nightly.timer`). |
-| `cross_source_sweep` | standing | Batch driver for the cross-source matcher over recently touched, unscanned claims; `--recent [--window 1d]` drains only never-scanned, non-status claims written within the window. |
+| `cross_source_sweep` | standing | Batch driver for the cross-source matcher over recently touched, unscanned claims; `--recent [--window 1d]` drains only never-scanned, embedded, non-status claims written within the window that pass the matcher's eligibility gate. |
 | `sweep_semantic_duplicates` | standing | Sweeps one page of the corpus for semantic near-duplicates; collapses exact restatements with `--apply`. |
 | `atomicity_sweep` | standing | Labels current atoms that still assert several things `compound-atom`, and unlabels claims that no longer qualify. |
 | `decompose_claims` | standing | Splits standalone compound claims into atoms with `decomposes_to` edges (the decomposition schedule's primitive). |

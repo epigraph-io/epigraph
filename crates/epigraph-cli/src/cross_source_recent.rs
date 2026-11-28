@@ -12,13 +12,26 @@
 //! * `is_current` claims,
 //! * with a NULL `last_match_scan_at`,
 //! * created within the window (default one day),
+//! * with an embedding,
 //! * carrying none of [`excluded_labels`] (the `status` marker plus every
 //!   [`STATUS_CLAIM_LABELS`] entry, matched exactly),
+//! * and passing the matcher's own eligibility gate: none of
+//!   `[matcher.eligibility] exclude_labels` and no host-provenance
+//!   `properties->>'event'`, applied exactly when the matcher applies it
+//!   (a non-empty list),
 //!
 //! oldest first, capped, runs them through the SAME `run_pipeline` (same
 //! `MatcherConfig`, verifier and `auto_promote`) as the default sweep, and
 //! stamps them. A claim that ages out of the window unscanned still has a NULL
 //! stamp, so the default sweep (NULL or older than 7 days) picks it up.
+//!
+//! The last two criteria keep the cap for claims the matcher can score. A
+//! claim the eligibility gate drops would only cost stance-probe embedding
+//! calls before every pair it yields is discarded, and then be stamped. A
+//! claim whose embed-on-write failed would get only the non-embedding
+//! blockers and then be stamped, hiding it from the default sweep for 7 days
+//! after `embed_backfill` gives it a vector; left unstamped, it stays due
+//! until it is embedded or ages out to the default sweep.
 //!
 //! The selection and the run-then-stamp step live here, not in the binary, so
 //! a test can drive exactly what the binary runs with a mock verifier.
@@ -27,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epigraph_embeddings::EmbeddingService;
-use epigraph_engine::matching::calibration::MatcherConfig;
+use epigraph_engine::matching::calibration::{EligibilityConfig, MatcherConfig};
 use epigraph_engine::matching::pipeline::{run_pipeline, RunInputs, RunReport};
 use epigraph_engine::matching::verifier::VerifierClient;
 use epigraph_mcp::tools::novelty_gate::STATUS_CLAIM_LABELS;
@@ -74,8 +87,12 @@ pub fn parse_window(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
-/// The `--recent` seed selection: current, never-scanned, non-status claims
-/// created within `window`, oldest first, at most `cap`.
+/// The `--recent` seed selection: current, never-scanned, embedded,
+/// non-status claims created within `window` that pass the matcher's
+/// `eligibility` gate, oldest first, at most `cap`.
+///
+/// `eligibility` must be the `MatcherConfig` the run uses, so the drain and
+/// the matcher agree on what is matchable.
 ///
 /// # Errors
 /// The query failing.
@@ -83,8 +100,14 @@ pub async fn select_recent_seeds(
     pool: &PgPool,
     window: Duration,
     cap: i64,
+    eligibility: &EligibilityConfig,
 ) -> sqlx::Result<Vec<Uuid>> {
-    let excluded: Vec<String> = excluded_labels().into_iter().map(String::from).collect();
+    let mut excluded: Vec<String> = excluded_labels().into_iter().map(String::from).collect();
+    // The matcher's gate (epigraph-engine `blocker::filter_ineligible`) runs
+    // only for a non-empty `exclude_labels`, and then drops the labels AND
+    // any `properties->>'event'` claim. Mirror that exactly.
+    let matcher_gate = !eligibility.exclude_labels.is_empty();
+    excluded.extend(eligibility.exclude_labels.iter().cloned());
     // `labels` is `text[] NOT NULL DEFAULT '{}'` (migration 001), so `&&`
     // never yields NULL here and an unlabelled claim is kept.
     sqlx::query_scalar(
@@ -92,13 +115,16 @@ pub async fn select_recent_seeds(
          WHERE is_current
            AND last_match_scan_at IS NULL
            AND created_at > now() - make_interval(secs => $1)
+           AND embedding IS NOT NULL
            AND NOT (labels && $2::text[])
+           AND (NOT $4 OR (properties->>'event') IS NULL)
          ORDER BY created_at ASC, id ASC
          LIMIT $3",
     )
     .bind(window.as_secs_f64())
     .bind(&excluded)
     .bind(cap)
+    .bind(matcher_gate)
     .fetch_all(pool)
     .await
 }

@@ -9,18 +9,23 @@
 //!   from another source is the ONLY seed the drain picks, and one drain pass
 //!   writes a `contradicts` match candidate (and edge) for the pair and stamps
 //!   the seed, so the next pass selects nothing;
-//! * the selection keeps an unlabelled claim and a topic-labelled one
-//!   (`daily-journal`, exact matching), and drops a `status` marker claim, a
-//!   `telemetry` claim, a `journal-status` claim (a `STATUS_CLAIM_LABELS`
-//!   entry), an already-stamped claim, a non-current claim and a claim older
-//!   than the window; a wider window picks the older claim up; the cap takes
-//!   the oldest first.
+//! * the selection (under the served `[matcher.eligibility]`) keeps an
+//!   unlabelled claim and a topic-labelled one, and drops a `status` marker
+//!   claim, a `telemetry` claim, a `journal-status` claim (a
+//!   `STATUS_CLAIM_LABELS` entry), a `workflow_step` and a `daily-journal`
+//!   claim (matcher `exclude_labels`), a host-provenance `event` claim, a
+//!   claim with no embedding, an already-stamped claim, a non-current claim
+//!   and a claim older than the window; a wider window picks the older claim
+//!   up; the cap takes the oldest first;
+//! * with the matcher's gate turned off (`exclude_labels = []`, which also
+//!   turns off its `event` filter) the matcher-only drops come back, while
+//!   the status claims and the unembedded claim stay out.
 
 #![cfg(feature = "db")]
 
 use async_trait::async_trait;
 use epigraph_cli::cross_source_recent::{select_recent_seeds, sweep_seeds, SweepInputs};
-use epigraph_engine::matching::calibration::MatcherConfig;
+use epigraph_engine::matching::calibration::{EligibilityConfig, MatcherConfig};
 use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -43,7 +48,8 @@ async fn insert_agent(pool: &PgPool) -> Uuid {
 
 /// One claim row. `age` backdates `created_at`; `stamped` sets
 /// `last_match_scan_at`; `embedding: None` leaves it NULL (required for a
-/// non-current claim by migration 052's CHECK).
+/// non-current claim by migration 052's CHECK); `event` sets the
+/// host-provenance `properties.event` marker.
 struct Claim<'a> {
     agent: Uuid,
     labels: &'a [&'a str],
@@ -52,6 +58,7 @@ struct Claim<'a> {
     is_current: bool,
     paper_doi: &'a str,
     embedding: Option<f32>,
+    event: Option<&'a str>,
 }
 
 impl<'a> Claim<'a> {
@@ -63,7 +70,8 @@ impl<'a> Claim<'a> {
             stamped: false,
             is_current: true,
             paper_doi: "10.1/recent-default",
-            embedding: None,
+            embedding: Some(0.5),
+            event: None,
         }
     }
 }
@@ -75,6 +83,10 @@ async fn insert_claim(pool: &PgPool, c: Claim<'_>) -> Uuid {
         .embedding
         .map(|x| format!("[{}]", vec![x.to_string(); 1536].join(",")));
     let labels: Vec<String> = c.labels.iter().map(|s| (*s).to_string()).collect();
+    let mut properties = serde_json::json!({ "paper_doi": c.paper_doi });
+    if let Some(e) = c.event {
+        properties["event"] = serde_json::json!(e);
+    }
     sqlx::query(
         "INSERT INTO claims
            (id, content, content_hash, truth_value, agent_id, properties, embedding,
@@ -86,7 +98,7 @@ async fn insert_claim(pool: &PgPool, c: Claim<'_>) -> Uuid {
     .bind(id)
     .bind(&content)
     .bind(c.agent)
-    .bind(serde_json::json!({ "paper_doi": c.paper_doi }))
+    .bind(properties)
     .bind(emb)
     .bind(&labels)
     .bind(c.is_current)
@@ -123,11 +135,16 @@ impl VerifierClient for AlwaysContradictsVerifier {
 /// score of an identical-embedding cross-source pair lands in the mid band,
 /// where the verifier decides (as in epigraph-engine's pipeline_end_to_end).
 fn mid_band_config() -> MatcherConfig {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../calibration.toml");
-    let mut cfg = MatcherConfig::load_from(&p).expect("load calibration.toml");
+    let mut cfg = served_config();
     cfg.bands.high = 0.50;
     cfg.bands.mid = 0.30;
     cfg
+}
+
+/// The repo's served `calibration.toml`, as the binary loads it by default.
+fn served_config() -> MatcherConfig {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../calibration.toml");
+    MatcherConfig::load_from(&p).expect("load calibration.toml")
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -158,7 +175,10 @@ async fn recent_drain_finds_a_fresh_contradiction_then_stamps_it(pool: PgPool) {
     )
     .await;
 
-    let seeds = select_recent_seeds(&pool, DAY, 200).await.expect("select");
+    let eligibility = served_config().eligibility;
+    let seeds = select_recent_seeds(&pool, DAY, 200, &eligibility)
+        .await
+        .expect("select");
     assert_eq!(seeds, vec![fresh], "only the fresh, unscanned claim is due");
 
     let report = sweep_seeds(
@@ -216,7 +236,9 @@ async fn recent_drain_finds_a_fresh_contradiction_then_stamps_it(pool: PgPool) {
             .await
             .expect("stamp");
     assert!(stamped.0, "the drained seed is stamped");
-    let again = select_recent_seeds(&pool, DAY, 200).await.expect("select");
+    let again = select_recent_seeds(&pool, DAY, 200, &eligibility)
+        .await
+        .expect("select");
     assert!(again.is_empty(), "the next pass has nothing due: {again:?}");
 }
 
@@ -235,18 +257,19 @@ async fn recent_selection_skips_status_scanned_superseded_and_old_claims(pool: P
     let topic = insert_claim(
         &pool,
         Claim {
-            labels: &["daily-journal"],
+            labels: &["physics"],
             ..Claim::fresh(a)
         },
     )
     .await;
-    let mut dropped = Vec::new();
+    // Dropped by the status-label filter, whatever the matcher config.
+    let mut status_drops = Vec::new();
     for labels in [
         &["status"][..],
         &["telemetry"],
         &["notes", "journal-status"],
     ] {
-        dropped.push(
+        status_drops.push(
             insert_claim(
                 &pool,
                 Claim {
@@ -257,26 +280,56 @@ async fn recent_selection_skips_status_scanned_superseded_and_old_claims(pool: P
             .await,
         );
     }
-    dropped.push(
-        insert_claim(
-            &pool,
-            Claim {
-                stamped: true,
-                ..Claim::fresh(a)
-            },
-        )
-        .await,
-    );
-    dropped.push(
-        insert_claim(
-            &pool,
-            Claim {
-                is_current: false,
-                ..Claim::fresh(a)
-            },
-        )
-        .await,
-    );
+    // Dropped only because the matcher's eligibility gate would drop them.
+    let workflow = insert_claim(
+        &pool,
+        Claim {
+            labels: &["workflow_step"],
+            ..Claim::fresh(a)
+        },
+    )
+    .await;
+    let journal = insert_claim(
+        &pool,
+        Claim {
+            labels: &["daily-journal"],
+            ..Claim::fresh(a)
+        },
+    )
+    .await;
+    let event = insert_claim(
+        &pool,
+        Claim {
+            event: Some("session_end"),
+            ..Claim::fresh(a)
+        },
+    )
+    .await;
+    let unembedded = insert_claim(
+        &pool,
+        Claim {
+            embedding: None,
+            ..Claim::fresh(a)
+        },
+    )
+    .await;
+    let stamped = insert_claim(
+        &pool,
+        Claim {
+            stamped: true,
+            ..Claim::fresh(a)
+        },
+    )
+    .await;
+    let superseded = insert_claim(
+        &pool,
+        Claim {
+            is_current: false,
+            embedding: None,
+            ..Claim::fresh(a)
+        },
+    )
+    .await;
     let old = insert_claim(
         &pool,
         Claim {
@@ -286,20 +339,47 @@ async fn recent_selection_skips_status_scanned_superseded_and_old_claims(pool: P
     )
     .await;
 
-    let seeds = select_recent_seeds(&pool, DAY, 200).await.expect("select");
+    let served = served_config().eligibility;
+    assert!(
+        served.exclude_labels.iter().any(|l| l == "workflow_step")
+            && served.exclude_labels.iter().any(|l| l == "daily-journal"),
+        "the fixture assumes the served calibration excludes these: {served:?}"
+    );
+    let seeds = select_recent_seeds(&pool, DAY, 200, &served)
+        .await
+        .expect("select");
     assert_eq!(
         seeds,
         vec![plain, topic],
-        "kept: unlabelled and topic-labelled, oldest first; dropped: {dropped:?} and {old}"
+        "kept: unlabelled and topic-labelled, oldest first; dropped: status \
+         {status_drops:?}, workflow_step {workflow}, daily-journal {journal}, \
+         event {event}, unembedded {unembedded}, stamped {stamped}, \
+         superseded {superseded}, old {old}"
     );
 
-    let wide = select_recent_seeds(&pool, 3 * DAY, 200)
+    let wide = select_recent_seeds(&pool, 3 * DAY, 200, &served)
         .await
         .expect("select wide");
     assert_eq!(wide, vec![old, plain, topic], "the window is the caller's");
 
-    let capped = select_recent_seeds(&pool, DAY, 1)
+    let capped = select_recent_seeds(&pool, DAY, 1, &served)
         .await
         .expect("select capped");
     assert_eq!(capped, vec![plain], "the cap takes the oldest first");
+
+    // With the matcher's gate off, the drain mirrors it: the matcher-only
+    // drops come back, the status and unembedded claims stay out.
+    let gate_off = EligibilityConfig {
+        exclude_labels: vec![],
+    };
+    let mut open = select_recent_seeds(&pool, DAY, 200, &gate_off)
+        .await
+        .expect("select gate off");
+    open.sort_unstable();
+    let mut expected = vec![plain, topic, workflow, journal, event];
+    expected.sort_unstable();
+    assert_eq!(
+        open, expected,
+        "exclude_labels = [] keeps workflow_step, daily-journal and event claims"
+    );
 }

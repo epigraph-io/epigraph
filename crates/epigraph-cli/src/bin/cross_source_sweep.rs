@@ -7,8 +7,9 @@
 //! scheduled-job logs.
 //!
 //! `--recent` (backlog efc1d318) switches the seed selection to the post-write
-//! drain: current, never-scanned, non-status claims created within `--window`
-//! (default one day), oldest first, capped by `--limit` (alias `--cap`). The
+//! drain: current, never-scanned, embedded, non-status claims created within
+//! `--window` (default one day) that pass the matcher's eligibility gate,
+//! oldest first, capped by `--limit` (alias `--cap`). The
 //! matcher run and the stamp are the default sweep's own, see
 //! `epigraph_cli::cross_source_recent`.
 
@@ -68,8 +69,9 @@ struct Args {
 
     /// Post-write drain mode: scan only current claims that have never been
     /// scanned (`last_match_scan_at IS NULL`), were created within `--window`,
-    /// and carry no status label (`status`, `telemetry` and the novelty gate's
-    /// status-claim labels), oldest first. Same matcher, verifier, policy and
+    /// have an embedding, carry no status label (`status`, `telemetry` and the
+    /// novelty gate's status-claim labels) and pass the matcher's eligibility
+    /// gate (`[matcher.eligibility]`), oldest first. Same matcher, verifier, policy and
     /// stamping as the default sweep.
     #[arg(long)]
     recent: bool,
@@ -162,11 +164,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let seeds: Vec<Uuid> = if args.recent {
-        // The post-write drain (efc1d318): never-scanned claims from the
-        // window, status claims excluded. A claim that ages out of the window
-        // unscanned keeps its NULL stamp, so the default sweep below still
-        // reaches it.
-        select_recent_seeds(&pool, args.window, args.limit).await?
+        // The post-write drain (efc1d318): never-scanned, embedded claims
+        // from the window, status claims and claims the matcher's
+        // eligibility gate would drop excluded. A claim that ages out of the
+        // window unscanned keeps its NULL stamp, so the default sweep below
+        // still reaches it.
+        select_recent_seeds(&pool, args.window, args.limit, &cfg.eligibility).await?
     } else {
         // Pick seeds: claims never scanned, or scanned more than 7 days ago.
         // Bias toward recent claims so newly-ingested material gets attention
