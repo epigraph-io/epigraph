@@ -10,7 +10,7 @@
 /// Greedy submodular selection balancing coverage and relevance.
 ///
 /// # Arguments
-/// * `neighbors` - Neighborhood graph: neighbors[i] = indices of i's neighbors
+/// * `neighbors` - Neighborhood graph: `neighbors[i]` = indices of i's neighbors
 /// * `similarities` - Query-to-candidate similarity scores (normalized 0..1)
 /// * `budget` - Maximum number of items to select
 /// * `alpha` - Coverage vs relevance tradeoff (0.0 = pure relevance, 1.0 = pure coverage)

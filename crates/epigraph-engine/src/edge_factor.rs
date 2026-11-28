@@ -1050,9 +1050,9 @@ fn global_source_strength(row: &MassFunctionRow, profile: &BeliefProfile) -> f64
 /// maps mean "no opinion" (fall through to per-frame / global calibration).
 #[derive(Debug, Clone, Default)]
 pub struct PerspectiveReliability {
-    /// `evidence_type` → base reliability weight ∈ [0,1].
+    /// `evidence_type` → base reliability weight ∈ \[0,1\].
     pub source_reliability: HashMap<String, f64>,
-    /// `locality_tag` → locality factor ∈ [0,1].
+    /// `locality_tag` → locality factor ∈ \[0,1\].
     pub locality_reliability: HashMap<String, f64>,
 }
 
