@@ -16,8 +16,10 @@
 //!   (`persist_planned_claim` in epigraph-mcp, private to that crate) makes;
 //! * `create_with_id_if_absent` (the pool entry point of the same INSERT);
 //! * `create_strict` (the INSERT `create_or_get` reaches);
-//! * the supersede successor INSERT, with the PREDECESSOR stamped first, so
-//!   a successor that copied its predecessor's column would be caught.
+//! * the two INSERTs that write a successor naming `supersedes` (the
+//!   register in `inherited_successor_insert_lint.rs`): the supersede act's
+//!   and `evolve_step`'s, each with the PREDECESSOR stamped first, so a
+//!   successor that copied its predecessor's column would be caught.
 //!
 //! Uses the non-macro `sqlx::query*` forms so the offline `.sqlx/` cache is
 //! not extended.
@@ -185,4 +187,34 @@ async fn supersede_successor_leaves_last_match_scan_at_null(pool: PgPool) {
     .expect("supersede");
     assert_ne!(new_id, old);
     assert_unscanned(&pool, new_id, "the supersede successor INSERT").await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_successor_leaves_last_match_scan_at_null(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let parent: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current, \
+                             last_match_scan_at) \
+         VALUES ($1, $2, 0.5, $3, true, now()) RETURNING id",
+    )
+    .bind("evolve scan subject, parent step")
+    .bind(ContentHasher::hash(b"evolve scan subject, parent step").as_slice())
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the scanned parent step");
+
+    let res = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(parent),
+        "evolve scan subject, child step",
+        "supersedes",
+        Some("last_match_scan_at successor test"),
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step");
+    assert_ne!(res.new_claim_id, parent);
+    assert_unscanned(&pool, res.new_claim_id, "the evolve_step successor INSERT").await;
 }
